@@ -786,11 +786,18 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxPrepare(
                 if xmlSecTransformCtxCreateAndPrepend(ctx, parser::xml_parser()).is_null() {
                     return -1;
                 }
-            } else if first_type & DATA_XML == 0
-                && input_type & DATA_XML != 0
-                && xmlSecTransformCtxCreateAndPrepend(ctx, builtin::incl_c14n()).is_null()
-            {
-                return -1;
+            } else if first_type & DATA_XML == 0 && input_type & DATA_XML != 0 {
+                // Base64 reads the text of a node set (XMLDSig 1.1 section 6.6.2),
+                // as Connect gives it after a node-set transform; libxmlsec1
+                // canonicalizes here, which feeds markup to the decoder.
+                let adapter = if std::ptr::eq((*(*ctx).first).id, builtin::base64()) {
+                    builtin::remove_xml_tags_c14n()
+                } else {
+                    builtin::incl_c14n()
+                };
+                if xmlSecTransformCtxCreateAndPrepend(ctx, adapter).is_null() {
+                    return -1;
+                }
             }
             if let Some(callback) = (*ctx).pre_exec_callback
                 && callback(ctx) < 0

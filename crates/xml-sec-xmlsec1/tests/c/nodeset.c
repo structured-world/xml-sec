@@ -115,11 +115,13 @@ int main(void) {
     xmlOutputBufferPtr out;
     int type;
 
-    /* Every type over one XPath result holding elements, an attribute, a
-     * namespace node and text. */
+    /* Every type over one XPath result holding an element, an attribute, a
+     * namespace node and text, none inside another's subtree: where listed
+     * subtrees nest, libxmlsec1 walks the nested nodes again, and this
+     * library visits each node once as the walk's contract states. */
     for (type = xmlSecNodeSetNormal; type <= xmlSecNodeSetTreeWithoutCommentsInvert; ++type) {
         nset = xmlSecNodeSetCreate(doc,
-            select_nodes(doc, "//a:first | //@attr | //d:second/namespace::b | //d:inner/text()"),
+            select_nodes(doc, "//d:inner | //@attr | //d:second/namespace::b | //d:second/text()"),
             (xmlSecNodeSetType)type);
         contains(types[type], doc, nset);
         walk(types[type], nset);

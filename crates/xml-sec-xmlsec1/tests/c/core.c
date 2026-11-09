@@ -141,6 +141,7 @@ static void lists(void) {
     xmlSecPtrListPtr copy;
     xmlSecPtrList local;
     int ii;
+    int ret;
 
     list = xmlSecPtrListCreate(&counting);
     printf("list name: %s\n", xmlSecPtrListGetName(list));
@@ -150,12 +151,15 @@ static void lists(void) {
     printf("insert: %d\n", xmlSecPtrListInsert(list, &items[9], 1));
     printf("insert past end: %d\n", xmlSecPtrListInsert(list, &items[8], 100));
     print_items("inserted", list);
-    printf("remove: %d destroyed=%d\n", xmlSecPtrListRemove(list, 1), destroyed);
+    /* each call runs before the counter it changes is read */
+    ret = xmlSecPtrListRemove(list, 1);
+    printf("remove: %d destroyed=%d\n", ret, destroyed);
     printf("remove and return: %d\n",
            (int)((char *)xmlSecPtrListRemoveAndReturn(list, 0) - items));
-    printf("pop last: %d destroyed=%d\n",
-           (int)((char *)xmlSecPtrListPopLast(list) - items), destroyed);
-    printf("set: %d destroyed=%d\n", xmlSecPtrListSet(list, &items[5], 0), destroyed);
+    ret = (int)((char *)xmlSecPtrListPopLast(list) - items);
+    printf("pop last: %d destroyed=%d\n", ret, destroyed);
+    ret = xmlSecPtrListSet(list, &items[5], 0);
+    printf("set: %d destroyed=%d\n", ret, destroyed);
     print_items("after set", list);
     printf("out of range: %s %d %d\n",
            xmlSecPtrListGetItem(list, 2) == NULL ? "null" : "item",
@@ -194,9 +198,9 @@ static void lists(void) {
            xmlSecPtrListInitialize(&local, &counting));
     xmlSecPtrListAdd(&local, &items[1]);
     xmlSecPtrListFinalize(&local);
-    printf("finalized: id=%s use=" XMLSEC_SIZE_FMT " add=%d size=" XMLSEC_SIZE_FMT "\n",
-           local.id == NULL ? "null" : "set", local.use,
-           xmlSecPtrListAdd(&local, &items[2]), xmlSecPtrListGetSize(&local));
+    printf("finalized: id=%s use=" XMLSEC_SIZE_FMT, local.id == NULL ? "null" : "set", local.use);
+    ret = xmlSecPtrListAdd(&local, &items[2]);
+    printf(" add=%d size=" XMLSEC_SIZE_FMT "\n", ret, xmlSecPtrListGetSize(&local));
     printf("null list: %s %d\n",
            xmlSecPtrListCreate(NULL) == NULL ? "null" : "list",
            xmlSecPtrListAdd(NULL, &items[1]));

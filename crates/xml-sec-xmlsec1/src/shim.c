@@ -29,24 +29,27 @@ int xs_xmlsec1_fputs(void *stream, const char *text) {
 /* The parser context is libxml2's own structure, laid out and named per
  * version; these read and set it with the headers of the linked libxml2. */
 
-/* libxmlsec1's default parser options for this libxml2: no external entities
- * or network, entities substituted, the DTD read for attribute defaults and
- * IDs, no shared dictionary, no libxml2 size ceilings. */
+/* The default parser options: no network, no external entity or external
+ * DTD, no shared dictionary, no libxml2 size ceilings. From libxml2 2.13 these
+ * are libxmlsec1's options: XML_PARSE_NO_XXE keeps internal entity
+ * substitution and DTD attribute defaults inside the document. Older
+ * libxml2 has no such switch, and the same entity and DTD options would read
+ * local files an untrusted document names, so they stay off there; internal
+ * entity references then remain reference nodes. */
 int xs_xmlsec1_default_parser_options(void) {
-    int options = XML_PARSE_NONET | XML_PARSE_NOENT | XML_PARSE_DTDLOAD | XML_PARSE_DTDATTR |
-                  XML_PARSE_NODICT | XML_PARSE_HUGE;
 #if LIBXML_VERSION >= 21300
-    options |= XML_PARSE_NO_XXE;
+    return XML_PARSE_NO_XXE | XML_PARSE_NONET | XML_PARSE_NOENT | XML_PARSE_DTDLOAD |
+           XML_PARSE_DTDATTR | XML_PARSE_NODICT | XML_PARSE_HUGE;
+#else
+    return XML_PARSE_NONET | XML_PARSE_NODICT | XML_PARSE_HUGE;
 #endif
-    return options;
 }
 
+/* Applies `options` and nothing else: libxmlsec1 additionally forces entity
+ * substitution and external-subset loading on libxml2 older than 2.13,
+ * which loads external entities whatever the options say. */
 void xs_xmlsec1_prepare_ctxt(xmlParserCtxtPtr ctxt, int options) {
-#if LIBXML_VERSION < 21300
-    /* canonicalization needs IDs, default attributes and expanded entities */
-    ctxt->loadsubset = XML_DETECT_IDS | XML_COMPLETE_ATTRS;
-    ctxt->replaceEntities = 1;
-#else
+#if LIBXML_VERSION >= 21300
     xmlCtxtSetOptions(ctxt, options);
 #endif
     xmlCtxtUseOptions(ctxt, options);

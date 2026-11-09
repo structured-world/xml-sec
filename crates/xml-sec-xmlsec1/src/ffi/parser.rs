@@ -13,6 +13,9 @@ use xml_sec_libxml2::ffi::XmlDoc;
 
 use super::contain;
 
+#[cfg(test)]
+mod tests;
+
 /// libxml2's `xmlParserCtxtPtr`, used only through libxml2 and the shim.
 pub(crate) type ParserCtxt = *mut c_void;
 

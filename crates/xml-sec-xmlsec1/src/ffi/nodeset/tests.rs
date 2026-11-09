@@ -3,7 +3,7 @@
 //! Trees are exercised against libxmlsec1 by the differential C program.
 
 use super::{
-    INTERSECTION, INVERT, NORMAL, SUBTRACTION, TREE_WITHOUT_COMMENTS, UNION, XmlSecNodeSet,
+    INTERSECTION, INVERT, NORMAL, SUBTRACTION, TREE, TREE_WITHOUT_COMMENTS, UNION, XmlSecNodeSet,
     xmlSecNodeSetAdd, xmlSecNodeSetAddList, xmlSecNodeSetContains, xmlSecNodeSetCreate,
     xmlSecNodeSetDestroy, xmlSecNodeSetGetChildren,
 };
@@ -104,5 +104,65 @@ fn refusals() {
             xmlSecNodeSetGetChildren(std::ptr::null_mut(), std::ptr::null_mut(), 1, 0).is_null()
         );
         xmlSecNodeSetDestroy(first);
+    }
+}
+
+/// Counts the walk's calls per node name or text content.
+unsafe extern "C" fn record(
+    _set: *mut XmlSecNodeSet,
+    node: *mut XmlNode,
+    _parent: *mut XmlNode,
+    data: *mut std::ffi::c_void,
+) -> std::ffi::c_int {
+    // SAFETY: the walk passes live nodes and the vector the test owns.
+    unsafe {
+        let seen = &mut *data.cast::<Vec<String>>();
+        let text = if (*node).kind == xml_sec_libxml2::ffi::XML_TEXT_NODE {
+            (*node).content.cast_const()
+        } else {
+            (*node).name
+        };
+        seen.push(
+            std::ffi::CStr::from_ptr(text.cast())
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    0
+}
+
+/// The walk calls back once per node of the set (the documented contract),
+/// also when a listed node lies inside another listed subtree or a later
+/// member adds nodes by union; libxmlsec1 walks only the listed subtrees.
+#[test]
+fn walk_visits_each_member_node_once() {
+    let xml = b"<r><a>x</a><b>y</b></r>";
+    // SAFETY: the document and node sets are used while live; each set owns
+    // its XPath node set.
+    unsafe {
+        let doc = crate::ffi::parser::xmlSecParseMemory(xml.as_ptr(), xml.len(), 0);
+        assert!(!doc.is_null());
+        let root = (*doc).children;
+        let a = (*root).children;
+        let b = (*a).next;
+        let walk = |set: *mut XmlSecNodeSet| {
+            let mut seen: Vec<String> = Vec::new();
+            let data = (&raw mut seen).cast::<std::ffi::c_void>();
+            assert_eq!(super::xmlSecNodeSetWalk(set, Some(record), data), 0);
+            seen
+        };
+
+        let listed = crate::ffi::tree::xmlXPathNodeSetCreate(a);
+        crate::ffi::tree::xmlXPathNodeSetAdd(listed, (*a).children);
+        let overlapping = xmlSecNodeSetCreate(doc, listed, NORMAL);
+        assert_eq!(walk(overlapping), ["a", "x"]);
+        xmlSecNodeSetDestroy(overlapping);
+
+        let left = xmlSecNodeSetCreate(doc, crate::ffi::tree::xmlXPathNodeSetCreate(a), TREE);
+        let right = xmlSecNodeSetCreate(doc, crate::ffi::tree::xmlXPathNodeSetCreate(b), TREE);
+        let union = xmlSecNodeSetAdd(left, right, UNION);
+        assert_eq!(walk(union), ["a", "x", "b", "y"]);
+        xmlSecNodeSetDestroy(union);
+        crate::ffi::tree::xmlFreeDoc(doc);
     }
 }

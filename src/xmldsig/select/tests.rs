@@ -203,6 +203,32 @@ fn xpointer_parts_are_tried_in_order_until_one_identifies_nodes() {
     );
 }
 
+/// Every part of one `XPointer` charges the same evaluation budget, so a
+/// pointer cannot multiply its work by repeating parts that identify
+/// nothing.
+#[test]
+fn xpointer_parts_share_one_work_budget() {
+    let document = document();
+    let run = |pointer: &str, work: usize| {
+        let resources = ResourcePolicy {
+            max_xpath_evaluation_work: work,
+            ..ResourcePolicy::default()
+        };
+        document.with_view(|view| {
+            super::select_xpointer(view, pointer, &[], None, &[], &resources)
+                .map(|nodes| nodes.len())
+        })
+    };
+    // The smallest budget one evaluating part fits in.
+    let mut work = 1usize;
+    while run("xpointer(/*)", work).is_err() {
+        work = work.checked_mul(2).expect("a part fits some budget");
+    }
+    let repeated = format!("{}xpointer(/*)", "xpointer(//nothing) ".repeat(20));
+    assert!(run(&repeated, work).is_err());
+    assert!(run(&repeated, work * 64).is_ok());
+}
+
 #[test]
 fn a_pointer_that_identifies_nothing_is_an_error() {
     // XPointer Framework 3.3: a pointer none of whose parts identifies a

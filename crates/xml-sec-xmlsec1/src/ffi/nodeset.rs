@@ -472,7 +472,28 @@ unsafe extern "C" fn walk_node(current: *mut XmlNode, data: *mut c_void) -> c_in
     }
 }
 
-/// `xmlSecNodeSetWalk`: calls `walk_func` for every node of the set in
+/// Whether no listed node lies inside the subtree of another listed node.
+///
+/// # Safety
+/// `nodes` and its nodes are live.
+unsafe fn disjoint(nodes: &XmlNodeSet) -> bool {
+    let count = usize::try_from(nodes.node_nr).unwrap_or(0);
+    // SAFETY: the table holds `node_nr` live nodes; ancestors are live.
+    unsafe {
+        (0..count).all(|index| {
+            let mut ancestor = parent_of(nodes.node_tab.add(index).read());
+            while !ancestor.is_null() {
+                if xmlXPathNodeSetContains((&raw const *nodes).cast_mut(), ancestor) != 0 {
+                    return false;
+                }
+                ancestor = parent_of(ancestor);
+            }
+            true
+        })
+    }
+}
+
+/// `xmlSecNodeSetWalk`: calls `walk_func` once for every node of the set in
 /// document order, stopping at the first negative return.
 ///
 /// # Safety
@@ -501,12 +522,16 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetWalk(
             data,
         };
         let walk_data = (&raw const walk).cast_mut().cast::<c_void>();
-        // A set of listed subtrees is walked from each listed node; any other
-        // from the document's top-level nodes.
+        // A lone member listing disjoint subtrees is walked from each listed
+        // node; any other set over the whole document, so every node is
+        // visited once (libxmlsec1 takes the shortcut for any listing member
+        // and then repeats nested nodes and misses nodes later members add).
         // SAFETY: the set's XPath nodes and document are live.
         unsafe {
             if !member.nodes.is_null()
+                && std::ptr::eq(member.next, set)
                 && matches!(member.kind, NORMAL | TREE | TREE_WITHOUT_COMMENTS)
+                && disjoint(&*member.nodes)
             {
                 let nodes = &*member.nodes;
                 for index in 0..usize::try_from(nodes.node_nr).unwrap_or(0) {

@@ -8,15 +8,23 @@ use super::{
     xmlSecPtrListPopLast, xmlSecPtrListRemove, xmlSecPtrListRemoveAndReturn, xmlSecPtrListSet,
     xmlSecStringListGetKlass,
 };
+use std::cell::Cell;
 use std::ffi::{CStr, c_char, c_void};
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Items destroyed by [`COUNTING`].
-static DESTROYED: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    /// Items destroyed by [`COUNTING`] on this thread: each test runs on its
+    /// own thread, so the count is the test's own however tests overlap.
+    static DESTROYED: Cell<usize> = const { Cell::new(0) };
+}
 
 unsafe extern "C" fn count_destroy(_item: *mut c_void) {
-    DESTROYED.fetch_add(1, Ordering::Relaxed);
+    DESTROYED.with(|count| count.set(count.get() + 1));
+}
+
+/// The items [`COUNTING`] destroyed in this test.
+fn destroyed() -> usize {
+    DESTROYED.with(Cell::get)
 }
 
 /// A klass that records destruction and does not duplicate.
@@ -58,12 +66,12 @@ fn positions_and_ownership() {
         assert_eq!(xmlSecPtrListInsert(list, item(8), 100), 0);
         assert_eq!(items(list), [1, 9, 2, 3, 8]);
         assert_eq!(xmlSecPtrListRemove(list, 1), 0);
-        assert_eq!(DESTROYED.load(Ordering::Relaxed), 1);
+        assert_eq!(destroyed(), 1);
         assert_eq!(xmlSecPtrListRemoveAndReturn(list, 0).addr(), 1);
         assert_eq!(xmlSecPtrListPopLast(list).addr(), 8);
-        assert_eq!(DESTROYED.load(Ordering::Relaxed), 1);
+        assert_eq!(destroyed(), 1);
         assert_eq!(xmlSecPtrListSet(list, item(5), 0), 0);
-        assert_eq!(DESTROYED.load(Ordering::Relaxed), 2);
+        assert_eq!(destroyed(), 2);
         assert_eq!(items(list), [5, 3]);
         // Out-of-range positions are refused without touching items.
         assert!(xmlSecPtrListGetItem(list, 2).is_null());
@@ -71,7 +79,7 @@ fn positions_and_ownership() {
         assert_eq!(xmlSecPtrListRemove(list, 2), -1);
         assert!(xmlSecPtrListRemoveAndReturn(list, 2).is_null());
         xmlSecPtrListDestroy(list);
-        assert_eq!(DESTROYED.load(Ordering::Relaxed), 4);
+        assert_eq!(destroyed(), 4);
     }
 }
 
@@ -91,7 +99,7 @@ fn growth_keeps_items() {
         xmlSecPtrListEmpty(list);
         assert_eq!(((*list).used, (*list).max), (0, 0));
         assert!((*list).data.is_null());
-        assert_eq!(DESTROYED.load(Ordering::Relaxed), 200);
+        assert_eq!(destroyed(), 200);
         assert!(xmlSecPtrListPopLast(list).is_null());
         xmlSecPtrListDestroy(list);
     }

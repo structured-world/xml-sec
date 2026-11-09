@@ -1207,6 +1207,11 @@ pub(crate) unsafe extern "C" fn xmlSecTransformDefaultPushBin(
                 return -1;
             };
             let chunk = context.binary_chunk_size;
+            // A caller may write 0 into the public field; libxmlsec1 then never
+            // consumes the input and loops forever. Fail as the pump does.
+            if chunk == 0 {
+                return -1;
+            }
             let (mut data, mut remaining) = (data, size);
             loop {
                 if remaining > 0 {

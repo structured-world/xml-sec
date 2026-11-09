@@ -1,14 +1,16 @@
-//! `xmlsec/base64.h`: libxmlsec1's streaming Base64 codec.
+//! `xmlsec/base64.h`: libxmlsec1's streaming Base64 API over the core's
+//! [`Base64Codec`].
 //!
-//! The codec is a byte-at-a-time state machine with libxmlsec1's exact
-//! rules: line breaks after `columns` output characters (none for 0), `=`
-//! padding, whitespace skipped while decoding, and any character after the
-//! padding refused. The Base64 transform keeps one context in the object
-//! tail, so its layout matches libxmlsec1's and the klass reports the same
-//! object size.
+//! The codec and its rules live in the core; this module keeps
+//! `xmlSecBase64Ctx` in libxmlsec1's layout (the Base64 transform holds one
+//! in its object tail, so the klass reports the same object size), moves the
+//! state between that structure and the codec around each call, and adds the
+//! C conventions: failure values and the terminating NUL.
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::atomic::{AtomicI32, Ordering};
+
+use xml_sec::codec::Base64Codec;
 
 use super::{contain, free, malloc};
 
@@ -32,275 +34,79 @@ pub(crate) struct XmlSecBase64Ctx {
     finished: c_int,
 }
 
-const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+impl XmlSecBase64Ctx {
+    /// A context for `encode` with `columns` per line; `None` for a
+    /// negative line size.
+    fn new(encode: c_int, columns: c_int) -> Option<Self> {
+        Some(Self {
+            encode,
+            columns: usize::try_from(columns).ok()?,
+            in_byte: 0,
+            in_pos: 0,
+            line_pos: 0,
+            finished: 0,
+        })
+    }
 
-/// The outcome of one step of the state machine.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Status {
-    /// The input byte is used and an output byte written.
-    ConsumeAndNext,
-    /// An output byte is written; the same input byte is offered again.
-    ConsumeAndRepeat,
-    /// The input byte is used without output.
-    Next,
-    /// Nothing remains.
-    Done,
-    Failed,
-}
-
-fn is_space(byte: u8) -> bool {
-    matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
-}
-
-/// The 6-bit value of a Base64 character, `None` for any other byte.
-fn sextet(byte: u8) -> Option<u8> {
-    match byte {
-        b'A'..=b'Z' => Some(byte - b'A'),
-        b'a'..=b'z' => Some(26 + byte - b'a'),
-        b'0'..=b'9' => Some(52 + byte - b'0'),
-        b'+' => Some(62),
-        b'/' => Some(63),
-        _ => None,
-    }
-}
-
-/// The low byte of the carried value; libxmlsec1 stores a byte in an `int`.
-fn carried(ctx: &XmlSecBase64Ctx) -> u8 {
-    ctx.in_byte.to_le_bytes()[0]
-}
-
-fn encode_byte(ctx: &mut XmlSecBase64Ctx, input: u8, output: &mut u8) -> Status {
-    if ctx.columns > 0 && ctx.line_pos >= ctx.columns {
-        *output = b'\n';
-        ctx.line_pos = 0;
-        return Status::ConsumeAndRepeat;
-    }
-    let previous = carried(ctx);
-    let (value, next) = match ctx.in_pos {
-        0 => ((input >> 2) & 0x3f, Status::ConsumeAndNext),
-        1 => (
-            ((previous << 4) & 0x30) | ((input >> 4) & 0x0f),
-            Status::ConsumeAndNext,
-        ),
-        2 => (
-            ((previous << 2) & 0x3c) | ((input >> 6) & 0x03),
-            Status::ConsumeAndRepeat,
-        ),
-        3 => (previous & 0x3f, Status::ConsumeAndNext),
-        _ => return Status::Failed,
-    };
-    *output = ALPHABET[usize::from(value)];
-    ctx.line_pos += 1;
-    if ctx.in_pos == 3 {
-        ctx.in_byte = 0;
-        ctx.in_pos = 0;
-    } else {
-        ctx.in_byte = c_int::from(input);
-        ctx.in_pos += 1;
-    }
-    next
-}
-
-fn encode_byte_final(ctx: &mut XmlSecBase64Ctx, output: &mut u8) -> Status {
-    if ctx.in_pos == 0 {
-        return Status::Done;
-    }
-    if ctx.columns > 0 && ctx.line_pos >= ctx.columns {
-        *output = b'\n';
-        ctx.line_pos = 0;
-        return Status::ConsumeAndRepeat;
-    }
-    if ctx.finished == 0 {
-        ctx.finished = 1;
-        return encode_byte(ctx, 0, output);
-    }
-    match ctx.in_pos {
-        1 | 2 => {
-            *output = b'=';
-            ctx.in_pos += 1;
-            ctx.line_pos += 1;
-            Status::ConsumeAndRepeat
-        }
-        3 => {
-            *output = b'=';
-            ctx.line_pos += 1;
-            ctx.in_pos = 0;
-            Status::ConsumeAndRepeat
-        }
-        _ => Status::Failed,
-    }
-}
-
-fn decode_byte(ctx: &mut XmlSecBase64Ctx, input: u8, output: &mut u8) -> Status {
-    if ctx.finished != 0 && ctx.in_pos == 0 {
-        return Status::Done;
-    }
-    if input == b'=' {
-        ctx.finished = 1;
-        return match ctx.in_pos {
-            2 => {
-                ctx.in_pos += 1;
-                Status::Next
-            }
-            3 => {
-                ctx.in_pos = 0;
-                Status::Next
-            }
-            _ => Status::Failed,
-        };
-    }
-    if is_space(input) {
-        return Status::Next;
-    }
-    let Some(value) = sextet(input).filter(|_| ctx.finished == 0) else {
-        return Status::Failed;
-    };
-    let previous = carried(ctx);
-    match ctx.in_pos {
-        0 => {
-            ctx.in_byte = c_int::from(value);
-            ctx.in_pos += 1;
-            Status::Next
-        }
-        1 => {
-            *output = (previous << 2) | (value >> 4);
-            ctx.in_byte = c_int::from(value);
-            ctx.in_pos += 1;
-            Status::ConsumeAndNext
-        }
-        2 => {
-            *output = (previous << 4) | (value >> 2);
-            ctx.in_byte = c_int::from(value);
-            ctx.in_pos += 1;
-            Status::ConsumeAndNext
-        }
-        3 => {
-            *output = (previous << 6) | value;
-            ctx.in_byte = 0;
-            ctx.in_pos = 0;
-            Status::ConsumeAndNext
-        }
-        _ => Status::Failed,
-    }
-}
-
-/// Encodes `input` into `output`; the number of input bytes read and output
-/// bytes written, or `None` on failure.
-fn encode(ctx: &mut XmlSecBase64Ctx, input: &[u8], output: &mut [u8]) -> Option<(usize, usize)> {
-    let (mut read, mut written) = (0, 0);
-    while read < input.len() && written < output.len() {
-        match encode_byte(ctx, input[read], &mut output[written]) {
-            Status::ConsumeAndNext => {
-                read += 1;
-                written += 1;
-            }
-            Status::ConsumeAndRepeat => written += 1,
-            Status::Next | Status::Done | Status::Failed => return None,
+    /// The codec in the state this context holds.
+    fn codec(&self) -> Base64Codec {
+        Base64Codec {
+            encode: self.encode != 0,
+            columns: self.columns,
+            // libxmlsec1 keeps the carried byte in an `int`.
+            carry: self.in_byte.to_le_bytes()[0],
+            position: self.in_pos,
+            line_position: self.line_pos,
+            finished: self.finished != 0,
         }
     }
-    Some((read, written))
-}
 
-/// Writes the final characters and padding; the bytes written, or `None`
-/// when the output is too small or the state is invalid.
-fn encode_final(ctx: &mut XmlSecBase64Ctx, output: &mut [u8]) -> Option<usize> {
-    let mut written = 0;
-    let mut status = Status::Next;
-    while written < output.len() && status != Status::Done {
-        status = encode_byte_final(ctx, &mut output[written]);
-        match status {
-            Status::ConsumeAndNext | Status::ConsumeAndRepeat => written += 1,
-            Status::Done => {}
-            Status::Next | Status::Failed => return None,
-        }
+    /// Stores the codec's state back.
+    fn store(&mut self, codec: &Base64Codec) {
+        self.in_byte = c_int::from(codec.carry);
+        self.in_pos = codec.position;
+        self.line_pos = codec.line_position;
+        self.finished = c_int::from(codec.finished);
     }
-    if status != Status::Done {
-        return None;
-    }
-    if written < output.len() {
-        output[written] = 0;
-    }
-    Some(written)
-}
-
-/// Decodes `input` into `output`, then skips trailing whitespace; the input
-/// bytes read and output bytes written, or `None` on failure.
-fn decode(ctx: &mut XmlSecBase64Ctx, input: &[u8], output: &mut [u8]) -> Option<(usize, usize)> {
-    let (mut read, mut written) = (0, 0);
-    let mut status = Status::Next;
-    while read < input.len() && written < output.len() && status != Status::Done {
-        status = decode_byte(ctx, input[read], &mut output[written]);
-        match status {
-            Status::ConsumeAndNext => {
-                read += 1;
-                written += 1;
-            }
-            Status::ConsumeAndRepeat => written += 1,
-            Status::Next => read += 1,
-            Status::Done => {}
-            Status::Failed => return None,
-        }
-    }
-    while read < input.len() && is_space(input[read]) {
-        read += 1;
-    }
-    Some((read, written))
 }
 
 /// The output size libxmlsec1 reserves to encode `size` bytes.
 pub(crate) fn encode_size(columns: usize, size: usize) -> Option<usize> {
-    let mut total = size.checked_mul(4)? / 3 + 4;
-    if let Some(breaks) = total.checked_div(columns) {
-        total = total.checked_add(breaks)?.checked_add(4)?;
-    }
-    total.checked_add(1)
+    Base64Codec::encoded_capacity(columns, size)
 }
 
 /// The output size libxmlsec1 reserves to decode `size` characters.
 pub(crate) fn decode_size(size: usize) -> Option<usize> {
-    size.checked_mul(3).map(|bytes| bytes / 4 + 8)
+    Base64Codec::decoded_capacity(size)
 }
 
 /// Initializes `ctx` for `encode` with `columns` per line; `None` for a
 /// negative line size.
 pub(crate) fn initialize(ctx: &mut XmlSecBase64Ctx, encode: c_int, columns: c_int) -> Option<()> {
-    *ctx = XmlSecBase64Ctx {
-        encode,
-        columns: usize::try_from(columns).ok()?,
-        in_byte: 0,
-        in_pos: 0,
-        line_pos: 0,
-        finished: 0,
-    };
+    *ctx = XmlSecBase64Ctx::new(encode, columns)?;
     Some(())
 }
 
 /// Encodes or decodes all of `input`; the bytes written, or `None` when the
 /// input fails or does not fit.
 pub(crate) fn update(ctx: &mut XmlSecBase64Ctx, input: &[u8], output: &mut [u8]) -> Option<usize> {
-    let (read, written) = if ctx.encode != 0 {
-        encode(ctx, input, output)?
-    } else {
-        decode(ctx, input, output)?
-    };
-    (read == input.len()).then_some(written)
+    let mut codec = ctx.codec();
+    let result = codec.update(input, output);
+    ctx.store(&codec);
+    result.ok()
 }
 
 /// Finishes the stream; the bytes written, or `None` when output does not
-/// fit or decoding stopped inside a group. A NUL follows when room remains.
+/// fit or decoding stopped inside a group. As libxmlsec1 does, a NUL follows
+/// the encoded characters when room remains, and the decoder writes one when
+/// more than one byte of room remains.
 pub(crate) fn finish(ctx: &mut XmlSecBase64Ctx, output: &mut [u8]) -> Option<usize> {
-    if output.is_empty() {
-        return None;
-    }
-    let written = if ctx.encode != 0 {
-        encode_final(ctx, output)?
-    } else {
-        if ctx.in_pos != 0 {
-            return None;
-        }
-        0
-    };
-    if written + 1 < output.len() {
+    let mut codec = ctx.codec();
+    let result = codec.finish(output);
+    ctx.store(&codec);
+    let written = result.ok()?;
+    let room = if codec.encode { written } else { written + 1 };
+    if room < output.len() {
         output[written] = 0;
     }
     Some(written)
@@ -510,17 +316,9 @@ pub(crate) unsafe extern "C" fn xmlSecBase64Encode(
         if input.is_null() {
             return std::ptr::null_mut();
         }
-        let mut ctx = XmlSecBase64Ctx {
-            encode: 1,
-            columns: 0,
-            in_byte: 0,
-            in_pos: 0,
-            line_pos: 0,
-            finished: 0,
-        };
-        if initialize(&mut ctx, 1, columns).is_none() {
+        let Some(mut ctx) = XmlSecBase64Ctx::new(1, columns) else {
             return std::ptr::null_mut();
-        }
+        };
         let Some(size) = encode_size(ctx.columns, in_size) else {
             return std::ptr::null_mut();
         };
@@ -568,13 +366,8 @@ pub(crate) unsafe extern "C" fn xmlSecBase64Decode_ex(
         let input = unsafe { CStr::from_ptr(text.cast::<c_char>()) }
             .to_bytes()
             .to_vec();
-        let mut ctx = XmlSecBase64Ctx {
-            encode: 0,
-            columns: 0,
-            in_byte: 0,
-            in_pos: 0,
-            line_pos: 0,
-            finished: 0,
+        let Some(mut ctx) = XmlSecBase64Ctx::new(0, 0) else {
+            return -1;
         };
         // SAFETY: `out` is writable for `out_size` bytes.
         let output = unsafe { out_slice(out, out_size) };

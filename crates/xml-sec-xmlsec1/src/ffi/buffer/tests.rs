@@ -108,6 +108,20 @@ fn append_and_prepend_grow_by_the_mode() {
 /// initialized after it is set.
 #[test]
 fn default_mode_applies_to_new_buffers() {
+    /// Puts the process-wide defaults back when the test ends, also by panic.
+    /// The test runner gives each test its own process, so no other test
+    /// observes the change while it is in place.
+    struct Restore(i32, usize);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            super::DEFAULT_ALLOC_MODE.store(self.0, std::sync::atomic::Ordering::Relaxed);
+            super::DEFAULT_INITIAL_SIZE.store(self.1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let _restore = Restore(
+        super::DEFAULT_ALLOC_MODE.load(std::sync::atomic::Ordering::Relaxed),
+        super::DEFAULT_INITIAL_SIZE.load(std::sync::atomic::Ordering::Relaxed),
+    );
     // SAFETY: setting the defaults is always allowed.
     unsafe { xmlSecBufferSetDefaultAllocMode(ALLOC_MODE_EXACT, 16) };
     let buf = Buffer::new(100);

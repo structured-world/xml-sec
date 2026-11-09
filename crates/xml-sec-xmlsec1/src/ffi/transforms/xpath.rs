@@ -3,16 +3,17 @@
 //! Each transform keeps libxmlsec1's list of expressions with the node-set
 //! type and operation of each. Executing it evaluates every expression with
 //! the core's `XPath` engine over the caller's tree, turns the result into a
-//! node set of that tree's nodes and combines it with the input as libxmlsec1
-//! does, so the combination keeps the donor's node-set algebra.
+//! node set of that tree's nodes and combines it with the input through the
+//! donor's node-set algebra; Filter 2.0 output is the input intersected with
+//! the filter, as its specification requires.
 
 use std::ffi::{CStr, c_int, c_void};
 
 use xml_sec::XmlDocument;
 use xml_sec::document::external::ExternalNode;
-use xml_sec::xmldsig::select::{SelectedNode, XPathForm, select_xpath, select_xpointer};
+use xml_sec::xmldsig::select::{SelectedNode, Selector, XPathForm};
 use xml_sec::xmldsig::transforms::XPathExpression;
-use xml_sec_libxml2::ffi::{LibxmlTree, XmlAttr, XmlDoc, XmlNode, XmlNodeSet};
+use xml_sec_libxml2::ffi::{LibxmlTree, XML_NAMESPACE_DECL, XmlAttr, XmlDoc, XmlNode, XmlNodeSet};
 
 use super::super::list::{
     XmlSecPtrList, XmlSecPtrListKlass, xmlSecPtrListAdd, xmlSecPtrListFinalize,
@@ -20,7 +21,8 @@ use super::super::list::{
 };
 use super::super::nodeset::{
     INTERSECTION, NORMAL, SUBTRACTION, TREE, TREE_WITHOUT_COMMENTS, UNION, XmlSecNodeSet,
-    xmlSecNodeSetAdd, xmlSecNodeSetCreate, xmlSecNodeSetDestroy,
+    xmlSecNodeSetAdd, xmlSecNodeSetCreate, xmlSecNodeSetDestroy, xmlSecNodeSetGetChildren,
+    xmlSecNodeSetWalk,
 };
 use super::super::strings::{
     xmlSecAttrFilter, xmlSecDSigNs, xmlSecNameXPath, xmlSecNameXPath2, xmlSecNameXPointer,
@@ -39,6 +41,9 @@ use super::{
     USAGE_DSIG_TRANSFORM, WithContext, XmlSecTransform, XmlSecTransformCtx, XmlSecTransformKlass,
     context, valid, xmlSecTransformDefaultPopXml, xmlSecTransformDefaultPushXml,
 };
+
+#[cfg(test)]
+mod tests;
 
 /// libxml2's element node type.
 const ELEMENT_NODE: c_int = 1;
@@ -536,62 +541,34 @@ unsafe fn node_set(doc: *mut XmlDoc, selected: &[SelectedNode<'_>]) -> Option<*m
     }
 }
 
-/// Evaluates `data` over `document`, the projection of `doc`, at `here`.
+/// Evaluates `data` through `selector`, whose document projects `doc`.
 ///
 /// # Safety
-/// `doc` is the live document `document` projects.
+/// `doc` is the live document the selector's view projects.
 unsafe fn evaluate(
     data: &Data,
     doc: *mut XmlDoc,
-    document: &XmlDocument,
-    here: Option<ExternalNode>,
+    selector: &Selector<'_, '_>,
 ) -> Option<*mut XmlSecNodeSet> {
-    let policy = policy::verification()?;
-    let selected = document
-        .with_view(|view| {
-            let mut expression = XPathExpression::new(data.expression.as_str());
-            for (prefix, uri) in &data.namespaces {
-                expression = expression.with_namespace(prefix.as_str(), uri.as_str());
-            }
-            match data.kind {
-                Kind::XPath => select_xpath(
-                    view,
-                    &expression,
-                    here,
-                    XPathForm::EachNode,
-                    &[],
-                    &policy.resources,
-                ),
-                Kind::XPath2 => select_xpath(
-                    view,
-                    &expression,
-                    here,
-                    XPathForm::NodeSet,
-                    &[],
-                    &policy.resources,
-                ),
-                Kind::XPointer => {
-                    let namespaces: Vec<(&str, &str)> = data
-                        .namespaces
-                        .iter()
-                        .map(|(prefix, uri)| (prefix.as_str(), uri.as_str()))
-                        .collect();
-                    select_xpointer(
-                        view,
-                        &data.expression,
-                        &namespaces,
-                        here,
-                        &[],
-                        &policy.resources,
-                    )
-                }
-            }
-            .map(|nodes| {
-                // SAFETY: the selected nodes are nodes of `doc`.
-                unsafe { node_set(doc, &nodes) }
-            })
-        })
-        .ok()??;
+    let mut expression = XPathExpression::new(data.expression.as_str());
+    for (prefix, uri) in &data.namespaces {
+        expression = expression.with_namespace(prefix.as_str(), uri.as_str());
+    }
+    let nodes = match data.kind {
+        Kind::XPath => selector.xpath(&expression, XPathForm::EachNode),
+        Kind::XPath2 => selector.xpath(&expression, XPathForm::NodeSet),
+        Kind::XPointer => {
+            let namespaces: Vec<(&str, &str)> = data
+                .namespaces
+                .iter()
+                .map(|(prefix, uri)| (prefix.as_str(), uri.as_str()))
+                .collect();
+            selector.xpointer(&data.expression, &namespaces)
+        }
+    }
+    .ok()?;
+    // SAFETY: the selected nodes are nodes of `doc`.
+    let selected = unsafe { node_set(doc, &nodes) }?;
     // SAFETY: the node set is the caller's to give up.
     let nodes = unsafe { xmlSecNodeSetCreate(doc, selected, data.node_set_type) };
     if nodes.is_null() {
@@ -645,27 +622,147 @@ unsafe extern "C" fn execute(
         let here = ((*object.here_node).doc == doc)
             .then(|| ExternalNode(object.here_node.expose_provenance() as u64));
         let input = object.in_nodes;
-        let mut result = input;
-        for position in 0..xmlSecPtrListGetSize(expressions) {
-            let data = &*xmlSecPtrListGetItem(expressions, position).cast::<Data>();
-            let Some(nodes) = evaluate(data, doc, &document, here) else {
-                if result != input {
+        let items: Vec<&Data> = (0..xmlSecPtrListGetSize(expressions))
+            .map(|position| &*xmlSecPtrListGetItem(expressions, position).cast::<Data>())
+            .collect();
+        // One selector for the whole transform: its expressions charge the
+        // same budgets.
+        let output = document.with_view(|view| {
+            let selector = Selector::new(view, here, &[], &policy.resources).ok()?;
+            // The input is a live set over `doc`, which the view projects.
+            combined_output(input, &items, doc, &selector)
+        });
+        match output {
+            Some(result) => {
+                object.out_nodes = result;
+                0
+            }
+            None => -1,
+        }
+    }
+}
+
+/// The transform's output for `input`.
+///
+/// # Safety
+/// `input` is null or a live node set over `doc`, which the selector's view
+/// projects.
+unsafe fn combined_output(
+    input: *mut XmlSecNodeSet,
+    items: &[&Data],
+    doc: *mut XmlDoc,
+    selector: &Selector<'_, '_>,
+) -> Option<*mut XmlSecNodeSet> {
+    let filter2 = items.iter().any(|data| data.kind == Kind::XPath2);
+    // XPath Filter 2.0 section 3.4: the filter starts from the whole
+    // document, O = I INTERSECT F. Folding the operations into the input
+    // directly computes the same set for intersect and subtract, but a
+    // union would add nodes outside I, and with no input the first
+    // operation would apply to nothing; libxmlsec1 does both.
+    if !(filter2 && (input.is_null() || items.iter().any(|data| data.op == UNION))) {
+        // SAFETY: by the caller's contract.
+        return unsafe { combine(input, input, items, doc, selector) };
+    }
+    // SAFETY: by the caller's contract; every set made here is released on
+    // failure.
+    unsafe {
+        let whole = xmlSecNodeSetGetChildren(doc, std::ptr::null_mut(), 1, 0);
+        let filter = combine(whole, std::ptr::null_mut(), items, doc, selector)?;
+        if input.is_null() {
+            return Some(filter);
+        }
+        let explicit = materialize(filter, doc);
+        xmlSecNodeSetDestroy(filter);
+        let explicit = explicit?;
+        let output = xmlSecNodeSetAdd(input, explicit, INTERSECTION);
+        if output.is_null() {
+            xmlSecNodeSetDestroy(explicit);
+            return None;
+        }
+        Some(output)
+    }
+}
+
+/// `start` combined with each expression's node set by its operation; on
+/// failure every set but `kept` (the caller's input) is destroyed.
+///
+/// # Safety
+/// `start` is null or a live node set over `doc`, which the selector's view
+/// projects.
+unsafe fn combine(
+    start: *mut XmlSecNodeSet,
+    kept: *mut XmlSecNodeSet,
+    items: &[&Data],
+    doc: *mut XmlDoc,
+    selector: &Selector<'_, '_>,
+) -> Option<*mut XmlSecNodeSet> {
+    let mut result = start;
+    // SAFETY: by the caller's contract; failed sets are released here.
+    unsafe {
+        if result.is_null() && start != kept {
+            return None;
+        }
+        for data in items {
+            let Some(nodes) = evaluate(data, doc, selector) else {
+                if result != kept {
                     xmlSecNodeSetDestroy(result);
                 }
-                return -1;
+                return None;
             };
             let combined = xmlSecNodeSetAdd(result, nodes, data.op);
             if combined.is_null() {
-                if result != input {
+                if result != kept {
                     xmlSecNodeSetDestroy(result);
                 }
                 xmlSecNodeSetDestroy(nodes);
-                return -1;
+                return None;
             }
             result = combined;
         }
-        object.out_nodes = result;
-        0
+    }
+    Some(result)
+}
+
+/// Adds each visited node to the `XPath` node set in `data`; a namespace
+/// node is added for its element, as libxml2 represents it.
+unsafe extern "C" fn collect(
+    _set: *mut XmlSecNodeSet,
+    node: *mut XmlNode,
+    parent: *mut XmlNode,
+    data: *mut c_void,
+) -> c_int {
+    // SAFETY: the walk passes live nodes and the set `materialize` owns.
+    unsafe {
+        let set = data.cast::<XmlNodeSet>();
+        if (*node).kind == XML_NAMESPACE_DECL {
+            xmlXPathNodeSetAddNs(set, parent, node.cast())
+        } else {
+            xmlXPathNodeSetAdd(set, node)
+        }
+    }
+}
+
+/// A normal node set listing exactly the nodes `set` contains.
+///
+/// # Safety
+/// `set` is a live node set over the live document `doc`.
+unsafe fn materialize(set: *mut XmlSecNodeSet, doc: *mut XmlDoc) -> Option<*mut XmlSecNodeSet> {
+    // SAFETY: by the caller's contract; the XPath set is freed on failure.
+    unsafe {
+        let nodes = xmlXPathNodeSetCreate(std::ptr::null_mut());
+        if nodes.is_null() {
+            return None;
+        }
+        if xmlSecNodeSetWalk(set, Some(collect), nodes.cast()) < 0 {
+            xmlXPathFreeNodeSet(nodes);
+            return None;
+        }
+        let explicit = xmlSecNodeSetCreate(doc, nodes, NORMAL);
+        if explicit.is_null() {
+            xmlXPathFreeNodeSet(nodes);
+            return None;
+        }
+        Some(explicit)
     }
 }
 

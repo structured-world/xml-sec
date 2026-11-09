@@ -122,64 +122,180 @@ pub fn select_xpath<'a>(
     registrations: &[IdAttributeRegistration],
     resources: &crate::policy::ResourcePolicy,
 ) -> Result<Vec<SelectedNode<'a>>, TransformError> {
-    let document = view.document();
-    let here = match here {
-        Some(external) => Some(
-            view.node_of_external(external)
-                .ok_or(TransformError::CrossDocumentNodeSetInput)?
-                .id(),
-        ),
-        None => None,
-    };
-    let materialization = NodeSetMaterializationBudget::with_limits(
-        resources.max_node_set_entries,
-        resources.max_node_set_owned_string_bytes,
-        resources.max_node_set_cumulative_owned_string_bytes,
-    );
-    let input = NodeSet::projected(document.root(), true, Some(&materialization))?;
-    let selected = select_projection(
-        &input.projection,
-        &Located { expression, here },
-        matches!(form, XPathForm::EachNode),
-        XPathRequestContext::new(XPathHereSemantics::default(), registrations),
-        &XPathWorkBudget::with_limits(resources),
-        &materialization,
-    )?;
-    let selected = NodeSet {
-        projection: selected,
-    };
-    let external = |node| {
-        view.external_node_of(node)
-            .ok_or(TransformError::CrossDocumentNodeSetInput)
-    };
-    let mut nodes = Vec::new();
-    for node in document.root().descendants() {
-        if selected.contains(node) {
-            nodes.push(SelectedNode::Node(external(node)?));
-        }
-        if !node.is_element() {
-            continue;
-        }
-        for namespace in node.namespaces() {
-            if selected.contains_namespace(node, namespace.name().unwrap_or(""), namespace.uri()) {
-                nodes.push(SelectedNode::Namespace {
-                    owner: external(node)?,
-                    prefix: namespace.name(),
-                    uri: namespace.uri(),
-                });
-            }
-        }
-        for attribute in node.attributes() {
-            if selected.contains_attribute(node, attribute.namespace(), attribute.name()) {
-                nodes.push(SelectedNode::Attribute {
-                    owner: external(node)?,
-                    namespace: attribute.namespace(),
-                    local_name: attribute.name(),
-                });
-            }
-        }
+    Selector::new(view, here, registrations, resources)?.xpath(expression, form)
+}
+
+/// One selection request over a tree-backed document: its projection, the
+/// `here()` node, the ID registrations and the resource budgets that every
+/// expression evaluated through it charges together, so a request made of
+/// several expressions (a Filter 2.0 transform, an `XPointer` of several
+/// parts) is bound as a whole.
+pub struct Selector<'a, 'r> {
+    view: crate::DocumentView<'a>,
+    input: NodeSet<'a>,
+    here: Option<NodeId>,
+    registrations: &'r [IdAttributeRegistration],
+    work: XPathWorkBudget,
+    materialization: NodeSetMaterializationBudget,
+}
+
+impl<'a, 'r> Selector<'a, 'r> {
+    /// A request over the document of `view`; `here`, `registrations` and
+    /// `resources` are as for [`select_xpath`].
+    ///
+    /// # Errors
+    /// A `here` node outside the document, or a document larger than the
+    /// node-set limits of `resources`.
+    pub fn new(
+        view: crate::DocumentView<'a>,
+        here: Option<ExternalNode>,
+        registrations: &'r [IdAttributeRegistration],
+        resources: &crate::policy::ResourcePolicy,
+    ) -> Result<Self, TransformError> {
+        let here = match here {
+            Some(external) => Some(
+                view.node_of_external(external)
+                    .ok_or(TransformError::CrossDocumentNodeSetInput)?
+                    .id(),
+            ),
+            None => None,
+        };
+        let materialization = NodeSetMaterializationBudget::with_limits(
+            resources.max_node_set_entries,
+            resources.max_node_set_owned_string_bytes,
+            resources.max_node_set_cumulative_owned_string_bytes,
+        );
+        let input = NodeSet::projected(view.document().root(), true, Some(&materialization))?;
+        Ok(Self {
+            view,
+            input,
+            here,
+            registrations,
+            work: XPathWorkBudget::with_limits(resources),
+            materialization,
+        })
     }
-    Ok(nodes)
+
+    /// Evaluate `expression` as [`select_xpath`] does, charging this
+    /// request's budgets.
+    ///
+    /// # Errors
+    /// As [`select_xpath`].
+    pub fn xpath(
+        &self,
+        expression: &XPathExpression,
+        form: XPathForm,
+    ) -> Result<Vec<SelectedNode<'a>>, TransformError> {
+        let (view, here) = (self.view, self.here);
+        let document = view.document();
+        let selected = select_projection(
+            &self.input.projection,
+            &Located { expression, here },
+            matches!(form, XPathForm::EachNode),
+            XPathRequestContext::new(XPathHereSemantics::default(), self.registrations),
+            &self.work,
+            &self.materialization,
+        )?;
+        let selected = NodeSet {
+            projection: selected,
+        };
+        let external = |node| {
+            view.external_node_of(node)
+                .ok_or(TransformError::CrossDocumentNodeSetInput)
+        };
+        let mut nodes = Vec::new();
+        for node in document.root().descendants() {
+            if selected.contains(node) {
+                nodes.push(SelectedNode::Node(external(node)?));
+            }
+            if !node.is_element() {
+                continue;
+            }
+            for namespace in node.namespaces() {
+                if selected.contains_namespace(
+                    node,
+                    namespace.name().unwrap_or(""),
+                    namespace.uri(),
+                ) {
+                    nodes.push(SelectedNode::Namespace {
+                        owner: external(node)?,
+                        prefix: namespace.name(),
+                        uri: namespace.uri(),
+                    });
+                }
+            }
+            for attribute in node.attributes() {
+                if selected.contains_attribute(node, attribute.namespace(), attribute.name()) {
+                    nodes.push(SelectedNode::Attribute {
+                        owner: external(node)?,
+                        namespace: attribute.namespace(),
+                        local_name: attribute.name(),
+                    });
+                }
+            }
+        }
+        Ok(nodes)
+    }
+
+    /// Evaluate `pointer` as [`select_xpointer`] does; every part charges
+    /// this request's budgets, so repeated parts cannot multiply the work.
+    ///
+    /// # Errors
+    /// As [`select_xpointer`].
+    pub fn xpointer(
+        &self,
+        pointer: &str,
+        namespaces: &[(&str, &str)],
+    ) -> Result<Vec<SelectedNode<'a>>, TransformError> {
+        let invalid = || TransformError::XPath("invalid XPointer".into());
+        let nothing = || TransformError::XPath("the XPointer identifies nothing".into());
+        let mut bindings = XPathExpression::new("");
+        for (prefix, uri) in namespaces {
+            bindings = bindings.with_namespace(*prefix, *uri);
+        }
+        let pointer = pointer.trim_matches(is_xml_space);
+        if is_ncname(pointer) {
+            // An NCName holds no quote, so the literal is always well formed.
+            let expression = XPathExpression::new(alloc::format!("id('{pointer}')"));
+            let nodes = self.xpath(&expression, XPathForm::NodeSet)?;
+            return if nodes.is_empty() {
+                Err(nothing())
+            } else {
+                Ok(nodes)
+            };
+        }
+        let mut rest = pointer;
+        while !rest.is_empty() {
+            let open = rest.find('(').ok_or_else(invalid)?;
+            let scheme = &rest[..open];
+            let (data, after) = scheme_data(&rest[open + 1..]).ok_or_else(invalid)?;
+            rest = after.trim_start_matches(is_xml_space);
+            let expression = match scheme {
+                "xmlns" => {
+                    let (prefix, uri) = data.split_once('=').ok_or_else(invalid)?;
+                    let prefix = prefix.trim_matches(is_xml_space);
+                    if !is_ncname(prefix) {
+                        return Err(invalid());
+                    }
+                    bindings = bindings.with_namespace(prefix, uri.trim_matches(is_xml_space));
+                    continue;
+                }
+                "xpointer" => data,
+                "element" => element_path(&data).ok_or_else(invalid)?,
+                _ if is_qname(scheme) => continue,
+                _ => return Err(invalid()),
+            };
+            let mut part = XPathExpression::new(expression);
+            for (prefix, uri) in bindings.namespaces() {
+                part = part.with_namespace(prefix.as_str(), uri.as_str());
+            }
+            let nodes = self.xpath(&part, XPathForm::NodeSet)?;
+            if !nodes.is_empty() {
+                return Ok(nodes);
+            }
+        }
+        Err(nothing())
+    }
 }
 
 /// Evaluate an `XPointer` over the document of `view` (`XPointer` Framework
@@ -253,68 +369,7 @@ pub fn select_xpointer<'a>(
     registrations: &[IdAttributeRegistration],
     resources: &crate::policy::ResourcePolicy,
 ) -> Result<Vec<SelectedNode<'a>>, TransformError> {
-    let invalid = || TransformError::XPath("invalid XPointer".into());
-    let nothing = || TransformError::XPath("the XPointer identifies nothing".into());
-    let mut bindings = XPathExpression::new("");
-    for (prefix, uri) in namespaces {
-        bindings = bindings.with_namespace(*prefix, *uri);
-    }
-    let pointer = pointer.trim_matches(is_xml_space);
-    if is_ncname(pointer) {
-        // An NCName holds no quote, so the literal is always well formed.
-        let expression = XPathExpression::new(alloc::format!("id('{pointer}')"));
-        let nodes = select_xpath(
-            view,
-            &expression,
-            here,
-            XPathForm::NodeSet,
-            registrations,
-            resources,
-        )?;
-        return if nodes.is_empty() {
-            Err(nothing())
-        } else {
-            Ok(nodes)
-        };
-    }
-    let mut rest = pointer;
-    while !rest.is_empty() {
-        let open = rest.find('(').ok_or_else(invalid)?;
-        let scheme = &rest[..open];
-        let (data, after) = scheme_data(&rest[open + 1..]).ok_or_else(invalid)?;
-        rest = after.trim_start_matches(is_xml_space);
-        let expression = match scheme {
-            "xmlns" => {
-                let (prefix, uri) = data.split_once('=').ok_or_else(invalid)?;
-                let prefix = prefix.trim_matches(is_xml_space);
-                if !is_ncname(prefix) {
-                    return Err(invalid());
-                }
-                bindings = bindings.with_namespace(prefix, uri.trim_matches(is_xml_space));
-                continue;
-            }
-            "xpointer" => data,
-            "element" => element_path(&data).ok_or_else(invalid)?,
-            _ if is_qname(scheme) => continue,
-            _ => return Err(invalid()),
-        };
-        let mut part = XPathExpression::new(expression);
-        for (prefix, uri) in bindings.namespaces() {
-            part = part.with_namespace(prefix.as_str(), uri.as_str());
-        }
-        let nodes = select_xpath(
-            view,
-            &part,
-            here,
-            XPathForm::NodeSet,
-            registrations,
-            resources,
-        )?;
-        if !nodes.is_empty() {
-            return Ok(nodes);
-        }
-    }
-    Err(nothing())
+    Selector::new(view, here, registrations, resources)?.xpointer(pointer, namespaces)
 }
 
 /// Unescaped scheme data up to its balancing `)`, and the text after it

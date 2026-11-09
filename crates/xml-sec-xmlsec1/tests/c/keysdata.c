@@ -151,6 +151,7 @@ int main(void) {
     xmlSecByte *written = (xmlSecByte *)"x";
     xmlSecSize writtenSize = 1;
     int dummy = 0;
+    int ret;
 
     printf("ids init: %d\n", xmlSecKeyDataIdsInit());
     xmlSecKeyDataIdListDebugDump(xmlSecKeyDataIdsGet(), stdout);
@@ -188,22 +189,25 @@ int main(void) {
     data = xmlSecKeyDataCreate(&binaryKlass);
     printf("create: %d initialize=%d valid=%d id=%d\n", data != NULL, calls_initialize,
            xmlSecKeyDataIsValid(data), xmlSecKeyDataCheckId(data, &binaryKlass));
-    printf("generate: %d size=%d type=%u\n", xmlSecKeyDataGenerate(data, 128, xmlSecKeyDataTypeSession),
-           (int)xmlSecKeyDataGetSize(data), xmlSecKeyDataGetType(data));
+    /* every state-changing call runs before the values that depend on it */
+    ret = xmlSecKeyDataGenerate(data, 128, xmlSecKeyDataTypeSession);
+    printf("generate: %d size=%d type=%u\n", ret, (int)xmlSecKeyDataGetSize(data), xmlSecKeyDataGetType(data));
     printf("generate too big: %d\n", xmlSecKeyDataGenerate(data, 4096, xmlSecKeyDataTypeSession));
     xmlSecKeyDataDebugDump(data, stdout);
     xmlSecKeyDataDebugXmlDump(data, stdout);
     copy = xmlSecKeyDataDuplicate(data);
     printf("duplicate: %d size=%d initialize=%d\n", copy != NULL, (int)xmlSecKeyDataBinaryValueGetSize(copy),
            calls_initialize);
-    printf("set buffer: %d %d size=%d\n", xmlSecKeyDataBinaryValueSetBuffer(copy, BAD_CAST "abc", 3),
-           xmlSecKeyDataBinaryValueSetBuffer(copy, BAD_CAST "abc", 0), (int)xmlSecKeyDataGetSize(copy));
+    ret = xmlSecKeyDataBinaryValueSetBuffer(copy, BAD_CAST "abc", 3);
+    printf("set buffer: %d", ret);
+    ret = xmlSecKeyDataBinaryValueSetBuffer(copy, BAD_CAST "abc", 0);
+    printf(" %d size=%d\n", ret, (int)xmlSecKeyDataGetSize(copy));
     printf("xml read: %d\n", xmlSecKeyDataXmlRead(&binaryKlass, (xmlSecKeyPtr)&dummy, (xmlNodePtr)&dummy, NULL));
     printf("xml read without key: %d\n", xmlSecKeyDataXmlRead(&binaryKlass, NULL, (xmlNodePtr)&dummy, NULL));
     printf("xml write missing: %d\n", xmlSecKeyDataXmlWrite(&binaryKlass, (xmlSecKeyPtr)&dummy, (xmlNodePtr)&dummy, NULL));
     printf("bin read missing: %d\n", xmlSecKeyDataBinRead(&binaryKlass, (xmlSecKeyPtr)&dummy, BAD_CAST "x", 1, NULL));
-    printf("bin write: %d size=%d\n", xmlSecKeyDataBinWrite(&binaryKlass, (xmlSecKeyPtr)&dummy, &written, &writtenSize, NULL),
-           (int)writtenSize);
+    ret = xmlSecKeyDataBinWrite(&binaryKlass, (xmlSecKeyPtr)&dummy, &written, &writtenSize, NULL);
+    printf("bin write: %d size=%d\n", ret, (int)writtenSize);
 
     /* a list owning key data: duplicates through the klass, dumps, frees */
     list = xmlSecPtrListCreate(xmlSecKeyDataListId);

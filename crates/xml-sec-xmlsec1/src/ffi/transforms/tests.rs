@@ -91,6 +91,45 @@ fn binary_chain_encodes_base64() {
     }
 }
 
+/// Base64 first in a chain receives the text of the input node set, not its
+/// canonical XML (`XMLDSig` 1.1 section 6.6.2), as it does after a node-set
+/// transform.
+#[test]
+fn base64_first_decodes_the_text_of_xml_input() {
+    let xml = b"<r>Zm9v<s>YmFy</s></r>";
+    // SAFETY: the document, node set and context are used while live.
+    unsafe {
+        let doc = crate::ffi::parser::xmlSecParseMemory(xml.as_ptr(), xml.len(), 0);
+        assert!(!doc.is_null());
+        let nodes = crate::ffi::nodeset::xmlSecNodeSetGetChildren(doc, std::ptr::null_mut(), 1, 0);
+        let ctx = xmlSecTransformCtxCreate();
+        assert!(!xmlSecTransformCtxCreateAndAppend(ctx, base64()).is_null());
+        assert_eq!(super::ctx::xmlSecTransformCtxXmlExecute(ctx, nodes), 0);
+        let result = (*ctx).result;
+        let text =
+            std::slice::from_raw_parts(xmlSecBufferGetData(result), xmlSecBufferGetSize(result));
+        assert_eq!(text, b"foobar");
+        xmlSecTransformCtxDestroy(ctx);
+        crate::ffi::nodeset::xmlSecNodeSetDestroy(nodes);
+        crate::ffi::tree::xmlFreeDoc(doc);
+    }
+}
+
+/// A chunk size of 0, written by a caller into the public context field,
+/// fails the push instead of appending nothing forever.
+#[test]
+fn zero_chunk_size_fails_the_default_push() {
+    // SAFETY: the context and its transform are used while live.
+    unsafe {
+        let ctx = xmlSecTransformCtxCreate();
+        let transform = xmlSecTransformCtxCreateAndAppend(ctx, base64());
+        (*ctx).binary_chunk_size = 0;
+        let pushed = super::xmlSecTransformDefaultPushBin(transform, b"Zm9v".as_ptr(), 4, 1, ctx);
+        assert_eq!(pushed, -1);
+        xmlSecTransformCtxDestroy(ctx);
+    }
+}
+
 /// The library's policy runs the core's OPC relationship transform: the
 /// selected relationships, sorted by Id, with the default `TargetMode` and
 /// without comments (ISO/IEC 29500-2 section 13.2.4.24, step 3), where

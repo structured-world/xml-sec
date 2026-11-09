@@ -3,6 +3,9 @@
  * unmodified against the pinned libxmlsec1 and against this crate, both must
  * print the same documents, results and statuses. */
 
+/* mkstemp, write, close and unlink are POSIX, hidden by a strict -std=c99 */
+#define _POSIX_C_SOURCE 200809L
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -70,7 +73,9 @@ int main(void) {
     int options = xmlSecParserGetDefaultOptions();
 
     printf("ids init: %d\n", xmlSecTransformIdsInit());
-    printf("options nonet: %d noent: %d\n", (options & XML_PARSE_NONET) != 0, (options & XML_PARSE_NOENT) != 0);
+    /* Entity options are left out: before libxml2 2.13 this library keeps
+     * external entities off, where libxmlsec1 loads them. */
+    printf("options nonet: %d\n", (options & XML_PARSE_NONET) != 0);
 
     doc_line("memory", xmlSecParseMemory(BAD_CAST good, strlen(good), 0));
     doc_line("malformed", xmlSecParseMemory(BAD_CAST bad, strlen(bad), 0));
@@ -123,8 +128,11 @@ int main(void) {
             xmlSecNodeSetDestroy(nodes);
         }
         nodes = NULL;
-        printf("pop again: %d nodes=%s\n", xmlSecTransformPopXml(parser, &nodes, &popCtx),
-               nodes == NULL ? "none" : "some");
+        ret = xmlSecTransformPopXml(parser, &nodes, &popCtx);
+        printf("pop again: %d nodes=%s\n", ret, nodes == NULL ? "none" : "some");
+        if (nodes != NULL) {
+            xmlSecNodeSetDestroy(nodes);
+        }
         left->next = NULL;
         parser->prev = NULL;
         xmlSecTransformDestroy(left);

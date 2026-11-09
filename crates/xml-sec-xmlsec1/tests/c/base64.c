@@ -82,8 +82,11 @@ int main(void) {
         decode(inputs[ii]);
     }
     printf("decode too small: %d\n", xmlSecBase64Decode_ex(BAD_CAST "Zm9v", small, sizeof(small), &written));
-    printf("in place: %d " XMLSEC_SIZE_FMT " [%.*s]\n",
-           xmlSecBase64DecodeInPlace(BAD_CAST inPlace, &written), written, (int)written, inPlace);
+    {
+        /* the decode runs before its outputs are read */
+        int decoded = xmlSecBase64DecodeInPlace(BAD_CAST inPlace, &written);
+        printf("in place: %d " XMLSEC_SIZE_FMT " [%.*s]\n", decoded, written, (int)written, inPlace);
+    }
     stream(1, BAD_CAST "the quick brown fox", 19, 1, 8);
     stream(1, BAD_CAST "the quick brown fox", 19, 5, 0);
     stream(0, BAD_CAST "dGhlIHF1aWNr\nIGJyb3du", 21, 3, 0);
