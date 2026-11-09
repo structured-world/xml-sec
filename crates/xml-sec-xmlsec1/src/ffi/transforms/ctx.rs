@@ -503,9 +503,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxCreateAndPrepend(
     })
 }
 
-unsafe extern "C" {
-    fn xmlGetProp(node: *mut XmlNode, name: *const u8) -> *mut u8;
-}
+use super::super::tree::xmlGetProp;
 
 /// `xmlSecTransformNodeRead`: creates the registered transform named by the
 /// node's `Algorithm` attribute for `usage`, if the context enables it, and

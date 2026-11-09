@@ -1,15 +1,18 @@
-/* The layout of the libxml2 structure members and constants the bridge reads
- * and writes, as the headers being linked define them. The Rust side
- * compares this record with its own declarations before touching any tree.
- * Structure sizes are not part of it: the bridge never allocates a libxml2
- * structure itself, and later releases append members. */
+/* Prints, one per line, the layout of the libxml2 structure members and
+ * constants the bridge reads and writes, as the installed headers define
+ * them. The crate's tests compile and run it and compare the output with the
+ * Rust declarations; the shipped library uses no headers. Structure sizes are
+ * not part of it: the bridge never allocates a libxml2 structure itself, and
+ * later releases append members. */
 
 #include <stddef.h>
+#include <stdio.h>
 #include <libxml/entities.h>
+#include <libxml/parser.h>
 #include <libxml/tree.h>
 #include <libxml/xpath.h>
 
-const size_t xs_libxml2_layout[] = {
+static const size_t layout[] = {
     offsetof(xmlNode, type),
     offsetof(xmlNode, name),
     offsetof(xmlNode, children),
@@ -59,6 +62,16 @@ const size_t xs_libxml2_layout[] = {
     offsetof(xmlNodeSet, nodeNr),
     offsetof(xmlNodeSet, nodeMax),
     offsetof(xmlNodeSet, nodeTab),
+    offsetof(xmlParserCtxt, sax),
+    offsetof(xmlParserCtxt, userData),
+    offsetof(xmlParserCtxt, myDoc),
+    offsetof(xmlParserCtxt, wellFormed),
 };
 
-const size_t xs_libxml2_layout_len = sizeof(xs_libxml2_layout) / sizeof(xs_libxml2_layout[0]);
+int main(void) {
+    size_t index;
+    for (index = 0; index < sizeof(layout) / sizeof(layout[0]); index++) {
+        printf("%zu\n", layout[index]);
+    }
+    return 0;
+}

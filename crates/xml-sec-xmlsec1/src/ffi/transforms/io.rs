@@ -10,26 +10,14 @@ use super::{
     xmlSecTransformDefaultGetDataType, xmlSecTransformPopBin, xmlSecTransformPushBin,
 };
 
-type WriteCallback = unsafe extern "C" fn(*mut c_void, *const c_char, c_int) -> c_int;
-type ReadCallback = unsafe extern "C" fn(*mut c_void, *mut c_char, c_int) -> c_int;
-type CloseCallback = unsafe extern "C" fn(*mut c_void) -> c_int;
-
-unsafe extern "C" {
-    fn xmlOutputBufferCreateIO(
-        write: Option<WriteCallback>,
-        close: Option<CloseCallback>,
-        context: *mut c_void,
-        encoder: *mut c_void,
-    ) -> *mut c_void;
-    fn xmlParserInputBufferCreateIO(
-        read: Option<ReadCallback>,
-        close: Option<CloseCallback>,
-        context: *mut c_void,
-        encoding: c_int,
-    ) -> *mut c_void;
-    pub(crate) fn xmlOutputBufferWrite(out: *mut c_void, len: c_int, data: *const c_char) -> c_int;
-    pub(crate) fn xmlOutputBufferClose(out: *mut c_void) -> c_int;
-}
+pub(crate) use xml_sec_libxml2::ffi::libxml2::{
+    xml_output_buffer_close as xmlOutputBufferClose,
+    xml_output_buffer_write as xmlOutputBufferWrite,
+};
+use xml_sec_libxml2::ffi::libxml2::{
+    xml_output_buffer_create_io as xmlOutputBufferCreateIO,
+    xml_parser_input_buffer_create_io as xmlParserInputBufferCreateIO,
+};
 
 /// `XML_CHAR_ENCODING_NONE`.
 const ENCODING_NONE: c_int = 0;

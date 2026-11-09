@@ -36,8 +36,8 @@ extern "C" {
 /* Create a document handle over `doc`, read under the compiled policy of
  * `operation` (XS_OPERATION_*) in `policy`. Returns XS_INVALID_ARGUMENT for
  * a null pointer or a node that is not a document, and XS_INTERNAL when the
- * linked libxml2 lays out its tree differently from the one the library was
- * built against. */
+ * process has no libxml2 loaded or one outside the supported releases (2.9 to
+ * 2.x). The library does not link libxml2; it uses the program's. */
 xs_status xs_libxml2_document(XsPolicy policy, uint32_t operation, xmlDocPtr doc,
                               XsDocument *out, XsError *error);
 

@@ -5,8 +5,10 @@
 //! libxmlsec1 1.3.13's own, and the exported functions keep its structure
 //! layouts, return values and memory ownership. Objects and strings handed
 //! to the caller are allocated with libxml2's allocator, as libxmlsec1's are,
-//! so the caller releases them with `xmlFree`. `SAFETY.md` records the
-//! invariants of the crate's single `unsafe` module.
+//! so the caller releases them with `xmlFree`. The library does not link
+//! libxml2: it uses the program's, found in the running process, and offers
+//! libxmlsec1's functionality only. `SAFETY.md` records the invariants of the
+//! crate's single `unsafe` module.
 
 #![warn(unreachable_pub)]
 #![deny(

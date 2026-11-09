@@ -1,39 +1,20 @@
-//! libxml2 declarations the library calls, beyond the tree structures
-//! `xml-sec-libxml2` declares and verifies.
+//! The caller's libxml2 functions the library calls, under their libxml2
+//! names. `xml-sec-libxml2` resolves them in the running process; the library
+//! links no libxml2 of its own.
 
-use std::ffi::{c_char, c_int, c_void};
+pub(crate) use xml_sec_libxml2::ffi::libxml2::{
+    xml_free_doc as xmlFreeDoc, xml_get_id as xmlGetID, xml_get_prop as xmlGetProp,
+    xml_node_add_content as xmlNodeAddContent, xml_node_get_content as xmlNodeGetContent,
+    xml_output_buffer_write_string as xmlOutputBufferWriteString, xml_search_ns as xmlSearchNs,
+    xml_str_equal as xmlStrEqual, xml_xpath_cmp_nodes as xmlXPathCmpNodes,
+    xml_xpath_free_node_set as xmlXPathFreeNodeSet, xml_xpath_node_set_add as xmlXPathNodeSetAdd,
+    xml_xpath_node_set_add_ns as xmlXPathNodeSetAddNs,
+    xml_xpath_node_set_contains as xmlXPathNodeSetContains,
+    xml_xpath_node_set_create as xmlXPathNodeSetCreate,
+};
 
-use xml_sec_libxml2::ffi::{XmlAttr, XmlDoc, XmlNode, XmlNodeSet, XmlNs};
-
-unsafe extern "C" {
-    pub(crate) fn xmlXPathNodeSetCreate(node: *mut XmlNode) -> *mut XmlNodeSet;
-    pub(crate) fn xmlXPathNodeSetAdd(set: *mut XmlNodeSet, node: *mut XmlNode) -> c_int;
-    pub(crate) fn xmlXPathNodeSetContains(set: *mut XmlNodeSet, node: *mut XmlNode) -> c_int;
-    pub(crate) fn xmlXPathFreeNodeSet(set: *mut XmlNodeSet);
-    /// 1 when `first` precedes `second` in document order, -1 when it
-    /// follows, 0 for the same node, -2 when they cannot be ordered.
-    pub(crate) fn xmlXPathCmpNodes(first: *mut XmlNode, second: *mut XmlNode) -> c_int;
-    pub(crate) fn xmlXPathNodeSetAddNs(
-        set: *mut XmlNodeSet,
-        node: *mut XmlNode,
-        ns: *mut XmlNs,
-    ) -> c_int;
-    pub(crate) fn xmlGetProp(node: *mut XmlNode, name: *const u8) -> *mut u8;
-    pub(crate) fn xmlNodeGetContent(node: *mut XmlNode) -> *mut u8;
-    pub(crate) fn xmlNodeAddContent(node: *mut XmlNode, content: *const u8);
-    pub(crate) fn xmlGetID(doc: *mut XmlDoc, id: *const u8) -> *mut XmlAttr;
-    pub(crate) fn xmlSearchNs(
-        doc: *mut XmlDoc,
-        node: *mut XmlNode,
-        prefix: *const u8,
-    ) -> *mut XmlNs;
-    pub(crate) fn xmlFreeDoc(doc: *mut XmlDoc);
-    pub(crate) fn xmlOutputBufferWriteString(out: *mut c_void, text: *const c_char) -> c_int;
-    pub(crate) fn xmlStrEqual(left: *const u8, right: *const u8) -> c_int;
-}
-
-/// Whether the linked libxml2 lays out its trees as declared; a function
-/// that would read a tree fails otherwise.
+/// Whether a supported libxml2 is loaded in the process; a function that
+/// would read a tree fails otherwise.
 pub(crate) fn readable() -> bool {
-    xml_sec_libxml2::ffi::layout_matches()
+    xml_sec_libxml2::ffi::libxml2::available()
 }

@@ -29,21 +29,18 @@ pub(crate) const ALLOC_MODE_EXACT: c_int = 0;
 /// `xmlSecAllocModeDouble`: grow to twice the requested size.
 pub(crate) const ALLOC_MODE_DOUBLE: c_int = 1;
 
-unsafe extern "C" {
-    fn xs_xmlsec1_malloc(size: usize) -> *mut c_void;
-    fn xs_xmlsec1_realloc(mem: *mut c_void, size: usize) -> *mut c_void;
-    fn xs_xmlsec1_free(mem: *mut c_void);
-    fn xs_xmlsec1_fputs(stream: *mut c_void, text: *const std::ffi::c_char) -> c_int;
-    #[cfg(test)]
-    static xs_xmlsec1_layout: [usize; 0];
-    #[cfg(test)]
-    static xs_xmlsec1_layout_len: usize;
-}
+use xml_sec_libxml2::ffi::libxml2;
 
-/// Allocates `size` bytes with libxml2's allocator; null when it fails.
+/// Allocates `size` bytes with the caller's libxml2 allocator, which
+/// libxmlsec1 hands memory out from and callers release with `xmlFree`; null
+/// when it fails or no libxml2 is loaded.
 fn malloc(size: usize) -> *mut c_void {
-    // SAFETY: `xmlMalloc` accepts any size and reports failure as null.
-    unsafe { xs_xmlsec1_malloc(size) }
+    if !libxml2::available() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: libxml2 is available; `xmlMalloc` accepts any size and reports
+    // failure as null.
+    unsafe { libxml2::xml_malloc(size) }
 }
 
 /// Resizes `mem`, which libxml2's allocator returned, to `size` bytes; null
@@ -52,8 +49,9 @@ fn malloc(size: usize) -> *mut c_void {
 /// # Safety
 /// `mem` came from [`malloc`] or [`realloc`] and was not freed.
 unsafe fn realloc(mem: *mut c_void, size: usize) -> *mut c_void {
-    // SAFETY: the caller passes a live libxml2 allocation.
-    unsafe { xs_xmlsec1_realloc(mem, size) }
+    // SAFETY: a live allocation proves libxml2 was available, and it stays
+    // resolved; the caller passes such an allocation.
+    unsafe { libxml2::xml_realloc(mem, size) }
 }
 
 /// Releases `mem`, which libxml2's allocator returned.
@@ -61,8 +59,11 @@ unsafe fn realloc(mem: *mut c_void, size: usize) -> *mut c_void {
 /// # Safety
 /// `mem` is null or came from [`malloc`] or [`realloc`] and was not freed.
 unsafe fn free(mem: *mut c_void) {
-    // SAFETY: the caller passes null or a live libxml2 allocation.
-    unsafe { xs_xmlsec1_free(mem) }
+    if mem.is_null() {
+        return;
+    }
+    // SAFETY: as for `realloc`.
+    unsafe { libxml2::xml_free(mem) }
 }
 
 /// Writes `text` to the C stream `stream`; text with an interior NUL is
@@ -77,7 +78,7 @@ unsafe fn write_stream(stream: *mut c_void, text: &str) {
     };
     // SAFETY: `stream` is a live stream and `text` is NUL-terminated. A
     // short write is the stream's state to report, as with fprintf.
-    unsafe { xs_xmlsec1_fputs(stream, text.as_ptr()) };
+    unsafe { libc::fputs(text.as_ptr(), stream.cast()) };
 }
 
 /// The size an allocation grows to for `size` bytes or items under
@@ -96,20 +97,4 @@ pub(crate) fn grown(alloc_mode: c_int, size: usize, initial: usize) -> Option<us
 /// unwinding into C.
 fn contain<T>(fallback: T, body: impl FnOnce() -> T) -> T {
     catch_unwind(AssertUnwindSafe(body)).unwrap_or(fallback)
-}
-
-/// The layout record of the crate's headers, in the order of `layout.c`. The
-/// headers are part of the crate, so a mismatch is a build defect the tests
-/// catch, not a property of the environment to check at run time.
-#[cfg(test)]
-pub(crate) fn header_layout() -> &'static [usize] {
-    // SAFETY: `layout.c` defines `xs_xmlsec1_layout` as an array of
-    // `xs_xmlsec1_layout_len` initialized `size_t` values with static
-    // storage, and `size_t` is `usize` on every target Rust supports.
-    unsafe {
-        std::slice::from_raw_parts(
-            (&raw const xs_xmlsec1_layout).cast::<usize>(),
-            xs_xmlsec1_layout_len,
-        )
-    }
 }

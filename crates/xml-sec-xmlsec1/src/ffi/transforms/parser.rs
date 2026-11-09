@@ -6,8 +6,8 @@ use std::ffi::{c_int, c_void};
 
 use super::super::nodeset::{TREE, XmlSecNodeSet, xmlSecNodeSetCreate, xmlSecNodeSetDocDestroy};
 use super::super::parser::{
-    ParserCtxt, options, xmlCreatePushParserCtxt, xmlParseChunk, xmlParseDocument,
-    xs_xmlsec1_free_ctxt, xs_xmlsec1_prepare_ctxt, xs_xmlsec1_push_input, xs_xmlsec1_take_doc,
+    ParserCtxt, free_ctxt, options, prepare_ctxt, push_input, take_doc, xmlCreatePushParserCtxt,
+    xmlParseChunk, xmlParseDocument,
 };
 use super::super::tree::xmlFreeDoc;
 use super::builtin::klass;
@@ -17,12 +17,11 @@ use super::{
     XmlSecTransform, XmlSecTransformCtx, XmlSecTransformKlass, context, xmlSecTransformPushXml,
 };
 
-unsafe extern "C" {
-    fn xmlNewParserCtxt() -> ParserCtxt;
-    fn xmlNewIOInputStream(ctxt: ParserCtxt, input: *mut c_void, encoding: c_int) -> *mut c_void;
-    fn xmlFreeInputStream(input: *mut c_void);
-    fn xmlFreeParserInputBuffer(input: *mut c_void);
-}
+use xml_sec_libxml2::ffi::libxml2::{
+    self, xml_free_input_stream as xmlFreeInputStream,
+    xml_free_parser_input_buffer as xmlFreeParserInputBuffer,
+    xml_new_io_input_stream as xmlNewIOInputStream, xml_new_parser_ctxt as xmlNewParserCtxt,
+};
 
 /// `XML_CHAR_ENCODING_NONE`: libxml2 detects the encoding.
 const ENCODING_NONE: c_int = 0;
@@ -67,8 +66,9 @@ unsafe extern "C" fn finalize(transform: *mut XmlSecTransform) {
     // SAFETY: an XML parser transform being destroyed.
     if let Some(slot) = unsafe { push_parser(transform) } {
         if !slot.is_null() {
-            // SAFETY: the push parser this transform created.
-            unsafe { xs_xmlsec1_free_ctxt(*slot) };
+            // SAFETY: the push parser this transform created, with the
+            // libxml2 that was available then.
+            unsafe { free_ctxt(*slot) };
         }
         *slot = std::ptr::null_mut();
     }
@@ -112,7 +112,7 @@ unsafe extern "C" fn push_bin(
         let object = &mut *transform;
         match object.status {
             STATUS_NONE => {
-                if !slot.is_null() {
+                if !slot.is_null() || !libxml2::available() {
                     return -1;
                 }
                 *slot = xmlCreatePushParserCtxt(
@@ -125,7 +125,7 @@ unsafe extern "C" fn push_bin(
                 if slot.is_null() {
                     return -1;
                 }
-                xs_xmlsec1_prepare_ctxt(*slot, options());
+                prepare_ctxt(*slot, options());
                 object.status = STATUS_WORKING;
             }
             STATUS_WORKING => {}
@@ -146,7 +146,7 @@ unsafe extern "C" fn push_bin(
         if xmlParseChunk(*slot, std::ptr::null(), 0, 1) != 0 {
             return -1;
         }
-        let doc = xs_xmlsec1_take_doc(*slot);
+        let doc = take_doc(*slot);
         if doc.is_null() {
             return -1;
         }
@@ -184,7 +184,7 @@ unsafe extern "C" fn pop_xml(
             }
             _ => return -1,
         }
-        if object.prev.is_null() {
+        if object.prev.is_null() || !libxml2::available() {
             return -1;
         }
         let input = xmlSecTransformCreateInputBuffer(object.prev, ctx);
@@ -196,24 +196,24 @@ unsafe extern "C" fn pop_xml(
             xmlFreeParserInputBuffer(input);
             return -1;
         }
-        xs_xmlsec1_prepare_ctxt(parser, options());
+        prepare_ctxt(parser, options());
         let stream = xmlNewIOInputStream(parser, input, ENCODING_NONE);
         if stream.is_null() {
-            xs_xmlsec1_free_ctxt(parser);
+            free_ctxt(parser);
             xmlFreeParserInputBuffer(input);
             return -1;
         }
-        if xs_xmlsec1_push_input(parser, stream) < 0 {
+        if push_input(parser, stream) < 0 {
             xmlFreeInputStream(stream);
-            xs_xmlsec1_free_ctxt(parser);
+            free_ctxt(parser);
             return -1;
         }
         if xmlParseDocument(parser) < 0 {
-            xs_xmlsec1_free_ctxt(parser);
+            free_ctxt(parser);
             return -1;
         }
-        let doc = xs_xmlsec1_take_doc(parser);
-        xs_xmlsec1_free_ctxt(parser);
+        let doc = take_doc(parser);
+        free_ctxt(parser);
         let result = owning(doc.cast());
         if result.is_null() {
             return -1;

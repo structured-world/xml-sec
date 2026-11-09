@@ -32,12 +32,15 @@ function:
 
 - Memory handed to the caller, and the data inside structures the caller can
   reach, comes from libxml2's `xmlMalloc`/`xmlRealloc` and is released only
-  with `xmlFree`, through `src/shim.c`, so a caller-installed libxml2 allocator
-  owns it.
+  with `xmlFree`: the allocator globals of the caller's libxml2, read in the
+  running process by `xml-sec-libxml2`, so a caller-installed libxml2 allocator
+  owns it. The library links no libxml2 and compiles no C; with no supported
+  libxml2 loaded, allocation fails and every tree-reading function refuses.
 - The bytes of a buffer between its size and its allocation are zero, as
   libxmlsec1 keeps them.
 - The Rust declarations of the C structures equal the layouts of the crate's
-  headers (checked by the crate's tests against `src/layout.c`); the headers
+  headers (checked by the crate's tests, which compile and run
+  `tests/layout.c`); the headers
   equal libxmlsec1's (checked by `xml-sec-tools xmlsec1-headers --check`).
 - No unwinding crosses the boundary: every exported function runs its body
   under `catch_unwind` and returns its failure value on a panic.

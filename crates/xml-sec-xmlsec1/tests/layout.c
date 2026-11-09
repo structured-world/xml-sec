@@ -1,16 +1,17 @@
-/* The layout of the xmlsec1 structures this crate creates or reads, as its
- * own headers define them. The Rust declarations are compared with this
- * record in the crate's tests; the headers themselves are compared with the
- * pinned libxmlsec1 by the header check and with its binary baseline by the
- * C layout test. */
+/* Prints, one per line, the layout of the xmlsec1 structures this crate
+ * creates or reads, as its own headers define them. The crate's tests compile
+ * and run it and compare the output with the Rust declarations; the headers
+ * themselves are compared with the pinned libxmlsec1 by the header check and
+ * with its binary baseline by the C layout test. */
 
 #include <stddef.h>
+#include <stdio.h>
 #include <xmlsec/xmlsec.h>
 #include <xmlsec/buffer.h>
 #include <xmlsec/list.h>
 #include <xmlsec/nodeset.h>
 
-const size_t xs_xmlsec1_layout[] = {
+static const size_t layout[] = {
     sizeof(xmlSecBuffer),
     offsetof(xmlSecBuffer, data),
     offsetof(xmlSecBuffer, size),
@@ -45,4 +46,10 @@ const size_t xs_xmlsec1_layout[] = {
     xmlSecNodeSetUnion,
 };
 
-const size_t xs_xmlsec1_layout_len = sizeof(xs_xmlsec1_layout) / sizeof(xs_xmlsec1_layout[0]);
+int main(void) {
+    size_t index;
+    for (index = 0; index < sizeof(layout) / sizeof(layout[0]); index++) {
+        printf("%zu\n", layout[index]);
+    }
+    return 0;
+}
