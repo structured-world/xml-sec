@@ -258,6 +258,10 @@ fn the_sanitized_build_keeps_the_callers_flags_and_names_its_target() {
     for target in targets() {
         expected.extend(["-p", target.package()]);
     }
+    // The libxmlsec1-compatible library's tests run wherever the bridge's do.
+    if targets().contains(&Target::Libxml2) {
+        expected.extend(["-p", Target::Xmlsec1.package()]);
+    }
     expected.extend(["--target", "aarch64-apple-darwin"]);
     assert_eq!(tests.args, expected);
     assert_eq!(

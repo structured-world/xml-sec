@@ -167,6 +167,10 @@ pub(crate) fn test_step(host: &str, rustflags: Option<&str>) -> Step {
     for target in targets() {
         args.extend(["-p", target.package()]);
     }
+    // The libxmlsec1-compatible library builds where the bridge does.
+    if targets().contains(&Target::Libxml2) {
+        args.extend(["-p", Target::Xmlsec1.package()]);
+    }
     cargo_step("sanitized tests", Mode::Sanitized, host, rustflags, &args)
 }
 
@@ -619,7 +623,52 @@ pub(crate) fn execute(mode: Mode, runner: &mut impl Run) -> Result<(), Failure> 
         );
     }
     if mode == Mode::Sanitized {
+        if targets().contains(&Target::Libxml2) {
+            sanitize_xmlsec1(&host, rustflags.as_deref(), scratch.path(), runner)?;
+        }
         require(runner.status(&test_step(&host, rustflags.as_deref()))?)?;
+    }
+    Ok(())
+}
+
+/// Runs the libxmlsec1-compatible library's C programs under the sanitizers;
+/// their output is compared with the oracle by `capi --xmlsec1`, here only a
+/// sanitizer report or a failing exit fails.
+fn sanitize_xmlsec1(
+    host: &str,
+    rustflags: Option<&str>,
+    scratch: &Path,
+    runner: &mut impl Run,
+) -> Result<(), Failure> {
+    let target = Target::Xmlsec1;
+    let (status, messages) =
+        runner.stdout(&build_step(target, Mode::Sanitized, host, rustflags))?;
+    require(status)?;
+    let library = library(&messages, target, std::env::consts::DLL_SUFFIX)?;
+    let template =
+        std::fs::read_to_string(root().join(XMLSEC1_CRATE).join("xml-sec-xmlsec1.pc.in"))
+            .map_err(|error| format!("read the pkg-config template: {error}"))?;
+    let mut flags = template_defines(&template)?;
+    flags.extend(libxml2_flags(runner)?);
+    for source in target.sources() {
+        let source = root().join(XMLSEC1_CRATE).join(source);
+        let compiler = compiler(host, &source)?;
+        let name = source
+            .file_stem()
+            .expect("a source file name")
+            .to_string_lossy();
+        let output = scratch.join(format!("{name}-sanitized{}", std::env::consts::EXE_SUFFIX));
+        let program = Program {
+            source: &source,
+            output: &output,
+            flags: &flags,
+        };
+        checked(
+            runner,
+            &compile_step(&compiler, Mode::Sanitized, target, &program, &library)?,
+        )?;
+        checked(runner, &program_step(&output, &[], &library))?;
+        println!("{}: {name}: clean under the sanitizers", target.package());
     }
     Ok(())
 }

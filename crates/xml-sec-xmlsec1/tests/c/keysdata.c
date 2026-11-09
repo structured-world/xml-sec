@@ -250,7 +250,15 @@ int main(void) {
                xmlSecTransformCtxExtraKeyDataEnsure(ctx, &binaryKlass) == ensured,
                xmlSecTransformCtxExtraKeyDataGet(ctx, &binaryKlass) == ensured);
         printf("extra adopt: %d", xmlSecTransformCtxExtraKeyDataAdopt(ctx, own));
-        printf(" duplicate klass: %d\n", xmlSecTransformCtxExtraKeyDataAdopt(ctx, xmlSecKeyDataCreate(&binaryKlass)));
+        {
+            /* a refused object stays the caller's */
+            xmlSecKeyDataPtr second = xmlSecKeyDataCreate(&binaryKlass);
+            int adopted = xmlSecTransformCtxExtraKeyDataAdopt(ctx, second);
+            printf(" duplicate klass: %d\n", adopted);
+            if (adopted < 0) {
+                xmlSecKeyDataDestroy(second);
+            }
+        }
         printf("extra list: %d\n", (int)xmlSecPtrListGetSize(ctx->extraKeyData));
         xmlSecTransformCtxDestroy(ctx);
         printf("extra finalize: %d\n", calls_finalize);

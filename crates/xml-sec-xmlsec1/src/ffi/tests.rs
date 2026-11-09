@@ -58,3 +58,14 @@ fn allocation_growth_follows_libxmlsec1() {
     assert_eq!(grown(ALLOC_MODE_DOUBLE, usize::MAX / 2, 0), None);
     assert_eq!(grown(ALLOC_MODE_EXACT, usize::MAX - 7, 0), None);
 }
+
+/// A panic inside an exported function's body becomes its failure value
+/// instead of unwinding across the C boundary, which is undefined behavior.
+#[test]
+fn a_panicking_body_returns_the_failure_value() {
+    let status = super::contain(-1, || -> c_int { panic!("an internal defect") });
+    assert_eq!(status, -1);
+    let pointer = super::contain(std::ptr::null_mut::<u8>(), || unreachable!("a defect"));
+    assert!(pointer.is_null());
+    assert_eq!(super::contain(-1, || 7), 7);
+}

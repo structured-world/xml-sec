@@ -134,6 +134,20 @@ static int pre_execute(xmlSecTransformCtxPtr ctx) {
     return ((int *)ctx->userData != NULL && *(int *)ctx->userData) ? -1 : 0;
 }
 
+/* A callback that reenters the library: it runs another context to the end,
+ * then tries to execute the context that is running it. */
+static int reentrant(xmlSecTransformCtxPtr ctx) {
+    xmlSecTransformCtxPtr nested = xmlSecTransformCtxCreate();
+    int ret;
+    xmlSecTransformCtxCreateAndAppend(nested, &upperKlass);
+    ret = xmlSecTransformCtxBinaryExecute(nested, BAD_CAST "in", 2);
+    printf("nested: ret=%d [%.*s]\n", ret, (int)xmlSecBufferGetSize(nested->result),
+           (const char *)xmlSecBufferGetData(nested->result));
+    xmlSecTransformCtxDestroy(nested);
+    printf("running again: %d\n", xmlSecTransformCtxBinaryExecute(ctx, BAD_CAST "x", 1));
+    return 0;
+}
+
 static const char document[] =
     "<root xmlns='urn:t' xmlns:a='urn:a'>"
     "<!--c-->"
@@ -210,6 +224,14 @@ int main(void) {
     ret = xmlSecTransformCtxBinaryExecute(ctx, BAD_CAST "no", 2);
     result("callback abort", ctx, ret);
     printf("callbacks: %d\n", observed);
+    xmlSecTransformCtxDestroy(ctx);
+
+    /* a callback that reenters the library */
+    ctx = xmlSecTransformCtxCreate();
+    ctx->preExecCallback = reentrant;
+    xmlSecTransformCtxCreateAndAppend(ctx, &upperKlass);
+    ret = xmlSecTransformCtxBinaryExecute(ctx, BAD_CAST "out", 3);
+    result("reentrant", ctx, ret);
     xmlSecTransformCtxDestroy(ctx);
 
     /* XML input into a binary klass: inclusive C14N is prepended */
