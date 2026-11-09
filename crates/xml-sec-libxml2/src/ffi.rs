@@ -811,33 +811,29 @@ unsafe fn c_bytes<'a>(text: *const XmlChar) -> Option<&'a [u8]> {
 /// expanded. Every expansion counts toward the projection's entity ceiling
 /// and every piece is admitted against its byte limit before it is copied,
 /// so nested references cannot grow a value past what the policy allows.
+/// The walk keeps its pending siblings on the heap, as the content walk
+/// does, so nesting depth costs no stack and needs no ceiling of its own:
+/// the expansion ceiling bounds it.
 ///
 /// # Safety
 /// `attr` is a live attribute of a live tree.
 unsafe fn attribute_value(attr: &XmlAttr, sink: &mut TreeSink<'_>) -> Result<String, ParseError> {
     let mut value = String::new();
-    // SAFETY: the attribute's children are live tree nodes.
-    unsafe { append_text(attr.children, &mut value, 0, sink) }?;
-    Ok(value)
-}
-
-/// Append the character data of `first` and its siblings to `value`.
-///
-/// # Safety
-/// `first` is null or a live node with live siblings.
-unsafe fn append_text(
-    first: *mut XmlNode,
-    value: &mut String,
-    depth: usize,
-    sink: &mut TreeSink<'_>,
-) -> Result<(), ParseError> {
-    // Entity expansion inside attribute values nests at most this deep.
-    if depth > 64 {
-        return Err(backend_error("attribute entity references nest too deep"));
-    }
-    let mut current = first;
-    while !current.is_null() {
-        // SAFETY: a live node.
+    // The next sibling to read at each enclosing reference level.
+    let mut resume = Vec::new();
+    let mut current = attr.children;
+    loop {
+        if current.is_null() {
+            match resume.pop() {
+                Some(next) => {
+                    current = next;
+                    continue;
+                }
+                None => return Ok(value),
+            }
+        }
+        // SAFETY: a live node of the attribute's value or of a declaration's
+        // replacement, which belong to the same live tree.
         let node = unsafe { &*current };
         match node.kind {
             XML_TEXT_NODE => {
@@ -845,17 +841,17 @@ unsafe fn append_text(
                 let text = unsafe { string(node.content) }?.unwrap_or_default();
                 sink.admit_attribute_bytes(value.len() + text.len())?;
                 value.push_str(text);
+                current = node.next;
             }
             XML_ENTITY_REF_NODE if !node.children.is_null() => {
                 sink.expand_attribute_entity()?;
+                resume.push(node.next);
                 // SAFETY: the declaration shares the common node part.
-                unsafe { append_text((*node.children).children, value, depth + 1, sink) }?;
+                current = unsafe { (*node.children).children };
             }
             _ => return Err(backend_error("an attribute value the tree cannot report")),
         }
-        current = node.next;
     }
-    Ok(())
 }
 
 /// Link the detached `node` under `parent` before `next`, or last.

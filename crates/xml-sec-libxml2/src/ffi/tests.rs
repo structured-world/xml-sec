@@ -916,6 +916,25 @@ fn nested_attribute_entities(levels: usize, leaf: &str) -> Libxml {
     doc
 }
 
+/// As [`nested_attribute_entities`], with each level referring once to the
+/// one below, down to a one-byte leaf.
+fn chained_attribute_entities(levels: usize) -> Libxml {
+    use std::fmt::Write as _;
+    let mut dtd = String::from("<!ENTITY e0 \"x\">");
+    for level in 1..=levels {
+        let below = level - 1;
+        write!(dtd, "<!ENTITY e{level} \"&e{below};\">").expect("writes to a String");
+    }
+    let doc = Libxml::parse(&format!("<!DOCTYPE r [{dtd}]><r a=\"x\"/>"), 0);
+    let reference = std::ffi::CString::new(format!("&e{levels};")).expect("no NUL");
+    // SAFETY: as in `nested_attribute_entities`.
+    unsafe {
+        let attribute = (*doc.element("r")).properties;
+        xmlNodeSetContent(attribute.cast(), reference.as_ptr().cast());
+    }
+    doc
+}
+
 #[test]
 fn attribute_entity_expansion_is_bounded_while_the_value_is_built() {
     // References the tree keeps inside an attribute value are expanded by
@@ -951,6 +970,18 @@ fn attribute_entity_expansion_is_bounded_while_the_value_is_built() {
         "{:?}",
         refused.err()
     );
+    // Deep nesting alone is no reason to refuse: a chain of 100 references
+    // is 100 expansions and one byte, within every limit, and the walk keeps
+    // its levels on the heap.
+    let chain = chained_attribute_entities(100);
+    let projected = xml_sec::XmlDocument::from_external_tree(
+        Box::new(super::LibxmlTree {
+            doc: chain.0,
+            journal: Vec::new(),
+        }),
+        &policy,
+    );
+    assert!(projected.is_ok(), "{:?}", projected.err());
     // 2^16 bytes through 2^11 expansions: refused at the byte limit before
     // the value is built past it.
     let mut limited = policy;
