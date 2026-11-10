@@ -790,14 +790,14 @@ unsafe fn read_algorithm(
     // SAFETY: by the caller's contract.
     unsafe {
         let here = here!("xmlSecTransformNodeRead");
-        let algorithm = format!("href={}", klass_text(href));
+        let algorithm = || format!("href={}", klass_text(href));
         let id = xmlSecTransformIdListFindByHref(xmlSecTransformIdsGet(), href, usage);
         if id.is_null() {
             errors::internal_with(
                 here,
                 std::ptr::null(),
                 c"xmlSecTransformIdListFindByHref",
-                &algorithm,
+                &algorithm(),
             );
             return std::ptr::null_mut();
         }
@@ -809,7 +809,7 @@ unsafe fn read_algorithm(
                 name,
                 std::ptr::null(),
                 errors::R_TRANSFORM_DISABLED,
-                &algorithm,
+                &algorithm(),
             );
             return std::ptr::null_mut();
         }

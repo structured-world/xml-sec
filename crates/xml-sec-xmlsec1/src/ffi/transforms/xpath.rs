@@ -1169,16 +1169,16 @@ unsafe extern "C" fn visa3d_execute(
     // SAFETY: a `Visa3D` transform with its id set, over a live document.
     unsafe {
         let name = name_of(transform);
-        let detail = format!("id=\"{}\"", klass_text(id));
+        let detail = || format!("id=\"{}\"", klass_text(id));
         // The tree's own ID table, which its builder filled.
         let attribute = xmlGetID(doc, id);
         if attribute.is_null() || (*attribute).parent.is_null() {
-            errors::xml_failed_with(here, name, c"xmlGetID", &detail);
+            errors::xml_failed_with(here, name, c"xmlGetID", &detail());
             return -1;
         }
         let set = xmlXPathNodeSetCreate((*attribute).parent);
         if set.is_null() {
-            errors::xml_failed_with(here, name, c"xmlXPathNodeSetCreate", &detail);
+            errors::xml_failed_with(here, name, c"xmlXPathNodeSetCreate", &detail());
             return -1;
         }
         object.out_nodes = xmlSecNodeSetCreate(doc, set, TREE_WITHOUT_COMMENTS);

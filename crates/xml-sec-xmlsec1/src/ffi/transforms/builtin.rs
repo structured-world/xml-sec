@@ -234,15 +234,17 @@ unsafe extern "C" fn mem_buf_execute(
         match object.status {
             STATUS_WORKING => {
                 let data = xmlSecBufferGetData(input);
-                let size = format!("size={in_size}");
+                let failed = |step: &CStr| {
+                    errors::internal_with(here, name, step, &format!("size={in_size}"));
+                };
                 if xmlSecBufferAppend(buffer, data, in_size) < 0
                     || xmlSecBufferAppend(&raw mut object.out_buf, data, in_size) < 0
                 {
-                    errors::internal_with(here, name, c"xmlSecBufferAppend", &size);
+                    failed(c"xmlSecBufferAppend");
                     return -1;
                 }
                 if xmlSecBufferRemoveHead(input, in_size) < 0 {
-                    errors::internal_with(here, name, c"xmlSecBufferRemoveHead", &size);
+                    failed(c"xmlSecBufferRemoveHead");
                     return -1;
                 }
                 if last != 0 {

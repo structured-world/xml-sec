@@ -398,20 +398,20 @@ pub(crate) unsafe extern "C" fn xmlSecCryptoDLGetLibraryFunctions(
                 unsafe { &**(*LIBRARIES.get()).data.add(position).cast::<*mut Library>() };
             return library.functions;
         }
-        let detail = format!("crypto={}", String::from_utf8_lossy(name));
+        let detail = || format!("crypto={}", String::from_utf8_lossy(name));
         let library = create_library(name);
         if library.is_null() {
             errors::internal_with(
                 here,
                 std::ptr::null(),
                 c"xmlSecCryptoDLLibraryCreate",
-                &detail,
+                &detail(),
             );
             return null;
         }
         // SAFETY: the list has a fixed address; it owns the library from here.
         if unsafe { xmlSecPtrListAdd(LIBRARIES.get(), library.cast()) } < 0 {
-            errors::internal_with(here, std::ptr::null(), c"xmlSecPtrListAdd", &detail);
+            errors::internal_with(here, std::ptr::null(), c"xmlSecPtrListAdd", &detail());
             // SAFETY: the list did not take the library.
             unsafe { destroy_library(library.cast()) };
             return null;

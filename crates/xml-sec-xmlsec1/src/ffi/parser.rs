@@ -227,19 +227,26 @@ pub(crate) unsafe extern "C" fn xmlSecParseFile(filename: *const c_char) -> *mut
         // path. libxml2's file context records the file's directory itself,
         // which libxmlsec1 sets again.
         unsafe {
-            let name = format!(
-                "filename={}",
-                std::ffi::CStr::from_ptr(filename).to_string_lossy()
-            );
+            let name = || {
+                format!(
+                    "filename={}",
+                    std::ffi::CStr::from_ptr(filename).to_string_lossy()
+                )
+            };
             xmlInitParser();
             let ctxt = xmlCreateFileParserCtxt(filename);
             if ctxt.is_null() {
-                errors::xml_failed_with(here, std::ptr::null(), c"xmlCreateFileParserCtxt", &name);
+                errors::xml_failed_with(
+                    here,
+                    std::ptr::null(),
+                    c"xmlCreateFileParserCtxt",
+                    &name(),
+                );
                 return std::ptr::null_mut();
             }
             prepare_ctxt(ctxt, options());
             let parsed = if xmlParseDocument(ctxt) < 0 {
-                errors::xml_failed_with(here, std::ptr::null(), c"xmlParseDocument", &name);
+                errors::xml_failed_with(here, std::ptr::null(), c"xmlParseDocument", &name());
                 false
             } else if !well_formed(ctxt) {
                 errors::internal(here, std::ptr::null(), c"document is not well formed");
