@@ -52,6 +52,8 @@ pub(crate) const R_INVALID_TYPE: c_int = 14;
 pub(crate) const R_INVALID_OPERATION: c_int = 15;
 /// `XMLSEC_ERRORS_R_INVALID_STATUS`.
 pub(crate) const R_INVALID_STATUS: c_int = 16;
+/// `XMLSEC_ERRORS_R_INVALID_VERSION`.
+pub(crate) const R_INVALID_VERSION: c_int = 19;
 /// `XMLSEC_ERRORS_R_INVALID_NODE`.
 pub(crate) const R_INVALID_NODE: c_int = 21;
 /// `XMLSEC_ERRORS_R_INVALID_NODE_CONTENT`.

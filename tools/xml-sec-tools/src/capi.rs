@@ -130,6 +130,7 @@ impl Target {
                 "tests/c/keysdata.c",
                 "tests/c/errors.c",
                 "tests/c/io.c",
+                "tests/c/library.c",
             ],
         }
     }

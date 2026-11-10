@@ -167,7 +167,14 @@ functions! {
     xml_output_buffer_write = "xmlOutputBufferWrite" fn(out: *mut c_void, len: c_int, data: *const c_char) -> c_int;
     xml_output_buffer_write_string = "xmlOutputBufferWriteString" fn(out: *mut c_void, text: *const c_char) -> c_int;
     xml_output_buffer_close = "xmlOutputBufferClose" fn(out: *mut c_void) -> c_int;
+    xml_get_external_entity_loader = "xmlGetExternalEntityLoader" fn() -> Option<EntityLoader>;
+    xml_set_external_entity_loader = "xmlSetExternalEntityLoader" fn(loader: Option<EntityLoader>);
 }
+
+/// libxml2's `xmlExternalEntityLoader`: the input for an external entity's
+/// URL and public id within a parser context, or null.
+pub type EntityLoader =
+    unsafe extern "C" fn(url: *const c_char, id: *const c_char, ctxt: *mut c_void) -> *mut c_void;
 
 /// Where libxml2 keeps one of its global variables, read on every use as the
 /// names of libxml2's headers read it, so a value the caller sets later (an
