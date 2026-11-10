@@ -505,6 +505,92 @@ pub(crate) fn int_to_size_impossible(here: Here, value: c_int) {
     );
 }
 
+/// libxml2's last error as libxmlsec1 writes it: `xml error: <code>: <msg>`.
+fn last_xml_error() -> String {
+    let (code, message) = if libxml2::available() {
+        // SAFETY: libxml2 is available.
+        unsafe { libxml2::xml_last_error() }
+    } else {
+        (0, std::ptr::null())
+    };
+    // SAFETY: libxml2's message is null or NUL-terminated.
+    let message = unsafe { bytes_or(message, b"NULL") };
+    format!("xml error: {code}: {}", String::from_utf8_lossy(message))
+}
+
+/// libxmlsec1's `xmlSecXmlError`: the libxml2 call `failed` failed, with
+/// libxml2's last error.
+pub(crate) fn xml_failed(here: Here, object: *const c_char, failed: &CStr) {
+    report(
+        here,
+        object,
+        failed.as_ptr(),
+        R_XML_FAILED,
+        &last_xml_error(),
+    );
+}
+
+/// libxmlsec1's `xmlSecXmlError2`: as [`xml_failed`], after `detail`.
+pub(crate) fn xml_failed_with(here: Here, object: *const c_char, failed: &CStr, detail: &str) {
+    report(
+        here,
+        object,
+        failed.as_ptr(),
+        R_XML_FAILED,
+        &format!("{detail}; {}", last_xml_error()),
+    );
+}
+
+/// libxmlsec1's `XMLSEC_SAFE_CAST_SIZE_TO_INT` failure: `value` does not
+/// fit an `int`.
+pub(crate) fn size_to_int_impossible(here: Here, value: usize) {
+    report(
+        here,
+        std::ptr::null(),
+        std::ptr::null(),
+        R_CAST_IMPOSSIBLE,
+        &format!(
+            "src-type=xmlSecSize; src-val={value};dst-type=int; dst-min={};dst-max={}",
+            c_int::MIN,
+            c_int::MAX
+        ),
+    );
+}
+
+/// The process has no libxml2 this library can use: a libxml2 call it needs
+/// cannot be made.
+pub(crate) fn no_libxml2(here: Here) {
+    report(
+        here,
+        std::ptr::null(),
+        std::ptr::null(),
+        R_XML_FAILED,
+        "no supported libxml2 is loaded in the process",
+    );
+}
+
+/// libxmlsec1's `xmlSecNotImplementedError`.
+pub(crate) fn not_implemented(here: Here, details: &str) {
+    report(
+        here,
+        std::ptr::null(),
+        std::ptr::null(),
+        R_NOT_IMPLEMENTED,
+        &format!("details={details}"),
+    );
+}
+
+/// libxmlsec1's `xmlSecUnsupportedEnumValueError`.
+pub(crate) fn unsupported_enum(here: Here, object: *const c_char, name: &str, value: c_int) {
+    report(
+        here,
+        object,
+        std::ptr::null(),
+        R_INVALID_TYPE,
+        &format!("unsupported value for '{name}': {value}"),
+    );
+}
+
 /// libxmlsec1's `xmlSecInvalidDataError`.
 pub(crate) fn invalid_data(here: Here, object: *const c_char, message: &str) {
     report(here, object, std::ptr::null(), R_INVALID_DATA, message);

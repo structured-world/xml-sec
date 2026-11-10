@@ -5,6 +5,7 @@ use std::ffi::{c_int, c_void};
 use xml_sec_libxml2::ffi::{XML_DOCUMENT_NODE, XML_ELEMENT_NODE, XmlNode};
 
 use super::contain;
+use super::errors::{self, check, here};
 use super::tree::{readable, xmlNodeGetContent, xmlSearchNs, xmlStrEqual};
 
 /// `xmlSecGetNodeContentAndTrim`: the text content of `cur` without leading
@@ -51,7 +52,14 @@ pub(crate) unsafe extern "C" fn xmlSecGetNodeContentAndTrim(cur: *mut XmlNode) -
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecGetNodeNsHref(cur: *mut XmlNode) -> *const u8 {
     contain(std::ptr::null(), || {
-        if cur.is_null() || !readable() {
+        check!(
+            !cur.is_null(),
+            "xmlSecGetNodeNsHref",
+            c"cur != NULL",
+            std::ptr::null()
+        );
+        if !readable() {
+            errors::no_libxml2(here!("xmlSecGetNodeNsHref"));
             return std::ptr::null();
         }
         // SAFETY: `cur` is a live node; its namespace and document are live.
@@ -78,7 +86,9 @@ pub(crate) unsafe extern "C" fn xmlSecCheckNodeName(
     ns: *const u8,
 ) -> c_int {
     contain(0, || {
-        if cur.is_null() || !readable() {
+        check!(!cur.is_null(), "xmlSecCheckNodeName", c"cur != NULL", 0);
+        if !readable() {
+            errors::no_libxml2(here!("xmlSecCheckNodeName"));
             return 0;
         }
         // SAFETY: `cur` is live; libxml2 compares possibly-null strings.
@@ -104,7 +114,14 @@ pub(crate) unsafe extern "C" fn xmlSecFindSibling(
     ns: *const u8,
 ) -> *mut XmlNode {
     contain(std::ptr::null_mut(), || {
-        if name.is_null() || !readable() {
+        check!(
+            !name.is_null(),
+            "xmlSecFindSibling",
+            c"name != NULL",
+            std::ptr::null_mut()
+        );
+        if !readable() {
+            errors::no_libxml2(here!("xmlSecFindSibling"));
             return std::ptr::null_mut();
         }
         let mut node = cur;
@@ -133,9 +150,18 @@ pub(crate) unsafe extern "C" fn xmlSecFindChild(
     ns: *const u8,
 ) -> *mut XmlNode {
     contain(std::ptr::null_mut(), || {
-        if parent.is_null() || name.is_null() || !readable() {
-            return std::ptr::null_mut();
-        }
+        check!(
+            !parent.is_null(),
+            "xmlSecFindChild",
+            c"parent != NULL",
+            std::ptr::null_mut()
+        );
+        check!(
+            !name.is_null(),
+            "xmlSecFindChild",
+            c"name != NULL",
+            std::ptr::null_mut()
+        );
         // SAFETY: `parent` is live and its children are its nodes.
         unsafe { xmlSecFindSibling((*parent).children, name, ns) }
     })
@@ -153,9 +179,18 @@ pub(crate) unsafe extern "C" fn xmlSecFindParent(
     ns: *const u8,
 ) -> *mut XmlNode {
     contain(std::ptr::null_mut(), || {
-        if cur.is_null() || name.is_null() || !readable() {
-            return std::ptr::null_mut();
-        }
+        check!(
+            !cur.is_null(),
+            "xmlSecFindParent",
+            c"cur != NULL",
+            std::ptr::null_mut()
+        );
+        check!(
+            !name.is_null(),
+            "xmlSecFindParent",
+            c"name != NULL",
+            std::ptr::null_mut()
+        );
         let mut node = cur;
         while !node.is_null() {
             // SAFETY: `node` is `cur` or one of its live ancestors.
@@ -224,9 +259,12 @@ pub(crate) unsafe extern "C" fn xmlSecFindNode(
     ns: *const u8,
 ) -> *mut XmlNode {
     contain(std::ptr::null_mut(), || {
-        if name.is_null() {
-            return std::ptr::null_mut();
-        }
+        check!(
+            !name.is_null(),
+            "xmlSecFindNode",
+            c"name != NULL",
+            std::ptr::null_mut()
+        );
         let mut search = FindNode {
             name,
             ns,
@@ -238,6 +276,11 @@ pub(crate) unsafe extern "C" fn xmlSecFindNode(
             // SAFETY: `node` is `parent` or one of its live siblings.
             unsafe {
                 if xmlSecDepthFirstTreeWalk(node, Some(find_node), data) < 0 {
+                    errors::internal(
+                        here!("xmlSecFindNode"),
+                        std::ptr::null(),
+                        c"xmlSecDepthFirstTreeWalk",
+                    );
                     return std::ptr::null_mut();
                 }
                 if !search.result.is_null() {
@@ -267,12 +310,14 @@ pub(crate) unsafe extern "C" fn xmlSecDepthFirstTreeWalk(
 ) -> c_int {
     contain(-1, || {
         let Some(callback) = callback else {
+            errors::assertion(here!("xmlSecDepthFirstTreeWalk"), c"callback != NULL");
             return -1;
         };
         if node.is_null() {
             return 0;
         }
         if !readable() {
+            errors::no_libxml2(here!("xmlSecDepthFirstTreeWalk"));
             return -1;
         }
         // A stack of pending nodes, children pushed last first, as libxmlsec1
@@ -282,6 +327,11 @@ pub(crate) unsafe extern "C" fn xmlSecDepthFirstTreeWalk(
             // SAFETY: `current` is a live node of the walked subtree.
             let result = unsafe { callback(current, data) };
             if result < 0 {
+                errors::internal(
+                    here!("xmlSecDepthFirstTreeWalk"),
+                    std::ptr::null(),
+                    c"callback",
+                );
                 return -1;
             }
             if result == 0 {

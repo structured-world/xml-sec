@@ -237,6 +237,18 @@ unsafe fn allocator<F: Copy>(name: &str, accessor: &str) -> Option<Global<Option
 /// libxml2's `xmlGenericErrorFunc`.
 type GenericErrorFn = unsafe extern "C" fn(*mut c_void, *const c_char, ...);
 
+/// The leading members of libxml2's `xmlError`, which every release shares.
+#[repr(C)]
+struct XmlErrorHead {
+    /// `domain`, which precedes the members read.
+    _domain: c_int,
+    code: c_int,
+    message: *const c_char,
+}
+
+/// `xmlGetLastError`.
+type LastErrorFn = unsafe extern "C" fn() -> *const XmlErrorHead;
+
 /// The resolved libxml2.
 struct Loaded {
     version: u32,
@@ -246,6 +258,8 @@ struct Loaded {
     realloc: Global<Option<ReallocFn>>,
     /// `xmlGenericError` and `xmlGenericErrorContext`.
     generic_error: Option<(Global<Option<GenericErrorFn>>, Global<*mut c_void>)>,
+    /// `xmlGetLastError`.
+    last_error: Option<LastErrorFn>,
     /// `xmlCtxtSetOptions`, from libxml2 2.13 on.
     set_options: Option<OptionsFn>,
     /// `xmlCtxtPushInput` (2.14 on) or, before it, `inputPush`.
@@ -287,6 +301,9 @@ impl Loaded {
             malloc,
             realloc,
             generic_error,
+            // SAFETY: `xmlGetLastError(void) -> const xmlError*`.
+            last_error: optional("xmlGetLastError\0")
+                .map(|address| unsafe { std::mem::transmute::<*mut c_void, LastErrorFn>(address) }),
             // SAFETY: `xmlCtxtSetOptions(xmlParserCtxtPtr, int) -> int`.
             set_options: optional("xmlCtxtSetOptions\0")
                 .map(|address| unsafe { std::mem::transmute::<*mut c_void, OptionsFn>(address) }),
@@ -399,6 +416,24 @@ pub unsafe fn xml_generic_error(message: &CStr) {
             let context = context.get().unwrap_or(std::ptr::null_mut());
             handler(context, c"%s".as_ptr(), message.as_ptr());
         }
+    }
+}
+
+/// The code and message of libxml2's last error on this thread
+/// (`xmlGetLastError`), as libxmlsec1 reports a failed libxml2 call: code 0
+/// and a null message when there is none.
+///
+/// # Safety
+/// [`available`] is true.
+#[must_use]
+pub unsafe fn xml_last_error() -> (c_int, *const c_char) {
+    // SAFETY: libxml2 returns null or its live last error, whose leading
+    // members every release shares.
+    unsafe {
+        loaded()
+            .last_error
+            .and_then(|last| last().as_ref())
+            .map_or((0, std::ptr::null()), |error| (error.code, error.message))
     }
 }
 
