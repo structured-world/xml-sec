@@ -189,9 +189,12 @@ xmlDocDumpMemory(doc, &bytes, &size);
   freed before the call returns. A failed call leaves the tree as it was.
 - `xs_document_serialize` refuses the handle with `XS_DOCUMENT`: the
   application serializes its tree with libxml2.
-- The library is built against the libxml2 `pkg-config` names (`libxml-2.0`)
-  and checks once that the linked headers lay out the tree as it expects; a
-  mismatch refuses every handle with `XS_INTERNAL`.
+- The library does not link libxml2: it uses the program's, found by symbol
+  name in the process when the first handle is created. The process must have
+  loaded a libxml2 release from 2.9 up to, not including, 3.0, with its symbols
+  in the global scope: a shared libxml2, or a static one linked so that it
+  exports them. Otherwise, and always on targets that are not Unix-like,
+  `xs_libxml2_document` returns `XS_INTERNAL`.
 
 ```sh
 cargo build --release -p xml-sec-libxml2

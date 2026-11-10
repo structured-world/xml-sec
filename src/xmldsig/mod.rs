@@ -74,6 +74,8 @@ pub(crate) mod modern;
 #[cfg(feature = "experimental-pq")]
 pub(crate) mod post_quantum;
 mod pq_algorithm;
+#[cfg(feature = "external-tree")]
+pub mod select;
 #[cfg(all(feature = "experimental-pq", feature = "xmldsig-sign"))]
 pub use post_quantum::PostQuantumSigningKey;
 pub use pq_algorithm::PqAlgorithm;

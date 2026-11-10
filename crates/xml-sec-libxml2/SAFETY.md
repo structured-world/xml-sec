@@ -1,8 +1,13 @@
 # Safety of the libxml2 bridge
 
-`src/ffi.rs` is the crate's only module with `unsafe` code. It reads and links
-the caller's libxml2 nodes directly and calls the libxml2 functions that create,
-unlink and free them. The clean C API it reexports keeps its own contract
+`src/ffi.rs` and its submodules are the crate's only code with `unsafe`. It reads
+and links the caller's libxml2 nodes directly and calls the libxml2 functions
+that create, unlink and free them. The crate does not link libxml2:
+`src/ffi/libxml2.rs` resolves those functions, and libxml2's allocator globals, by
+name in the running process, where the caller's libxml2 is loaded; the globals
+are read on every allocation, so an allocator the caller installs later is the
+one used. The clean C API it
+reexports keeps its own contract
 ([`xml-sec-capi/SAFETY.md`](../xml-sec-capi/SAFETY.md)); this file records what
 the bridge adds.
 
@@ -18,12 +23,18 @@ the bridge adds.
 
 - A null, misaligned or non-document pointer is refused with
   `XS_INVALID_ARGUMENT` before anything else is read.
-- The structure members and constants the bridge uses are declared in Rust and
-  compared, once per process, with their offsets and values in the headers the
-  crate is built against (`src/layout.c`). A mismatch refuses the handle with
-  `XS_INTERNAL`, and a projection on an existing handle fails, so no tree is
-  read through a wrong declaration. Structure sizes are not compared: the bridge
-  never allocates a libxml2 structure itself, and later releases append members.
+- The structure members and constants the bridge uses are declared in Rust:
+  only the leading members every libxml2 release from 2.9 on shares. Before a
+  tree is touched, the libxml2 loaded in the process must report a release in
+  that range (`xmlParserVersion`) and provide every function the bridge calls;
+  otherwise the handle is refused with `XS_INTERNAL` and a projection on an
+  existing handle fails, so no tree is read through a wrong declaration or a
+  missing function. The crate's tests compile a program against installed
+  headers (`tests/layout.c`) and compare its offsets with the declarations.
+  Structure sizes are not compared: the bridge never allocates a libxml2
+  structure itself, and later releases append members.
+- Several libxml2 copies in one process are not supported: the functions come
+  from the one the process resolves by default.
 - Each operation projects the whole tree into the library's semantic model
   under the operation's compiled policy (depth, node count, namespace bindings,
   bytes, DTD admission) before anything is evaluated; a tree beyond those limits

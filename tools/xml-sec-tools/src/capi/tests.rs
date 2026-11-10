@@ -1,6 +1,7 @@
 use super::{
-    FIPS_ONLY, HEADER, Library, Mode, Target, build_step, declared, host, library, symbol_mismatch,
-    targets, test_step,
+    FIPS_ONLY, HEADER, Library, Mode, Target, build_step, declared, declared_with,
+    first_difference, host, layout_program, library, symbol_mismatch, targets, template_defines,
+    test_step,
 };
 use crate::test_support::read;
 use std::collections::BTreeSet;
@@ -124,6 +125,94 @@ fn exports_and_declarations_must_match_except_the_optional_engine() {
 }
 
 #[test]
+fn libxmlsec1_declarations_are_found_across_alignment_spaces() {
+    // libxmlsec1 aligns names and parameter lists with spaces; function
+    // pointer typedefs and macros are not exported functions.
+    let header = "XMLSEC_EXPORT xmlSecBufferPtr   xmlSecBufferCreate              (xmlSecSize size);\n\
+                  typedef int (*xmlSecTransformInitializeMethod) (xmlSecTransformPtr t);\n\
+                  #define xmlSecTransformIsValid(t) ((t) != NULL)\n\
+                  XMLSEC_EXPORT int xmlSecInit(void);\n";
+    assert_eq!(
+        declared_with(header, "xmlSec"),
+        names(&["xmlSecBufferCreate", "xmlSecInit"])
+    );
+    let real = declared_with(
+        &read("crates/xml-sec-xmlsec1/include/xmlsec/transforms.h"),
+        "xmlSec",
+    );
+    for name in [
+        "xmlSecTransformCtxCreate",
+        "xmlSecTransformPushBin",
+        "xmlSecTransformIdsGet",
+    ] {
+        assert!(real.contains(name), "{name}");
+    }
+}
+
+#[test]
+fn exported_variables_are_declarations_too() {
+    // The string constants are data exports; a function prototype is not a
+    // variable.
+    let header = "XMLSEC_EXPORT_VAR const xmlChar xmlSecNs[];\n\
+                  XMLSEC_EXPORT_VAR int xmlSecFlag;\n\
+                  XMLSEC_EXPORT int xmlSecInit(void);\n";
+    assert_eq!(
+        super::declared_variables(header, "xmlSec"),
+        names(&["xmlSecFlag", "xmlSecNs"])
+    );
+    let real = super::declared_variables(
+        &read("crates/xml-sec-xmlsec1/include/xmlsec/strings.h"),
+        "xmlSec",
+    );
+    assert!(real.contains("xmlSecDSigNs"));
+    assert!(real.contains("xmlSecNameBase64"));
+}
+
+#[test]
+fn the_template_defines_are_what_a_consumer_compiles_with() {
+    // Only the `-D` flags of the Cflags line; the include path is the
+    // installation's and differs between the oracle and the library.
+    let template = "Name: x\nCflags: -DA=1 -D__F__=__func__ -I${includedir}\nLibs: -lx\n";
+    assert_eq!(
+        template_defines(template).unwrap(),
+        ["-DA=1", "-D__F__=__func__"]
+    );
+    assert!(template_defines("Name: x\n").is_err());
+    let real = template_defines(&read("crates/xml-sec-xmlsec1/xml-sec-xmlsec1.pc.in")).unwrap();
+    assert!(real.contains(&"-DXMLSEC_CRYPTO_DYNAMIC_LOADING=1".to_owned()));
+}
+
+#[test]
+fn the_layout_program_prints_every_baseline_record() {
+    // One line per structure, field and enumerator of the baseline, so both
+    // builds print comparable records and a field the headers lack fails to
+    // compile rather than being skipped.
+    let baseline = r#"{"structs":[{"name":"_S","fields":[{"name":"a"},{"name":"b"}]}],
+        "enums":[{"name":"E","values":[{"name":"eOne"}]}]}"#;
+    let program = layout_program(baseline).unwrap();
+    assert!(program.starts_with("#define XMLSEC_PRIVATE 1\n"));
+    assert!(program.contains("sizeof(struct _S), alignof(struct _S)"));
+    assert!(program.contains("offsetof(struct _S, a)"));
+    assert!(program.contains("offsetof(struct _S, b)"));
+    assert!(program.contains("(int)eOne"));
+    assert!(layout_program("{}").is_err());
+    let real = layout_program(&read(
+        "compatibility/libxmlsec1-1.3.13-abi-linux-x86_64.json",
+    ))
+    .unwrap();
+    assert!(real.contains("offsetof(struct _xmlSecTransformCtx, enabledTransforms)"));
+}
+
+#[test]
+fn differences_name_the_first_differing_line() {
+    // A missing or extra line is a difference, as is a changed one.
+    assert_eq!(first_difference("a\nb\n", "a\nb\n"), None);
+    assert!(first_difference("a\nb\n", "a\nc\n").is_some_and(|d| d.starts_with("line 2")));
+    assert!(first_difference("a\n", "a\nb\n").is_some_and(|d| d.contains("None")));
+    assert!(first_difference("a\nb\n", "a\n").is_some_and(|d| d.starts_with("line 2")));
+}
+
+#[test]
 fn the_sanitized_build_keeps_the_callers_flags_and_names_its_target() {
     // The sanitizer applies to the target only, never to build scripts, and
     // adds to the caller's flags rather than replacing them.
@@ -168,6 +257,10 @@ fn the_sanitized_build_keeps_the_callers_flags_and_names_its_target() {
     let mut expected = vec!["+nightly", "nextest", "run"];
     for target in targets() {
         expected.extend(["-p", target.package()]);
+    }
+    // The libxmlsec1-compatible library's tests run wherever the bridge's do.
+    if targets().contains(&Target::Libxml2) {
+        expected.extend(["-p", Target::Xmlsec1.package()]);
     }
     expected.extend(["--target", "aarch64-apple-darwin"]);
     assert_eq!(tests.args, expected);
