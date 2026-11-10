@@ -66,6 +66,8 @@ pub(crate) const R_UNEXPECTED_NODE: c_int = 27;
 pub(crate) const R_NODE_NOT_FOUND: c_int = 28;
 /// `XMLSEC_ERRORS_R_INVALID_TRANSFORM`.
 pub(crate) const R_INVALID_TRANSFORM: c_int = 31;
+/// `XMLSEC_ERRORS_R_INVALID_URI_TYPE`.
+pub(crate) const R_INVALID_URI_TYPE: c_int = 33;
 /// `XMLSEC_ERRORS_R_TRANSFORM_DISABLED`.
 pub(crate) const R_TRANSFORM_DISABLED: c_int = 35;
 /// `XMLSEC_ERRORS_R_TRANSFORM_SAME_DOCUMENT_REQUIRED`.
@@ -744,6 +746,17 @@ pub(crate) fn policy_unavailable(here: Here) {
         std::ptr::null(),
         R_INVALID_CONFIG,
         "the library policy did not compile",
+    );
+}
+
+/// The policy's reference URI permission refuses the class of `uri`.
+pub(crate) fn uri_refused(here: Here, object: *const c_char, uri: &[u8]) {
+    report(
+        here,
+        object,
+        std::ptr::null(),
+        R_INVALID_URI_TYPE,
+        &format!("uri={}", String::from_utf8_lossy(uri)),
     );
 }
 

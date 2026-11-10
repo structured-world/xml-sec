@@ -1,10 +1,13 @@
 //! The input-URI transform's policy bounds: a resource read through the
 //! caller's callbacks is refused once it passes the policy's per-resource
 //! size, and read whole when it is exactly that size. libxmlsec1 bounds
-//! neither, so the differential C program cannot cover them. Each test runs
-//! in its own process, so the callback list it fills is its own.
+//! neither, so the differential C program cannot cover them. Each test that
+//! fills the callback list checks that it runs in its own process, so the
+//! list is its own.
 
-use super::{xmlSecIOInit, xmlSecIORegisterCallbacks, xmlSecIOShutdown};
+use crate::ffi::tests::own_process;
+
+use super::{UriTypeSet, admits, xmlSecIOInit, xmlSecIORegisterCallbacks, xmlSecIOShutdown};
 use crate::ffi::buffer::xmlSecBufferGetSize;
 use crate::ffi::policy;
 use crate::ffi::transforms::ctx::{
@@ -43,6 +46,7 @@ unsafe extern "C" fn close(_context: *mut c_void) -> c_int {
 /// Executes a context on one URI read by the test's callbacks; the result's
 /// size, or `None` when the execution fails.
 fn read_resource() -> Option<usize> {
+    own_process();
     // SAFETY: the callback list and the context are used by this test alone.
     unsafe {
         assert_eq!(xmlSecIOInit(), 0);
@@ -64,6 +68,28 @@ fn per_resource_limit() -> usize {
         .expect("the library policy compiles")
         .resources
         .max_external_resource_bytes
+}
+
+/// The reference URI permission gates the read: a same-document permission
+/// refuses an external URI before any callback opens it and admits the
+/// empty and same-document classes.
+#[test]
+fn reference_permission_gates_the_uri_class() {
+    assert!(!admits(UriTypeSet::SAME_DOCUMENT, b"example:thing"));
+    assert!(admits(UriTypeSet::SAME_DOCUMENT, b"#id"));
+    assert!(admits(UriTypeSet::SAME_DOCUMENT, b""));
+    assert!(admits(UriTypeSet::ALL, b"example:thing"));
+}
+
+/// The library's policy admits external reference URIs, which it resolves
+/// only through the caller's callbacks, and leaves the key retrieval
+/// permissions of the profile as they are.
+#[test]
+fn library_policy_admits_external_references_only() {
+    let policy = policy::verification().expect("the library policy compiles");
+    assert_eq!(policy.uris.references, UriTypeSet::ALL);
+    assert_eq!(policy.uris.retrieval_methods, UriTypeSet::SAME_DOCUMENT);
+    assert_eq!(policy.uris.key_info_references, UriTypeSet::SAME_DOCUMENT);
 }
 
 /// An endless resource stops the run at the per-resource limit instead of

@@ -1,6 +1,9 @@
 //! Error reporting against libxmlsec1's semantics: the reason table, the
-//! callback priority, message formatting and truncation. Each test runs in
-//! its own process, so the process-wide callbacks it sets are its own.
+//! callback priority, message formatting and truncation. Each test that sets
+//! a callback checks that it runs in its own process, so the process-wide
+//! callbacks it sets are its own.
+
+use crate::ffi::tests::own_process;
 
 use super::{
     ErrorsCallback, MESSAGE_CAPACITY, R_ASSERTION, here, report, xmlSecError, xmlSecErrorsGetCode,
@@ -97,6 +100,7 @@ fn reason_table_matches_libxmlsec1() {
 /// field through unchanged.
 #[test]
 fn xml_sec_error_formats_the_message() {
+    own_process();
     // SAFETY: the callback has the callback's signature; the format matches
     // its arguments.
     unsafe {
@@ -130,6 +134,7 @@ fn xml_sec_error_formats_the_message() {
 /// set; a null message reports an empty one.
 #[test]
 fn user_callback_takes_priority_and_null_disables() {
+    own_process();
     // SAFETY: the callbacks have the callback's signature.
     unsafe {
         xmlSecErrorsSetSystemCallback(Some(other as ErrorsCallback));
@@ -159,6 +164,7 @@ fn user_callback_takes_priority_and_null_disables() {
 /// for `xmlSecError` and for the library's own reports.
 #[test]
 fn long_messages_are_truncated() {
+    own_process();
     let long = "x".repeat(4000);
     let format = std::ffi::CString::new(long.clone()).expect("no NUL");
     // SAFETY: the callback has the callback's signature; the format has no

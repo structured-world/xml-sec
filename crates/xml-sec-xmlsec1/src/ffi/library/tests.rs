@@ -1,7 +1,10 @@
 //! Library state: initialization and shutdown racing each other, the version
 //! check, the crypto library loaded by name, a report callback that reenters
-//! the library, and a panic contained at the boundary. Each test runs in its
-//! own process, so the process-wide state it sets is its own.
+//! the library, and a panic contained at the boundary. Each test that sets
+//! process-wide state checks that it runs in its own process, so the state
+//! it sets is its own.
+
+use crate::ffi::tests::own_process;
 
 use super::{xmlSecCheckVersionExt, xmlSecGetDefaultCrypto, xmlSecInit, xmlSecShutdown};
 use crate::ffi::buffer::xmlSecBufferInitialize;
@@ -44,6 +47,7 @@ unsafe extern "C" fn record(
 /// transform registry holds libxmlsec1's defaults once.
 #[test]
 fn racing_init_and_shutdown_leave_consistent_registries() {
+    own_process();
     let threads: Vec<_> = (0..8)
         .map(|_| {
             std::thread::spawn(|| {
@@ -74,6 +78,7 @@ fn racing_init_and_shutdown_leave_consistent_registries() {
 /// first, which the leak checker of the sanitizer run verifies.
 #[test]
 fn repeated_init_releases_the_previous_registries() {
+    own_process();
     // SAFETY: init and shutdown run on this thread alone.
     unsafe {
         assert_eq!(xmlSecInit(), 0);
@@ -104,6 +109,7 @@ fn version_check_follows_libxmlsec1() {
 /// reports libxmlsec1's missing-method error.
 #[test]
 fn default_crypto_loads_the_builtin_table() {
+    own_process();
     // SAFETY: the callback has the callback's signature; init and the table
     // calls run on this thread alone.
     unsafe {
@@ -164,6 +170,7 @@ unsafe extern "C" fn reentering(
 /// through the same callback, after the outer report was delivered.
 #[test]
 fn report_callback_may_reenter_the_library() {
+    own_process();
     // SAFETY: the callback has the callback's signature.
     unsafe {
         xmlSecErrorsSetCallback(Some(reentering as ErrorsCallback));
@@ -182,6 +189,7 @@ fn report_callback_may_reenter_the_library() {
 /// this thread receives the reports of a call on another thread.
 #[test]
 fn report_callback_is_process_global() {
+    own_process();
     // SAFETY: the callback has the callback's signature.
     unsafe { xmlSecErrorsSetCallback(Some(record as ErrorsCallback)) };
     std::thread::spawn(|| {
@@ -198,6 +206,7 @@ fn report_callback_is_process_global() {
 /// and returns the fallback instead of unwinding into C.
 #[test]
 fn panic_is_contained_and_reported() {
+    own_process();
     // SAFETY: the callback has the callback's signature.
     unsafe { xmlSecErrorsSetCallback(Some(record as ErrorsCallback)) };
     let result = crate::ffi::contain(-7, || -> c_int { panic!("boundary") });

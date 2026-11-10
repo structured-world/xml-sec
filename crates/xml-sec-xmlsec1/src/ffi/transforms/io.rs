@@ -12,6 +12,8 @@
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 
+use xml_sec::xmldsig::UriTypeSet;
+
 use super::super::buffer::{XmlSecBuffer, xmlSecBufferAppend};
 use super::super::errors::{self, check, here};
 use super::super::list::{
@@ -271,9 +273,17 @@ macro_rules! input_uri_or {
     };
 }
 
+/// Whether the reference URI permission `references` admits the class of
+/// `uri` (empty, same-document or external); the class depends only on the
+/// first octet, so a lossy reading of other octets cannot change it.
+fn admits(references: UriTypeSet, uri: &[u8]) -> bool {
+    references.allows(&String::from_utf8_lossy(uri))
+}
+
 /// `xmlSecTransformInputURIOpen`: opens `uri` through the most recently
 /// registered callbacks that match it, trying the unescaped URI first and
-/// the URI as given when no set matches that.
+/// the URI as given when no set matches that. The policy's reference URI
+/// permission decides first whether the URI's class may be read at all.
 ///
 /// # Safety
 /// `transform` is null or a valid transform; `uri` is null or
@@ -305,6 +315,14 @@ pub(crate) unsafe extern "C" fn xmlSecTransformInputURIOpen(
         );
         // SAFETY: `uri` is NUL-terminated.
         let text = unsafe { CStr::from_ptr(uri.cast()) }.to_bytes();
+        let here = here!("xmlSecTransformInputURIOpen");
+        let Some(policy) = policy::verification_at(here) else {
+            return -1;
+        };
+        if !admits(policy.uris.references, text) {
+            errors::uri_refused(here, c"input-uri".as_ptr(), text);
+            return -1;
+        }
         // The unescaped URI has no NUL unless an escape decodes one, which
         // ends the C string as it ends libxml2's.
         let mut unescaped = unescape(text);
@@ -324,7 +342,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformInputURIOpen(
         }
         if state.callbacks.is_null() || state.context.is_null() {
             errors::internal_with(
-                here!("xmlSecTransformInputURIOpen"),
+                here,
                 c"input-uri".as_ptr(),
                 c"ctx->clbks->opencallback",
                 &format!("uri={}", String::from_utf8_lossy(text)),
