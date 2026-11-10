@@ -301,3 +301,61 @@ fn a_here_node_outside_the_document_is_refused() {
     let expression = XPathExpression::new("here()");
     assert!(select(&expression, Some(ExternalNode(99)), XPathForm::NodeSet, &[]).is_err());
 }
+
+/// `<r>a<![CDATA[b]]></r>` as a libxml2 tree reports it: two adjacent text
+/// nodes, which the view keeps as one.
+struct AdjacentText;
+
+const FIRST_TEXT: ExternalNode = ExternalNode(11);
+const SECOND_TEXT: ExternalNode = ExternalNode(12);
+
+impl ExternalTree for AdjacentText {
+    fn document(&self) -> ExternalNode {
+        ExternalNode(1)
+    }
+
+    fn project(&self, sink: &mut TreeSink<'_>) -> Result<(), ParseError> {
+        sink.begin_element(ROOT, "r", None, None)?;
+        sink.open_element()?;
+        sink.text(FIRST_TEXT, "a")?;
+        sink.text(SECOND_TEXT, "b")?;
+        sink.end_element()
+    }
+
+    fn apply(&mut self, _: &[TreeEdit<'_>]) -> Result<(), TreeEditError> {
+        Err(TreeEditError("read-only test tree".into()))
+    }
+    fn checkpoint(&mut self) -> usize {
+        0
+    }
+    fn rollback(&mut self, _: usize) {}
+    fn release(&mut self, _: usize) {}
+}
+
+/// Selecting a text node the view joined from several tree nodes selects
+/// each of them, so the caller's node set covers the whole run.
+#[test]
+fn a_joined_text_node_selects_every_tree_node_of_its_run() {
+    let document =
+        XmlDocument::from_external_tree(Box::new(AdjacentText), &VerificationPolicy::default())
+            .expect("the tree must project");
+    let expression = XPathExpression::new("//text()");
+    let nodes = document.with_view(|view| {
+        select_xpath(
+            view,
+            &expression,
+            None,
+            XPathForm::NodeSet,
+            &[],
+            &ResourcePolicy::default(),
+        )
+        .map(|nodes| nodes.into_iter().map(owned).collect::<alloc::vec::Vec<_>>())
+    });
+    assert_eq!(
+        nodes.expect("selection"),
+        [
+            SelectedNode::Node(FIRST_TEXT),
+            SelectedNode::Node(SECOND_TEXT)
+        ]
+    );
+}

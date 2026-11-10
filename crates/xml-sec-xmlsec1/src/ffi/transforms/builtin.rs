@@ -39,6 +39,7 @@ use super::super::strings::{
 use super::super::tree::{readable, xmlGetProp, xmlSearchNs};
 use super::super::xmltree::{xmlSecCheckNodeName, xmlSecFindParent, xmlSecGetNextElementNode};
 use super::super::{contain, free, policy};
+use super::ctx::{charge, run_budget};
 use super::io::{
     xmlOutputBufferClose, xmlOutputBufferWrite, xmlSecBufferCreateOutputBuffer,
     xmlSecTransformCreateOutputBuffer,
@@ -323,8 +324,25 @@ unsafe extern "C" fn base64_execute(
         }
         match object.status {
             STATUS_WORKING => {
+                let Some(policy) = policy::verification() else {
+                    return -1;
+                };
+                let resources = &policy.resources;
+                let budget = run_budget(ctx);
+                let before = xmlSecBufferGetSize(output);
                 let in_size = xmlSecBufferGetSize(input);
                 if in_size > 0 {
+                    // Input is charged before the codec allocates for it,
+                    // which bounds that allocation too.
+                    if charge(
+                        &mut budget.base64_input,
+                        in_size,
+                        resources.max_base64_transform_input_bytes,
+                    )
+                    .is_none()
+                    {
+                        return -1;
+                    }
                     let reserve = if codec.encode != 0 {
                         encode_size(codec.columns, in_size)
                     } else {
@@ -341,11 +359,23 @@ unsafe extern "C" fn base64_execute(
                         return -1;
                     }
                 }
+                // The last group and padding fit in 16 bytes.
+                if last != 0 && write_into(output, 16, |room| base64::finish(codec, room)).is_none()
+                {
+                    return -1;
+                }
+                // Output is charged before it moves on: a refused step
+                // leaves it in this transform's buffer.
+                if charge(
+                    &mut budget.base64_output,
+                    xmlSecBufferGetSize(output) - before,
+                    resources.max_base64_transform_output_bytes,
+                )
+                .is_none()
+                {
+                    return -1;
+                }
                 if last != 0 {
-                    // The last group and padding fit in 16 bytes.
-                    if write_into(output, 16, |room| base64::finish(codec, room)).is_none() {
-                        return -1;
-                    }
                     object.status = STATUS_FINISHED;
                 }
                 0
@@ -596,6 +626,26 @@ impl Selection<'_> {
 
 impl SelectedNodes for Selection<'_> {
     fn node(&self, node: Node<'_, '_>) -> Option<bool> {
+        // Text the tree holds as adjacent nodes (text and CDATA) is one text
+        // node of the canonical form (Canonical XML 1.0 section 2.1): it is
+        // output when the set holds all of its tree nodes and left out when
+        // it holds none. A set holding part of it would need part of that
+        // one text, which the canonical form cannot express, so it is
+        // refused rather than written whole or dropped.
+        if let Some(run) = self.view.external_text_run_of(node) {
+            let mut verdict = None;
+            for part in run {
+                let part = node_of((*part)?);
+                // SAFETY: a live node of the projected tree.
+                let contained = self.contains(part, unsafe { (*part).parent });
+                match verdict {
+                    None => verdict = Some(contained),
+                    Some(previous) if previous != contained => return None,
+                    Some(_) => {}
+                }
+            }
+            return verdict;
+        }
         let node = self.element(node)?;
         // SAFETY: a live node of the projected tree.
         Some(self.contains(node, unsafe { (*node).parent }))

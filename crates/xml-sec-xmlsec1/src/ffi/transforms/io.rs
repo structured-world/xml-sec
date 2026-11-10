@@ -28,15 +28,17 @@ struct TransformIo {
     write: bool,
     transform: *mut XmlSecTransform,
     ctx: *mut XmlSecTransformCtx,
+    /// The octets reading may still return; reading past them fails.
+    remaining: usize,
 }
 
 /// The transform I/O state for a callback.
 ///
 /// # Safety
 /// `context` is null or a live [`TransformIo`].
-unsafe fn state<'a>(context: *mut c_void) -> Option<&'a TransformIo> {
+unsafe fn state<'a>(context: *mut c_void) -> Option<&'a mut TransformIo> {
     // SAFETY: by the caller's contract.
-    unsafe { context.cast::<TransformIo>().as_ref() }.filter(|io| {
+    unsafe { context.cast::<TransformIo>().as_mut() }.filter(|io| {
         // SAFETY: the state names a transform it was created for.
         unsafe { valid(io.transform) }.is_some() && !io.ctx.is_null()
     })
@@ -79,6 +81,10 @@ unsafe extern "C" fn transform_read(context: *mut c_void, data: *mut c_char, len
         {
             return -1;
         }
+        let Some(remaining) = io.remaining.checked_sub(size) else {
+            return -1;
+        };
+        io.remaining = remaining;
         c_int::try_from(size).unwrap_or(-1)
     }
 }
@@ -107,6 +113,7 @@ fn create(
     write: bool,
     transform: *mut XmlSecTransform,
     ctx: *mut XmlSecTransformCtx,
+    remaining: usize,
 ) -> *mut c_void {
     let io = malloc(size_of::<TransformIo>()).cast::<TransformIo>();
     if !io.is_null() {
@@ -116,6 +123,7 @@ fn create(
                 write,
                 transform,
                 ctx,
+                remaining,
             });
         }
     }
@@ -142,7 +150,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCreateOutputBuffer(
             if xmlSecTransformDefaultGetDataType(transform, MODE_PUSH, ctx) & DATA_BIN == 0 {
                 return std::ptr::null_mut();
             }
-            let io = create(true, transform, ctx);
+            let io = create(true, transform, ctx, 0);
             if io.is_null() {
                 return io;
             }
@@ -172,29 +180,43 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCreateInputBuffer(
 ) -> *mut c_void {
     contain(std::ptr::null_mut(), || {
         // SAFETY: by the caller's contract.
-        unsafe {
-            if valid(transform).is_none() || ctx.is_null() {
-                return std::ptr::null_mut();
-            }
-            if xmlSecTransformDefaultGetDataType(transform, MODE_POP, ctx) & DATA_BIN == 0 {
-                return std::ptr::null_mut();
-            }
-            let io = create(false, transform, ctx);
-            if io.is_null() {
-                return io;
-            }
-            let input = xmlParserInputBufferCreateIO(
-                Some(transform_read),
-                Some(transform_close),
-                io,
-                ENCODING_NONE,
-            );
-            if input.is_null() {
-                free(io);
-            }
-            input
-        }
+        unsafe { bounded_input_buffer(transform, ctx, usize::MAX) }
     })
+}
+
+/// A libxml2 input buffer popping binary data from `transform` that fails a
+/// read past `limit` octets in all.
+///
+/// # Safety
+/// As for [`xmlSecTransformCreateOutputBuffer`].
+pub(crate) unsafe fn bounded_input_buffer(
+    transform: *mut XmlSecTransform,
+    ctx: *mut XmlSecTransformCtx,
+    limit: usize,
+) -> *mut c_void {
+    // SAFETY: by the caller's contract.
+    unsafe {
+        if valid(transform).is_none() || ctx.is_null() {
+            return std::ptr::null_mut();
+        }
+        if xmlSecTransformDefaultGetDataType(transform, MODE_POP, ctx) & DATA_BIN == 0 {
+            return std::ptr::null_mut();
+        }
+        let io = create(false, transform, ctx, limit);
+        if io.is_null() {
+            return io;
+        }
+        let input = xmlParserInputBufferCreateIO(
+            Some(transform_read),
+            Some(transform_close),
+            io,
+            ENCODING_NONE,
+        );
+        if input.is_null() {
+            free(io);
+        }
+        input
+    }
 }
 
 unsafe extern "C" fn buffer_write(context: *mut c_void, data: *const c_char, len: c_int) -> c_int {

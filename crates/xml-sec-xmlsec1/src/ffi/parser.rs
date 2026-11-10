@@ -70,6 +70,14 @@ pub(crate) fn options() -> c_int {
     }
 }
 
+/// The options of the XML parser transform: those in effect without
+/// `XML_PARSE_HUGE`. That transform parses transform output, which the
+/// document's own content may make arbitrarily large, so libxml2's depth and
+/// size ceilings stay on there; libxmlsec1 lifts them for every parse.
+pub(crate) fn transform_options() -> c_int {
+    options() & !XML_PARSE_HUGE
+}
+
 /// Applies `options` and nothing else to `ctxt`: libxmlsec1 additionally
 /// forces entity substitution and external-subset loading on libxml2 older
 /// than 2.13, which loads external entities whatever the options say.
@@ -149,6 +157,13 @@ pub(crate) unsafe extern "C" fn xmlSecParserGetDefaultOptions() -> c_int {
 /// Callable during initialization, like libxmlsec1's other globals.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecParserSetDefaultOptions(options: c_int) {
+    // The options are taken as given, as libxmlsec1 takes them: parsing is
+    // the caller's libxml2 under options the caller chooses for its own
+    // documents, not a decision of this library's policy, and a program that
+    // enables DTD loading here enables it in its own process. The policy
+    // applies where it owns the decision: the projection of every parsed tree,
+    // and the XML parser transform, which keeps libxml2's ceilings and the
+    // document size (`transform_options`).
     contain((), || {
         OPTIONS.store(options, Ordering::Relaxed);
         OPTIONS_SET.store(true, Ordering::Release);

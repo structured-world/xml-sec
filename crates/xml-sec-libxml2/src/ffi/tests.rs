@@ -1342,6 +1342,85 @@ fn untouched_nodes_of_every_kind_keep_their_pointers_through_an_operation() {
     unsafe { check_links(doc.0.cast(), (*doc.0).children) };
 }
 
+/// Allocations through the counting allocator below.
+static COUNTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+unsafe extern "C" fn counting_malloc(size: usize) -> *mut c_void {
+    COUNTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: the C allocator, which libxml2's default one is.
+    unsafe { libc::malloc(size) }
+}
+
+unsafe extern "C" fn counting_realloc(mem: *mut c_void, size: usize) -> *mut c_void {
+    COUNTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: as above.
+    unsafe { libc::realloc(mem, size) }
+}
+
+unsafe extern "C" fn counting_free(mem: *mut c_void) {
+    COUNTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: as above.
+    unsafe { libc::free(mem) }
+}
+
+/// The address of libxml2's allocator global `name` as the calling thread
+/// sees it: through `accessor` on threaded releases before 2.12, as their
+/// headers define the name, else the global itself.
+///
+/// # Safety
+/// `F` is the global's function pointer type.
+unsafe fn allocator_slot<F>(name: &str, accessor: &str) -> *mut Option<F> {
+    let find = |symbol: &str| {
+        let symbol = std::ffi::CString::new(symbol).expect("no NUL in a symbol name");
+        // SAFETY: a NUL-terminated name searched in the global scope.
+        unsafe { libc::dlsym(libc::RTLD_DEFAULT, symbol.as_ptr()) }
+    };
+    let through = find(accessor);
+    if through.is_null() {
+        find(name).cast()
+    } else {
+        // SAFETY: the accessor takes no argument and returns the address.
+        unsafe {
+            std::mem::transmute::<*mut c_void, unsafe extern "C" fn() -> *mut Option<F>>(through)()
+        }
+    }
+}
+
+/// An allocator the caller installs after the library first used libxml2
+/// allocates, resizes and frees what the library hands over, as libxmlsec1's
+/// `xmlMalloc`/`xmlFree` macros read libxml2's globals on every call. The
+/// test installs it by writing the globals, as `xmlMemSetup` does; some
+/// vendor builds (macOS) refuse `xmlMemSetup` itself.
+#[test]
+fn a_later_installed_allocator_serves_the_library() {
+    use std::sync::atomic::Ordering;
+    type Free = unsafe extern "C" fn(*mut c_void);
+    type Malloc = unsafe extern "C" fn(usize) -> *mut c_void;
+    type Realloc = unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void;
+    // SAFETY: libxml2 is loaded by the test support; the slots are its
+    // allocator globals, and every allocation is released by the C allocator
+    // that both the default and the counting functions use.
+    unsafe {
+        libxml2::xml_free(libxml2::xml_malloc(8));
+        let free = allocator_slot::<Free>("xmlFree", "__xmlFree");
+        let malloc = allocator_slot::<Malloc>("xmlMalloc", "__xmlMalloc");
+        let realloc = allocator_slot::<Realloc>("xmlRealloc", "__xmlRealloc");
+        assert!(!free.is_null() && !malloc.is_null() && !realloc.is_null());
+        let saved = (free.read(), malloc.read(), realloc.read());
+        free.write(Some(counting_free));
+        malloc.write(Some(counting_malloc));
+        realloc.write(Some(counting_realloc));
+        let before = COUNTED.load(Ordering::Relaxed);
+        let memory = libxml2::xml_realloc(libxml2::xml_malloc(8), 16);
+        libxml2::xml_free(memory);
+        let counted = COUNTED.load(Ordering::Relaxed) - before;
+        free.write(saved.0);
+        malloc.write(saved.1);
+        realloc.write(saved.2);
+        assert_eq!(counted, 3);
+    }
+}
+
 /// The child nodes of `parent`, in order.
 fn children(parent: *mut XmlNode) -> Vec<*mut XmlNode> {
     let mut found = Vec::new();

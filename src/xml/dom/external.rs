@@ -39,6 +39,23 @@ pub(crate) struct ProjectionMetrics {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ExternalNode(pub u64);
 
+/// The text nodes the projection joined from adjacent tree text (text and
+/// CDATA, XML 1.0 has no boundary between them): for each, its arena
+/// position and the tree nodes of the run in order, `None` for text an
+/// entity expansion produced. Sorted by position, since a joined node is
+/// always the last one built.
+pub(crate) type TextRuns = Vec<(usize, Vec<Option<ExternalNode>>)>;
+
+/// A finished projection: the document, the tree node of each arena node
+/// (`None` where none corresponds alone), the joined text runs and the
+/// projection's measurements.
+pub(crate) struct Projection<'input> {
+    pub(crate) document: Document<'input>,
+    pub(crate) nodes: Vec<Option<ExternalNode>>,
+    pub(crate) runs: TextRuns,
+    pub(crate) metrics: ProjectionMetrics,
+}
+
 /// An element whose start tag is being reported.
 struct Pending {
     node: ExternalNode,
@@ -62,6 +79,7 @@ pub struct TreeSink<'input> {
     tree: TreeBuilder<'input, Native>,
     open: Vec<NodeId>,
     nodes: Vec<Option<ExternalNode>>,
+    runs: TextRuns,
     pending: Option<Pending>,
     /// The current start tag's declarations; reused from element to element.
     declarations: Vec<(Option<String>, String)>,
@@ -96,6 +114,7 @@ impl<'input> TreeSink<'input> {
             tree,
             open: alloc::vec![root],
             nodes: alloc::vec![Some(document)],
+            runs: Vec::new(),
             pending: None,
             declarations: Vec::new(),
             limits,
@@ -285,8 +304,17 @@ impl<'input> TreeSink<'input> {
             // node built: nothing follows it under its parent, and every
             // earlier sibling's subtree was built before it. That run now
             // spans several tree nodes, none of which alone is the node an
-            // edit would select, so it keeps no reference and refuses edits.
-            *joined = None;
+            // edit would select, so it keeps no reference and refuses edits;
+            // the run keeps them for read-only selection.
+            let previous = joined.take();
+            let position = self.nodes.len() - 1;
+            let constituent = (self.entity_depth == 0).then_some(node);
+            match self.runs.last_mut() {
+                Some((last, run)) if *last == position => run.push(constituent),
+                _ => self
+                    .runs
+                    .push((position, alloc::vec![previous, constituent])),
+            }
         }
         Ok(())
     }
@@ -383,16 +411,7 @@ impl<'input> TreeSink<'input> {
         Ok(())
     }
 
-    pub(crate) fn finish(
-        mut self,
-    ) -> Result<
-        (
-            Document<'input>,
-            Vec<Option<ExternalNode>>,
-            ProjectionMetrics,
-        ),
-        ParseError,
-    > {
+    pub(crate) fn finish(mut self) -> Result<Projection<'input>, ParseError> {
         if self.pending.is_some() || self.open.len() != 1 || self.entity_depth != 0 {
             return Err(misuse("projection ended inside an open node"));
         }
@@ -402,7 +421,12 @@ impl<'input> TreeSink<'input> {
         if !document.root().children().any(|node| node.is_element()) {
             return Err(misuse("projection has no document element"));
         }
-        Ok((document, self.nodes, self.metrics))
+        Ok(Projection {
+            document,
+            nodes: self.nodes,
+            runs: self.runs,
+            metrics: self.metrics,
+        })
     }
 
     fn parent(&self) -> NodeId {

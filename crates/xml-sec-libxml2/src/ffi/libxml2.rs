@@ -169,13 +169,74 @@ functions! {
     xml_output_buffer_close = "xmlOutputBufferClose" fn(out: *mut c_void) -> c_int;
 }
 
+/// Where libxml2 keeps one allocator function, read on every call as the
+/// `xmlMalloc`/`xmlFree` names of libxml2's headers read it, so an allocator
+/// the caller installs later is the one used. `xmlMemGet` is not used: some
+/// vendor builds (macOS) return failure from it.
+enum Allocator<F> {
+    /// The global itself.
+    Global(*const Option<F>),
+    /// The accessor of threaded releases before 2.12, whose headers define
+    /// the name as a call to it; it returns the calling thread's slot.
+    Accessor(unsafe extern "C" fn() -> *const Option<F>),
+}
+
+// SAFETY: the pointers are libxml2's process-wide globals and accessor,
+// valid for the life of the process and read as libxml2's callers read them.
+unsafe impl<F> Send for Allocator<F> {}
+// SAFETY: as above.
+unsafe impl<F> Sync for Allocator<F> {}
+
+impl<F: Copy> Allocator<F> {
+    /// The allocator in libxml2's global `name`, reached through `accessor`
+    /// where the release has one; `None` when neither exists or the global
+    /// holds no function.
+    ///
+    /// # Safety
+    /// `F` is the function pointer type of the global.
+    unsafe fn resolve(name: &str, accessor: &str) -> Option<Self> {
+        let through = symbol(accessor);
+        let allocator = if through.is_null() {
+            let global = symbol(name).cast::<Option<F>>().cast_const();
+            if global.is_null() {
+                return None;
+            }
+            Self::Global(global)
+        } else {
+            // SAFETY: the accessor takes no argument and returns the
+            // global's address.
+            Self::Accessor(unsafe {
+                std::mem::transmute::<*mut c_void, unsafe extern "C" fn() -> *const Option<F>>(
+                    through,
+                )
+            })
+        };
+        // SAFETY: by the caller's contract.
+        unsafe { allocator.get() }.map(|_| allocator)
+    }
+
+    /// The function the global holds now.
+    ///
+    /// # Safety
+    /// `F` is the function pointer type of the global.
+    unsafe fn get(&self) -> Option<F> {
+        let global = match self {
+            Self::Global(global) => *global,
+            // SAFETY: libxml2's accessor, callable on any thread.
+            Self::Accessor(accessor) => unsafe { accessor() },
+        };
+        // SAFETY: the global holds a function pointer of type `F` or null.
+        unsafe { global.as_ref() }.copied().flatten()
+    }
+}
+
 /// The resolved libxml2.
 struct Loaded {
     version: u32,
     functions: Functions,
-    free: FreeFn,
-    malloc: MallocFn,
-    realloc: ReallocFn,
+    free: Allocator<FreeFn>,
+    malloc: Allocator<MallocFn>,
+    realloc: Allocator<ReallocFn>,
     /// `xmlCtxtSetOptions`, from libxml2 2.13 on.
     set_options: Option<OptionsFn>,
     /// `xmlCtxtPushInput` (2.14 on) or, before it, `inputPush`.
@@ -193,9 +254,9 @@ impl Loaded {
         // the accessor threaded releases before 2.12 reach it through.
         let (free, malloc, realloc) = unsafe {
             (
-                allocator::<FreeFn>("xmlFree\0", "__xmlFree\0")?,
-                allocator::<MallocFn>("xmlMalloc\0", "__xmlMalloc\0")?,
-                allocator::<ReallocFn>("xmlRealloc\0", "__xmlRealloc\0")?,
+                Allocator::<FreeFn>::resolve("xmlFree\0", "__xmlFree\0")?,
+                Allocator::<MallocFn>::resolve("xmlMalloc\0", "__xmlMalloc\0")?,
+                Allocator::<ReallocFn>::resolve("xmlRealloc\0", "__xmlRealloc\0")?,
             )
         };
         let optional = |name: &str| {
@@ -220,34 +281,6 @@ impl Loaded {
     }
 }
 
-/// The allocator function libxml2 keeps in the global `name`: read through
-/// `accessor` where the release has one (threaded builds before 2.12, whose
-/// headers define the name as a macro over it), else from the global. This is
-/// the function a caller compiled against libxml2's headers calls as
-/// `xmlFree` and the like. `xmlMemGet` is not used: some vendor builds
-/// (macOS) return failure from it.
-///
-/// # Safety
-/// `F` is the function pointer type of the global.
-unsafe fn allocator<F: Copy>(name: &str, accessor: &str) -> Option<F> {
-    let through = symbol(accessor);
-    let global = if through.is_null() {
-        symbol(name).cast::<Option<F>>().cast_const()
-    } else {
-        // SAFETY: the accessor takes no argument and returns the global's
-        // address.
-        unsafe {
-            std::mem::transmute::<*mut c_void, unsafe extern "C" fn() -> *const Option<F>>(through)(
-            )
-        }
-    };
-    if global.is_null() {
-        return None;
-    }
-    // SAFETY: the global holds a function pointer of type `F` or null.
-    unsafe { global.read() }
-}
-
 /// The resolved libxml2, resolving it on first use; a failed resolution is
 /// retried, since libxml2 may be loaded later than this library.
 fn load() -> Option<&'static Loaded> {
@@ -262,6 +295,8 @@ fn load() -> Option<&'static Loaded> {
     Some(LOADED.get_or_init(|| loaded))
 }
 
+// A plain `expect` for a programmer invariant: `clippy::expect_used` is not
+// enabled here, so a `#[expect]` for it would itself fail the build.
 fn loaded() -> &'static Loaded {
     load().expect("the calling entry point checked that libxml2 is available")
 }
@@ -287,8 +322,14 @@ pub fn version() -> Option<u32> {
 /// [`available`] is true.
 #[must_use]
 pub unsafe fn xml_malloc(size: usize) -> *mut c_void {
-    // SAFETY: libxml2's allocator accepts any size and reports failure as null.
-    unsafe { (loaded().malloc)(size) }
+    // SAFETY: libxml2's allocator accepts any size and reports failure as
+    // null; a cleared global is a failed allocation.
+    unsafe {
+        loaded()
+            .malloc
+            .get()
+            .map_or(std::ptr::null_mut(), |malloc| malloc(size))
+    }
 }
 
 /// Resizes with the caller's libxml2 allocator (`xmlRealloc`).
@@ -297,8 +338,14 @@ pub unsafe fn xml_malloc(size: usize) -> *mut c_void {
 /// [`available`] is true; `mem` is null or came from [`xml_malloc`] or this
 /// function and was not freed.
 pub unsafe fn xml_realloc(mem: *mut c_void, size: usize) -> *mut c_void {
-    // SAFETY: by the caller's contract.
-    unsafe { (loaded().realloc)(mem, size) }
+    // SAFETY: by the caller's contract; a cleared global is a failed
+    // resize, which leaves `mem` as it was.
+    unsafe {
+        loaded()
+            .realloc
+            .get()
+            .map_or(std::ptr::null_mut(), |realloc| realloc(mem, size))
+    }
 }
 
 /// Frees with the caller's libxml2 allocator (`xmlFree`).
@@ -307,8 +354,12 @@ pub unsafe fn xml_realloc(mem: *mut c_void, size: usize) -> *mut c_void {
 /// [`available`] is true; `mem` is null or a live allocation of libxml2's
 /// allocator.
 pub unsafe fn xml_free(mem: *mut c_void) {
-    // SAFETY: by the caller's contract.
-    unsafe { (loaded().free)(mem) }
+    // SAFETY: by the caller's contract. libxml2 never clears the global; were
+    // it cleared, no function could free `mem`, which then stays allocated.
+    if let Some(free) = unsafe { loaded().free.get() } {
+        // SAFETY: as above.
+        unsafe { free(mem) }
+    }
 }
 
 /// `xmlCtxtSetOptions`, or `None` on a release before 2.13, which lacks it.

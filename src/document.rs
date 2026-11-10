@@ -526,6 +526,10 @@ struct ParsedDocument<'input> {
     /// from, indexed by arena position; empty for a parsed document.
     #[cfg(feature = "external-tree")]
     external: Vec<Option<crate::xml::dom::external::ExternalNode>>,
+    /// For a tree-backed document, the tree nodes of each text node joined
+    /// from adjacent tree text.
+    #[cfg(feature = "external-tree")]
+    external_runs: crate::xml::dom::external::TextRuns,
     /// For a tree-backed document, the content bytes its projection read,
     /// which stand for the serialization's length in size checks.
     #[cfg(feature = "external-tree")]
@@ -3065,6 +3069,25 @@ impl<'a> DocumentView<'a> {
             .flatten()
     }
 
+    /// The tree nodes a text node of a tree-backed document was joined from,
+    /// in order, when the tree holds that text as adjacent nodes (text and
+    /// CDATA); `None` for any other node. An entry is `None` for text an
+    /// entity expansion produced. Such a text node has no
+    /// [`Self::external_node_of`]: no one tree node is it, so it accepts no
+    /// edit, but a selection over the tree can judge each of its nodes.
+    #[cfg(feature = "external-tree")]
+    #[must_use]
+    pub fn external_text_run_of(
+        self,
+        node: Node<'_, '_>,
+    ) -> Option<&'a [Option<crate::document::external::ExternalNode>]> {
+        let runs = &self.parsed.external_runs;
+        let position = node.id().get_usize();
+        runs.binary_search_by_key(&position, |(at, _)| *at)
+            .ok()
+            .map(|found| runs[found].1.as_slice())
+    }
+
     /// The node of this view's tree projected from `external`, if any.
     #[cfg(feature = "external-tree")]
     #[must_use]
@@ -3273,6 +3296,8 @@ fn build_semantic_cell(
             #[cfg(feature = "external-tree")]
             external: Vec::new(),
             #[cfg(feature = "external-tree")]
+            external_runs: Vec::new(),
+            #[cfg(feature = "external-tree")]
             external_bytes: 0,
         })
     })?;
@@ -3340,7 +3365,12 @@ fn project_external(
     let cell = DocumentCell::try_new(String::new(), |source| {
         let mut sink = TreeSink::new(source, tree.document(), limits)?;
         tree.project(&mut sink)?;
-        let (document, external, metrics) = sink.finish()?;
+        let crate::xml::dom::external::Projection {
+            document,
+            nodes: external,
+            runs: external_runs,
+            metrics,
+        } = sink.finish()?;
         has_dtd = metrics.has_dtd;
         #[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
         let _ = metrics.peak_namespace_bindings;
@@ -3355,6 +3385,7 @@ fn project_external(
             #[cfg(feature = "xmldsig")]
             parse_work: metrics.bytes,
             external,
+            external_runs,
             external_bytes: metrics.bytes,
         })
     })?;
@@ -3369,7 +3400,10 @@ fn project_external(
     any(feature = "xmldsig", feature = "xmlenc")
 ))]
 fn same_projection(current: &ParsedDocument<'_>, next: &ParsedDocument<'_>) -> bool {
-    if current.external != next.external || current.external_bytes != next.external_bytes {
+    if current.external != next.external
+        || current.external_runs != next.external_runs
+        || current.external_bytes != next.external_bytes
+    {
         return false;
     }
     let mut left = current.document.root().descendants();

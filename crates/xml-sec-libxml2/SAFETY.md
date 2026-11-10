@@ -3,8 +3,10 @@
 `src/ffi.rs` and its submodules are the crate's only code with `unsafe`. It reads
 and links the caller's libxml2 nodes directly and calls the libxml2 functions
 that create, unlink and free them. The crate does not link libxml2:
-`src/ffi/libxml2.rs` resolves those functions, and libxml2's allocator, by name
-in the running process, where the caller's libxml2 is loaded. The clean C API it
+`src/ffi/libxml2.rs` resolves those functions, and libxml2's allocator globals, by
+name in the running process, where the caller's libxml2 is loaded; the globals
+are read on every allocation, so an allocator the caller installs later is the
+one used. The clean C API it
 reexports keeps its own contract
 ([`xml-sec-capi/SAFETY.md`](../xml-sec-capi/SAFETY.md)); this file records what
 the bridge adds.

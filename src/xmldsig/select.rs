@@ -219,7 +219,17 @@ impl<'a, 'r> Selector<'a, 'r> {
         let mut nodes = Vec::new();
         for node in document.root().descendants() {
             if selected.contains(node) {
-                nodes.push(SelectedNode::Node(external(node)?));
+                // A text node joined from adjacent tree text is each of its
+                // tree nodes; one an entity produced has no node to name.
+                match view.external_text_run_of(node) {
+                    Some(run) => {
+                        for part in run {
+                            let part = part.ok_or(TransformError::CrossDocumentNodeSetInput)?;
+                            nodes.push(SelectedNode::Node(part));
+                        }
+                    }
+                    None => nodes.push(SelectedNode::Node(external(node)?)),
+                }
             }
             if !node.is_element() {
                 continue;

@@ -65,6 +65,39 @@ pub(crate) struct XmlSecTransformCtx {
     pub(crate) reserved0: *mut c_void,
 }
 
+/// What one run of a context has spent of the policy's per-chain budgets.
+/// Every transform of the chain charges the same budget, as the core charges
+/// one budget across a reference's transforms; the context's `reserved0`
+/// holds it from its first charge until the context is reset.
+#[derive(Default)]
+pub(crate) struct RunBudget {
+    pub(crate) base64_input: usize,
+    pub(crate) base64_output: usize,
+}
+
+/// The run budget of `ctx`, created on first use.
+///
+/// # Safety
+/// `ctx` is an initialized context.
+pub(crate) unsafe fn run_budget<'a>(ctx: *mut XmlSecTransformCtx) -> &'a mut RunBudget {
+    // SAFETY: by the caller's contract; `reserved0` is null or the budget
+    // this function created, which only reset frees.
+    unsafe {
+        if (*ctx).reserved0.is_null() {
+            (*ctx).reserved0 = Box::into_raw(Box::<RunBudget>::default()).cast();
+        }
+        &mut *(*ctx).reserved0.cast::<RunBudget>()
+    }
+}
+
+/// Charges `amount` to `spent` within `limit`; refused once the total would
+/// pass it.
+pub(crate) fn charge(spent: &mut usize, amount: usize, limit: usize) -> Option<()> {
+    let total = spent.checked_add(amount).filter(|total| *total <= limit)?;
+    *spent = total;
+    Some(())
+}
+
 /// The binary chunk size of contexts initialized from now on (64 KiB).
 static DEFAULT_CHUNK_SIZE: AtomicUsize = AtomicUsize::new(64 * 1024);
 /// The maximum transform depth of contexts initialized from now on.
@@ -324,6 +357,10 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxReset(ctx: *mut XmlSecTransfor
             };
             context.result = std::ptr::null_mut();
             context.status = STATUS_NONE;
+            if !context.reserved0.is_null() {
+                drop(Box::from_raw(context.reserved0.cast::<RunBudget>()));
+                context.reserved0 = std::ptr::null_mut();
+            }
             if !context.extra_key_data.is_null() {
                 xmlSecPtrListDestroy(context.extra_key_data);
                 context.extra_key_data = std::ptr::null_mut();
@@ -733,7 +770,18 @@ unsafe fn select_fragment(
                 return result;
             } else {
                 // A bare name is an id reference; `xpointer(id('...'))` handles
-                // numeric and other names an XPointer shorthand cannot.
+                // numeric and other names an XPointer shorthand cannot. The
+                // name is the content of an XPath string literal inside
+                // XPointer scheme data, so a quote would end the literal, and
+                // a parenthesis or circumflex would change the scheme data
+                // (XPointer Framework section 3.1, `escaped`); libxmlsec1
+                // copies it unchecked and selects whatever it then spells.
+                if fragment[1..]
+                    .iter()
+                    .any(|byte| matches!(byte, b'\'' | b'(' | b')' | b'^'))
+                {
+                    return -1;
+                }
                 let mut expression = b"xpointer(id('".to_vec();
                 expression.extend_from_slice(&fragment[1..]);
                 expression.extend_from_slice(b"'))");

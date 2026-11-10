@@ -126,7 +126,11 @@ pub(crate) fn exported_strings(
             .map_err(|error| format!("section of {name}: {error}"))?;
         let start = usize::try_from(address - section.address())
             .map_err(|_| format!("{name} lies beyond the address space"))?;
-        let rest = &data[start..];
+        // A section without file contents (`.bss`) has fewer bytes than its
+        // address range.
+        let rest = data
+            .get(start..)
+            .ok_or_else(|| format!("{name} lies beyond the bytes of its section"))?;
         let end = rest
             .iter()
             .position(|&byte| byte == 0)

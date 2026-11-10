@@ -11,6 +11,15 @@ use super::{
 };
 use crate::ffi::{ALLOC_MODE_DOUBLE, ALLOC_MODE_EXACT};
 use std::mem::MaybeUninit;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
+/// Held by every test whose sizes depend on the process-wide default mode
+/// and initial size, so the test that changes them never runs beside one
+/// that reads them, whatever the runner's threading.
+fn defaults() -> MutexGuard<'static, ()> {
+    static DEFAULTS: Mutex<()> = Mutex::new(());
+    DEFAULTS.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// A created buffer, destroyed on drop.
 struct Buffer(*mut XmlSecBuffer);
@@ -69,6 +78,7 @@ impl Drop for Buffer {
 /// default 1024 bytes, all zero.
 #[test]
 fn creation_allocates_like_libxmlsec1() {
+    let _defaults = defaults();
     let empty = Buffer::new(0);
     assert_eq!((empty.size(), empty.max_size()), (0, 0));
     // SAFETY: the buffer is live.
@@ -85,6 +95,7 @@ fn creation_allocates_like_libxmlsec1() {
 /// buffer's mode: double mode grows to twice the needed size plus 32.
 #[test]
 fn append_and_prepend_grow_by_the_mode() {
+    let _defaults = defaults();
     let buf = Buffer::new(0);
     assert_eq!(buf.append(b"world"), 0);
     // SAFETY: the buffer is live and the slice readable.
@@ -108,9 +119,8 @@ fn append_and_prepend_grow_by_the_mode() {
 /// initialized after it is set.
 #[test]
 fn default_mode_applies_to_new_buffers() {
-    /// Puts the process-wide defaults back when the test ends, also by panic.
-    /// The test runner gives each test its own process, so no other test
-    /// observes the change while it is in place.
+    /// Puts the process-wide defaults back when the test ends, also by panic,
+    /// before the lock taken below is released.
     struct Restore(i32, usize);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -118,6 +128,7 @@ fn default_mode_applies_to_new_buffers() {
             super::DEFAULT_INITIAL_SIZE.store(self.1, std::sync::atomic::Ordering::Relaxed);
         }
     }
+    let _defaults = defaults();
     let _restore = Restore(
         super::DEFAULT_ALLOC_MODE.load(std::sync::atomic::Ordering::Relaxed),
         super::DEFAULT_INITIAL_SIZE.load(std::sync::atomic::Ordering::Relaxed),
@@ -159,6 +170,7 @@ fn removed_bytes_are_zeroed() {
 /// allocation, and finalizing releases it.
 #[test]
 fn set_empty_and_finalize() {
+    let _defaults = defaults();
     let buf = Buffer::new(0);
     // SAFETY: the buffer is live and the slices readable.
     unsafe {
@@ -178,6 +190,7 @@ fn set_empty_and_finalize() {
 /// A buffer the caller owns is initialized and finalized in place.
 #[test]
 fn caller_owned_buffer_initializes_in_place() {
+    let _defaults = defaults();
     let mut storage = MaybeUninit::<XmlSecBuffer>::uninit();
     let buf = storage.as_mut_ptr();
     // SAFETY: `storage` is writable memory of a buffer's size.
@@ -194,6 +207,7 @@ fn caller_owned_buffer_initializes_in_place() {
 /// Growing never shrinks the allocation; swap exchanges whole contents.
 #[test]
 fn max_size_and_swap() {
+    let _defaults = defaults();
     let left = Buffer::new(0);
     let right = Buffer::new(0);
     left.append(b"left");
@@ -244,6 +258,7 @@ fn reverse_in_place() {
 /// allocation: 1030 bytes leave 2080 bytes allocated, not 2 * 1030 + 32.
 #[test]
 fn read_file_appends_in_libxmlsec1_chunks() {
+    let _defaults = defaults();
     let dir = tempfile::tempdir().expect("scratch directory");
     let path = dir.path().join("data.bin");
     let contents: Vec<u8> = (0..1030u32)

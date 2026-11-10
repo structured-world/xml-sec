@@ -1,17 +1,21 @@
 //! The XML parser klass: the binary-to-XML adapter, which parses its input
-//! octets into a libxml2 document with the library's parser options and
-//! passes on that document as a tree node set it owns.
+//! octets into a libxml2 document with the library's parser options (less
+//! `XML_PARSE_HUGE`) and passes on that document as a tree node set it owns.
+//! A document is at most the policy's document size, counted over its pushes
+//! or its pops.
 
 use std::ffi::{c_int, c_void};
 
 use super::super::nodeset::{TREE, XmlSecNodeSet, xmlSecNodeSetCreate, xmlSecNodeSetDocDestroy};
 use super::super::parser::{
-    ParserCtxt, free_ctxt, options, prepare_ctxt, push_input, take_doc, xmlCreatePushParserCtxt,
-    xmlParseChunk, xmlParseDocument,
+    ParserCtxt, free_ctxt, prepare_ctxt, push_input, take_doc, transform_options,
+    xmlCreatePushParserCtxt, xmlParseChunk, xmlParseDocument,
 };
+use super::super::policy;
 use super::super::tree::xmlFreeDoc;
 use super::builtin::klass;
-use super::io::xmlSecTransformCreateInputBuffer;
+use super::ctx::charge;
+use super::io::bounded_input_buffer;
 use super::{
     STATUS_FINISHED, STATUS_NONE, STATUS_WORKING, USAGE_DSIG_TRANSFORM, WithContext,
     XmlSecTransform, XmlSecTransformCtx, XmlSecTransformKlass, context, xmlSecTransformPushXml,
@@ -129,7 +133,7 @@ unsafe extern "C" fn push_bin(
                 if slot.is_null() {
                     return -1;
                 }
-                prepare_ctxt(*slot, options());
+                prepare_ctxt(*slot, transform_options());
                 object.status = STATUS_WORKING;
             }
             STATUS_WORKING => {}
@@ -137,6 +141,16 @@ unsafe extern "C" fn push_bin(
             _ => return -1,
         }
         if !data.is_null() && size > 0 {
+            let Some(policy) = policy::verification() else {
+                return -1;
+            };
+            // The octets of this document pushed so far live in `reserved0`,
+            // as the object's tail is libxmlsec1's single parser pointer.
+            let mut pushed = object.reserved0.addr();
+            if charge(&mut pushed, size, policy.resources.max_xml_document_bytes).is_none() {
+                return -1;
+            }
+            object.reserved0 = std::ptr::without_provenance_mut(pushed);
             let Ok(len) = c_int::try_from(size) else {
                 return -1;
             };
@@ -188,10 +202,13 @@ unsafe extern "C" fn pop_xml(
             }
             _ => return -1,
         }
+        let Some(policy) = policy::verification() else {
+            return -1;
+        };
         if object.prev.is_null() || !libxml2::available() {
             return -1;
         }
-        let input = xmlSecTransformCreateInputBuffer(object.prev, ctx);
+        let input = bounded_input_buffer(object.prev, ctx, policy.resources.max_xml_document_bytes);
         if input.is_null() {
             return -1;
         }
@@ -200,7 +217,7 @@ unsafe extern "C" fn pop_xml(
             xmlFreeParserInputBuffer(input);
             return -1;
         }
-        prepare_ctxt(parser, options());
+        prepare_ctxt(parser, transform_options());
         let stream = xmlNewIOInputStream(parser, input, ENCODING_NONE);
         if stream.is_null() {
             free_ctxt(parser);
