@@ -1,7 +1,8 @@
 [package]
 name = "xml-sec-xmlsec1"
 edition = "2024"
-rust-version = "1.95"
+# C-variadic definitions (`xmlSecError`) are stable from 1.99.
+rust-version = "1.99"
 license = "Apache-2.0 AND MIT"
 publish = false
 description = "libxmlsec1 source and extension compatibility over the xml-sec core"

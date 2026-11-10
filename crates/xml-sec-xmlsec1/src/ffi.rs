@@ -11,6 +11,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 pub(crate) mod base64;
 pub(crate) mod buffer;
+pub(crate) mod errors;
 pub(crate) mod keysdata;
 pub(crate) mod list;
 pub(crate) mod nodeset;

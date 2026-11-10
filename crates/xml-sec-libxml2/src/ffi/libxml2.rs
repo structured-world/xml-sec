@@ -169,74 +169,83 @@ functions! {
     xml_output_buffer_close = "xmlOutputBufferClose" fn(out: *mut c_void) -> c_int;
 }
 
-/// Where libxml2 keeps one allocator function, read on every call as the
-/// `xmlMalloc`/`xmlFree` names of libxml2's headers read it, so an allocator
-/// the caller installs later is the one used. `xmlMemGet` is not used: some
-/// vendor builds (macOS) return failure from it.
-enum Allocator<F> {
+/// Where libxml2 keeps one of its global variables, read on every use as the
+/// names of libxml2's headers read it, so a value the caller sets later (an
+/// allocator, an error handler) is the one used. `xmlMemGet` is not used for
+/// the allocator: some vendor builds (macOS) return failure from it.
+enum Global<T> {
     /// The global itself.
-    Global(*const Option<F>),
+    Address(*const T),
     /// The accessor of threaded releases before 2.12, whose headers define
     /// the name as a call to it; it returns the calling thread's slot.
-    Accessor(unsafe extern "C" fn() -> *const Option<F>),
+    Accessor(unsafe extern "C" fn() -> *const T),
 }
 
 // SAFETY: the pointers are libxml2's process-wide globals and accessor,
 // valid for the life of the process and read as libxml2's callers read them.
-unsafe impl<F> Send for Allocator<F> {}
+unsafe impl<T> Send for Global<T> {}
 // SAFETY: as above.
-unsafe impl<F> Sync for Allocator<F> {}
+unsafe impl<T> Sync for Global<T> {}
 
-impl<F: Copy> Allocator<F> {
-    /// The allocator in libxml2's global `name`, reached through `accessor`
-    /// where the release has one; `None` when neither exists or the global
-    /// holds no function.
+impl<T: Copy> Global<T> {
+    /// libxml2's global `name`, reached through `accessor` where the release
+    /// has one; `None` when neither exists.
     ///
     /// # Safety
-    /// `F` is the function pointer type of the global.
+    /// `T` is the type of the global.
     unsafe fn resolve(name: &str, accessor: &str) -> Option<Self> {
         let through = symbol(accessor);
-        let allocator = if through.is_null() {
-            let global = symbol(name).cast::<Option<F>>().cast_const();
-            if global.is_null() {
-                return None;
-            }
-            Self::Global(global)
-        } else {
-            // SAFETY: the accessor takes no argument and returns the
-            // global's address.
-            Self::Accessor(unsafe {
-                std::mem::transmute::<*mut c_void, unsafe extern "C" fn() -> *const Option<F>>(
-                    through,
-                )
-            })
-        };
-        // SAFETY: by the caller's contract.
-        unsafe { allocator.get() }.map(|_| allocator)
+        if through.is_null() {
+            let global = symbol(name).cast::<T>().cast_const();
+            return (!global.is_null()).then_some(Self::Address(global));
+        }
+        // SAFETY: the accessor takes no argument and returns the global's
+        // address.
+        Some(Self::Accessor(unsafe {
+            std::mem::transmute::<*mut c_void, unsafe extern "C" fn() -> *const T>(through)
+        }))
     }
 
-    /// The function the global holds now.
+    /// The value the global holds now; `None` when an accessor returns no
+    /// slot.
     ///
     /// # Safety
-    /// `F` is the function pointer type of the global.
-    unsafe fn get(&self) -> Option<F> {
+    /// `T` is the type of the global.
+    unsafe fn get(&self) -> Option<T> {
         let global = match self {
-            Self::Global(global) => *global,
+            Self::Address(global) => *global,
             // SAFETY: libxml2's accessor, callable on any thread.
             Self::Accessor(accessor) => unsafe { accessor() },
         };
-        // SAFETY: the global holds a function pointer of type `F` or null.
-        unsafe { global.as_ref() }.copied().flatten()
+        // SAFETY: the global holds a value of type `T`.
+        unsafe { global.as_ref() }.copied()
     }
 }
+
+/// libxml2's allocator global `name`, which must hold a function.
+///
+/// # Safety
+/// `F` is the function pointer type of the global.
+unsafe fn allocator<F: Copy>(name: &str, accessor: &str) -> Option<Global<Option<F>>> {
+    // SAFETY: by the caller's contract.
+    unsafe {
+        let global = Global::<Option<F>>::resolve(name, accessor)?;
+        global.get().flatten().map(|_| global)
+    }
+}
+
+/// libxml2's `xmlGenericErrorFunc`.
+type GenericErrorFn = unsafe extern "C" fn(*mut c_void, *const c_char, ...);
 
 /// The resolved libxml2.
 struct Loaded {
     version: u32,
     functions: Functions,
-    free: Allocator<FreeFn>,
-    malloc: Allocator<MallocFn>,
-    realloc: Allocator<ReallocFn>,
+    free: Global<Option<FreeFn>>,
+    malloc: Global<Option<MallocFn>>,
+    realloc: Global<Option<ReallocFn>>,
+    /// `xmlGenericError` and `xmlGenericErrorContext`.
+    generic_error: Option<(Global<Option<GenericErrorFn>>, Global<*mut c_void>)>,
     /// `xmlCtxtSetOptions`, from libxml2 2.13 on.
     set_options: Option<OptionsFn>,
     /// `xmlCtxtPushInput` (2.14 on) or, before it, `inputPush`.
@@ -254,10 +263,18 @@ impl Loaded {
         // the accessor threaded releases before 2.12 reach it through.
         let (free, malloc, realloc) = unsafe {
             (
-                Allocator::<FreeFn>::resolve("xmlFree\0", "__xmlFree\0")?,
-                Allocator::<MallocFn>::resolve("xmlMalloc\0", "__xmlMalloc\0")?,
-                Allocator::<ReallocFn>::resolve("xmlRealloc\0", "__xmlRealloc\0")?,
+                allocator::<FreeFn>("xmlFree\0", "__xmlFree\0")?,
+                allocator::<MallocFn>("xmlMalloc\0", "__xmlMalloc\0")?,
+                allocator::<ReallocFn>("xmlRealloc\0", "__xmlRealloc\0")?,
             )
+        };
+        // SAFETY: libxml2's generic error handler and its context, or the
+        // accessors threaded releases before 2.12 reach them through.
+        let generic_error = unsafe {
+            Global::resolve("xmlGenericError\0", "__xmlGenericError\0").zip(Global::resolve(
+                "xmlGenericErrorContext\0",
+                "__xmlGenericErrorContext\0",
+            ))
         };
         let optional = |name: &str| {
             let address = symbol(name);
@@ -269,6 +286,7 @@ impl Loaded {
             free,
             malloc,
             realloc,
+            generic_error,
             // SAFETY: `xmlCtxtSetOptions(xmlParserCtxtPtr, int) -> int`.
             set_options: optional("xmlCtxtSetOptions\0")
                 .map(|address| unsafe { std::mem::transmute::<*mut c_void, OptionsFn>(address) }),
@@ -328,6 +346,7 @@ pub unsafe fn xml_malloc(size: usize) -> *mut c_void {
         loaded()
             .malloc
             .get()
+            .flatten()
             .map_or(std::ptr::null_mut(), |malloc| malloc(size))
     }
 }
@@ -344,6 +363,7 @@ pub unsafe fn xml_realloc(mem: *mut c_void, size: usize) -> *mut c_void {
         loaded()
             .realloc
             .get()
+            .flatten()
             .map_or(std::ptr::null_mut(), |realloc| realloc(mem, size))
     }
 }
@@ -356,9 +376,29 @@ pub unsafe fn xml_realloc(mem: *mut c_void, size: usize) -> *mut c_void {
 pub unsafe fn xml_free(mem: *mut c_void) {
     // SAFETY: by the caller's contract. libxml2 never clears the global; were
     // it cleared, no function could free `mem`, which then stays allocated.
-    if let Some(free) = unsafe { loaded().free.get() } {
+    if let Some(free) = unsafe { loaded().free.get() }.flatten() {
         // SAFETY: as above.
         unsafe { free(mem) }
+    }
+}
+
+/// Writes `message` through libxml2's current generic error handler
+/// (`xmlGenericError(xmlGenericErrorContext, "%s", message)`), as libxml2's
+/// callers report errors; nothing when the release has no handler.
+///
+/// # Safety
+/// [`available`] is true.
+pub unsafe fn xml_generic_error(message: &CStr) {
+    let Some((handler, context)) = &loaded().generic_error else {
+        return;
+    };
+    // SAFETY: the globals hold libxml2's handler and its context; the handler
+    // takes a printf format, and "%s" consumes exactly the one string passed.
+    unsafe {
+        if let Some(Some(handler)) = handler.get() {
+            let context = context.get().unwrap_or(std::ptr::null_mut());
+            handler(context, c"%s".as_ptr(), message.as_ptr());
+        }
     }
 }
 

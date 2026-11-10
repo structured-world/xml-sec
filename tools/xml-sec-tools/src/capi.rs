@@ -128,6 +128,7 @@ impl Target {
                 "tests/c/xpath.c",
                 "tests/c/parser.c",
                 "tests/c/keysdata.c",
+                "tests/c/errors.c",
             ],
         }
     }
@@ -256,32 +257,34 @@ pub(crate) fn declared(header: &str) -> BTreeSet<String> {
 }
 
 /// Function names starting with `prefix` that `header` declares: the
-/// identifier right before a parameter list (libxmlsec1 aligns its
-/// parameter lists with spaces), outside comments and preprocessor lines.
+/// identifier right before a parameter list, outside comments and
+/// preprocessor lines. libxmlsec1 aligns its parameter lists with spaces and
+/// sometimes starts one on the line after the name.
 pub(crate) fn declared_with(header: &str, prefix: &str) -> BTreeSet<String> {
     let identifier = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let code: Vec<&str> = header
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !["/*", "*", "#"]
+                .iter()
+                .any(|start| trimmed.starts_with(start))
+        })
+        .collect();
+    let code = code.join("\n");
     let mut names = BTreeSet::new();
-    for line in header.lines() {
-        let trimmed = line.trim_start();
-        if ["/*", "*", "#"]
-            .iter()
-            .any(|start| trimmed.starts_with(start))
-        {
-            continue;
-        }
-        let mut rest = line;
-        while let Some(open) = rest.find('(') {
-            let before = rest[..open].trim_end();
-            let start = before
-                .rfind(|c: char| !identifier(c))
-                .map_or(0, |at| at + 1);
-            rest = &rest[open + 1..];
-            // `type (*name)(...)` declares a function pointer, whose return
-            // type is not a function.
-            let pointer = rest.trim_start().starts_with('*');
-            if !pointer && before[start..].starts_with(prefix) {
-                names.insert(before[start..].to_owned());
-            }
+    let mut rest = code.as_str();
+    while let Some(open) = rest.find('(') {
+        let before = rest[..open].trim_end();
+        let start = before
+            .rfind(|c: char| !identifier(c))
+            .map_or(0, |at| at + 1);
+        rest = &rest[open + 1..];
+        // `type (*name)(...)` declares a function pointer, whose return type
+        // is not a function.
+        let pointer = rest.trim_start().starts_with('*');
+        if !pointer && before[start..].starts_with(prefix) {
+            names.insert(before[start..].to_owned());
         }
     }
     names
