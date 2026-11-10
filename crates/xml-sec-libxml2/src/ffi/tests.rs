@@ -1342,23 +1342,30 @@ fn untouched_nodes_of_every_kind_keep_their_pointers_through_an_operation() {
     unsafe { check_links(doc.0.cast(), (*doc.0).children) };
 }
 
-/// Allocations through the counting allocator below.
-static COUNTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    /// Calls of the counting allocator below on this thread: while it is
+    /// installed, other threads of the test process allocate through it too.
+    static COUNTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn count_call() {
+    COUNTED.with(|count| count.set(count.get() + 1));
+}
 
 unsafe extern "C" fn counting_malloc(size: usize) -> *mut c_void {
-    COUNTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    count_call();
     // SAFETY: the C allocator, which libxml2's default one is.
     unsafe { libc::malloc(size) }
 }
 
 unsafe extern "C" fn counting_realloc(mem: *mut c_void, size: usize) -> *mut c_void {
-    COUNTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    count_call();
     // SAFETY: as above.
     unsafe { libc::realloc(mem, size) }
 }
 
 unsafe extern "C" fn counting_free(mem: *mut c_void) {
-    COUNTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    count_call();
     // SAFETY: as above.
     unsafe { libc::free(mem) }
 }
@@ -1393,7 +1400,6 @@ unsafe fn allocator_slot<F>(name: &str, accessor: &str) -> *mut Option<F> {
 /// vendor builds (macOS) refuse `xmlMemSetup` itself.
 #[test]
 fn a_later_installed_allocator_serves_the_library() {
-    use std::sync::atomic::Ordering;
     type Free = unsafe extern "C" fn(*mut c_void);
     type Malloc = unsafe extern "C" fn(usize) -> *mut c_void;
     type Realloc = unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void;
@@ -1410,10 +1416,10 @@ fn a_later_installed_allocator_serves_the_library() {
         free.write(Some(counting_free));
         malloc.write(Some(counting_malloc));
         realloc.write(Some(counting_realloc));
-        let before = COUNTED.load(Ordering::Relaxed);
+        let before = COUNTED.with(std::cell::Cell::get);
         let memory = libxml2::xml_realloc(libxml2::xml_malloc(8), 16);
         libxml2::xml_free(memory);
-        let counted = COUNTED.load(Ordering::Relaxed) - before;
+        let counted = COUNTED.with(std::cell::Cell::get) - before;
         free.write(saved.0);
         malloc.write(saved.1);
         realloc.write(saved.2);
