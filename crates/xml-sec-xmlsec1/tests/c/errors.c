@@ -42,9 +42,12 @@ static void record(const char *file, int line, const char *func, const char *obj
     }
     last_reason = reason;
     ++reports;
-    if (printing) {
+    if (printing == 1) {
         printf("  report: obj=%s subj=%s reason=%d msg=[%s]\n", safe(object), safe(subject),
                reason, safe(msg));
+    } else if (printing == 2) {
+        /* The message names the evaluator's own cause. */
+        printf("  report: obj=%s subj=%s reason=%d\n", safe(object), safe(subject), reason);
     }
 }
 
@@ -182,6 +185,11 @@ static void transform_context(void) {
         "<Transform/>"
         "<Transform Algorithm='urn:unknown'/>"
         "<Transform Algorithm='http://www.w3.org/2000/09/xmldsig#enveloped-signature'/>"
+        "<L><Transform Algorithm='http://www.w3.org/2002/06/xmldsig-filter2'>"
+        "<XPath xmlns='http://www.w3.org/2002/06/xmldsig-filter2'>/</XPath>"
+        "</Transform></L>"
+        "<L><Transform Algorithm='http://www.w3.org/TR/1999/REC-xpath-19991116'>"
+        "<Other/></Transform></L>"
         "<Other/>"
         "</T>";
     xmlDocPtr doc = xmlReadMemory(document, (int)strlen(document), "doc.xml", NULL, 0);
@@ -189,6 +197,8 @@ static void transform_context(void) {
     xmlNodePtr bare = xmlSecGetNextElementNode(root->children);
     xmlNodePtr unknown = xmlSecGetNextElementNode(bare->next);
     xmlNodePtr enveloped = xmlSecGetNextElementNode(unknown->next);
+    xmlNodePtr xpath2 = xmlSecGetNextElementNode(enveloped->next);
+    xmlNodePtr xpath = xmlSecGetNextElementNode(xpath2->next);
     xmlSecTransformCtx ctx;
 
     printing = 1;
@@ -238,6 +248,31 @@ static void transform_context(void) {
     xmlSecTransformCtxInitialize(&ctx);
     xmlSecTransformCtxNodeRead(&ctx, enveloped, xmlSecTransformUsageAny);
     end(xmlSecTransformCtxExecute(&ctx, doc));
+    xmlSecTransformCtxFinalize(&ctx);
+
+    printing = 2;
+    begin("xpointer selecting a missing id");
+    xmlSecTransformCtxInitialize(&ctx);
+    xmlSecTransformCtxSetUri(&ctx, BAD_CAST "#absent", root);
+    end(xmlSecTransformCtxExecute(&ctx, doc));
+    xmlSecTransformCtxFinalize(&ctx);
+
+    begin("visa3d selecting a missing id");
+    xmlSecTransformCtxInitialize(&ctx);
+    ctx.flags |= XMLSEC_TRANSFORMCTX_FLAGS_USE_VISA3D_HACK;
+    xmlSecTransformCtxSetUri(&ctx, BAD_CAST "#absent", root);
+    end(xmlSecTransformCtxExecute(&ctx, doc));
+    xmlSecTransformCtxFinalize(&ctx);
+    printing = 1;
+
+    begin("xpath2 transform without a filter");
+    xmlSecTransformCtxInitialize(&ctx);
+    end(xmlSecTransformCtxNodesListRead(&ctx, xpath2, xmlSecTransformUsageAny));
+    xmlSecTransformCtxFinalize(&ctx);
+
+    begin("xpath transform without an expression");
+    xmlSecTransformCtxInitialize(&ctx);
+    end(xmlSecTransformCtxNodesListRead(&ctx, xpath, xmlSecTransformUsageAny));
     xmlSecTransformCtxFinalize(&ctx);
 
     printing = 0;
