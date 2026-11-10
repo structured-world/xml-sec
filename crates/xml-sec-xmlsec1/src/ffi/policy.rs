@@ -5,6 +5,8 @@
 
 use std::sync::OnceLock;
 
+use super::errors::{self, Here};
+
 use xml_sec::policy::{
     CompiledPolicies, PolicyCompileContext, PolicyCompiler, PolicyProfile, VerificationPolicy,
 };
@@ -33,4 +35,14 @@ fn compiled() -> Option<&'static CompiledPolicies> {
 /// canonical output and transform work.
 pub(crate) fn verification() -> Option<&'static VerificationPolicy> {
     compiled()?.verification()
+}
+
+/// [`verification`] for the entry point at `here`, which reports the
+/// failure when the profile is unavailable.
+pub(crate) fn verification_at(here: Here) -> Option<&'static VerificationPolicy> {
+    let policy = verification();
+    if policy.is_none() {
+        errors::policy_unavailable(here);
+    }
+    policy
 }

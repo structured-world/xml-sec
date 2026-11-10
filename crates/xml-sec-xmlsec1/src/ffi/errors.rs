@@ -32,12 +32,16 @@ pub(crate) type ErrorsCallback = unsafe extern "C" fn(
 pub(crate) const R_XMLSEC_FAILED: c_int = 1;
 /// `XMLSEC_ERRORS_R_MALLOC_FAILED`.
 pub(crate) const R_MALLOC_FAILED: c_int = 2;
+/// `XMLSEC_ERRORS_R_STRDUP_FAILED`.
+pub(crate) const R_STRDUP_FAILED: c_int = 3;
 /// `XMLSEC_ERRORS_R_XML_FAILED`.
 pub(crate) const R_XML_FAILED: c_int = 5;
 /// `XMLSEC_ERRORS_R_IO_FAILED`.
 pub(crate) const R_IO_FAILED: c_int = 7;
 /// `XMLSEC_ERRORS_R_NOT_IMPLEMENTED`.
 pub(crate) const R_NOT_IMPLEMENTED: c_int = 9;
+/// `XMLSEC_ERRORS_R_INVALID_CONFIG`.
+pub(crate) const R_INVALID_CONFIG: c_int = 10;
 /// `XMLSEC_ERRORS_R_INVALID_SIZE`.
 pub(crate) const R_INVALID_SIZE: c_int = 11;
 /// `XMLSEC_ERRORS_R_INVALID_DATA`.
@@ -54,12 +58,18 @@ pub(crate) const R_INVALID_VERSION: c_int = 19;
 pub(crate) const R_INVALID_NODE: c_int = 21;
 /// `XMLSEC_ERRORS_R_INVALID_NODE_CONTENT`.
 pub(crate) const R_INVALID_NODE_CONTENT: c_int = 22;
+/// `XMLSEC_ERRORS_R_INVALID_NODE_ATTRIBUTE`.
+pub(crate) const R_INVALID_NODE_ATTRIBUTE: c_int = 23;
+/// `XMLSEC_ERRORS_R_UNEXPECTED_NODE`.
+pub(crate) const R_UNEXPECTED_NODE: c_int = 27;
 /// `XMLSEC_ERRORS_R_INVALID_TRANSFORM`.
 pub(crate) const R_INVALID_TRANSFORM: c_int = 31;
 /// `XMLSEC_ERRORS_R_INVALID_URI_TYPE`.
 pub(crate) const R_INVALID_URI_TYPE: c_int = 33;
 /// `XMLSEC_ERRORS_R_TRANSFORM_DISABLED`.
 pub(crate) const R_TRANSFORM_DISABLED: c_int = 35;
+/// `XMLSEC_ERRORS_R_INVALID_KEY_DATA_SIZE`.
+pub(crate) const R_INVALID_KEY_DATA_SIZE: c_int = 44;
 /// `XMLSEC_ERRORS_R_ASSERTION`.
 pub(crate) const R_ASSERTION: c_int = 100;
 /// `XMLSEC_ERROR_R_CAST_IMPOSSIBLE`.
@@ -591,6 +601,47 @@ pub(crate) fn unsupported_enum(here: Here, object: *const c_char, name: &str, va
     );
 }
 
+/// libxmlsec1's `xmlSecInvalidNodeAttributeError`.
+///
+/// # Safety
+/// `node` is null or a live node.
+pub(crate) unsafe fn invalid_node_attribute(
+    here: Here,
+    node: *const XmlNode,
+    attribute: &CStr,
+    object: *const c_char,
+    reason: &str,
+) {
+    // SAFETY: by the caller's contract.
+    let name = unsafe { node_name(node) };
+    report(
+        here,
+        object,
+        std::ptr::null(),
+        R_INVALID_NODE_ATTRIBUTE,
+        &format!(
+            "node={name}; attribute={}; reason={reason}",
+            attribute.to_string_lossy()
+        ),
+    );
+}
+
+/// libxmlsec1's `xmlSecUnexpectedNodeError`.
+///
+/// # Safety
+/// `node` is null or a live node.
+pub(crate) unsafe fn unexpected_node(here: Here, node: *const XmlNode, object: *const c_char) {
+    // SAFETY: by the caller's contract.
+    let name = unsafe { node_name(node) };
+    report(
+        here,
+        object,
+        std::ptr::null(),
+        R_UNEXPECTED_NODE,
+        &format!("node={name}"),
+    );
+}
+
 /// libxmlsec1's `xmlSecInvalidDataError`.
 pub(crate) fn invalid_data(here: Here, object: *const c_char, message: &str) {
     report(here, object, std::ptr::null(), R_INVALID_DATA, message);
@@ -617,6 +668,39 @@ pub(crate) fn assertion(here: Here, expression: &CStr) {
         expression.as_ptr(),
         R_ASSERTION,
         " ",
+    );
+}
+
+/// The library's compiled policy is unavailable, so no bounded work can run.
+pub(crate) fn policy_unavailable(here: Here) {
+    report(
+        here,
+        std::ptr::null(),
+        std::ptr::null(),
+        R_INVALID_CONFIG,
+        "the library policy did not compile",
+    );
+}
+
+/// Work refused because it exceeds the policy limit `limit` of `max`.
+pub(crate) fn limit_exceeded(here: Here, object: *const c_char, limit: &str, max: usize) {
+    report(
+        here,
+        object,
+        std::ptr::null(),
+        R_INVALID_SIZE,
+        &format!("limit={limit}; max={max}"),
+    );
+}
+
+/// libxmlsec1's `xmlSecStrdupError`: copying `text` failed.
+pub(crate) fn strdup_failed(here: Here, object: *const c_char, text: &[u8]) {
+    report(
+        here,
+        object,
+        c"xmlStrdup".as_ptr(),
+        R_STRDUP_FAILED,
+        &format!("size={}", text.len()),
     );
 }
 

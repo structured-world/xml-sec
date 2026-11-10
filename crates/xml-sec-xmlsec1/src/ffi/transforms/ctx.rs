@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use xml_sec_libxml2::ffi::{XmlDoc, XmlNode};
 
 use super::super::buffer::XmlSecBuffer;
+use super::super::errors::{self, check, here};
 use super::super::keysdata::{
     XmlSecKeyData, XmlSecKeyDataKlass, xmlSecKeyDataCreate, xmlSecKeyDataDestroy,
     xmlSecKeyDataListGetKlass,
@@ -24,7 +25,7 @@ use super::super::{contain, free, malloc, policy, write_stream};
 use super::{
     DATA_BIN, DATA_UNKNOWN, DATA_XML, FLAGS_USER_SPECIFIED, MODE_PUSH, STATUS_FINISHED,
     STATUS_NONE, STATUS_WORKING, XmlSecTransform, XmlSecTransformKlass, builtin, klass_text,
-    parser, valid, xml_text, xmlSecTransformConnect, xmlSecTransformCreate,
+    parser, valid, valid_or, xml_text, xmlSecTransformConnect, xmlSecTransformCreate,
     xmlSecTransformDebugDump, xmlSecTransformDebugXmlDump, xmlSecTransformDestroy,
     xmlSecTransformGetDataType, xmlSecTransformIdListDebugDump, xmlSecTransformIdListDebugXmlDump,
     xmlSecTransformIdListFind, xmlSecTransformIdListFindByHref, xmlSecTransformIdListGetKlass,
@@ -152,14 +153,24 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxExtraKeyDataGet(
     id: *const XmlSecKeyDataKlass,
 ) -> *mut XmlSecKeyData {
     contain(std::ptr::null_mut(), || {
+        let null = std::ptr::null_mut();
+        check!(
+            !ctx.is_null(),
+            "xmlSecTransformCtxExtraKeyDataGet",
+            c"ctx != NULL",
+            null
+        );
+        check!(
+            !id.is_null(),
+            "xmlSecTransformCtxExtraKeyDataGet",
+            c"dataId != xmlSecKeyDataIdUnknown",
+            null
+        );
         // SAFETY: by the caller's contract; the list holds key data.
         unsafe {
-            let Some(context) = ctx.as_ref() else {
-                return std::ptr::null_mut();
-            };
-            let list = context.extra_key_data;
-            if id.is_null() || list.is_null() {
-                return std::ptr::null_mut();
+            let list = (*ctx).extra_key_data;
+            if list.is_null() {
+                return null;
             }
             (0..xmlSecPtrListGetSize(list))
                 .map(|pos| xmlSecPtrListGetItem(list, pos).cast::<XmlSecKeyData>())
@@ -169,15 +180,23 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxExtraKeyDataGet(
     })
 }
 
-/// The context's extra key-data list, created on first use.
+/// The context's extra key-data list, created on first use; null after
+/// reporting the failure as the entry point at `here`.
 ///
 /// # Safety
 /// `ctx` is a context.
-unsafe fn extra_key_data(ctx: *mut XmlSecTransformCtx) -> *mut XmlSecPtrList {
+unsafe fn extra_key_data(ctx: *mut XmlSecTransformCtx, here: errors::Here) -> *mut XmlSecPtrList {
     // SAFETY: by the caller's contract; the context owns the list.
     unsafe {
         if (*ctx).extra_key_data.is_null() {
             (*ctx).extra_key_data = xmlSecPtrListCreate(xmlSecKeyDataListGetKlass());
+            if (*ctx).extra_key_data.is_null() {
+                errors::internal(
+                    here,
+                    std::ptr::null(),
+                    c"xmlSecPtrListCreate(xmlSecKeyDataListId)",
+                );
+            }
         }
         (*ctx).extra_key_data
     }
@@ -197,24 +216,42 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxExtraKeyDataEnsure(
         // SAFETY: by the caller's contract; a new object is destroyed when
         // the list does not take it.
         unsafe {
-            if ctx.is_null() || id.is_null() {
-                return std::ptr::null_mut();
-            }
+            let null = std::ptr::null_mut();
+            check!(
+                !ctx.is_null(),
+                "xmlSecTransformCtxExtraKeyDataEnsure",
+                c"ctx != NULL",
+                null
+            );
+            check!(
+                !id.is_null(),
+                "xmlSecTransformCtxExtraKeyDataEnsure",
+                c"dataId != xmlSecKeyDataIdUnknown",
+                null
+            );
+            let here = here!("xmlSecTransformCtxExtraKeyDataEnsure");
             let existing = xmlSecTransformCtxExtraKeyDataGet(ctx, id);
             if !existing.is_null() {
                 return existing;
             }
-            let list = extra_key_data(ctx);
+            let list = extra_key_data(ctx, here);
             if list.is_null() {
-                return std::ptr::null_mut();
+                return null;
             }
             let data = xmlSecKeyDataCreate(id);
             if data.is_null() {
+                errors::internal_with(
+                    here,
+                    std::ptr::null(),
+                    c"xmlSecKeyDataCreate",
+                    &format!("dataId={}", klass_text((*id).name)),
+                );
                 return data;
             }
             if xmlSecPtrListAdd(list, data.cast()) < 0 {
+                errors::internal(here, std::ptr::null(), c"xmlSecPtrListAdd");
                 xmlSecKeyDataDestroy(data);
-                return std::ptr::null_mut();
+                return null;
             }
             data
         }
@@ -235,14 +272,42 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxExtraKeyDataAdopt(
     contain(-1, || {
         // SAFETY: by the caller's contract.
         unsafe {
-            if ctx.is_null() || data.is_null() || (*data).id.is_null() {
-                return -1;
-            }
+            check!(
+                !ctx.is_null(),
+                "xmlSecTransformCtxExtraKeyDataAdopt",
+                c"ctx != NULL",
+                -1
+            );
+            check!(
+                !data.is_null(),
+                "xmlSecTransformCtxExtraKeyDataAdopt",
+                c"data != NULL",
+                -1
+            );
+            check!(
+                !(*data).id.is_null(),
+                "xmlSecTransformCtxExtraKeyDataAdopt",
+                c"data->id != xmlSecKeyDataIdUnknown",
+                -1
+            );
+            let here = here!("xmlSecTransformCtxExtraKeyDataAdopt");
             if !xmlSecTransformCtxExtraKeyDataGet(ctx, (*data).id).is_null() {
+                errors::invalid_data(
+                    here,
+                    std::ptr::null(),
+                    &format!(
+                        "extra key data of type '{}' already exists",
+                        klass_text((*(*data).id).name)
+                    ),
+                );
                 return -1;
             }
-            let list = extra_key_data(ctx);
-            if list.is_null() || xmlSecPtrListAdd(list, data.cast()) < 0 {
+            let list = extra_key_data(ctx, here);
+            if list.is_null() {
+                return -1;
+            }
+            if xmlSecPtrListAdd(list, data.cast()) < 0 {
+                errors::internal(here, std::ptr::null(), c"xmlSecPtrListAdd");
                 return -1;
             }
             0
@@ -260,10 +325,20 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxCreate() -> *mut XmlSecTransfo
     contain(std::ptr::null_mut(), || {
         let ctx = malloc(size_of::<XmlSecTransformCtx>()).cast::<XmlSecTransformCtx>();
         if ctx.is_null() {
+            errors::malloc_failed(
+                here!("xmlSecTransformCtxCreate"),
+                std::ptr::null(),
+                size_of::<XmlSecTransformCtx>(),
+            );
             return ctx;
         }
         // SAFETY: a fresh allocation of a context's size.
         if unsafe { xmlSecTransformCtxInitialize(ctx) } < 0 {
+            errors::internal(
+                here!("xmlSecTransformCtxCreate"),
+                std::ptr::null(),
+                c"xmlSecTransformCtxInitialize",
+            );
             // SAFETY: initialization left a finalizable context.
             unsafe { xmlSecTransformCtxDestroy(ctx) };
             return std::ptr::null_mut();
@@ -280,9 +355,12 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxCreate() -> *mut XmlSecTransfo
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecTransformCtxDestroy(ctx: *mut XmlSecTransformCtx) {
     contain((), || {
-        if ctx.is_null() {
-            return;
-        }
+        check!(
+            !ctx.is_null(),
+            "xmlSecTransformCtxDestroy",
+            c"ctx != NULL",
+            ()
+        );
         // SAFETY: a live created context, finalized then freed.
         unsafe {
             xmlSecTransformCtxFinalize(ctx);
@@ -301,9 +379,12 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxInitialize(
     ctx: *mut XmlSecTransformCtx,
 ) -> c_int {
     contain(-1, || {
-        if ctx.is_null() {
-            return -1;
-        }
+        check!(
+            !ctx.is_null(),
+            "xmlSecTransformCtxInitialize",
+            c"ctx != NULL",
+            -1
+        );
         // SAFETY: `ctx` is writable; it is zeroed before any field is read.
         unsafe {
             ctx.write_bytes(0, 1);
@@ -312,6 +393,11 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxInitialize(
                 xmlSecTransformIdListGetKlass(),
             ) < 0
             {
+                errors::internal(
+                    here!("xmlSecTransformCtxInitialize"),
+                    std::ptr::null(),
+                    c"xmlSecPtrListInitialize(xmlSecTransformIdListId)",
+                );
                 return -1;
             }
             (*ctx).enabled_uris = URI_TYPE_ANY;
@@ -329,9 +415,12 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxInitialize(
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecTransformCtxFinalize(ctx: *mut XmlSecTransformCtx) {
     contain((), || {
-        if ctx.is_null() {
-            return;
-        }
+        check!(
+            !ctx.is_null(),
+            "xmlSecTransformCtxFinalize",
+            c"ctx != NULL",
+            ()
+        );
         // SAFETY: an initialized context.
         unsafe {
             xmlSecTransformCtxReset(ctx);
@@ -349,12 +438,16 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxFinalize(ctx: *mut XmlSecTrans
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecTransformCtxReset(ctx: *mut XmlSecTransformCtx) {
     contain((), || {
+        check!(
+            !ctx.is_null(),
+            "xmlSecTransformCtxReset",
+            c"ctx != NULL",
+            ()
+        );
         // SAFETY: an initialized context whose chain, strings and lists it
         // owns.
         unsafe {
-            let Some(context) = ctx.as_mut() else {
-                return;
-            };
+            let context = &mut *ctx;
             context.result = std::ptr::null_mut();
             context.status = STATUS_NONE;
             if !context.reserved0.is_null() {
@@ -392,31 +485,81 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxCopyUserPref(
     src: *mut XmlSecTransformCtx,
 ) -> c_int {
     contain(-1, || {
+        check!(
+            !dst.is_null(),
+            "xmlSecTransformCtxCopyUserPref",
+            c"dst != NULL",
+            -1
+        );
+        check!(
+            !src.is_null(),
+            "xmlSecTransformCtxCopyUserPref",
+            c"src != NULL",
+            -1
+        );
         // SAFETY: initialized contexts.
         unsafe {
-            let (Some(target), Some(source)) = (dst.as_mut(), src.as_mut()) else {
-                return -1;
-            };
+            let (target, source) = (&mut *dst, &mut *src);
             target.user_data = source.user_data;
             target.flags = source.flags;
             target.max_depth = source.max_depth;
             target.enabled_uris = source.enabled_uris;
             target.pre_exec_callback = source.pre_exec_callback;
-            xmlSecPtrListCopy(
+            if xmlSecPtrListCopy(
                 &raw mut target.enabled_transforms,
                 &raw mut source.enabled_transforms,
-            )
+            ) < 0
+            {
+                errors::internal(
+                    here!("xmlSecTransformCtxCopyUserPref"),
+                    std::ptr::null(),
+                    c"xmlSecPtrListCopy(enabledTransforms)",
+                );
+                return -1;
+            }
         }
+        0
     })
 }
 
-/// The context when it is still building its chain.
-///
-/// # Safety
-/// `ctx` is null or an initialized context.
-unsafe fn building<'a>(ctx: *mut XmlSecTransformCtx) -> Option<&'a mut XmlSecTransformCtx> {
-    // SAFETY: by the caller's contract.
-    unsafe { ctx.as_mut() }.filter(|context| context.status == STATUS_NONE)
+/// The context `$ctx` still building its chain, after libxmlsec1's
+/// assertions inside the entry point `$func`, or `$ret`.
+macro_rules! building_or {
+    ($ctx:expr, $func:literal, $ret:expr) => {{
+        check!(!$ctx.is_null(), $func, c"ctx != NULL", $ret);
+        // SAFETY: the caller passes an initialized context.
+        let context = unsafe { &mut *$ctx };
+        check!(
+            context.status == STATUS_NONE,
+            $func,
+            c"ctx->status == xmlSecTransformStatusNone",
+            $ret
+        );
+        context
+    }};
+}
+
+/// As [`building_or`], for a context that has no result yet, with the
+/// assertions in libxmlsec1's order.
+macro_rules! fresh_or {
+    ($ctx:expr, $func:literal, $ret:expr) => {{
+        check!(!$ctx.is_null(), $func, c"ctx != NULL", $ret);
+        // SAFETY: the caller passes an initialized context.
+        let context = unsafe { &mut *$ctx };
+        check!(
+            context.result.is_null(),
+            $func,
+            c"ctx->result == NULL",
+            $ret
+        );
+        check!(
+            context.status == STATUS_NONE,
+            $func,
+            c"ctx->status == xmlSecTransformStatusNone",
+            $ret
+        );
+        context
+    }};
 }
 
 /// `xmlSecTransformCtxAppend`: connects `transform` after the last one.
@@ -430,24 +573,26 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxAppend(
     transform: *mut XmlSecTransform,
 ) -> c_int {
     contain(-1, || {
+        let context = building_or!(ctx, "xmlSecTransformCtxAppend", -1);
+        let (_, klass) = valid_or!(transform, "xmlSecTransformCtxAppend", -1);
+        if context.last.is_null() {
+            check!(
+                context.first.is_null(),
+                "xmlSecTransformCtxAppend",
+                c"ctx->first == NULL",
+                -1
+            );
+            context.first = transform;
         // SAFETY: by the caller's contract.
-        unsafe {
-            let Some(context) = building(ctx) else {
-                return -1;
-            };
-            if valid(transform).is_none() {
-                return -1;
-            }
-            if context.last.is_null() {
-                if !context.first.is_null() {
-                    return -1;
-                }
-                context.first = transform;
-            } else if xmlSecTransformConnect(context.last, transform, ctx) < 0 {
-                return -1;
-            }
-            context.last = transform;
+        } else if unsafe { xmlSecTransformConnect(context.last, transform, ctx) } < 0 {
+            errors::internal(
+                here!("xmlSecTransformCtxAppend"),
+                klass.name.cast(),
+                c"xmlSecTransformConnect",
+            );
+            return -1;
         }
+        context.last = transform;
         0
     })
 }
@@ -462,47 +607,54 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxPrepend(
     transform: *mut XmlSecTransform,
 ) -> c_int {
     contain(-1, || {
+        let context = building_or!(ctx, "xmlSecTransformCtxPrepend", -1);
+        let (_, klass) = valid_or!(transform, "xmlSecTransformCtxPrepend", -1);
+        if context.first.is_null() {
+            check!(
+                context.last.is_null(),
+                "xmlSecTransformCtxPrepend",
+                c"ctx->last == NULL",
+                -1
+            );
+            context.last = transform;
         // SAFETY: by the caller's contract.
-        unsafe {
-            let Some(context) = building(ctx) else {
-                return -1;
-            };
-            if valid(transform).is_none() {
-                return -1;
-            }
-            if context.first.is_null() {
-                if !context.last.is_null() {
-                    return -1;
-                }
-                context.last = transform;
-            } else if xmlSecTransformConnect(transform, context.first, ctx) < 0 {
-                return -1;
-            }
-            context.first = transform;
+        } else if unsafe { xmlSecTransformConnect(transform, context.first, ctx) } < 0 {
+            errors::internal(
+                here!("xmlSecTransformCtxPrepend"),
+                klass.name.cast(),
+                c"xmlSecTransformConnect",
+            );
+            return -1;
         }
+        context.first = transform;
         0
     })
 }
 
-/// Creates a transform of `id` and adds it at one end of the chain.
+/// Creates a transform of `id` and adds it at one end of the chain with
+/// `add`, named `added` in reports from the entry point at `here`.
 ///
 /// # Safety
-/// `ctx` is null or an initialized context; `id` is null or a klass.
+/// `ctx` is a context still building; `id` is a klass.
 unsafe fn create_and_add(
     ctx: *mut XmlSecTransformCtx,
     id: *const XmlSecTransformKlass,
-    add: unsafe extern "C" fn(*mut XmlSecTransformCtx, *mut XmlSecTransform) -> c_int,
+    (add, added): (
+        unsafe extern "C" fn(*mut XmlSecTransformCtx, *mut XmlSecTransform) -> c_int,
+        &CStr,
+    ),
+    here: errors::Here,
 ) -> *mut XmlSecTransform {
     // SAFETY: by the caller's contract.
     unsafe {
-        if building(ctx).is_none() || id.is_null() {
-            return std::ptr::null_mut();
-        }
+        let name = (*id).name.cast();
         let transform = xmlSecTransformCreate(id);
         if valid(transform).is_none() {
+            errors::internal(here, name, c"xmlSecTransformCreate");
             return std::ptr::null_mut();
         }
         if add(ctx, transform) < 0 {
+            errors::internal(here, name, added);
             xmlSecTransformDestroy(transform);
             return std::ptr::null_mut();
         }
@@ -519,9 +671,24 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxCreateAndAppend(
     ctx: *mut XmlSecTransformCtx,
     id: *const XmlSecTransformKlass,
 ) -> *mut XmlSecTransform {
-    // SAFETY: by the caller's contract.
-    contain(std::ptr::null_mut(), || unsafe {
-        create_and_add(ctx, id, xmlSecTransformCtxAppend)
+    contain(std::ptr::null_mut(), || {
+        let null = std::ptr::null_mut();
+        building_or!(ctx, "xmlSecTransformCtxCreateAndAppend", null);
+        check!(
+            !id.is_null(),
+            "xmlSecTransformCtxCreateAndAppend",
+            c"id != xmlSecTransformIdUnknown",
+            null
+        );
+        // SAFETY: a building context and a klass.
+        unsafe {
+            create_and_add(
+                ctx,
+                id,
+                (xmlSecTransformCtxAppend, c"xmlSecTransformCtxAppend"),
+                here!("xmlSecTransformCtxCreateAndAppend"),
+            )
+        }
     })
 }
 
@@ -534,9 +701,24 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxCreateAndPrepend(
     ctx: *mut XmlSecTransformCtx,
     id: *const XmlSecTransformKlass,
 ) -> *mut XmlSecTransform {
-    // SAFETY: by the caller's contract.
-    contain(std::ptr::null_mut(), || unsafe {
-        create_and_add(ctx, id, xmlSecTransformCtxPrepend)
+    contain(std::ptr::null_mut(), || {
+        let null = std::ptr::null_mut();
+        building_or!(ctx, "xmlSecTransformCtxCreateAndPrepend", null);
+        check!(
+            !id.is_null(),
+            "xmlSecTransformCtxCreateAndPrepend",
+            c"id != xmlSecTransformIdUnknown",
+            null
+        );
+        // SAFETY: a building context and a klass.
+        unsafe {
+            create_and_add(
+                ctx,
+                id,
+                (xmlSecTransformCtxPrepend, c"xmlSecTransformCtxPrepend"),
+                here!("xmlSecTransformCtxCreateAndPrepend"),
+            )
+        }
     })
 }
 
@@ -556,15 +738,31 @@ pub(crate) unsafe extern "C" fn xmlSecTransformNodeRead(
     ctx: *mut XmlSecTransformCtx,
 ) -> *mut XmlSecTransform {
     contain(std::ptr::null_mut(), || {
-        if node.is_null() || ctx.is_null() || !readable() {
-            return std::ptr::null_mut();
+        let null = std::ptr::null_mut();
+        check!(
+            !node.is_null(),
+            "xmlSecTransformNodeRead",
+            c"node != NULL",
+            null
+        );
+        check!(
+            !ctx.is_null(),
+            "xmlSecTransformNodeRead",
+            c"transformCtx != NULL",
+            null
+        );
+        let here = here!("xmlSecTransformNodeRead");
+        if !readable() {
+            errors::no_libxml2(here);
+            return null;
         }
         // SAFETY: a live element and an initialized context; the attribute
         // value is a libxml2 string released with `xmlFree`.
         unsafe {
             let href = xmlGetProp(node, xmlSecAttrAlgorithm.as_ptr());
             if href.is_null() {
-                return std::ptr::null_mut();
+                errors::invalid_node_attribute(here, node, c"Algorithm", std::ptr::null(), "empty");
+                return null;
             }
             let transform = read_algorithm(node, href, usage, ctx);
             free(href.cast::<c_void>());
@@ -585,21 +783,39 @@ unsafe fn read_algorithm(
 ) -> *mut XmlSecTransform {
     // SAFETY: by the caller's contract.
     unsafe {
+        let here = here!("xmlSecTransformNodeRead");
+        let algorithm = format!("href={}", klass_text(href));
         let id = xmlSecTransformIdListFindByHref(xmlSecTransformIdsGet(), href, usage);
         if id.is_null() {
+            errors::internal_with(
+                here,
+                std::ptr::null(),
+                c"xmlSecTransformIdListFindByHref",
+                &algorithm,
+            );
             return std::ptr::null_mut();
         }
+        let name = (*id).name.cast();
         let enabled = &raw mut (*ctx).enabled_transforms;
         if xmlSecPtrListGetSize(enabled) > 0 && xmlSecTransformIdListFind(enabled, id) != 1 {
+            errors::report(
+                here,
+                name,
+                std::ptr::null(),
+                errors::R_TRANSFORM_DISABLED,
+                &algorithm,
+            );
             return std::ptr::null_mut();
         }
         let transform = xmlSecTransformCreate(id);
         let Some((_, klass)) = valid(transform) else {
+            errors::internal(here, name, c"xmlSecTransformCreate(id)");
             return std::ptr::null_mut();
         };
         if let Some(read_node) = klass.read_node
             && read_node(transform, node, ctx) < 0
         {
+            errors::internal(here, name, c"readNode");
             xmlSecTransformDestroy(transform);
             return std::ptr::null_mut();
         }
@@ -620,18 +836,30 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxNodeRead(
     usage: c_uint,
 ) -> *mut XmlSecTransform {
     contain(std::ptr::null_mut(), || {
+        let null = std::ptr::null_mut();
+        building_or!(ctx, "xmlSecTransformCtxNodeRead", null);
+        check!(
+            !node.is_null(),
+            "xmlSecTransformCtxNodeRead",
+            c"node != NULL",
+            null
+        );
+        let here = here!("xmlSecTransformCtxNodeRead");
         // SAFETY: by the caller's contract.
         unsafe {
-            if building(ctx).is_none() || node.is_null() {
-                return std::ptr::null_mut();
-            }
             let transform = xmlSecTransformNodeRead(node, usage, ctx);
             if transform.is_null() {
+                errors::internal(here, (*node).name.cast(), c"xmlSecTransformNodeRead");
                 return transform;
             }
             if xmlSecTransformCtxAppend(ctx, transform) < 0 {
+                errors::internal(
+                    here,
+                    (*(*transform).id).name.cast(),
+                    c"xmlSecTransformCtxAppend",
+                );
                 xmlSecTransformDestroy(transform);
-                return std::ptr::null_mut();
+                return null;
             }
             transform
         }
@@ -651,12 +879,21 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxNodesListRead(
     usage: c_uint,
 ) -> c_int {
     contain(-1, || {
+        building_or!(ctx, "xmlSecTransformCtxNodesListRead", -1);
+        check!(
+            !node.is_null(),
+            "xmlSecTransformCtxNodesListRead",
+            c"node != NULL",
+            -1
+        );
+        let here = here!("xmlSecTransformCtxNodesListRead");
+        if !readable() {
+            errors::no_libxml2(here);
+            return -1;
+        }
         // SAFETY: by the caller's contract; the children of a live element
         // are live.
         unsafe {
-            if building(ctx).is_none() || node.is_null() || !readable() {
-                return -1;
-            }
             let mut current = xmlSecGetNextElementNode((*node).children);
             while !current.is_null()
                 && xmlSecCheckNodeName(current, xmlSecNodeTransform.as_ptr(), xmlSecDSigNs.as_ptr())
@@ -664,16 +901,27 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxNodesListRead(
             {
                 let transform = xmlSecTransformNodeRead(current, usage, ctx);
                 if transform.is_null() {
+                    errors::internal(here, (*current).name.cast(), c"xmlSecTransformNodeRead");
                     return -1;
                 }
                 (*transform).flags |= FLAGS_USER_SPECIFIED;
                 if xmlSecTransformCtxAppend(ctx, transform) < 0 {
+                    errors::internal(
+                        here,
+                        (*(*transform).id).name.cast(),
+                        c"xmlSecTransformCtxAppend",
+                    );
                     xmlSecTransformDestroy(transform);
                     return -1;
                 }
                 current = xmlSecGetNextElementNode((*current).next);
             }
-            if current.is_null() { 0 } else { -1 }
+            if current.is_null() {
+                0
+            } else {
+                errors::unexpected_node(here, current, std::ptr::null());
+                -1
+            }
         }
     })
 }
@@ -706,42 +954,102 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxSetUri(
     here: *mut XmlNode,
 ) -> c_int {
     contain(-1, || {
+        check!(
+            !ctx.is_null(),
+            "xmlSecTransformCtxSetUri",
+            c"ctx != NULL",
+            -1
+        );
+        // SAFETY: the caller passes an initialized context.
+        let context = unsafe { &mut *ctx };
+        check!(
+            context.uri.is_null(),
+            "xmlSecTransformCtxSetUri",
+            c"ctx->uri == NULL",
+            -1
+        );
+        check!(
+            context.xptr_expr.is_null(),
+            "xmlSecTransformCtxSetUri",
+            c"ctx->xptrExpr == NULL",
+            -1
+        );
+        check!(
+            context.status == STATUS_NONE,
+            "xmlSecTransformCtxSetUri",
+            c"ctx->status == xmlSecTransformStatusNone",
+            -1
+        );
+        check!(
+            !here.is_null(),
+            "xmlSecTransformCtxSetUri",
+            c"hereNode != NULL",
+            -1
+        );
+        let location = here!("xmlSecTransformCtxSetUri");
         // SAFETY: by the caller's contract.
         unsafe {
-            let Some(context) = building(ctx) else {
-                return -1;
-            };
-            if !context.uri.is_null() || !context.xptr_expr.is_null() || here.is_null() {
-                return -1;
-            }
-            if super::xmlSecTransformUriTypeCheck(context.enabled_uris, uri) != 1 {
-                return -1;
-            }
             let text = if uri.is_null() {
                 &[][..]
             } else {
                 CStr::from_ptr(uri.cast()).to_bytes()
             };
+            if super::xmlSecTransformUriTypeCheck(context.enabled_uris, uri) != 1 {
+                // libxmlsec1 reports this refusal with the key-data-size
+                // reason; a drop-in reports the same code.
+                errors::report(
+                    location,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    errors::R_INVALID_KEY_DATA_SIZE,
+                    &format!("uri={}", text_or_null(uri, text)),
+                );
+                return -1;
+            }
             if text.is_empty() {
                 return 0;
             }
             let Some(hash) = text.iter().position(|&byte| byte == b'#') else {
                 context.uri = duplicate(text);
-                return if context.uri.is_null() { -1 } else { 0 };
+                return stored(context.uri, location, text);
             };
             if text == b"#xpointer(/)" {
                 context.xptr_expr = duplicate(text);
-                return if context.xptr_expr.is_null() { -1 } else { 0 };
+                return stored(context.xptr_expr, location, text);
             }
             context.uri = duplicate(&text[..hash]);
+            if stored(context.uri, location, text) < 0 {
+                return -1;
+            }
             context.xptr_expr = duplicate(&text[hash..]);
-            if context.uri.is_null() || context.xptr_expr.is_null() {
+            if stored(context.xptr_expr, location, &text[hash..]) < 0 {
                 return -1;
             }
             let fragment = &text[hash..];
             select_fragment(ctx, fragment, here)
         }
     })
+}
+
+/// `uri` for a report: its text, or `NULL` as libxmlsec1's
+/// `xmlSecErrorsSafeString` writes a null string.
+fn text_or_null(uri: *const u8, text: &[u8]) -> std::borrow::Cow<'_, str> {
+    if uri.is_null() {
+        "NULL".into()
+    } else {
+        String::from_utf8_lossy(text)
+    }
+}
+
+/// 0 when `copy` holds the copy of `text`, otherwise reports libxmlsec1's
+/// `xmlSecStrdupError` and returns -1.
+fn stored(copy: *mut u8, here: errors::Here, text: &[u8]) -> c_int {
+    if copy.is_null() {
+        errors::strdup_failed(here, std::ptr::null(), text);
+        -1
+    } else {
+        0
+    }
 }
 
 /// Prepends the transform that selects `fragment` (starting with `#`).
@@ -753,6 +1061,7 @@ unsafe fn select_fragment(
     fragment: &[u8],
     here: *mut XmlNode,
 ) -> c_int {
+    let location = here!("xmlSecTransformCtxSetUri");
     // SAFETY: by the caller's contract.
     unsafe {
         let visa3d = (*ctx).flags & FLAGS_USE_VISA3D_HACK != 0;
@@ -761,12 +1070,24 @@ unsafe fn select_fragment(
                 (fragment[1..].to_vec(), TREE)
             } else if visa3d {
                 let transform = xmlSecTransformCtxCreateAndPrepend(ctx, xpath::visa3d_hack());
-                if valid(transform).is_none() {
+                let Some((_, klass)) = valid(transform) else {
+                    errors::internal(
+                        location,
+                        std::ptr::null(),
+                        c"xmlSecTransformCtxCreateAndPrepend(xmlSecTransformVisa3DHackId)",
+                    );
                     return -1;
-                }
+                };
                 let id = duplicate(&fragment[1..]);
                 let result = xpath::xmlSecTransformVisa3DHackSetID(transform, id);
                 free(id.cast::<c_void>());
+                if result < 0 {
+                    errors::internal(
+                        location,
+                        klass.name.cast(),
+                        c"xmlSecTransformVisa3DHackSetID",
+                    );
+                }
                 return result;
             } else {
                 // A bare name is an id reference; `xpointer(id('...'))` handles
@@ -780,6 +1101,14 @@ unsafe fn select_fragment(
                     .iter()
                     .any(|byte| matches!(byte, b'\'' | b'(' | b')' | b'^'))
                 {
+                    errors::invalid_data(
+                        location,
+                        std::ptr::null(),
+                        &format!(
+                            "id={}; reason=not an XPointer string literal",
+                            String::from_utf8_lossy(&fragment[1..])
+                        ),
+                    );
                     return -1;
                 }
                 let mut expression = b"xpointer(id('".to_vec();
@@ -788,12 +1117,28 @@ unsafe fn select_fragment(
                 (expression, TREE_WITHOUT_COMMENTS)
             };
         let transform = xmlSecTransformCtxCreateAndPrepend(ctx, xpath::xpointer());
-        if valid(transform).is_none() {
+        let Some((_, klass)) = valid(transform) else {
+            errors::internal(
+                location,
+                std::ptr::null(),
+                c"xmlSecTransformCtxCreateAndPrepend(xmlSecTransformXPointerId)",
+            );
+            return -1;
+        };
+        let copy = duplicate(&expression);
+        if copy.is_null() {
+            errors::malloc_failed(location, std::ptr::null(), expression.len() + 1);
             return -1;
         }
-        let expression = duplicate(&expression);
-        let result = xpath::xmlSecTransformXPointerSetExpr(transform, expression, kind, here);
-        free(expression.cast::<c_void>());
+        let result = xpath::xmlSecTransformXPointerSetExpr(transform, copy, kind, here);
+        free(copy.cast::<c_void>());
+        if result < 0 {
+            errors::internal(
+                location,
+                klass.name.cast(),
+                c"xmlSecTransformXPointerSetExpr",
+            );
+        }
         result
     }
 }
@@ -811,40 +1156,54 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxPrepare(
     input_type: u8,
 ) -> c_int {
     contain(-1, || {
-        // SAFETY: by the caller's contract.
+        let context = fresh_or!(ctx, "xmlSecTransformCtxPrepare", -1);
+        let here = here!("xmlSecTransformCtxPrepare");
+        // The chain is bounded by the policy as a core reference's is:
+        // every execution passes here, before any transform runs, and
+        // the bound also limits the push recursion through the chain.
+        let Some(policy) = policy::verification_at(here) else {
+            return -1;
+        };
+        let max = policy.resources.max_transforms_per_reference;
+        let mut length = 0usize;
+        let mut current = context.first;
+        while !current.is_null() {
+            length += 1;
+            if length > max {
+                errors::limit_exceeded(here, std::ptr::null(), "max_transforms_per_reference", max);
+                return -1;
+            }
+            // SAFETY: the chain's transforms are live.
+            current = unsafe { (*current).next };
+        }
+        // SAFETY: a building context; its transforms are live.
         unsafe {
-            let Some(context) = building(ctx) else {
-                return -1;
-            };
-            if !context.result.is_null() {
-                return -1;
-            }
-            // The chain is bounded by the policy as a core reference's is:
-            // every execution passes here, before any transform runs, and
-            // the bound also limits the push recursion through the chain.
-            let Some(policy) = policy::verification() else {
-                return -1;
-            };
-            let mut length = 0usize;
-            let mut current = context.first;
-            while !current.is_null() {
-                length += 1;
-                if length > policy.resources.max_transforms_per_reference {
-                    return -1;
-                }
-                current = (*current).next;
-            }
             let terminal = xmlSecTransformCtxCreateAndAppend(ctx, builtin::mem_buf());
-            if valid(terminal).is_none() {
+            let Some((_, klass)) = valid(terminal) else {
+                errors::internal(
+                    here,
+                    std::ptr::null(),
+                    c"xmlSecTransformCtxCreateAndAppend(xmlSecTransformMemBufId)",
+                );
                 return -1;
-            }
+            };
             (*ctx).result = builtin::xmlSecTransformMemBufGetBuffer(terminal);
             if (*ctx).result.is_null() {
+                errors::internal(
+                    here,
+                    klass.name.cast(),
+                    c"xmlSecTransformMemBufGetBuffer(xmlSecTransformMemBufId)",
+                );
                 return -1;
             }
             let first_type = xmlSecTransformGetDataType((*ctx).first, MODE_PUSH, ctx);
             if first_type & DATA_BIN == 0 && input_type & DATA_BIN != 0 {
                 if xmlSecTransformCtxCreateAndPrepend(ctx, parser::xml_parser()).is_null() {
+                    errors::internal(
+                        here,
+                        std::ptr::null(),
+                        c"xmlSecTransformCtxCreateAndPrepend(xmlSecTransformXmlParserId)",
+                    );
                     return -1;
                 }
             } else if first_type & DATA_XML == 0 && input_type & DATA_XML != 0 {
@@ -857,12 +1216,18 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxPrepare(
                     builtin::incl_c14n()
                 };
                 if xmlSecTransformCtxCreateAndPrepend(ctx, adapter).is_null() {
+                    errors::internal(
+                        here,
+                        std::ptr::null(),
+                        c"xmlSecTransformCtxCreateAndPrepend(xmlSecTransformInclC14NId)",
+                    );
                     return -1;
                 }
             }
             if let Some(callback) = (*ctx).pre_exec_callback
                 && callback(ctx) < 0
             {
+                errors::internal(here, std::ptr::null(), c"ctx->preExecCallback");
                 return -1;
             }
             (*ctx).status = STATUS_WORKING;
@@ -883,17 +1248,31 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxBinaryExecute(
     size: usize,
 ) -> c_int {
     contain(-1, || {
+        let context = fresh_or!(ctx, "xmlSecTransformCtxBinaryExecute", -1);
+        check!(
+            context.uri.is_null(),
+            "xmlSecTransformCtxBinaryExecute",
+            c"ctx->uri == NULL",
+            -1
+        );
+        let here = here!("xmlSecTransformCtxBinaryExecute");
         // SAFETY: by the caller's contract.
         unsafe {
-            let Some(context) = building(ctx) else {
-                return -1;
-            };
-            if !context.result.is_null() || !context.uri.is_null() {
+            if xmlSecTransformCtxPrepare(ctx, DATA_BIN) < 0 {
+                errors::internal(
+                    here,
+                    std::ptr::null(),
+                    c"xmlSecTransformCtxPrepare(TypeBin)",
+                );
                 return -1;
             }
-            if xmlSecTransformCtxPrepare(ctx, DATA_BIN) < 0
-                || xmlSecTransformPushBin((*ctx).first, data, size, 1, ctx) < 0
-            {
+            if xmlSecTransformPushBin((*ctx).first, data, size, 1, ctx) < 0 {
+                errors::internal_with(
+                    here,
+                    std::ptr::null(),
+                    c"xmlSecTransformPushBin",
+                    &format!("dataSize={size}"),
+                );
                 return -1;
             }
             (*ctx).status = STATUS_FINISHED;
@@ -914,28 +1293,58 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxUriExecute(
     uri: *const u8,
 ) -> c_int {
     contain(-1, || {
+        let context = building_or!(ctx, "xmlSecTransformCtxUriExecute", -1);
+        check!(
+            !uri.is_null(),
+            "xmlSecTransformCtxUriExecute",
+            c"uri != NULL",
+            -1
+        );
+        check!(
+            context.uri.is_null()
+                || uri == context.uri.cast_const()
+                // SAFETY: both strings are NUL-terminated.
+                || unsafe { super::super::tree::xmlStrEqual(uri, context.uri) } != 0,
+            "xmlSecTransformCtxUriExecute",
+            c"(ctx->uri == NULL) || (uri == ctx->uri) || xmlStrEqual(uri, ctx->uri)",
+            -1
+        );
+        let here = here!("xmlSecTransformCtxUriExecute");
         // SAFETY: by the caller's contract.
         unsafe {
-            let Some(context) = building(ctx) else {
-                return -1;
-            };
-            if uri.is_null() {
-                return -1;
-            }
-            if !context.uri.is_null()
-                && uri != context.uri.cast_const()
-                && super::super::tree::xmlStrEqual(uri, context.uri) == 0
-            {
-                return -1;
-            }
             let input = xmlSecTransformCtxCreateAndPrepend(ctx, builtin::input_uri());
-            if input.is_null() || builtin::xmlSecTransformInputURIOpen(input, uri) < 0 {
+            if input.is_null() {
+                errors::internal(
+                    here,
+                    std::ptr::null(),
+                    c"xmlSecTransformCtxCreateAndPrepend(xmlSecTransformInputURIId)",
+                );
                 return -1;
             }
-            if xmlSecTransformCtxPrepare(ctx, DATA_UNKNOWN) < 0
-                || xmlSecTransformPump(input, (*input).next, ctx) < 0
-                || builtin::xmlSecTransformInputURIClose(input) < 0
-            {
+            let name = (*(*input).id).name.cast();
+            if builtin::xmlSecTransformInputURIOpen(input, uri) < 0 {
+                errors::internal_with(
+                    here,
+                    std::ptr::null(),
+                    c"xmlSecTransformInputURIOpen",
+                    &format!("uri={}", klass_text(uri)),
+                );
+                return -1;
+            }
+            if xmlSecTransformCtxPrepare(ctx, DATA_UNKNOWN) < 0 {
+                errors::internal(
+                    here,
+                    std::ptr::null(),
+                    c"xmlSecTransformCtxPrepare(TypeUnknown)",
+                );
+                return -1;
+            }
+            if xmlSecTransformPump(input, (*input).next, ctx) < 0 {
+                errors::internal(here, name, c"xmlSecTransformPump");
+                return -1;
+            }
+            if builtin::xmlSecTransformInputURIClose(input) < 0 {
+                errors::internal(here, name, c"xmlSecTransformInputURIClose");
                 return -1;
             }
             (*ctx).status = STATUS_FINISHED;
@@ -954,20 +1363,37 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxXmlExecute(
     nodes: *mut XmlSecNodeSet,
 ) -> c_int {
     contain(-1, || {
+        let context = fresh_or!(ctx, "xmlSecTransformCtxXmlExecute", -1);
+        check!(
+            !nodes.is_null(),
+            "xmlSecTransformCtxXmlExecute",
+            c"nodes != NULL",
+            -1
+        );
+        check!(
+            // SAFETY: a context's URI is null or NUL-terminated.
+            context.uri.is_null() || unsafe { CStr::from_ptr(context.uri.cast()) }.is_empty(),
+            "xmlSecTransformCtxXmlExecute",
+            c"(ctx->uri == NULL) || (xmlStrlen(ctx->uri) == 0)",
+            -1
+        );
+        let here = here!("xmlSecTransformCtxXmlExecute");
         // SAFETY: by the caller's contract.
         unsafe {
-            let Some(context) = building(ctx) else {
-                return -1;
-            };
-            if !context.result.is_null() || nodes.is_null() {
+            if xmlSecTransformCtxPrepare(ctx, DATA_XML) < 0 {
+                errors::internal(
+                    here,
+                    std::ptr::null(),
+                    c"xmlSecTransformCtxPrepare(TypeXml)",
+                );
                 return -1;
             }
-            if !context.uri.is_null() && !CStr::from_ptr(context.uri.cast()).is_empty() {
-                return -1;
-            }
-            if xmlSecTransformCtxPrepare(ctx, DATA_XML) < 0
-                || xmlSecTransformPushXml((*ctx).first, nodes, ctx) < 0
-            {
+            if xmlSecTransformPushXml((*ctx).first, nodes, ctx) < 0 {
+                errors::internal(
+                    here,
+                    (*(*(*ctx).first).id).name.cast(),
+                    c"xmlSecTransformPushXml",
+                );
                 return -1;
             }
             (*ctx).status = STATUS_FINISHED;
@@ -989,28 +1415,44 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxExecute(
     doc: *mut XmlDoc,
 ) -> c_int {
     contain(-1, || {
+        let context = fresh_or!(ctx, "xmlSecTransformCtxExecute", -1);
+        check!(
+            !doc.is_null(),
+            "xmlSecTransformCtxExecute",
+            c"doc != NULL",
+            -1
+        );
+        let here = here!("xmlSecTransformCtxExecute");
         // SAFETY: by the caller's contract.
         unsafe {
-            let Some(context) = building(ctx) else {
-                return -1;
-            };
-            if !context.result.is_null() || doc.is_null() {
-                return -1;
-            }
             let empty = |text: *mut u8| text.is_null() || CStr::from_ptr(text.cast()).is_empty();
             if !empty(context.uri) {
-                return xmlSecTransformCtxUriExecute(ctx, context.uri);
+                let result = xmlSecTransformCtxUriExecute(ctx, context.uri);
+                if result < 0 {
+                    errors::internal(here, std::ptr::null(), c"xmlSecTransformCtxUriExecute");
+                }
+                return result;
             }
             // The XPointer transform selects its own nodes from the document.
-            let nodes = if empty(context.xptr_expr) {
-                xmlSecNodeSetGetChildren(doc, std::ptr::null_mut(), 0, 0)
+            let (nodes, built) = if empty(context.xptr_expr) {
+                (
+                    xmlSecNodeSetGetChildren(doc, std::ptr::null_mut(), 0, 0),
+                    c"xmlSecNodeSetGetChildren",
+                )
             } else {
-                xmlSecNodeSetCreate(doc, std::ptr::null_mut(), NORMAL)
+                (
+                    xmlSecNodeSetCreate(doc, std::ptr::null_mut(), NORMAL),
+                    c"xmlSecNodeSetCreate",
+                )
             };
             if nodes.is_null() {
+                errors::internal(here, std::ptr::null(), built);
                 return -1;
             }
             let result = xmlSecTransformCtxXmlExecute(ctx, nodes);
+            if result < 0 {
+                errors::internal(here, std::ptr::null(), c"xmlSecTransformCtxXmlExecute");
+            }
             xmlSecNodeSetDestroy(nodes);
             result
         }
@@ -1037,14 +1479,21 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxDebugDump(
     output: *mut c_void,
 ) {
     contain((), || {
+        check!(
+            !ctx.is_null(),
+            "xmlSecTransformCtxDebugDump",
+            c"ctx != NULL",
+            ()
+        );
+        check!(
+            !output.is_null(),
+            "xmlSecTransformCtxDebugDump",
+            c"output != NULL",
+            ()
+        );
         // SAFETY: by the caller's contract.
         unsafe {
-            let Some(context) = ctx.as_mut() else {
-                return;
-            };
-            if output.is_null() {
-                return;
-            }
+            let context = &mut *ctx;
             write_stream(
                 output,
                 &format!(
@@ -1085,14 +1534,21 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxDebugXmlDump(
     output: *mut c_void,
 ) {
     contain((), || {
+        check!(
+            !ctx.is_null(),
+            "xmlSecTransformCtxDebugXmlDump",
+            c"ctx != NULL",
+            ()
+        );
+        check!(
+            !output.is_null(),
+            "xmlSecTransformCtxDebugXmlDump",
+            c"output != NULL",
+            ()
+        );
         // SAFETY: by the caller's contract.
         unsafe {
-            let Some(context) = ctx.as_mut() else {
-                return;
-            };
-            if output.is_null() {
-                return;
-            }
+            let context = &mut *ctx;
             write_stream(
                 output,
                 &format!(

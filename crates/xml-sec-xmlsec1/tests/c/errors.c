@@ -19,6 +19,9 @@
 #include <xmlsec/buffer.h>
 #include <xmlsec/list.h>
 #include <xmlsec/base64.h>
+#include <xmlsec/transforms.h>
+#include <xmlsec/xmltree.h>
+#include <libxml/parser.h>
 
 static int reports;
 static int first_reason;
@@ -163,11 +166,71 @@ static void library(void) {
     xmlSecBufferDestroy(buf);
 }
 
+/* Transform-chain failures, every report printed: the precondition, the
+ * cause and the chain of callers above it. */
+static void transform_context(void) {
+    static const char document[] =
+        "<T xmlns='http://www.w3.org/2000/09/xmldsig#'>"
+        "<Transform/>"
+        "<Transform Algorithm='urn:unknown'/>"
+        "<Transform Algorithm='http://www.w3.org/2000/09/xmldsig#enveloped-signature'/>"
+        "<Other/>"
+        "</T>";
+    xmlDocPtr doc = xmlReadMemory(document, (int)strlen(document), "doc.xml", NULL, 0);
+    xmlNodePtr root = xmlDocGetRootElement(doc);
+    xmlNodePtr bare = xmlSecGetNextElementNode(root->children);
+    xmlNodePtr unknown = xmlSecGetNextElementNode(bare->next);
+    xmlNodePtr enveloped = xmlSecGetNextElementNode(unknown->next);
+    xmlSecTransformCtx ctx;
+
+    printing = 1;
+    xmlSecErrorsSetCallback(record);
+    printf("transform ids init: %d\n", xmlSecTransformIdsInit());
+
+    begin("ctx append null");
+    end(xmlSecTransformCtxAppend(NULL, NULL));
+    begin("ctx execute without document");
+    xmlSecTransformCtxInitialize(&ctx);
+    end(xmlSecTransformCtxExecute(&ctx, NULL));
+    begin("node read without algorithm");
+    end(xmlSecTransformCtxNodeRead(&ctx, bare, xmlSecTransformUsageAny) == NULL ? -1 : 0);
+    begin("node read unknown algorithm");
+    end(xmlSecTransformCtxNodeRead(&ctx, unknown, xmlSecTransformUsageAny) == NULL ? -1 : 0);
+    begin("node read disabled algorithm");
+    xmlSecPtrListAdd(&ctx.enabledTransforms, (void *)xmlSecTransformBase64Id);
+    end(xmlSecTransformCtxNodeRead(&ctx, enveloped, xmlSecTransformUsageAny) == NULL ? -1 : 0);
+    begin("nodes list with a foreign node");
+    xmlSecTransformCtxFinalize(&ctx);
+    xmlSecTransformCtxInitialize(&ctx);
+    end(xmlSecTransformCtxNodesListRead(&ctx, root, xmlSecTransformUsageAny));
+    xmlSecTransformCtxFinalize(&ctx);
+
+    begin("set uri of a disabled type");
+    xmlSecTransformCtxInitialize(&ctx);
+    ctx.enabledUris = xmlSecTransformUriTypeSameDocument;
+    end(xmlSecTransformCtxSetUri(&ctx, BAD_CAST "http://example.org/a", root));
+    begin("set uri twice");
+    end(xmlSecTransformCtxSetUri(&ctx, BAD_CAST "#a", root));
+    end(xmlSecTransformCtxSetUri(&ctx, BAD_CAST "#b", root));
+    xmlSecTransformCtxFinalize(&ctx);
+
+    begin("prepare twice");
+    xmlSecTransformCtxInitialize(&ctx);
+    end(xmlSecTransformCtxPrepare(&ctx, xmlSecTransformDataTypeBin));
+    end(xmlSecTransformCtxPrepare(&ctx, xmlSecTransformDataTypeBin));
+    xmlSecTransformCtxFinalize(&ctx);
+
+    printing = 0;
+    xmlSecTransformIdsShutdown();
+    xmlFreeDoc(doc);
+}
+
 int main(void) {
     table();
     formatting();
     truncation();
     priority();
     library();
+    transform_context();
     return 0;
 }
