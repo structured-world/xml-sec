@@ -726,6 +726,24 @@ unsafe fn canonical(
     Some(output)
 }
 
+/// The octets of `nodes` over `view`, its projection: inclusive C14N 1.0
+/// without comments, the conversion of a node set to octets (`XMLDSig` 1.1
+/// section 4.4.3.2).
+///
+/// # Safety
+/// `nodes` is a live node set over the document `view` projects.
+pub(super) unsafe fn selected_octets(
+    view: DocumentView<'_>,
+    nodes: *mut XmlSecNodeSet,
+    resources: &xml_sec::policy::ResourcePolicy,
+) -> Option<Vec<u8>> {
+    let algorithm = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
+    let selection = Selection { nodes, view };
+    let mut output = Vec::new();
+    canonicalize_selected(view, &selection, &algorithm, resources, &mut output).ok()?;
+    Some(output)
+}
+
 /// Writes the C14N form of `nodes` for klass `id` to the libxml2 output
 /// buffer `out`.
 ///

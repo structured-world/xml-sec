@@ -3,7 +3,7 @@
 //! The transform element's `RelationshipReference` and
 //! `RelationshipsGroupReference` children select relationships by `SourceId`
 //! and `SourceType`; the output is the core's relationship transform of the
-//! input document followed by its canonicalization, as the core produces it
+//! input node set followed by its canonicalization, as the core produces it
 //! for a reference.
 
 use std::ffi::{CStr, c_int, c_void};
@@ -13,7 +13,7 @@ use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::xmldsig::transforms::{
     RelationshipSelector, Transform, execute_transforms_with_policy,
 };
-use xml_sec::xmldsig::types::{NodeSet, TransformData};
+use xml_sec::xmldsig::types::TransformData;
 use xml_sec_libxml2::ffi::{LibxmlTree, XmlNode};
 
 use super::super::nodeset::XmlSecNodeSet;
@@ -24,7 +24,7 @@ use super::super::strings::{
 use super::super::tree::{readable, xmlGetProp};
 use super::super::xmltree::xmlSecCheckNodeName;
 use super::super::{free, policy};
-use super::builtin::{klass, pop_rendered, push_rendered};
+use super::builtin::{klass, pop_rendered, push_rendered, selected_octets};
 use super::io::xmlOutputBufferWrite;
 use super::{
     USAGE_DSIG_TRANSFORM, WithContext, XmlSecTransform, XmlSecTransformCtx, XmlSecTransformKlass,
@@ -174,17 +174,21 @@ unsafe fn render(selectors: &Selectors, nodes: *mut XmlSecNodeSet, out: *mut c_v
         Transform::Relationship(selectors.clone()),
         Transform::C14n(C14nAlgorithm::new(C14nMode::Inclusive1_0, false)),
     ];
+    // The input is the node set received, converted to octets as the core
+    // converts a relationship transform's node-set input, so what a
+    // preceding filter removed stays removed.
     let bytes = document.with_view(|view| {
-        let document = view.document();
-        let input = NodeSet::entire_document_without_comments(document)?;
+        // SAFETY: `nodes` is over the document `view` projects.
+        let input = unsafe { selected_octets(view, nodes, &policy.resources) }?;
         execute_transforms_with_policy(
-            document.root(),
-            TransformData::NodeSet(input),
+            view.document().root(),
+            TransformData::Binary(input),
             &transforms,
             policy,
         )
+        .ok()
     });
-    let Ok(bytes) = bytes else {
+    let Some(bytes) = bytes else {
         return -1;
     };
     for chunk in bytes.chunks(c_int::MAX.unsigned_abs() as usize) {

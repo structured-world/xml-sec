@@ -372,6 +372,54 @@ fn bare_fragment_cannot_break_out_of_the_id_literal() {
     }
 }
 
+/// The relationship klass transforms the node set it receives, as the core
+/// canonicalizes its node-set input first: a relationship a preceding
+/// filter removed stays removed although a selector names it.
+#[test]
+fn relationship_transform_keeps_the_incoming_selection() {
+    let xml =
+        b"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'>\
+        <Relationship Id='rId1' Type='urn:t:a' Target='a.xml'/>\
+        <Relationship Id='rId3' Type='urn:t:c' Target='c.xml'/>\
+        </Relationships>";
+    let selectors =
+        b"<Transform xmlns:m='http://schemas.openxmlformats.org/package/2006/digital-signature'>\
+        <m:RelationshipReference SourceId='rId1'/><m:RelationshipReference SourceId='rId3'/>\
+        </Transform>";
+    // SAFETY: the documents, node set and context are used while live.
+    unsafe {
+        let doc = crate::ffi::parser::xmlSecParseMemory(xml.as_ptr(), xml.len(), 0);
+        let template =
+            crate::ffi::parser::xmlSecParseMemory(selectors.as_ptr(), selectors.len(), 0);
+        assert!(!doc.is_null() && !template.is_null());
+        let root = (*doc).children;
+        let excluded = crate::ffi::xmltree::xmlSecGetNextElementNode(
+            (*crate::ffi::xmltree::xmlSecGetNextElementNode((*root).children)).next,
+        );
+        // Everything but the rId3 relationship.
+        let nodes = crate::ffi::nodeset::xmlSecNodeSetGetChildren(doc, excluded, 0, 1);
+        let ctx = xmlSecTransformCtxCreate();
+        let transform = xmlSecTransformCtxCreateAndAppend(ctx, super::relationship::relationship());
+        let read = (*super::relationship::relationship())
+            .read_node
+            .expect("the klass reads its node");
+        assert_eq!(read(transform, (*template).children, ctx), 0);
+        assert_eq!(super::ctx::xmlSecTransformCtxXmlExecute(ctx, nodes), 0);
+        let result = (*ctx).result;
+        let output = String::from_utf8(
+            std::slice::from_raw_parts(xmlSecBufferGetData(result), xmlSecBufferGetSize(result))
+                .to_vec(),
+        )
+        .expect("UTF-8");
+        assert!(output.contains("rId1"), "{output}");
+        assert!(!output.contains("rId3"), "{output}");
+        xmlSecTransformCtxDestroy(ctx);
+        crate::ffi::nodeset::xmlSecNodeSetDestroy(nodes);
+        crate::ffi::tree::xmlFreeDoc(template);
+        crate::ffi::tree::xmlFreeDoc(doc);
+    }
+}
+
 /// The library's policy runs the core's OPC relationship transform: the
 /// selected relationships, sorted by Id, with the default `TargetMode` and
 /// without comments (ISO/IEC 29500-2 section 13.2.4.24, step 3), where
