@@ -24,7 +24,8 @@ function:
    callbacks, the loaded crypto libraries) change only during initialization
    and shutdown, while no operation reads them, as libxmlsec1 requires; the
    crypto table installed by `xmlSecCryptoDLSetFunctions` outlives its use.
-   `xmlSecInit` and `xmlSecShutdown` serialize against each other.
+   `xmlSecInit` and `xmlSecShutdown` serialize against each other, and a
+   second `xmlSecInit` without a shutdown releases the lists it replaces.
 6. Callbacks the caller registers (report, input, klass methods, crypto table
    methods) are functions of their declared signatures, callable while
    registered.

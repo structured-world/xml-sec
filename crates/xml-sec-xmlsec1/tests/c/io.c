@@ -8,6 +8,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <libxml/parser.h>
+
 #include <xmlsec/xmlsec.h>
 #include <xmlsec/errors.h>
 #include <xmlsec/io.h>
@@ -95,7 +97,11 @@ static void execute(const char *label, const char *uri) {
 
 int main(void) {
     xmlSecTransformPtr transform;
+    int closed;
 
+    /* A libxmlsec1 caller works with libxml2, which provides the allocator;
+     * initializing it also keeps the linker from dropping it. */
+    xmlInitParser();
     xmlSecErrorsSetCallback(record);
     printf("io init: %d\n", xmlSecIOInit());
     xmlSecIOCleanupCallbacks();
@@ -118,8 +124,12 @@ int main(void) {
     transform = xmlSecTransformCreate(xmlSecTransformInputURIId);
     closes = 0;
     printf("  open=%d\n", xmlSecTransformInputURIOpen(transform, BAD_CAST "example:x"));
-    printf("  close=%d closes=%d\n", xmlSecTransformInputURIClose(transform), closes);
-    printf("  close again=%d closes=%d\n", xmlSecTransformInputURIClose(transform), closes);
+    /* The call runs before `closes` is read: argument evaluation order is
+     * unspecified, so the result is taken in its own statement. */
+    closed = xmlSecTransformInputURIClose(transform);
+    printf("  close=%d closes=%d\n", closed, closes);
+    closed = xmlSecTransformInputURIClose(transform);
+    printf("  close again=%d closes=%d\n", closed, closes);
     xmlSecTransformDestroy(transform);
 
     printf("register without match: %d\n",

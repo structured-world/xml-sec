@@ -11,6 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <libxml/parser.h>
+
 #include <xmlsec/xmlsec.h>
 #include <xmlsec/errors.h>
 #include <xmlsec/app.h>
@@ -57,7 +59,11 @@ static xmlSecTransformId caller_sha1(void) {
 int main(void) {
     struct _xmlSecCryptoDLFunctions *table;
     xmlSecSize before;
+    int ret;
 
+    /* A libxmlsec1 caller works with libxml2, which provides the allocator;
+     * initializing it also keeps the linker from dropping it. */
+    xmlInitParser();
     xmlSecErrorsSetCallback(record);
 
     printf("layout: size=%d init=%d keydata=%d store=%d aes=%d sha1=%d appinit=%d pwd=%d\n",
@@ -92,7 +98,10 @@ int main(void) {
     table->transformSha1GetKlass = caller_sha1;
     printf("set table: %d\n", xmlSecCryptoDLSetFunctions(table));
     printf("table installed: %d\n", xmlSecCryptoDLGetFunctions() == table);
-    printf("crypto init: %d inits=%d\n", xmlSecCryptoInit(), inits);
+    /* The call runs before `inits` is read: argument evaluation order is
+     * unspecified, so the result is taken in its own statement. */
+    ret = xmlSecCryptoInit();
+    printf("crypto init: %d inits=%d\n", ret, inits);
     printf("app init: %d\n", xmlSecCryptoAppInit("config"));
     printf("crypto shutdown: %d\n", xmlSecCryptoShutdown());
     printf("sha1 klass: %s\n", xmlSecTransformKlassGetName(xmlSecTransformSha1GetKlass()));

@@ -69,6 +69,20 @@ fn racing_init_and_shutdown_leave_consistent_registries() {
     }
 }
 
+/// A second initialization without a shutdown in between leaves the
+/// registries holding the defaults once and releases the storage of the
+/// first, which the leak checker of the sanitizer run verifies.
+#[test]
+fn repeated_init_releases_the_previous_registries() {
+    // SAFETY: init and shutdown run on this thread alone.
+    unsafe {
+        assert_eq!(xmlSecInit(), 0);
+        assert_eq!(xmlSecInit(), 0);
+        assert_eq!(xmlSecPtrListGetSize(xmlSecTransformIdsGet()), 12);
+        assert_eq!(xmlSecShutdown(), 0);
+    }
+}
+
 /// The version check accepts this release exactly and any older minor or
 /// subminor as ABI compatible, and refuses another major.
 #[test]

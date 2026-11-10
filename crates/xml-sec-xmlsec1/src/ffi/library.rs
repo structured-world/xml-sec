@@ -34,6 +34,9 @@ const VERSION: (c_int, c_int, c_int) = (1, 3, 13);
 /// Held while `xmlSecInit` or `xmlSecShutdown` runs.
 static LIFECYCLE: AtomicBool = AtomicBool::new(false);
 
+/// Whether the registries are set up: written only inside [`serialized`].
+static INITIALIZED: AtomicBool = AtomicBool::new(false);
+
 /// Runs `body` while no other initialization or shutdown runs.
 fn serialized<T>(body: impl FnOnce() -> T) -> T {
     /// Releases the lifecycle on every exit, a panic included.
@@ -72,6 +75,15 @@ pub(crate) unsafe extern "C" fn xmlSecInit() -> c_int {
     contain(-1, || {
         serialized(|| {
             let here = here!("xmlSecInit");
+            // A second initialization without a shutdown in between (two
+            // callers racing) releases the registries first: libxmlsec1
+            // overwrites them and leaks their storage, the state left is the
+            // same defaults either way.
+            if INITIALIZED.load(Ordering::Relaxed) {
+                // SAFETY: no operation runs, by the caller's contract.
+                unsafe { release() };
+            }
+            INITIALIZED.store(true, Ordering::Relaxed);
             // SAFETY: initialization while no operation runs; libxmlsec1
             // ignores the I/O initialization's result.
             unsafe {
@@ -110,25 +122,36 @@ pub(crate) unsafe extern "C" fn xmlSecInit() -> c_int {
 pub(crate) unsafe extern "C" fn xmlSecShutdown() -> c_int {
     contain(-1, || {
         serialized(|| {
-            let mut result = 0;
+            INITIALIZED.store(false, Ordering::Relaxed);
             // SAFETY: shutdown while no operation runs.
-            unsafe {
-                xmlSecTransformIdsShutdown();
-                xmlSecKeyDataIdsShutdown();
-                if xmlSecCryptoDLShutdown() < 0 {
-                    errors::internal(
-                        here!("xmlSecShutdown"),
-                        std::ptr::null(),
-                        c"xmlSecCryptoDLShutdown",
-                    );
-                    result = -1;
-                }
-                xmlSecIOShutdown();
-                xmlSecErrorsShutdown();
-            }
-            result
+            unsafe { release() }
         })
     })
+}
+
+/// Releases what `xmlSecInit` set up; -1 when the crypto library list fails
+/// to shut down.
+///
+/// # Safety
+/// Runs inside [`serialized`] while no operation runs.
+unsafe fn release() -> c_int {
+    let mut result = 0;
+    // SAFETY: by the caller's contract.
+    unsafe {
+        xmlSecTransformIdsShutdown();
+        xmlSecKeyDataIdsShutdown();
+        if xmlSecCryptoDLShutdown() < 0 {
+            errors::internal(
+                here!("xmlSecShutdown"),
+                std::ptr::null(),
+                c"xmlSecCryptoDLShutdown",
+            );
+            result = -1;
+        }
+        xmlSecIOShutdown();
+        xmlSecErrorsShutdown();
+    }
+    result
 }
 
 /// `xmlSecSetExternalEntityLoader`: installs `loader` as libxml2's external
