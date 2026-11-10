@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
 use xml_sec_libxml2::ffi::XmlNode;
 
+use super::errors::{self, check, here};
 use super::{ALLOC_MODE_DOUBLE, contain, free, grown, malloc, realloc};
 
 #[cfg(test)]
@@ -72,10 +73,21 @@ pub(crate) unsafe extern "C" fn xmlSecBufferCreate(size: usize) -> *mut XmlSecBu
     contain(std::ptr::null_mut(), || {
         let buf = malloc(size_of::<XmlSecBuffer>()).cast::<XmlSecBuffer>();
         if buf.is_null() {
+            errors::malloc_failed(
+                here!("xmlSecBufferCreate"),
+                std::ptr::null(),
+                size_of::<XmlSecBuffer>(),
+            );
             return buf;
         }
         // SAFETY: `buf` is a fresh allocation of a buffer's size.
         if unsafe { xmlSecBufferInitialize(buf, size) } < 0 {
+            errors::internal_with(
+                here!("xmlSecBufferCreate"),
+                std::ptr::null(),
+                c"xmlSecBufferInitialize",
+                &format!("size={size}"),
+            );
             // SAFETY: initialization left `buf` a valid, empty buffer.
             unsafe { xmlSecBufferDestroy(buf) };
             return std::ptr::null_mut();
@@ -92,9 +104,7 @@ pub(crate) unsafe extern "C" fn xmlSecBufferCreate(size: usize) -> *mut XmlSecBu
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecBufferDestroy(buf: *mut XmlSecBuffer) {
     contain((), || {
-        if buf.is_null() {
-            return;
-        }
+        check!(!buf.is_null(), "xmlSecBufferDestroy", c"buf != NULL", ());
         // SAFETY: the caller passes a live created buffer.
         unsafe {
             xmlSecBufferFinalize(buf);
@@ -115,9 +125,7 @@ pub(crate) unsafe extern "C" fn xmlSecBufferInitialize(
     size: usize,
 ) -> c_int {
     contain(-1, || {
-        if buf.is_null() {
-            return -1;
-        }
+        check!(!buf.is_null(), "xmlSecBufferInitialize", c"buf != NULL", -1);
         // SAFETY: `buf` is writable; the write does not read the old value.
         unsafe {
             buf.write(XmlSecBuffer {
@@ -139,9 +147,7 @@ pub(crate) unsafe extern "C" fn xmlSecBufferInitialize(
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecBufferFinalize(buf: *mut XmlSecBuffer) {
     contain((), || {
-        if buf.is_null() {
-            return;
-        }
+        check!(!buf.is_null(), "xmlSecBufferFinalize", c"buf != NULL", ());
         // SAFETY: the caller passes a valid buffer, whose data is null or a
         // libxml2 allocation it owns.
         unsafe {
@@ -164,14 +170,16 @@ pub(crate) unsafe extern "C" fn xmlSecBufferFinalize(buf: *mut XmlSecBuffer) {
 pub(crate) unsafe extern "C" fn xmlSecBufferEmpty(buf: *mut XmlSecBuffer) {
     contain((), || {
         // SAFETY: the caller passes null or a valid buffer.
-        let Some(buf) = (unsafe { buf.as_mut() }) else {
-            return;
-        };
+        let buf = unsafe { buf.as_mut() };
+        check!(buf.is_some(), "xmlSecBufferEmpty", c"buf != NULL", ());
+        let Some(buf) = buf else { return };
         if !buf.data.is_null() {
-            if buf.max_size == 0 {
-                // libxmlsec1's assertion: data without an allocation size.
-                return;
-            }
+            check!(
+                buf.max_size > 0,
+                "xmlSecBufferEmpty",
+                c"buf->maxSize > 0",
+                ()
+            );
             // SAFETY: `data` holds `maxSize` bytes.
             unsafe { buf.data.write_bytes(0, buf.max_size) };
         }
@@ -201,8 +209,14 @@ pub(crate) unsafe extern "C" fn xmlSecBufferIsEmpty(buf: *mut XmlSecBuffer) -> c
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecBufferGetData(buf: *mut XmlSecBuffer) -> *mut u8 {
     contain(std::ptr::null_mut(), || {
-        // SAFETY: the caller passes null or a valid buffer.
-        unsafe { buf.as_ref() }.map_or(std::ptr::null_mut(), |buf| buf.data)
+        check!(
+            !buf.is_null(),
+            "xmlSecBufferGetData",
+            c"buf != NULL",
+            std::ptr::null_mut()
+        );
+        // SAFETY: the caller passes a valid buffer.
+        unsafe { (*buf).data }
     })
 }
 
@@ -218,15 +232,20 @@ pub(crate) unsafe extern "C" fn xmlSecBufferSetData(
     size: usize,
 ) -> c_int {
     contain(-1, || {
-        if buf.is_null() {
-            return -1;
-        }
+        check!(!buf.is_null(), "xmlSecBufferSetData", c"buf != NULL", -1);
         // SAFETY: the caller passes a valid buffer and `size` readable bytes
         // at `data`; after growing, `buf`'s data holds at least `size` bytes.
         unsafe {
             xmlSecBufferEmpty(buf);
             if size > 0 {
-                if data.is_null() || xmlSecBufferSetMaxSize(buf, size) < 0 {
+                check!(!data.is_null(), "xmlSecBufferSetData", c"data != NULL", -1);
+                if xmlSecBufferSetMaxSize(buf, size) < 0 {
+                    errors::internal_with(
+                        here!("xmlSecBufferSetData"),
+                        std::ptr::null(),
+                        c"xmlSecBufferSetMaxSize",
+                        &format!("size={size}"),
+                    );
                     return -1;
                 }
                 data.copy_to((*buf).data, size);
@@ -244,8 +263,9 @@ pub(crate) unsafe extern "C" fn xmlSecBufferSetData(
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecBufferGetSize(buf: *mut XmlSecBuffer) -> usize {
     contain(0, || {
-        // SAFETY: the caller passes null or a valid buffer.
-        unsafe { buf.as_ref() }.map_or(0, |buf| buf.size)
+        check!(!buf.is_null(), "xmlSecBufferGetSize", c"buf != NULL", 0);
+        // SAFETY: the caller passes a valid buffer.
+        unsafe { (*buf).size }
     })
 }
 
@@ -257,20 +277,27 @@ pub(crate) unsafe extern "C" fn xmlSecBufferGetSize(buf: *mut XmlSecBuffer) -> u
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecBufferSetSize(buf: *mut XmlSecBuffer, size: usize) -> c_int {
     contain(-1, || {
-        if buf.is_null() {
-            return -1;
-        }
+        check!(!buf.is_null(), "xmlSecBufferSetSize", c"buf != NULL", -1);
         // SAFETY: the caller passes a valid buffer; after growing, its data
         // holds `maxSize >= max(size, old size)` bytes.
         unsafe {
             if xmlSecBufferSetMaxSize(buf, size) < 0 {
+                errors::internal_with(
+                    here!("xmlSecBufferSetSize"),
+                    std::ptr::null(),
+                    c"xmlSecBufferSetMaxSize",
+                    &format!("size={size}"),
+                );
                 return -1;
             }
             let buf = &mut *buf;
             if size < buf.size {
-                if buf.data.is_null() {
-                    return -1;
-                }
+                check!(
+                    !buf.data.is_null(),
+                    "xmlSecBufferSetSize",
+                    c"buf->data != NULL",
+                    -1
+                );
                 buf.data.add(size).write_bytes(0, buf.size - size);
             }
             buf.size = size;
@@ -286,8 +313,9 @@ pub(crate) unsafe extern "C" fn xmlSecBufferSetSize(buf: *mut XmlSecBuffer, size
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecBufferGetMaxSize(buf: *mut XmlSecBuffer) -> usize {
     contain(0, || {
-        // SAFETY: the caller passes null or a valid buffer.
-        unsafe { buf.as_ref() }.map_or(0, |buf| buf.max_size)
+        check!(!buf.is_null(), "xmlSecBufferGetMaxSize", c"buf != NULL", 0);
+        // SAFETY: the caller passes a valid buffer.
+        unsafe { (*buf).max_size }
     })
 }
 
@@ -302,18 +330,17 @@ pub(crate) unsafe extern "C" fn xmlSecBufferSetMaxSize(
     size: usize,
 ) -> c_int {
     contain(-1, || {
-        // SAFETY: the caller passes null or a valid buffer.
-        let Some(buf) = (unsafe { buf.as_mut() }) else {
-            return -1;
-        };
+        check!(!buf.is_null(), "xmlSecBufferSetMaxSize", c"buf != NULL", -1);
+        // SAFETY: the caller passes a valid buffer.
+        let buf = unsafe { &mut *buf };
         if size <= buf.max_size {
             return 0;
         }
-        let Some(new_size) = grown(
-            buf.alloc_mode,
-            size,
-            DEFAULT_INITIAL_SIZE.load(Ordering::Relaxed),
-        ) else {
+        // libxmlsec1 computes the size in unchecked arithmetic; an overflow
+        // here is the allocation it could not make.
+        let initial = DEFAULT_INITIAL_SIZE.load(Ordering::Relaxed);
+        let Some(new_size) = grown(buf.alloc_mode, size, initial) else {
+            errors::malloc_failed(here!("xmlSecBufferSetMaxSize"), std::ptr::null(), size);
             return -1;
         };
         let data = if buf.data.is_null() {
@@ -323,6 +350,7 @@ pub(crate) unsafe extern "C" fn xmlSecBufferSetMaxSize(
             unsafe { realloc(buf.data.cast::<c_void>(), new_size) }
         };
         if data.is_null() {
+            errors::malloc_failed(here!("xmlSecBufferSetMaxSize"), std::ptr::null(), new_size);
             return -1;
         }
         buf.data = data.cast::<u8>();
@@ -342,12 +370,36 @@ pub(crate) unsafe extern "C" fn xmlSecBufferSetMaxSize(
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecBufferSwap(buf1: *mut XmlSecBuffer, buf2: *mut XmlSecBuffer) {
     contain((), || {
-        if buf1.is_null() || buf2.is_null() {
-            return;
-        }
+        check!(!buf1.is_null(), "xmlSecBufferSwap", c"buf1 != NULL", ());
+        check!(!buf2.is_null(), "xmlSecBufferSwap", c"buf2 != NULL", ());
         // SAFETY: both are valid buffers; `swap` allows them to be the same.
         unsafe { std::ptr::swap(buf1, buf2) };
     });
+}
+
+/// Grows `buf` to hold `size` more bytes than its contents; the new total,
+/// or `None` after reporting the failure as the entry point at `here`.
+///
+/// # Safety
+/// `buf` is a valid buffer.
+unsafe fn grow_by(buf: *mut XmlSecBuffer, size: usize, here: errors::Here) -> Option<usize> {
+    // SAFETY: by the caller's contract.
+    let current = unsafe { (*buf).size };
+    // A total past the address space is an allocation libxmlsec1 could not
+    // make either.
+    let grown = current
+        .checked_add(size)
+        // SAFETY: by the caller's contract.
+        .filter(|total| unsafe { xmlSecBufferSetMaxSize(buf, *total) } >= 0);
+    if grown.is_none() {
+        errors::internal_with(
+            here,
+            std::ptr::null(),
+            c"xmlSecBufferSetMaxSize",
+            &format!("size={}", current.wrapping_add(size)),
+        );
+    }
+    grown
 }
 
 /// `xmlSecBufferAppend`: adds `size` bytes of `data` after the contents.
@@ -362,21 +414,17 @@ pub(crate) unsafe extern "C" fn xmlSecBufferAppend(
     size: usize,
 ) -> c_int {
     contain(-1, || {
-        if buf.is_null() {
-            return -1;
-        }
+        check!(!buf.is_null(), "xmlSecBufferAppend", c"buf != NULL", -1);
         if size == 0 {
             return 0;
         }
+        check!(!data.is_null(), "xmlSecBufferAppend", c"data != NULL", -1);
         // SAFETY: the caller passes a valid buffer and `size` readable bytes
         // at `data`; after growing, the buffer holds `old size + size` bytes.
         unsafe {
-            let Some(total) = (*buf).size.checked_add(size) else {
+            let Some(total) = grow_by(buf, size, here!("xmlSecBufferAppend")) else {
                 return -1;
             };
-            if data.is_null() || xmlSecBufferSetMaxSize(buf, total) < 0 {
-                return -1;
-            }
             let buf = &mut *buf;
             data.copy_to(buf.data.add(buf.size), size);
             buf.size = total;
@@ -397,20 +445,16 @@ pub(crate) unsafe extern "C" fn xmlSecBufferPrepend(
     size: usize,
 ) -> c_int {
     contain(-1, || {
-        if buf.is_null() {
-            return -1;
-        }
+        check!(!buf.is_null(), "xmlSecBufferPrepend", c"buf != NULL", -1);
         if size == 0 {
             return 0;
         }
+        check!(!data.is_null(), "xmlSecBufferPrepend", c"data != NULL", -1);
         // SAFETY: as for append; the old contents move within the grown data.
         unsafe {
-            let Some(total) = (*buf).size.checked_add(size) else {
+            let Some(total) = grow_by(buf, size, here!("xmlSecBufferPrepend")) else {
                 return -1;
             };
-            if data.is_null() || xmlSecBufferSetMaxSize(buf, total) < 0 {
-                return -1;
-            }
             let buf = &mut *buf;
             buf.data.copy_to(buf.data.add(size), buf.size);
             data.copy_to(buf.data, size);
@@ -431,14 +475,16 @@ pub(crate) unsafe extern "C" fn xmlSecBufferRemoveHead(
     size: usize,
 ) -> c_int {
     contain(-1, || {
-        // SAFETY: the caller passes null or a valid buffer.
-        let Some(buf) = (unsafe { buf.as_mut() }) else {
-            return -1;
-        };
+        check!(!buf.is_null(), "xmlSecBufferRemoveHead", c"buf != NULL", -1);
+        // SAFETY: the caller passes a valid buffer.
+        let buf = unsafe { &mut *buf };
         if size < buf.size {
-            if buf.data.is_null() {
-                return -1;
-            }
+            check!(
+                !buf.data.is_null(),
+                "xmlSecBufferRemoveHead",
+                c"buf->data != NULL",
+                -1
+            );
             buf.size -= size;
             // SAFETY: both ranges lie inside the old `size` bytes of data.
             unsafe { buf.data.add(size).copy_to(buf.data, buf.size) };
@@ -446,9 +492,12 @@ pub(crate) unsafe extern "C" fn xmlSecBufferRemoveHead(
             buf.size = 0;
         }
         if buf.size < buf.max_size {
-            if buf.data.is_null() {
-                return -1;
-            }
+            check!(
+                !buf.data.is_null(),
+                "xmlSecBufferRemoveHead",
+                c"buf->data != NULL",
+                -1
+            );
             // SAFETY: data holds `maxSize > size` bytes.
             unsafe { zero_tail(buf) };
         }
@@ -467,17 +516,19 @@ pub(crate) unsafe extern "C" fn xmlSecBufferRemoveTail(
     size: usize,
 ) -> c_int {
     contain(-1, || {
-        // SAFETY: the caller passes null or a valid buffer.
-        let Some(buf) = (unsafe { buf.as_mut() }) else {
-            return -1;
-        };
+        check!(!buf.is_null(), "xmlSecBufferRemoveTail", c"buf != NULL", -1);
+        // SAFETY: the caller passes a valid buffer.
+        let buf = unsafe { &mut *buf };
         // libxmlsec1's contract: removing more than the contents empties the
         // buffer, so clamping at zero is the specified result.
         buf.size = buf.size.saturating_sub(size);
         if buf.size < buf.max_size {
-            if buf.data.is_null() {
-                return -1;
-            }
+            check!(
+                !buf.data.is_null(),
+                "xmlSecBufferRemoveTail",
+                c"buf->data != NULL",
+                -1
+            );
             // SAFETY: data holds `maxSize > size` bytes.
             unsafe { zero_tail(buf) };
         }
@@ -492,16 +543,18 @@ pub(crate) unsafe extern "C" fn xmlSecBufferRemoveTail(
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecBufferReverse(buf: *mut XmlSecBuffer) -> c_int {
     contain(-1, || {
-        // SAFETY: the caller passes null or a valid buffer.
-        let Some(buf) = (unsafe { buf.as_mut() }) else {
-            return -1;
-        };
+        check!(!buf.is_null(), "xmlSecBufferReverse", c"buf != NULL", -1);
+        // SAFETY: the caller passes a valid buffer.
+        let buf = unsafe { &mut *buf };
         if buf.size <= 1 {
             return 0;
         }
-        if buf.data.is_null() {
-            return -1;
-        }
+        check!(
+            !buf.data.is_null(),
+            "xmlSecBufferReverse",
+            c"pp != NULL",
+            -1
+        );
         // SAFETY: data holds `size` initialized bytes the buffer owns.
         unsafe { std::slice::from_raw_parts_mut(buf.data, buf.size) }.reverse();
         0
@@ -519,18 +572,42 @@ pub(crate) unsafe extern "C" fn xmlSecBufferReadFile(
     filename: *const c_char,
 ) -> c_int {
     contain(-1, || {
-        if buf.is_null() || filename.is_null() {
-            return -1;
-        }
+        check!(!buf.is_null(), "xmlSecBufferReadFile", c"buf != NULL", -1);
+        check!(
+            !filename.is_null(),
+            "xmlSecBufferReadFile",
+            c"filename != NULL",
+            -1
+        );
         // SAFETY: the caller passes a NUL-terminated name.
         let name = unsafe { CStr::from_ptr(filename) };
-        let Ok(contents) = std::fs::read(path(name)) else {
-            return -1;
+        let contents = match std::fs::read(path(name)) {
+            Ok(contents) => contents,
+            Err(error) => {
+                errors::report(
+                    here!("xmlSecBufferReadFile"),
+                    std::ptr::null(),
+                    c"fopen".as_ptr(),
+                    errors::R_IO_FAILED,
+                    &format!(
+                        "name=\"{}\"; errno={}",
+                        name.to_string_lossy(),
+                        error.raw_os_error().unwrap_or(0)
+                    ),
+                );
+                return -1;
+            }
         };
         // Appended in libxmlsec1's read size, so the buffer grows the same way.
         for chunk in contents.chunks(FILE_CHUNK) {
             // SAFETY: `buf` is valid and `chunk` is readable.
             if unsafe { xmlSecBufferAppend(buf, chunk.as_ptr(), chunk.len()) } < 0 {
+                errors::internal_with(
+                    here!("xmlSecBufferReadFile"),
+                    std::ptr::null(),
+                    c"xmlSecBufferAppend",
+                    &format!("size={}", chunk.len()),
+                );
                 return -1;
             }
         }
@@ -575,9 +652,13 @@ pub(crate) unsafe extern "C" fn xmlSecBufferHexRead(
     hex_str: *const u8,
 ) -> c_int {
     contain(-1, || {
-        if buf.is_null() || hex_str.is_null() {
-            return -1;
-        }
+        check!(!buf.is_null(), "xmlSecBufferHexRead", c"buf != NULL", -1);
+        check!(
+            !hex_str.is_null(),
+            "xmlSecBufferHexRead",
+            c"hexStr != NULL",
+            -1
+        );
         // SAFETY: the caller passes a NUL-terminated string.
         let hex = unsafe { CStr::from_ptr(hex_str.cast::<c_char>()) }.to_bytes();
         if hex.is_empty() {
@@ -586,20 +667,41 @@ pub(crate) unsafe extern "C" fn xmlSecBufferHexRead(
             return 0;
         }
         if hex.len() % 2 != 0 {
+            errors::report(
+                here!("xmlSecBufferHexRead"),
+                std::ptr::null(),
+                std::ptr::null(),
+                errors::R_INVALID_DATA,
+                &format!(
+                    "invalid data for 'hexStrSize': actual={} and expected even",
+                    hex.len()
+                ),
+            );
             return -1;
         }
-        // SAFETY: `buf` is valid; after sizing, its data holds `hex.len() / 2`
-        // bytes.
+        let size = hex.len() / 2;
+        // SAFETY: `buf` is valid; after sizing, its data holds `size` bytes.
         unsafe {
-            if xmlSecBufferSetSize(buf, hex.len() / 2) < 0 {
+            if xmlSecBufferSetSize(buf, size) < 0 {
+                errors::internal_with(
+                    here!("xmlSecBufferHexRead"),
+                    std::ptr::null(),
+                    c"xmlSecBufferSetSize",
+                    &format!("bufSize={size}"),
+                );
                 return -1;
             }
             let data = (*buf).data;
-            if data.is_null() {
-                return -1;
-            }
+            check!(!data.is_null(), "xmlSecBufferHexRead", c"data != NULL", -1);
             for (index, [first, second]) in hex.as_chunks::<2>().0.iter().enumerate() {
                 let (Some(high), Some(low)) = (hex_digit(*first), hex_digit(*second)) else {
+                    errors::report(
+                        here!("xmlSecBufferHexRead"),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        errors::R_INVALID_DATA,
+                        "Unexpected character (not hex)",
+                    );
                     return -1;
                 };
                 data.add(index).write((high << 4) | low);
@@ -620,34 +722,55 @@ pub(crate) unsafe extern "C" fn xmlSecBufferBase64NodeContentRead(
     node: *mut XmlNode,
 ) -> c_int {
     contain(-1, || {
-        if buf.is_null() || node.is_null() {
-            return -1;
-        }
+        check!(
+            !buf.is_null(),
+            "xmlSecBufferBase64NodeContentRead",
+            c"buf != NULL",
+            -1
+        );
+        check!(
+            !node.is_null(),
+            "xmlSecBufferBase64NodeContentRead",
+            c"node != NULL",
+            -1
+        );
+        let here = here!("xmlSecBufferBase64NodeContentRead");
         // SAFETY: a valid buffer and live node; the content is freed on
         // every path.
         unsafe {
             let content = super::xmltree::xmlSecGetNodeContentAndTrim(node);
             if content.is_null() {
+                errors::invalid_node_content(here, node, std::ptr::null(), "empty");
                 return -1;
             }
             let len = CStr::from_ptr(content.cast::<c_char>()).to_bytes().len();
             let mut written = 0;
             // Base64 decodes to fewer bytes than its text.
-            let result = if xmlSecBufferSetMaxSize(buf, len) < 0
-                || super::base64::xmlSecBase64Decode_ex(
-                    content,
-                    xmlSecBufferGetData(buf),
-                    xmlSecBufferGetMaxSize(buf),
-                    &raw mut written,
-                ) < 0
-                || xmlSecBufferSetSize(buf, written) < 0
+            let failed = if xmlSecBufferSetMaxSize(buf, len) < 0 {
+                errors::internal(here, std::ptr::null(), c"xmlSecBufferSetMaxSize");
+                true
+            } else if super::base64::xmlSecBase64Decode_ex(
+                content,
+                xmlSecBufferGetData(buf),
+                xmlSecBufferGetMaxSize(buf),
+                &raw mut written,
+            ) < 0
             {
-                -1
+                errors::internal(here, std::ptr::null(), c"xmlSecBase64Decode_ex");
+                true
+            } else if xmlSecBufferSetSize(buf, written) < 0 {
+                errors::internal_with(
+                    here,
+                    std::ptr::null(),
+                    c"xmlSecBufferSetSize",
+                    &format!("size={written}"),
+                );
+                true
             } else {
-                0
+                false
             };
             free(content.cast());
-            result
+            if failed { -1 } else { 0 }
         }
     })
 }
@@ -664,9 +787,18 @@ pub(crate) unsafe extern "C" fn xmlSecBufferBase64NodeContentWrite(
     columns: c_int,
 ) -> c_int {
     contain(-1, || {
-        if buf.is_null() || node.is_null() {
-            return -1;
-        }
+        check!(
+            !buf.is_null(),
+            "xmlSecBufferBase64NodeContentWrite",
+            c"buf != NULL",
+            -1
+        );
+        check!(
+            !node.is_null(),
+            "xmlSecBufferBase64NodeContentWrite",
+            c"node != NULL",
+            -1
+        );
         // SAFETY: a valid buffer and live node; the encoding is freed after
         // libxml2 copies it.
         unsafe {
@@ -676,6 +808,11 @@ pub(crate) unsafe extern "C" fn xmlSecBufferBase64NodeContentWrite(
                 columns,
             );
             if content.is_null() {
+                errors::internal(
+                    here!("xmlSecBufferBase64NodeContentWrite"),
+                    std::ptr::null(),
+                    c"xmlSecBase64Encode",
+                );
                 return -1;
             }
             super::tree::xmlNodeAddContent(node, content);
@@ -696,9 +833,18 @@ pub(crate) unsafe extern "C" fn xmlSecBufferDebugHexDump(
     output: *mut c_void,
 ) {
     contain((), || {
-        if buf.is_null() || output.is_null() {
-            return;
-        }
+        check!(
+            !buf.is_null(),
+            "xmlSecBufferDebugHexDump",
+            c"buf != NULL",
+            ()
+        );
+        check!(
+            !output.is_null(),
+            "xmlSecBufferDebugHexDump",
+            c"output != NULL",
+            ()
+        );
         // SAFETY: a valid buffer holds `size` bytes at `data`.
         let bytes = unsafe {
             let size = xmlSecBufferGetSize(buf);

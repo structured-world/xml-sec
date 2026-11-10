@@ -10,7 +10,7 @@
 use std::ffi::{CStr, VaList, c_char, c_int, c_void};
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
-use xml_sec_libxml2::ffi::libxml2;
+use xml_sec_libxml2::ffi::{XmlNode, libxml2};
 
 use super::contain;
 
@@ -52,6 +52,8 @@ pub(crate) const R_INVALID_STATUS: c_int = 16;
 pub(crate) const R_INVALID_VERSION: c_int = 19;
 /// `XMLSEC_ERRORS_R_INVALID_NODE`.
 pub(crate) const R_INVALID_NODE: c_int = 21;
+/// `XMLSEC_ERRORS_R_INVALID_NODE_CONTENT`.
+pub(crate) const R_INVALID_NODE_CONTENT: c_int = 22;
 /// `XMLSEC_ERRORS_R_INVALID_TRANSFORM`.
 pub(crate) const R_INVALID_TRANSFORM: c_int = 31;
 /// `XMLSEC_ERRORS_R_INVALID_URI_TYPE`.
@@ -60,6 +62,8 @@ pub(crate) const R_INVALID_URI_TYPE: c_int = 33;
 pub(crate) const R_TRANSFORM_DISABLED: c_int = 35;
 /// `XMLSEC_ERRORS_R_ASSERTION`.
 pub(crate) const R_ASSERTION: c_int = 100;
+/// `XMLSEC_ERROR_R_CAST_IMPOSSIBLE`.
+pub(crate) const R_CAST_IMPOSSIBLE: c_int = 101;
 
 /// libxmlsec1's reason table, in its order; positions past it hold no code
 /// and no message.
@@ -416,6 +420,108 @@ pub(crate) fn report(
 pub(crate) fn internal(here: Here, object: *const c_char, failed: &CStr) {
     report(here, object, failed.as_ptr(), R_XMLSEC_FAILED, " ");
 }
+
+/// libxmlsec1's `xmlSecInternalError2`: the call `failed` failed, with
+/// `message`.
+pub(crate) fn internal_with(here: Here, object: *const c_char, failed: &CStr, message: &str) {
+    report(here, object, failed.as_ptr(), R_XMLSEC_FAILED, message);
+}
+
+/// The name of `node` for a report (libxmlsec1's `xmlSecNodeGetName`).
+///
+/// # Safety
+/// `node` is null or a live node.
+unsafe fn node_name(node: *const XmlNode) -> String {
+    // SAFETY: by the caller's contract; a node's name is null or
+    // NUL-terminated.
+    unsafe {
+        node.as_ref()
+            .filter(|node| !node.name.is_null())
+            .map_or_else(
+                || "NULL".to_owned(),
+                |node| {
+                    CStr::from_ptr(node.name.cast())
+                        .to_string_lossy()
+                        .into_owned()
+                },
+            )
+    }
+}
+
+/// libxmlsec1's `xmlSecInvalidNodeContentError`.
+///
+/// # Safety
+/// `node` is null or a live node.
+pub(crate) unsafe fn invalid_node_content(
+    here: Here,
+    node: *const XmlNode,
+    object: *const c_char,
+    reason: &str,
+) {
+    // SAFETY: by the caller's contract.
+    let name = unsafe { node_name(node) };
+    report(
+        here,
+        object,
+        std::ptr::null(),
+        R_INVALID_NODE_CONTENT,
+        &format!("node={name}; reason={reason}"),
+    );
+}
+
+/// libxmlsec1's `xmlSecInvalidNodeError`: `node` is not the expected one.
+///
+/// # Safety
+/// `node` is null or a live node.
+pub(crate) unsafe fn invalid_node(
+    here: Here,
+    node: *const XmlNode,
+    expected: &str,
+    object: *const c_char,
+) {
+    // SAFETY: by the caller's contract.
+    let name = unsafe { node_name(node) };
+    report(
+        here,
+        object,
+        std::ptr::null(),
+        R_INVALID_NODE,
+        &format!("actual={name}; expected={expected}"),
+    );
+}
+
+/// libxmlsec1's `XMLSEC_SAFE_CAST_INT_TO_SIZE` failure: `value` is not a
+/// size.
+pub(crate) fn int_to_size_impossible(here: Here, value: c_int) {
+    report(
+        here,
+        std::ptr::null(),
+        std::ptr::null(),
+        R_CAST_IMPOSSIBLE,
+        &format!(
+            "src-type=int; src-val={value};dst-type=xmlSecSize; dst-min=0;dst-max={}",
+            usize::MAX
+        ),
+    );
+}
+
+/// libxmlsec1's `xmlSecInvalidDataError`.
+pub(crate) fn invalid_data(here: Here, object: *const c_char, message: &str) {
+    report(here, object, std::ptr::null(), R_INVALID_DATA, message);
+}
+
+/// libxmlsec1's `xmlSecAssert2`: when `$condition` does not hold, reports the
+/// precondition `$text` (libxmlsec1's expression text) as failed inside
+/// `$func` and returns `$ret`.
+macro_rules! check {
+    ($condition:expr, $func:literal, $text:literal, $ret:expr) => {
+        if !$condition {
+            $crate::ffi::errors::assertion($crate::ffi::errors::here!($func), $text);
+            return $ret;
+        }
+    };
+}
+pub(crate) use check;
 
 /// libxmlsec1's `xmlSecAssert`: the precondition `expression` does not hold.
 pub(crate) fn assertion(here: Here, expression: &CStr) {

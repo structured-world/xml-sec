@@ -1,8 +1,9 @@
 //! `xmlsec/list.h`: the pointer list whose klass owns its items.
 
-use std::ffi::{c_int, c_void};
+use std::ffi::{c_char, c_int, c_void};
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
+use super::errors::{self, check, here};
 use super::{ALLOC_MODE_DOUBLE, contain, free, grown, malloc, realloc};
 
 #[cfg(test)]
@@ -62,6 +63,15 @@ unsafe fn klass(list: &XmlSecPtrList) -> &XmlSecPtrListKlass {
     unsafe { &*list.id }
 }
 
+/// The name of a klass for a report (`xmlSecPtrListKlassGetName`).
+///
+/// # Safety
+/// `id` is null or a klass.
+unsafe fn klass_name(id: *const XmlSecPtrListKlass) -> *const c_char {
+    // SAFETY: by the caller's contract.
+    unsafe { id.as_ref() }.map_or(std::ptr::null(), |klass| klass.name.cast())
+}
+
 /// Grows `list` to hold `size` items. Like libxmlsec1, it grows when `size`
 /// reaches the allocation, not only when it exceeds it.
 ///
@@ -71,14 +81,15 @@ unsafe fn ensure_size(list: &mut XmlSecPtrList, size: usize) -> c_int {
     if size < list.max {
         return 0;
     }
-    let Some(new_size) = grown(
-        list.alloc_mode,
-        size,
-        DEFAULT_INITIAL_SIZE.load(Ordering::Relaxed),
-    ) else {
-        return -1;
-    };
-    let Some(bytes) = new_size.checked_mul(size_of::<*mut c_void>()) else {
+    // SAFETY: a valid list's klass outlives it.
+    let name = unsafe { klass_name(list.id) };
+    let initial = DEFAULT_INITIAL_SIZE.load(Ordering::Relaxed);
+    // A size past the address space is an allocation libxmlsec1 could not
+    // make either.
+    let Some((new_size, bytes)) = grown(list.alloc_mode, size, initial)
+        .and_then(|new_size| Some((new_size, new_size.checked_mul(size_of::<*mut c_void>())?)))
+    else {
+        errors::malloc_failed(here!("xmlSecPtrListEnsureSize"), name, usize::MAX);
         return -1;
     };
     let data = if list.data.is_null() {
@@ -88,6 +99,7 @@ unsafe fn ensure_size(list: &mut XmlSecPtrList, size: usize) -> c_int {
         unsafe { realloc(list.data.cast::<c_void>(), bytes) }
     };
     if data.is_null() {
+        errors::malloc_failed(here!("xmlSecPtrListEnsureSize"), name, bytes);
         return -1;
     }
     list.data = data.cast::<*mut c_void>();
@@ -123,9 +135,18 @@ pub(crate) unsafe extern "C" fn xmlSecPtrListInitialize(
     id: *const XmlSecPtrListKlass,
 ) -> c_int {
     contain(-1, || {
-        if id.is_null() || list.is_null() {
-            return -1;
-        }
+        check!(
+            !id.is_null(),
+            "xmlSecPtrListInitialize",
+            c"id != xmlSecPtrListIdUnknown",
+            -1
+        );
+        check!(
+            !list.is_null(),
+            "xmlSecPtrListInitialize",
+            c"list != NULL",
+            -1
+        );
         // SAFETY: `list` is writable; the write does not read the old value.
         unsafe {
             list.write(XmlSecPtrList {
@@ -148,10 +169,13 @@ pub(crate) unsafe extern "C" fn xmlSecPtrListInitialize(
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecPtrListFinalize(list: *mut XmlSecPtrList) {
     contain((), || {
-        // SAFETY: the caller passes null or a list.
-        if unsafe { valid(list) }.is_none() {
-            return;
-        }
+        check!(
+            // SAFETY: the caller passes null or a list.
+            unsafe { valid(list) }.is_some(),
+            "xmlSecPtrListFinalize",
+            c"xmlSecPtrListIsValid(list)",
+            ()
+        );
         // SAFETY: `list` is valid and writable.
         unsafe {
             xmlSecPtrListEmpty(list);
@@ -170,15 +194,30 @@ pub(crate) unsafe extern "C" fn xmlSecPtrListCreate(
     id: *const XmlSecPtrListKlass,
 ) -> *mut XmlSecPtrList {
     contain(std::ptr::null_mut(), || {
-        if id.is_null() {
-            return std::ptr::null_mut();
-        }
+        check!(
+            !id.is_null(),
+            "xmlSecPtrListCreate",
+            c"id != xmlSecPtrListIdUnknown",
+            std::ptr::null_mut()
+        );
+        // SAFETY: `id` is a klass.
+        let name = unsafe { klass_name(id) };
         let list = malloc(size_of::<XmlSecPtrList>()).cast::<XmlSecPtrList>();
         if list.is_null() {
+            errors::malloc_failed(
+                here!("xmlSecPtrListCreate"),
+                name,
+                size_of::<XmlSecPtrList>(),
+            );
             return list;
         }
         // SAFETY: `list` is a fresh allocation of a list's size.
         if unsafe { xmlSecPtrListInitialize(list, id) } < 0 {
+            errors::internal(
+                here!("xmlSecPtrListCreate"),
+                name,
+                c"xmlSecPtrListInitialize",
+            );
             // SAFETY: the allocation is ours and holds nothing.
             unsafe { free(list.cast::<c_void>()) };
             return std::ptr::null_mut();
@@ -195,10 +234,13 @@ pub(crate) unsafe extern "C" fn xmlSecPtrListCreate(
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecPtrListDestroy(list: *mut XmlSecPtrList) {
     contain((), || {
-        // SAFETY: the caller passes null or a created list.
-        if unsafe { valid(list) }.is_none() {
-            return;
-        }
+        check!(
+            // SAFETY: the caller passes null or a created list.
+            unsafe { valid(list) }.is_some(),
+            "xmlSecPtrListDestroy",
+            c"xmlSecPtrListIsValid(list)",
+            ()
+        );
         // SAFETY: a valid created list is finalized, then its allocation freed.
         unsafe {
             xmlSecPtrListFinalize(list);
@@ -216,15 +258,23 @@ pub(crate) unsafe extern "C" fn xmlSecPtrListDestroy(list: *mut XmlSecPtrList) {
 pub(crate) unsafe extern "C" fn xmlSecPtrListEmpty(list: *mut XmlSecPtrList) {
     contain((), || {
         // SAFETY: the caller passes null or a list.
-        let Some(list) = (unsafe { valid(list) }) else {
-            return;
-        };
+        let list = unsafe { valid(list) };
+        check!(
+            list.is_some(),
+            "xmlSecPtrListEmpty",
+            c"xmlSecPtrListIsValid(list)",
+            ()
+        );
+        let Some(list) = list else { return };
         // SAFETY: the list's klass outlives it.
         if let Some(destroy) = unsafe { klass(list) }.destroy_item {
             for pos in 0..list.used {
-                if list.data.is_null() {
-                    return;
-                }
+                check!(
+                    !list.data.is_null(),
+                    "xmlSecPtrListEmpty",
+                    c"list->data != NULL",
+                    ()
+                );
                 // SAFETY: `pos < used <= max` items are stored at `data`.
                 let item = unsafe { list.data.add(pos).read() };
                 if !item.is_null() {
@@ -234,9 +284,12 @@ pub(crate) unsafe extern "C" fn xmlSecPtrListEmpty(list: *mut XmlSecPtrList) {
             }
         }
         if list.max > 0 {
-            if list.data.is_null() {
-                return;
-            }
+            check!(
+                !list.data.is_null(),
+                "xmlSecPtrListEmpty",
+                c"list->data != NULL",
+                ()
+            );
             // SAFETY: `data` holds `max >= used` items and is the list's
             // libxml2 allocation.
             unsafe {
@@ -262,25 +315,59 @@ pub(crate) unsafe extern "C" fn xmlSecPtrListCopy(
 ) -> c_int {
     contain(-1, || {
         // SAFETY: the caller passes null or lists.
-        let (Some(dst), Some(src)) = (unsafe { valid(dst) }, unsafe { valid(src) }) else {
+        let (dst, src) = unsafe { (valid(dst), valid(src)) };
+        check!(
+            dst.is_some(),
+            "xmlSecPtrListCopy",
+            c"xmlSecPtrListIsValid(dst)",
+            -1
+        );
+        check!(
+            src.is_some(),
+            "xmlSecPtrListCopy",
+            c"xmlSecPtrListIsValid(src)",
+            -1
+        );
+        let (Some(dst), Some(src)) = (dst, src) else {
             return -1;
         };
-        if dst.id != src.id {
-            return -1;
-        }
-        let Some(total) = dst.used.checked_add(src.used) else {
-            return -1;
-        };
+        check!(
+            dst.id == src.id,
+            "xmlSecPtrListCopy",
+            c"dst->id == src->id",
+            -1
+        );
+        // SAFETY: both lists share a klass that outlives them.
+        let name = unsafe { klass_name(src.id) };
         // SAFETY: `dst` is valid.
-        if unsafe { ensure_size(dst, total) } < 0 {
+        let grown = dst
+            .used
+            .checked_add(src.used)
+            .filter(|total| unsafe { ensure_size(dst, *total) } >= 0);
+        if grown.is_none() {
+            errors::internal_with(
+                here!("xmlSecPtrListCopy"),
+                name,
+                c"xmlSecPtrListEnsureSize",
+                &format!("size={}", src.used),
+            );
             return -1;
         }
         // SAFETY: both lists share a klass that outlives them.
         let duplicate = unsafe { klass(dst) }.duplicate_item;
         for index in 0..src.used {
-            if src.data.is_null() || dst.data.is_null() {
-                return -1;
-            }
+            check!(
+                !src.data.is_null(),
+                "xmlSecPtrListCopy",
+                c"src->data != NULL",
+                -1
+            );
+            check!(
+                !dst.data.is_null(),
+                "xmlSecPtrListCopy",
+                c"dst->data != NULL",
+                -1
+            );
             // SAFETY: `index < src.used` items are stored at `src.data`.
             let item = unsafe { src.data.add(index).read() };
             let copied = match duplicate {
@@ -288,6 +375,7 @@ pub(crate) unsafe extern "C" fn xmlSecPtrListCopy(
                     // SAFETY: the klass duplicates its own items.
                     let copied = unsafe { duplicate(item) };
                     if copied.is_null() {
+                        errors::internal(here!("xmlSecPtrListCopy"), name, c"duplicateItem");
                         return -1;
                     }
                     copied
@@ -312,16 +400,31 @@ pub(crate) unsafe extern "C" fn xmlSecPtrListDuplicate(
 ) -> *mut XmlSecPtrList {
     contain(std::ptr::null_mut(), || {
         // SAFETY: the caller passes null or a list.
-        let Some(source) = (unsafe { valid(list) }) else {
+        let source = unsafe { valid(list) };
+        check!(
+            source.is_some(),
+            "xmlSecPtrListDuplicate",
+            c"xmlSecPtrListIsValid(list)",
+            std::ptr::null_mut()
+        );
+        let Some(source) = source else {
             return std::ptr::null_mut();
         };
+        // SAFETY: the klass outlives the list.
+        let name = unsafe { klass_name(source.id) };
         // SAFETY: the klass outlives both lists.
         let copy = unsafe { xmlSecPtrListCreate(source.id) };
         if copy.is_null() {
+            errors::internal(
+                here!("xmlSecPtrListDuplicate"),
+                name,
+                c"xmlSecPtrListCreate",
+            );
             return copy;
         }
         // SAFETY: both are valid lists of one klass.
         if unsafe { xmlSecPtrListCopy(copy, list) } < 0 {
+            errors::internal(here!("xmlSecPtrListDuplicate"), name, c"xmlSecPtrListCopy");
             // SAFETY: `copy` is our created list.
             unsafe { xmlSecPtrListDestroy(copy) };
             return std::ptr::null_mut();
@@ -338,8 +441,29 @@ pub(crate) unsafe extern "C" fn xmlSecPtrListDuplicate(
 pub(crate) unsafe extern "C" fn xmlSecPtrListGetSize(list: *mut XmlSecPtrList) -> usize {
     contain(0, || {
         // SAFETY: the caller passes null or a list.
-        unsafe { valid(list) }.map_or(0, |list| list.used)
+        let list = unsafe { valid(list) };
+        check!(
+            list.is_some(),
+            "xmlSecPtrListGetSize",
+            c"xmlSecPtrListIsValid(list)",
+            0
+        );
+        list.map_or(0, |list| list.used)
     })
+}
+
+/// The valid list `list` with an item at `pos`, after libxmlsec1's checks of
+/// the entry point `$func`, or `$ret`.
+macro_rules! item_list {
+    ($list:expr, $pos:expr, $func:literal, $ret:expr) => {{
+        // SAFETY: the caller passes null or a list.
+        let list = unsafe { valid($list) };
+        check!(list.is_some(), $func, c"xmlSecPtrListIsValid(list)", $ret);
+        let Some(list) = list else { return $ret };
+        check!(!list.data.is_null(), $func, c"list->data != NULL", $ret);
+        check!($pos < list.used, $func, c"pos < list->use", $ret);
+        list
+    }};
 }
 
 /// `xmlSecPtrListGetItem`: the item at `pos`, null when out of range.
@@ -352,15 +476,33 @@ pub(crate) unsafe extern "C" fn xmlSecPtrListGetItem(
     pos: usize,
 ) -> *mut c_void {
     contain(std::ptr::null_mut(), || {
-        // SAFETY: the caller passes null or a list.
-        match unsafe { valid(list) } {
-            // SAFETY: `pos < used` items are stored at `data`.
-            Some(list) if !list.data.is_null() && pos < list.used => unsafe {
-                list.data.add(pos).read()
-            },
-            _ => std::ptr::null_mut(),
-        }
+        let list = item_list!(list, pos, "xmlSecPtrListGetItem", std::ptr::null_mut());
+        // SAFETY: `pos < used` items are stored at `data`.
+        unsafe { list.data.add(pos).read() }
     })
+}
+
+/// Grows `list` by one item; the new size, or `None` after reporting the
+/// failure as the entry point at `here`.
+///
+/// # Safety
+/// `list` is a valid list.
+unsafe fn grow_by_one(list: &mut XmlSecPtrList, here: errors::Here) -> Option<usize> {
+    let size = list
+        .used
+        .checked_add(1)
+        // SAFETY: by the caller's contract.
+        .filter(|size| unsafe { ensure_size(list, *size) } >= 0);
+    if size.is_none() {
+        errors::internal_with(
+            here,
+            // SAFETY: a valid list's klass outlives it.
+            unsafe { klass_name(list.id) },
+            c"xmlSecPtrListEnsureSize",
+            &format!("size={}", list.used.wrapping_add(1)),
+        );
+    }
+    size
 }
 
 /// `xmlSecPtrListAdd`: appends `item`, which the list now owns.
@@ -374,20 +516,22 @@ pub(crate) unsafe extern "C" fn xmlSecPtrListAdd(
 ) -> c_int {
     contain(-1, || {
         // SAFETY: the caller passes null or a list.
-        let Some(list) = (unsafe { valid(list) }) else {
-            return -1;
-        };
-        let Some(size) = list.used.checked_add(1) else {
-            return -1;
-        };
+        let list = unsafe { valid(list) };
+        check!(
+            list.is_some(),
+            "xmlSecPtrListAdd",
+            c"xmlSecPtrListIsValid(list)",
+            -1
+        );
+        let Some(list) = list else { return -1 };
         // SAFETY: `list` is valid; after growing `used < max`.
         unsafe {
-            if ensure_size(list, size) < 0 {
+            let Some(size) = grow_by_one(list, here!("xmlSecPtrListAdd")) else {
                 return -1;
-            }
+            };
             list.data.add(list.used).write(item);
+            list.used = size;
         }
-        list.used = size;
         0
     })
 }
@@ -405,25 +549,27 @@ pub(crate) unsafe extern "C" fn xmlSecPtrListInsert(
 ) -> c_int {
     contain(-1, || {
         // SAFETY: the caller passes null or a list.
-        let Some(list) = (unsafe { valid(list) }) else {
-            return -1;
-        };
-        let Some(size) = list.used.checked_add(1) else {
-            return -1;
-        };
+        let list = unsafe { valid(list) };
+        check!(
+            list.is_some(),
+            "xmlSecPtrListInsert",
+            c"xmlSecPtrListIsValid(list)",
+            -1
+        );
+        let Some(list) = list else { return -1 };
         // SAFETY: `list` is valid; after growing `used < max`, so the
         // shifted range `pos + 1..=used` fits.
         unsafe {
-            if ensure_size(list, size) < 0 {
+            let Some(size) = grow_by_one(list, here!("xmlSecPtrListInsert")) else {
                 return -1;
-            }
+            };
             let at = pos.min(list.used);
             list.data
                 .add(at)
                 .copy_to(list.data.add(at + 1), list.used - at);
             list.data.add(at).write(item);
+            list.used = size;
         }
-        list.used = size;
         0
     })
 }
@@ -439,13 +585,7 @@ pub(crate) unsafe extern "C" fn xmlSecPtrListSet(
     pos: usize,
 ) -> c_int {
     contain(-1, || {
-        // SAFETY: the caller passes null or a list.
-        let Some(list) = (unsafe { valid(list) }) else {
-            return -1;
-        };
-        if list.data.is_null() || pos >= list.used {
-            return -1;
-        }
+        let list = item_list!(list, pos, "xmlSecPtrListSet", -1);
         // SAFETY: `pos < used`; the klass owns the replaced item.
         unsafe {
             let slot = list.data.add(pos);
@@ -486,13 +626,7 @@ unsafe fn take(list: &mut XmlSecPtrList, pos: usize) -> *mut c_void {
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecPtrListRemove(list: *mut XmlSecPtrList, pos: usize) -> c_int {
     contain(-1, || {
-        // SAFETY: the caller passes null or a list.
-        let Some(list) = (unsafe { valid(list) }) else {
-            return -1;
-        };
-        if list.data.is_null() || pos >= list.used {
-            return -1;
-        }
+        let list = item_list!(list, pos, "xmlSecPtrListRemove", -1);
         // SAFETY: `pos < used` and the klass owns the removed item.
         unsafe {
             let item = list.data.add(pos).read();
@@ -518,13 +652,12 @@ pub(crate) unsafe extern "C" fn xmlSecPtrListRemoveAndReturn(
     pos: usize,
 ) -> *mut c_void {
     contain(std::ptr::null_mut(), || {
-        // SAFETY: the caller passes null or a list.
-        let Some(list) = (unsafe { valid(list) }) else {
-            return std::ptr::null_mut();
-        };
-        if list.data.is_null() || pos >= list.used {
-            return std::ptr::null_mut();
-        }
+        let list = item_list!(
+            list,
+            pos,
+            "xmlSecPtrListRemoveAndReturn",
+            std::ptr::null_mut()
+        );
         // SAFETY: `pos < used` with non-null data.
         unsafe { take(list, pos) }
     })
@@ -539,10 +672,14 @@ pub(crate) unsafe extern "C" fn xmlSecPtrListRemoveAndReturn(
 pub(crate) unsafe extern "C" fn xmlSecPtrListPopLast(list: *mut XmlSecPtrList) -> *mut c_void {
     contain(std::ptr::null_mut(), || {
         // SAFETY: the caller passes null or a list.
-        let Some(checked) = (unsafe { valid(list) }) else {
-            return std::ptr::null_mut();
-        };
-        let Some(tail) = checked.used.checked_sub(1) else {
+        let checked = unsafe { valid(list) };
+        check!(
+            checked.is_some(),
+            "xmlSecPtrListPopLast",
+            c"xmlSecPtrListIsValid(list)",
+            std::ptr::null_mut()
+        );
+        let Some(tail) = checked.and_then(|checked| checked.used.checked_sub(1)) else {
             return std::ptr::null_mut();
         };
         // SAFETY: `list` is a valid list.
@@ -550,28 +687,36 @@ pub(crate) unsafe extern "C" fn xmlSecPtrListPopLast(list: *mut XmlSecPtrList) -
     })
 }
 
-/// Writes `header`, each non-null item through `dump`, then `footer`.
+/// Writes `header`, each non-null item through `dump`, then `footer`, after
+/// libxmlsec1's checks of the entry point `func`.
 ///
 /// # Safety
 /// `list` is null or a list; `output` is null or a C stream.
 unsafe fn dump_items(
     list: *mut XmlSecPtrList,
     output: *mut c_void,
-    header: &str,
-    footer: &str,
+    here: errors::Here,
+    text: impl Fn(usize) -> (String, &'static str),
     dump: impl Fn(&XmlSecPtrListKlass) -> DebugDumpItem,
 ) {
     // SAFETY: by the caller's contract; the items precede `used`.
     unsafe {
         let Some(checked) = valid(list) else {
+            errors::assertion(here, c"xmlSecPtrListIsValid(list)");
             return;
         };
         if output.is_null() {
+            errors::assertion(here, c"output != NULL");
             return;
         }
-        super::write_stream(output, header);
+        let (header, footer) = text(checked.used);
+        super::write_stream(output, &header);
         if let Some(item_dump) = checked.id.as_ref().and_then(dump) {
             for pos in 0..checked.used {
+                if checked.data.is_null() {
+                    errors::assertion(here, c"list->data != NULL");
+                    return;
+                }
                 let item = checked.data.add(pos).read();
                 if !item.is_null() {
                     item_dump(item, output);
@@ -594,9 +739,13 @@ pub(crate) unsafe extern "C" fn xmlSecPtrListDebugDump(
     contain((), || {
         // SAFETY: by the caller's contract.
         unsafe {
-            let used = valid(list).map_or(0, |checked| checked.used);
-            let header = format!("=== list size: {used}\n");
-            dump_items(list, output, &header, "", |klass| klass.debug_dump_item);
+            dump_items(
+                list,
+                output,
+                here!("xmlSecPtrListDebugDump"),
+                |used| (format!("=== list size: {used}\n"), ""),
+                |klass| klass.debug_dump_item,
+            );
         }
     });
 }
@@ -614,11 +763,13 @@ pub(crate) unsafe extern "C" fn xmlSecPtrListDebugXmlDump(
     contain((), || {
         // SAFETY: by the caller's contract.
         unsafe {
-            let used = valid(list).map_or(0, |checked| checked.used);
-            let header = format!("<List size=\"{used}\">\n");
-            dump_items(list, output, &header, "</List>\n", |klass| {
-                klass.debug_xml_dump_item
-            });
+            dump_items(
+                list,
+                output,
+                here!("xmlSecPtrListDebugXmlDump"),
+                |used| (format!("<List size=\"{used}\">\n"), "</List>\n"),
+                |klass| klass.debug_xml_dump_item,
+            );
         }
     });
 }
@@ -626,11 +777,11 @@ pub(crate) unsafe extern "C" fn xmlSecPtrListDebugXmlDump(
 /// Duplicates a string item with libxml2's allocator.
 unsafe extern "C" fn string_duplicate(item: *mut c_void) -> *mut c_void {
     if item.is_null() {
+        errors::assertion(here!("xmlSecStringListDuplicateItem"), c"ptr != NULL");
         return item;
     }
     // SAFETY: a strings-list item is a NUL-terminated string.
-    let text =
-        unsafe { std::ffi::CStr::from_ptr(item.cast::<std::ffi::c_char>()) }.to_bytes_with_nul();
+    let text = unsafe { std::ffi::CStr::from_ptr(item.cast::<c_char>()) }.to_bytes_with_nul();
     let copy = malloc(text.len());
     if !copy.is_null() {
         // SAFETY: `copy` holds `text.len()` bytes.
@@ -641,6 +792,10 @@ unsafe extern "C" fn string_duplicate(item: *mut c_void) -> *mut c_void {
 
 /// Frees a string item.
 unsafe extern "C" fn string_destroy(item: *mut c_void) {
+    if item.is_null() {
+        errors::assertion(here!("xmlSecStringListDestroyItem"), c"ptr != NULL");
+        return;
+    }
     // SAFETY: a strings-list item is a libxml2 allocation the list owns.
     unsafe { free(item) };
 }

@@ -352,15 +352,18 @@ unsafe extern "C" fn base64_execute(
                         return -1;
                     };
                     let data = std::slice::from_raw_parts(xmlSecBufferGetData(input), in_size);
-                    if write_into(output, reserve, |room| base64::update(codec, data, room))
-                        .is_none()
+                    if write_into(output, reserve, |room| {
+                        base64::update(codec, data, room).ok()
+                    })
+                    .is_none()
                         || xmlSecBufferRemoveHead(input, in_size) < 0
                     {
                         return -1;
                     }
                 }
                 // The last group and padding fit in 16 bytes.
-                if last != 0 && write_into(output, 16, |room| base64::finish(codec, room)).is_none()
+                if last != 0
+                    && write_into(output, 16, |room| base64::finish(codec, room).ok()).is_none()
                 {
                     return -1;
                 }
