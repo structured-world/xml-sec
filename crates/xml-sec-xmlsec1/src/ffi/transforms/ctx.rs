@@ -24,7 +24,7 @@ use super::super::xmltree::{xmlSecCheckNodeName, xmlSecGetNextElementNode};
 use super::super::{contain, free, malloc, policy, write_stream};
 use super::{
     DATA_BIN, DATA_UNKNOWN, DATA_XML, FLAGS_USER_SPECIFIED, MODE_PUSH, STATUS_FINISHED,
-    STATUS_NONE, STATUS_WORKING, XmlSecTransform, XmlSecTransformKlass, builtin, klass_text,
+    STATUS_NONE, STATUS_WORKING, XmlSecTransform, XmlSecTransformKlass, builtin, io, klass_text,
     parser, valid, valid_or, xml_text, xmlSecTransformConnect, xmlSecTransformCreate,
     xmlSecTransformDebugDump, xmlSecTransformDebugXmlDump, xmlSecTransformDestroy,
     xmlSecTransformGetDataType, xmlSecTransformIdListDebugDump, xmlSecTransformIdListDebugXmlDump,
@@ -74,6 +74,8 @@ pub(crate) struct XmlSecTransformCtx {
 pub(crate) struct RunBudget {
     pub(crate) base64_input: usize,
     pub(crate) base64_output: usize,
+    /// Octets read from external resources through the input callbacks.
+    pub(crate) external_resources: usize,
 }
 
 /// The run budget of `ctx`, created on first use.
@@ -1316,7 +1318,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxUriExecute(
         let here = here!("xmlSecTransformCtxUriExecute");
         // SAFETY: by the caller's contract.
         unsafe {
-            let input = xmlSecTransformCtxCreateAndPrepend(ctx, builtin::input_uri());
+            let input = xmlSecTransformCtxCreateAndPrepend(ctx, io::input_uri());
             if input.is_null() {
                 errors::internal(
                     here,
@@ -1326,7 +1328,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxUriExecute(
                 return -1;
             }
             let name = (*(*input).id).name.cast();
-            if builtin::xmlSecTransformInputURIOpen(input, uri) < 0 {
+            if io::xmlSecTransformInputURIOpen(input, uri) < 0 {
                 errors::internal_with(
                     here,
                     std::ptr::null(),
@@ -1347,7 +1349,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxUriExecute(
                 errors::internal(here, name, c"xmlSecTransformPump");
                 return -1;
             }
-            if builtin::xmlSecTransformInputURIClose(input) < 0 {
+            if io::xmlSecTransformInputURIClose(input) < 0 {
                 errors::internal(here, name, c"xmlSecTransformInputURIClose");
                 return -1;
             }

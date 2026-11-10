@@ -129,6 +129,7 @@ impl Target {
                 "tests/c/parser.c",
                 "tests/c/keysdata.c",
                 "tests/c/errors.c",
+                "tests/c/io.c",
             ],
         }
     }

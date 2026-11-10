@@ -265,7 +265,16 @@ unsafe extern "C" fn pop_xml(
             errors::no_libxml2(here);
             return -1;
         }
-        let input = bounded_input_buffer(object.prev, ctx, policy.resources.max_xml_document_bytes);
+        let limit = Limit {
+            name: "max_xml_document_bytes",
+            max: policy.resources.max_xml_document_bytes,
+        };
+        let input = bounded_input_buffer(
+            object.prev,
+            ctx,
+            limit,
+            here!("xmlSecTransformCreateInputBuffer"),
+        );
         if input.is_null() {
             errors::internal(here, name(), c"xmlSecTransformCreateInputBuffer");
             return -1;
