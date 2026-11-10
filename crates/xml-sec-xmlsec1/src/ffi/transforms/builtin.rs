@@ -7,19 +7,23 @@
 //! projected under the library's policy and canonicalized with exactly the
 //! nodes, attributes and namespace nodes the input node set contains.
 
-use std::ffi::{c_int, c_uint, c_void};
+use std::ffi::{CStr, c_int, c_uint, c_void};
 
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, SelectedNodes, canonicalize_selected};
 use xml_sec::document::external::ExternalNode;
 use xml_sec::{DocumentView, Node, XmlDocument};
 use xml_sec_libxml2::ffi::{LibxmlTree, XmlAttr, XmlNode};
 
-use super::super::base64::{self, XmlSecBase64Ctx, decode_size, encode_size};
+use super::super::base64::{
+    self, XmlSecBase64Ctx, decode_size, encode_size, xmlSecBase64CtxFinal_ex,
+    xmlSecBase64CtxInitialize, xmlSecBase64CtxUpdate_ex,
+};
 use super::super::buffer::{
     XmlSecBuffer, xmlSecBufferAppend, xmlSecBufferFinalize, xmlSecBufferGetData,
     xmlSecBufferGetSize, xmlSecBufferInitialize, xmlSecBufferRemoveHead, xmlSecBufferSetMaxSize,
     xmlSecBufferSetSize,
 };
+use super::super::errors::{self, check, here};
 use super::super::list::{
     XmlSecPtrList, xmlSecPtrListAdd, xmlSecPtrListFinalize, xmlSecPtrListGetSize,
     xmlSecPtrListInitialize, xmlSecStringListGetKlass,
@@ -39,7 +43,7 @@ use super::super::strings::{
 use super::super::tree::{readable, xmlGetProp, xmlSearchNs};
 use super::super::xmltree::{xmlSecCheckNodeName, xmlSecFindParent, xmlSecGetNextElementNode};
 use super::super::{contain, free, policy};
-use super::ctx::{charge, run_budget};
+use super::ctx::{Limit, charge, run_budget};
 use super::io::{
     xmlOutputBufferClose, xmlOutputBufferWrite, xmlSecBufferCreateOutputBuffer,
     xmlSecTransformCreateOutputBuffer,
@@ -47,9 +51,9 @@ use super::io::{
 use super::{
     OPERATION_DECODE, OPERATION_ENCODE, STATUS_FINISHED, STATUS_NONE, STATUS_WORKING,
     USAGE_C14N_METHOD, USAGE_DSIG_TRANSFORM, WithContext, XmlSecTransform, XmlSecTransformCtx,
-    XmlSecTransformKlass, context, valid, xmlSecTransformDefaultGetDataType,
-    xmlSecTransformDefaultPopBin, xmlSecTransformDefaultPopXml, xmlSecTransformDefaultPushBin,
-    xmlSecTransformDefaultPushXml, xmlSecTransformPopXml,
+    XmlSecTransformKlass, context, context_or, klass_text, valid,
+    xmlSecTransformDefaultGetDataType, xmlSecTransformDefaultPopBin, xmlSecTransformDefaultPopXml,
+    xmlSecTransformDefaultPushBin, xmlSecTransformDefaultPushXml, xmlSecTransformPopXml,
 };
 use super::{relationship, xpath};
 
@@ -143,27 +147,59 @@ pub(crate) unsafe extern "C" fn xmlSecTransformMemBufGetBuffer(
     transform: *mut XmlSecTransform,
 ) -> *mut XmlSecBuffer {
     contain(std::ptr::null_mut(), || {
-        // SAFETY: a memory-buffer transform's tail is its buffer.
-        unsafe { context::<XmlSecBuffer>(transform, mem_buf()) }
-            .map_or(std::ptr::null_mut(), std::ptr::from_mut)
+        let buffer = context_or!(
+            transform,
+            XmlSecBuffer,
+            mem_buf(),
+            "xmlSecTransformMemBufGetBuffer",
+            c"xmlSecTransformCheckId(transform, xmlSecTransformMemBufId)",
+            std::ptr::null_mut()
+        );
+        std::ptr::from_mut(buffer)
     })
 }
 
+/// The name of a transform's klass for a report.
+///
+/// # Safety
+/// `transform` is a valid transform.
+unsafe fn name_of(transform: *const XmlSecTransform) -> *const std::ffi::c_char {
+    // SAFETY: by the caller's contract.
+    unsafe { (*(*transform).id).name.cast() }
+}
+
 unsafe extern "C" fn mem_buf_initialize(transform: *mut XmlSecTransform) -> c_int {
-    // SAFETY: the transform is a fresh memory-buffer transform.
-    match unsafe { context::<XmlSecBuffer>(transform, mem_buf()) } {
-        // SAFETY: the tail is writable buffer storage.
-        Some(buffer) => unsafe { xmlSecBufferInitialize(buffer, 0) },
-        None => -1,
+    let buffer = context_or!(
+        transform,
+        XmlSecBuffer,
+        mem_buf(),
+        "xmlSecTransformMemBufInitialize",
+        c"xmlSecTransformCheckId(transform, xmlSecTransformMemBufId)",
+        -1
+    );
+    // SAFETY: the tail is writable buffer storage.
+    if unsafe { xmlSecBufferInitialize(buffer, 0) } < 0 {
+        errors::internal(
+            here!("xmlSecTransformMemBufInitialize"),
+            // SAFETY: a valid transform.
+            unsafe { name_of(transform) },
+            c"xmlSecBufferInitialize",
+        );
+        return -1;
     }
+    0
 }
 
 unsafe extern "C" fn mem_buf_finalize(transform: *mut XmlSecTransform) {
-    // SAFETY: the transform is a memory-buffer transform being destroyed.
-    if let Some(buffer) = unsafe { context::<XmlSecBuffer>(transform, mem_buf()) } {
-        // SAFETY: an initialized buffer.
-        unsafe { xmlSecBufferFinalize(buffer) };
-    }
+    let buffer = context_or!(
+        transform,
+        XmlSecBuffer,
+        mem_buf(),
+        "xmlSecTransformMemBufFinalize",
+        c"xmlSecTransformCheckId(transform, xmlSecTransformMemBufId)"
+    );
+    // SAFETY: an initialized buffer.
+    unsafe { xmlSecBufferFinalize(buffer) };
 }
 
 unsafe extern "C" fn mem_buf_execute(
@@ -171,14 +207,24 @@ unsafe extern "C" fn mem_buf_execute(
     last: c_int,
     ctx: *mut XmlSecTransformCtx,
 ) -> c_int {
+    let buffer = context_or!(
+        transform,
+        XmlSecBuffer,
+        mem_buf(),
+        "xmlSecTransformMemBufExecute",
+        c"xmlSecTransformCheckId(transform, xmlSecTransformMemBufId)",
+        -1
+    );
+    check!(
+        !ctx.is_null(),
+        "xmlSecTransformMemBufExecute",
+        c"transformCtx != NULL",
+        -1
+    );
+    let here = here!("xmlSecTransformMemBufExecute");
     // SAFETY: a memory-buffer transform with its own buffers.
     unsafe {
-        let Some(buffer) = context::<XmlSecBuffer>(transform, mem_buf()) else {
-            return -1;
-        };
-        if ctx.is_null() {
-            return -1;
-        }
+        let name = name_of(transform);
         let object = &mut *transform;
         let input = &raw mut object.in_buf;
         let in_size = xmlSecBufferGetSize(input);
@@ -188,10 +234,15 @@ unsafe extern "C" fn mem_buf_execute(
         match object.status {
             STATUS_WORKING => {
                 let data = xmlSecBufferGetData(input);
+                let size = format!("size={in_size}");
                 if xmlSecBufferAppend(buffer, data, in_size) < 0
                     || xmlSecBufferAppend(&raw mut object.out_buf, data, in_size) < 0
-                    || xmlSecBufferRemoveHead(input, in_size) < 0
                 {
+                    errors::internal_with(here, name, c"xmlSecBufferAppend", &size);
+                    return -1;
+                }
+                if xmlSecBufferRemoveHead(input, in_size) < 0 {
+                    errors::internal_with(here, name, c"xmlSecBufferRemoveHead", &size);
                     return -1;
                 }
                 if last != 0 {
@@ -200,8 +251,17 @@ unsafe extern "C" fn mem_buf_execute(
                 0
             }
             // Only reached without input.
-            STATUS_FINISHED if in_size == 0 => 0,
-            _ => -1,
+            STATUS_FINISHED => {
+                if in_size != 0 {
+                    errors::assertion(here, c"inSize == 0");
+                    return -1;
+                }
+                0
+            }
+            status => {
+                errors::invalid_status(here, name, status);
+                -1
+            }
         }
     }
 }
@@ -247,56 +307,181 @@ pub(crate) unsafe extern "C" fn xmlSecTransformBase64SetLineSize(
     line_size: usize,
 ) {
     contain((), || {
-        // SAFETY: a Base64 transform's tail is its codec context.
-        if let Some(codec) = unsafe { context::<XmlSecBase64Ctx>(transform, base64()) } {
-            codec.columns = line_size;
-        }
+        let codec = context_or!(
+            transform,
+            XmlSecBase64Ctx,
+            base64(),
+            "xmlSecTransformBase64SetLineSize",
+            c"xmlSecTransformCheckId(transform, xmlSecTransformBase64Id)"
+        );
+        codec.columns = line_size;
     });
 }
 
 unsafe extern "C" fn base64_initialize(transform: *mut XmlSecTransform) -> c_int {
-    // SAFETY: a fresh Base64 transform.
+    let codec = context_or!(
+        transform,
+        XmlSecBase64Ctx,
+        base64(),
+        "xmlSecBase64Initialize",
+        c"xmlSecTransformCheckId(transform, xmlSecTransformBase64Id)",
+        -1
+    );
+    // SAFETY: a fresh Base64 transform; the tail is its codec context.
     unsafe {
-        let Some(codec) = context::<XmlSecBase64Ctx>(transform, base64()) else {
-            return -1;
-        };
         (*transform).operation = OPERATION_DECODE;
-        let columns = super::super::base64::xmlSecBase64GetDefaultLineSize();
-        match base64::initialize(codec, 0, columns) {
-            Some(()) => 0,
-            None => -1,
+        let columns = base64::xmlSecBase64GetDefaultLineSize();
+        if xmlSecBase64CtxInitialize(codec, 0, columns) < 0 {
+            errors::internal(
+                here!("xmlSecBase64Initialize"),
+                name_of(transform),
+                c"xmlSecBase64CtxInitialize",
+            );
+            return -1;
         }
     }
+    0
 }
 
 unsafe extern "C" fn base64_finalize(transform: *mut XmlSecTransform) {
-    // SAFETY: a Base64 transform being destroyed.
-    if let Some(codec) = unsafe { context::<XmlSecBase64Ctx>(transform, base64()) } {
-        // SAFETY: the codec context is plain data.
-        unsafe { std::ptr::from_mut(codec).write_bytes(0, 1) };
-    }
+    let codec = context_or!(
+        transform,
+        XmlSecBase64Ctx,
+        base64(),
+        "xmlSecBase64Finalize",
+        c"xmlSecTransformCheckId(transform, xmlSecTransformBase64Id)"
+    );
+    // SAFETY: the codec context is plain data.
+    unsafe { std::ptr::from_mut(codec).write_bytes(0, 1) };
 }
 
-/// Grows `out` by up to `reserve` bytes and lets `step` write into the new
-/// room; the size is then set to what was written.
+/// One codec step into `out`: grows it by `reserve` bytes, lets `step` (a
+/// libxmlsec1 codec entry point named `stepped`, which reports its own
+/// failure) write into the new room, and sets the size to what was written.
 ///
 /// # Safety
-/// `out` is a valid buffer.
-unsafe fn write_into(
+/// `out` is a valid buffer of the transform `name` names.
+unsafe fn codec_step(
     out: *mut XmlSecBuffer,
     reserve: usize,
-    step: impl FnOnce(&mut [u8]) -> Option<usize>,
+    (step, stepped): (impl FnOnce(*mut u8, usize, *mut usize) -> c_int, &CStr),
+    here: errors::Here,
+    name: *const std::ffi::c_char,
 ) -> Option<()> {
     // SAFETY: after growing, `out` holds `size + reserve` bytes.
     unsafe {
         let size = xmlSecBufferGetSize(out);
-        let total = size.checked_add(reserve)?;
+        let Some(total) = size.checked_add(reserve) else {
+            errors::internal_with(here, name, c"xmlSecBufferSetMaxSize", "size overflow");
+            return None;
+        };
         if xmlSecBufferSetMaxSize(out, total) < 0 {
+            errors::internal_with(
+                here,
+                name,
+                c"xmlSecBufferSetMaxSize",
+                &format!("size={total}"),
+            );
             return None;
         }
-        let room = std::slice::from_raw_parts_mut(xmlSecBufferGetData(out).add(size), reserve);
-        let written = step(room)?;
-        (xmlSecBufferSetSize(out, size + written) >= 0).then_some(())
+        let mut written = 0;
+        if step(
+            xmlSecBufferGetData(out).add(size),
+            reserve,
+            &raw mut written,
+        ) < 0
+        {
+            errors::internal(here, name, stepped);
+            return None;
+        }
+        if xmlSecBufferSetSize(out, size + written) < 0 {
+            errors::internal_with(
+                here,
+                name,
+                c"xmlSecBufferSetSize",
+                &format!("size={}", size + written),
+            );
+            return None;
+        }
+        Some(())
+    }
+}
+
+/// One working step of a Base64 transform: codes all of `input` into
+/// `output`, and finishes the stream when `last`, within the run's Base64
+/// budgets. Failures are reported.
+///
+/// # Safety
+/// `codec`, `input` and `output` belong to a live Base64 transform; `ctx` is
+/// its initialized context.
+unsafe fn base64_step(
+    codec: *mut XmlSecBase64Ctx,
+    input: *mut XmlSecBuffer,
+    output: *mut XmlSecBuffer,
+    last: bool,
+    ctx: *mut XmlSecTransformCtx,
+) -> Option<()> {
+    let here = here!("xmlSecBase64Execute");
+    let name = xmlSecNameBase64.as_ptr().cast();
+    let policy = policy::verification_at(here)?;
+    let resources = &policy.resources;
+    // SAFETY: by the caller's contract.
+    unsafe {
+        let budget = run_budget(ctx);
+        let before = xmlSecBufferGetSize(output);
+        let in_size = xmlSecBufferGetSize(input);
+        if in_size > 0 {
+            // Input is charged before the codec allocates for it, which
+            // bounds that allocation too.
+            let limit = Limit {
+                name: "max_base64_transform_input_bytes",
+                max: resources.max_base64_transform_input_bytes,
+            };
+            charge(&mut budget.base64_input, in_size, limit, here, name)?;
+            let reserve = if (*codec).encode != 0 {
+                encode_size((*codec).columns, in_size)
+            } else {
+                decode_size(in_size)
+            };
+            let Some(reserve) = reserve else {
+                errors::internal_with(here, name, c"xmlSecBufferSetMaxSize", "size overflow");
+                return None;
+            };
+            let data = xmlSecBufferGetData(input);
+            let update = |out, out_size, written| {
+                xmlSecBase64CtxUpdate_ex(codec, data, in_size, out, out_size, written)
+            };
+            codec_step(
+                output,
+                reserve,
+                (update, c"xmlSecBase64CtxUpdate_ex"),
+                here,
+                name,
+            )?;
+            if xmlSecBufferRemoveHead(input, in_size) < 0 {
+                errors::internal_with(
+                    here,
+                    name,
+                    c"xmlSecBufferRemoveHead",
+                    &format!("size={in_size}"),
+                );
+                return None;
+            }
+        }
+        // The last group and padding fit in 16 bytes.
+        if last {
+            let finish =
+                |out, out_size, written| xmlSecBase64CtxFinal_ex(codec, out, out_size, written);
+            codec_step(output, 16, (finish, c"xmlSecBase64CtxFinal_ex"), here, name)?;
+        }
+        // Output is charged before it moves on: a refused step leaves it in
+        // this transform's buffer.
+        let limit = Limit {
+            name: "max_base64_transform_output_bytes",
+            max: resources.max_base64_transform_output_bytes,
+        };
+        let produced = xmlSecBufferGetSize(output) - before;
+        charge(&mut budget.base64_output, produced, limit, here, name)
     }
 }
 
@@ -305,77 +490,43 @@ unsafe extern "C" fn base64_execute(
     last: c_int,
     ctx: *mut XmlSecTransformCtx,
 ) -> c_int {
+    let codec = context_or!(
+        transform,
+        XmlSecBase64Ctx,
+        base64(),
+        "xmlSecBase64Execute",
+        c"xmlSecTransformCheckId(transform, xmlSecTransformBase64Id)",
+        -1
+    );
+    // SAFETY: a valid transform.
+    let operation = unsafe { (*transform).operation };
+    check!(
+        operation == OPERATION_ENCODE || operation == OPERATION_DECODE,
+        "xmlSecBase64Execute",
+        c"(transform->operation == xmlSecTransformOperationEncode) || (transform->operation == xmlSecTransformOperationDecode)",
+        -1
+    );
+    check!(
+        !ctx.is_null(),
+        "xmlSecBase64Execute",
+        c"transformCtx != NULL",
+        -1
+    );
+    let here = here!("xmlSecBase64Execute");
     // SAFETY: a Base64 transform with its own buffers.
     unsafe {
-        let Some(codec) = context::<XmlSecBase64Ctx>(transform, base64()) else {
-            return -1;
-        };
+        let name = name_of(transform);
+        let codec: *mut XmlSecBase64Ctx = codec;
         let object = &mut *transform;
-        if (object.operation != OPERATION_ENCODE && object.operation != OPERATION_DECODE)
-            || ctx.is_null()
-        {
-            return -1;
-        }
         let input = &raw mut object.in_buf;
         let output = &raw mut object.out_buf;
         if object.status == STATUS_NONE {
-            codec.encode = c_int::from(object.operation == OPERATION_ENCODE);
+            (*codec).encode = c_int::from(object.operation == OPERATION_ENCODE);
             object.status = STATUS_WORKING;
         }
         match object.status {
             STATUS_WORKING => {
-                let Some(policy) = policy::verification() else {
-                    return -1;
-                };
-                let resources = &policy.resources;
-                let budget = run_budget(ctx);
-                let before = xmlSecBufferGetSize(output);
-                let in_size = xmlSecBufferGetSize(input);
-                if in_size > 0 {
-                    // Input is charged before the codec allocates for it,
-                    // which bounds that allocation too.
-                    if charge(
-                        &mut budget.base64_input,
-                        in_size,
-                        resources.max_base64_transform_input_bytes,
-                    )
-                    .is_none()
-                    {
-                        return -1;
-                    }
-                    let reserve = if codec.encode != 0 {
-                        encode_size(codec.columns, in_size)
-                    } else {
-                        decode_size(in_size)
-                    };
-                    let Some(reserve) = reserve else {
-                        return -1;
-                    };
-                    let data = std::slice::from_raw_parts(xmlSecBufferGetData(input), in_size);
-                    if write_into(output, reserve, |room| {
-                        base64::update(codec, data, room).ok()
-                    })
-                    .is_none()
-                        || xmlSecBufferRemoveHead(input, in_size) < 0
-                    {
-                        return -1;
-                    }
-                }
-                // The last group and padding fit in 16 bytes.
-                if last != 0
-                    && write_into(output, 16, |room| base64::finish(codec, room).ok()).is_none()
-                {
-                    return -1;
-                }
-                // Output is charged before it moves on: a refused step
-                // leaves it in this transform's buffer.
-                if charge(
-                    &mut budget.base64_output,
-                    xmlSecBufferGetSize(output) - before,
-                    resources.max_base64_transform_output_bytes,
-                )
-                .is_none()
-                {
+                if base64_step(codec, input, output, last != 0, ctx).is_none() {
                     return -1;
                 }
                 if last != 0 {
@@ -384,8 +535,17 @@ unsafe extern "C" fn base64_execute(
                 0
             }
             // Only reached without input.
-            STATUS_FINISHED if xmlSecBufferGetSize(input) == 0 => 0,
-            _ => -1,
+            STATUS_FINISHED => {
+                if xmlSecBufferGetSize(input) != 0 {
+                    errors::assertion(here, c"xmlSecBufferGetSize(in) == 0");
+                    return -1;
+                }
+                0
+            }
+            status => {
+                errors::invalid_status(here, name, status);
+                -1
+            }
         }
     }
 }
@@ -425,19 +585,27 @@ fn is_c14n(id: *const XmlSecTransformKlass) -> bool {
     algorithm_of(id).is_some() || std::ptr::eq(id, &raw const REMOVE_XML_TAGS_C14N)
 }
 
-/// The prefix list of a C14N transform, from its context.
+/// The prefix list of a C14N transform, from its context; otherwise reports
+/// libxmlsec1's failed `xmlSecTransformC14NCheckId` from the entry point at
+/// `here`.
 ///
 /// # Safety
 /// `transform` is null or a valid transform.
-unsafe fn c14n_list<'a>(transform: *mut XmlSecTransform) -> Option<&'a mut XmlSecPtrList> {
-    // SAFETY: a C14N-family transform's tail is its prefix list.
-    unsafe {
-        let (_, klass) = valid(transform)?;
-        if !is_c14n(klass) {
-            return None;
-        }
-        context::<XmlSecPtrList>(transform, klass)
+unsafe fn c14n_list<'a>(
+    transform: *mut XmlSecTransform,
+    here: errors::Here,
+) -> Option<&'a mut XmlSecPtrList> {
+    // SAFETY: by the caller's contract; a C14N-family transform's tail is
+    // its prefix list.
+    let list = unsafe {
+        valid(transform)
+            .filter(|(_, klass)| is_c14n(*klass))
+            .and_then(|(_, klass)| context::<XmlSecPtrList>(transform, klass))
+    };
+    if list.is_none() {
+        errors::assertion(here, c"xmlSecTransformC14NCheckId(transform)");
     }
+    list
 }
 
 /// A C14N-family klass sharing the prefix list and the push/pop methods.
@@ -530,17 +698,27 @@ klass_getter! {
 }
 
 unsafe extern "C" fn c14n_initialize(transform: *mut XmlSecTransform) -> c_int {
+    let here = here!("xmlSecTransformC14NInitialize");
     // SAFETY: a fresh C14N-family transform.
-    match unsafe { c14n_list(transform) } {
-        // SAFETY: the tail is writable list storage.
-        Some(list) => unsafe { xmlSecPtrListInitialize(list, xmlSecStringListGetKlass()) },
-        None => -1,
+    let Some(list) = (unsafe { c14n_list(transform, here) }) else {
+        return -1;
+    };
+    // SAFETY: the tail is writable list storage.
+    if unsafe { xmlSecPtrListInitialize(list, xmlSecStringListGetKlass()) } < 0 {
+        // SAFETY: a valid transform.
+        errors::internal(
+            here,
+            unsafe { name_of(transform) },
+            c"xmlSecPtrListInitialize",
+        );
+        return -1;
     }
+    0
 }
 
 unsafe extern "C" fn c14n_finalize(transform: *mut XmlSecTransform) {
     // SAFETY: a C14N-family transform being destroyed.
-    if let Some(list) = unsafe { c14n_list(transform) } {
+    if let Some(list) = unsafe { c14n_list(transform, here!("xmlSecTransformC14NFinalize")) } {
         // SAFETY: an initialized strings list.
         unsafe { xmlSecPtrListFinalize(list) };
     }
@@ -554,14 +732,33 @@ unsafe extern "C" fn c14n_read_node(
     node: *mut XmlNode,
     ctx: *mut XmlSecTransformCtx,
 ) -> c_int {
+    let here = here!("xmlSecTransformC14NNodeRead");
+    // SAFETY: the caller passes null or a transform.
+    let Some(list) = (unsafe { c14n_list(transform, here) }) else {
+        return -1;
+    };
+    check!(
+        !node.is_null(),
+        "xmlSecTransformC14NNodeRead",
+        c"node != NULL",
+        -1
+    );
+    check!(
+        !ctx.is_null(),
+        "xmlSecTransformC14NNodeRead",
+        c"transformCtx != NULL",
+        -1
+    );
+    check!(
+        // SAFETY: an initialized list.
+        unsafe { xmlSecPtrListGetSize(list) } == 0,
+        "xmlSecTransformC14NNodeRead",
+        c"xmlSecPtrListGetSize(nsList) == 0",
+        -1
+    );
     // SAFETY: an exclusive C14N transform and a live element of its document.
     unsafe {
-        let Some(list) = c14n_list(transform) else {
-            return -1;
-        };
-        if node.is_null() || ctx.is_null() || xmlSecPtrListGetSize(list) != 0 {
-            return -1;
-        }
+        let name = name_of(transform);
         let mut current = xmlSecGetNextElementNode((*node).children);
         if !current.is_null() {
             if xmlSecCheckNodeName(
@@ -570,35 +767,52 @@ unsafe extern "C" fn c14n_read_node(
                 xmlSecNsExcC14N.as_ptr(),
             ) == 0
             {
+                errors::invalid_node(here, current, "InclusiveNamespaces", name);
                 return -1;
             }
             let prefixes = xmlGetProp(current, xmlSecAttrPrefixList.as_ptr());
             if prefixes.is_null() {
+                errors::invalid_node_attribute(here, current, c"PrefixList", name, "empty");
                 return -1;
             }
             let text = std::ffi::CStr::from_ptr(prefixes.cast())
                 .to_bytes()
                 .to_vec();
             free(prefixes.cast());
-            // Single spaces separate the prefixes, as libxmlsec1 splits them.
-            for prefix in text.split(|&byte| byte == b' ') {
+            // Single spaces separate the prefixes, as libxmlsec1 splits
+            // them: a space ends a prefix, so two spaces give an empty one
+            // and a trailing space none.
+            let mut rest = &text[..];
+            while !rest.is_empty() {
+                let (prefix, after) = match rest.iter().position(|&byte| byte == b' ') {
+                    Some(space) => (&rest[..space], &rest[space + 1..]),
+                    None => (rest, &[][..]),
+                };
+                rest = after;
                 let copy = super::super::malloc(prefix.len() + 1).cast::<u8>();
                 if copy.is_null() {
+                    errors::strdup_failed(here, name, prefix);
                     return -1;
                 }
                 prefix.as_ptr().copy_to(copy, prefix.len());
                 copy.add(prefix.len()).write(0);
                 if xmlSecPtrListAdd(list, copy.cast()) < 0 {
+                    errors::internal(here, name, c"xmlSecPtrListAdd");
                     free(copy.cast());
                     return -1;
                 }
             }
             if xmlSecPtrListAdd(list, std::ptr::null_mut()) < 0 {
+                errors::internal(here, name, c"xmlSecPtrListAdd");
                 return -1;
             }
             current = xmlSecGetNextElementNode((*current).next);
         }
-        if current.is_null() { 0 } else { -1 }
+        if !current.is_null() {
+            errors::unexpected_node(here, current, std::ptr::null());
+            return -1;
+        }
+        0
     }
 }
 
@@ -700,8 +914,8 @@ impl SelectedNodes for Selection<'_> {
     }
 }
 
-/// The canonical form of `nodes` under `mode`, or `None` when the tree cannot
-/// be projected or canonicalized under the library's policy.
+/// The canonical form of `nodes` under `mode`, or why the tree cannot be
+/// projected or canonicalized under the library's policy.
 ///
 /// # Safety
 /// `nodes` is a live node set over a live document.
@@ -710,11 +924,12 @@ unsafe fn canonical(
     mode: C14nMode,
     comments: bool,
     prefixes: Option<String>,
-) -> Option<Vec<u8>> {
-    let policy = policy::verification()?;
+) -> Result<Vec<u8>, String> {
+    let policy = policy::verification().ok_or("the library policy did not compile")?;
     // SAFETY: the node set's document is live for the call.
-    let tree = unsafe { LibxmlTree::new((*nodes).doc) }?;
-    let document = XmlDocument::from_external_tree(Box::new(tree), policy).ok()?;
+    let tree = unsafe { LibxmlTree::new((*nodes).doc) }.ok_or("the document cannot be read")?;
+    let document = XmlDocument::from_external_tree(Box::new(tree), policy)
+        .map_err(|error| error.to_string())?;
     let mut algorithm = C14nAlgorithm::new(mode, comments);
     if let Some(prefixes) = prefixes {
         algorithm = algorithm.with_prefix_list(&prefixes);
@@ -725,8 +940,8 @@ unsafe fn canonical(
             let selection = Selection { nodes, view };
             canonicalize_selected(view, &selection, &algorithm, &policy.resources, &mut output)
         })
-        .ok()?;
-    Some(output)
+        .map_err(|error| error.to_string())?;
+    Ok(output)
 }
 
 /// The octets of `nodes` over `view`, its projection: inclusive C14N 1.0
@@ -759,15 +974,48 @@ unsafe fn c14n_execute(
     list: &XmlSecPtrList,
     out: *mut c_void,
 ) -> c_int {
+    check!(
+        !id.is_null(),
+        "xmlSecTransformC14NExecute",
+        c"id != xmlSecTransformIdUnknown",
+        -1
+    );
+    check!(
+        !nodes.is_null(),
+        "xmlSecTransformC14NExecute",
+        c"nodes != NULL",
+        -1
+    );
+    check!(
+        // SAFETY: a node set.
+        !unsafe { (*nodes).doc }.is_null(),
+        "xmlSecTransformC14NExecute",
+        c"nodes->doc != NULL",
+        -1
+    );
+    check!(
+        !out.is_null(),
+        "xmlSecTransformC14NExecute",
+        c"buf != NULL",
+        -1
+    );
+    let here = here!("xmlSecTransformC14NExecute");
+    if !readable() {
+        errors::no_libxml2(here);
+        return -1;
+    }
     // SAFETY: by the caller's contract.
     unsafe {
-        if nodes.is_null() || (*nodes).doc.is_null() || !readable() {
-            return -1;
-        }
+        let name = (*id).name.cast();
         if std::ptr::eq(id, remove_xml_tags_c14n()) {
-            return xmlSecNodeSetDumpTextNodes(nodes, out);
+            let result = xmlSecNodeSetDumpTextNodes(nodes, out);
+            if result < 0 {
+                errors::xml_failed(here, name, c"xmlC14NExecute");
+            }
+            return result;
         }
         let Some((mode, comments)) = algorithm_of(id) else {
+            errors::other(here, errors::R_INVALID_TRANSFORM, name, None);
             return -1;
         };
         let prefixes = (mode == C14nMode::Exclusive1_0 && list.used > 0).then(|| {
@@ -782,14 +1030,25 @@ unsafe fn c14n_execute(
                 .collect::<Vec<_>>()
                 .join(" ")
         });
-        let Some(bytes) = canonical(nodes, mode, comments, prefixes) else {
-            return -1;
+        let bytes = match canonical(nodes, mode, comments, prefixes) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                // The core canonicalizes in place of libxml2's
+                // `xmlC14NExecute`; its error is the cause.
+                errors::report(
+                    here,
+                    name,
+                    c"xmlC14NExecute".as_ptr(),
+                    errors::R_XML_FAILED,
+                    &error,
+                );
+                return -1;
+            }
         };
         for chunk in bytes.chunks(c_int::MAX.unsigned_abs() as usize) {
-            let Ok(len) = c_int::try_from(chunk.len()) else {
-                return -1;
-            };
+            let len = c_int::try_from(chunk.len()).expect("a chunk is at most c_int::MAX bytes");
             if xmlOutputBufferWrite(out, len, chunk.as_ptr().cast()) < 0 {
+                errors::xml_failed(here, name, c"xmlOutputBufferWrite");
                 return -1;
             }
         }
@@ -802,54 +1061,92 @@ unsafe extern "C" fn c14n_push_xml(
     nodes: *mut XmlSecNodeSet,
     ctx: *mut XmlSecTransformCtx,
 ) -> c_int {
+    // SAFETY: the caller passes null or a transform.
+    let Some(list) = (unsafe { c14n_list(transform, here!("xmlSecTransformC14NPushXml")) }) else {
+        return -1;
+    };
+    // SAFETY: a valid transform.
+    let id = unsafe { (*transform).id };
+    let render = |nodes, out| {
+        // SAFETY: the node set, the prefix list and the output buffer are
+        // live for the call.
+        unsafe { c14n_execute(id, nodes, list, out) }
+    };
     // SAFETY: a C14N-family transform, its chain and context.
     unsafe {
-        let Some(list) = c14n_list(transform) else {
-            return -1;
-        };
-        let id = (*transform).id;
-        push_rendered(transform, nodes, ctx, |nodes, out| {
-            c14n_execute(id, nodes, list, out)
-        })
+        push_rendered(
+            transform,
+            nodes,
+            ctx,
+            (render, c"xmlSecTransformC14NExecute"),
+            here!("xmlSecTransformC14NPushXml"),
+        )
     }
 }
 
 /// The push side of a node-set-to-octets klass: on the first push, `render`
-/// writes the octets of `nodes` to the next transform, or to the object's
-/// own output buffer at the end of the chain.
+/// (named `rendered` in reports) writes the octets of `nodes` to the next
+/// transform, or to the object's own output buffer at the end of the chain.
+/// Failures are reported from the entry point at `here`.
 ///
 /// # Safety
-/// `transform` is a valid transform of its chain; `ctx` is its context.
+/// `transform` is a valid transform of its chain; `ctx` is null or its
+/// context.
 pub(crate) unsafe fn push_rendered(
     transform: *mut XmlSecTransform,
     nodes: *mut XmlSecNodeSet,
     ctx: *mut XmlSecTransformCtx,
-    render: impl FnOnce(*mut XmlSecNodeSet, *mut c_void) -> c_int,
+    (render, rendered): (impl FnOnce(*mut XmlSecNodeSet, *mut c_void) -> c_int, &CStr),
+    here: errors::Here,
 ) -> c_int {
+    if nodes.is_null() {
+        errors::assertion(here, c"nodes != NULL");
+        return -1;
+    }
+    // SAFETY: a node set.
+    if unsafe { (*nodes).doc }.is_null() {
+        errors::assertion(here, c"nodes->doc != NULL");
+        return -1;
+    }
+    if ctx.is_null() {
+        errors::assertion(here, c"transformCtx != NULL");
+        return -1;
+    }
     // SAFETY: by the caller's contract.
     unsafe {
-        if nodes.is_null() || (*nodes).doc.is_null() || ctx.is_null() {
-            return -1;
-        }
+        let name = name_of(transform);
         let object = &mut *transform;
         match object.status {
             STATUS_NONE => object.status = STATUS_WORKING,
             STATUS_WORKING | STATUS_FINISHED => return 0,
-            _ => return -1,
+            status => {
+                errors::invalid_status(here, name, status);
+                return -1;
+            }
         }
         let out = if object.next.is_null() {
-            xmlSecBufferCreateOutputBuffer(&raw mut object.out_buf)
+            let out = xmlSecBufferCreateOutputBuffer(&raw mut object.out_buf);
+            if out.is_null() {
+                errors::internal(here, name, c"xmlSecBufferCreateOutputBuffer");
+            }
+            out
         } else {
-            xmlSecTransformCreateOutputBuffer(object.next, ctx)
+            let out = xmlSecTransformCreateOutputBuffer(object.next, ctx);
+            if out.is_null() {
+                errors::internal(here, name, c"xmlSecTransformCreateOutputBuffer");
+            }
+            out
         };
         if out.is_null() {
             return -1;
         }
         if render(nodes, out) < 0 {
+            errors::internal(here, name, rendered);
             xmlOutputBufferClose(out);
             return -1;
         }
         if xmlOutputBufferClose(out) < 0 {
+            errors::xml_failed(here, name, c"xmlOutputBufferClose");
             return -1;
         }
         object.status = STATUS_FINISHED;
@@ -864,45 +1161,85 @@ unsafe extern "C" fn c14n_pop_bin(
     size: *mut usize,
     ctx: *mut XmlSecTransformCtx,
 ) -> c_int {
+    // SAFETY: the caller passes null or a transform.
+    let Some(list) = (unsafe { c14n_list(transform, here!("xmlSecTransformC14NPopBin")) }) else {
+        return -1;
+    };
+    // SAFETY: a valid transform.
+    let id = unsafe { (*transform).id };
+    let render = |nodes, out| {
+        // SAFETY: the node set, the prefix list and the output buffer are
+        // live for the call.
+        unsafe { c14n_execute(id, nodes, list, out) }
+    };
+    let target = PopTarget {
+        data,
+        max_size,
+        size,
+    };
     // SAFETY: a C14N-family transform, its chain and context.
     unsafe {
-        let Some(list) = c14n_list(transform) else {
-            return -1;
-        };
-        let id = (*transform).id;
-        pop_rendered(transform, data, max_size, size, ctx, |nodes, out| {
-            c14n_execute(id, nodes, list, out)
-        })
+        pop_rendered(
+            transform,
+            target,
+            ctx,
+            (render, c"xmlSecTransformC14NExecute"),
+            here!("xmlSecTransformC14NPopBin"),
+        )
     }
 }
 
+/// Where [`pop_rendered`] writes: `max_size` bytes at `data`, the count
+/// written to `size`.
+#[derive(Clone, Copy)]
+pub(crate) struct PopTarget {
+    pub(crate) data: *mut u8,
+    pub(crate) max_size: usize,
+    pub(crate) size: *mut usize,
+}
+
 /// The pop side of a node-set-to-octets klass: on the first pop, `render`
-/// writes the octets of the node set the previous transform pops to the
-/// object's output buffer, which then drains in chunks.
+/// (named `rendered` in reports) writes the octets of the node set the
+/// previous transform pops to the object's output buffer, which then drains
+/// in chunks. Failures are reported from the entry point at `here`.
 ///
 /// # Safety
-/// `transform` is a valid transform of its chain; `ctx` is its context;
-/// `data` holds `max_size` writable bytes.
+/// `transform` is a valid transform of its chain; `ctx` is null or its
+/// context; `target.data` is null or holds `target.max_size` writable bytes;
+/// `target.size` is null or writable.
 pub(crate) unsafe fn pop_rendered(
     transform: *mut XmlSecTransform,
-    data: *mut u8,
-    max_size: usize,
-    size: *mut usize,
+    target: PopTarget,
     ctx: *mut XmlSecTransformCtx,
-    render: impl FnOnce(*mut XmlSecNodeSet, *mut c_void) -> c_int,
+    (render, rendered): (impl FnOnce(*mut XmlSecNodeSet, *mut c_void) -> c_int, &CStr),
+    here: errors::Here,
 ) -> c_int {
+    let PopTarget {
+        data,
+        max_size,
+        size,
+    } = target;
+    if data.is_null() {
+        errors::assertion(here, c"data != NULL");
+        return -1;
+    }
+    if size.is_null() {
+        errors::assertion(here, c"dataSize != NULL");
+        return -1;
+    }
+    if ctx.is_null() {
+        errors::assertion(here, c"transformCtx != NULL");
+        return -1;
+    }
     // SAFETY: by the caller's contract.
     unsafe {
-        let Some(context) = ctx.as_ref() else {
-            return -1;
-        };
-        if data.is_null() || size.is_null() {
-            return -1;
-        }
+        let name = name_of(transform);
+        let chunk_size = (*ctx).binary_chunk_size;
         let object = &mut *transform;
         let out = &raw mut object.out_buf;
         if object.status == STATUS_NONE {
             if !object.in_nodes.is_null() {
+                errors::assertion(here, c"transform->inNodes == NULL");
                 return -1;
             }
             if object.prev.is_null() {
@@ -911,17 +1248,21 @@ pub(crate) unsafe fn pop_rendered(
                 return 0;
             }
             if xmlSecTransformPopXml(object.prev, &raw mut object.in_nodes, ctx) < 0 {
+                errors::internal(here, name, c"xmlSecTransformPopXml");
                 return -1;
             }
             let buffer = xmlSecBufferCreateOutputBuffer(out);
             if buffer.is_null() {
+                errors::internal(here, name, c"xmlSecBufferCreateOutputBuffer");
                 return -1;
             }
             if render(object.in_nodes, buffer) < 0 {
+                errors::internal(here, name, rendered);
                 xmlOutputBufferClose(buffer);
                 return -1;
             }
             if xmlOutputBufferClose(buffer) < 0 {
+                errors::xml_failed(here, name, c"xmlOutputBufferClose");
                 return -1;
             }
             object.status = STATUS_WORKING;
@@ -929,10 +1270,16 @@ pub(crate) unsafe fn pop_rendered(
         match object.status {
             STATUS_WORKING => {
                 let available = xmlSecBufferGetSize(out);
-                let chunk = available.min(max_size).min(context.binary_chunk_size);
+                let chunk = available.min(max_size).min(chunk_size);
                 if chunk > 0 {
                     xmlSecBufferGetData(out).copy_to(data, chunk);
                     if xmlSecBufferRemoveHead(out, chunk) < 0 {
+                        errors::internal_with(
+                            here,
+                            name,
+                            c"xmlSecBufferRemoveHead",
+                            &format!("size={chunk}"),
+                        );
                         return -1;
                     }
                 } else if available == 0 {
@@ -941,11 +1288,18 @@ pub(crate) unsafe fn pop_rendered(
                 size.write(chunk);
                 0
             }
-            STATUS_FINISHED if xmlSecBufferGetSize(out) == 0 => {
+            STATUS_FINISHED => {
+                if xmlSecBufferGetSize(out) != 0 {
+                    errors::assertion(here, c"xmlSecBufferGetSize(out) == 0");
+                    return -1;
+                }
                 size.write(0);
                 0
             }
-            _ => -1,
+            status => {
+                errors::invalid_status(here, name, status);
+                -1
+            }
         }
     }
 }
@@ -972,20 +1326,48 @@ unsafe extern "C" fn enveloped_execute(
     last: c_int,
     ctx: *mut XmlSecTransformCtx,
 ) -> c_int {
+    // SAFETY: the caller passes null or a transform.
+    let checked =
+        unsafe { valid(transform) }.filter(|(_, klass)| std::ptr::eq(*klass, &raw const ENVELOPED));
+    check!(
+        checked.is_some(),
+        "xmlSecTransformEnvelopedExecute",
+        c"xmlSecTransformCheckId(transform, xmlSecTransformEnvelopedId)",
+        -1
+    );
+    let Some((object, _)) = checked else {
+        return -1;
+    };
+    check!(
+        !object.here_node.is_null(),
+        "xmlSecTransformEnvelopedExecute",
+        c"transform->hereNode != NULL",
+        -1
+    );
+    check!(
+        object.out_nodes.is_null(),
+        "xmlSecTransformEnvelopedExecute",
+        c"transform->outNodes == NULL",
+        -1
+    );
+    check!(
+        last != 0,
+        "xmlSecTransformEnvelopedExecute",
+        c"last != 0",
+        -1
+    );
+    check!(
+        !ctx.is_null(),
+        "xmlSecTransformEnvelopedExecute",
+        c"transformCtx != NULL",
+        -1
+    );
+    let here = here!("xmlSecTransformEnvelopedExecute");
     // SAFETY: an enveloped transform read from a live `dsig:Transform`.
     unsafe {
-        let Some((object, klass)) = valid(transform) else {
-            return -1;
-        };
-        if !std::ptr::eq(klass, &raw const ENVELOPED)
-            || object.here_node.is_null()
-            || !object.out_nodes.is_null()
-            || last == 0
-            || ctx.is_null()
-        {
-            return -1;
-        }
+        let name = name_of(transform);
         if !object.in_nodes.is_null() && (*object.in_nodes).doc != (*object.here_node).doc {
+            errors::other(here, errors::R_TRANSFORM_SAME_DOCUMENT_REQUIRED, name, None);
             return -1;
         }
         let signature = xmlSecFindParent(
@@ -994,14 +1376,28 @@ unsafe extern "C" fn enveloped_execute(
             xmlSecDSigNs.as_ptr(),
         );
         if signature.is_null() {
+            errors::node_not_found(
+                here,
+                c"xmlSecFindParent",
+                object.here_node,
+                c"Signature",
+                name,
+            );
             return -1;
         }
         let outside = xmlSecNodeSetGetChildren((*signature).doc, signature, 1, 1);
         if outside.is_null() {
+            errors::internal_with(
+                here,
+                name,
+                c"xmlSecNodeSetGetChildren",
+                &format!("node={}", klass_text((*signature).name)),
+            );
             return -1;
         }
         object.out_nodes = xmlSecNodeSetAdd(object.in_nodes, outside, INTERSECTION);
         if object.out_nodes.is_null() {
+            errors::internal(here, name, c"xmlSecNodeSetAdd");
             xmlSecNodeSetDestroy(outside);
             return -1;
         }

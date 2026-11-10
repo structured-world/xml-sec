@@ -52,8 +52,6 @@ pub(crate) const R_INVALID_TYPE: c_int = 14;
 pub(crate) const R_INVALID_OPERATION: c_int = 15;
 /// `XMLSEC_ERRORS_R_INVALID_STATUS`.
 pub(crate) const R_INVALID_STATUS: c_int = 16;
-/// `XMLSEC_ERRORS_R_INVALID_VERSION`.
-pub(crate) const R_INVALID_VERSION: c_int = 19;
 /// `XMLSEC_ERRORS_R_INVALID_NODE`.
 pub(crate) const R_INVALID_NODE: c_int = 21;
 /// `XMLSEC_ERRORS_R_INVALID_NODE_CONTENT`.
@@ -62,12 +60,14 @@ pub(crate) const R_INVALID_NODE_CONTENT: c_int = 22;
 pub(crate) const R_INVALID_NODE_ATTRIBUTE: c_int = 23;
 /// `XMLSEC_ERRORS_R_UNEXPECTED_NODE`.
 pub(crate) const R_UNEXPECTED_NODE: c_int = 27;
+/// `XMLSEC_ERRORS_R_NODE_NOT_FOUND`.
+pub(crate) const R_NODE_NOT_FOUND: c_int = 28;
 /// `XMLSEC_ERRORS_R_INVALID_TRANSFORM`.
 pub(crate) const R_INVALID_TRANSFORM: c_int = 31;
-/// `XMLSEC_ERRORS_R_INVALID_URI_TYPE`.
-pub(crate) const R_INVALID_URI_TYPE: c_int = 33;
 /// `XMLSEC_ERRORS_R_TRANSFORM_DISABLED`.
 pub(crate) const R_TRANSFORM_DISABLED: c_int = 35;
+/// `XMLSEC_ERRORS_R_TRANSFORM_SAME_DOCUMENT_REQUIRED`.
+pub(crate) const R_TRANSFORM_SAME_DOCUMENT_REQUIRED: c_int = 34;
 /// `XMLSEC_ERRORS_R_INVALID_KEY_DATA_SIZE`.
 pub(crate) const R_INVALID_KEY_DATA_SIZE: c_int = 44;
 /// `XMLSEC_ERRORS_R_ASSERTION`.
@@ -163,19 +163,27 @@ impl Slot {
         self.set.store(true, Ordering::Release);
     }
 
-    /// The callback set, or `None` when the slot was never set.
-    fn load(&self) -> Option<Option<ErrorsCallback>> {
+    /// What the slot holds.
+    fn load(&self) -> Setting {
         if !self.set.load(Ordering::Acquire) {
-            return None;
+            return Setting::Unset;
         }
         let pointer = self.callback.load(Ordering::Relaxed);
-        // SAFETY: the slot holds null or a pointer `store` made from an
+        if pointer.is_null() {
+            return Setting::Set(None);
+        }
+        // SAFETY: a non-null pointer in the slot is one `store` made from an
         // `ErrorsCallback`.
-        Some(
-            (!pointer.is_null())
-                .then(|| unsafe { std::mem::transmute::<*mut c_void, ErrorsCallback>(pointer) }),
-        )
+        Setting::Set(Some(unsafe {
+            std::mem::transmute::<*mut c_void, ErrorsCallback>(pointer)
+        }))
     }
+}
+
+/// What a callback slot holds: never set, or set to a callback or to null.
+enum Setting {
+    Unset,
+    Set(Option<ErrorsCallback>),
 }
 
 /// The callback the crypto layer sets; the default callback until then.
@@ -187,8 +195,10 @@ static PRINT: AtomicBool = AtomicBool::new(true);
 
 /// The callback a report goes to now, if any.
 fn current() -> Option<ErrorsCallback> {
-    USER.load()
-        .unwrap_or_else(|| SYSTEM.load().unwrap_or(Some(xmlSecErrorsDefaultCallback)))
+    match (USER.load(), SYSTEM.load()) {
+        (Setting::Set(callback), _) | (Setting::Unset, Setting::Set(callback)) => callback,
+        (Setting::Unset, Setting::Unset) => Some(xmlSecErrorsDefaultCallback),
+    }
 }
 
 /// `xmlSecErrorsInit`: nothing to initialize.
@@ -268,7 +278,7 @@ pub(crate) unsafe extern "C" fn xmlSecErrorsPrintCryptoLibraryLogOnExitSet(_enab
 ///
 /// # Safety
 /// `text` is null or NUL-terminated.
-unsafe fn bytes_or<'a>(text: *const c_char, fallback: &'a [u8]) -> &'a [u8] {
+unsafe fn bytes_or(text: *const c_char, fallback: &[u8]) -> &[u8] {
     if text.is_null() {
         fallback
     } else {
@@ -649,8 +659,15 @@ pub(crate) fn invalid_data(here: Here, object: *const c_char, message: &str) {
 
 /// libxmlsec1's `xmlSecAssert2`: when `$condition` does not hold, reports the
 /// precondition `$text` (libxmlsec1's expression text) as failed inside
-/// `$func` and returns `$ret`.
+/// `$func` and returns `$ret`; without `$ret`, libxmlsec1's `xmlSecAssert`
+/// for a function that returns nothing.
 macro_rules! check {
+    ($condition:expr, $func:literal, $text:literal $(,)?) => {
+        if !$condition {
+            $crate::ffi::errors::assertion($crate::ffi::errors::here!($func), $text);
+            return;
+        }
+    };
     ($condition:expr, $func:literal, $text:literal, $ret:expr) => {
         if !$condition {
             $crate::ffi::errors::assertion($crate::ffi::errors::here!($func), $text);
@@ -668,6 +685,52 @@ pub(crate) fn assertion(here: Here, expression: &CStr) {
         expression.as_ptr(),
         R_ASSERTION,
         " ",
+    );
+}
+
+/// libxmlsec1's `xmlSecInvalidTransfromStatusError`.
+pub(crate) fn invalid_status(here: Here, object: *const c_char, status: c_int) {
+    report(
+        here,
+        object,
+        std::ptr::null(),
+        R_INVALID_STATUS,
+        &format!("transformStatus={status}"),
+    );
+}
+
+/// libxmlsec1's `xmlSecNodeNotFoundError`: `failed` found no `target` from
+/// `start`.
+///
+/// # Safety
+/// `start` is null or a live node.
+pub(crate) unsafe fn node_not_found(
+    here: Here,
+    failed: &CStr,
+    start: *const XmlNode,
+    target: &CStr,
+    object: *const c_char,
+) {
+    // SAFETY: by the caller's contract.
+    let name = unsafe { node_name(start) };
+    report(
+        here,
+        object,
+        failed.as_ptr(),
+        R_NODE_NOT_FOUND,
+        &format!("startNode={name}; target={}", target.to_string_lossy()),
+    );
+}
+
+/// libxmlsec1's `xmlSecOtherError`: `code` for `object`, with `details`
+/// (`NULL` when absent).
+pub(crate) fn other(here: Here, code: c_int, object: *const c_char, details: Option<&str>) {
+    report(
+        here,
+        object,
+        std::ptr::null(),
+        code,
+        &format!("details={}", details.unwrap_or("NULL")),
     );
 }
 

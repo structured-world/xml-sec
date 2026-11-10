@@ -225,7 +225,7 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetCreate(
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecNodeSetDestroy(set: *mut XmlSecNodeSet) {
     contain((), || {
-        check!(!set.is_null(), "xmlSecNodeSetDestroy", c"nset != NULL", ());
+        check!(!set.is_null(), "xmlSecNodeSetDestroy", c"nset != NULL");
         let mut current = set;
         let mut destroy_doc: *mut XmlDoc = std::ptr::null_mut();
         while !current.is_null() {
@@ -266,12 +266,7 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetDestroy(set: *mut XmlSecNodeSet) {
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecNodeSetDocDestroy(set: *mut XmlSecNodeSet) {
     contain((), || {
-        check!(
-            !set.is_null(),
-            "xmlSecNodeSetDocDestroy",
-            c"nset != NULL",
-            ()
-        );
+        check!(!set.is_null(), "xmlSecNodeSetDocDestroy", c"nset != NULL",);
         // SAFETY: the caller passes a live node set.
         unsafe { (*set).destroy_doc = 1 };
     });
@@ -747,17 +742,11 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetDebugDump(
     output: *mut c_void,
 ) {
     contain((), || {
-        check!(
-            !set.is_null(),
-            "xmlSecNodeSetDebugDump",
-            c"nset != NULL",
-            ()
-        );
+        check!(!set.is_null(), "xmlSecNodeSetDebugDump", c"nset != NULL",);
         check!(
             !output.is_null(),
             "xmlSecNodeSetDebugDump",
             c"output != NULL",
-            ()
         );
         // SAFETY: the caller passes a live node set.
         let set = unsafe { &*set };

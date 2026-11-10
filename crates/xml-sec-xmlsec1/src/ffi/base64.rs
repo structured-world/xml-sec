@@ -129,24 +129,96 @@ pub(crate) fn finish(ctx: &mut XmlSecBase64Ctx, output: &mut [u8]) -> Result<usi
     Ok(written)
 }
 
-/// Reports a codec failure with the reason libxmlsec1's codec reports for
-/// it: invalid input, too little output room, or an unfinished group.
-pub(crate) fn report_failure(here: errors::Here, error: Base64Error, output_size: usize) {
-    match error {
-        Base64Error::Invalid => {
-            errors::invalid_data(here, std::ptr::null(), "invalid Base64 input or state");
+/// The byte-level cause libxmlsec1's decoder reports when decoding `input`
+/// from the state `before` fails: the state itself, misplaced padding, or a
+/// byte that is not Base64. `None` when it reports none: the stream had
+/// already ended, or the output filled up.
+///
+/// The codec finds the failing byte itself: a copy of the state before the
+/// call is fed the input one byte at a time until it refuses one.
+fn decode_cause(before: Base64Codec, input: &[u8]) -> Option<String> {
+    let mut codec = before;
+    // One input byte decodes to at most one output byte.
+    let mut room = [0u8; 1];
+    if codec.update(&[], &mut room).is_err() {
+        return Some(format!(
+            "invalid data for 'ctx->inPos': actual={} and expected 0,1,2,3",
+            before.position
+        ));
+    }
+    for &byte in input {
+        // libxmlsec1 stops at the end of the stream without inspecting the
+        // byte and reports only that input was left over.
+        if codec.finished && codec.position == 0 {
+            return None;
         }
-        Base64Error::OutputFull => errors::report(
-            here,
+        let position = codec.position;
+        match codec.update(&[byte], &mut room) {
+            Ok(_) => {}
+            Err(Base64Error::Invalid) if byte == b'=' => {
+                return Some(format!(
+                    "invalid data for 'ctx->inPos': actual={position} and expected 2,3"
+                ));
+            }
+            Err(Base64Error::Invalid) => {
+                return Some(format!(
+                    "invalid data for 'inByte': actual={byte} and expected base64 character"
+                ));
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// Reports a failed update from the state `before` over `input` with the
+/// reports libxmlsec1's codec makes below `xmlSecBase64CtxUpdate_ex`: for a
+/// byte the decoder refuses, the byte's cause and the failed decoding step.
+fn report_update_failure(before: Base64Codec, input: &[u8], error: Base64Error) {
+    if before.encode || error != Base64Error::Invalid {
+        return;
+    }
+    if let Some(cause) = decode_cause(before, input) {
+        errors::invalid_data(here!("xmlSecBase64CtxDecodeByte"), std::ptr::null(), &cause);
+        // `xmlSecBase64StatusFailed`.
+        errors::internal_with(
+            here!("xmlSecBase64CtxDecode"),
+            std::ptr::null(),
+            c"xmlSecBase64CtxDecodeByte",
+            "status=4",
+        );
+    }
+}
+
+/// Reports a failed finish with the reports libxmlsec1 makes for it: an
+/// unfinished decoder group, or an encoder whose output does not fit.
+fn report_final_failure(here: errors::Here, encode: bool, error: Base64Error, out_size: usize) {
+    if !encode {
+        errors::internal(here, std::ptr::null(), c"xmlSecBase64CtxDecodeIsFinished");
+        return;
+    }
+    let encode_final = here!("xmlSecBase64CtxEncodeFinal");
+    if error == Base64Error::Invalid {
+        errors::invalid_data(
+            encode_final,
+            std::ptr::null(),
+            "invalid data for 'ctx->inPos': expected 0,1,2,3",
+        );
+    } else {
+        errors::report(
+            encode_final,
             std::ptr::null(),
             std::ptr::null(),
             errors::R_INVALID_SIZE,
-            &format!("invalid size for 'outSize': actual={output_size}"),
-        ),
-        Base64Error::Truncated => {
-            errors::internal(here, std::ptr::null(), c"xmlSecBase64CtxDecodeIsFinished")
-        }
+            "invalid size: invalid base64 buffer size",
+        );
     }
+    errors::internal_with(
+        here,
+        std::ptr::null(),
+        c"xmlSecBase64CtxEncodeFinal",
+        &format!("outSize={out_size}"),
+    );
 }
 
 /// A mutable byte slice over a C buffer; empty for a zero size.
@@ -235,7 +307,7 @@ pub(crate) unsafe extern "C" fn xmlSecBase64CtxCreate(
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecBase64CtxDestroy(ctx: *mut XmlSecBase64Ctx) {
     contain((), || {
-        check!(!ctx.is_null(), "xmlSecBase64CtxDestroy", c"ctx != NULL", ());
+        check!(!ctx.is_null(), "xmlSecBase64CtxDestroy", c"ctx != NULL");
         // SAFETY: a live created context, finalized then freed.
         unsafe {
             xmlSecBase64CtxFinalize(ctx);
@@ -281,12 +353,7 @@ pub(crate) unsafe extern "C" fn xmlSecBase64CtxInitialize(
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecBase64CtxFinalize(ctx: *mut XmlSecBase64Ctx) {
     contain((), || {
-        check!(
-            !ctx.is_null(),
-            "xmlSecBase64CtxFinalize",
-            c"ctx != NULL",
-            ()
-        );
+        check!(!ctx.is_null(), "xmlSecBase64CtxFinalize", c"ctx != NULL");
         // SAFETY: `ctx` is a writable context.
         unsafe { ctx.write(XmlSecBase64Ctx::empty()) };
     });
@@ -335,19 +402,17 @@ pub(crate) unsafe extern "C" fn xmlSecBase64CtxUpdate_ex(
         );
         // SAFETY: by the caller's contract.
         unsafe {
-            let encode = (*ctx).encode != 0;
-            match update(
-                &mut *ctx,
-                in_slice(input, in_size),
-                out_slice(out, out_size),
-            ) {
+            let before = (*ctx).codec();
+            let encode = before.encode;
+            let data = in_slice(input, in_size);
+            match update(&mut *ctx, data, out_slice(out, out_size)) {
                 Ok(written) => {
                     out_written.write(written);
                     0
                 }
                 Err(error) => {
                     let here = here!("xmlSecBase64CtxUpdate_ex");
-                    report_failure(here, error, out_size);
+                    report_update_failure(before, data, error);
                     let failed = if encode {
                         c"xmlSecBase64CtxEncode"
                     } else {
@@ -401,15 +466,7 @@ pub(crate) unsafe extern "C" fn xmlSecBase64CtxFinal_ex(
                 }
                 Err(error) => {
                     let here = here!("xmlSecBase64CtxFinal_ex");
-                    report_failure(here, error, out_size);
-                    if (*ctx).encode != 0 {
-                        errors::internal_with(
-                            here,
-                            std::ptr::null(),
-                            c"xmlSecBase64CtxEncodeFinal",
-                            &format!("outSize={out_size}"),
-                        );
-                    }
+                    report_final_failure(here, (*ctx).encode != 0, error, out_size);
                     -1
                 }
             }

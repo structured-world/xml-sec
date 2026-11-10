@@ -104,7 +104,7 @@ pub(crate) unsafe extern "C" fn xmlSecBufferCreate(size: usize) -> *mut XmlSecBu
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecBufferDestroy(buf: *mut XmlSecBuffer) {
     contain((), || {
-        check!(!buf.is_null(), "xmlSecBufferDestroy", c"buf != NULL", ());
+        check!(!buf.is_null(), "xmlSecBufferDestroy", c"buf != NULL");
         // SAFETY: the caller passes a live created buffer.
         unsafe {
             xmlSecBufferFinalize(buf);
@@ -147,7 +147,7 @@ pub(crate) unsafe extern "C" fn xmlSecBufferInitialize(
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecBufferFinalize(buf: *mut XmlSecBuffer) {
     contain((), || {
-        check!(!buf.is_null(), "xmlSecBufferFinalize", c"buf != NULL", ());
+        check!(!buf.is_null(), "xmlSecBufferFinalize", c"buf != NULL");
         // SAFETY: the caller passes a valid buffer, whose data is null or a
         // libxml2 allocation it owns.
         unsafe {
@@ -171,15 +171,10 @@ pub(crate) unsafe extern "C" fn xmlSecBufferEmpty(buf: *mut XmlSecBuffer) {
     contain((), || {
         // SAFETY: the caller passes null or a valid buffer.
         let buf = unsafe { buf.as_mut() };
-        check!(buf.is_some(), "xmlSecBufferEmpty", c"buf != NULL", ());
+        check!(buf.is_some(), "xmlSecBufferEmpty", c"buf != NULL");
         let Some(buf) = buf else { return };
         if !buf.data.is_null() {
-            check!(
-                buf.max_size > 0,
-                "xmlSecBufferEmpty",
-                c"buf->maxSize > 0",
-                ()
-            );
+            check!(buf.max_size > 0, "xmlSecBufferEmpty", c"buf->maxSize > 0",);
             // SAFETY: `data` holds `maxSize` bytes.
             unsafe { buf.data.write_bytes(0, buf.max_size) };
         }
@@ -370,8 +365,8 @@ pub(crate) unsafe extern "C" fn xmlSecBufferSetMaxSize(
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecBufferSwap(buf1: *mut XmlSecBuffer, buf2: *mut XmlSecBuffer) {
     contain((), || {
-        check!(!buf1.is_null(), "xmlSecBufferSwap", c"buf1 != NULL", ());
-        check!(!buf2.is_null(), "xmlSecBufferSwap", c"buf2 != NULL", ());
+        check!(!buf1.is_null(), "xmlSecBufferSwap", c"buf1 != NULL");
+        check!(!buf2.is_null(), "xmlSecBufferSwap", c"buf2 != NULL");
         // SAFETY: both are valid buffers; `swap` allows them to be the same.
         unsafe { std::ptr::swap(buf1, buf2) };
     });
@@ -833,17 +828,11 @@ pub(crate) unsafe extern "C" fn xmlSecBufferDebugHexDump(
     output: *mut c_void,
 ) {
     contain((), || {
-        check!(
-            !buf.is_null(),
-            "xmlSecBufferDebugHexDump",
-            c"buf != NULL",
-            ()
-        );
+        check!(!buf.is_null(), "xmlSecBufferDebugHexDump", c"buf != NULL",);
         check!(
             !output.is_null(),
             "xmlSecBufferDebugHexDump",
             c"output != NULL",
-            ()
         );
         // SAFETY: a valid buffer holds `size` bytes at `data`.
         let bytes = unsafe {

@@ -178,12 +178,7 @@ pub(crate) unsafe extern "C" fn xmlSecParserSetDefaultOptions(options: c_int) {
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecParsePrepareCtxt(ctxt: ParserCtxt) {
     contain((), || {
-        check!(
-            !ctxt.is_null(),
-            "xmlSecParsePrepareCtxt",
-            c"ctxt != NULL",
-            ()
-        );
+        check!(!ctxt.is_null(), "xmlSecParsePrepareCtxt", c"ctxt != NULL",);
         if !libxml2::available() {
             errors::no_libxml2(here!("xmlSecParsePrepareCtxt"));
             return;

@@ -210,8 +210,19 @@ pub(crate) unsafe fn valid<'a>(
 
 /// The transform and klass of a valid `$transform`, after libxmlsec1's
 /// assertion `$text` (`xmlSecTransformIsValid(...)`) inside the entry point
-/// `$func`, or `$ret`.
+/// `$func`, or `$ret` (nothing, without `$ret`).
 macro_rules! valid_or {
+    ($transform:expr, $func:literal) => {{
+        // SAFETY: the caller passes null or a transform.
+        let checked = unsafe { $crate::ffi::transforms::valid($transform) };
+        $crate::ffi::errors::check!(
+            checked.is_some(),
+            $func,
+            c"xmlSecTransformIsValid(transform)"
+        );
+        let Some(checked) = checked else { return };
+        checked
+    }};
     ($transform:expr, $func:literal, $text:literal, $ret:expr) => {{
         // SAFETY: the caller passes null or a transform.
         let checked = unsafe { $crate::ffi::transforms::valid($transform) };
@@ -229,6 +240,29 @@ macro_rules! valid_or {
     };
 }
 pub(crate) use valid_or;
+
+/// The `$ty` tail of a transform of klass `$klass`, after libxmlsec1's
+/// assertion `$text` (`xmlSecTransformCheckId(...)`) inside the entry point
+/// `$func`, or `$ret` (nothing, without `$ret`).
+macro_rules! context_or {
+    ($transform:expr, $ty:ty, $klass:expr, $func:literal, $text:literal) => {{
+        // SAFETY: the caller passes null or a transform whose tail, for this
+        // klass, holds a `$ty`.
+        let checked = unsafe { $crate::ffi::transforms::context::<$ty>($transform, $klass) };
+        $crate::ffi::errors::check!(checked.is_some(), $func, $text);
+        let Some(checked) = checked else { return };
+        checked
+    }};
+    ($transform:expr, $ty:ty, $klass:expr, $func:literal, $text:literal, $ret:expr) => {{
+        // SAFETY: the caller passes null or a transform whose tail, for this
+        // klass, holds a `$ty`.
+        let checked = unsafe { $crate::ffi::transforms::context::<$ty>($transform, $klass) };
+        $crate::ffi::errors::check!(checked.is_some(), $func, $text, $ret);
+        let Some(checked) = checked else { return $ret };
+        checked
+    }};
+}
+pub(crate) use context_or;
 
 /// The klass method `$method`, after libxmlsec1's assertion `$text` that it
 /// is set, inside the entry point `$func`; returns -1 otherwise.
@@ -496,7 +530,6 @@ pub(crate) unsafe extern "C" fn xmlSecTransformIdListDebugDump(
             !output.is_null(),
             "xmlSecTransformIdListDebugDump",
             c"output != NULL",
-            ()
         );
         let names: Vec<String> = klasses
             .iter()
@@ -530,7 +563,6 @@ pub(crate) unsafe extern "C" fn xmlSecTransformIdListDebugXmlDump(
             !output.is_null(),
             "xmlSecTransformIdListDebugXmlDump",
             c"output != NULL",
-            ()
         );
         let mut text = String::from("<TransformIdsList>\n");
         for klass in klasses {
@@ -753,12 +785,11 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCreate(
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecTransformDestroy(transform: *mut XmlSecTransform) {
     contain((), || {
-        let (object, klass) = valid_or!(transform, "xmlSecTransformDestroy", ());
+        let (object, klass) = valid_or!(transform, "xmlSecTransformDestroy");
         check!(
             klass.obj_size > 0,
             "xmlSecTransformDestroy",
             c"transform->id->objSize > 0",
-            ()
         );
         let size = klass.obj_size;
         let finalize = klass.finalize;
@@ -1120,12 +1151,11 @@ pub(crate) unsafe extern "C" fn xmlSecTransformDebugDump(
     output: *mut c_void,
 ) {
     contain((), || {
-        let (_, klass) = valid_or!(transform, "xmlSecTransformDebugDump", ());
+        let (_, klass) = valid_or!(transform, "xmlSecTransformDebugDump");
         check!(
             !output.is_null(),
             "xmlSecTransformDebugDump",
             c"output != NULL",
-            ()
         );
         // SAFETY: klass strings are NUL-terminated; `output` is live.
         unsafe {
@@ -1149,12 +1179,11 @@ pub(crate) unsafe extern "C" fn xmlSecTransformDebugXmlDump(
     output: *mut c_void,
 ) {
     contain((), || {
-        let (_, klass) = valid_or!(transform, "xmlSecTransformDebugXmlDump", ());
+        let (_, klass) = valid_or!(transform, "xmlSecTransformDebugXmlDump");
         check!(
             !output.is_null(),
             "xmlSecTransformDebugXmlDump",
             c"output != NULL",
-            ()
         );
         // SAFETY: klass strings are NUL-terminated; `output` is live. A null
         // string prints nothing, as libxmlsec1's string printer does.
@@ -1270,7 +1299,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformConnect(
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecTransformRemove(transform: *mut XmlSecTransform) {
     contain((), || {
-        let (object, _) = valid_or!(transform, "xmlSecTransformRemove", ());
+        let (object, _) = valid_or!(transform, "xmlSecTransformRemove");
         // SAFETY: the neighbours are live transforms of the same chain.
         unsafe {
             if let Some(next) = object.next.as_mut() {
@@ -1431,8 +1460,6 @@ pub(crate) unsafe extern "C" fn xmlSecTransformDefaultPushBin(
     ctx: *mut XmlSecTransformCtx,
 ) -> c_int {
     contain(-1, || {
-        // SAFETY: the caller's contract; every buffer belongs to the live
-        // transform and `data` advances within its `size` bytes.
         let (object, klass) = valid_or!(transform, "xmlSecTransformDefaultPushBin", -1);
         check!(
             !ctx.is_null(),
@@ -1442,6 +1469,8 @@ pub(crate) unsafe extern "C" fn xmlSecTransformDefaultPushBin(
         );
         let here = here!("xmlSecTransformDefaultPushBin");
         let name = klass.name.cast();
+        // SAFETY: the caller's contract; every buffer belongs to the live
+        // transform and `data` advances within its `size` bytes.
         unsafe {
             let chunk = (*ctx).binary_chunk_size;
             // A caller may write 0 into the public field; libxmlsec1 then never
@@ -1544,9 +1573,6 @@ pub(crate) unsafe extern "C" fn xmlSecTransformDefaultPopBin(
     ctx: *mut XmlSecTransformCtx,
 ) -> c_int {
     contain(-1, || {
-        // SAFETY: the caller's contract; every buffer belongs to the live
-        // transform, and the previous transform writes at most one chunk into
-        // the space reserved for it.
         let (object, klass) = valid_or!(transform, "xmlSecTransformDefaultPopBin", -1);
         check!(
             !data.is_null(),
@@ -1568,7 +1594,9 @@ pub(crate) unsafe extern "C" fn xmlSecTransformDefaultPopBin(
         );
         let here = here!("xmlSecTransformDefaultPopBin");
         let name = klass.name.cast();
-        // SAFETY: as above.
+        // SAFETY: the caller's contract; every buffer belongs to the live
+        // transform, and the previous transform writes at most one chunk into
+        // the space reserved for it.
         unsafe {
             let chunk = (*ctx).binary_chunk_size;
             let mut is_final = false;

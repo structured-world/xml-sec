@@ -22,12 +22,12 @@ struct Report {
 static REPORTS: Mutex<Vec<Report>> = Mutex::new(Vec::new());
 
 fn text(value: *const c_char) -> Option<String> {
+    if value.is_null() {
+        return None;
+    }
     // SAFETY: the library passes null or NUL-terminated strings.
-    (!value.is_null()).then(|| {
-        unsafe { CStr::from_ptr(value) }
-            .to_string_lossy()
-            .into_owned()
-    })
+    let text = unsafe { CStr::from_ptr(value) };
+    Some(text.to_string_lossy().into_owned())
 }
 
 unsafe extern "C" fn record(
@@ -151,7 +151,7 @@ fn user_callback_takes_priority_and_null_disables() {
         assert_eq!(reports[0].message, "");
         xmlSecErrorsSetCallback(None);
         report(here!("probe"), std::ptr::null(), std::ptr::null(), 1, "a");
-        assert!(take().is_empty());
+        assert_eq!(take(), []);
     }
 }
 

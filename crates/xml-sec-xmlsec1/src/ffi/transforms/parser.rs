@@ -4,8 +4,9 @@
 //! A document is at most the policy's document size, counted over its pushes
 //! or its pops.
 
-use std::ffi::{c_int, c_void};
+use std::ffi::{c_char, c_int, c_void};
 
+use super::super::errors::{self, check, here};
 use super::super::nodeset::{TREE, XmlSecNodeSet, xmlSecNodeSetCreate, xmlSecNodeSetDocDestroy};
 use super::super::parser::{
     ParserCtxt, free_ctxt, prepare_ctxt, push_input, take_doc, transform_options,
@@ -14,11 +15,11 @@ use super::super::parser::{
 use super::super::policy;
 use super::super::tree::xmlFreeDoc;
 use super::builtin::klass;
-use super::ctx::charge;
+use super::ctx::{Limit, charge};
 use super::io::bounded_input_buffer;
 use super::{
     STATUS_FINISHED, STATUS_NONE, STATUS_WORKING, USAGE_DSIG_TRANSFORM, WithContext,
-    XmlSecTransform, XmlSecTransformCtx, XmlSecTransformKlass, context, xmlSecTransformPushXml,
+    XmlSecTransform, XmlSecTransformCtx, XmlSecTransformKlass, context_or, xmlSecTransformPushXml,
 };
 
 use xml_sec_libxml2::ffi::libxml2::{
@@ -60,43 +61,54 @@ pub(crate) unsafe extern "C" fn xmlSecTransformXmlParserGetKlass() -> *const Xml
     xml_parser()
 }
 
-/// The push parser of an XML parser transform; the object's tail starts
-/// zeroed, so a fresh transform has none.
-///
-/// # Safety
-/// `transform` is null or a valid transform.
-unsafe fn push_parser<'a>(transform: *mut XmlSecTransform) -> Option<&'a mut ParserCtxt> {
-    // SAFETY: an XML parser transform's tail is its push parser.
-    unsafe { context::<ParserCtxt>(transform, xml_parser()) }
+/// The push parser of the XML parser transform `$transform` (null until the
+/// first push), after libxmlsec1's assertion inside the entry point `$func`,
+/// or `$ret`.
+macro_rules! push_parser_or {
+    ($transform:expr, $func:literal $(, $ret:expr)?) => {
+        context_or!(
+            $transform,
+            ParserCtxt,
+            xml_parser(),
+            $func,
+            c"xmlSecTransformCheckId(transform, xmlSecTransformXmlParserId)"
+            $(, $ret)?
+        )
+    };
 }
 
 unsafe extern "C" fn finalize(transform: *mut XmlSecTransform) {
-    // SAFETY: an XML parser transform being destroyed.
-    if let Some(slot) = unsafe { push_parser(transform) } {
-        if !slot.is_null() {
-            // SAFETY: the push parser this transform created, with the
-            // libxml2 that was available then.
-            unsafe { free_ctxt(*slot) };
-        }
-        *slot = std::ptr::null_mut();
+    let slot = push_parser_or!(transform, "xmlSecParserFinalize");
+    if !slot.is_null() {
+        // SAFETY: the push parser this transform created, with the libxml2
+        // that was available then.
+        unsafe { free_ctxt(*slot) };
     }
+    *slot = std::ptr::null_mut();
 }
 
-/// A tree node set that owns `doc`, freeing `doc` when one cannot be made.
+/// A tree node set that owns `doc`, freeing `doc` when one cannot be made
+/// (reported for the transform `name` names at `here`).
 ///
 /// # Safety
 /// `doc` is a live document the caller gives up.
-unsafe fn owning(doc: *mut c_void) -> *mut XmlSecNodeSet {
+unsafe fn owning(doc: *mut c_void, here: errors::Here, name: *const c_char) -> *mut XmlSecNodeSet {
     // SAFETY: by the caller's contract.
     unsafe {
         let nodes = xmlSecNodeSetCreate(doc.cast(), std::ptr::null_mut(), TREE);
         if nodes.is_null() {
+            errors::internal(here, name, c"xmlSecNodeSetCreate");
             xmlFreeDoc(doc.cast());
             return nodes;
         }
         xmlSecNodeSetDocDestroy(nodes);
         nodes
     }
+}
+
+/// The name of the XML parser klass for a report.
+fn name() -> *const c_char {
+    c"xml-parser".as_ptr()
 }
 
 /// Feeds pushed octets to the push parser; the final call finishes the
@@ -108,19 +120,26 @@ unsafe extern "C" fn push_bin(
     last: c_int,
     ctx: *mut XmlSecTransformCtx,
 ) -> c_int {
+    let slot = push_parser_or!(transform, "xmlSecParserPushBin", -1);
+    check!(
+        !ctx.is_null(),
+        "xmlSecParserPushBin",
+        c"transformCtx != NULL",
+        -1
+    );
+    let here = here!("xmlSecParserPushBin");
     // SAFETY: an XML parser transform in a live chain; `data` holds `size`
     // bytes.
     unsafe {
-        let Some(slot) = push_parser(transform) else {
-            return -1;
-        };
-        if ctx.is_null() {
-            return -1;
-        }
         let object = &mut *transform;
         match object.status {
             STATUS_NONE => {
-                if !slot.is_null() || !libxml2::available() {
+                if !slot.is_null() {
+                    errors::assertion(here, c"ctx->parserCtx == NULL");
+                    return -1;
+                }
+                if !libxml2::available() {
+                    errors::no_libxml2(here);
                     return -1;
                 }
                 *slot = xmlCreatePushParserCtxt(
@@ -131,6 +150,7 @@ unsafe extern "C" fn push_bin(
                     std::ptr::null(),
                 );
                 if slot.is_null() {
+                    errors::xml_failed(here, name(), c"xmlCreatePushParserCtxt");
                     return -1;
                 }
                 prepare_ctxt(*slot, transform_options());
@@ -138,42 +158,59 @@ unsafe extern "C" fn push_bin(
             }
             STATUS_WORKING => {}
             STATUS_FINISHED => return 0,
-            _ => return -1,
+            status => {
+                errors::invalid_status(here, name(), status);
+                return -1;
+            }
+        }
+        if slot.is_null() {
+            errors::assertion(here, c"ctx->parserCtx != NULL");
+            return -1;
         }
         if !data.is_null() && size > 0 {
-            let Some(policy) = policy::verification() else {
+            let Some(policy) = policy::verification_at(here) else {
                 return -1;
             };
             // The octets of this document pushed so far live in `reserved0`,
             // as the object's tail is libxmlsec1's single parser pointer.
             let mut pushed = object.reserved0.addr();
-            if charge(&mut pushed, size, policy.resources.max_xml_document_bytes).is_none() {
+            let limit = Limit {
+                name: "max_xml_document_bytes",
+                max: policy.resources.max_xml_document_bytes,
+            };
+            if charge(&mut pushed, size, limit, here, name()).is_none() {
                 return -1;
             }
             object.reserved0 = std::ptr::without_provenance_mut(pushed);
             let Ok(len) = c_int::try_from(size) else {
+                errors::size_to_int_impossible(here, size);
                 return -1;
             };
             if xmlParseChunk(*slot, data.cast(), len, 0) != 0 {
+                errors::xml_failed_with(here, name(), c"xmlParseChunk", &format!("size={len}"));
                 return -1;
             }
         }
         if last == 0 {
             return 0;
         }
-        if xmlParseChunk(*slot, std::ptr::null(), 0, 1) != 0 {
-            return -1;
-        }
-        let doc = take_doc(*slot);
+        let finished = xmlParseChunk(*slot, std::ptr::null(), 0, 1) == 0;
+        let doc = if finished {
+            take_doc(*slot)
+        } else {
+            std::ptr::null_mut()
+        };
         if doc.is_null() {
+            errors::xml_failed(here, name(), c"xmlParseChunk");
             return -1;
         }
-        object.out_nodes = owning(doc.cast());
+        object.out_nodes = owning(doc.cast(), here, name());
         if object.out_nodes.is_null() {
             return -1;
         }
         if !object.next.is_null() && xmlSecTransformPushXml(object.next, object.out_nodes, ctx) < 0
         {
+            errors::internal(here, name(), c"xmlSecTransformPushXml");
             return -1;
         }
         object.status = STATUS_FINISHED;
@@ -187,11 +224,17 @@ unsafe extern "C" fn pop_xml(
     nodes: *mut *mut XmlSecNodeSet,
     ctx: *mut XmlSecTransformCtx,
 ) -> c_int {
+    push_parser_or!(transform, "xmlSecParserPopXml", -1);
+    check!(!nodes.is_null(), "xmlSecParserPopXml", c"nodes != NULL", -1);
+    check!(
+        !ctx.is_null(),
+        "xmlSecParserPopXml",
+        c"transformCtx != NULL",
+        -1
+    );
+    let here = here!("xmlSecParserPopXml");
     // SAFETY: an XML parser transform in a live chain; `nodes` is writable.
     unsafe {
-        if push_parser(transform).is_none() || nodes.is_null() || ctx.is_null() {
-            return -1;
-        }
         let object = &mut *transform;
         match object.status {
             STATUS_NONE => object.status = STATUS_WORKING,
@@ -200,26 +243,43 @@ unsafe extern "C" fn pop_xml(
                 nodes.write(std::ptr::null_mut());
                 return 0;
             }
-            _ => return -1,
+            status => {
+                errors::invalid_status(here, name(), status);
+                return -1;
+            }
         }
-        let Some(policy) = policy::verification() else {
+        let Some(policy) = policy::verification_at(here) else {
             return -1;
         };
-        if object.prev.is_null() || !libxml2::available() {
+        if object.prev.is_null() {
+            errors::report(
+                here,
+                name(),
+                std::ptr::null(),
+                errors::R_INVALID_TRANSFORM,
+                "prev transform=\"NULL\"",
+            );
+            return -1;
+        }
+        if !libxml2::available() {
+            errors::no_libxml2(here);
             return -1;
         }
         let input = bounded_input_buffer(object.prev, ctx, policy.resources.max_xml_document_bytes);
         if input.is_null() {
+            errors::internal(here, name(), c"xmlSecTransformCreateInputBuffer");
             return -1;
         }
         let parser = xmlNewParserCtxt();
         if parser.is_null() {
+            errors::xml_failed(here, name(), c"xmlNewParserCtxt");
             xmlFreeParserInputBuffer(input);
             return -1;
         }
         prepare_ctxt(parser, transform_options());
         let stream = xmlNewIOInputStream(parser, input, ENCODING_NONE);
         if stream.is_null() {
+            errors::xml_failed(here, name(), c"xmlNewIOInputStream");
             free_ctxt(parser);
             // From libxml2 2.13 a failed `xmlNewIOInputStream` frees the
             // buffer itself (`xmlNewInputInternal`); before, it stays ours.
@@ -229,17 +289,19 @@ unsafe extern "C" fn pop_xml(
             return -1;
         }
         if push_input(parser, stream) < 0 {
+            errors::xml_failed(here, name(), c"xmlCtxtPushInput");
             xmlFreeInputStream(stream);
             free_ctxt(parser);
             return -1;
         }
         if xmlParseDocument(parser) < 0 {
+            errors::xml_failed(here, name(), c"xmlParseDocument");
             free_ctxt(parser);
             return -1;
         }
         let doc = take_doc(parser);
         free_ctxt(parser);
-        let result = owning(doc.cast());
+        let result = owning(doc.cast(), here, name());
         if result.is_null() {
             return -1;
         }

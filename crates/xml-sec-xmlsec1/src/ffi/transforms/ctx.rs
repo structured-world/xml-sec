@@ -91,10 +91,29 @@ pub(crate) unsafe fn run_budget<'a>(ctx: *mut XmlSecTransformCtx) -> &'a mut Run
     }
 }
 
-/// Charges `amount` to `spent` within `limit`; refused once the total would
-/// pass it.
-pub(crate) fn charge(spent: &mut usize, amount: usize, limit: usize) -> Option<()> {
-    let total = spent.checked_add(amount).filter(|total| *total <= limit)?;
+/// A policy limit as a charge names it in its report.
+#[derive(Clone, Copy)]
+pub(crate) struct Limit {
+    pub(crate) name: &'static str,
+    pub(crate) max: usize,
+}
+
+/// Charges `amount` to `spent` within `limit`; refused, and reported for
+/// `object` at `here`, once the total would pass it.
+pub(crate) fn charge(
+    spent: &mut usize,
+    amount: usize,
+    limit: Limit,
+    here: errors::Here,
+    object: *const std::ffi::c_char,
+) -> Option<()> {
+    let Some(total) = spent
+        .checked_add(amount)
+        .filter(|total| *total <= limit.max)
+    else {
+        errors::limit_exceeded(here, object, limit.name, limit.max);
+        return None;
+    };
     *spent = total;
     Some(())
 }
@@ -355,12 +374,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxCreate() -> *mut XmlSecTransfo
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecTransformCtxDestroy(ctx: *mut XmlSecTransformCtx) {
     contain((), || {
-        check!(
-            !ctx.is_null(),
-            "xmlSecTransformCtxDestroy",
-            c"ctx != NULL",
-            ()
-        );
+        check!(!ctx.is_null(), "xmlSecTransformCtxDestroy", c"ctx != NULL",);
         // SAFETY: a live created context, finalized then freed.
         unsafe {
             xmlSecTransformCtxFinalize(ctx);
@@ -415,12 +429,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxInitialize(
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecTransformCtxFinalize(ctx: *mut XmlSecTransformCtx) {
     contain((), || {
-        check!(
-            !ctx.is_null(),
-            "xmlSecTransformCtxFinalize",
-            c"ctx != NULL",
-            ()
-        );
+        check!(!ctx.is_null(), "xmlSecTransformCtxFinalize", c"ctx != NULL",);
         // SAFETY: an initialized context.
         unsafe {
             xmlSecTransformCtxReset(ctx);
@@ -438,12 +447,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxFinalize(ctx: *mut XmlSecTrans
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecTransformCtxReset(ctx: *mut XmlSecTransformCtx) {
     contain((), || {
-        check!(
-            !ctx.is_null(),
-            "xmlSecTransformCtxReset",
-            c"ctx != NULL",
-            ()
-        );
+        check!(!ctx.is_null(), "xmlSecTransformCtxReset", c"ctx != NULL",);
         // SAFETY: an initialized context whose chain, strings and lists it
         // owns.
         unsafe {
@@ -1483,13 +1487,11 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxDebugDump(
             !ctx.is_null(),
             "xmlSecTransformCtxDebugDump",
             c"ctx != NULL",
-            ()
         );
         check!(
             !output.is_null(),
             "xmlSecTransformCtxDebugDump",
             c"output != NULL",
-            ()
         );
         // SAFETY: by the caller's contract.
         unsafe {
@@ -1538,13 +1540,11 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxDebugXmlDump(
             !ctx.is_null(),
             "xmlSecTransformCtxDebugXmlDump",
             c"ctx != NULL",
-            ()
         );
         check!(
             !output.is_null(),
             "xmlSecTransformCtxDebugXmlDump",
             c"output != NULL",
-            ()
         );
         // SAFETY: by the caller's contract.
         unsafe {

@@ -174,7 +174,6 @@ pub(crate) unsafe extern "C" fn xmlSecPtrListFinalize(list: *mut XmlSecPtrList) 
             unsafe { valid(list) }.is_some(),
             "xmlSecPtrListFinalize",
             c"xmlSecPtrListIsValid(list)",
-            ()
         );
         // SAFETY: `list` is valid and writable.
         unsafe {
@@ -239,7 +238,6 @@ pub(crate) unsafe extern "C" fn xmlSecPtrListDestroy(list: *mut XmlSecPtrList) {
             unsafe { valid(list) }.is_some(),
             "xmlSecPtrListDestroy",
             c"xmlSecPtrListIsValid(list)",
-            ()
         );
         // SAFETY: a valid created list is finalized, then its allocation freed.
         unsafe {
@@ -263,7 +261,6 @@ pub(crate) unsafe extern "C" fn xmlSecPtrListEmpty(list: *mut XmlSecPtrList) {
             list.is_some(),
             "xmlSecPtrListEmpty",
             c"xmlSecPtrListIsValid(list)",
-            ()
         );
         let Some(list) = list else { return };
         // SAFETY: the list's klass outlives it.
@@ -273,7 +270,6 @@ pub(crate) unsafe extern "C" fn xmlSecPtrListEmpty(list: *mut XmlSecPtrList) {
                     !list.data.is_null(),
                     "xmlSecPtrListEmpty",
                     c"list->data != NULL",
-                    ()
                 );
                 // SAFETY: `pos < used <= max` items are stored at `data`.
                 let item = unsafe { list.data.add(pos).read() };
@@ -288,7 +284,6 @@ pub(crate) unsafe extern "C" fn xmlSecPtrListEmpty(list: *mut XmlSecPtrList) {
                 !list.data.is_null(),
                 "xmlSecPtrListEmpty",
                 c"list->data != NULL",
-                ()
             );
             // SAFETY: `data` holds `max >= used` items and is the list's
             // libxml2 allocation.

@@ -151,7 +151,7 @@ static void library(void) {
     xmlSecSize written = 0;
     int ret;
 
-    printing = 0;
+    printing = 1;
     xmlSecErrorsSetCallback(record);
     begin("buffer initialize null");
     end(xmlSecBufferInitialize(NULL, 1));
@@ -160,6 +160,14 @@ static void library(void) {
     begin("base64 decode invalid");
     ret = xmlSecBase64Decode_ex(BAD_CAST "A!A=", out, sizeof(out), &written);
     end(ret);
+    begin("base64 decode misplaced padding");
+    end(xmlSecBase64Decode_ex(BAD_CAST "A===", out, sizeof(out), &written));
+    begin("base64 decode after the end");
+    end(xmlSecBase64Decode_ex(BAD_CAST "AA==AA", out, sizeof(out), &written));
+    begin("base64 decode unfinished group");
+    end(xmlSecBase64Decode_ex(BAD_CAST "AAA", out, sizeof(out), &written));
+    begin("base64 decode into too little room");
+    end(xmlSecBase64Decode_ex(BAD_CAST "AAAAAAAA", out, 2, &written));
     begin("buffer base64 read invalid");
     buf = xmlSecBufferCreate(0);
     end(xmlSecBufferBase64NodeContentRead(buf, NULL));
@@ -218,6 +226,18 @@ static void transform_context(void) {
     xmlSecTransformCtxInitialize(&ctx);
     end(xmlSecTransformCtxPrepare(&ctx, xmlSecTransformDataTypeBin));
     end(xmlSecTransformCtxPrepare(&ctx, xmlSecTransformDataTypeBin));
+    xmlSecTransformCtxFinalize(&ctx);
+
+    begin("base64 transform on invalid input");
+    xmlSecTransformCtxInitialize(&ctx);
+    xmlSecTransformCtxCreateAndAppend(&ctx, xmlSecTransformBase64Id);
+    end(xmlSecTransformCtxBinaryExecute(&ctx, BAD_CAST "A!A=", 4));
+    xmlSecTransformCtxFinalize(&ctx);
+
+    begin("enveloped transform outside a signature");
+    xmlSecTransformCtxInitialize(&ctx);
+    xmlSecTransformCtxNodeRead(&ctx, enveloped, xmlSecTransformUsageAny);
+    end(xmlSecTransformCtxExecute(&ctx, doc));
     xmlSecTransformCtxFinalize(&ctx);
 
     printing = 0;
