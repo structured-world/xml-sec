@@ -20,6 +20,7 @@
 #include <xmlsec/list.h>
 #include <xmlsec/base64.h>
 #include <xmlsec/transforms.h>
+#include <xmlsec/keysdata.h>
 #include <xmlsec/xmltree.h>
 #include <libxml/parser.h>
 
@@ -280,6 +281,44 @@ static void transform_context(void) {
     xmlFreeDoc(doc);
 }
 
+/* Key-data failures: preconditions, a klass method missing and a lookup in
+ * a list of the wrong kind. */
+static void key_data(void) {
+    xmlSecKeyDataPtr name;
+    xmlSecPtrListPtr list;
+
+    printing = 1;
+    xmlSecErrorsSetCallback(record);
+    printf("key data ids init: %d\n", xmlSecKeyDataIdsInit());
+    name = xmlSecKeyDataCreate(xmlSecKeyDataNameId);
+
+    begin("key data create without klass");
+    end(xmlSecKeyDataCreate(NULL) == NULL ? -1 : 0);
+    begin("key data duplicate without method");
+    end(xmlSecKeyDataDuplicate(name) == NULL ? -1 : 0);
+    begin("binary value of a plain key data");
+    end(xmlSecKeyDataBinaryValueGetBuffer(name) == NULL ? -1 : 0);
+    begin("generate without method");
+    end(xmlSecKeyDataGenerate(name, 128, xmlSecKeyDataTypeAny));
+    begin("find in a list of another kind");
+    list = xmlSecPtrListCreate(xmlSecStringListId);
+    end(xmlSecKeyDataIdListFindByName(list, BAD_CAST "x", xmlSecKeyDataUsageAny) == NULL
+            ? -1
+            : 0);
+    begin("find by a null href");
+    end(xmlSecKeyDataIdListFindByHref(xmlSecKeyDataIdsGet(), NULL, xmlSecKeyDataUsageAny) ==
+                NULL
+            ? -1
+            : 0);
+    begin("store create without klass");
+    end(xmlSecKeyDataStoreCreate(NULL) == NULL ? -1 : 0);
+
+    printing = 0;
+    xmlSecPtrListDestroy(list);
+    xmlSecKeyDataDestroy(name);
+    xmlSecKeyDataIdsShutdown();
+}
+
 int main(void) {
     table();
     formatting();
@@ -287,5 +326,6 @@ int main(void) {
     priority();
     library();
     transform_context();
+    key_data();
     return 0;
 }
