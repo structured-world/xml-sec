@@ -164,6 +164,22 @@ fn report_callback_may_reenter_the_library() {
     );
 }
 
+/// The report callback is process-global, as libxmlsec1's is: one set on
+/// this thread receives the reports of a call on another thread.
+#[test]
+fn report_callback_is_process_global() {
+    // SAFETY: the callback has the callback's signature.
+    unsafe { xmlSecErrorsSetCallback(Some(record as ErrorsCallback)) };
+    std::thread::spawn(|| {
+        // SAFETY: a failing call of the library.
+        let initialized = unsafe { xmlSecBufferInitialize(std::ptr::null_mut(), 0) };
+        assert_eq!(initialized, -1);
+    })
+    .join()
+    .expect("the thread does not panic");
+    assert_eq!(take(), [("xmlSecBufferInitialize".to_owned(), R_ASSERTION)]);
+}
+
 /// A panic inside an entry point's body is reported as an internal error
 /// and returns the fallback instead of unwinding into C.
 #[test]
