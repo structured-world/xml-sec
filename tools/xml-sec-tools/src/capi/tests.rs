@@ -107,6 +107,19 @@ fn declarations_are_functions_before_their_parameter_lists() {
     assert!(!real.contains("xs_status"));
 }
 
+/// A libxmlsec1 declaration whose parameter list starts on the line after
+/// the name still declares that name.
+#[test]
+fn a_parameter_list_on_the_next_line_declares_the_name() {
+    let header = "XMLSEC_EXPORT void              xmlSecOneEnableOutput\n\
+                  \x20                                                (int enabled);\n\
+                  XMLSEC_EXPORT int xmlSecTwo (void);\n";
+    assert_eq!(
+        declared_with(header, "xmlSec"),
+        names(&["xmlSecOneEnableOutput", "xmlSecTwo"])
+    );
+}
+
 #[test]
 fn exports_and_declarations_must_match_except_the_optional_engine() {
     // An undeclared export is ABI nobody can call correctly; a declared

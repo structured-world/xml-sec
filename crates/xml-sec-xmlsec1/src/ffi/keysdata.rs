@@ -9,13 +9,14 @@
 //! registration; their reading and writing of keys belongs to the key
 //! objects and `KeyInfo` processing that use them.
 
-use std::ffi::{c_int, c_uint, c_void};
+use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use super::buffer::{XmlSecBuffer, xmlSecBufferGetSize, xmlSecBufferSetData};
+use super::errors::{self, check, here};
 use super::list::{
     XmlSecPtrList, XmlSecPtrListKlass, xmlSecPtrListAdd, xmlSecPtrListFinalize,
-    xmlSecPtrListGetItem, xmlSecPtrListGetSize, xmlSecPtrListInitialize,
+    xmlSecPtrListInitialize,
 };
 use super::strings::{
     xmlSecDSig11Ns, xmlSecDSigNs, xmlSecEnc11Ns, xmlSecEncNs, xmlSecExperimental202512Ns,
@@ -139,6 +140,24 @@ unsafe fn valid<'a>(data: *mut XmlSecKeyData) -> Option<&'a XmlSecKeyDataKlass> 
     }
 }
 
+/// The klass of a valid key-data object `$data`, after libxmlsec1's
+/// `xmlSecKeyDataIsValid(data)` assertion inside the entry point `$func`, or
+/// `$ret` (nothing, without `$ret`).
+macro_rules! key_data_or {
+    ($data:expr, $func:literal $(, $ret:expr)?) => {{
+        // SAFETY: the caller passes null or a key-data object.
+        let klass = unsafe { valid($data) };
+        check!(klass.is_some(), $func, c"xmlSecKeyDataIsValid(data)" $(, $ret)?);
+        let Some(klass) = klass else { return $($ret)? };
+        klass
+    }};
+}
+
+/// The name of a key-data klass for a report.
+fn name_of(klass: &XmlSecKeyDataKlass) -> *const c_char {
+    klass.name.cast()
+}
+
 // ----------------------------------------------------------------------------
 // The registry
 
@@ -171,18 +190,25 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataIdsGetEnabled() -> *mut XmlSecPtrLi
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecKeyDataIdsInit() -> c_int {
     contain(-1, || {
+        let here = here!("xmlSecKeyDataIdsInit");
         // SAFETY: the registries have fixed addresses and are not in use.
         unsafe {
-            if xmlSecPtrListInitialize(xmlSecKeyDataIdsGet(), xmlSecKeyDataIdListGetKlass()) < 0
-                || xmlSecPtrListInitialize(
-                    xmlSecKeyDataIdsGetEnabled(),
-                    xmlSecKeyDataIdListGetKlass(),
-                ) < 0
-            {
+            for registry in [xmlSecKeyDataIdsGet(), xmlSecKeyDataIdsGetEnabled()] {
+                if xmlSecPtrListInitialize(registry, xmlSecKeyDataIdListGetKlass()) < 0 {
+                    errors::internal(
+                        here,
+                        std::ptr::null(),
+                        c"xmlSecPtrListInitialize(xmlSecKeyDataIdListId)",
+                    );
+                    return -1;
+                }
+            }
+            if xmlSecKeyDataIdsRegisterDefault() < 0 {
+                errors::internal(here, std::ptr::null(), c"xmlSecKeyDataIdsRegisterDefault");
                 return -1;
             }
-            xmlSecKeyDataIdsRegisterDefault()
         }
+        0
     })
 }
 
@@ -209,14 +235,22 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataIdsShutdown() {
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecKeyDataIdsRegister(id: *const XmlSecKeyDataKlass) -> c_int {
     contain(-1, || {
-        if id.is_null() {
-            return -1;
-        }
+        check!(
+            !id.is_null(),
+            "xmlSecKeyDataIdsRegister",
+            c"id != xmlSecKeyDataIdUnknown",
+            -1
+        );
+        let here = here!("xmlSecKeyDataIdsRegister");
         // SAFETY: the registries have fixed addresses; the klass is static.
         unsafe {
-            if xmlSecPtrListAdd(xmlSecKeyDataIdsGet(), id.cast_mut().cast()) < 0
-                || xmlSecPtrListAdd(xmlSecKeyDataIdsGetEnabled(), id.cast_mut().cast()) < 0
-            {
+            let name = (*id).name.cast();
+            if xmlSecPtrListAdd(xmlSecKeyDataIdsGet(), id.cast_mut().cast()) < 0 {
+                errors::internal(here, name, c"xmlSecPtrListAdd(&xmlSecAllKeyDataIds)");
+                return -1;
+            }
+            if xmlSecPtrListAdd(xmlSecKeyDataIdsGetEnabled(), id.cast_mut().cast()) < 0 {
+                errors::internal(here, name, c"xmlSecPtrListAdd(&xmlSecEnabledKeyDataIds)");
                 return -1;
             }
         }
@@ -233,12 +267,24 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataIdsRegisterDisabled(
     id: *const XmlSecKeyDataKlass,
 ) -> c_int {
     contain(-1, || {
-        if id.is_null() {
-            return -1;
-        }
+        check!(
+            !id.is_null(),
+            "xmlSecKeyDataIdsRegisterDisabled",
+            c"id != xmlSecKeyDataIdUnknown",
+            -1
+        );
         // SAFETY: the registry has a fixed address; the klass is static.
-        let added = unsafe { xmlSecPtrListAdd(xmlSecKeyDataIdsGet(), id.cast_mut().cast()) };
-        if added < 0 { -1 } else { 0 }
+        unsafe {
+            if xmlSecPtrListAdd(xmlSecKeyDataIdsGet(), id.cast_mut().cast()) < 0 {
+                errors::internal(
+                    here!("xmlSecKeyDataIdsRegisterDisabled"),
+                    (*id).name.cast(),
+                    c"xmlSecPtrListAdd(&xmlSecAllKeyDataIds)",
+                );
+                return -1;
+            }
+        }
+        0
     })
 }
 
@@ -251,24 +297,65 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataIdsRegisterDisabled(
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecKeyDataIdsRegisterDefault() -> c_int {
     contain(-1, || {
-        let enabled = [
-            &raw const NAME,
-            &raw const RETRIEVAL_METHOD,
-            &raw const KEY_INFO_REFERENCE,
-            &raw const ENCRYPTED_KEY,
-            &raw const AGREEMENT_METHOD,
-            &raw const DERIVED_KEY,
+        // libxmlsec1's order, with the step each failure names; the
+        // unterminated parentheses are libxmlsec1's own text.
+        let registrations: [(*const XmlSecKeyDataKlass, bool, &CStr); 8] = [
+            (
+                &raw const NAME,
+                true,
+                c"xmlSecKeyDataIdsRegister(xmlSecKeyDataNameId)",
+            ),
+            (
+                &raw const RETRIEVAL_METHOD,
+                true,
+                c"xmlSecKeyDataIdsRegister(xmlSecKeyDataRetrievalMethodId",
+            ),
+            (
+                &raw const KEY_INFO_REFERENCE,
+                true,
+                c"xmlSecKeyDataIdsRegister(xmlSecKeyDataKeyInfoReferenceId",
+            ),
+            (
+                &raw const ENCRYPTED_KEY,
+                true,
+                c"xmlSecKeyDataIdsRegister(xmlSecKeyDataEncryptedKeyId)",
+            ),
+            (
+                &raw const AGREEMENT_METHOD,
+                true,
+                c"xmlSecKeyDataIdsRegister(xmlSecKeyDataAgreementMethodId)",
+            ),
+            (
+                &raw const DERIVED_KEY,
+                true,
+                c"xmlSecKeyDataIdsRegister(xmlSecKeyDataDerivedKeyId)",
+            ),
+            (
+                &raw const ENCAPSULATION_MECHANISM,
+                false,
+                c"xmlSecKeyDataIdsRegister(xmlSecKeyDataEncapsulationMechanismId)",
+            ),
+            (
+                &raw const VALUE,
+                false,
+                c"xmlSecKeyDataIdsRegister(xmlSecKeyDataValueId)",
+            ),
         ];
-        // SAFETY: registering static klasses.
-        unsafe {
-            for id in enabled {
-                if xmlSecKeyDataIdsRegister(id) < 0 {
-                    return -1;
+        for (id, enabled, step) in registrations {
+            // SAFETY: registering static klasses.
+            let registered = unsafe {
+                if enabled {
+                    xmlSecKeyDataIdsRegister(id)
+                } else {
+                    xmlSecKeyDataIdsRegisterDisabled(id)
                 }
-            }
-            if xmlSecKeyDataIdsRegisterDisabled(&raw const ENCAPSULATION_MECHANISM) < 0
-                || xmlSecKeyDataIdsRegisterDisabled(&raw const VALUE) < 0
-            {
+            };
+            if registered < 0 {
+                errors::internal(
+                    here!("xmlSecKeyDataIdsRegisterDefault"),
+                    std::ptr::null(),
+                    step,
+                );
                 return -1;
             }
         }
@@ -288,19 +375,34 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataCreate(
     id: *const XmlSecKeyDataKlass,
 ) -> *mut XmlSecKeyData {
     contain(std::ptr::null_mut(), || {
-        // SAFETY: by the caller's contract; the object is the klass's size.
+        let null = std::ptr::null_mut();
+        check!(!id.is_null(), "xmlSecKeyDataCreate", c"id != NULL", null);
+        // SAFETY: a klass by the caller's contract.
+        let klass = unsafe { &*id };
+        check!(
+            klass.klass_size >= size_of::<XmlSecKeyDataKlass>(),
+            "xmlSecKeyDataCreate",
+            c"id->klassSize >= sizeof(xmlSecKeyDataKlass)",
+            null
+        );
+        check!(
+            klass.obj_size >= size_of::<XmlSecKeyData>(),
+            "xmlSecKeyDataCreate",
+            c"id->objSize >= sizeof(xmlSecKeyData)",
+            null
+        );
+        check!(
+            !klass.name.is_null(),
+            "xmlSecKeyDataCreate",
+            c"id->name != NULL",
+            null
+        );
+        let here = here!("xmlSecKeyDataCreate");
+        // SAFETY: the object is the klass's size.
         unsafe {
-            let Some(klass) = id.as_ref() else {
-                return std::ptr::null_mut();
-            };
-            if klass.klass_size < size_of::<XmlSecKeyDataKlass>()
-                || klass.obj_size < size_of::<XmlSecKeyData>()
-                || klass.name.is_null()
-            {
-                return std::ptr::null_mut();
-            }
             let data = malloc(klass.obj_size).cast::<XmlSecKeyData>();
             if data.is_null() {
+                errors::malloc_failed(here, name_of(klass), klass.obj_size);
                 return data;
             }
             data.cast::<u8>().write_bytes(0, klass.obj_size);
@@ -308,8 +410,9 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataCreate(
             if let Some(initialize) = klass.initialize
                 && initialize(data) < 0
             {
+                errors::internal(here, name_of(klass), c"id->initialize");
                 xmlSecKeyDataDestroy(data);
-                return std::ptr::null_mut();
+                return null;
             }
             data
         }
@@ -326,18 +429,27 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataDuplicate(
     data: *mut XmlSecKeyData,
 ) -> *mut XmlSecKeyData {
     contain(std::ptr::null_mut(), || {
+        let null = std::ptr::null_mut();
+        let klass = key_data_or!(data, "xmlSecKeyDataDuplicate", null);
+        let Some(duplicate) = klass.duplicate else {
+            errors::assertion(
+                here!("xmlSecKeyDataDuplicate"),
+                c"data->id->duplicate != NULL",
+            );
+            return null;
+        };
+        let here = here!("xmlSecKeyDataDuplicate");
         // SAFETY: by the caller's contract.
         unsafe {
-            let Some(duplicate) = valid(data).and_then(|klass| klass.duplicate) else {
-                return std::ptr::null_mut();
-            };
             let copy = xmlSecKeyDataCreate((*data).id);
             if copy.is_null() {
+                errors::internal(here, name_of(klass), c"xmlSecKeyDataCreate");
                 return copy;
             }
             if duplicate(copy, data) < 0 {
+                errors::internal(here, name_of(klass), c"id->duplicate");
                 xmlSecKeyDataDestroy(copy);
-                return std::ptr::null_mut();
+                return null;
             }
             copy
         }
@@ -351,13 +463,12 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataDuplicate(
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecKeyDataDestroy(data: *mut XmlSecKeyData) {
     contain((), || {
+        let klass = key_data_or!(data, "xmlSecKeyDataDestroy");
+        let size = klass.obj_size;
+        let finalize = klass.finalize;
         // SAFETY: by the caller's contract.
         unsafe {
-            let Some(klass) = valid(data) else {
-                return;
-            };
-            let size = klass.obj_size;
-            if let Some(finalize) = klass.finalize {
+            if let Some(finalize) = finalize {
                 finalize(data);
             }
             data.cast::<u8>().write_bytes(0, size);
@@ -377,13 +488,25 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataGenerate(
     kind: c_uint,
 ) -> c_int {
     contain(-1, || {
+        let klass = key_data_or!(data, "xmlSecKeyDataGenerate", -1);
+        let Some(generate) = klass.generate else {
+            errors::assertion(
+                here!("xmlSecKeyDataGenerate"),
+                c"data->id->generate != NULL",
+            );
+            return -1;
+        };
         // SAFETY: by the caller's contract.
-        unsafe {
-            match valid(data).and_then(|klass| klass.generate) {
-                Some(generate) if generate(data, size_bits, kind) >= 0 => 0,
-                _ => -1,
-            }
+        if unsafe { generate(data, size_bits, kind) } < 0 {
+            errors::internal_with(
+                here!("xmlSecKeyDataGenerate"),
+                name_of(klass),
+                c"id->generate",
+                &format!("size={size_bits}"),
+            );
+            return -1;
         }
+        0
     })
 }
 
@@ -394,12 +517,11 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataGenerate(
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecKeyDataGetType(data: *mut XmlSecKeyData) -> c_uint {
     contain(TYPE_UNKNOWN, || {
-        // SAFETY: by the caller's contract.
-        unsafe {
-            match valid(data).and_then(|klass| klass.get_type) {
-                Some(get_type) => get_type(data),
-                None => TYPE_UNKNOWN,
-            }
+        let klass = key_data_or!(data, "xmlSecKeyDataGetType", TYPE_UNKNOWN);
+        match klass.get_type {
+            // SAFETY: by the caller's contract.
+            Some(get_type) => unsafe { get_type(data) },
+            None => TYPE_UNKNOWN,
         }
     })
 }
@@ -411,12 +533,11 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataGetType(data: *mut XmlSecKeyData) -
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecKeyDataGetSize(data: *mut XmlSecKeyData) -> usize {
     contain(0, || {
-        // SAFETY: by the caller's contract.
-        unsafe {
-            match valid(data).and_then(|klass| klass.get_size) {
-                Some(get_size) => get_size(data),
-                None => 0,
-            }
+        let klass = key_data_or!(data, "xmlSecKeyDataGetSize", 0);
+        match klass.get_size {
+            // SAFETY: by the caller's contract.
+            Some(get_size) => unsafe { get_size(data) },
+            None => 0,
         }
     })
 }
@@ -424,10 +545,17 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataGetSize(data: *mut XmlSecKeyData) -
 /// `xmlSecKeyDataGetIdentifier`: deprecated, always null.
 ///
 /// # Safety
-/// Callable at any time.
+/// `data` is null or a key-data object.
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn xmlSecKeyDataGetIdentifier(_data: *mut XmlSecKeyData) -> *const u8 {
-    std::ptr::null()
+pub(crate) unsafe extern "C" fn xmlSecKeyDataGetIdentifier(data: *mut XmlSecKeyData) -> *const u8 {
+    contain(std::ptr::null(), || {
+        key_data_or!(data, "xmlSecKeyDataGetIdentifier", std::ptr::null());
+        errors::not_implemented(
+            here!("xmlSecKeyDataGetIdentifier"),
+            "Key data identifier method is deprecated",
+        );
+        std::ptr::null()
+    })
 }
 
 /// `xmlSecKeyDataDebugDump`.
@@ -440,14 +568,21 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataDebugDump(
     output: *mut c_void,
 ) {
     contain((), || {
+        let klass = key_data_or!(data, "xmlSecKeyDataDebugDump");
+        let Some(dump) = klass.debug_dump else {
+            errors::assertion(
+                here!("xmlSecKeyDataDebugDump"),
+                c"data->id->debugDump != NULL",
+            );
+            return;
+        };
+        check!(
+            !output.is_null(),
+            "xmlSecKeyDataDebugDump",
+            c"output != NULL"
+        );
         // SAFETY: by the caller's contract.
-        unsafe {
-            if let Some(dump) = valid(data).and_then(|klass| klass.debug_dump)
-                && !output.is_null()
-            {
-                dump(data, output);
-            }
-        }
+        unsafe { dump(data, output) };
     });
 }
 
@@ -461,14 +596,21 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataDebugXmlDump(
     output: *mut c_void,
 ) {
     contain((), || {
+        let klass = key_data_or!(data, "xmlSecKeyDataDebugXmlDump");
+        let Some(dump) = klass.debug_xml_dump else {
+            errors::assertion(
+                here!("xmlSecKeyDataDebugXmlDump"),
+                c"data->id->debugXmlDump != NULL",
+            );
+            return;
+        };
+        check!(
+            !output.is_null(),
+            "xmlSecKeyDataDebugXmlDump",
+            c"output != NULL"
+        );
         // SAFETY: by the caller's contract.
-        unsafe {
-            if let Some(dump) = valid(data).and_then(|klass| klass.debug_xml_dump)
-                && !output.is_null()
-            {
-                dump(data, output);
-            }
-        }
+        unsafe { dump(data, output) };
     });
 }
 
@@ -485,13 +627,16 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataXmlRead(
     ctx: Opaque,
 ) -> c_int {
     contain(-1, || {
+        check!(!id.is_null(), "xmlSecKeyDataXmlRead", c"id != NULL", -1);
+        // SAFETY: a klass by the caller's contract.
+        let Some(read) = (unsafe { (*id).xml_read }) else {
+            errors::assertion(here!("xmlSecKeyDataXmlRead"), c"id->xmlRead != NULL");
+            return -1;
+        };
+        check!(!key.is_null(), "xmlSecKeyDataXmlRead", c"key != NULL", -1);
+        check!(!node.is_null(), "xmlSecKeyDataXmlRead", c"node != NULL", -1);
         // SAFETY: by the caller's contract.
-        unsafe {
-            match id.as_ref().and_then(|klass| klass.xml_read) {
-                Some(read) if !key.is_null() && !node.is_null() => read(id, key, node, ctx),
-                _ => -1,
-            }
-        }
+        unsafe { read(id, key, node, ctx) }
     })
 }
 
@@ -507,13 +652,21 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataXmlWrite(
     ctx: Opaque,
 ) -> c_int {
     contain(-1, || {
+        check!(!id.is_null(), "xmlSecKeyDataXmlWrite", c"id != NULL", -1);
+        // SAFETY: a klass by the caller's contract.
+        let Some(write) = (unsafe { (*id).xml_write }) else {
+            errors::assertion(here!("xmlSecKeyDataXmlWrite"), c"id->xmlWrite != NULL");
+            return -1;
+        };
+        check!(!key.is_null(), "xmlSecKeyDataXmlWrite", c"key != NULL", -1);
+        check!(
+            !node.is_null(),
+            "xmlSecKeyDataXmlWrite",
+            c"node != NULL",
+            -1
+        );
         // SAFETY: by the caller's contract.
-        unsafe {
-            match id.as_ref().and_then(|klass| klass.xml_write) {
-                Some(write) if !key.is_null() && !node.is_null() => write(id, key, node, ctx),
-                _ => -1,
-            }
-        }
+        unsafe { write(id, key, node, ctx) }
     })
 }
 
@@ -531,13 +684,16 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataBinRead(
     ctx: Opaque,
 ) -> c_int {
     contain(-1, || {
+        check!(!id.is_null(), "xmlSecKeyDataBinRead", c"id != NULL", -1);
+        // SAFETY: a klass by the caller's contract.
+        let Some(read) = (unsafe { (*id).bin_read }) else {
+            errors::assertion(here!("xmlSecKeyDataBinRead"), c"id->binRead != NULL");
+            return -1;
+        };
+        check!(!key.is_null(), "xmlSecKeyDataBinRead", c"key != NULL", -1);
+        check!(!buf.is_null(), "xmlSecKeyDataBinRead", c"buf != NULL", -1);
         // SAFETY: by the caller's contract.
-        unsafe {
-            match id.as_ref().and_then(|klass| klass.bin_read) {
-                Some(read) if !key.is_null() && !buf.is_null() => read(id, key, buf, size, ctx),
-                _ => -1,
-            }
-        }
+        unsafe { read(id, key, buf, size, ctx) }
     })
 }
 
@@ -555,34 +711,37 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataBinWrite(
     ctx: Opaque,
 ) -> c_int {
     contain(-1, || {
+        check!(!id.is_null(), "xmlSecKeyDataBinWrite", c"id != NULL", -1);
+        // SAFETY: a klass by the caller's contract.
+        let Some(write) = (unsafe { (*id).bin_write }) else {
+            errors::assertion(here!("xmlSecKeyDataBinWrite"), c"id->binWrite != NULL");
+            return -1;
+        };
+        check!(!key.is_null(), "xmlSecKeyDataBinWrite", c"key != NULL", -1);
+        check!(!buf.is_null(), "xmlSecKeyDataBinWrite", c"buf != NULL", -1);
         // SAFETY: by the caller's contract.
-        unsafe {
-            match id.as_ref().and_then(|klass| klass.bin_write) {
-                Some(write) if !key.is_null() && !buf.is_null() => write(id, key, buf, size, ctx),
-                _ => -1,
-            }
-        }
+        unsafe { write(id, key, buf, size, ctx) }
     })
 }
 
 // ----------------------------------------------------------------------------
 // Binary key data
 
-/// The value buffer of a binary key-data object.
-///
-/// # Safety
-/// `data` is null or a key-data object.
-unsafe fn binary_buffer(data: *mut XmlSecKeyData) -> *mut XmlSecBuffer {
-    // SAFETY: a valid object at least the binary layout's size starts with
-    // that layout.
-    unsafe {
-        match valid(data) {
-            Some(klass) if klass.obj_size >= size_of::<XmlSecKeyDataBinary>() => {
-                &raw mut (*data.cast::<XmlSecKeyDataBinary>()).buffer
-            }
-            _ => std::ptr::null_mut(),
-        }
-    }
+/// The value buffer of the binary key-data object `$data`, after
+/// libxmlsec1's assertions inside the entry point `$func`, or `$ret`.
+macro_rules! binary_buffer_or {
+    ($data:expr, $func:literal, $ret:expr) => {{
+        let klass = key_data_or!($data, $func, $ret);
+        check!(
+            klass.obj_size >= size_of::<XmlSecKeyDataBinary>(),
+            $func,
+            c"xmlSecKeyDataCheckSize(data, xmlSecKeyDataBinarySize)",
+            $ret
+        );
+        // SAFETY: a valid object at least the binary layout's size starts
+        // with that layout.
+        unsafe { &raw mut (*$data.cast::<XmlSecKeyDataBinary>()).buffer }
+    }};
 }
 
 /// `xmlSecKeyDataBinaryValueGetSize`: the value's size in bits.
@@ -592,16 +751,11 @@ unsafe fn binary_buffer(data: *mut XmlSecKeyData) -> *mut XmlSecBuffer {
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecKeyDataBinaryValueGetSize(data: *mut XmlSecKeyData) -> usize {
     contain(0, || {
-        // SAFETY: by the caller's contract.
-        unsafe {
-            let buffer = binary_buffer(data);
-            if buffer.is_null() {
-                return 0;
-            }
-            // libxmlsec1 computes `8 * size` in `xmlSecSize`, which wraps for
-            // a value of more than `SIZE_MAX / 8` bytes; the same number here.
-            xmlSecBufferGetSize(buffer).wrapping_mul(8)
-        }
+        let buffer = binary_buffer_or!(data, "xmlSecKeyDataBinaryValueGetSize", 0);
+        // libxmlsec1 computes `8 * size` in `xmlSecSize`, which wraps for a
+        // value of more than `SIZE_MAX / 8` bytes; the same number here.
+        // SAFETY: the object's value buffer.
+        unsafe { xmlSecBufferGetSize(buffer) }.wrapping_mul(8)
     })
 }
 
@@ -613,8 +767,13 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataBinaryValueGetSize(data: *mut XmlSe
 pub(crate) unsafe extern "C" fn xmlSecKeyDataBinaryValueGetBuffer(
     data: *mut XmlSecKeyData,
 ) -> *mut XmlSecBuffer {
-    // SAFETY: by the caller's contract.
-    contain(std::ptr::null_mut(), || unsafe { binary_buffer(data) })
+    contain(std::ptr::null_mut(), || {
+        binary_buffer_or!(
+            data,
+            "xmlSecKeyDataBinaryValueGetBuffer",
+            std::ptr::null_mut()
+        )
+    })
 }
 
 /// `xmlSecKeyDataBinaryValueSetBuffer`: replaces the value with `size`
@@ -629,14 +788,21 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataBinaryValueSetBuffer(
     size: usize,
 ) -> c_int {
     contain(-1, || {
-        // SAFETY: by the caller's contract.
-        unsafe {
-            let buffer = binary_buffer(data);
-            if buffer.is_null() || buf.is_null() || size == 0 {
-                return -1;
-            }
-            xmlSecBufferSetData(buffer, buf, size)
-        }
+        let buffer = binary_buffer_or!(data, "xmlSecKeyDataBinaryValueSetBuffer", -1);
+        check!(
+            !buf.is_null(),
+            "xmlSecKeyDataBinaryValueSetBuffer",
+            c"buf != NULL",
+            -1
+        );
+        check!(
+            size > 0,
+            "xmlSecKeyDataBinaryValueSetBuffer",
+            c"bufSize > 0",
+            -1
+        );
+        // SAFETY: the object's value buffer; `buf` holds `size` bytes.
+        unsafe { xmlSecBufferSetData(buffer, buf, size) }
     })
 }
 
@@ -719,24 +885,28 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataStorePtrListGetKlass() -> *const Xm
     &raw const STORE_LIST_KLASS
 }
 
-/// The klasses of a key-data klass list, or `None` for another list.
+/// The items of a key-data klass list; otherwise reports libxmlsec1's
+/// failed list check from the entry point at `here`.
 ///
 /// # Safety
 /// `list` is null or a list.
-unsafe fn id_list<'a>(list: *mut XmlSecPtrList) -> Option<Vec<&'a XmlSecKeyDataKlass>> {
-    // SAFETY: by the caller's contract; a klass list holds klasses.
-    unsafe {
-        if !std::ptr::eq(list.as_ref()?.id, &raw const KEY_DATA_ID_LIST_KLASS) {
-            return None;
-        }
-        (0..xmlSecPtrListGetSize(list))
-            .map(|pos| {
-                xmlSecPtrListGetItem(list, pos)
-                    .cast::<XmlSecKeyDataKlass>()
-                    .as_ref()
-            })
-            .collect()
+unsafe fn klass_items<'a>(
+    list: *mut XmlSecPtrList,
+    here: errors::Here,
+) -> Option<&'a [*const XmlSecKeyDataKlass]> {
+    // SAFETY: by the caller's contract.
+    let Some(owner) = (unsafe { list.as_ref() })
+        .filter(|owner| std::ptr::eq(owner.id, &raw const KEY_DATA_ID_LIST_KLASS))
+    else {
+        errors::assertion(here, c"xmlSecPtrListCheckId(list, xmlSecKeyDataIdListId)");
+        return None;
+    };
+    if owner.used == 0 || owner.data.is_null() {
+        return Some(&[]);
     }
+    // SAFETY: a list's first `used` items are its entries; a klass list's
+    // entries are klass pointers.
+    Some(unsafe { std::slice::from_raw_parts(owner.data.cast(), owner.used) })
 }
 
 /// `xmlSecKeyDataIdListFind`: 1 when `id` is listed, 0 otherwise.
@@ -750,30 +920,59 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataIdListFind(
 ) -> c_int {
     contain(0, || {
         // SAFETY: by the caller's contract.
-        let Some(klasses) = (unsafe { id_list(list) }) else {
+        let Some(items) = (unsafe { klass_items(list, here!("xmlSecKeyDataIdListFind")) }) else {
             return 0;
         };
-        c_int::from(!id.is_null() && klasses.iter().any(|klass| std::ptr::eq(*klass, id)))
+        check!(
+            !id.is_null(),
+            "xmlSecKeyDataIdListFind",
+            c"dataId != NULL",
+            0
+        );
+        c_int::from(items.iter().any(|item| std::ptr::eq(*item, id)))
     })
 }
 
-/// The first listed klass usable for `usage` that `matches`, or null.
+/// The first listed klass usable for `usage` that `matches`, or null; a
+/// null entry reached first is reported from the entry point at `here`.
 ///
 /// # Safety
-/// `list` is null or a list.
+/// `items` are null or klasses.
 unsafe fn find(
-    list: *mut XmlSecPtrList,
+    items: &[*const XmlSecKeyDataKlass],
     usage: c_uint,
     matches: impl Fn(&XmlSecKeyDataKlass) -> bool,
+    here: errors::Here,
 ) -> *const XmlSecKeyDataKlass {
-    // SAFETY: by the caller's contract.
-    let Some(klasses) = (unsafe { id_list(list) }) else {
-        return std::ptr::null();
-    };
-    klasses
-        .into_iter()
-        .find(|klass| usage & klass.usage != 0 && matches(klass))
-        .map_or(std::ptr::null(), std::ptr::from_ref)
+    for &item in items {
+        // SAFETY: by the caller's contract.
+        let Some(klass) = (unsafe { item.as_ref() }) else {
+            errors::assertion(here, c"dataId != xmlSecKeyDataIdUnknown");
+            return std::ptr::null();
+        };
+        if usage & klass.usage != 0 && matches(klass) {
+            return item;
+        }
+    }
+    std::ptr::null()
+}
+
+/// The klass of `$list` usable for `$usage` whose `$key` field equals the
+/// required `$value` (named `$text` in libxmlsec1's assertion), searched for
+/// the entry point `$func`.
+macro_rules! find_by {
+    ($list:expr, $value:expr, $usage:expr, $func:literal, $text:literal, $matches:expr) => {{
+        let null = std::ptr::null();
+        let here = here!($func);
+        // SAFETY: by the caller's contract.
+        let Some(items) = (unsafe { klass_items($list, here) }) else {
+            return null;
+        };
+        check!(!$value.is_null(), $func, $text, null);
+        let matches = $matches;
+        // SAFETY: a klass list holds klasses.
+        unsafe { find(items, $usage, matches, here) }
+    }};
 }
 
 /// `xmlSecKeyDataIdListFindByNode`: the klass of a `KeyInfo` child.
@@ -788,17 +987,21 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataIdListFindByNode(
     usage: c_uint,
 ) -> *const XmlSecKeyDataKlass {
     contain(std::ptr::null(), || {
-        if node_name.is_null() {
-            return std::ptr::null();
-        }
-        // SAFETY: by the caller's contract; libxml2 compares null equal to
-        // null only.
-        unsafe {
-            find(list, usage, |klass| {
-                xmlStrEqual(node_name, klass.data_node_name) != 0
-                    && xmlStrEqual(node_ns, klass.data_node_ns) != 0
-            })
-        }
+        find_by!(
+            list,
+            node_name,
+            usage,
+            "xmlSecKeyDataIdListFindByNode",
+            c"nodeName != NULL",
+            |klass: &XmlSecKeyDataKlass| {
+                // SAFETY: the names are null or NUL-terminated; libxml2
+                // compares null equal to null only.
+                unsafe {
+                    xmlStrEqual(node_name, klass.data_node_name) != 0
+                        && xmlStrEqual(node_ns, klass.data_node_ns) != 0
+                }
+            }
+        )
     })
 }
 
@@ -813,15 +1016,17 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataIdListFindByHref(
     usage: c_uint,
 ) -> *const XmlSecKeyDataKlass {
     contain(std::ptr::null(), || {
-        if href.is_null() {
-            return std::ptr::null();
-        }
-        // SAFETY: by the caller's contract.
-        unsafe {
-            find(list, usage, |klass| {
-                !klass.href.is_null() && xmlStrEqual(href, klass.href) != 0
-            })
-        }
+        find_by!(
+            list,
+            href,
+            usage,
+            "xmlSecKeyDataIdListFindByHref",
+            c"href != NULL",
+            |klass: &XmlSecKeyDataKlass| {
+                // SAFETY: the hrefs are NUL-terminated.
+                !klass.href.is_null() && unsafe { xmlStrEqual(href, klass.href) } != 0
+            }
+        )
     })
 }
 
@@ -836,16 +1041,44 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataIdListFindByName(
     usage: c_uint,
 ) -> *const XmlSecKeyDataKlass {
     contain(std::ptr::null(), || {
-        if name.is_null() {
-            return std::ptr::null();
-        }
-        // SAFETY: by the caller's contract.
-        unsafe {
-            find(list, usage, |klass| {
-                !klass.name.is_null() && xmlStrEqual(name, klass.name) != 0
-            })
-        }
+        find_by!(
+            list,
+            name,
+            usage,
+            "xmlSecKeyDataIdListFindByName",
+            c"name != NULL",
+            |klass: &XmlSecKeyDataKlass| {
+                // SAFETY: the names are NUL-terminated.
+                !klass.name.is_null() && unsafe { xmlStrEqual(name, klass.name) } != 0
+            }
+        )
     })
+}
+
+/// The names of `items` for a dump, each passed to `write`; a null entry or
+/// name stops the dump with libxmlsec1's assertion, from `here`.
+///
+/// # Safety
+/// `items` are null or klasses.
+unsafe fn dump_names(
+    items: &[*const XmlSecKeyDataKlass],
+    here: errors::Here,
+    mut write: impl FnMut(usize, String),
+) -> Option<()> {
+    for (position, &item) in items.iter().enumerate() {
+        // SAFETY: by the caller's contract.
+        let Some(klass) = (unsafe { item.as_ref() }) else {
+            errors::assertion(here, c"dataId != NULL");
+            return None;
+        };
+        if klass.name.is_null() {
+            errors::assertion(here, c"dataId->name != NULL");
+            return None;
+        }
+        // SAFETY: a klass name is NUL-terminated.
+        write(position, unsafe { klass_text(klass.name) });
+    }
+    Some(())
 }
 
 /// `xmlSecKeyDataIdListDebugDump`: the quoted names, comma-separated.
@@ -858,20 +1091,33 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataIdListDebugDump(
     output: *mut c_void,
 ) {
     contain((), || {
+        let here = here!("xmlSecKeyDataIdListDebugDump");
         // SAFETY: by the caller's contract.
-        let Some(klasses) = (unsafe { id_list(list) }) else {
+        let Some(items) = (unsafe { klass_items(list, here) }) else {
             return;
         };
-        if output.is_null() {
-            return;
+        check!(
+            !output.is_null(),
+            "xmlSecKeyDataIdListDebugDump",
+            c"output != NULL"
+        );
+        let mut text = String::new();
+        // SAFETY: a klass list holds klasses.
+        let complete = unsafe {
+            dump_names(items, here, |position, name| {
+                if position > 0 {
+                    text.push(',');
+                }
+                text.push('"');
+                text.push_str(&name);
+                text.push('"');
+            })
+        };
+        if complete.is_some() {
+            text.push('\n');
         }
-        let names: Vec<String> = klasses
-            .iter()
-            // SAFETY: klass names are NUL-terminated.
-            .map(|klass| format!("\"{}\"", unsafe { klass_text(klass.name) }))
-            .collect();
         // SAFETY: `output` is a live stream.
-        unsafe { write_stream(output, &format!("{}\n", names.join(","))) };
+        unsafe { write_stream(output, &text) };
     });
 }
 
@@ -885,22 +1131,28 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataIdListDebugXmlDump(
     output: *mut c_void,
 ) {
     contain((), || {
+        let here = here!("xmlSecKeyDataIdListDebugXmlDump");
         // SAFETY: by the caller's contract.
-        let Some(klasses) = (unsafe { id_list(list) }) else {
+        let Some(items) = (unsafe { klass_items(list, here) }) else {
             return;
         };
-        if output.is_null() {
-            return;
-        }
+        check!(
+            !output.is_null(),
+            "xmlSecKeyDataIdListDebugXmlDump",
+            c"output != NULL"
+        );
         let mut text = String::from("<KeyDataIdsList>\n");
-        for klass in klasses {
-            // SAFETY: klass names are NUL-terminated.
-            let name = xml_text(&unsafe { klass_text(klass.name) });
-            text.push_str("<DataId name=\"");
-            text.push_str(&name);
-            text.push_str("\"/>");
+        // SAFETY: a klass list holds klasses.
+        let complete = unsafe {
+            dump_names(items, here, |_, name| {
+                text.push_str("<DataId name=\"");
+                text.push_str(&xml_text(&name));
+                text.push_str("\"/>");
+            })
+        };
+        if complete.is_some() {
+            text.push_str("</KeyDataIdsList>\n");
         }
-        text.push_str("</KeyDataIdsList>\n");
         // SAFETY: `output` is a live stream.
         unsafe { write_stream(output, &text) };
     });
@@ -919,16 +1171,28 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataStoreCreate(
     id: *const XmlSecKeyDataStoreKlass,
 ) -> *mut XmlSecKeyDataStore {
     contain(std::ptr::null_mut(), || {
-        // SAFETY: by the caller's contract; the object is the klass's size.
+        let null = std::ptr::null_mut();
+        check!(
+            !id.is_null(),
+            "xmlSecKeyDataStoreCreate",
+            c"id != NULL",
+            null
+        );
+        // SAFETY: a store klass by the caller's contract.
+        let klass = unsafe { &*id };
+        check!(
+            klass.obj_size > 0,
+            "xmlSecKeyDataStoreCreate",
+            c"id->objSize > 0",
+            null
+        );
+        let here = here!("xmlSecKeyDataStoreCreate");
+        let name = klass.name.cast();
+        // SAFETY: the object is the klass's size.
         unsafe {
-            let Some(klass) = id.as_ref() else {
-                return std::ptr::null_mut();
-            };
-            if klass.obj_size == 0 {
-                return std::ptr::null_mut();
-            }
             let store = malloc(klass.obj_size).cast::<XmlSecKeyDataStore>();
             if store.is_null() {
+                errors::malloc_failed(here, name, klass.obj_size);
                 return store;
             }
             store.cast::<u8>().write_bytes(0, klass.obj_size);
@@ -936,8 +1200,9 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataStoreCreate(
             if let Some(initialize) = klass.initialize
                 && initialize(store) < 0
             {
+                errors::internal(here, name, c"id->initialize");
                 xmlSecKeyDataStoreDestroy(store);
-                return std::ptr::null_mut();
+                return null;
             }
             store
         }
@@ -952,14 +1217,21 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataStoreCreate(
 pub(crate) unsafe extern "C" fn xmlSecKeyDataStoreDestroy(store: *mut XmlSecKeyDataStore) {
     contain((), || {
         // SAFETY: by the caller's contract.
+        let klass = unsafe { store.as_ref().and_then(|store| store.id.as_ref()) };
+        check!(
+            klass.is_some(),
+            "xmlSecKeyDataStoreDestroy",
+            c"xmlSecKeyDataStoreIsValid(store)"
+        );
+        let Some(klass) = klass else { return };
+        let size = klass.obj_size;
+        check!(
+            size > 0,
+            "xmlSecKeyDataStoreDestroy",
+            c"store->id->objSize > 0"
+        );
+        // SAFETY: a store of the klass's size.
         unsafe {
-            let Some(klass) = store.as_ref().and_then(|store| store.id.as_ref()) else {
-                return;
-            };
-            let size = klass.obj_size;
-            if size == 0 {
-                return;
-            }
             if let Some(finalize) = klass.finalize {
                 finalize(store);
             }

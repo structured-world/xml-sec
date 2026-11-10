@@ -118,6 +118,18 @@ fn allocation_growth_follows_libxmlsec1() {
     assert_eq!(grown(ALLOC_MODE_EXACT, usize::MAX - 7, 0), None);
 }
 
+/// Asserts that the calling test runs in a process of its own, as cargo
+/// nextest runs every test. A test that sets and observes process-global
+/// state (report callbacks, registries, the input callback list) would race
+/// the other tests of a shared process instead.
+pub(super) fn own_process() {
+    assert_eq!(
+        std::env::var("NEXTEST_EXECUTION_MODE").as_deref(),
+        Ok("process-per-test"),
+        "this test sets process-global state and needs a process of its own: run it with cargo nextest"
+    );
+}
+
 /// A panic inside an exported function's body becomes its failure value
 /// instead of unwinding across the C boundary, which is undefined behavior.
 #[test]

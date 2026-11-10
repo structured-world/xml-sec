@@ -11,7 +11,10 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 pub(crate) mod base64;
 pub(crate) mod buffer;
+pub(crate) mod crypto;
+pub(crate) mod errors;
 pub(crate) mod keysdata;
+pub(crate) mod library;
 pub(crate) mod list;
 pub(crate) mod nodeset;
 pub(crate) mod parser;
@@ -93,8 +96,25 @@ pub(crate) fn grown(alloc_mode: c_int, size: usize, initial: usize) -> Option<us
     Some(wanted.max(initial))
 }
 
-/// Runs an exported function's body; a panic returns `fallback` instead of
-/// unwinding into C.
+/// Runs an exported function's body; a panic is reported as an internal
+/// error and returns `fallback` instead of unwinding into C.
 fn contain<T>(fallback: T, body: impl FnOnce() -> T) -> T {
-    catch_unwind(AssertUnwindSafe(body)).unwrap_or(fallback)
+    match catch_unwind(AssertUnwindSafe(body)) {
+        Ok(value) => value,
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("panic");
+            errors::report(
+                errors::here!("contain"),
+                std::ptr::null(),
+                c"panic".as_ptr(),
+                errors::R_XMLSEC_FAILED,
+                message,
+            );
+            fallback
+        }
+    }
 }

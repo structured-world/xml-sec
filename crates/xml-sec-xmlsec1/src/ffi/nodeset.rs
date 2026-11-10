@@ -14,6 +14,7 @@ use xml_sec_libxml2::ffi::{
     XmlNs,
 };
 
+use super::errors::{self, check, here};
 use super::tree::{
     readable, xmlFreeDoc, xmlOutputBufferWriteString, xmlSearchNs, xmlXPathCmpNodes,
     xmlXPathFreeNodeSet, xmlXPathNodeSetAdd, xmlXPathNodeSetContains, xmlXPathNodeSetCreate,
@@ -164,7 +165,15 @@ unsafe fn member_contains(set: &XmlSecNodeSet, node: *mut XmlNode, parent: *mut 
                 !comment && !listed_or_ancestor(set.nodes, node, parent)
             }
             // libxmlsec1 reports an unsupported type and answers 0.
-            _ => false,
+            kind => {
+                errors::unsupported_enum(
+                    here!("xmlSecNodeSetContains"),
+                    std::ptr::null(),
+                    "node set type",
+                    kind,
+                );
+                false
+            }
         }
     }
 }
@@ -183,6 +192,11 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetCreate(
     contain(std::ptr::null_mut(), || {
         let set = malloc(size_of::<XmlSecNodeSet>()).cast::<XmlSecNodeSet>();
         if set.is_null() {
+            errors::malloc_failed(
+                here!("xmlSecNodeSetCreate"),
+                std::ptr::null(),
+                size_of::<XmlSecNodeSet>(),
+            );
             return set;
         }
         // SAFETY: `set` is a fresh allocation of a node set's size.
@@ -211,6 +225,7 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetCreate(
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecNodeSetDestroy(set: *mut XmlSecNodeSet) {
     contain((), || {
+        check!(!set.is_null(), "xmlSecNodeSetDestroy", c"nset != NULL");
         let mut current = set;
         let mut destroy_doc: *mut XmlDoc = std::ptr::null_mut();
         while !current.is_null() {
@@ -251,10 +266,9 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetDestroy(set: *mut XmlSecNodeSet) {
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecNodeSetDocDestroy(set: *mut XmlSecNodeSet) {
     contain((), || {
-        // SAFETY: the caller passes null or a live node set.
-        if let Some(set) = unsafe { set.as_mut() } {
-            set.destroy_doc = 1;
-        }
+        check!(!set.is_null(), "xmlSecNodeSetDocDestroy", c"nset != NULL",);
+        // SAFETY: the caller passes a live node set.
+        unsafe { (*set).destroy_doc = 1 };
     });
 }
 
@@ -272,13 +286,12 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetContains(
     parent: *mut XmlNode,
 ) -> c_int {
     contain(-1, || {
-        if node.is_null() {
-            return 0;
-        }
+        check!(!node.is_null(), "xmlSecNodeSetContains", c"node != NULL", 0);
         if set.is_null() {
             return 1;
         }
         if !readable() {
+            errors::no_libxml2(here!("xmlSecNodeSetContains"));
             return -1;
         }
         let inside = |member: &XmlSecNodeSet| {
@@ -307,7 +320,16 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetContains(
                         status = true;
                     }
                 }
-                _ => return -1,
+                op => {
+                    errors::report(
+                        here!("xmlSecNodeSetContains"),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        errors::R_INVALID_OPERATION,
+                        &format!("node set operation={op}"),
+                    );
+                    return -1;
+                }
             }
             current = member.next;
             if current == set {
@@ -333,17 +355,29 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetAdd(
     contain(std::ptr::null_mut(), || {
         // SAFETY: the caller passes null or live node sets.
         unsafe {
-            if new_set.is_null() || (*new_set).next != new_set {
-                return std::ptr::null_mut();
-            }
+            check!(
+                !new_set.is_null(),
+                "xmlSecNodeSetAdd",
+                c"newNSet != NULL",
+                std::ptr::null_mut()
+            );
+            check!(
+                (*new_set).next == new_set,
+                "xmlSecNodeSetAdd",
+                c"newNSet->next == newNSet",
+                std::ptr::null_mut()
+            );
             (*new_set).op = op;
             if set.is_null() {
                 return new_set;
             }
             // Every member of a combined set belongs to one document.
-            if (*set).doc != (*new_set).doc {
-                return std::ptr::null_mut();
-            }
+            check!(
+                (*set).doc == (*new_set).doc,
+                "xmlSecNodeSetAdd",
+                c"nset->doc == newNSet->doc",
+                std::ptr::null_mut()
+            );
             (*new_set).next = set;
             (*new_set).prev = (*set).prev;
             (*(*set).prev).next = new_set;
@@ -363,6 +397,10 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetAddList(
     _new_set: *mut XmlSecNodeSet,
     _op: c_int,
 ) -> *mut XmlSecNodeSet {
+    errors::not_implemented(
+        here!("xmlSecNodeSetAddList"),
+        "xmlSecNodeSetAddList is deprecated",
+    );
     std::ptr::null_mut()
 }
 
@@ -379,12 +417,21 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetGetChildren(
     invert: c_int,
 ) -> *mut XmlSecNodeSet {
     contain(std::ptr::null_mut(), || {
-        if doc.is_null() || !readable() {
+        check!(
+            !doc.is_null(),
+            "xmlSecNodeSetGetChildren",
+            c"doc != NULL",
+            std::ptr::null_mut()
+        );
+        let here = here!("xmlSecNodeSetGetChildren");
+        if !readable() {
+            errors::no_libxml2(here);
             return std::ptr::null_mut();
         }
         // SAFETY: libxml2 creates a set holding `parent` (none for null).
         let nodes = unsafe { xmlXPathNodeSetCreate(parent) };
         if nodes.is_null() {
+            errors::xml_failed(here, std::ptr::null(), c"xmlXPathNodeSetCreate");
             return std::ptr::null_mut();
         }
         if parent.is_null() {
@@ -408,6 +455,7 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetGetChildren(
         // SAFETY: `nodes` is ours to give to the new set.
         let set = unsafe { xmlSecNodeSetCreate(doc, nodes, kind) };
         if set.is_null() {
+            errors::internal(here, std::ptr::null(), c"xmlSecNodeSetCreate");
             // SAFETY: the set was not created, so `nodes` is still ours.
             unsafe { xmlXPathFreeNodeSet(nodes) };
         }
@@ -546,14 +594,21 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetWalk(
     data: *mut c_void,
 ) -> c_int {
     contain(-1, || {
+        check!(!set.is_null(), "xmlSecNodeSetWalk", c"nset != NULL", -1);
+        // SAFETY: the caller passes a live node set.
+        let member = unsafe { &*set };
+        check!(
+            !member.doc.is_null(),
+            "xmlSecNodeSetWalk",
+            c"nset->doc != NULL",
+            -1
+        );
         let Some(callback) = walk_func else {
+            errors::assertion(here!("xmlSecNodeSetWalk"), c"walkFunc != NULL");
             return -1;
         };
-        // SAFETY: the caller passes null or a live node set.
-        let Some(member) = (unsafe { set.as_ref() }) else {
-            return -1;
-        };
-        if member.doc.is_null() || !readable() {
+        if !readable() {
+            errors::no_libxml2(here!("xmlSecNodeSetWalk"));
             return -1;
         }
         let walk = Walk {
@@ -579,6 +634,11 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetWalk(
             {
                 for start in seeds {
                     if xmlSecDepthFirstTreeWalk(start, Some(walk_node), walk_data) < 0 {
+                        errors::internal(
+                            here!("xmlSecNodeSetWalk"),
+                            std::ptr::null(),
+                            c"xmlSecNodeSetWalkRecursive",
+                        );
                         return -1;
                     }
                 }
@@ -587,6 +647,11 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetWalk(
             let mut current = (*member.doc).children;
             while !current.is_null() {
                 if xmlSecDepthFirstTreeWalk(current, Some(walk_node), walk_data) < 0 {
+                    errors::internal(
+                        here!("xmlSecNodeSetWalk"),
+                        std::ptr::null(),
+                        c"xmlSecNodeSetWalkRecursive",
+                    );
                     return -1;
                 }
                 current = (*current).next;
@@ -612,6 +677,11 @@ unsafe extern "C" fn dump_text(
             return 0;
         }
         if xmlOutputBufferWriteString(data, (*node).content.cast::<c_char>()) < 0 {
+            errors::xml_failed(
+                here!("xmlSecNodeSetDumpTextNodes"),
+                std::ptr::null(),
+                c"xmlOutputBufferWriteString",
+            );
             return -1;
         }
     }
@@ -630,9 +700,18 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetDumpTextNodes(
     out: *mut c_void,
 ) -> c_int {
     contain(-1, || {
-        if set.is_null() || out.is_null() {
-            return -1;
-        }
+        check!(
+            !set.is_null(),
+            "xmlSecNodeSetDumpTextNodes",
+            c"nset != NULL",
+            -1
+        );
+        check!(
+            !out.is_null(),
+            "xmlSecNodeSetDumpTextNodes",
+            c"out != NULL",
+            -1
+        );
         // SAFETY: as the caller passes.
         unsafe { xmlSecNodeSetWalk(set, Some(dump_text), out) }
     })
@@ -663,11 +742,16 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetDebugDump(
     output: *mut c_void,
 ) {
     contain((), || {
-        // SAFETY: the caller passes null or a live node set.
-        let Some(set) = (unsafe { set.as_ref() }) else {
-            return;
-        };
-        if output.is_null() || !readable() {
+        check!(!set.is_null(), "xmlSecNodeSetDebugDump", c"nset != NULL",);
+        check!(
+            !output.is_null(),
+            "xmlSecNodeSetDebugDump",
+            c"output != NULL",
+        );
+        // SAFETY: the caller passes a live node set.
+        let set = unsafe { &*set };
+        if !readable() {
+            errors::no_libxml2(here!("xmlSecNodeSetDebugDump"));
             return;
         }
         let kind = match set.kind {

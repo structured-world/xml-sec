@@ -20,6 +20,7 @@ pub(crate) use xml_sec_libxml2::ffi::libxml2::{
 use xml_sec_libxml2::ffi::{XmlDoc, XmlParserCtxt};
 
 use super::contain;
+use super::errors::{self, check, here};
 
 #[cfg(test)]
 mod tests;
@@ -177,10 +178,13 @@ pub(crate) unsafe extern "C" fn xmlSecParserSetDefaultOptions(options: c_int) {
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecParsePrepareCtxt(ctxt: ParserCtxt) {
     contain((), || {
-        if !ctxt.is_null() && libxml2::available() {
-            // SAFETY: a live parser context of the loaded libxml2.
-            unsafe { prepare_ctxt(ctxt, options()) };
+        check!(!ctxt.is_null(), "xmlSecParsePrepareCtxt", c"ctxt != NULL",);
+        if !libxml2::available() {
+            errors::no_libxml2(here!("xmlSecParsePrepareCtxt"));
+            return;
         }
+        // SAFETY: a live parser context of the loaded libxml2.
+        unsafe { prepare_ctxt(ctxt, options()) };
     });
 }
 
@@ -208,27 +212,55 @@ unsafe fn finish(ctxt: ParserCtxt, parsed: bool) -> *mut XmlDoc {
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecParseFile(filename: *const c_char) -> *mut XmlDoc {
     contain(std::ptr::null_mut(), || {
-        if filename.is_null() || !libxml2::available() {
+        check!(
+            !filename.is_null(),
+            "xmlSecParseFile",
+            c"filename != NULL",
+            std::ptr::null_mut()
+        );
+        let here = here!("xmlSecParseFile");
+        if !libxml2::available() {
+            errors::no_libxml2(here);
             return std::ptr::null_mut();
         }
         // SAFETY: a NUL-terminated file name; the context is freed on every
         // path. libxml2's file context records the file's directory itself,
         // which libxmlsec1 sets again.
         unsafe {
+            let name = || {
+                format!(
+                    "filename={}",
+                    std::ffi::CStr::from_ptr(filename).to_string_lossy()
+                )
+            };
             xmlInitParser();
             let ctxt = xmlCreateFileParserCtxt(filename);
             if ctxt.is_null() {
+                errors::xml_failed_with(
+                    here,
+                    std::ptr::null(),
+                    c"xmlCreateFileParserCtxt",
+                    &name(),
+                );
                 return std::ptr::null_mut();
             }
             prepare_ctxt(ctxt, options());
-            let parsed = xmlParseDocument(ctxt) >= 0 && well_formed(ctxt);
+            let parsed = if xmlParseDocument(ctxt) < 0 {
+                errors::xml_failed_with(here, std::ptr::null(), c"xmlParseDocument", &name());
+                false
+            } else if !well_formed(ctxt) {
+                errors::internal(here, std::ptr::null(), c"document is not well formed");
+                false
+            } else {
+                true
+            };
             finish(ctxt, parsed)
         }
     })
 }
 
-/// Pushes `size` bytes at `data` into a push parser; nothing to push
-/// succeeds.
+/// Pushes `size` bytes at `data` into a push parser, reporting a failure as
+/// `xmlSecParseMemoryExt`; nothing to push succeeds.
 ///
 /// # Safety
 /// `ctxt` is a live push parser; `data` is null or holds `size` bytes.
@@ -236,11 +268,22 @@ unsafe fn push(ctxt: ParserCtxt, data: *const u8, size: usize) -> bool {
     if data.is_null() || size == 0 {
         return true;
     }
+    let here = here!("xmlSecParseMemoryExt");
     let Ok(len) = c_int::try_from(size) else {
+        errors::size_to_int_impossible(here, size);
         return false;
     };
     // SAFETY: by the caller's contract.
-    unsafe { xmlParseChunk(ctxt, data.cast(), len, 0) == 0 }
+    if unsafe { xmlParseChunk(ctxt, data.cast(), len, 0) } != 0 {
+        errors::xml_failed_with(
+            here,
+            std::ptr::null(),
+            c"xmlParseChunk",
+            &format!("chunkSize={len}"),
+        );
+        return false;
+    }
+    true
 }
 
 /// `xmlSecParseMemoryExt`: the document of the three chunks in sequence.
@@ -257,7 +300,9 @@ pub(crate) unsafe extern "C" fn xmlSecParseMemoryExt(
     postfix_size: usize,
 ) -> *mut XmlDoc {
     contain(std::ptr::null_mut(), || {
+        let here = here!("xmlSecParseMemoryExt");
         if !libxml2::available() {
+            errors::no_libxml2(here);
             return std::ptr::null_mut();
         }
         // SAFETY: the chunks by the caller's contract; the context is freed
@@ -271,13 +316,20 @@ pub(crate) unsafe extern "C" fn xmlSecParseMemoryExt(
                 std::ptr::null(),
             );
             if ctxt.is_null() {
+                errors::xml_failed(here, std::ptr::null(), c"xmlCreatePushParserCtxt");
                 return std::ptr::null_mut();
             }
             prepare_ctxt(ctxt, options());
-            let parsed = push(ctxt, prefix, prefix_size)
+            let mut parsed = push(ctxt, prefix, prefix_size)
                 && push(ctxt, buffer, buffer_size)
-                && push(ctxt, postfix, postfix_size)
-                && xmlParseChunk(ctxt, std::ptr::null(), 0, 1) == 0;
+                && push(ctxt, postfix, postfix_size);
+            if parsed
+                && (xmlParseChunk(ctxt, std::ptr::null(), 0, 1) != 0
+                    || (*ctxt.cast::<XmlParserCtxt>()).my_doc.is_null())
+            {
+                errors::xml_failed(here, std::ptr::null(), c"xmlParseChunk");
+                parsed = false;
+            }
             finish(ctxt, parsed)
         }
     })
@@ -295,10 +347,19 @@ pub(crate) unsafe extern "C" fn xmlSecParseMemory(
     recovery: c_int,
 ) -> *mut XmlDoc {
     contain(std::ptr::null_mut(), || {
+        check!(
+            !buffer.is_null(),
+            "xmlSecParseMemory",
+            c"buffer != NULL",
+            std::ptr::null_mut()
+        );
+        let here = here!("xmlSecParseMemory");
         let Ok(len) = c_int::try_from(size) else {
+            errors::size_to_int_impossible(here, size);
             return std::ptr::null_mut();
         };
-        if buffer.is_null() || !libxml2::available() {
+        if !libxml2::available() {
+            errors::no_libxml2(here);
             return std::ptr::null_mut();
         }
         // SAFETY: `buffer` holds `size` bytes; the context is freed on every
@@ -306,13 +367,22 @@ pub(crate) unsafe extern "C" fn xmlSecParseMemory(
         unsafe {
             let ctxt = xmlCreateMemoryParserCtxt(buffer.cast(), len);
             if ctxt.is_null() {
+                errors::xml_failed(here, std::ptr::null(), c"xmlCreateMemoryParserCtxt");
                 return std::ptr::null_mut();
             }
             prepare_ctxt(ctxt, options());
             // As libxmlsec1: a failed `xmlParseDocument` yields no document
             // even with `recovery`; recovery only keeps a document libxml2
             // parsed without failing that is not well formed.
-            let parsed = xmlParseDocument(ctxt) >= 0 && (well_formed(ctxt) || recovery != 0);
+            let parsed = if xmlParseDocument(ctxt) < 0 {
+                errors::xml_failed(here, std::ptr::null(), c"xmlParseDocument");
+                false
+            } else if !well_formed(ctxt) && recovery == 0 {
+                errors::internal(here, std::ptr::null(), c"document is not well formed");
+                false
+            } else {
+                true
+            };
             finish(ctxt, parsed)
         }
     })

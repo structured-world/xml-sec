@@ -18,7 +18,17 @@ function:
    function, strings and data with `xmlFree`; objects the caller initialized
    are released with `Finalize`.
 4. One object is used by one thread at a time, as in libxmlsec1. The process
-   defaults (`xmlSec*SetDefaultAllocMode`) may be set from any thread.
+   defaults (`xmlSec*SetDefaultAllocMode`) and the report callbacks may be set
+   from any thread.
+5. The process-global lists (the transform and key-data registries, the input
+   callbacks, the loaded crypto libraries) change only during initialization
+   and shutdown, while no operation reads them, as libxmlsec1 requires; the
+   crypto table installed by `xmlSecCryptoDLSetFunctions` outlives its use.
+   `xmlSecInit` and `xmlSecShutdown` serialize against each other, and a
+   second `xmlSecInit` without a shutdown releases the lists it replaces.
+6. Callbacks the caller registers (report, input, klass methods, crypto table
+   methods) are functions of their declared signatures, callable while
+   registered.
 
 ## What the library checks
 
@@ -43,4 +53,7 @@ function:
   `tests/layout.c`); the headers
   equal libxmlsec1's (checked by `xml-sec-tools xmlsec1-headers --check`).
 - No unwinding crosses the boundary: every exported function runs its body
-  under `catch_unwind` and returns its failure value on a panic.
+  under `catch_unwind`, reports a panic as an internal error and returns its
+  failure value.
+- A report callback is called during the call that fails, on the calling
+  thread, and may call the library again.

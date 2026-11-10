@@ -7,7 +7,7 @@
 //! its chunking, final-call and buffer semantics, so a klass written for
 //! libxmlsec1 runs unchanged.
 
-use std::ffi::{c_int, c_uint, c_void};
+use std::ffi::{CStr, c_int, c_uint, c_void};
 
 use xml_sec_libxml2::ffi::XmlNode;
 
@@ -16,9 +16,10 @@ use super::buffer::{
     xmlSecBufferGetSize, xmlSecBufferInitialize, xmlSecBufferRemoveHead, xmlSecBufferSetMaxSize,
     xmlSecBufferSetSize,
 };
+use super::errors::{self, check, here};
 use super::list::{
     XmlSecPtrList, XmlSecPtrListKlass, xmlSecPtrListAdd, xmlSecPtrListFinalize,
-    xmlSecPtrListGetItem, xmlSecPtrListGetSize, xmlSecPtrListInitialize,
+    xmlSecPtrListGetItem, xmlSecPtrListInitialize,
 };
 use super::nodeset::{XmlSecNodeSet, xmlSecNodeSetDestroy};
 use super::tree::xmlStrEqual;
@@ -207,6 +208,74 @@ pub(crate) unsafe fn valid<'a>(
     }
 }
 
+/// The transform and klass of a valid `$transform`, after libxmlsec1's
+/// assertion `$text` (`xmlSecTransformIsValid(...)`) inside the entry point
+/// `$func`, or `$ret` (nothing, without `$ret`).
+macro_rules! valid_or {
+    ($transform:expr, $func:literal) => {{
+        // SAFETY: the caller passes null or a transform.
+        let checked = unsafe { $crate::ffi::transforms::valid($transform) };
+        $crate::ffi::errors::check!(
+            checked.is_some(),
+            $func,
+            c"xmlSecTransformIsValid(transform)"
+        );
+        let Some(checked) = checked else { return };
+        checked
+    }};
+    ($transform:expr, $func:literal, $text:literal, $ret:expr) => {{
+        // SAFETY: the caller passes null or a transform.
+        let checked = unsafe { $crate::ffi::transforms::valid($transform) };
+        $crate::ffi::errors::check!(checked.is_some(), $func, $text, $ret);
+        let Some(checked) = checked else { return $ret };
+        checked
+    }};
+    ($transform:expr, $func:literal, $ret:expr) => {
+        valid_or!(
+            $transform,
+            $func,
+            c"xmlSecTransformIsValid(transform)",
+            $ret
+        )
+    };
+}
+pub(crate) use valid_or;
+
+/// The `$ty` tail of a transform of klass `$klass`, after libxmlsec1's
+/// assertion `$text` (`xmlSecTransformCheckId(...)`) inside the entry point
+/// `$func`, or `$ret` (nothing, without `$ret`).
+macro_rules! context_or {
+    ($transform:expr, $ty:ty, $klass:expr, $func:literal, $text:literal) => {{
+        // SAFETY: the caller passes null or a transform whose tail, for this
+        // klass, holds a `$ty`.
+        let checked = unsafe { $crate::ffi::transforms::context::<$ty>($transform, $klass) };
+        $crate::ffi::errors::check!(checked.is_some(), $func, $text);
+        let Some(checked) = checked else { return };
+        checked
+    }};
+    ($transform:expr, $ty:ty, $klass:expr, $func:literal, $text:literal, $ret:expr) => {{
+        // SAFETY: the caller passes null or a transform whose tail, for this
+        // klass, holds a `$ty`.
+        let checked = unsafe { $crate::ffi::transforms::context::<$ty>($transform, $klass) };
+        $crate::ffi::errors::check!(checked.is_some(), $func, $text, $ret);
+        let Some(checked) = checked else { return $ret };
+        checked
+    }};
+}
+pub(crate) use context_or;
+
+/// The klass method `$method`, after libxmlsec1's assertion `$text` that it
+/// is set, inside the entry point `$func`; returns -1 otherwise.
+macro_rules! method {
+    ($method:expr, $func:literal, $text:literal) => {{
+        let Some(method) = $method else {
+            $crate::ffi::errors::assertion($crate::ffi::errors::here!($func), $text);
+            return -1;
+        };
+        method
+    }};
+}
+
 /// The context in the tail of a transform of klass `klass`, when the object
 /// is large enough to hold it (`xmlSecTransformCheckSize`).
 ///
@@ -277,24 +346,36 @@ pub(crate) unsafe extern "C" fn xmlSecTransformIdListGetKlass() -> *const XmlSec
     &raw const TRANSFORM_ID_LIST_KLASS
 }
 
-/// The klasses of a transform-ids list, or `None` for another list.
+/// The klasses of a transform-ids list; `None`, after libxmlsec1's
+/// assertions reported as the entry point at `here`, for another list or a
+/// null item.
 ///
 /// # Safety
 /// `list` is null or a list.
-unsafe fn id_list<'a>(list: *mut XmlSecPtrList) -> Option<Vec<&'a XmlSecTransformKlass>> {
+unsafe fn id_list<'a>(
+    list: *mut XmlSecPtrList,
+    here: errors::Here,
+) -> Option<Vec<&'a XmlSecTransformKlass>> {
     // SAFETY: by the caller's contract; a transform-ids list holds klasses.
     unsafe {
-        let checked = list.as_ref()?;
-        if !std::ptr::eq(checked.id, &raw const TRANSFORM_ID_LIST_KLASS) {
+        let Some(checked) = list
+            .as_ref()
+            .filter(|checked| std::ptr::eq(checked.id, &raw const TRANSFORM_ID_LIST_KLASS))
+        else {
+            errors::assertion(here, c"xmlSecPtrListCheckId(list, xmlSecTransformIdListId)");
             return None;
-        }
-        (0..xmlSecPtrListGetSize(list))
+        };
+        let klasses: Option<Vec<&XmlSecTransformKlass>> = (0..checked.used)
             .map(|pos| {
                 xmlSecPtrListGetItem(list, pos)
                     .cast::<XmlSecTransformKlass>()
                     .as_ref()
             })
-            .collect()
+            .collect();
+        if klasses.is_none() {
+            errors::assertion(here, c"transformId != xmlSecTransformIdUnknown");
+        }
+        klasses
     }
 }
 
@@ -309,14 +390,17 @@ pub(crate) unsafe extern "C" fn xmlSecTransformIdListFind(
     id: *const XmlSecTransformKlass,
 ) -> c_int {
     contain(-1, || {
-        if id.is_null() {
-            return -1;
-        }
         // SAFETY: by the caller's contract.
-        match unsafe { id_list(list) } {
-            Some(klasses) => c_int::from(klasses.iter().any(|klass| std::ptr::eq(*klass, id))),
-            None => -1,
-        }
+        let Some(klasses) = (unsafe { id_list(list, here!("xmlSecTransformIdListFind")) }) else {
+            return -1;
+        };
+        check!(
+            !id.is_null(),
+            "xmlSecTransformIdListFind",
+            c"transformId != NULL",
+            -1
+        );
+        c_int::from(klasses.iter().any(|klass| std::ptr::eq(*klass, id)))
     })
 }
 
@@ -330,14 +414,16 @@ unsafe fn find_by(
     value: *const u8,
     usage: c_uint,
     field: fn(&XmlSecTransformKlass) -> *const u8,
+    (here, value_text): (errors::Here, &CStr),
 ) -> *const XmlSecTransformKlass {
-    if value.is_null() {
-        return std::ptr::null();
-    }
     // SAFETY: by the caller's contract.
-    let Some(klasses) = (unsafe { id_list(list) }) else {
+    let Some(klasses) = (unsafe { id_list(list, here) }) else {
         return std::ptr::null();
     };
+    if value.is_null() {
+        errors::assertion(here, value_text);
+        return std::ptr::null();
+    }
     for klass in klasses {
         let candidate = field(klass);
         if (usage & klass.usage) == 0 || candidate.is_null() {
@@ -364,7 +450,13 @@ pub(crate) unsafe extern "C" fn xmlSecTransformIdListFindByHref(
 ) -> *const XmlSecTransformKlass {
     // SAFETY: by the caller's contract.
     contain(std::ptr::null(), || unsafe {
-        find_by(list, href, usage, |klass| klass.href)
+        find_by(
+            list,
+            href,
+            usage,
+            |klass| klass.href,
+            (here!("xmlSecTransformIdListFindByHref"), c"href != NULL"),
+        )
     })
 }
 
@@ -380,7 +472,13 @@ pub(crate) unsafe extern "C" fn xmlSecTransformIdListFindByName(
 ) -> *const XmlSecTransformKlass {
     // SAFETY: by the caller's contract.
     contain(std::ptr::null(), || unsafe {
-        find_by(list, name, usage, |klass| klass.name)
+        find_by(
+            list,
+            name,
+            usage,
+            |klass| klass.name,
+            (here!("xmlSecTransformIdListFindByName"), c"name != NULL"),
+        )
     })
 }
 
@@ -424,12 +522,15 @@ pub(crate) unsafe extern "C" fn xmlSecTransformIdListDebugDump(
 ) {
     contain((), || {
         // SAFETY: by the caller's contract.
-        let Some(klasses) = (unsafe { id_list(list) }) else {
+        let Some(klasses) = (unsafe { id_list(list, here!("xmlSecTransformIdListDebugDump")) })
+        else {
             return;
         };
-        if output.is_null() {
-            return;
-        }
+        check!(
+            !output.is_null(),
+            "xmlSecTransformIdListDebugDump",
+            c"output != NULL",
+        );
         let names: Vec<String> = klasses
             .iter()
             .map(|klass| {
@@ -454,12 +555,15 @@ pub(crate) unsafe extern "C" fn xmlSecTransformIdListDebugXmlDump(
 ) {
     contain((), || {
         // SAFETY: by the caller's contract.
-        let Some(klasses) = (unsafe { id_list(list) }) else {
+        let Some(klasses) = (unsafe { id_list(list, here!("xmlSecTransformIdListDebugXmlDump")) })
+        else {
             return;
         };
-        if output.is_null() {
-            return;
-        }
+        check!(
+            !output.is_null(),
+            "xmlSecTransformIdListDebugXmlDump",
+            c"output != NULL",
+        );
         let mut text = String::from("<TransformIdsList>\n");
         for klass in klasses {
             // SAFETY: klass names are NUL-terminated.
@@ -492,14 +596,24 @@ pub(crate) unsafe extern "C" fn xmlSecTransformIdsGet() -> *mut XmlSecPtrList {
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecTransformIdsInit() -> c_int {
     contain(-1, || {
+        let here = here!("xmlSecTransformIdsInit");
         // SAFETY: the registry has a fixed address and is not in use.
         unsafe {
             if xmlSecPtrListInitialize(xmlSecTransformIdsGet(), xmlSecTransformIdListGetKlass()) < 0
             {
+                errors::internal(
+                    here,
+                    std::ptr::null(),
+                    c"xmlSecPtrListInitialize(xmlSecTransformIdListId)",
+                );
                 return -1;
             }
-            xmlSecTransformIdsRegisterDefault()
+            if xmlSecTransformIdsRegisterDefault() < 0 {
+                errors::internal(here, std::ptr::null(), c"xmlSecTransformIdsRegisterDefault");
+                return -1;
+            }
         }
+        0
     })
 }
 
@@ -525,11 +639,23 @@ pub(crate) unsafe extern "C" fn xmlSecTransformIdsRegister(
     id: *const XmlSecTransformKlass,
 ) -> c_int {
     contain(-1, || {
-        if id.is_null() {
+        check!(
+            !id.is_null(),
+            "xmlSecTransformIdsRegister",
+            c"id != xmlSecTransformIdUnknown",
+            -1
+        );
+        // SAFETY: the registry has a fixed address; items are klasses.
+        if unsafe { xmlSecPtrListAdd(xmlSecTransformIdsGet(), id.cast_mut().cast()) } < 0 {
+            errors::internal(
+                here!("xmlSecTransformIdsRegister"),
+                // SAFETY: `id` is a klass.
+                unsafe { (*id).name }.cast(),
+                c"xmlSecPtrListAdd",
+            );
             return -1;
         }
-        // SAFETY: the registry has a fixed address; items are klasses.
-        unsafe { xmlSecPtrListAdd(xmlSecTransformIdsGet(), id.cast_mut().cast()) }
+        0
     })
 }
 
@@ -544,6 +670,13 @@ pub(crate) unsafe extern "C" fn xmlSecTransformIdsRegisterDefault() -> c_int {
         for id in builtin::defaults() {
             // SAFETY: built-in klasses are statics.
             if unsafe { xmlSecTransformIdsRegister(id) } < 0 {
+                errors::internal_with(
+                    here!("xmlSecTransformIdsRegisterDefault"),
+                    std::ptr::null(),
+                    c"xmlSecTransformIdsRegister",
+                    // SAFETY: built-in klass names are static strings.
+                    &format!("klass={}", unsafe { klass_text((*id).name) }),
+                );
                 return -1;
             }
         }
@@ -589,18 +722,33 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCreate(
     id: *const XmlSecTransformKlass,
 ) -> *mut XmlSecTransform {
     contain(std::ptr::null_mut(), || {
-        // SAFETY: the caller passes null or a klass.
-        let Some(klass) = (unsafe { id.as_ref() }) else {
-            return std::ptr::null_mut();
-        };
-        if klass.klass_size < size_of::<XmlSecTransformKlass>()
-            || klass.obj_size < size_of::<XmlSecTransform>()
-            || klass.name.is_null()
-        {
-            return std::ptr::null_mut();
-        }
+        let null = std::ptr::null_mut();
+        check!(!id.is_null(), "xmlSecTransformCreate", c"id != NULL", null);
+        // SAFETY: the caller passes a klass.
+        let klass = unsafe { &*id };
+        check!(
+            klass.klass_size >= size_of::<XmlSecTransformKlass>(),
+            "xmlSecTransformCreate",
+            c"id->klassSize >= sizeof(xmlSecTransformKlass)",
+            null
+        );
+        check!(
+            klass.obj_size >= size_of::<XmlSecTransform>(),
+            "xmlSecTransformCreate",
+            c"id->objSize >= sizeof(xmlSecTransform)",
+            null
+        );
+        check!(
+            !klass.name.is_null(),
+            "xmlSecTransformCreate",
+            c"id->name != NULL",
+            null
+        );
+        let here = here!("xmlSecTransformCreate");
+        let name = klass.name.cast();
         let transform = malloc(klass.obj_size).cast::<XmlSecTransform>();
         if transform.is_null() {
+            errors::malloc_failed(here, std::ptr::null(), klass.obj_size);
             return transform;
         }
         // SAFETY: a fresh allocation of the klass's object size, zeroed
@@ -611,14 +759,16 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCreate(
             if let Some(initialize) = klass.initialize
                 && initialize(transform) < 0
             {
+                errors::internal(here, name, c"id->initialize");
                 xmlSecTransformDestroy(transform);
-                return std::ptr::null_mut();
+                return null;
             }
             if xmlSecBufferInitialize(&raw mut (*transform).in_buf, 0) < 0
                 || xmlSecBufferInitialize(&raw mut (*transform).out_buf, 0) < 0
             {
+                errors::internal(here, name, c"xmlSecBufferInitialize");
                 xmlSecTransformDestroy(transform);
-                return std::ptr::null_mut();
+                return null;
             }
         }
         transform
@@ -635,13 +785,12 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCreate(
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecTransformDestroy(transform: *mut XmlSecTransform) {
     contain((), || {
-        // SAFETY: the caller passes null or a created transform.
-        let Some((object, klass)) = (unsafe { valid(transform) }) else {
-            return;
-        };
-        if klass.obj_size == 0 {
-            return;
-        }
+        let (object, klass) = valid_or!(transform, "xmlSecTransformDestroy");
+        check!(
+            klass.obj_size > 0,
+            "xmlSecTransformDestroy",
+            c"transform->id->objSize > 0",
+        );
         let size = klass.obj_size;
         let finalize = klass.finalize;
         // SAFETY: the transform is live until freed at the end.
@@ -672,13 +821,8 @@ pub(crate) unsafe extern "C" fn xmlSecTransformSetKey(
     key: *mut c_void,
 ) -> c_int {
     contain(-1, || {
-        // SAFETY: the caller passes null or a valid transform.
-        let Some((_, klass)) = (unsafe { valid(transform) }) else {
-            return -1;
-        };
-        if key.is_null() {
-            return -1;
-        }
+        let (_, klass) = valid_or!(transform, "xmlSecTransformSetKey", -1);
+        check!(!key.is_null(), "xmlSecTransformSetKey", c"key != NULL", -1);
         // SAFETY: the klass method keeps libxmlsec1's contract.
         klass
             .set_key
@@ -698,14 +842,15 @@ pub(crate) unsafe extern "C" fn xmlSecTransformSetKeyReq(
     key_req: *mut XmlSecKeyReq,
 ) -> c_int {
     contain(-1, || {
-        // SAFETY: the caller passes null or a valid transform.
-        let Some((_, klass)) = (unsafe { valid(transform) }) else {
-            return -1;
-        };
-        // SAFETY: the caller passes null or a key requirement.
-        let Some(req) = (unsafe { key_req.as_mut() }) else {
-            return -1;
-        };
+        let (_, klass) = valid_or!(transform, "xmlSecTransformSetKeyReq", -1);
+        check!(
+            !key_req.is_null(),
+            "xmlSecTransformSetKeyReq",
+            c"keyReq != NULL",
+            -1
+        );
+        // SAFETY: the caller passes a key requirement.
+        let req = unsafe { &mut *key_req };
         req.key_id = std::ptr::null();
         req.key_type = 0;
         req.key_usage = KEY_USAGE_ANY;
@@ -731,15 +876,22 @@ pub(crate) unsafe extern "C" fn xmlSecTransformVerify(
     ctx: *mut XmlSecTransformCtx,
 ) -> c_int {
     contain(-1, || {
-        // SAFETY: the caller passes null or a valid transform.
-        let Some((_, klass)) = (unsafe { valid(transform) }) else {
+        let (_, klass) = valid_or!(transform, "xmlSecTransformVerify", -1);
+        let Some(verify) = klass.verify else {
+            errors::assertion(
+                here!("xmlSecTransformVerify"),
+                c"transform->id->verify != NULL",
+            );
             return -1;
         };
-        match klass.verify {
-            // SAFETY: the klass method keeps libxmlsec1's contract.
-            Some(verify) if !ctx.is_null() => unsafe { verify(transform, data, size, ctx) },
-            _ => -1,
-        }
+        check!(
+            !ctx.is_null(),
+            "xmlSecTransformVerify",
+            c"transformCtx != NULL",
+            -1
+        );
+        // SAFETY: the klass method keeps libxmlsec1's contract.
+        unsafe { verify(transform, data, size, ctx) }
     })
 }
 
@@ -756,26 +908,43 @@ pub(crate) unsafe extern "C" fn xmlSecTransformVerifyNodeContent(
     ctx: *mut XmlSecTransformCtx,
 ) -> c_int {
     contain(-1, || {
+        let (_, klass) = valid_or!(transform, "xmlSecTransformVerifyNodeContent", -1);
+        check!(
+            !node.is_null(),
+            "xmlSecTransformVerifyNodeContent",
+            c"node != NULL",
+            -1
+        );
+        check!(
+            !ctx.is_null(),
+            "xmlSecTransformVerifyNodeContent",
+            c"transformCtx != NULL",
+            -1
+        );
+        let here = here!("xmlSecTransformVerifyNodeContent");
+        let name = klass.name.cast();
         // SAFETY: by the caller's contract; the buffer is finalized on every
         // path.
         unsafe {
-            if valid(transform).is_none() || node.is_null() || ctx.is_null() {
-                return -1;
-            }
             let mut buffer = std::mem::MaybeUninit::<XmlSecBuffer>::uninit();
             let buffer = buffer.as_mut_ptr();
             if xmlSecBufferInitialize(buffer, 0) < 0 {
+                errors::internal(here, name, c"xmlSecBufferInitialize");
                 return -1;
             }
             let result = if super::buffer::xmlSecBufferBase64NodeContentRead(buffer, node) < 0
                 || xmlSecBufferGetData(buffer).is_null()
-                || xmlSecTransformVerify(
-                    transform,
-                    xmlSecBufferGetData(buffer),
-                    xmlSecBufferGetSize(buffer),
-                    ctx,
-                ) < 0
             {
+                errors::internal(here, name, c"xmlSecBufferBase64NodeContentRead");
+                -1
+            } else if xmlSecTransformVerify(
+                transform,
+                xmlSecBufferGetData(buffer),
+                xmlSecBufferGetSize(buffer),
+                ctx,
+            ) < 0
+            {
+                errors::internal(here, name, c"xmlSecTransformVerify");
                 -1
             } else {
                 0
@@ -798,16 +967,16 @@ pub(crate) unsafe extern "C" fn xmlSecTransformGetDataType(
     ctx: *mut XmlSecTransformCtx,
 ) -> u8 {
     contain(DATA_UNKNOWN, || {
-        // SAFETY: the caller passes null or a valid transform.
-        let Some((_, klass)) = (unsafe { valid(transform) }) else {
+        let (_, klass) = valid_or!(transform, "xmlSecTransformGetDataType", DATA_UNKNOWN);
+        let Some(get_data_type) = klass.get_data_type else {
+            errors::assertion(
+                here!("xmlSecTransformGetDataType"),
+                c"transform->id->getDataType != NULL",
+            );
             return DATA_UNKNOWN;
         };
         // SAFETY: the klass method keeps libxmlsec1's contract.
-        klass
-            .get_data_type
-            .map_or(DATA_UNKNOWN, |get_data_type| unsafe {
-                get_data_type(transform, mode, ctx)
-            })
+        unsafe { get_data_type(transform, mode, ctx) }
     })
 }
 
@@ -825,15 +994,20 @@ pub(crate) unsafe extern "C" fn xmlSecTransformPushBin(
     ctx: *mut XmlSecTransformCtx,
 ) -> c_int {
     contain(-1, || {
-        // SAFETY: the caller passes null or a valid transform.
-        let Some((_, klass)) = (unsafe { valid(transform) }) else {
-            return -1;
-        };
-        match klass.push_bin {
-            // SAFETY: the klass method keeps libxmlsec1's contract.
-            Some(push) if !ctx.is_null() => unsafe { push(transform, data, size, is_final, ctx) },
-            _ => -1,
-        }
+        let (_, klass) = valid_or!(transform, "xmlSecTransformPushBin", -1);
+        let push = method!(
+            klass.push_bin,
+            "xmlSecTransformPushBin",
+            c"transform->id->pushBin != NULL"
+        );
+        check!(
+            !ctx.is_null(),
+            "xmlSecTransformPushBin",
+            c"transformCtx != NULL",
+            -1
+        );
+        // SAFETY: the klass method keeps libxmlsec1's contract.
+        unsafe { push(transform, data, size, is_final, ctx) }
     })
 }
 
@@ -851,17 +1025,32 @@ pub(crate) unsafe extern "C" fn xmlSecTransformPopBin(
     ctx: *mut XmlSecTransformCtx,
 ) -> c_int {
     contain(-1, || {
-        // SAFETY: the caller passes null or a valid transform.
-        let Some((_, klass)) = (unsafe { valid(transform) }) else {
-            return -1;
-        };
-        match klass.pop_bin {
-            Some(pop) if !data.is_null() && !size.is_null() && !ctx.is_null() => {
-                // SAFETY: the klass method keeps libxmlsec1's contract.
-                unsafe { pop(transform, data, max_size, size, ctx) }
-            }
-            _ => -1,
-        }
+        let (_, klass) = valid_or!(transform, "xmlSecTransformPopBin", -1);
+        let pop = method!(
+            klass.pop_bin,
+            "xmlSecTransformPopBin",
+            c"transform->id->popBin != NULL"
+        );
+        check!(
+            !data.is_null(),
+            "xmlSecTransformPopBin",
+            c"data != NULL",
+            -1
+        );
+        check!(
+            !size.is_null(),
+            "xmlSecTransformPopBin",
+            c"dataSize != NULL",
+            -1
+        );
+        check!(
+            !ctx.is_null(),
+            "xmlSecTransformPopBin",
+            c"transformCtx != NULL",
+            -1
+        );
+        // SAFETY: the klass method keeps libxmlsec1's contract.
+        unsafe { pop(transform, data, max_size, size, ctx) }
     })
 }
 
@@ -877,15 +1066,20 @@ pub(crate) unsafe extern "C" fn xmlSecTransformPushXml(
     ctx: *mut XmlSecTransformCtx,
 ) -> c_int {
     contain(-1, || {
-        // SAFETY: the caller passes null or a valid transform.
-        let Some((_, klass)) = (unsafe { valid(transform) }) else {
-            return -1;
-        };
-        match klass.push_xml {
-            // SAFETY: the klass method keeps libxmlsec1's contract.
-            Some(push) if !ctx.is_null() => unsafe { push(transform, nodes, ctx) },
-            _ => -1,
-        }
+        let (_, klass) = valid_or!(transform, "xmlSecTransformPushXml", -1);
+        let push = method!(
+            klass.push_xml,
+            "xmlSecTransformPushXml",
+            c"transform->id->pushXml != NULL"
+        );
+        check!(
+            !ctx.is_null(),
+            "xmlSecTransformPushXml",
+            c"transformCtx != NULL",
+            -1
+        );
+        // SAFETY: the klass method keeps libxmlsec1's contract.
+        unsafe { push(transform, nodes, ctx) }
     })
 }
 
@@ -901,15 +1095,20 @@ pub(crate) unsafe extern "C" fn xmlSecTransformPopXml(
     ctx: *mut XmlSecTransformCtx,
 ) -> c_int {
     contain(-1, || {
-        // SAFETY: the caller passes null or a valid transform.
-        let Some((_, klass)) = (unsafe { valid(transform) }) else {
-            return -1;
-        };
-        match klass.pop_xml {
-            // SAFETY: the klass method keeps libxmlsec1's contract.
-            Some(pop) if !ctx.is_null() => unsafe { pop(transform, nodes, ctx) },
-            _ => -1,
-        }
+        let (_, klass) = valid_or!(transform, "xmlSecTransformPopXml", -1);
+        let pop = method!(
+            klass.pop_xml,
+            "xmlSecTransformPopXml",
+            c"transform->id->popXml != NULL"
+        );
+        check!(
+            !ctx.is_null(),
+            "xmlSecTransformPopXml",
+            c"transformCtx != NULL",
+            -1
+        );
+        // SAFETY: the klass method keeps libxmlsec1's contract.
+        unsafe { pop(transform, nodes, ctx) }
     })
 }
 
@@ -924,15 +1123,20 @@ pub(crate) unsafe extern "C" fn xmlSecTransformExecute(
     ctx: *mut XmlSecTransformCtx,
 ) -> c_int {
     contain(-1, || {
-        // SAFETY: the caller passes null or a valid transform.
-        let Some((_, klass)) = (unsafe { valid(transform) }) else {
-            return -1;
-        };
-        match klass.execute {
-            // SAFETY: the klass method keeps libxmlsec1's contract.
-            Some(execute) if !ctx.is_null() => unsafe { execute(transform, last, ctx) },
-            _ => -1,
-        }
+        let (_, klass) = valid_or!(transform, "xmlSecTransformExecute", -1);
+        let execute = method!(
+            klass.execute,
+            "xmlSecTransformExecute",
+            c"transform->id->execute != NULL"
+        );
+        check!(
+            !ctx.is_null(),
+            "xmlSecTransformExecute",
+            c"transformCtx != NULL",
+            -1
+        );
+        // SAFETY: the klass method keeps libxmlsec1's contract.
+        unsafe { execute(transform, last, ctx) }
     })
 }
 
@@ -947,13 +1151,12 @@ pub(crate) unsafe extern "C" fn xmlSecTransformDebugDump(
     output: *mut c_void,
 ) {
     contain((), || {
-        // SAFETY: the caller passes null or a valid transform.
-        let Some((_, klass)) = (unsafe { valid(transform) }) else {
-            return;
-        };
-        if output.is_null() {
-            return;
-        }
+        let (_, klass) = valid_or!(transform, "xmlSecTransformDebugDump");
+        check!(
+            !output.is_null(),
+            "xmlSecTransformDebugDump",
+            c"output != NULL",
+        );
         // SAFETY: klass strings are NUL-terminated; `output` is live.
         unsafe {
             let text = format!(
@@ -976,13 +1179,12 @@ pub(crate) unsafe extern "C" fn xmlSecTransformDebugXmlDump(
     output: *mut c_void,
 ) {
     contain((), || {
-        // SAFETY: the caller passes null or a valid transform.
-        let Some((_, klass)) = (unsafe { valid(transform) }) else {
-            return;
-        };
-        if output.is_null() {
-            return;
-        }
+        let (_, klass) = valid_or!(transform, "xmlSecTransformDebugXmlDump");
+        check!(
+            !output.is_null(),
+            "xmlSecTransformDebugXmlDump",
+            c"output != NULL",
+        );
         // SAFETY: klass strings are NUL-terminated; `output` is live. A null
         // string prints nothing, as libxmlsec1's string printer does.
         unsafe {
@@ -1017,14 +1219,25 @@ pub(crate) unsafe extern "C" fn xmlSecTransformConnect(
     ctx: *mut XmlSecTransformCtx,
 ) -> c_int {
     contain(-1, || {
-        // SAFETY: the caller passes null or valid transforms.
-        let (Some(_), Some((_, right_klass))) = (unsafe { valid(left) }, unsafe { valid(right) })
-        else {
-            return -1;
-        };
-        if ctx.is_null() {
-            return -1;
-        }
+        let (_, left_klass) = valid_or!(
+            left,
+            "xmlSecTransformConnect",
+            c"xmlSecTransformIsValid(left)",
+            -1
+        );
+        let (_, right_klass) = valid_or!(
+            right,
+            "xmlSecTransformConnect",
+            c"xmlSecTransformIsValid(right)",
+            -1
+        );
+        check!(
+            !ctx.is_null(),
+            "xmlSecTransformConnect",
+            c"transformCtx != NULL",
+            -1
+        );
+        let here = here!("xmlSecTransformConnect");
         // SAFETY: valid transforms and a context.
         let (left_type, right_type) = unsafe {
             (
@@ -1050,12 +1263,24 @@ pub(crate) unsafe extern "C" fn xmlSecTransformConnect(
                 builtin::incl_c14n()
             }
         } else {
+            errors::report(
+                here,
+                left_klass.name.cast(),
+                std::ptr::null(),
+                errors::R_INVALID_TRANSFORM,
+                &format!(
+                    "transforms types do not match, right transform=\"{}\"",
+                    // SAFETY: klass names are NUL-terminated.
+                    unsafe { klass_text(right_klass.name) }
+                ),
+            );
             return -1;
         };
         // SAFETY: a built-in klass; the transforms are valid.
         unsafe {
             let middle = xmlSecTransformCreate(middle_id);
             if middle.is_null() {
+                errors::internal(here, (*middle_id).name.cast(), c"xmlSecTransformCreate");
                 return -1;
             }
             (*left).next = middle;
@@ -1074,10 +1299,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformConnect(
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecTransformRemove(transform: *mut XmlSecTransform) {
     contain((), || {
-        // SAFETY: the caller passes null or a valid transform.
-        let Some((object, _)) = (unsafe { valid(transform) }) else {
-            return;
-        };
+        let (object, _) = valid_or!(transform, "xmlSecTransformRemove");
         // SAFETY: the neighbours are live transforms of the same chain.
         unsafe {
             if let Some(next) = object.next.as_mut() {
@@ -1104,43 +1326,76 @@ pub(crate) unsafe extern "C" fn xmlSecTransformPump(
     ctx: *mut XmlSecTransformCtx,
 ) -> c_int {
     contain(-1, || {
-        // SAFETY: the caller passes null or valid transforms and context.
+        let (_, left_klass) = valid_or!(
+            left,
+            "xmlSecTransformPump",
+            c"xmlSecTransformIsValid(left)",
+            -1
+        );
+        let (_, right_klass) = valid_or!(
+            right,
+            "xmlSecTransformPump",
+            c"xmlSecTransformIsValid(right)",
+            -1
+        );
+        check!(
+            !ctx.is_null(),
+            "xmlSecTransformPump",
+            c"transformCtx != NULL",
+            -1
+        );
+        let here = here!("xmlSecTransformPump");
+        let (left_name, right_name) = (left_klass.name.cast(), right_klass.name.cast());
+        // SAFETY: valid transforms and a context.
         unsafe {
-            if valid(left).is_none() || valid(right).is_none() {
-                return -1;
-            }
-            let Some(context) = ctx.as_ref() else {
-                return -1;
-            };
-            let chunk = context.binary_chunk_size;
-            if chunk == 0 {
-                return -1;
-            }
+            let chunk = (*ctx).binary_chunk_size;
+            check!(
+                chunk > 0,
+                "xmlSecTransformPump",
+                c"transformCtx->binaryChunkSize > 0",
+                -1
+            );
             let left_type = xmlSecTransformGetDataType(left, MODE_POP, ctx);
             let right_type = xmlSecTransformGetDataType(right, MODE_PUSH, ctx);
             if left_type & DATA_XML != 0 && right_type & DATA_XML != 0 {
                 let mut nodes = std::ptr::null_mut();
-                if xmlSecTransformPopXml(left, &raw mut nodes, ctx) < 0
-                    || xmlSecTransformPushXml(right, nodes, ctx) < 0
-                {
+                if xmlSecTransformPopXml(left, &raw mut nodes, ctx) < 0 {
+                    errors::internal(here, left_name, c"xmlSecTransformPopXml");
+                    return -1;
+                }
+                if xmlSecTransformPushXml(right, nodes, ctx) < 0 {
+                    errors::internal(here, right_name, c"xmlSecTransformPushXml");
                     return -1;
                 }
                 return 0;
             }
             if left_type & DATA_BIN == 0 || right_type & DATA_BIN == 0 {
+                errors::report(
+                    here,
+                    left_name,
+                    std::ptr::null(),
+                    errors::R_INVALID_TRANSFORM,
+                    &format!(
+                        "transforms input/output data formats do not match, right transform=\"{}\"",
+                        klass_text(right_klass.name)
+                    ),
+                );
                 return -1;
             }
             let buffer = malloc(chunk).cast::<u8>();
             if buffer.is_null() {
+                errors::malloc_failed(here, std::ptr::null(), chunk);
                 return -1;
             }
             let result = loop {
                 let mut size = 0;
                 if xmlSecTransformPopBin(left, buffer, chunk, &raw mut size, ctx) < 0 {
+                    errors::internal(here, left_name, c"xmlSecTransformPopBin");
                     break -1;
                 }
                 let is_final = c_int::from(size == 0);
                 if xmlSecTransformPushBin(right, buffer, size, is_final, ctx) < 0 {
+                    errors::internal(here, right_name, c"xmlSecTransformPushBin");
                     break -1;
                 }
                 if is_final != 0 {
@@ -1165,17 +1420,25 @@ pub(crate) unsafe extern "C" fn xmlSecTransformDefaultGetDataType(
     ctx: *mut XmlSecTransformCtx,
 ) -> u8 {
     contain(DATA_UNKNOWN, || {
-        // SAFETY: the caller passes null or a valid transform.
-        let Some((_, klass)) = (unsafe { valid(transform) }) else {
-            return DATA_UNKNOWN;
-        };
-        if ctx.is_null() {
-            return DATA_UNKNOWN;
-        }
+        let (_, klass) = valid_or!(transform, "xmlSecTransformDefaultGetDataType", DATA_UNKNOWN);
+        check!(
+            !ctx.is_null(),
+            "xmlSecTransformDefaultGetDataType",
+            c"transformCtx != NULL",
+            DATA_UNKNOWN
+        );
         let (binary, xml) = match mode {
             MODE_PUSH => (klass.push_bin.is_some(), klass.push_xml.is_some()),
             MODE_POP => (klass.pop_bin.is_some(), klass.pop_xml.is_some()),
-            _ => return DATA_UNKNOWN,
+            _ => {
+                errors::unsupported_enum(
+                    here!("xmlSecTransformDefaultGetDataType"),
+                    klass.name.cast(),
+                    "mode",
+                    mode,
+                );
+                return DATA_UNKNOWN;
+            }
         };
         (if binary { DATA_BIN } else { DATA_UNKNOWN }) | (if xml { DATA_XML } else { DATA_UNKNOWN })
     })
@@ -1197,29 +1460,44 @@ pub(crate) unsafe extern "C" fn xmlSecTransformDefaultPushBin(
     ctx: *mut XmlSecTransformCtx,
 ) -> c_int {
     contain(-1, || {
+        let (object, klass) = valid_or!(transform, "xmlSecTransformDefaultPushBin", -1);
+        check!(
+            !ctx.is_null(),
+            "xmlSecTransformDefaultPushBin",
+            c"transformCtx != NULL",
+            -1
+        );
+        let here = here!("xmlSecTransformDefaultPushBin");
+        let name = klass.name.cast();
         // SAFETY: the caller's contract; every buffer belongs to the live
         // transform and `data` advances within its `size` bytes.
         unsafe {
-            let Some((object, _)) = valid(transform) else {
-                return -1;
-            };
-            let Some(context) = ctx.as_ref() else {
-                return -1;
-            };
-            let chunk = context.binary_chunk_size;
+            let chunk = (*ctx).binary_chunk_size;
             // A caller may write 0 into the public field; libxmlsec1 then never
             // consumes the input and loops forever. Fail as the pump does.
-            if chunk == 0 {
-                return -1;
-            }
+            check!(
+                chunk > 0,
+                "xmlSecTransformDefaultPushBin",
+                c"transformCtx->binaryChunkSize > 0",
+                -1
+            );
             let (mut data, mut remaining) = (data, size);
             loop {
                 if remaining > 0 {
-                    if data.is_null() {
-                        return -1;
-                    }
+                    check!(
+                        !data.is_null(),
+                        "xmlSecTransformDefaultPushBin",
+                        c"data != NULL",
+                        -1
+                    );
                     let part = remaining.min(chunk);
                     if xmlSecBufferAppend(&raw mut object.in_buf, data, part) < 0 {
+                        errors::internal_with(
+                            here,
+                            name,
+                            c"xmlSecBufferAppend",
+                            &format!("size={part}"),
+                        );
                         return -1;
                     }
                     remaining -= part;
@@ -1227,6 +1505,12 @@ pub(crate) unsafe extern "C" fn xmlSecTransformDefaultPushBin(
                 }
                 let mut final_data = c_int::from(remaining == 0 && is_final != 0);
                 if xmlSecTransformExecute(transform, final_data, ctx) < 0 {
+                    errors::internal_with(
+                        here,
+                        name,
+                        c"xmlSecTransformExecute",
+                        &format!("final={is_final}"),
+                    );
                     return -1;
                 }
                 let in_size = xmlSecBufferGetSize(&raw mut object.in_buf);
@@ -1248,9 +1532,21 @@ pub(crate) unsafe extern "C" fn xmlSecTransformDefaultPushBin(
                         ctx,
                     ) < 0
                 {
+                    errors::internal_with(
+                        here,
+                        valid(object.next).map_or(std::ptr::null(), |(_, next)| next.name.cast()),
+                        c"xmlSecTransformPushBin",
+                        &format!("final={is_final};outSize={out_size}"),
+                    );
                     return -1;
                 }
                 if out_size > 0 && xmlSecBufferRemoveHead(&raw mut object.out_buf, out_size) < 0 {
+                    errors::internal_with(
+                        here,
+                        name,
+                        c"xmlSecBufferRemoveHead",
+                        &format!("size={out_size}"),
+                    );
                     return -1;
                 }
                 if remaining == 0 && out_size == 0 {
@@ -1277,20 +1573,32 @@ pub(crate) unsafe extern "C" fn xmlSecTransformDefaultPopBin(
     ctx: *mut XmlSecTransformCtx,
 ) -> c_int {
     contain(-1, || {
+        let (object, klass) = valid_or!(transform, "xmlSecTransformDefaultPopBin", -1);
+        check!(
+            !data.is_null(),
+            "xmlSecTransformDefaultPopBin",
+            c"data != NULL",
+            -1
+        );
+        check!(
+            !size.is_null(),
+            "xmlSecTransformDefaultPopBin",
+            c"dataSize != NULL",
+            -1
+        );
+        check!(
+            !ctx.is_null(),
+            "xmlSecTransformDefaultPopBin",
+            c"transformCtx != NULL",
+            -1
+        );
+        let here = here!("xmlSecTransformDefaultPopBin");
+        let name = klass.name.cast();
         // SAFETY: the caller's contract; every buffer belongs to the live
         // transform, and the previous transform writes at most one chunk into
         // the space reserved for it.
         unsafe {
-            let Some((object, _)) = valid(transform) else {
-                return -1;
-            };
-            let Some(context) = ctx.as_ref() else {
-                return -1;
-            };
-            if data.is_null() || size.is_null() {
-                return -1;
-            }
-            let chunk = context.binary_chunk_size;
+            let chunk = (*ctx).binary_chunk_size;
             let mut is_final = false;
             while xmlSecBufferGetSize(&raw mut object.out_buf) == 0 && !is_final {
                 if object.prev.is_null() {
@@ -1298,19 +1606,39 @@ pub(crate) unsafe extern "C" fn xmlSecTransformDefaultPopBin(
                     is_final = true;
                 } else {
                     let in_size = xmlSecBufferGetSize(&raw mut object.in_buf);
-                    let Some(room) = in_size.checked_add(chunk) else {
-                        return -1;
-                    };
-                    if xmlSecBufferSetMaxSize(&raw mut object.in_buf, room) < 0 {
+                    // A room past the address space is an allocation
+                    // libxmlsec1 could not make either.
+                    let room = in_size
+                        .checked_add(chunk)
+                        .filter(|room| xmlSecBufferSetMaxSize(&raw mut object.in_buf, *room) >= 0);
+                    if room.is_none() {
+                        errors::internal_with(
+                            here,
+                            name,
+                            c"xmlSecBufferSetMaxSize",
+                            &format!("size={}", in_size.wrapping_add(chunk)),
+                        );
                         return -1;
                     }
                     let mut got = chunk;
                     let target = xmlSecBufferGetData(&raw mut object.in_buf).add(in_size);
                     if xmlSecTransformPopBin(object.prev, target, chunk, &raw mut got, ctx) < 0 {
+                        errors::internal(
+                            here,
+                            valid(object.prev)
+                                .map_or(std::ptr::null(), |(_, prev)| prev.name.cast()),
+                            c"xmlSecTransformPopBin",
+                        );
                         return -1;
                     }
                     if got > 0 {
                         if xmlSecBufferSetSize(&raw mut object.in_buf, in_size + got) < 0 {
+                            errors::internal_with(
+                                here,
+                                name,
+                                c"xmlSecBufferSetSize",
+                                &format!("size={}", in_size + got),
+                            );
                             return -1;
                         }
                     } else {
@@ -1318,6 +1646,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformDefaultPopBin(
                     }
                 }
                 if xmlSecTransformExecute(transform, c_int::from(is_final), ctx) < 0 {
+                    errors::internal(here, name, c"xmlSecTransformExecute");
                     return -1;
                 }
             }
@@ -1326,11 +1655,20 @@ pub(crate) unsafe extern "C" fn xmlSecTransformDefaultPopBin(
                 .min(chunk);
             if out_size > 0 {
                 let output = xmlSecBufferGetData(&raw mut object.out_buf);
-                if output.is_null() {
-                    return -1;
-                }
+                check!(
+                    !output.is_null(),
+                    "xmlSecTransformDefaultPopBin",
+                    c"xmlSecBufferGetData(&(transform->outBuf))",
+                    -1
+                );
                 output.copy_to(data, out_size);
                 if xmlSecBufferRemoveHead(&raw mut object.out_buf, out_size) < 0 {
+                    errors::internal_with(
+                        here,
+                        name,
+                        c"xmlSecBufferRemoveHead",
+                        &format!("size={out_size}"),
+                    );
                     return -1;
                 }
             }
@@ -1353,21 +1691,38 @@ pub(crate) unsafe extern "C" fn xmlSecTransformDefaultPushXml(
     ctx: *mut XmlSecTransformCtx,
 ) -> c_int {
     contain(-1, || {
-        // SAFETY: the caller passes null or a valid transform and context.
+        let (object, klass) = valid_or!(transform, "xmlSecTransformDefaultPushXml", -1);
+        check!(
+            object.in_nodes.is_null(),
+            "xmlSecTransformDefaultPushXml",
+            c"transform->inNodes == NULL",
+            -1
+        );
+        check!(
+            object.out_nodes.is_null(),
+            "xmlSecTransformDefaultPushXml",
+            c"transform->outNodes == NULL",
+            -1
+        );
+        check!(
+            !ctx.is_null(),
+            "xmlSecTransformDefaultPushXml",
+            c"transformCtx != NULL",
+            -1
+        );
+        let here = here!("xmlSecTransformDefaultPushXml");
+        let name = klass.name.cast();
+        // SAFETY: a valid transform and a context.
         unsafe {
-            let Some((object, _)) = valid(transform) else {
-                return -1;
-            };
-            if !object.in_nodes.is_null() || !object.out_nodes.is_null() || ctx.is_null() {
-                return -1;
-            }
             object.in_nodes = nodes;
             if xmlSecTransformExecute(transform, 1, ctx) < 0 {
+                errors::internal(here, name, c"xmlSecTransformExecute");
                 return -1;
             }
             if !object.next.is_null()
                 && xmlSecTransformPushXml(object.next, object.out_nodes, ctx) < 0
             {
+                errors::internal(here, name, c"xmlSecTransformPushXml");
                 return -1;
             }
         }
@@ -1388,20 +1743,37 @@ pub(crate) unsafe extern "C" fn xmlSecTransformDefaultPopXml(
     ctx: *mut XmlSecTransformCtx,
 ) -> c_int {
     contain(-1, || {
-        // SAFETY: the caller passes null or a valid transform and context.
+        let (object, klass) = valid_or!(transform, "xmlSecTransformDefaultPopXml", -1);
+        check!(
+            object.in_nodes.is_null(),
+            "xmlSecTransformDefaultPopXml",
+            c"transform->inNodes == NULL",
+            -1
+        );
+        check!(
+            object.out_nodes.is_null(),
+            "xmlSecTransformDefaultPopXml",
+            c"transform->outNodes == NULL",
+            -1
+        );
+        check!(
+            !ctx.is_null(),
+            "xmlSecTransformDefaultPopXml",
+            c"transformCtx != NULL",
+            -1
+        );
+        let here = here!("xmlSecTransformDefaultPopXml");
+        let name = klass.name.cast();
+        // SAFETY: a valid transform and a context.
         unsafe {
-            let Some((object, _)) = valid(transform) else {
-                return -1;
-            };
-            if !object.in_nodes.is_null() || !object.out_nodes.is_null() || ctx.is_null() {
-                return -1;
-            }
             if !object.prev.is_null()
                 && xmlSecTransformPopXml(object.prev, &raw mut object.in_nodes, ctx) < 0
             {
+                errors::internal(here, name, c"xmlSecTransformPopXml");
                 return -1;
             }
             if xmlSecTransformExecute(transform, 1, ctx) < 0 {
+                errors::internal(here, name, c"xmlSecTransformExecute");
                 return -1;
             }
             if !nodes.is_null() {

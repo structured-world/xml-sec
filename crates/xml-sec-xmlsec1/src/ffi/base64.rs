@@ -5,13 +5,16 @@
 //! `xmlSecBase64Ctx` in libxmlsec1's layout (the Base64 transform holds one
 //! in its object tail, so the klass reports the same object size), moves the
 //! state between that structure and the codec around each call, and adds the
-//! C conventions: failure values and the terminating NUL.
+//! C conventions: failure values, error reports and the terminating NUL. The
+//! one-shot functions run through the streaming entry points, as libxmlsec1's
+//! do, so a failure reports the same chain.
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::atomic::{AtomicI32, Ordering};
 
-use structured_base64::Base64Codec;
+use structured_base64::{Base64Codec, Base64Error};
 
+use super::errors::{self, check, here};
 use super::{contain, free, malloc};
 
 #[cfg(test)]
@@ -46,6 +49,18 @@ impl XmlSecBase64Ctx {
             line_pos: 0,
             finished: 0,
         })
+    }
+
+    /// An empty decoder, the state `xmlSecBase64CtxInitialize` writes first.
+    const fn empty() -> Self {
+        Self {
+            encode: 0,
+            columns: 0,
+            in_byte: 0,
+            in_pos: 0,
+            line_pos: 0,
+            finished: 0,
+        }
     }
 
     /// The codec in the state this context holds.
@@ -87,29 +102,123 @@ pub(crate) fn initialize(ctx: &mut XmlSecBase64Ctx, encode: c_int, columns: c_in
     Some(())
 }
 
-/// Encodes or decodes all of `input`; the bytes written, or `None` when the
-/// input fails or does not fit.
-pub(crate) fn update(ctx: &mut XmlSecBase64Ctx, input: &[u8], output: &mut [u8]) -> Option<usize> {
+/// Encodes or decodes all of `input`; the bytes written.
+pub(crate) fn update(
+    ctx: &mut XmlSecBase64Ctx,
+    input: &[u8],
+    output: &mut [u8],
+) -> Result<usize, Base64Error> {
     let mut codec = ctx.codec();
     let result = codec.update(input, output);
     ctx.store(&codec);
-    result.ok()
+    result
 }
 
-/// Finishes the stream; the bytes written, or `None` when output does not
-/// fit or decoding stopped inside a group. As libxmlsec1 does, a NUL follows
+/// Finishes the stream; the bytes written. As libxmlsec1 does, a NUL follows
 /// the encoded characters when room remains, and the decoder writes one when
 /// more than one byte of room remains.
-pub(crate) fn finish(ctx: &mut XmlSecBase64Ctx, output: &mut [u8]) -> Option<usize> {
+pub(crate) fn finish(ctx: &mut XmlSecBase64Ctx, output: &mut [u8]) -> Result<usize, Base64Error> {
     let mut codec = ctx.codec();
     let result = codec.finish(output);
     ctx.store(&codec);
-    let written = result.ok()?;
+    let written = result?;
     let room = if codec.encode { written } else { written + 1 };
     if room < output.len() {
         output[written] = 0;
     }
-    Some(written)
+    Ok(written)
+}
+
+/// The byte-level cause libxmlsec1's decoder reports when decoding `input`
+/// from the state `before` fails: the state itself, misplaced padding, or a
+/// byte that is not Base64. `None` when it reports none: the stream had
+/// already ended, or the output filled up.
+///
+/// The codec finds the failing byte itself: a copy of the state before the
+/// call is fed the input one byte at a time until it refuses one.
+fn decode_cause(before: Base64Codec, input: &[u8]) -> Option<String> {
+    let mut codec = before;
+    // One input byte decodes to at most one output byte.
+    let mut room = [0u8; 1];
+    if codec.update(&[], &mut room).is_err() {
+        return Some(format!(
+            "invalid data for 'ctx->inPos': actual={} and expected 0,1,2,3",
+            before.position
+        ));
+    }
+    for &byte in input {
+        // libxmlsec1 stops at the end of the stream without inspecting the
+        // byte and reports only that input was left over.
+        if codec.finished && codec.position == 0 {
+            return None;
+        }
+        let position = codec.position;
+        match codec.update(&[byte], &mut room) {
+            Ok(_) => {}
+            Err(Base64Error::Invalid) if byte == b'=' => {
+                return Some(format!(
+                    "invalid data for 'ctx->inPos': actual={position} and expected 2,3"
+                ));
+            }
+            Err(Base64Error::Invalid) => {
+                return Some(format!(
+                    "invalid data for 'inByte': actual={byte} and expected base64 character"
+                ));
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// Reports a failed update from the state `before` over `input` with the
+/// reports libxmlsec1's codec makes below `xmlSecBase64CtxUpdate_ex`: for a
+/// byte the decoder refuses, the byte's cause and the failed decoding step.
+fn report_update_failure(before: Base64Codec, input: &[u8], error: Base64Error) {
+    if before.encode || error != Base64Error::Invalid {
+        return;
+    }
+    if let Some(cause) = decode_cause(before, input) {
+        errors::invalid_data(here!("xmlSecBase64CtxDecodeByte"), std::ptr::null(), &cause);
+        // `xmlSecBase64StatusFailed`.
+        errors::internal_with(
+            here!("xmlSecBase64CtxDecode"),
+            std::ptr::null(),
+            c"xmlSecBase64CtxDecodeByte",
+            "status=4",
+        );
+    }
+}
+
+/// Reports a failed finish with the reports libxmlsec1 makes for it: an
+/// unfinished decoder group, or an encoder whose output does not fit.
+fn report_final_failure(here: errors::Here, encode: bool, error: Base64Error, out_size: usize) {
+    if !encode {
+        errors::internal(here, std::ptr::null(), c"xmlSecBase64CtxDecodeIsFinished");
+        return;
+    }
+    let encode_final = here!("xmlSecBase64CtxEncodeFinal");
+    if error == Base64Error::Invalid {
+        errors::invalid_data(
+            encode_final,
+            std::ptr::null(),
+            "invalid data for 'ctx->inPos': expected 0,1,2,3",
+        );
+    } else {
+        errors::report(
+            encode_final,
+            std::ptr::null(),
+            std::ptr::null(),
+            errors::R_INVALID_SIZE,
+            "invalid size: invalid base64 buffer size",
+        );
+    }
+    errors::internal_with(
+        here,
+        std::ptr::null(),
+        c"xmlSecBase64CtxEncodeFinal",
+        &format!("outSize={out_size}"),
+    );
 }
 
 /// A mutable byte slice over a C buffer; empty for a zero size.
@@ -168,10 +277,20 @@ pub(crate) unsafe extern "C" fn xmlSecBase64CtxCreate(
     contain(std::ptr::null_mut(), || {
         let ctx = malloc(size_of::<XmlSecBase64Ctx>()).cast::<XmlSecBase64Ctx>();
         if ctx.is_null() {
+            errors::malloc_failed(
+                here!("xmlSecBase64CtxCreate"),
+                std::ptr::null(),
+                size_of::<XmlSecBase64Ctx>(),
+            );
             return ctx;
         }
         // SAFETY: `ctx` is a fresh allocation of a context's size.
         if unsafe { xmlSecBase64CtxInitialize(ctx, encode, columns) } < 0 {
+            errors::internal(
+                here!("xmlSecBase64CtxCreate"),
+                std::ptr::null(),
+                c"xmlSecBase64CtxInitialize",
+            );
             // SAFETY: the allocation is ours.
             unsafe { free(ctx.cast::<c_void>()) };
             return std::ptr::null_mut();
@@ -188,9 +307,7 @@ pub(crate) unsafe extern "C" fn xmlSecBase64CtxCreate(
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecBase64CtxDestroy(ctx: *mut XmlSecBase64Ctx) {
     contain((), || {
-        if ctx.is_null() {
-            return;
-        }
+        check!(!ctx.is_null(), "xmlSecBase64CtxDestroy", c"ctx != NULL");
         // SAFETY: a live created context, finalized then freed.
         unsafe {
             xmlSecBase64CtxFinalize(ctx);
@@ -210,17 +327,22 @@ pub(crate) unsafe extern "C" fn xmlSecBase64CtxInitialize(
     columns: c_int,
 ) -> c_int {
     contain(-1, || {
-        if ctx.is_null() {
-            return -1;
-        }
+        check!(
+            !ctx.is_null(),
+            "xmlSecBase64CtxInitialize",
+            c"ctx != NULL",
+            -1
+        );
         // SAFETY: `ctx` is writable; it is zeroed before any field is read.
         unsafe {
-            ctx.write_bytes(0, 1);
-            match initialize(&mut *ctx, encode, columns) {
-                Some(()) => 0,
-                None => -1,
+            ctx.write(XmlSecBase64Ctx::empty());
+            (*ctx).encode = encode;
+            if initialize(&mut *ctx, encode, columns).is_none() {
+                errors::int_to_size_impossible(here!("xmlSecBase64CtxInitialize"), columns);
+                return -1;
             }
         }
+        0
     })
 }
 
@@ -230,10 +352,11 @@ pub(crate) unsafe extern "C" fn xmlSecBase64CtxInitialize(
 /// `ctx` is null or a context.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecBase64CtxFinalize(ctx: *mut XmlSecBase64Ctx) {
-    if !ctx.is_null() {
+    contain((), || {
+        check!(!ctx.is_null(), "xmlSecBase64CtxFinalize", c"ctx != NULL");
         // SAFETY: `ctx` is a writable context.
-        unsafe { ctx.write_bytes(0, 1) };
-    }
+        unsafe { ctx.write(XmlSecBase64Ctx::empty()) };
+    });
 }
 
 /// `xmlSecBase64CtxUpdate_ex`: processes all of `input`, writing at most
@@ -253,21 +376,51 @@ pub(crate) unsafe extern "C" fn xmlSecBase64CtxUpdate_ex(
     out_written: *mut usize,
 ) -> c_int {
     contain(-1, || {
-        if ctx.is_null() || input.is_null() || out.is_null() || out_written.is_null() {
-            return -1;
-        }
+        check!(
+            !ctx.is_null(),
+            "xmlSecBase64CtxUpdate_ex",
+            c"ctx != NULL",
+            -1
+        );
+        check!(
+            !input.is_null(),
+            "xmlSecBase64CtxUpdate_ex",
+            c"in != NULL",
+            -1
+        );
+        check!(
+            !out.is_null(),
+            "xmlSecBase64CtxUpdate_ex",
+            c"out != NULL",
+            -1
+        );
+        check!(
+            !out_written.is_null(),
+            "xmlSecBase64CtxUpdate_ex",
+            c"outWritten != NULL",
+            -1
+        );
         // SAFETY: by the caller's contract.
         unsafe {
-            match update(
-                &mut *ctx,
-                in_slice(input, in_size),
-                out_slice(out, out_size),
-            ) {
-                Some(written) => {
+            let before = (*ctx).codec();
+            let encode = before.encode;
+            let data = in_slice(input, in_size);
+            match update(&mut *ctx, data, out_slice(out, out_size)) {
+                Ok(written) => {
                     out_written.write(written);
                     0
                 }
-                None => -1,
+                Err(error) => {
+                    let here = here!("xmlSecBase64CtxUpdate_ex");
+                    report_update_failure(before, data, error);
+                    let failed = if encode {
+                        c"xmlSecBase64CtxEncode"
+                    } else {
+                        c"xmlSecBase64CtxDecode"
+                    };
+                    errors::internal(here, std::ptr::null(), failed);
+                    -1
+                }
             }
         }
     })
@@ -285,17 +438,37 @@ pub(crate) unsafe extern "C" fn xmlSecBase64CtxFinal_ex(
     out_written: *mut usize,
 ) -> c_int {
     contain(-1, || {
-        if ctx.is_null() || out.is_null() || out_size == 0 || out_written.is_null() {
-            return -1;
-        }
+        check!(
+            !ctx.is_null(),
+            "xmlSecBase64CtxFinal_ex",
+            c"ctx != NULL",
+            -1
+        );
+        check!(
+            !out.is_null(),
+            "xmlSecBase64CtxFinal_ex",
+            c"out != NULL",
+            -1
+        );
+        check!(out_size > 0, "xmlSecBase64CtxFinal_ex", c"outSize > 0", -1);
+        check!(
+            !out_written.is_null(),
+            "xmlSecBase64CtxFinal_ex",
+            c"outWritten != NULL",
+            -1
+        );
         // SAFETY: by the caller's contract.
         unsafe {
             match finish(&mut *ctx, out_slice(out, out_size)) {
-                Some(written) => {
+                Ok(written) => {
                     out_written.write(written);
                     0
                 }
-                None => -1,
+                Err(error) => {
+                    let here = here!("xmlSecBase64CtxFinal_ex");
+                    report_final_failure(here, (*ctx).encode != 0, error, out_size);
+                    -1
+                }
             }
         }
     })
@@ -313,31 +486,62 @@ pub(crate) unsafe extern "C" fn xmlSecBase64Encode(
     columns: c_int,
 ) -> *mut u8 {
     contain(std::ptr::null_mut(), || {
-        if input.is_null() {
+        check!(
+            !input.is_null(),
+            "xmlSecBase64Encode",
+            c"in != NULL",
+            std::ptr::null_mut()
+        );
+        let here = here!("xmlSecBase64Encode");
+        let mut ctx = XmlSecBase64Ctx::empty();
+        // SAFETY: `ctx` is a context on the stack.
+        if unsafe { xmlSecBase64CtxInitialize(&raw mut ctx, 1, columns) } < 0 {
+            errors::internal(here, std::ptr::null(), c"xmlSecBase64CtxInitialize");
             return std::ptr::null_mut();
         }
-        let Some(mut ctx) = XmlSecBase64Ctx::new(1, columns) else {
-            return std::ptr::null_mut();
-        };
         let Some(size) = encode_size(ctx.columns, in_size) else {
+            errors::internal(here, std::ptr::null(), c"xmlSecBase64GetEncodeSize");
             return std::ptr::null_mut();
         };
         let result = malloc(size).cast::<u8>();
         if result.is_null() {
+            errors::malloc_failed(here, std::ptr::null(), size);
             return result;
         }
-        // SAFETY: `result` holds `size` bytes; `input` is readable.
-        let output = unsafe { out_slice(result, size) };
-        // SAFETY: as above.
-        let encoded = update(&mut ctx, unsafe { in_slice(input, in_size) }, output)
-            .and_then(|written| Some((written, finish(&mut ctx, &mut output[written..])?)));
-        let Some((written, last)) = encoded else {
-            // SAFETY: the allocation is ours.
-            unsafe { free(result.cast::<c_void>()) };
-            return std::ptr::null_mut();
-        };
-        output[written + last] = 0;
-        result
+        let (mut written, mut last) = (0, 0);
+        // SAFETY: `result` holds `size` bytes; `input` is readable for
+        // `in_size` bytes.
+        unsafe {
+            if xmlSecBase64CtxUpdate_ex(
+                &raw mut ctx,
+                input,
+                in_size,
+                result,
+                size,
+                &raw mut written,
+            ) < 0
+            {
+                errors::internal_with(
+                    here,
+                    std::ptr::null(),
+                    c"xmlSecBase64CtxUpdate_ex",
+                    &format!("inSize={in_size}; outSize={size}"),
+                );
+            } else if xmlSecBase64CtxFinal_ex(
+                &raw mut ctx,
+                result.add(written),
+                size - written,
+                &raw mut last,
+            ) < 0
+            {
+                errors::internal(here, std::ptr::null(), c"xmlSecBase64CtxFinal_ex");
+            } else {
+                result.add(written + last).write(0);
+                return result;
+            }
+            free(result.cast::<c_void>());
+        }
+        std::ptr::null_mut()
     })
 }
 
@@ -356,9 +560,15 @@ pub(crate) unsafe extern "C" fn xmlSecBase64Decode_ex(
     out_written: *mut usize,
 ) -> c_int {
     contain(-1, || {
-        if text.is_null() || out.is_null() || out_written.is_null() {
-            return -1;
-        }
+        check!(!text.is_null(), "xmlSecBase64Decode_ex", c"str != NULL", -1);
+        check!(!out.is_null(), "xmlSecBase64Decode_ex", c"out != NULL", -1);
+        check!(
+            !out_written.is_null(),
+            "xmlSecBase64Decode_ex",
+            c"outWritten != NULL",
+            -1
+        );
+        let here = here!("xmlSecBase64Decode_ex");
         // Decoding never writes ahead of reading (three bytes out per four
         // characters in), so `out` may alias `text`. The input is copied
         // first so that the slices do not alias.
@@ -366,19 +576,35 @@ pub(crate) unsafe extern "C" fn xmlSecBase64Decode_ex(
         let input = unsafe { CStr::from_ptr(text.cast::<c_char>()) }
             .to_bytes()
             .to_vec();
-        let Some(mut ctx) = XmlSecBase64Ctx::new(0, 0) else {
-            return -1;
-        };
-        // SAFETY: `out` is writable for `out_size` bytes.
-        let output = unsafe { out_slice(out, out_size) };
-        let Some(written) = update(&mut ctx, &input, output) else {
-            return -1;
-        };
-        let Some(last) = finish(&mut ctx, &mut output[written..]) else {
-            return -1;
-        };
-        // SAFETY: `out_written` is writable.
-        unsafe { out_written.write(written + last) };
+        let mut ctx = XmlSecBase64Ctx::empty();
+        let (mut written, mut last) = (0, 0);
+        // SAFETY: `ctx` is on the stack; `out` is writable for `out_size`
+        // bytes and the input is our copy.
+        unsafe {
+            if xmlSecBase64CtxUpdate_ex(
+                &raw mut ctx,
+                input.as_ptr(),
+                input.len(),
+                out,
+                out_size,
+                &raw mut written,
+            ) < 0
+            {
+                errors::internal(here, std::ptr::null(), c"xmlSecBase64CtxUpdate_ex");
+                return -1;
+            }
+            if xmlSecBase64CtxFinal_ex(
+                &raw mut ctx,
+                out.add(written),
+                out_size - written,
+                &raw mut last,
+            ) < 0
+            {
+                errors::internal(here, std::ptr::null(), c"xmlSecBase64CtxFinal_ex");
+                return -1;
+            }
+            out_written.write(written + last);
+        }
         0
     })
 }
@@ -393,9 +619,12 @@ pub(crate) unsafe extern "C" fn xmlSecBase64DecodeInPlace(
     out_written: *mut usize,
 ) -> c_int {
     contain(-1, || {
-        if text.is_null() {
-            return -1;
-        }
+        check!(
+            !text.is_null(),
+            "xmlSecBase64DecodeInPlace",
+            c"str != NULL",
+            -1
+        );
         // SAFETY: the string is NUL-terminated and writable through its NUL.
         unsafe {
             let size = CStr::from_ptr(text.cast::<c_char>()).to_bytes().len() + 1;
