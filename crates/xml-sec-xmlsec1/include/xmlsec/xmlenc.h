@@ -19,8 +19,7 @@
 
 #include <stdio.h>
 
-#include <libxml/tree.h>
-#include <libxml/parser.h>
+#include <xs_tree.h>
 
 #include <xmlsec/exports.h>
 #include <xmlsec/xmlsec.h>

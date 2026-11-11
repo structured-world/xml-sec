@@ -15,7 +15,7 @@
  * @{
  */
 
-#include <libxml/tree.h>
+#include <xs_tree.h>
 
 #include <xmlsec/exports.h>
 #include <xmlsec/xmlsec.h>
@@ -86,8 +86,7 @@ XMLSEC_EXPORT int               xmlSecBufferRemoveHead          (xmlSecBufferPtr
 XMLSEC_EXPORT int               xmlSecBufferRemoveTail          (xmlSecBufferPtr buf,
                                                                  xmlSecSize size);
 XMLSEC_EXPORT int               xmlSecBufferReverse             (xmlSecBufferPtr buf);
-XMLSEC_EXPORT int               xmlSecBufferReadFile            (xmlSecBufferPtr buf,
-                                                                 const char* filename);
+/* xmlSecBufferReadFile is not offered: the library reads no file; the caller passes the bytes. */
 XMLSEC_EXPORT int               xmlSecBufferBase64NodeContentRead(xmlSecBufferPtr buf,
                                                                  xmlNodePtr node);
 XMLSEC_EXPORT int               xmlSecBufferBase64NodeContentWrite(xmlSecBufferPtr buf,

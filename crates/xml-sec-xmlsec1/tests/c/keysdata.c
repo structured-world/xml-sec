@@ -2,14 +2,13 @@
  * enabled subset, lookups, a custom binary key-data klass driven through
  * every dispatcher, key-data lists, a custom store klass, the binary value
  * helpers, a transform context's extra key data, and Base64 node content.
- * Built unmodified against the pinned libxmlsec1 and against
- * this crate, both must print the same. */
+ * Built against the pinned libxmlsec1 and against this crate, both must
+ * print the same. */
 
 #include <stdio.h>
 #include <string.h>
 
-#include <libxml/parser.h>
-#include <libxml/tree.h>
+#include "tree.h"
 #include <xmlsec/xmlsec.h>
 #include <xmlsec/xmltree.h>
 #include <xmlsec/transforms.h>
@@ -273,19 +272,19 @@ int main(void) {
     /* Base64 node content and hex dumps */
     {
         static const char xml[] = "<a>\n  Zm9v\n  YmFy  \n</a>";
-        xmlDocPtr doc = xmlReadMemory(xml, (int)strlen(xml), "b.xml", NULL, 0);
-        xmlNodePtr root = xmlDocGetRootElement(doc);
-        xmlNodePtr out = xmlNewDocNode(doc, NULL, BAD_CAST "out", NULL);
+        xmlDocPtr doc = xsReadMemory(xml, (int)strlen(xml), "b.xml", NULL, 0);
+        xmlNodePtr root = xsDocGetRootElement(doc);
+        xmlNodePtr out = xsNewDocNode(doc, NULL, BAD_CAST "out", NULL);
         xmlSecBufferPtr buf = xmlSecBufferCreate(0);
         xmlChar *trimmed = xmlSecGetNodeContentAndTrim(root);
         printf("trimmed: [%s]\n", (const char *)trimmed);
-        xmlFree(trimmed);
+        xsFree(trimmed);
         printf("node read: %d [%.*s]\n", xmlSecBufferBase64NodeContentRead(buf, root),
                (int)xmlSecBufferGetSize(buf), (const char *)xmlSecBufferGetData(buf));
         printf("node write: %d", xmlSecBufferBase64NodeContentWrite(buf, out, 4));
-        trimmed = xmlNodeGetContent(out);
+        trimmed = xsNodeGetContent(out);
         printf(" [%s]\n", (const char *)trimmed);
-        xmlFree(trimmed);
+        xsFree(trimmed);
         xmlSecBufferSetData(buf, BAD_CAST "0123456789abcdef0123456789abcdefXY", 34);
         xmlSecBufferDebugHexDump(buf, stdout);
         printf("\n");
@@ -299,8 +298,8 @@ int main(void) {
             xmlSecTransformCtxDestroy(ctx);
         }
         xmlSecBufferDestroy(buf);
-        xmlFreeNode(out);
-        xmlFreeDoc(doc);
+        xsFreeNode(out);
+        xsFreeDoc(doc);
     }
 
     printf("persist: %d", xmlSecImportGetPersistKey());

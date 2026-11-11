@@ -9,7 +9,7 @@
 
 use std::ffi::{CStr, c_int, c_uint, c_void};
 
-use xml_sec_libxml2::ffi::XmlNode;
+use super::tree::XmlNode;
 
 use super::buffer::{
     XmlSecBuffer, xmlSecBufferAppend, xmlSecBufferFinalize, xmlSecBufferGetData,

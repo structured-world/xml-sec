@@ -68,20 +68,20 @@ fn the_library_is_the_one_cargo_names_for_the_crate() {
 }
 
 #[test]
-fn the_bridge_declares_the_clean_api_and_its_entry_point() {
-    // The bridge library reexports the clean C API, so its exports are checked
-    // against both headers, and its programs include both directories.
+fn the_tree_library_declares_the_clean_api_its_entry_point_and_the_tree() {
+    // The tree library reexports the clean C API, so its exports are checked
+    // against the clean header, its own and the tree functions' header, and
+    // its programs include their directories.
     let headers = Target::Libxml2.headers();
     assert_eq!(headers[0], HEADER);
-    let bridge = declared(&read(headers[1]));
-    assert!(bridge.contains("xs_libxml2_document"));
-    assert!(!declared(&read(HEADER)).contains("xs_libxml2_document"));
+    let entry = declared(&read(headers[1]));
+    assert!(entry.contains("xs_tree_document"));
+    assert!(!declared(&read(HEADER)).contains("xs_tree_document"));
+    let tree = declared(&read(headers[2]));
+    assert!(tree.contains("xsReadMemory") && tree.contains("xsFree"));
     assert_eq!(Target::Libxml2.includes().len(), 2);
-    // The bridge is qualified exactly where a support level is claimed.
-    assert_eq!(
-        targets().contains(&Target::Libxml2),
-        cfg!(any(target_os = "linux", target_os = "macos"))
-    );
+    // Nothing is resolved at run time, so it is qualified on every platform.
+    assert!(targets().contains(&Target::Libxml2));
 }
 
 #[test]
