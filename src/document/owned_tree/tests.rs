@@ -469,6 +469,31 @@ fn a_fragment_parses_in_the_namespaces_of_its_context() {
 }
 
 #[test]
+fn a_node_copied_from_another_tree_keeps_its_namespaces() {
+    // As libxml2's xmlDocCopyNode: the copy is unlinked in the target tree
+    // and declares the bindings its source inherited, so it reads the same
+    // once linked there; its xml:id is registered.
+    let source = parsed(r#"<s xmlns:p="urn:p"><p:a xml:id="i"><b p:x="1"/></p:a></s>"#);
+    let element = children(&source, source.root_element().expect("a root"))[0];
+    let mut target = parsed("<t/>");
+    let copy = target.copy_from(&source, element).expect("a live node");
+    assert_eq!(target.parent(copy), Ok(None));
+    let root = target.root_element().expect("a root");
+    target
+        .append_child(root, copy)
+        .expect("an unlinked node links");
+    assert_eq!(
+        target.serialize(),
+        "<?xml version=\"1.0\"?>\n<t><p:a xmlns:p=\"urn:p\" xml:id=\"i\"><b p:x=\"1\"/></p:a></t>\n"
+    );
+    assert_eq!(target.element_by_id("i"), Some(copy));
+    assert_eq!(
+        target.copy_from(&source, source.document_node()),
+        Err(TreeError::DocumentNode)
+    );
+}
+
+#[test]
 fn a_cdata_terminator_in_edited_content_survives_serialization() {
     // XML 1.0 section 2.7: CDATA content cannot hold `]]>`, so the
     // serialization splits it across sections, as libxml2 writes it.

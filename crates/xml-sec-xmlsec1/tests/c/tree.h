@@ -21,8 +21,12 @@
 #define xsFree(mem) xmlFree(mem)
 #define xsStrdup xmlStrdup
 #define xsReadMemory xmlReadMemory
+#define xsNewDoc xmlNewDoc
 #define xsFreeDoc xmlFreeDoc
 #define xsDocGetRootElement xmlDocGetRootElement
+#define xsDocSetRootElement xmlDocSetRootElement
+#define xsAddChild xmlAddChild
+#define xsGetProp xmlGetProp
 #define xsDocDumpMemory xmlDocDumpMemory
 #define xsNewDocNode xmlNewDocNode
 #define xsNodeGetContent xmlNodeGetContent

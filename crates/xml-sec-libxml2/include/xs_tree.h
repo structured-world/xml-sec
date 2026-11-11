@@ -116,6 +116,9 @@ void xsUnlinkNode(xmlNodePtr node);
 void xsFreeNode(xmlNodePtr node);
 /* Unlike libxml2's: a node of a linked list is unlinked before it is freed. */
 void xsFreeNodeList(xmlNodePtr node);
+/* Unlike libxml2's: only extended == 1, the recursive copy, is made; other
+ * values return NULL. */
+xmlNodePtr xsDocCopyNode(const xmlNode *node, xmlDocPtr doc, int extended);
 xmlNodePtr xsReplaceNode(xmlNodePtr old, xmlNodePtr current);
 /* data is UTF-8. Unlike libxml2's, a refusal returns 1 (bad context or
  * encoding) or 5 (content not well-formed or refused by the policy) rather

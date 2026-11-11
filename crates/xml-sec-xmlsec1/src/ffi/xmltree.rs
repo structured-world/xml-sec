@@ -10,6 +10,11 @@ mod content;
 mod edit;
 mod qname;
 
+pub(crate) use content::xmlSecNodeEncodeAndSetContent;
+pub(crate) use edit::{
+    xmlSecAddChild, xmlSecAddNextSibling, xmlSecAddPrevSibling, xmlSecReplaceContent,
+};
+
 /// C `isspace` in the "C" locale, which libxmlsec1 trims and tests with.
 const fn is_space(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
