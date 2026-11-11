@@ -2,7 +2,7 @@
 //!
 //! Serializes a `Document` tree into a well-formed XML string.
 
-use crate::parser_xmloxide::tree::{Document, NodeId, NodeKind};
+use crate::parser_xmloxide::tree::{Attribute, Document, NodeId, NodeKind};
 use alloc::string::{String, ToString};
 
 /// Options controlling XML serialization output.
@@ -287,7 +287,13 @@ fn serialize_element_node(
         out.push(':');
     }
     out.push_str(name);
-    for attr in attributes {
+    let is_ns_decl =
+        |attr: &&Attribute| attr.name == "xmlns" || attr.prefix.as_deref() == Some("xmlns");
+    // libxml2 writes an element's namespace declarations before its
+    // attributes, each group in its own order.
+    let declarations = attributes.iter().filter(is_ns_decl);
+    let others = attributes.iter().filter(|attr| !is_ns_decl(attr));
+    for attr in declarations.chain(others) {
         out.push(' ');
         if let Some(pfx) = &attr.prefix {
             out.push_str(pfx);
@@ -295,7 +301,7 @@ fn serialize_element_node(
         }
         out.push_str(&attr.name);
         out.push_str("=\"");
-        let is_ns_decl = attr.name == "xmlns" || attr.prefix.as_deref() == Some("xmlns");
+        let is_ns_decl = is_ns_decl(&attr);
         if let Some(raw) = attr.raw_value.as_ref().filter(|_| !is_ns_decl) {
             write_escaped_attr_preserve_refs(out, raw, reencode_non_ascii);
         } else {

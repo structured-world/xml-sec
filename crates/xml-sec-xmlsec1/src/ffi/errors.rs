@@ -60,6 +60,8 @@ pub(crate) const R_INVALID_NODE: c_int = 21;
 pub(crate) const R_INVALID_NODE_CONTENT: c_int = 22;
 /// `XMLSEC_ERRORS_R_INVALID_NODE_ATTRIBUTE`.
 pub(crate) const R_INVALID_NODE_ATTRIBUTE: c_int = 23;
+/// `XMLSEC_ERRORS_R_NODE_ALREADY_PRESENT`.
+pub(crate) const R_NODE_ALREADY_PRESENT: c_int = 26;
 /// `XMLSEC_ERRORS_R_UNEXPECTED_NODE`.
 pub(crate) const R_UNEXPECTED_NODE: c_int = 27;
 /// `XMLSEC_ERRORS_R_NODE_NOT_FOUND`.
@@ -470,6 +472,28 @@ pub(crate) unsafe fn invalid_node_content(
         std::ptr::null(),
         R_INVALID_NODE_CONTENT,
         &format!("node={name}; reason={reason}"),
+    );
+}
+
+/// libxmlsec1's `xmlSecNodeAlreadyPresentError`: `parent` already has a
+/// child `node`.
+///
+/// # Safety
+/// Callable with any pointer; `unsafe` keeps the reporting helpers' shape.
+pub(crate) unsafe fn node_already_present(
+    here: Here,
+    parent: *const XmlNode,
+    node: &CStr,
+    object: *const c_char,
+) {
+    // SAFETY: by the caller's contract.
+    let name = unsafe { node_name(parent) };
+    report(
+        here,
+        object,
+        std::ptr::null(),
+        R_NODE_ALREADY_PRESENT,
+        &format!("parent={name}; node={}", node.to_string_lossy()),
     );
 }
 

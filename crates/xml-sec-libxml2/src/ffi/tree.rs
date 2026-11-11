@@ -633,6 +633,27 @@ pub unsafe extern "C" fn xsFreeNode(node: *mut Node) {
     });
 }
 
+/// `xmlDocCopyNode`: a copy of `node` and its subtree in `doc`, unlinked,
+/// for `extended` 1, the recursive copy; null otherwise or when refused. An
+/// element copy declares the namespace bindings it inherited.
+///
+/// # Safety
+/// Callable with any pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xsDocCopyNode(
+    node: *const Node,
+    doc: *mut Doc,
+    extended: c_int,
+) -> *mut Node {
+    contain(std::ptr::null_mut(), || {
+        if extended == 1 {
+            nodes::copy_node(node, doc)
+        } else {
+            std::ptr::null_mut()
+        }
+    })
+}
+
 /// `xmlFreeNodeList`: free `node` and every sibling after it, each with its
 /// subtree; a node of a linked list is unlinked before it is freed.
 ///

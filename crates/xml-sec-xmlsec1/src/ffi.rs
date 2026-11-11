@@ -20,6 +20,7 @@ pub(crate) mod nodeset;
 pub(crate) mod parser;
 pub(crate) mod policy;
 pub(crate) mod strings;
+pub(crate) mod templates;
 pub(crate) mod transforms;
 pub(crate) mod tree;
 pub(crate) mod xmltree;

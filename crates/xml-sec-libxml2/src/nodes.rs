@@ -756,6 +756,27 @@ fn parse_fragment(node: *const Node, bytes: &[u8]) -> Result<*mut Node, Fragment
     Ok(first.map_or(std::ptr::null_mut(), |first| node_pointer(document, first)))
 }
 
+/// `xmlDocCopyNode` with a recursive copy: `node` and its subtree copied
+/// into `doc`, unlinked; null when either names nothing live or `node` is a
+/// document. The copy is staged outside both documents, so no two document
+/// locks are ever held together.
+#[must_use]
+pub fn copy_node(node: *const Node, doc: *const Doc) -> *mut Node {
+    let (Some((source_document, source)), Some(target)) = (tree_node(node), document_of(doc))
+    else {
+        return std::ptr::null_mut();
+    };
+    let staged = handles::read_document(source_document, |tree| {
+        let mut staged = OwnedTree::new();
+        staged.copy_from(tree, source).map(|top| (staged, top))
+    });
+    let Ok(Ok((staged, top))) = staged else {
+        return std::ptr::null_mut();
+    };
+    handles::edit_document(target, |tree| tree.copy_from(&staged, top))
+        .map_or(std::ptr::null_mut(), |copy| node_pointer(target, copy))
+}
+
 /// `xmlFreeNodeList`: free `node` and every sibling after it, each with its
 /// subtree; a value naming nothing live is ignored. Unlike libxml2's, which
 /// leaves a linked list's parent pointing at freed memory, each node is

@@ -619,16 +619,64 @@ impl OwnedTree {
             .map(|child| self.import(&parsed.document, child))
             .collect();
         for &top in &tops {
-            let elements: Vec<NodeId> = core::iter::once(top)
-                .chain(self.document.descendants(top))
-                .collect();
-            for element in elements {
-                // A value another element holds keeps that element, as
-                // libxml2's parser keeps the first.
-                drop(self.register_xml_id(element, &[]));
-            }
+            self.register_imported_ids(top);
         }
         Ok(self.hold(&tops))
+    }
+
+    /// A copy of `node` of `source` and its subtree in this tree, unlinked,
+    /// as libxml2's `xmlDocCopyNode` makes one: an element copy declares
+    /// the bindings its source had in scope from its ancestors, so it reads
+    /// the same wherever it is linked. `source` may be this tree's own state
+    /// before the copy.
+    ///
+    /// # Errors
+    /// [`TreeError::StaleNode`] for a node that is not live in `source`, or
+    /// [`TreeError::DocumentNode`] for its document node.
+    pub fn copy_from(&mut self, source: &Self, node: TreeNode) -> Result<TreeNode, TreeError> {
+        let from = source.live(node)?;
+        if from == source.document.root() {
+            return Err(TreeError::DocumentNode);
+        }
+        let copy = self.import(&source.document, from);
+        if let Some(parent) = source.linked_parent(from) {
+            let declared: Vec<Option<String>> = source
+                .document
+                .attributes(from)
+                .iter()
+                .filter_map(declaration)
+                .map(|declared| declared.prefix.map(String::from))
+                .collect();
+            let inherited: Vec<(Option<String>, String)> = source
+                .bindings_in_scope(parent)
+                .into_iter()
+                .filter(|(prefix, _)| !declared.iter().any(|own| own.as_deref() == *prefix))
+                .map(|(prefix, uri)| (prefix.map(String::from), String::from(uri)))
+                .collect();
+            if matches!(self.document.node(copy).kind, NodeKind::Element { .. }) {
+                for (prefix, uri) in inherited {
+                    let (name, attribute_prefix) = match prefix.as_deref() {
+                        Some(prefix) => (prefix, Some("xmlns")),
+                        None => ("xmlns", None),
+                    };
+                    self.put_attribute(copy, name, attribute_prefix, None, &uri);
+                }
+            }
+        }
+        self.register_imported_ids(copy);
+        Ok(TreeNode::of(copy))
+    }
+
+    /// Register the `xml:id` attributes of the imported subtree at `top`; a
+    /// value another element holds keeps that element, as libxml2's parser
+    /// keeps the first.
+    fn register_imported_ids(&mut self, top: NodeId) {
+        let elements: Vec<NodeId> = core::iter::once(top)
+            .chain(self.document.descendants(top))
+            .collect();
+        for element in elements {
+            drop(self.register_xml_id(element, &[]));
+        }
     }
 
     /// The namespace bindings in scope at `element`, nearest declaration of
