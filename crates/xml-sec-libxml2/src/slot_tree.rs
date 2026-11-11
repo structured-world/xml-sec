@@ -11,6 +11,9 @@ use crate::handles::{self, HandleError};
 
 /// The tree in one slot of the handle table.
 pub struct SlotTree {
+    /// A slot number is never reused, so once its document is freed every
+    /// access is refused rather than reaching a later document; no
+    /// generation needs checking beside it.
     slot: usize,
     document: ExternalNode,
 }
