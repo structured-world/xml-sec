@@ -1,6 +1,24 @@
 use super::*;
 use crate::nodes::pointer_of;
 
+/// The owned tree keeps documents whichever backend a build selects: a
+/// build with only roxmltree parses tree documents and keeps roxmltree as
+/// the backend of the clean C API.
+#[cfg(all(
+    feature = "xml-backend-roxmltree",
+    not(feature = "xml-backend-xmloxide")
+))]
+#[test]
+fn the_tree_leaves_the_selected_backend_alone() {
+    assert_eq!(
+        xml_sec::XmlBackend::default(),
+        xml_sec::XmlBackend::Roxmltree
+    );
+    assert!(!xml_sec::XmlBackend::Xmloxide.is_available());
+    let doc = parse(b"<r/>").expect("a tree document parses");
+    handles::free_document(doc).expect("the document can be freed");
+}
+
 #[test]
 fn a_utf16_document_parses() {
     // XML 1.0 section 4.3.3: every processor reads UTF-16; the byte-order

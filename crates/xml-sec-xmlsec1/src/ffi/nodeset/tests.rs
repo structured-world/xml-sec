@@ -203,6 +203,40 @@ fn walk_follows_document_order_and_the_member_operation() {
     xml_sec_libxml2::document::free(doc);
 }
 
+/// A document a Rust caller parsed with an internal DTD and registered: its
+/// entity references stay in the tree, the parsed replacement under each.
+fn with_entity(xml: &str) -> *mut XmlDoc {
+    let mut policy = xml_sec::policy::VerificationPolicy::default();
+    policy.xml.allow_internal_dtd = true;
+    let tree = xml_sec::document::owned_tree::OwnedTree::parse_with_policy(xml, &policy)
+        .expect("the document parses");
+    nodes::pointer_of(xml_sec_libxml2::handles::register(tree).expect("a handle"))
+}
+
+/// The replacement of an entity reference is content of the element that
+/// holds the reference: a walk reaches it, and a tree set listing that
+/// element holds it through the reference.
+#[test]
+fn entity_replacement_content_is_walked_and_held_by_its_element() {
+    let doc = with_entity(r#"<!DOCTYPE r [<!ENTITY e "<b>t</b>">]><r>&e;</r>"#);
+    let root = nodes::root_element(doc);
+    let reference = nodes::first_child(root);
+    let replaced = nodes::first_child(reference);
+    // SAFETY: the sets are live until destroyed; each owns its node list.
+    unsafe {
+        let all = xmlSecNodeSetCreate(doc, std::ptr::null_mut(), TREE);
+        assert!(
+            walk(all).contains(&String::from("t")),
+            "the walk enters the reference"
+        );
+        xmlSecNodeSetDestroy(all);
+        let set = xmlSecNodeSetCreate(doc, listing(&[root]), TREE);
+        assert_eq!(xmlSecNodeSetContains(set, replaced, reference), 1);
+        xmlSecNodeSetDestroy(set);
+    }
+    xml_sec_libxml2::document::free(doc);
+}
+
 /// A tree set listing the document node holds the whole document, as the
 /// subtree of `/` (`XPath` Filter 2.0 section 3.4: nodes with an ancestor in
 /// the set); libxmlsec1 stops the ancestor walk at elements.

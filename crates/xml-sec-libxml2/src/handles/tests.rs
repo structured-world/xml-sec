@@ -106,6 +106,25 @@ fn freeing_a_document_ends_every_handle_into_it() {
 }
 
 #[test]
+fn work_on_one_document_does_not_hold_up_another() {
+    // A projection or edit holds its own document only: another thread reads
+    // a second document meanwhile.
+    let first = document(register_xml("<a/>")).expect("a live document");
+    let second = document(register_xml("<b/>")).expect("a live document");
+    let (done, waiting) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        read_document(second, |tree| tree.root_element().is_some()).expect("a live document");
+        done.send(()).expect("the first thread waits");
+    });
+    let answered = read_document(first, |_| {
+        waiting.recv_timeout(std::time::Duration::from_secs(5))
+    })
+    .expect("a live document");
+    reader.join().expect("the reader finishes");
+    assert!(answered.is_ok(), "the second document was read meanwhile");
+}
+
+#[test]
 fn a_freed_documents_slot_never_names_a_later_document() {
     // A clean C API document keeps the slot; once its document is freed, a
     // later document must not answer for it.

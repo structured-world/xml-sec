@@ -40,6 +40,23 @@ unsafe fn text<'a>(text: *const XmlChar) -> Option<&'a str> {
         .ok()
 }
 
+/// A string argument that is neither null nor UTF-8.
+struct NotText;
+
+/// The text of an optional NUL-terminated argument: `Ok(None)` for null,
+/// which the call reads as absent, and [`NotText`] for text that is not
+/// UTF-8, which names nothing the call can act on and refuses it.
+///
+/// # Safety
+/// As for [`text`].
+unsafe fn optional<'a>(value: *const XmlChar) -> Result<Option<&'a str>, NotText> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: the caller's contract.
+    unsafe { text(value) }.map(Some).ok_or(NotText)
+}
+
 /// As [`text`], with null as the empty string, as libxml2 takes a null value.
 ///
 /// # Safety
@@ -290,6 +307,24 @@ pub unsafe extern "C" fn xsNodeGetName(node: *const Node) -> *mut XmlChar {
     contain(std::ptr::null_mut(), || give(nodes::name(node)))
 }
 
+/// The name of `node` as `node->name` reads it: a string the caller does
+/// not own, valid until the document is freed; null for a node without a
+/// name or a value naming nothing live. libxmlsec1's `xmlSecNodeGetName`
+/// macro reads it.
+///
+/// # Safety
+/// Callable with any pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xsNodeName(node: *const Node) -> *const XmlChar {
+    contain(std::ptr::null(), || {
+        let (Ok(document), Some(name)) = (handles::document(handle_of(node)), nodes::name(node))
+        else {
+            return std::ptr::null();
+        };
+        handles::intern(document, &name)
+    })
+}
+
 /// The namespace URI of an element or attribute, as `node->ns->href`; a
 /// copy the caller frees with `xsFree`, or null for none.
 ///
@@ -417,7 +452,8 @@ pub unsafe extern "C" fn xsNewDocNode(
 ) -> *mut Node {
     contain(std::ptr::null_mut(), || {
         // SAFETY: NUL-terminated or null by the caller's contract.
-        let (Some(name), content) = (unsafe { text(name) }, unsafe { text(content) }) else {
+        let (Some(name), Ok(content)) = (unsafe { text(name) }, unsafe { optional(content) })
+        else {
             return std::ptr::null_mut();
         };
         let Some(document) = document_of(doc) else {
@@ -693,7 +729,7 @@ pub unsafe extern "C" fn xsGetNsProp(
 ) -> *mut XmlChar {
     contain(std::ptr::null_mut(), || {
         // SAFETY: as documented.
-        let (Some(name), href) = (unsafe { text(name) }, unsafe { text(href) }) else {
+        let (Some(name), Ok(href)) = (unsafe { text(name) }, unsafe { optional(href) }) else {
             return std::ptr::null_mut();
         };
         give(nodes::namespaced_property(node, name, href))
@@ -728,7 +764,7 @@ pub unsafe extern "C" fn xsHasNsProp(
 ) -> *mut Attr {
     contain(std::ptr::null_mut(), || {
         // SAFETY: as documented.
-        let (Some(name), href) = (unsafe { text(name) }, unsafe { text(href) }) else {
+        let (Some(name), Ok(href)) = (unsafe { text(name) }, unsafe { optional(href) }) else {
             return std::ptr::null_mut();
         };
         nodes::attribute(node, name, href)
@@ -852,7 +888,7 @@ pub unsafe extern "C" fn xsNewNs(
 ) -> *mut Ns {
     contain(std::ptr::null_mut(), || {
         // SAFETY: as documented.
-        let (Some(href), prefix) = (unsafe { text(href) }, unsafe { text(prefix) }) else {
+        let (Some(href), Ok(prefix)) = (unsafe { text(href) }, unsafe { optional(prefix) }) else {
             return std::ptr::null_mut();
         };
         if prefix == Some("xml") {
@@ -897,7 +933,10 @@ pub unsafe extern "C" fn xsSearchNs(
 ) -> *mut Ns {
     contain(std::ptr::null_mut(), || {
         // SAFETY: as documented.
-        nodes::search_namespace(node, unsafe { text(prefix) })
+        match unsafe { optional(prefix) } {
+            Ok(prefix) => nodes::search_namespace(node, prefix),
+            Err(NotText) => std::ptr::null_mut(),
+        }
     })
 }
 
@@ -947,10 +986,11 @@ pub unsafe extern "C" fn xsSetNs(node: *mut Node, ns: *mut Ns) {
     });
 }
 
-/// Register the element of the attribute `attr` as the element of the ID
-/// `value` in `doc`; 0 on success, -1 when refused. libxml2's `xmlAddID`
-/// takes a validation context and returns the table entry; this one needs
-/// neither.
+/// Register the attribute `attr` as carrying the ID `value` in `doc`; 0 on
+/// success, -1 when refused, as for an ID another element holds. A later
+/// change of the attribute moves or ends the registration. libxml2's
+/// `xmlAddID` takes a validation context and returns the table entry; this
+/// one needs neither.
 ///
 /// # Safety
 /// `value` is null or NUL-terminated.
@@ -963,7 +1003,12 @@ pub unsafe extern "C" fn xsAddID(doc: *mut Doc, value: *const XmlChar, attr: *mu
         };
         let Ok(Resolved {
             document,
-            target: Target::Attribute { element, .. },
+            target:
+                Target::Attribute {
+                    element,
+                    name,
+                    namespace,
+                },
         }) = handles::resolve(handle_of(attr))
         else {
             return -1;
@@ -972,7 +1017,7 @@ pub unsafe extern "C" fn xsAddID(doc: *mut Doc, value: *const XmlChar, attr: *mu
             return -1;
         }
         status(&handles::edit_document(document, |tree| {
-            tree.register_id(element, value)
+            tree.register_id(element, &name, namespace.as_deref(), value)
         }))
     })
 }

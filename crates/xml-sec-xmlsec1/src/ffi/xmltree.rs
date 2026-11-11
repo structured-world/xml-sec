@@ -310,8 +310,13 @@ pub(crate) unsafe extern "C" fn xmlSecDepthFirstTreeWalk(
             if result == 0 {
                 break;
             }
+            // An entity reference a tree kept holds its parsed replacement,
+            // which is content (XML 1.0 section 4.4.2), so the walk enters it.
             let kind = nodes::kind(current);
-            if kind == XML_ELEMENT_NODE || kind == XML_DOCUMENT_NODE {
+            if matches!(
+                kind,
+                XML_ELEMENT_NODE | XML_DOCUMENT_NODE | nodes::XML_ENTITY_REF_NODE
+            ) {
                 let mut child = nodes::last_child(current);
                 while !child.is_null() {
                     pending.push(child);

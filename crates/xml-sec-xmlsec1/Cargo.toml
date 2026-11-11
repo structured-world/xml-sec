@@ -13,7 +13,7 @@ description = "libxmlsec1 source and extension compatibility over the xml-sec co
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-xml-sec = { path = "../..", default-features = false, features = ["std", "xmldsig", "c14n", "external-tree", "rustcrypto"] }
+xml-sec = { path = "../..", default-features = false, features = ["std", "xmldsig", "c14n", "owned-tree", "rustcrypto"] }
 xml-sec-libxml2 = { path = "../xml-sec-libxml2" }
 # C `fputs` for debug dumps to a caller's `FILE*`.
 libc = "0.2"

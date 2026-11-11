@@ -19,7 +19,8 @@ what this library adds.
    library's functions returned, released once, as with `free`.
 4. Callbacks installed for I/O buffers or the generic error channel are
    callable with the context given with them until the buffer is closed or the
-   handler replaced.
+   handler replaced. A generic error handler is the installing thread's own,
+   as libxml2's is.
 5. While a call on a clean C API document handle runs, no other code changes
    its tree.
 
@@ -30,8 +31,11 @@ what this library adds.
   that names nothing live (null, forged, a freed node or document, a removed
   attribute or declaration) is refused with null, 0 or -1; none is
   dereferenced, so a stale or forged handle cannot reach freed memory.
-- Handle values come from a counter that never repeats, so a stale handle
-  never names a later object.
+- Handle values and document numbers come from a counter that never repeats,
+  so a stale handle never names a later object.
+- Each document has its own lock, taken after the handle table's is
+  released; the two are never held together, so work on one document does not
+  wait for another and the locks cannot deadlock.
 - Documents are parsed by the core under the library policy, with its limits
   enforced while parsing; no file, URL or external entity is read.
 

@@ -41,7 +41,9 @@ static void describe(xmlNodePtr node, xmlNodePtr parent, char *out, size_t size)
     } else if (type == XML_DOCUMENT_NODE) {
         snprintf(out, size, "#document");
     } else {
-        snprintf(out, size, "%s", shown(xsNodeGetName(node), first, sizeof(first)));
+        /* libxmlsec1's macro: the name the node holds, not a copy. */
+        const char *name = xmlSecNodeGetName(node);
+        snprintf(out, size, "%s", name != NULL ? name : "");
     }
 }
 

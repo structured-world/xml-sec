@@ -271,17 +271,17 @@ pub unsafe extern "C" fn xsOutputBufferWriteString(
 }
 
 /// `xmlOutputBufferFlush`: every write already reached its callback, so
-/// there is nothing to flush; 0, or -1 for a buffer that is not live.
+/// there is nothing to flush; 0, or -1 for a buffer that is not live or
+/// whose write failed, as libxml2 reports a buffer in error.
 ///
 /// # Safety
 /// Callable with any pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xsOutputBufferFlush(out: *mut OutputBuffer) -> c_int {
     contain(-1, || {
-        if outputs(|outputs| outputs.contains_key(&handle_of(out))) {
-            0
-        } else {
-            -1
+        match outputs(|outputs| outputs.get(&handle_of(out)).map(|output| output.failed)) {
+            Some(false) => 0,
+            Some(true) | None => -1,
         }
     })
 }

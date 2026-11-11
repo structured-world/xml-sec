@@ -6,7 +6,6 @@
 //! edit frees is refused from then on, never reused, so a stale name is an
 //! error rather than a different node. No caller reaches the tree's memory.
 
-use alloc::collections::BTreeMap;
 use alloc::{string::String, vec, vec::Vec};
 use core::num::NonZeroU32;
 
@@ -17,6 +16,9 @@ use super::{DocumentParseSettings, XmlDocumentError, XmlDocumentPolicy};
 use crate::ParseError;
 use crate::parser_xmloxide as xmloxide;
 use crate::xml::dom::storage::{Native, Storage as _};
+use ids::{IdSource, IdTable};
+
+mod ids;
 use xmloxide::tree::{Attribute, NodeId, NodeKind};
 
 /// The namespace the `xml` prefix is bound to (Namespaces in XML 1.0
@@ -141,6 +143,9 @@ pub enum TreeError {
     /// A name or value holds a character XML does not admit.
     #[error("a name or value holds a character XML does not admit")]
     InvalidText,
+    /// Another live element already holds the ID.
+    #[error("another element already holds the ID")]
+    DuplicateId,
 }
 
 /// An undo record of an edit applied through [`ExternalTree::apply`].
@@ -154,10 +159,10 @@ enum Undo {
         parent: NodeId,
         next: Option<NodeId>,
     },
-    /// An ID an edit registered, and the element it named before.
+    /// An ID an edit registered, and the attribute it named before.
     Id {
         value: String,
-        previous: Option<TreeNode>,
+        previous: Option<IdSource>,
     },
 }
 
@@ -170,7 +175,7 @@ pub struct OwnedTree {
     /// The tree's ID table: `xml:id` values and the IDs a caller registered,
     /// as libxml2's is without a DTD. The parser's own index, which also
     /// names every unprefixed `id` attribute, is not consulted.
-    ids: BTreeMap<String, TreeNode>,
+    ids: IdTable,
 }
 
 impl core::fmt::Debug for OwnedTree {
@@ -196,7 +201,7 @@ impl OwnedTree {
             document: xmloxide::Document::new(),
             freed: Vec::new(),
             journal: Vec::new(),
-            ids: BTreeMap::new(),
+            ids: IdTable::default(),
         }
     }
 
@@ -294,7 +299,7 @@ impl OwnedTree {
         // expansion: the lexical scan every other parse runs refuses one the
         // policy does not allow before its internal subset is read, and
         // bounds the entities it expands.
-        if !crate::xml::dom::XmlBackend::Xmloxide.records_positions(xml) {
+        if crate::xml::dom::declares_document_type(xml) {
             let mut pass = super::LimitPass::new(settings, None, super::NativeXmlStorage)?;
             crate::xml::dom::scan_declared_document(xml, settings.allow_dtd, &mut pass)
                 .map_err(|error| pass.refusal_or(XmlDocumentError::Parse(error)))?;
@@ -306,7 +311,7 @@ impl OwnedTree {
         .map_err(|_| XmlDocumentError::Parse(ParseError::AllocationFailed))?;
         let (parsed, counter) = xmloxide::parser::parse_str_enforcing_limits(
             xml,
-            &crate::xml::dom::xmloxide_backend_options(),
+            &crate::xml::dom::xmloxide_parse_options(),
             super::parse_limits(settings),
             tree,
         )
@@ -325,7 +330,7 @@ impl OwnedTree {
             document,
             freed: Vec::new(),
             journal: Vec::new(),
-            ids: BTreeMap::new(),
+            ids: IdTable::default(),
         };
         tree.settle_parsed_attributes();
         Ok(tree)
@@ -373,12 +378,39 @@ impl OwnedTree {
             .expect("normalizing in place allocates nothing");
         attribute.raw_value = None;
         let value = attribute.value.clone();
-        let previous = self.ids.get(value.as_str()).copied();
-        if previous.is_some_and(|node| self.contains(node) && self.attached(node)) {
-            return None;
+        self.claim(
+            value,
+            IdSource {
+                element: TreeNode::of(element),
+                name: String::from("id"),
+                namespace: Some(String::from(XML_NAMESPACE)),
+            },
+        )
+        .ok()
+        .flatten()
+    }
+
+    /// Make `value` the ID `source` carries, unless an attribute of another
+    /// live, linked element holds it. The undo record of a change is
+    /// returned; `None` when `source` already held it.
+    ///
+    /// # Errors
+    /// [`TreeError::DuplicateId`] when another element holds `value`.
+    fn claim(&mut self, value: String, source: IdSource) -> Result<Option<Undo>, TreeError> {
+        let previous = self.ids.get(&value).cloned();
+        match &previous {
+            Some(held) if *held == source => return Ok(None),
+            Some(held)
+                if held.element != source.element
+                    && self.contains(held.element)
+                    && self.attached(held.element) =>
+            {
+                return Err(TreeError::DuplicateId);
+            }
+            _ => {}
         }
-        self.ids.insert(value.clone(), TreeNode::of(element));
-        Some(Undo::Id { value, previous })
+        self.ids.insert(value.clone(), source);
+        Ok(Some(Undo::Id { value, previous }))
     }
 
     /// Register the `xml:id` attributes of the inserted subtrees `built`,
@@ -620,7 +652,7 @@ impl OwnedTree {
     /// The element registered for the ID `value`, if it is live and linked.
     #[must_use]
     pub fn element_by_id(&self, value: &str) -> Option<TreeNode> {
-        let node = *self.ids.get(value)?;
+        let node = self.ids.get(value)?.element;
         (self.contains(node) && self.attached(node)).then_some(node)
     }
 
@@ -637,14 +669,25 @@ impl OwnedTree {
         false
     }
 
-    /// Register `element` as the element of the ID `value`.
+    /// Register the attribute `name` in `namespace` of `element` as carrying
+    /// the ID `value`; a later change of that attribute moves or ends the
+    /// registration.
     ///
     /// # Errors
-    /// [`TreeError::StaleNode`] or [`TreeError::NotAnElement`].
-    pub fn register_id(&mut self, element: TreeNode, value: &str) -> Result<(), TreeError> {
+    /// [`TreeError::StaleNode`], [`TreeError::NotAnElement`], or
+    /// [`TreeError::DuplicateId`] when another live element holds `value`,
+    /// as libxml2's `xmlAddID` refuses it.
+    pub fn register_id(
+        &mut self,
+        element: TreeNode,
+        name: &str,
+        namespace: Option<&str>,
+        value: &str,
+    ) -> Result<(), TreeError> {
         self.element(element)?;
-        self.ids.insert(String::from(value), element);
-        Ok(())
+        let source = id_source(element, name, namespace);
+        // A caller's registration is not journaled, so its undo record is not kept.
+        self.claim(String::from(value), source).map(drop)
     }
 
     fn element(&self, node: TreeNode) -> Result<NodeId, TreeError> {
@@ -753,34 +796,19 @@ impl OwnedTree {
         valid(value)?;
         prefix.map(valid).transpose()?;
         namespace.map(valid).transpose()?;
-        let is_xml_id = is_xml_id(local_name, namespace);
-        if is_xml_id {
-            self.forget_xml_id(id);
-        }
+        // An ID the attribute carries moves with its value: libxml2 removes
+        // the ID of a changed attribute and adds the new value.
+        let source = id_source(element, local_name, namespace);
+        let carried = self.ids.remove_source(&source);
         self.put_attribute(id, local_name, prefix, namespace, value);
-        if is_xml_id {
-            // A caller's edit is not journaled, so its undo record is not kept.
+        // A caller's edit is not journaled, so its undo records are not kept.
+        if is_xml_id(local_name, namespace) {
             drop(self.register_xml_id(id));
+        } else if carried.is_some() {
+            // Refused like xmlAddID when another element holds the value.
+            drop(self.claim(String::from(value), source));
         }
         Ok(())
-    }
-
-    /// Drop the ID table entry the `xml:id` of `element` holds, if that
-    /// entry names `element`, before the attribute changes or goes.
-    fn forget_xml_id(&mut self, element: NodeId) {
-        let current = self
-            .document
-            .attributes(element)
-            .iter()
-            .find_map(|attribute| {
-                is_xml_id(&attribute.name, attribute.namespace.as_deref())
-                    .then_some(attribute.value.as_str())
-            });
-        if let Some(value) = current
-            && self.ids.get(value) == Some(&TreeNode::of(element))
-        {
-            self.ids.remove(value);
-        }
     }
 
     fn put_attribute(
@@ -864,9 +892,9 @@ impl OwnedTree {
     ) -> Result<bool, TreeError> {
         let id = self.element(element)?;
         let namespace = namespace.filter(|uri| !uri.is_empty());
-        if is_xml_id(local_name, namespace) {
-            self.forget_xml_id(id);
-        }
+        // A removed attribute carries its ID away.
+        self.ids
+            .remove_source(&id_source(element, local_name, namespace));
         let NodeKind::Element { attributes, .. } = &mut self.document.node_mut(id).kind else {
             return Err(TreeError::NotAnElement);
         };
@@ -1070,7 +1098,16 @@ impl OwnedTree {
     /// section 4) or registered in the document's ID table.
     fn is_id(&self, element: NodeId, attribute: &Attribute) -> bool {
         is_xml_id(&attribute.name, attribute.namespace.as_deref())
-            || self.ids.get(attribute.value.as_str()) == Some(&TreeNode::of(element))
+            || self
+                .ids
+                .get(attribute.value.as_str())
+                .is_some_and(|source| {
+                    source.is(
+                        TreeNode::of(element),
+                        &attribute.name,
+                        attribute.namespace.as_deref(),
+                    )
+                })
     }
 
     /// Build the fragment's nodes unlinked, in order.
@@ -1302,6 +1339,16 @@ enum Closes {
     Element,
     /// An entity reference's replacement.
     Entity,
+}
+
+/// The ID table's key for the attribute `name` in `namespace` of `element`;
+/// an empty URI is no namespace.
+fn id_source(element: TreeNode, name: &str, namespace: Option<&str>) -> IdSource {
+    IdSource {
+        element,
+        name: String::from(name),
+        namespace: namespace.filter(|uri| !uri.is_empty()).map(String::from),
+    }
 }
 
 /// Whether `local_name` in `namespace` names `xml:id` (xml:id 1.0 section 4).

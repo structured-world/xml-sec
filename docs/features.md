@@ -28,6 +28,13 @@ Every core build must select `xml-backend-xmloxide` or
 `xml-backends-all` compiles both. `xml-backend-differential` also chooses
 differential parsing as the default runtime backend.
 
+`owned-tree` adds the crate's own mutable document tree
+(`document::owned_tree`), which the tree library of the libxmlsec1 surface
+keeps its documents in; it implies `external-tree`. The tree is built over the
+xmloxide arena, so the feature compiles that parser for the tree alone: it
+does not make xmloxide a parser backend or change the backend a build
+selects.
+
 The built-in provider is the `rustcrypto` feature. `xmldsig-sign`, `xmlenc`,
 `dstu4145`, `experimental-pq` and `aws-lc-fips` imply it, since they import keys
 into or implement algorithms with its backends. Without it, `default_provider()`

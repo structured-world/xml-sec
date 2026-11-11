@@ -30,15 +30,23 @@ pub use tree::{
     Namespaces, Node, NodeId, NodeType, PI, XmlIdError,
 };
 
-/// The xmloxide parser options every parse of this crate uses, for a parse
-/// into a tree other than the semantic arena (the owned tree's).
-#[cfg(all(
-    feature = "external-tree",
-    feature = "xml-backend-xmloxide",
-    any(feature = "xmldsig", feature = "xmlenc")
-))]
-pub(crate) fn xmloxide_backend_options() -> crate::parser_xmloxide::parser::ParseOptions {
-    xmloxide::backend_options()
+/// The xmloxide parser options every parse of this crate uses, into the
+/// semantic arena or into the owned tree.
+#[cfg(any(feature = "xml-backend-xmloxide", feature = "owned-tree"))]
+pub(crate) fn xmloxide_parse_options() -> crate::parser_xmloxide::parser::ParseOptions {
+    // The shared preflight owns the backend-neutral contract. These absolute
+    // limits are defense in depth against a backend regression allocating
+    // expanded entity data before returning control to the semantic tree.
+    crate::parser_xmloxide::parser::ParseOptions::default()
+        .max_depth(
+            u32::try_from(crate::hard_limits::XML_DOCUMENT_DEPTH_CEILING)
+                .expect("XML depth ceiling fits into u32"),
+        )
+        .max_attributes(u32::MAX)
+        .max_attribute_length(usize::MAX)
+        .max_text_length(crate::hard_limits::XML_ENTITY_EXPANSION_WORK_BYTE_CEILING)
+        .max_name_length(usize::MAX)
+        .max_entity_expansions(crate::hard_limits::XML_ENTITY_EXPANSION_CEILING)
 }
 
 /// The lexical scan a document with a document type declaration passes before
@@ -48,17 +56,22 @@ pub(crate) fn xmloxide_backend_options() -> crate::parser_xmloxide::parser::Pars
 ///
 /// # Errors
 /// [`ParseError::DtdDetected`], a lexical error, or the observer's refusal.
-#[cfg(all(
-    feature = "external-tree",
-    feature = "xml-backend-xmloxide",
-    any(feature = "xmldsig", feature = "xmlenc")
-))]
+#[cfg(all(feature = "owned-tree", any(feature = "xmldsig", feature = "xmlenc")))]
 pub(crate) fn scan_declared_document<'input, O: ScanObserver<'input>>(
     input: &'input str,
     allow_dtd: bool,
     observer: &mut O,
 ) -> Result<(), ParseError> {
     LexicalPreflight::scan_observed(input, allow_dtd, XmlBackend::Xmloxide, observer).map(drop)
+}
+
+/// Whether `input` may declare a document type, which brings declarations
+/// and entity expansion a lexical scan must bound before xmloxide reads it.
+/// The keyword is case-sensitive (XML 1.0 production 28); any other spelling
+/// is not well-formed and xmloxide refuses it.
+#[cfg(any(feature = "xml-backend-xmloxide", feature = "owned-tree"))]
+pub(crate) fn declares_document_type(input: &str) -> bool {
+    input.contains("<!DOCTYPE")
 }
 
 /// Parser-neutral options used after bounded lexical preflight.
@@ -140,7 +153,7 @@ impl XmlBackend {
     /// declarations and entity expansion, which a scan must bound first.
     #[cfg(feature = "xml-backend-xmloxide")]
     pub(crate) fn records_positions(self, input: &str) -> bool {
-        self == Self::Xmloxide && !input.contains("<!DOCTYPE")
+        self == Self::Xmloxide && !declares_document_type(input)
     }
 
     fn parse<'input>(

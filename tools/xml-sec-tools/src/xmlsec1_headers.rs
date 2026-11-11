@@ -76,9 +76,18 @@ pub(crate) const NOT_OFFERED: [(&str, &str); 4] = [
 /// The include that replaces libxml2's headers.
 const TREE_INCLUDE: &str = "#include <xs_tree.h>";
 
+/// Lines of libxmlsec1's headers that read a field of a tree type, which
+/// `xs_tree.h` declares incomplete, with the line that reads it through the
+/// tree's accessor instead.
+pub(crate) const FIELD_READS: [(&str, &str); 1] = [(
+    "    (((node)) ? ((const char*)((node)->name)) : NULL)",
+    "    (((node)) ? ((const char*)xsNodeName(node)) : NULL)",
+)];
+
 /// `header` with libxml2's includes replaced by one include of the tree
-/// header and every declaration of a [`NOT_OFFERED`] function replaced by a
-/// comment saying so.
+/// header, every declaration of a [`NOT_OFFERED`] function replaced by a
+/// comment saying so, and every [`FIELD_READS`] line read through the
+/// accessor.
 pub(crate) fn adapted(header: &[u8]) -> Result<Vec<u8>, String> {
     let text = std::str::from_utf8(header).map_err(|_| "a header is not UTF-8")?;
     let mut lines = Vec::new();
@@ -105,6 +114,11 @@ pub(crate) fn adapted(header: &[u8]) -> Result<Vec<u8>, String> {
         if let Some((name, reason)) = declared {
             lines.push(format!("/* {name} is not offered: {reason}. */\n"));
             skipping = !line.contains(';');
+            continue;
+        }
+        let body = line.trim_end_matches(['\r', '\n']);
+        if let Some((_, accessor)) = FIELD_READS.iter().find(|(field, _)| *field == body) {
+            lines.push(format!("{accessor}{}", &line[body.len()..]));
             continue;
         }
         lines.push(line.to_owned());

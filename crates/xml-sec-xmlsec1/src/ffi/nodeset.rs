@@ -103,7 +103,13 @@ fn listed_or_ancestor(
         // the document node: a tree set listing it holds the whole document
         // (XPath Filter 2.0 section 3.4: nodes with an ancestor in the set).
         // libxmlsec1 stops at the root element.
-        if !parent.is_null() && matches!(nodes::kind(parent), XML_ELEMENT_NODE | XML_DOCUMENT_NODE)
+        // An entity reference passes the walk up to the element holding it:
+        // its replacement is that element's content.
+        if !parent.is_null()
+            && matches!(
+                nodes::kind(parent),
+                XML_ELEMENT_NODE | XML_DOCUMENT_NODE | nodes::XML_ENTITY_REF_NODE
+            )
         {
             node = parent;
             parent = nodes::parent(parent);

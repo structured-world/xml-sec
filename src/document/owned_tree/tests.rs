@@ -248,6 +248,58 @@ fn setting_or_removing_an_xml_id_keeps_the_id_table_in_step() {
 }
 
 #[test]
+fn a_registered_id_follows_its_attribute() {
+    // An ID registered for an attribute answers under the attribute's
+    // current value: a changed value moves it, a removed attribute ends it.
+    let mut tree = parsed(r#"<r token="old"/>"#);
+    let root = tree.root_element().expect("a document element");
+    tree.register_id(root, "token", None, "old")
+        .expect("a fresh ID");
+    tree.set_attribute(root, "token", None, None, "new")
+        .expect("an element");
+    assert_eq!(tree.element_by_id("old"), None);
+    assert_eq!(tree.element_by_id("new"), Some(root));
+    tree.remove_attribute(root, "token", None)
+        .expect("an element");
+    assert_eq!(tree.element_by_id("new"), None);
+}
+
+#[test]
+fn a_second_registration_of_a_held_id_is_refused() {
+    // As libxml2's xmlAddID: an ID a live element holds is not taken over,
+    // and the first element keeps it.
+    let mut tree = parsed(r#"<r><a k="x"/><b k="x"/></r>"#);
+    let root = tree.root_element().expect("a document element");
+    let kids = children(&tree, root);
+    tree.register_id(kids[0], "k", None, "x")
+        .expect("a fresh ID");
+    assert_eq!(
+        tree.register_id(kids[1], "k", None, "x"),
+        Err(TreeError::DuplicateId)
+    );
+    assert_eq!(tree.element_by_id("x"), Some(kids[0]));
+    // The holder registering again is no conflict.
+    assert_eq!(tree.register_id(kids[0], "k", None, "x"), Ok(()));
+}
+
+#[test]
+fn a_snapshot_counts_its_projected_bytes() {
+    // The byte ceiling of a later operation is checked against what the
+    // projection read, not against an empty serialization.
+    let tree = parsed("<r><c>text</c></r>");
+    let snapshot = XmlDocument::snapshot_of_external_tree(&tree, &VerificationPolicy::default())
+        .expect("the tree projects");
+    let owned = XmlDocument::from_external_tree(
+        Box::new(parsed("<r><c>text</c></r>")),
+        &VerificationPolicy::default(),
+    )
+    .expect("the tree projects");
+    assert!(snapshot.content_len() > 0);
+    assert_eq!(snapshot.content_len(), owned.content_len());
+    assert!(snapshot.is_tree_backed());
+}
+
+#[test]
 fn an_attribute_value_survives_serialization_and_reparse() {
     // XML 1.0 section 3.3.3: a literal newline in an attribute value is
     // normalized to a space, a reference is not; the serialization must

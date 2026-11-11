@@ -30,6 +30,24 @@ fn the_headers_take_the_tree_header_and_leave_out_file_readers() {
     );
 }
 
+/// A macro reading a field of an incomplete tree type would not compile:
+/// it reads the field through the accessor instead.
+#[test]
+fn a_field_read_goes_through_the_accessor() {
+    let header = concat!(
+        "#define xmlSecNodeGetName(node) \\\n",
+        "    (((node)) ? ((const char*)((node)->name)) : NULL)\n",
+    );
+    let adapted = String::from_utf8(adapted(header.as_bytes()).expect("UTF-8")).expect("UTF-8");
+    assert_eq!(
+        adapted,
+        concat!(
+            "#define xmlSecNodeGetName(node) \\\n",
+            "    (((node)) ? ((const char*)xsNodeName(node)) : NULL)\n",
+        )
+    );
+}
+
 /// A directory holding every header with its own name as content.
 fn installed(dir: &std::path::Path) {
     for header in HEADERS {

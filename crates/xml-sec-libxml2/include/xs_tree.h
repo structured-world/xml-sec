@@ -11,7 +11,9 @@
  *
  * A program written against libxml2 ports by renaming its tree calls
  * (xmlFoo -> xsFoo) and reading node fields through the accessor functions
- * below instead of through the structure.
+ * below instead of through the structure. A few results differ from
+ * libxml2's and are marked where declared: check those calls after the
+ * rename.
  */
 #ifndef XS_TREE_H
 #define XS_TREE_H
@@ -89,7 +91,11 @@ xmlNodePtr xsNodeGetLast(const xmlNode *node);
 xmlNodePtr xsNodeGetNext(const xmlNode *node);
 xmlNodePtr xsNodeGetPrev(const xmlNode *node);
 int xsNodeGetType(const xmlNode *node);
+/* The name as a copy the caller frees with xsFree. */
 xmlChar *xsNodeGetName(const xmlNode *node);
+/* The name as node->name reads it: not owned by the caller, valid until the
+ * document is freed. */
+const xmlChar *xsNodeName(const xmlNode *node);
 xmlChar *xsNodeGetNsHref(const xmlNode *node);
 xmlChar *xsNodeGetNsPrefix(const xmlNode *node);
 xmlAttrPtr xsNodeGetProperties(const xmlNode *node);
@@ -113,6 +119,7 @@ xmlNodePtr xsReplaceNode(xmlNodePtr old, xmlNodePtr current);
 /* Content and attributes. */
 xmlChar *xsNodeGetContent(const xmlNode *node);
 int xsNodeSetContent(xmlNodePtr node, const xmlChar *content);
+/* Unlike libxml2's, which returns nothing: 0 on success, -1 when refused. */
 int xsNodeAddContent(xmlNodePtr node, const xmlChar *content);
 xmlChar *xsGetProp(const xmlNode *node, const xmlChar *name);
 xmlChar *xsGetNsProp(const xmlNode *node, const xmlChar *name, const xmlChar *href);
@@ -127,6 +134,9 @@ xmlNsPtr xsNewNs(xmlNodePtr node, const xmlChar *href, const xmlChar *prefix);
 xmlNsPtr xsSearchNs(xmlDocPtr doc, xmlNodePtr node, const xmlChar *prefix);
 xmlNsPtr xsSearchNsByHref(xmlDocPtr doc, xmlNodePtr node, const xmlChar *href);
 void xsSetNs(xmlNodePtr node, xmlNsPtr ns);
+/* Unlike libxml2's: xsAddID returns 0 on success and -1 when refused (not an
+ * xmlIDPtr, NULL on failure), and xsGetID returns the element carrying the
+ * ID (not its attribute). */
 int xsAddID(xmlDocPtr doc, const xmlChar *value, xmlAttrPtr attr);
 xmlNodePtr xsGetID(xmlDocPtr doc, const xmlChar *value);
 

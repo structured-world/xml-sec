@@ -58,10 +58,7 @@ pub trait ExternalTree: Send + Sync {
 
     /// This tree as the crate's own [`OwnedTree`](super::owned_tree::OwnedTree),
     /// if it is one, so a caller that lent it to a document gets it back.
-    #[cfg(all(
-        feature = "xml-backend-xmloxide",
-        any(feature = "xmldsig", feature = "xmlenc")
-    ))]
+    #[cfg(all(feature = "owned-tree", any(feature = "xmldsig", feature = "xmlenc")))]
     #[must_use]
     fn into_owned_tree(self: alloc::boxed::Box<Self>) -> Option<super::owned_tree::OwnedTree> {
         None

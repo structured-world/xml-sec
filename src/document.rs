@@ -1213,11 +1213,7 @@ impl XmlDocument {
     ///
     /// # Errors
     /// As for [`Self::from_external_tree`].
-    #[cfg(all(
-        feature = "external-tree",
-        feature = "xml-backend-xmloxide",
-        any(feature = "xmldsig", feature = "xmlenc")
-    ))]
+    #[cfg(all(feature = "owned-tree", any(feature = "xmldsig", feature = "xmlenc")))]
     pub fn from_owned_tree(
         tree: owned_tree::OwnedTree,
         policy: &impl XmlDocumentPolicy,
@@ -1230,11 +1226,7 @@ impl XmlDocument {
 
     /// The crate's own tree this document reads and edits, given back to the
     /// caller that lent it; `None` for a parsed document or another tree.
-    #[cfg(all(
-        feature = "external-tree",
-        feature = "xml-backend-xmloxide",
-        any(feature = "xmldsig", feature = "xmlenc")
-    ))]
+    #[cfg(all(feature = "owned-tree", any(feature = "xmldsig", feature = "xmlenc")))]
     #[must_use]
     pub fn into_owned_tree(mut self) -> Option<owned_tree::OwnedTree> {
         self.tree.take()?.into_owned_tree()
@@ -1348,10 +1340,17 @@ impl XmlDocument {
     #[must_use]
     pub fn content_len(&self) -> usize {
         #[cfg(feature = "external-tree")]
-        if self.tree.is_some() {
+        if self.is_projected() {
             return self.cell.borrow_dependent().external_bytes;
         }
         self.as_xml().len()
+    }
+
+    /// Whether this generation is a projection of an external tree, kept
+    /// (a tree-backed document) or not (a snapshot).
+    #[cfg(feature = "external-tree")]
+    fn is_projected(&self) -> bool {
+        !self.cell.borrow_dependent().external.is_empty()
     }
 
     /// Return the deterministic serialized representation of this generation.
@@ -1601,7 +1600,7 @@ impl XmlDocument {
     /// serialization to splice, so every mutation is refused.
     #[cfg(feature = "external-tree")]
     fn is_snapshot(&self) -> bool {
-        self.tree.is_none() && !self.cell.borrow_dependent().external.is_empty()
+        self.tree.is_none() && self.is_projected()
     }
 
     /// Replace one complete element with a well-formed element fragment.
@@ -2471,11 +2470,12 @@ impl XmlDocument {
         self.commit_generation(next)
     }
 
-    /// Whether this document's content is an external tree.
+    /// Whether this document's content is an external tree: one it edits,
+    /// or one a read-only snapshot projected. Either has no serialization.
     #[cfg(feature = "external-tree")]
     #[must_use]
-    pub const fn is_tree_backed(&self) -> bool {
-        self.tree.is_some()
+    pub fn is_tree_backed(&self) -> bool {
+        self.is_projected()
     }
 
     /// Read the external tree again; a tree that changed becomes a new
@@ -5575,11 +5575,7 @@ fn element_opening_end(element: &str) -> Result<usize, XmlDocumentError> {
 pub mod external;
 #[cfg(feature = "external-tree")]
 mod markup;
-#[cfg(all(
-    feature = "external-tree",
-    feature = "xml-backend-xmloxide",
-    any(feature = "xmldsig", feature = "xmlenc")
-))]
+#[cfg(all(feature = "owned-tree", any(feature = "xmldsig", feature = "xmlenc")))]
 pub mod owned_tree;
 #[cfg(feature = "external-tree")]
 mod tree_edits;

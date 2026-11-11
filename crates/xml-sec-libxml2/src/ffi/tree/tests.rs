@@ -190,6 +190,44 @@ fn a_uri_search_passes_a_shadowed_prefix_for_one_still_in_scope() {
 }
 
 #[test]
+fn a_borrowed_name_reads_as_the_name_field() {
+    // The name libxmlsec1's xmlSecNodeGetName macro reads: not the caller's
+    // to free, the same pointer for each read.
+    // SAFETY: as above.
+    unsafe {
+        let doc = parse("<r><c/></r>");
+        let child = xsNodeGetChildren(xsDocGetRootElement(doc));
+        let name = xsNodeName(child);
+        assert!(!name.is_null());
+        assert_eq!(CStr::from_ptr(name.cast()).to_str(), Ok("c"));
+        assert_eq!(xsNodeName(child), name);
+        let forged: *mut Node = pointer_of(usize::MAX - 9);
+        assert!(xsNodeName(forged).is_null());
+        xsFreeDoc(doc);
+    }
+}
+
+#[test]
+fn text_that_is_not_utf8_is_refused_not_read_as_absent() {
+    // A prefix, URI or content that is not UTF-8 names nothing the call can
+    // act on; reading it as null would act on the default namespace, on no
+    // namespace or on no content instead.
+    let invalid = [0xFF_u8, 0];
+    let invalid: *const XmlChar = invalid.as_ptr();
+    // SAFETY: as above; `invalid` is NUL-terminated.
+    unsafe {
+        let doc = parse(r#"<r xmlns="urn:d" a="1"/>"#);
+        let root = xsDocGetRootElement(doc);
+        assert!(xsSearchNs(doc, root, invalid).is_null());
+        assert!(xsNewNs(root, c"urn:x".as_ptr().cast(), invalid).is_null());
+        assert!(take(xsGetNsProp(root, c"a".as_ptr().cast(), invalid)).is_none());
+        assert!(xsHasNsProp(root, c"a".as_ptr().cast(), invalid).is_null());
+        assert!(xsNewDocNode(doc, std::ptr::null_mut(), c"n".as_ptr().cast(), invalid).is_null());
+        xsFreeDoc(doc);
+    }
+}
+
+#[test]
 fn content_ids_and_root_replacement_follow_libxml2() {
     // SAFETY: as above.
     unsafe {

@@ -13,7 +13,9 @@ description = "The document tree of the libxmlsec1 surface, without libxml2"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-xml-sec = { path = "../..", default-features = false, features = ["std", "xmldsig", "xmldsig-sign", "xmlenc", "c14n", "external-tree"] }
+# The owned tree is the documents' storage whichever parser backend the
+# clean C API selects.
+xml-sec = { path = "../..", default-features = false, features = ["std", "xmldsig", "xmldsig-sign", "xmlenc", "c14n", "owned-tree"] }
 xml-sec-capi = { path = "../xml-sec-capi", default-features = false, features = ["external-tree"] }
 # The C heap the library hands memory out from, released with `xsFree`.
 libc = "0.2"
