@@ -146,6 +146,9 @@ pub enum TreeError {
     /// Another live element already holds the ID.
     #[error("another element already holds the ID")]
     DuplicateId,
+    /// The element has no attribute of that name carrying the ID.
+    #[error("the attribute does not carry the ID")]
+    IdNotCarried,
 }
 
 /// An undo record of an edit applied through [`ExternalTree::apply`].
@@ -353,7 +356,9 @@ impl OwnedTree {
                     attribute.raw_value = None;
                 }
             }
-            self.register_xml_id(id);
+            // A value repeated later keeps its first element, as libxml2's
+            // parser keeps the first: the repeat is not registered.
+            drop(self.register_xml_id(id, &[]));
             let first = pending.len();
             pending.extend(self.document.children(id));
             // Children are popped first to last.
@@ -362,71 +367,112 @@ impl OwnedTree {
     }
 
     /// Normalize the `xml:id` attribute of `element`, if it has one, and
-    /// register its element under the normalized value unless a live element
-    /// in the document holds it: xml:id 1.0 section 4 normalizes the value as
-    /// an ID before assigning it and keeps the normalized value in the
-    /// infoset. Returns the undo record of a registration it made.
-    fn register_xml_id(&mut self, element: NodeId) -> Option<Undo> {
+    /// register its element under the normalized value: xml:id 1.0 section 4
+    /// normalizes the value as an ID before assigning it and keeps the
+    /// normalized value in the infoset. Returns the undo record of a
+    /// registration it made.
+    ///
+    /// # Errors
+    /// [`TreeError::DuplicateId`] when another element holds the value (see
+    /// [`Self::claim`]); the attribute is normalized all the same.
+    fn register_xml_id(
+        &mut self,
+        element: NodeId,
+        released: &[NodeId],
+    ) -> Result<Option<Undo>, TreeError> {
         let NodeKind::Element { attributes, .. } = &mut self.document.node_mut(element).kind else {
-            return None;
+            return Ok(None);
         };
-        let attribute = attributes
+        let Some(attribute) = attributes
             .iter_mut()
-            .find(|attribute| is_xml_id(&attribute.name, attribute.namespace.as_deref()))?;
-        Native
-            .normalize_id(&mut attribute.value)
-            .expect("normalizing in place allocates nothing");
+            .find(|attribute| is_xml_id(&attribute.name, attribute.namespace.as_deref()))
+        else {
+            return Ok(None);
+        };
+        normalize_id_value(&mut attribute.value);
         attribute.raw_value = None;
         let value = attribute.value.clone();
-        self.claim(
-            value,
-            IdSource {
-                element: TreeNode::of(element),
-                name: String::from("id"),
-                namespace: Some(String::from(XML_NAMESPACE)),
-            },
-        )
-        .ok()
-        .flatten()
+        self.claim(value, xml_id_source(TreeNode::of(element)), released)
     }
 
-    /// Make `value` the ID `source` carries, unless an attribute of another
-    /// live, linked element holds it. The undo record of a change is
+    /// Make `value` the ID `source` carries. The undo record of a change is
     /// returned; `None` when `source` already held it.
     ///
     /// # Errors
-    /// [`TreeError::DuplicateId`] when another element holds `value`.
-    fn claim(&mut self, value: String, source: IdSource) -> Result<Option<Undo>, TreeError> {
+    /// [`TreeError::DuplicateId`] when another element holds `value` (see
+    /// [`Self::check_claim`]).
+    fn claim(
+        &mut self,
+        value: String,
+        source: IdSource,
+        released: &[NodeId],
+    ) -> Result<Option<Undo>, TreeError> {
         let previous = self.ids.get(&value).cloned();
-        match &previous {
-            Some(held) if *held == source => return Ok(None),
-            Some(held)
-                if held.element != source.element
-                    && self.contains(held.element)
-                    && self.attached(held.element) =>
-            {
-                return Err(TreeError::DuplicateId);
-            }
-            _ => {}
+        if previous.as_ref() == Some(&source) {
+            return Ok(None);
         }
+        self.check_claim(&value, &source, released)?;
         self.ids.insert(value.clone(), source);
         Ok(Some(Undo::Id { value, previous }))
     }
 
+    /// Whether `source` may take the ID `value`: it may unless an attribute
+    /// of another element that still holds IDs carries it.
+    ///
+    /// # Errors
+    /// [`TreeError::DuplicateId`] when such an element holds `value`.
+    fn check_claim(
+        &self,
+        value: &str,
+        source: &IdSource,
+        released: &[NodeId],
+    ) -> Result<(), TreeError> {
+        match self.ids.get(value) {
+            Some(held)
+                if held.element != source.element && self.holds_ids(held.element, released) =>
+            {
+                Err(TreeError::DuplicateId)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether `element` still holds its IDs: it is live, linked or not, as
+    /// libxml2 keeps the IDs of an unlinked node, unless it hangs in a
+    /// subtree the running edit unlinked from the place it fills (`released`).
+    fn holds_ids(&self, element: TreeNode, released: &[NodeId]) -> bool {
+        let Ok(mut top) = self.live(element) else {
+            return false;
+        };
+        while let Some(parent) = self.document.parent(top) {
+            top = parent;
+        }
+        !released.contains(&top)
+    }
+
     /// Register the `xml:id` attributes of the inserted subtrees `built`,
-    /// after the edit unlinked what it replaces, so a restored element takes
-    /// the ID its replaced one held.
-    fn register_inserted_ids(&mut self, built: &[NodeId]) {
+    /// after the edit unlinked what it replaces (`released`), so a restored
+    /// element takes the ID its replaced one held.
+    ///
+    /// # Errors
+    /// [`TreeError::DuplicateId`] when an inserted ID is held elsewhere; the
+    /// registrations made so far are journaled and roll back with the edit.
+    fn register_inserted_ids(
+        &mut self,
+        built: &[NodeId],
+        released: &[NodeId],
+    ) -> Result<(), TreeError> {
         for &top in built {
             let elements: Vec<NodeId> = core::iter::once(top)
                 .chain(self.document.descendants(top))
                 .collect();
             for element in elements {
-                if let Some(undo) = self.register_xml_id(element) {
+                if let Some(undo) = self.register_xml_id(element, released)? {
                     self.journal.push(undo);
                 }
             }
         }
+        Ok(())
     }
 
     /// The document as XML text: the XML declaration, then every node linked
@@ -685,9 +731,14 @@ impl OwnedTree {
         value: &str,
     ) -> Result<(), TreeError> {
         self.element(element)?;
+        // The registration names the attribute and the value it carries, so
+        // lookup and projection agree on it.
+        if self.attribute(element, name, namespace)? != Some(value) {
+            return Err(TreeError::IdNotCarried);
+        }
         let source = id_source(element, name, namespace);
         // A caller's registration is not journaled, so its undo record is not kept.
-        self.claim(String::from(value), source).map(drop)
+        self.claim(String::from(value), source, &[]).map(drop)
     }
 
     fn element(&self, node: TreeNode) -> Result<NodeId, TreeError> {
@@ -797,16 +848,27 @@ impl OwnedTree {
         prefix.map(valid).transpose()?;
         namespace.map(valid).transpose()?;
         // An ID the attribute carries moves with its value: libxml2 removes
-        // the ID of a changed attribute and adds the new value.
+        // the ID of a changed attribute and adds the new value. A value
+        // another element holds refuses the change before anything moves
+        // (xml:id 1.0 section 4: a repeated ID is an error).
         let source = id_source(element, local_name, namespace);
-        let carried = self.ids.remove_source(&source);
+        let xml_id = is_xml_id(local_name, namespace);
+        let carries = self.ids.carries(&source);
+        if xml_id || carries {
+            let mut next = String::from(value);
+            if xml_id {
+                normalize_id_value(&mut next);
+            }
+            self.check_claim(&next, &source, &[])?;
+        }
+        self.ids.remove_source(&source);
         self.put_attribute(id, local_name, prefix, namespace, value);
-        // A caller's edit is not journaled, so its undo records are not kept.
-        if is_xml_id(local_name, namespace) {
-            drop(self.register_xml_id(id));
-        } else if carried.is_some() {
-            // Refused like xmlAddID when another element holds the value.
-            drop(self.claim(String::from(value), source));
+        // A caller's edit is not journaled, so its undo records are not kept;
+        // the check above already admitted the value.
+        if xml_id {
+            self.register_xml_id(id, &[])?;
+        } else if carries {
+            self.claim(String::from(value), source, &[])?;
         }
         Ok(())
     }
@@ -1215,17 +1277,19 @@ impl OwnedTree {
             TreeEdit::ReplaceContent { target, fragment } => {
                 let target = self.target(target)?;
                 let built = self.build(&fragment)?;
+                let mut released = Vec::new();
                 while let Some(child) = self.document.first_child(target) {
                     self.detach_recorded(child);
+                    released.push(child);
                 }
                 self.attach(target, None, &built);
-                self.register_inserted_ids(&built);
+                self.register_edit_ids(&built, &released)?;
             }
             TreeEdit::AppendChild { target, fragment } => {
                 let target = self.target(target)?;
                 let built = self.build(&fragment)?;
                 self.attach(target, None, &built);
-                self.register_inserted_ids(&built);
+                self.register_edit_ids(&built, &[])?;
             }
             TreeEdit::InsertBefore { target, fragment }
             | TreeEdit::ReplaceNode { target, fragment } => {
@@ -1236,13 +1300,27 @@ impl OwnedTree {
                     .ok_or_else(|| edit_error("the target has no parent"))?;
                 let built = self.build(&fragment)?;
                 self.attach(parent, Some(target), &built);
-                if matches!(edit, TreeEdit::ReplaceNode { .. }) {
+                let released = if matches!(edit, TreeEdit::ReplaceNode { .. }) {
                     self.detach_recorded(target);
-                }
-                self.register_inserted_ids(&built);
+                    alloc::vec![target]
+                } else {
+                    Vec::new()
+                };
+                self.register_edit_ids(&built, &released)?;
             }
         }
         Ok(())
+    }
+
+    /// [`Self::register_inserted_ids`] within an edit: a refusal fails the
+    /// edit, whose journal then rolls back.
+    fn register_edit_ids(
+        &mut self,
+        built: &[NodeId],
+        released: &[NodeId],
+    ) -> Result<(), TreeEditError> {
+        self.register_inserted_ids(built, released)
+            .map_err(|error| edit_error(&alloc::format!("{error}")))
     }
 
     fn target(&self, node: ExternalNode) -> Result<NodeId, TreeEditError> {
@@ -1348,6 +1426,22 @@ fn id_source(element: TreeNode, name: &str, namespace: Option<&str>) -> IdSource
         element,
         name: String::from(name),
         namespace: namespace.filter(|uri| !uri.is_empty()).map(String::from),
+    }
+}
+
+/// Normalize `value` in place as an ID value (xml:id 1.0 section 4).
+fn normalize_id_value(value: &mut String) {
+    Native
+        .normalize_id(value)
+        .expect("normalizing in place allocates nothing");
+}
+
+/// The ID table's key for the `xml:id` attribute of `element`.
+fn xml_id_source(element: TreeNode) -> IdSource {
+    IdSource {
+        element,
+        name: String::from("id"),
+        namespace: Some(String::from(XML_NAMESPACE)),
     }
 }
 

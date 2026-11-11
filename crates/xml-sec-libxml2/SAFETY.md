@@ -33,9 +33,12 @@ what this library adds.
   dereferenced, so a stale or forged handle cannot reach freed memory.
 - Handle values and document numbers come from a counter that never repeats,
   so a stale handle never names a later object.
-- Each document has its own lock, taken after the handle table's is
-  released; the two are never held together, so work on one document does not
-  wait for another and the locks cannot deadlock.
+- Each document has its own lock, so work on one document does not wait for
+  another. Locks are taken in one order, a document's and then the handle
+  table's for a short step, never the other way, so they cannot deadlock. A
+  change and the dropping of the handles it ended happen under one hold of
+  the document's lock, so a removed attribute's handle never names a later
+  attribute of the same name.
 - Documents are parsed by the core under the library policy, with its limits
   enforced while parsing; no file, URL or external entity is read.
 

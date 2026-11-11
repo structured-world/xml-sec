@@ -48,6 +48,11 @@ impl IdTable {
         previous
     }
 
+    /// Whether `source` carries an ID.
+    pub(super) fn carries(&self, source: &IdSource) -> bool {
+        self.by_source.contains_key(source)
+    }
+
     /// Drop the entry of `value`.
     pub(super) fn remove(&mut self, value: &str) {
         if let Some(source) = self.by_value.remove(value) {

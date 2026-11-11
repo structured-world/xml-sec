@@ -179,8 +179,10 @@ fn serialize_node(
             write_escaped_text(out, content, reencode_non_ascii);
         }
         NodeKind::CData { content } => {
+            // XML 1.0 section 2.7: content cannot hold `]]>`, so each one is
+            // split across adjacent sections, as libxml2 writes it.
             out.push_str("<![CDATA[");
-            out.push_str(content);
+            out.push_str(&content.replace("]]>", "]]]]><![CDATA[>"));
             out.push_str("]]>");
         }
         NodeKind::Comment { content } => {

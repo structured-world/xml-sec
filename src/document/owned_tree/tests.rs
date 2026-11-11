@@ -283,6 +283,94 @@ fn a_second_registration_of_a_held_id_is_refused() {
 }
 
 #[test]
+fn an_unlinked_element_keeps_its_id() {
+    // As libxml2 keeps the ID of an unlinked node: another element cannot
+    // take it, so relinking the holder never leaves two elements one ID.
+    let mut tree = parsed(r#"<r><a xml:id="x"/><b/></r>"#);
+    let root = tree.root_element().expect("a document element");
+    let kids = children(&tree, root);
+    tree.unlink(kids[0]).expect("a live node");
+    assert_eq!(
+        tree.set_attribute(kids[1], "id", Some("xml"), Some(XML_NAMESPACE), "x"),
+        Err(TreeError::DuplicateId)
+    );
+    tree.append_child(root, kids[0]).expect("both live");
+    assert_eq!(tree.element_by_id("x"), Some(kids[0]));
+}
+
+#[test]
+fn a_duplicate_id_leaves_the_attribute_and_the_table_as_they_were() {
+    // xml:id 1.0 section 4: a repeated value is an error. A refused change
+    // keeps the old value and its registration.
+    let mut tree = parsed(r#"<r><a xml:id="x"/><b xml:id="y"/></r>"#);
+    let root = tree.root_element().expect("a document element");
+    let kids = children(&tree, root);
+    assert_eq!(
+        tree.set_attribute(kids[1], "id", Some("xml"), Some(XML_NAMESPACE), "x"),
+        Err(TreeError::DuplicateId)
+    );
+    assert_eq!(
+        tree.attribute(kids[1], "id", Some(XML_NAMESPACE)),
+        Ok(Some("y"))
+    );
+    assert_eq!(tree.element_by_id("y"), Some(kids[1]));
+    assert_eq!(tree.element_by_id("x"), Some(kids[0]));
+    // An inserted fragment repeating an ID is refused and rolled back.
+    let mut document =
+        XmlDocument::from_external_tree(Box::new(tree), &VerificationPolicy::default())
+            .expect("the tree projects");
+    let root = document.with_view(|view| view.node_identity(view.document().root_element()));
+    assert!(document.append_child(root, r#"<c xml:id="x"/>"#).is_err());
+    let tree = document.into_owned_tree().expect("the lent tree");
+    let root = tree.root_element().expect("a document element");
+    assert_eq!(children(&tree, root).len(), 2);
+    assert_eq!(tree.element_by_id("x"), Some(kids[0]));
+}
+
+#[test]
+fn a_replacement_takes_over_the_id_of_what_it_replaces() {
+    // An element put in the place of one holding the same xml:id, as
+    // decryption restores it, takes the ID: the replaced one leaves with the
+    // edit.
+    let tree = parsed(r#"<r><a xml:id="x"/></r>"#);
+    let mut document =
+        XmlDocument::from_external_tree(Box::new(tree), &VerificationPolicy::default())
+            .expect("the tree projects");
+    let replaced = document.with_view(|view| {
+        let child = view
+            .document()
+            .root_element()
+            .first_element_child()
+            .expect("a child element");
+        view.node_identity(child)
+    });
+    document
+        .replace_element(replaced, r#"<b xml:id="x"/>"#)
+        .expect("the replacement is admitted");
+    let tree = document.into_owned_tree().expect("the lent tree");
+    let element = tree.element_by_id("x").expect("the ID is registered");
+    assert_eq!(tree.name(element), Ok(Some("b")));
+}
+
+#[test]
+fn an_id_is_registered_only_for_an_attribute_carrying_it() {
+    // The registration names the attribute and its value; a missing
+    // attribute or another value would make lookup and projection disagree.
+    let mut tree = parsed(r#"<r token="old"/>"#);
+    let root = tree.root_element().expect("a document element");
+    assert_eq!(
+        tree.register_id(root, "missing", None, "x"),
+        Err(TreeError::IdNotCarried)
+    );
+    assert_eq!(
+        tree.register_id(root, "token", None, "other"),
+        Err(TreeError::IdNotCarried)
+    );
+    assert_eq!(tree.element_by_id("x"), None);
+    assert_eq!(tree.element_by_id("other"), None);
+}
+
+#[test]
 fn a_snapshot_counts_its_projected_bytes() {
     // The byte ceiling of a later operation is checked against what the
     // projection read, not against an empty serialization.
@@ -297,6 +385,21 @@ fn a_snapshot_counts_its_projected_bytes() {
     assert!(snapshot.content_len() > 0);
     assert_eq!(snapshot.content_len(), owned.content_len());
     assert!(snapshot.is_tree_backed());
+}
+
+#[test]
+fn a_cdata_terminator_in_edited_content_survives_serialization() {
+    // XML 1.0 section 2.7: CDATA content cannot hold `]]>`, so the
+    // serialization splits it across sections, as libxml2 writes it.
+    let mut tree = parsed("<r><![CDATA[x]]></r>");
+    let root = tree.root_element().expect("a document element");
+    let cdata = children(&tree, root)[0];
+    tree.set_text(cdata, "a]]>b").expect("a CDATA node");
+    let xml = tree.serialize();
+    assert!(xml.contains("<![CDATA[a]]]]><![CDATA[>b]]>"), "{xml}");
+    let again = parsed(&xml);
+    let root = again.root_element().expect("a document element");
+    assert_eq!(again.text_content(root), Ok(String::from("a]]>b")));
 }
 
 #[test]

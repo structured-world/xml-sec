@@ -76,8 +76,16 @@ pub enum HandleError {
     Tree(#[from] TreeError),
 }
 
-/// One document: its tree and the strings handed out of it. Each document
-/// has its own lock, so reading or changing one does not hold up the others.
+/// One document: its tree, the strings handed out of it and the handles
+/// issued into it. Each document has its own lock, so reading or changing
+/// one does not hold up the others.
+///
+/// Locks are taken in one order: a document's lock, then the table's for
+/// a short step. The table's lock is never held while a document's is
+/// taken, so the two cannot deadlock. A change and the dropping of the
+/// handles it ended happen under one hold of the document's lock, and so do
+/// a target's check and its handle's issue, so no other call sees a removed
+/// target's handle name a later target of the same name.
 struct Slot {
     /// `None` while an operation holds the tree.
     tree: Option<OwnedTree>,
@@ -86,11 +94,15 @@ struct Slot {
     /// document is freed. A `CString`'s bytes stay where they are when the
     /// map moves it, so a returned pointer stays valid.
     strings: HashMap<String, std::ffi::CString>,
+    /// The handles issued into the document; readers holding the document's
+    /// shared lock add to it, so it has its own lock, never held with the
+    /// table's.
+    issued: Mutex<Issued>,
 }
 
 /// A document shared between the table and the calls working on it: a call
 /// takes its own reference, leaves the table's lock and then locks the
-/// document, so the two locks are never held together.
+/// document.
 type Shared = Arc<RwLock<Slot>>;
 
 /// The handles issued into one document.
@@ -110,7 +122,7 @@ struct Issued {
 struct Table {
     /// Documents by a number from the handle counter, never reused: a slot
     /// number kept past its document's end never names a later document.
-    slots: HashMap<usize, (Shared, Issued)>,
+    slots: HashMap<usize, Shared>,
     handles: HashMap<usize, Resolved>,
     reverse: HashMap<Resolved, usize>,
     /// Node sets, under handles from the same counter.
@@ -132,7 +144,7 @@ fn slot(document: usize) -> Result<Shared, HandleError> {
         table
             .slots
             .get(&document)
-            .map(|(slot, _)| Arc::clone(slot))
+            .map(Arc::clone)
             .ok_or(HandleError::Stale)
     })
 }
@@ -205,20 +217,22 @@ impl Table {
         Ok(handle)
     }
 
-    fn issue(&mut self, resolved: Resolved) -> Result<usize, HandleError> {
+    /// The handle of `resolved`, issued now if it has none; whether it is
+    /// new. The caller holds the document's lock and records a new handle in
+    /// the document's [`Issued`].
+    fn issue(&mut self, resolved: Resolved) -> Result<(usize, bool), HandleError> {
         if let Some(&handle) = self.reverse.get(&resolved) {
-            return Ok(handle);
+            return Ok((handle, false));
         }
-        // A value the counter skips for a missing document is never issued.
+        if !self.slots.contains_key(&resolved.document) {
+            return Err(HandleError::Stale);
+        }
+        self.issue_new(resolved).map(|handle| (handle, true))
+    }
+
+    /// A new handle for `resolved`, which has none.
+    fn issue_new(&mut self, resolved: Resolved) -> Result<usize, HandleError> {
         let handle = self.fresh()?;
-        let (_, issued) = self
-            .slots
-            .get_mut(&resolved.document)
-            .ok_or(HandleError::Stale)?;
-        issued.all.insert(handle);
-        if !matches!(resolved.target, Target::Node(_)) {
-            issued.named.insert(handle);
-        }
         self.handles.insert(handle, resolved.clone());
         self.reverse.insert(resolved, handle);
         Ok(handle)
@@ -226,70 +240,82 @@ impl Table {
 
     fn forget(&mut self, handle: usize) {
         if let Some(resolved) = self.handles.remove(&handle) {
-            if let Some((_, issued)) = self.slots.get_mut(&resolved.document) {
-                issued.all.remove(&handle);
-                issued.named.remove(&handle);
-            }
             self.reverse.remove(&resolved);
         }
     }
+}
 
-    /// The name-keyed handles of `document` with their targets.
-    fn named(&self, document: usize) -> Vec<(usize, Target)> {
-        self.slots
-            .get(&document)
-            .map(|(_, issued)| {
-                issued
-                    .named
-                    .iter()
-                    .filter_map(|handle| {
-                        self.handles
-                            .get(handle)
-                            .map(|resolved| (*handle, resolved.target.clone()))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+/// Whether `target` is named by element and name, so a later target of the
+/// same name could take its place.
+fn is_named(target: &Target) -> bool {
+    !matches!(target, Target::Node(_))
+}
+
+impl Issued {
+    fn record(&mut self, handle: usize, named: bool) {
+        self.all.insert(handle);
+        if named {
+            self.named.insert(handle);
+        }
+    }
+
+    fn remove(&mut self, handle: usize) {
+        self.all.remove(&handle);
+        self.named.remove(&handle);
     }
 }
 
-/// Drop the handles of `document` named by element and name whose target no
-/// longer exists; only that document's are visited.
-fn prune(document: usize, slot: &Shared) {
-    let named = with_table(|table| table.named(document));
+/// Drop the handles of a document named by element and name whose target no
+/// longer exists in `slot`; the caller holds the document's lock for
+/// writing, through the change that removed them.
+fn prune(slot: &Slot) {
+    let Some(tree) = slot.tree.as_ref() else {
+        return;
+    };
+    let named: Vec<usize> = slot.issued.lock().named.iter().copied().collect();
     if named.is_empty() {
         return;
     }
-    let dead: Vec<usize> = {
-        let guard = slot.read();
-        let Some(tree) = guard.tree.as_ref() else {
-            return;
-        };
+    let targets: Vec<(usize, Target)> = with_table(|table| {
         named
-            .into_iter()
-            .filter(|(_, target)| !exists(tree, target))
-            .map(|(handle, _)| handle)
+            .iter()
+            .filter_map(|handle| {
+                table
+                    .handles
+                    .get(handle)
+                    .map(|resolved| (*handle, resolved.target.clone()))
+            })
             .collect()
-    };
+    });
+    let dead: Vec<usize> = targets
+        .into_iter()
+        .filter(|(_, target)| !exists(tree, target))
+        .map(|(handle, _)| handle)
+        .collect();
+    if dead.is_empty() {
+        return;
+    }
     with_table(|table| {
-        for handle in dead {
+        for &handle in &dead {
             table.forget(handle);
         }
     });
+    let mut issued = slot.issued.lock();
+    for handle in dead {
+        issued.remove(handle);
+    }
 }
 
-/// Run `work` on the tree of `document` for writing, then drop the handles
-/// of what it removed.
+/// Run `work` on the tree of `document` for writing and drop the handles of
+/// what it removed, under one hold of the document's lock.
 fn write_document<R>(
     document: usize,
     work: impl FnOnce(&mut OwnedTree) -> R,
 ) -> Result<R, HandleError> {
     let slot = slot(document)?;
-    let result = {
-        let mut guard = slot.write();
-        work(guard.tree.as_mut().ok_or(HandleError::Busy)?)
-    };
-    prune(document, &slot);
+    let mut guard = slot.write();
+    let result = work(guard.tree.as_mut().ok_or(HandleError::Busy)?);
+    prune(&guard);
     Ok(result)
 }
 
@@ -299,17 +325,24 @@ fn write_document<R>(
 /// [`HandleError::Stale`] when the handle counter is exhausted.
 pub fn register(tree: OwnedTree) -> Result<usize, HandleError> {
     let node = tree.document_node();
-    let slot = Arc::new(RwLock::new(Slot {
-        tree: Some(tree),
-        strings: HashMap::new(),
-    }));
     with_table(|table| {
         let document = table.fresh()?;
-        table.slots.insert(document, (slot, Issued::default()));
-        table.issue(Resolved {
+        // The document joins the table with its first handle recorded.
+        let handle = table.issue_new(Resolved {
             document,
             target: Target::Node(node),
-        })
+        })?;
+        let mut issued = Issued::default();
+        issued.record(handle, false);
+        table.slots.insert(
+            document,
+            Arc::new(RwLock::new(Slot {
+                tree: Some(tree),
+                strings: HashMap::new(),
+                issued: Mutex::new(issued),
+            })),
+        );
+        Ok(handle)
     })
 }
 
@@ -321,13 +354,17 @@ pub fn register(tree: OwnedTree) -> Result<usize, HandleError> {
 pub fn resolve(handle: usize) -> Result<Resolved, HandleError> {
     let resolved =
         with_table(|table| table.handles.get(&handle).cloned()).ok_or(HandleError::Stale)?;
-    let alive = read_document(resolved.document, |tree| exists(tree, &resolved.target))?;
-    if alive {
-        Ok(resolved)
-    } else {
-        with_table(|table| table.forget(handle));
-        Err(HandleError::Stale)
+    let slot = slot(resolved.document)?;
+    let guard = slot.read();
+    let tree = guard.tree.as_ref().ok_or(HandleError::Busy)?;
+    if exists(tree, &resolved.target) {
+        return Ok(resolved);
     }
+    // A dead handle is dropped while the document's lock keeps its target
+    // from coming back meanwhile.
+    with_table(|table| table.forget(handle));
+    guard.issued.lock().remove(handle);
+    Err(HandleError::Stale)
 }
 
 /// The node `handle` names.
@@ -359,12 +396,20 @@ pub fn document(handle: usize) -> Result<usize, HandleError> {
 /// [`HandleError::Stale`] for a document or target that does not exist, or
 /// an exhausted counter.
 pub fn handle(document: usize, target: Target) -> Result<usize, HandleError> {
-    // A target removed between the check and the issue gets a handle that
-    // its first lookup refuses and forgets.
-    if !read_document(document, |tree| exists(tree, &target))? {
+    // The check and the issue happen under one hold of the document's lock,
+    // so no change removes the target between them.
+    let slot = slot(document)?;
+    let guard = slot.read();
+    let tree = guard.tree.as_ref().ok_or(HandleError::Busy)?;
+    if !exists(tree, &target) {
         return Err(HandleError::Stale);
     }
-    with_table(|table| table.issue(Resolved { document, target }))
+    let named = is_named(&target);
+    let (handle, new) = with_table(|table| table.issue(Resolved { document, target }))?;
+    if new {
+        guard.issued.lock().record(handle, named);
+    }
+    Ok(handle)
 }
 
 /// The handle of the document node of `document`.
@@ -467,14 +512,12 @@ pub fn lend(handle: usize) -> Result<(usize, OwnedTree), HandleError> {
 /// [`HandleError::Busy`] when it already holds a tree.
 pub fn give_back(document: usize, tree: OwnedTree) -> Result<(), HandleError> {
     let slot = slot(document)?;
-    {
-        let mut guard = slot.write();
-        if guard.tree.is_some() {
-            return Err(HandleError::Busy);
-        }
-        guard.tree = Some(tree);
+    let mut guard = slot.write();
+    if guard.tree.is_some() {
+        return Err(HandleError::Busy);
     }
-    prune(document, &slot);
+    guard.tree = Some(tree);
+    prune(&guard);
     Ok(())
 }
 
@@ -505,23 +548,20 @@ pub fn intern(document: usize, value: &str) -> *const u8 {
 /// [`HandleError::Stale`] or [`HandleError::Busy`].
 pub fn free_document(handle: usize) -> Result<(), HandleError> {
     let document = resolve(handle)?.document;
-    // The tree goes first, under the document's own lock: a document an
-    // operation holds is refused, and a call already holding a reference
-    // to the slot finds no tree from then on.
-    slot(document)?
-        .write()
-        .tree
-        .take()
-        .ok_or(HandleError::Busy)?;
+    // Under the document's own lock: a document an operation holds is
+    // refused, and a call already holding a reference to the slot finds no
+    // tree from then on.
+    let slot = slot(document)?;
+    let mut guard = slot.write();
+    guard.tree.take().ok_or(HandleError::Busy)?;
+    let issued = core::mem::take(guard.issued.get_mut());
     with_table(|table| {
-        let (_, issued) = table.slots.remove(&document).ok_or(HandleError::Stale)?;
+        table.slots.remove(&document);
         for handle in issued.all {
-            if let Some(resolved) = table.handles.remove(&handle) {
-                table.reverse.remove(&resolved);
-            }
+            table.forget(handle);
         }
-        Ok(())
-    })
+    });
+    Ok(())
 }
 
 /// A handle value never issued before, for an object another table keeps.

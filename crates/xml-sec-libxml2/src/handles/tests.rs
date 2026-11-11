@@ -111,12 +111,16 @@ fn work_on_one_document_does_not_hold_up_another() {
     // a second document meanwhile.
     let first = document(register_xml("<a/>")).expect("a live document");
     let second = document(register_xml("<b/>")).expect("a live document");
+    let (holding, held) = std::sync::mpsc::channel();
     let (done, waiting) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
+        // The second read starts only once the first document is held.
+        held.recv().expect("the first document is held");
         read_document(second, |tree| tree.root_element().is_some()).expect("a live document");
         done.send(()).expect("the first thread waits");
     });
     let answered = read_document(first, |_| {
+        holding.send(()).expect("the reader waits");
         waiting.recv_timeout(std::time::Duration::from_secs(5))
     })
     .expect("a live document");

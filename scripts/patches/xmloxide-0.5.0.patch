@@ -11503,7 +11503,7 @@
  fn serialize_node(
      doc: &Document,
      id: NodeId,
-@@ -166,87 +166,15 @@
+@@ -166,93 +166,23 @@
  ) {
      let indent = options.indent;
      match &doc.node(id).kind {
@@ -11600,7 +11600,16 @@
          NodeKind::Text { content } => {
              write_escaped_text(out, content, reencode_non_ascii);
          }
-@@ -313,7 +241,7 @@
+         NodeKind::CData { content } => {
++            // XML 1.0 section 2.7: content cannot hold `]]>`, so each one is
++            // split across adjacent sections, as libxml2 writes it.
+             out.push_str("<![CDATA[");
+-            out.push_str(content);
++            out.push_str(&content.replace("]]>", "]]]]><![CDATA[>"));
+             out.push_str("]]>");
+         }
+         NodeKind::Comment { content } => {
+@@ -313,7 +243,7 @@
                  }
                  _ => {}
              }
@@ -11609,7 +11618,7 @@
                  out.push_str(" [");
                  out.push_str(subset);
                  out.push_str("]>");
-@@ -327,9 +255,101 @@
+@@ -327,9 +257,101 @@
      }
  }
  
@@ -11712,7 +11721,7 @@
      let _ = write!(out, "&#x{:X};", ch as u32);
  }
  
-@@ -549,7 +569,38 @@
+@@ -549,7 +571,38 @@
  #[allow(clippy::unwrap_used)]
  mod tests {
      use super::*;
