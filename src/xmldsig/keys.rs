@@ -4,6 +4,9 @@ use alloc::{boxed::Box, collections::BTreeMap, string::String, vec::Vec};
 use core::fmt;
 
 #[cfg(test)]
+mod key_value_tests;
+
+#[cfg(test)]
 use super::parse::parse_x509_certificate;
 #[cfg(feature = "rustcrypto")]
 use dsa::pkcs8::EncodePublicKey as DsaEncodePublicKey;
@@ -15,7 +18,6 @@ use x509_parser::prelude::FromDer;
 use x509_parser::prelude::X509Certificate;
 use zeroize::Zeroizing;
 
-#[cfg(feature = "rustcrypto")]
 use super::parse::{EC_P256_OID, EC_P384_OID, EC_P521_OID};
 use super::pkix::X509DataSource;
 use super::signature::{
@@ -2594,6 +2596,129 @@ fn validate_ec_spki_point(
     }
     .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
     Ok(())
+}
+
+impl KeyValueInfo {
+    /// The DER `SubjectPublicKeyInfo` (RFC 5280 section 4.1.2.7) of an RSA,
+    /// DSA or EC key value, with its components validated as key resolution
+    /// validates them; key strength is the operation policy's decision.
+    ///
+    /// # Errors
+    /// [`KeyResolutionError::InvalidPublicKey`] for a DSA value without its
+    /// domain parameters, a DH, invalid or unsupported value, or components
+    /// that do not form a key.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use xml_sec::policy::ResourcePolicy;
+    /// use xml_sec::xmldsig::KeyValueInfo;
+    ///
+    /// let value = KeyValueInfo::Rsa { modulus: vec![0xc5], exponent: vec![3] };
+    /// let spki = value.to_spki_der()?;
+    /// assert_eq!(KeyValueInfo::from_spki_der(&spki, &ResourcePolicy::default())?, value);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn to_spki_der(&self) -> Result<Vec<u8>, KeyResolutionError> {
+        match self {
+            Self::Rsa { modulus, exponent } => rsa_key_value_to_spki_der(modulus, exponent),
+            Self::Dsa {
+                p: Some(p),
+                q: Some(q),
+                g: Some(g),
+                y,
+            } => dsa_key_value_to_spki_der(p, q, g, y),
+            Self::Ec {
+                curve_oid,
+                public_key,
+            } => ec_key_value_to_spki_der(curve_oid, public_key),
+            _ => Err(KeyResolutionError::InvalidPublicKey),
+        }
+    }
+
+    /// The key value of an `rsaEncryption`, DSA or named-curve EC
+    /// `SubjectPublicKeyInfo`, read within the X.509 work and workspace
+    /// budgets of `resources`.
+    ///
+    /// # Errors
+    /// [`KeyResolutionError::InvalidPublicKey`] for another key family, a
+    /// DSA key without domain parameters or malformed encoding;
+    /// [`KeyResolutionError::AlgorithmMismatch`] for an unsupported curve or
+    /// an `id-RSASSA-PSS` key, whose PSS restriction a key value cannot
+    /// carry; a resource error when the budgets are exhausted.
+    pub fn from_spki_der(
+        spki_der: &[u8],
+        resources: &crate::policy::ResourcePolicy,
+    ) -> Result<Self, KeyResolutionError> {
+        use super::pkix::{PublicKey, SpkiAlgorithm};
+        let session = super::pkix::CertificateSession::new(resources);
+        let algorithm = session
+            .spki_algorithm(spki_der)
+            .map_err(|error| structured_key_error(&session, error))?;
+        match algorithm {
+            // RFC 4055 section 1.2: an id-RSASSA-PSS key admits only PSS,
+            // which RSAKeyValue cannot express.
+            SpkiAlgorithm::RsaPss => Err(KeyResolutionError::AlgorithmMismatch),
+            SpkiAlgorithm::RsaEncryption => {
+                let Some(key) = session
+                    .admitted_rsa_public_key(spki_der, |_, _| Ok(true))
+                    .map_err(|error| structured_key_error(&session, error))?
+                else {
+                    return Err(KeyResolutionError::InvalidPublicKey);
+                };
+                let (modulus, exponent) = bounded_rsa_public_components(
+                    key.modulus().as_bytes(),
+                    key.exponent().as_bytes(),
+                )?;
+                Ok(Self::Rsa {
+                    modulus: modulus.to_vec(),
+                    exponent: exponent.to_vec(),
+                })
+            }
+            SpkiAlgorithm::Ec => {
+                validate_ec_spki_point(&session, spki_der)?;
+                // The read shares the validation's work allowance, so its
+                // resource refusal is reported as such.
+                let PublicKey::Ec(key) = session
+                    .read_public_key(spki_der)
+                    .map_err(|error| structured_key_error(&session, error))?
+                else {
+                    return Err(KeyResolutionError::InvalidPublicKey);
+                };
+                let structured_pkix::key::ec::Curve::Named(curve) = key.curve() else {
+                    return Err(KeyResolutionError::AlgorithmMismatch);
+                };
+                let curve_oid = match super::signature::EcCurve::from_oid_bytes(curve.as_bytes()) {
+                    Some(super::signature::EcCurve::P256) => EC_P256_OID,
+                    Some(super::signature::EcCurve::P384) => EC_P384_OID,
+                    Some(super::signature::EcCurve::P521) => EC_P521_OID,
+                    None => return Err(KeyResolutionError::AlgorithmMismatch),
+                };
+                Ok(Self::Ec {
+                    curve_oid: String::from(curve_oid),
+                    public_key: key.as_bytes().to_vec(),
+                })
+            }
+            SpkiAlgorithm::Dsa => {
+                validate_dsa_spki(&session, spki_der)?;
+                let key = session
+                    .read_dsa_public_key(spki_der)
+                    .map_err(|error| structured_key_error(&session, error))?;
+                let parameters = key
+                    .parameters()
+                    .ok_or(KeyResolutionError::InvalidPublicKey)?;
+                let [p, q, g, y] = [parameters.p(), parameters.q(), parameters.g(), key.y()]
+                    .map(|component| component.as_bytes().to_vec());
+                Ok(Self::Dsa {
+                    p: Some(p),
+                    q: Some(q),
+                    g: Some(g),
+                    y,
+                })
+            }
+            _ => Err(KeyResolutionError::InvalidPublicKey),
+        }
+    }
 }
 
 pub(crate) fn supported_key_value_is_rsa(

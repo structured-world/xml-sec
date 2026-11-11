@@ -158,7 +158,7 @@ pub(crate) fn plan(phase: &str, coverage: Option<&Coverage>) -> Result<Vec<Actio
     Ok(actions)
 }
 
-fn coverage_actions(coverage: &Coverage) -> [Action; 10] {
+fn coverage_actions(coverage: &Coverage) -> [Action; 11] {
     let evidence = |name: &str| coverage.evidence.join(name).display().to_string();
     let json = evidence("coverage.json");
     let lcov = evidence("coverage.lcov");
@@ -176,6 +176,21 @@ fn coverage_actions(coverage: &Coverage) -> [Action; 10] {
         )),
         Action::ShowEnv(cargo("coverage environment", &["llvm-cov", "show-env"])),
         Action::TokenTests(vec!["--workspace".into(), "--all-features".into()]),
+        // The libxmlsec1-compatible library is exercised by C programs: they
+        // link the instrumented library and write their profiles beside the
+        // tests', against the oracle under XMLSEC1_PREFIX.
+        Action::Run(cargo(
+            "coverage C ABI",
+            &[
+                "run",
+                "--quiet",
+                "-p",
+                "xml-sec-tools",
+                "--",
+                "capi",
+                "--xmlsec1",
+            ],
+        )),
         // The report consumes the completed instrumented build. Every package
         // is selected explicitly: the default covers only the root package.
         Action::Run(cargo(
