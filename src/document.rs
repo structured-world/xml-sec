@@ -614,6 +614,11 @@ pub enum XmlDocumentError {
     #[cfg(feature = "external-tree")]
     #[error("a tree-backed XML document changes only through edits of its tree")]
     TreeBackedSerialization,
+    /// A snapshot of an external tree keeps neither the tree nor a
+    /// serialization, so it is read only.
+    #[cfg(feature = "external-tree")]
+    #[error("a snapshot of an external tree is read only")]
+    ReadOnlySnapshot,
     /// A tree operation was asked of a document parsed from text.
     #[cfg(feature = "external-tree")]
     #[error("the XML document was parsed from text and has no external tree")]
@@ -946,6 +951,9 @@ pub struct DocumentView<'a> {
     identity: DocumentIdentity,
     generation: u64,
     parsed: &'a ParsedDocument<'a>,
+    /// The document is a snapshot, which refuses every mutation target.
+    #[cfg(feature = "external-tree")]
+    snapshot: bool,
 }
 
 impl XmlDocument {
@@ -1179,12 +1187,12 @@ impl XmlDocument {
         Ok(projected.into_document(Some(tree)))
     }
 
-    /// A document reading `tree` as it is now, under the XML input policy
-    /// and resource limits of `policy`'s operation, that keeps no hold on
-    /// it: [`DocumentView::external_node_of`] names the tree's nodes, so a
-    /// read-only operation can answer in terms of the tree while the tree's
-    /// owner keeps it, but edits change this document only and never reach
-    /// the tree.
+    /// A read-only document reading `tree` as it is now, under the XML input
+    /// policy and resource limits of `policy`'s operation, that keeps no
+    /// hold on it: [`DocumentView::external_node_of`] names the tree's nodes,
+    /// so a read-only operation can answer in terms of the tree while the
+    /// tree's owner keeps it. It keeps neither the tree nor a serialization,
+    /// so every mutation is refused with [`XmlDocumentError::ReadOnlySnapshot`].
     ///
     /// # Errors
     /// As for [`Self::from_external_tree`].
@@ -1575,13 +1583,25 @@ impl XmlDocument {
 
     /// Borrow the retained parsed view without reparsing.
     pub fn with_view<R>(&self, operation: impl for<'a> FnOnce(DocumentView<'a>) -> R) -> R {
+        #[cfg(feature = "external-tree")]
+        let snapshot = self.is_snapshot();
         self.cell.with_dependent(|_, parsed| {
             operation(DocumentView {
                 identity: self.identity,
                 generation: self.generation,
                 parsed,
+                #[cfg(feature = "external-tree")]
+                snapshot,
             })
         })
+    }
+
+    /// Whether this document is a snapshot of an external tree: a projected
+    /// generation without its tree, which has no tree to edit and no
+    /// serialization to splice, so every mutation is refused.
+    #[cfg(feature = "external-tree")]
+    fn is_snapshot(&self) -> bool {
+        self.tree.is_none() && !self.cell.borrow_dependent().external.is_empty()
     }
 
     /// Replace one complete element with a well-formed element fragment.
@@ -2535,6 +2555,11 @@ impl XmlDocument {
 
     /// Make `next` the current generation, numbered above every one issued.
     fn commit_generation(&mut self, mut next: DocumentCell) -> Result<(), XmlDocumentError> {
+        // Mutations that name no target reach a snapshot only here.
+        #[cfg(feature = "external-tree")]
+        if self.is_snapshot() {
+            return Err(XmlDocumentError::ReadOnlySnapshot);
+        }
         #[cfg(feature = "xmldsig-sign")]
         let issued = self.issued;
         #[cfg(not(feature = "xmldsig-sign"))]
@@ -3167,6 +3192,10 @@ impl<'a> DocumentView<'a> {
         identity: NodeIdentity,
     ) -> Result<Node<'a, 'a>, XmlDocumentError> {
         let node = self.resolve_node(identity)?;
+        #[cfg(feature = "external-tree")]
+        if self.snapshot {
+            return Err(XmlDocumentError::ReadOnlySnapshot);
+        }
         // A tree-backed node is a target when it has a node of the tree to edit.
         #[cfg(feature = "external-tree")]
         if self.is_tree_backed() {
@@ -3418,7 +3447,7 @@ impl Projected {
     }
 
     /// The document over `tree`, which this generation projects; without a
-    /// tree, a snapshot that edits only itself.
+    /// tree, a read-only snapshot.
     fn into_document(
         self,
         tree: Option<alloc::boxed::Box<dyn external::ExternalTree>>,

@@ -9,7 +9,7 @@
 //! C code never reaches the tree's memory. One thing always yields the same
 //! handle, so C code may compare pointers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use parking_lot::Mutex;
 use xml_sec::document::owned_tree::{OwnedTree, TreeError, TreeNode, TreeNodeKind};
@@ -84,6 +84,14 @@ struct Slot {
     /// document is freed. A `CString`'s bytes stay where they are when the
     /// map moves it, so a returned pointer stays valid.
     strings: HashMap<String, std::ffi::CString>,
+    /// Every handle into the document.
+    handles: HashSet<usize>,
+    /// The handles whose target is named by element and name (attributes,
+    /// declarations, namespace nodes): an edit can remove such a target and
+    /// add another under the same name, so an edit drops the handles of the
+    /// removed ones at once. A node's number is never reused, so a node
+    /// handle is refused once its node is freed without that.
+    named: HashSet<usize>,
 }
 
 impl Slot {
@@ -91,13 +99,17 @@ impl Slot {
         Self {
             tree: Some(tree),
             strings: HashMap::new(),
+            handles: HashSet::new(),
+            named: HashSet::new(),
         }
     }
 }
 
 #[derive(Default)]
 struct Table {
-    slots: Vec<Option<Slot>>,
+    /// Documents by a number from the handle counter, never reused: a slot
+    /// number kept past its document's end never names a later document.
+    slots: HashMap<usize, Slot>,
     handles: HashMap<usize, Resolved>,
     reverse: HashMap<Resolved, usize>,
     /// Node sets, under handles from the same counter.
@@ -168,7 +180,7 @@ pub const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
 #[derive(Default)]
 struct Set {
     members: Vec<usize>,
-    index: std::collections::HashSet<usize>,
+    index: HashSet<usize>,
 }
 
 impl Table {
@@ -185,7 +197,16 @@ impl Table {
         if let Some(&handle) = self.reverse.get(&resolved) {
             return Ok(handle);
         }
+        // A value the counter skips for a missing document is never issued.
         let handle = self.fresh()?;
+        let slot = self
+            .slots
+            .get_mut(&resolved.document)
+            .ok_or(HandleError::Stale)?;
+        slot.handles.insert(handle);
+        if !matches!(resolved.target, Target::Node(_)) {
+            slot.named.insert(handle);
+        }
         self.handles.insert(handle, resolved.clone());
         self.reverse.insert(resolved, handle);
         Ok(handle)
@@ -193,8 +214,7 @@ impl Table {
 
     fn tree(&self, document: usize) -> Result<&OwnedTree, HandleError> {
         self.slots
-            .get(document)
-            .and_then(Option::as_ref)
+            .get(&document)
             .ok_or(HandleError::Stale)?
             .tree
             .as_ref()
@@ -203,8 +223,7 @@ impl Table {
 
     fn tree_mut(&mut self, document: usize) -> Result<&mut OwnedTree, HandleError> {
         self.slots
-            .get_mut(document)
-            .and_then(Option::as_mut)
+            .get_mut(&document)
             .ok_or(HandleError::Stale)?
             .tree
             .as_mut()
@@ -223,22 +242,32 @@ impl Table {
 
     fn forget(&mut self, handle: usize) {
         if let Some(resolved) = self.handles.remove(&handle) {
+            if let Some(slot) = self.slots.get_mut(&resolved.document) {
+                slot.handles.remove(&handle);
+                slot.named.remove(&handle);
+            }
             self.reverse.remove(&resolved);
         }
     }
 
-    /// Drop every handle of `document` whose target no longer exists.
+    /// Drop the handles of `document` named by element and name whose target
+    /// no longer exists; only that document's are visited.
     fn prune(&mut self, document: usize) {
-        let Ok(tree) = self.tree(document) else {
+        let Some(slot) = self.slots.get(&document) else {
             return;
         };
-        let dead: Vec<usize> = self
-            .handles
+        let Some(tree) = slot.tree.as_ref() else {
+            return;
+        };
+        let dead: Vec<usize> = slot
+            .named
             .iter()
-            .filter(|(_, resolved)| {
-                resolved.document == document && !exists(tree, &resolved.target)
+            .copied()
+            .filter(|handle| {
+                self.handles
+                    .get(handle)
+                    .is_some_and(|resolved| !exists(tree, &resolved.target))
             })
-            .map(|(&handle, _)| handle)
             .collect();
         for handle in dead {
             self.forget(handle);
@@ -253,13 +282,8 @@ impl Table {
 pub fn register(tree: OwnedTree) -> Result<usize, HandleError> {
     with_table(|table| {
         let node = tree.document_node();
-        let document = if let Some(free) = table.slots.iter().position(Option::is_none) {
-            table.slots[free] = Some(Slot::new(tree));
-            free
-        } else {
-            table.slots.push(Some(Slot::new(tree)));
-            table.slots.len() - 1
-        };
+        let document = table.fresh()?;
+        table.slots.insert(document, Slot::new(tree));
         table.issue(Resolved {
             document,
             target: Target::Node(node),
@@ -407,8 +431,7 @@ pub fn lend(handle: usize) -> Result<(usize, OwnedTree), HandleError> {
         let document = table.resolve(handle)?.document;
         let tree = table
             .slots
-            .get_mut(document)
-            .and_then(Option::as_mut)
+            .get_mut(&document)
             .ok_or(HandleError::Stale)?
             .tree
             .take()
@@ -424,11 +447,7 @@ pub fn lend(handle: usize) -> Result<(usize, OwnedTree), HandleError> {
 /// [`HandleError::Busy`] when it already holds a tree.
 pub fn give_back(document: usize, tree: OwnedTree) -> Result<(), HandleError> {
     with_table(|table| {
-        let slot = table
-            .slots
-            .get_mut(document)
-            .and_then(Option::as_mut)
-            .ok_or(HandleError::Stale)?;
+        let slot = table.slots.get_mut(&document).ok_or(HandleError::Stale)?;
         if slot.tree.is_some() {
             return Err(HandleError::Busy);
         }
@@ -445,7 +464,7 @@ pub fn give_back(document: usize, tree: OwnedTree) -> Result<(), HandleError> {
 #[must_use]
 pub fn intern(document: usize, value: &str) -> *const u8 {
     with_table(|table| {
-        let Some(slot) = table.slots.get_mut(document).and_then(Option::as_mut) else {
+        let Some(slot) = table.slots.get_mut(&document) else {
             return std::ptr::null();
         };
         if let Some(copy) = slot.strings.get(value) {
@@ -467,15 +486,11 @@ pub fn intern(document: usize, value: &str) -> *const u8 {
 pub fn free_document(handle: usize) -> Result<(), HandleError> {
     with_table(|table| {
         let document = table.resolve(handle)?.document;
-        table.slots[document] = None;
-        let dead: Vec<usize> = table
-            .handles
-            .iter()
-            .filter(|(_, other)| other.document == document)
-            .map(|(&handle, _)| handle)
-            .collect();
-        for handle in dead {
-            table.forget(handle);
+        let slot = table.slots.remove(&document).ok_or(HandleError::Stale)?;
+        for handle in slot.handles {
+            if let Some(resolved) = table.handles.remove(&handle) {
+                table.reverse.remove(&resolved);
+            }
         }
         Ok(())
     })

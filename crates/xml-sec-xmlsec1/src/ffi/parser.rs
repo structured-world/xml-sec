@@ -49,7 +49,13 @@ pub(crate) unsafe extern "C" fn xmlSecParserSetDefaultOptions(options: c_int) {
 /// The document in `bytes`, parsed by the core; failures are reported from
 /// the entry point at `here`.
 pub(crate) fn parse(bytes: &[u8], here: errors::Here) -> *mut XmlDoc {
-    if let Ok(doc) = xml_sec_libxml2::document::parse(bytes) {
+    parse_parts(&[bytes], here)
+}
+
+/// The document of `parts` in sequence, as [`parse`]; parts too large
+/// together are refused before they are joined.
+fn parse_parts(parts: &[&[u8]], here: errors::Here) -> *mut XmlDoc {
+    if let Ok(doc) = xml_sec_libxml2::document::parse_parts(parts) {
         xml_sec_libxml2::nodes::pointer_of(doc)
     } else {
         // The reason is the tree layer's last error, which the report reads.
@@ -93,7 +99,7 @@ pub(crate) unsafe extern "C" fn xmlSecParseMemoryExt(
                 chunk(postfix, postfix_size),
             ]
         };
-        parse(&parts.concat(), here!("xmlSecParseMemoryExt"))
+        parse_parts(&parts, here!("xmlSecParseMemoryExt"))
     })
 }
 

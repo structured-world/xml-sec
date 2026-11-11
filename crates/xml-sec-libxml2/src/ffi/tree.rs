@@ -84,9 +84,10 @@ pub unsafe extern "C" fn xsStrEqual(left: *const XmlChar, right: *const XmlChar)
 }
 
 /// `xmlReadMemory`: the document in `size` bytes at `buffer`, parsed by the
-/// core under the library policy; null when it is refused. The bytes are
-/// UTF-8; `url`, `encoding` and `options` are accepted for the shape of the
-/// call and do not change the parse, which loads nothing external.
+/// core under the library policy; null when it is refused. The bytes are in
+/// the encoding their byte-order mark or XML declaration selects, UTF-16
+/// included; `url`, `encoding` and `options` are accepted for the shape of
+/// the call and do not change the parse, which loads nothing external.
 ///
 /// # Safety
 /// `buffer` is null or holds `size` bytes.
@@ -494,16 +495,39 @@ fn link(
         return std::ptr::null_mut();
     };
     let done = handles::edit_document(document, |tree| {
-        if tree.parent(linked)?.is_some() {
-            tree.unlink(linked)?;
-        }
-        place(tree, anchor_node, linked)
+        moved(tree, linked, |tree| place(tree, anchor_node, linked))
     });
     if done.is_ok() {
         node
     } else {
         std::ptr::null_mut()
     }
+}
+
+/// Unlink `node` and run `place`; when `place` refuses, `node` goes back
+/// where it was, so a refused call leaves the document as it found it. The
+/// tree alone decides what a link may do.
+fn moved(
+    tree: &mut OwnedTree,
+    node: TreeNode,
+    place: impl FnOnce(&mut OwnedTree) -> Result<(), TreeError>,
+) -> Result<(), TreeError> {
+    let origin = match tree.parent(node)? {
+        Some(parent) => Some((parent, tree.next_sibling(node)?)),
+        None => None,
+    };
+    if origin.is_some() {
+        tree.unlink(node)?;
+    }
+    place(tree).inspect_err(|_| match origin {
+        Some((_, Some(next))) => tree
+            .insert_before(next, node)
+            .expect("a node goes back before its former sibling"),
+        Some((parent, None)) => tree
+            .append_child(parent, node)
+            .expect("a node goes back under its former parent"),
+        None => {}
+    })
 }
 
 /// `xmlAddChild`: link `child` as the last child of `parent`.
@@ -580,10 +604,9 @@ pub unsafe extern "C" fn xsReplaceNode(old: *mut Node, current: *mut Node) -> *m
             return std::ptr::null_mut();
         };
         let done = handles::edit_document(document, |tree| {
-            if tree.parent(new_node)?.is_some() {
-                tree.unlink(new_node)?;
-            }
-            tree.insert_before(old_node, new_node)?;
+            moved(tree, new_node, |tree| {
+                tree.insert_before(old_node, new_node)
+            })?;
             tree.unlink(old_node)
         });
         if done.is_ok() {

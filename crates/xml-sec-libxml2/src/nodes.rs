@@ -498,18 +498,19 @@ pub fn in_scope<T>(node: *const T, prefix: Option<&str>) -> Option<String> {
 }
 
 /// The nearest element at or above `node` declaring a binding `wanted`
-/// accepts: its document, the element and the declared prefix.
+/// accepts, given the tree, `node`'s tree node, the prefix and the URI: its
+/// document, the element and the declared prefix.
 fn declaring(
     node: *const Node,
-    wanted: impl Fn(Option<&str>, &str) -> bool,
+    wanted: impl Fn(&OwnedTree, TreeNode, Option<&str>, &str) -> bool,
 ) -> Option<(usize, TreeNode, Option<String>)> {
     let (document, start) = tree_node(node)?;
     handles::read_document(document, |tree| {
         let mut current = Some(start);
         while let Some(element) = current {
             if let Ok(mut declarations) = tree.namespace_declarations(element)
-                && let Some(found) =
-                    declarations.find(|declaration| wanted(declaration.prefix, declaration.uri))
+                && let Some(found) = declarations
+                    .find(|declaration| wanted(tree, start, declaration.prefix, declaration.uri))
             {
                 return Some((document, element, found.prefix.map(String::from)));
             }
@@ -539,7 +540,9 @@ pub fn search_namespace<T>(node: *const T, prefix: Option<&str>) -> *mut Ns {
             pointer(document, Target::XmlNamespace)
         });
     }
-    declaration_pointer(declaring(node.cast(), |declared, _| declared == prefix))
+    declaration_pointer(declaring(node.cast(), |_, _, declared, _| {
+        declared == prefix
+    }))
 }
 
 /// `xmlSearchNsByHref`: a declaration of `href` in scope at `node` whose
@@ -551,13 +554,11 @@ pub fn search_namespace_by_uri<T>(node: *const T, href: &str) -> *mut Ns {
             pointer(document, Target::XmlNamespace)
         });
     }
-    let found = declaring(node.cast(), |_, uri| uri == href);
-    match &found {
-        Some((_, _, prefix)) if in_scope(node, prefix.as_deref()).as_deref() != Some(href) => {
-            std::ptr::null_mut()
-        }
-        _ => declaration_pointer(found),
-    }
+    // A declaration whose prefix a nearer one rebinds is passed over, and
+    // the search goes on to the other prefixes, as libxml2's does.
+    declaration_pointer(declaring(node.cast(), |tree, start, prefix, uri| {
+        uri == href && handles::in_scope(tree, start, prefix) == Some(href)
+    }))
 }
 
 /// The namespace node of the element `element` for `prefix`, as libxml2's

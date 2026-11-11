@@ -143,28 +143,36 @@ pub unsafe fn output_write(out: *mut OutputBuffer, bytes: &[u8]) -> c_int {
         Step::Written => return length,
         Step::Call(Some(write), context) => (write, context),
     };
-    if bytes.is_empty() {
-        return 0;
+    // A callback may take fewer bytes than offered; the rest is offered
+    // again, as libxml2 keeps it for the next write. A callback that takes
+    // nothing, reports an error or claims more than offered fails the buffer.
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        // Within `bytes`, whose length fits an `int`.
+        let offered = c_int::try_from(rest.len()).unwrap_or(length);
+        // SAFETY: the caller's callback with its context, given `offered`
+        // readable bytes.
+        let taken = unsafe {
+            write(
+                std::ptr::with_exposed_provenance_mut(context),
+                rest.as_ptr().cast(),
+                offered,
+            )
+        };
+        match usize::try_from(taken) {
+            Ok(taken) if taken > 0 && taken <= rest.len() => rest = &rest[taken..],
+            _ => break,
+        }
     }
-    // SAFETY: the caller's callback with its context, given `length`
-    // readable bytes.
-    let result = unsafe {
-        write(
-            std::ptr::with_exposed_provenance_mut(context),
-            bytes.as_ptr().cast(),
-            length,
-        )
-    };
+    let written = bytes.len() - rest.len();
+    let complete = rest.is_empty();
     outputs(|outputs| {
         if let Some(output) = outputs.get_mut(&handle) {
-            if result < 0 {
-                output.failed = true;
-            } else {
-                output.written += bytes.len();
-            }
+            output.written += written;
+            output.failed |= !complete;
         }
     });
-    if result < 0 { -1 } else { length }
+    if complete { length } else { -1 }
 }
 
 /// Close `out`: its close callback runs and the buffer is gone. Returns the
@@ -498,3 +506,6 @@ pub unsafe extern "C" fn xsFreeParserInputBuffer(input: *mut InputBuffer) {
     // SAFETY: by the caller's contract.
     contain((), || unsafe { input_free(input) });
 }
+
+#[cfg(test)]
+mod tests;

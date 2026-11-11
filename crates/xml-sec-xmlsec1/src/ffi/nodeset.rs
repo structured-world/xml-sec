@@ -62,8 +62,9 @@ pub(crate) type WalkCallback = Option<
 
 /// Whether `node`, whose parent is `parent`, is listed in `nodes`; a null
 /// list contains every node. A namespace node is listed as the namespace
-/// node of the element it is rendered on: `parent`, or an attribute
-/// parent's element, as libxmlsec1 compares it.
+/// node of the element it is rendered on (`parent`, or an attribute
+/// parent's element) with the same prefix and URI, as libxmlsec1 compares
+/// it.
 fn listed(set: *mut XmlNodeSet, node: *mut XmlNode, parent: *mut XmlNode) -> bool {
     if set.is_null() {
         return true;
@@ -76,10 +77,13 @@ fn listed(set: *mut XmlNodeSet, node: *mut XmlNode, parent: *mut XmlNode) -> boo
     } else {
         parent
     };
-    let Some((prefix, _)) = nodes::binding(node) else {
+    let Some((prefix, uri)) = nodes::binding(node) else {
         return false;
     };
-    nodes::node_set_contains(set, nodes::namespace_node(element, prefix.as_deref()))
+    // The element's own namespace node for the prefix stands for `node` only
+    // when it binds the same URI; a nearer redeclaration is another binding.
+    let own = nodes::namespace_node(element, prefix.as_deref());
+    nodes::binding(own).is_some_and(|(_, bound)| bound == uri) && nodes::node_set_contains(set, own)
 }
 
 /// Whether `node` or one of its element ancestors is listed in `nodes`.

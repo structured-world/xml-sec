@@ -147,6 +147,49 @@ fn attributes_and_namespace_nodes_are_nodes_of_node_sets() {
 }
 
 #[test]
+fn a_refused_link_leaves_the_document_unchanged() {
+    // A link the tree refuses, such as one making a node its own ancestor
+    // or placing a node beside one without a parent, must not have unlinked
+    // the node first.
+    // SAFETY: as above.
+    unsafe {
+        let doc = parse("<r><c><d/></c></r>");
+        let root = xsDocGetRootElement(doc);
+        let child = xsNodeGetChildren(root);
+        let grandchild = xsNodeGetChildren(child);
+        let before = dump(doc);
+        assert!(xsAddChild(grandchild, child).is_null());
+        assert_eq!(dump(doc), before);
+        let detached = xsNewDocNode(
+            doc,
+            std::ptr::null_mut(),
+            c"u".as_ptr().cast(),
+            std::ptr::null(),
+        );
+        assert!(xsAddNextSibling(detached, child).is_null());
+        assert!(xsReplaceNode(detached, child).is_null());
+        assert_eq!(dump(doc), before);
+        xsFreeDoc(doc);
+    }
+}
+
+#[test]
+fn a_uri_search_passes_a_shadowed_prefix_for_one_still_in_scope() {
+    // `p` is redeclared at `c`, but `q` still binds the URI there, so the
+    // search finds `q`, as libxml2's does.
+    // SAFETY: as above.
+    unsafe {
+        let doc =
+            parse(r#"<r xmlns:p="urn:wanted" xmlns:q="urn:wanted"><c xmlns:p="urn:other"/></r>"#);
+        let child = xsNodeGetChildren(xsDocGetRootElement(doc));
+        let ns = xsSearchNsByHref(doc, child, c"urn:wanted".as_ptr().cast());
+        assert!(!ns.is_null(), "a binding in scope is found");
+        assert_eq!(take(xsNsGetPrefix(ns)).as_deref(), Some("q"));
+        xsFreeDoc(doc);
+    }
+}
+
+#[test]
 fn content_ids_and_root_replacement_follow_libxml2() {
     // SAFETY: as above.
     unsafe {

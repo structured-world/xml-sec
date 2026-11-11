@@ -104,3 +104,51 @@ fn freeing_a_document_ends_every_handle_into_it() {
     assert_ne!(other, doc);
     assert_ne!(root(other), element);
 }
+
+#[test]
+fn a_freed_documents_slot_never_names_a_later_document() {
+    // A clean C API document keeps the slot; once its document is freed, a
+    // later document must not answer for it.
+    let doc = register_xml("<r/>");
+    let slot = document(doc).expect("a live document");
+    free_document(doc).expect("a live document");
+    let other = register_xml("<s/>");
+    assert_ne!(document(other), Ok(slot));
+    assert_eq!(read_document(slot, |_| ()), Err(HandleError::Stale));
+}
+
+#[test]
+fn an_edit_drops_only_the_handles_of_what_it_removed() {
+    // Removing an attribute ends its handle; a node handle of the same
+    // document and every handle of another document stay.
+    let doc = register_xml(r#"<r a="v"><c/></r>"#);
+    let other = register_xml(r#"<s a="v"/>"#);
+    let slot = document(doc).expect("a live document");
+    let other_slot = document(other).expect("a live document");
+    let element = node(root(doc)).expect("a node").1;
+    let attribute = |slot, element| {
+        handle(
+            slot,
+            Target::Attribute {
+                element,
+                name: String::from("a"),
+                namespace: None,
+            },
+        )
+        .expect("a present attribute")
+    };
+    let mine = attribute(slot, element);
+    let theirs = attribute(other_slot, node(root(other)).expect("a node").1);
+    let child = read(root(doc), OwnedTree::first_child)
+        .expect("a live node")
+        .expect("a live node")
+        .expect("a child");
+    let child = handle(slot, Target::Node(child)).expect("a live node");
+    edit(root(doc), |tree, element| {
+        tree.remove_attribute(element, "a", None).map(drop)
+    })
+    .expect("a live element");
+    assert_eq!(resolve(mine), Err(HandleError::Stale));
+    assert!(resolve(theirs).is_ok());
+    assert!(resolve(child).is_ok());
+}

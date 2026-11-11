@@ -16,6 +16,7 @@ use super::external::{
 use super::{DocumentParseSettings, XmlDocumentError, XmlDocumentPolicy};
 use crate::ParseError;
 use crate::parser_xmloxide as xmloxide;
+use crate::xml::dom::storage::{Native, Storage as _};
 use xmloxide::tree::{Attribute, NodeId, NodeKind};
 
 /// The namespace the `xml` prefix is bound to (Namespaces in XML 1.0
@@ -143,7 +144,7 @@ pub enum TreeError {
 }
 
 /// An undo record of an edit applied through [`ExternalTree::apply`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum Undo {
     /// A node an edit created and linked.
     Linked(NodeId),
@@ -152,6 +153,11 @@ enum Undo {
         node: NodeId,
         parent: NodeId,
         next: Option<NodeId>,
+    },
+    /// An ID an edit registered, and the element it named before.
+    Id {
+        value: String,
+        previous: Option<TreeNode>,
     },
 }
 
@@ -206,16 +212,76 @@ impl OwnedTree {
         xml: &str,
         policy: &impl XmlDocumentPolicy,
     ) -> Result<Self, XmlDocumentError> {
+        Self::under_policy(policy, |settings| Self::parse_with_settings(xml, settings))
+    }
+
+    /// Parse `bytes` as [`Self::parse_with_policy`] parses text, after
+    /// decoding them: a byte-order mark or the XML declaration selects the
+    /// encoding (XML 1.0 section 4.3.3 and appendix F), and the declaration
+    /// of the decoded text names UTF-8.
+    ///
+    /// # Errors
+    /// As for [`Self::parse_with_policy`], or bytes that are not in the
+    /// encoding they select.
+    pub fn parse_bytes_with_policy(
+        bytes: &[u8],
+        policy: &impl XmlDocumentPolicy,
+    ) -> Result<Self, XmlDocumentError> {
+        Self::parse_parts_with_policy(&[bytes], policy)
+    }
+
+    /// Parse the bytes of `parts` in sequence as
+    /// [`Self::parse_bytes_with_policy`] parses one buffer. Their combined
+    /// length meets the document byte limit before they are joined, so
+    /// parts too large together are refused without a copy.
+    ///
+    /// # Errors
+    /// As for [`Self::parse_bytes_with_policy`].
+    pub fn parse_parts_with_policy(
+        parts: &[&[u8]],
+        policy: &impl XmlDocumentPolicy,
+    ) -> Result<Self, XmlDocumentError> {
+        Self::under_policy(policy, |settings| {
+            let maximum = settings.max_bytes;
+            match parts
+                .iter()
+                .try_fold(0_usize, |total, part| total.checked_add(part.len()))
+            {
+                Some(actual) if actual <= maximum => {}
+                // A sum beyond `usize` is reported as the largest size there is.
+                actual => {
+                    return Err(XmlDocumentError::DocumentTooLarge {
+                        maximum,
+                        actual: actual.unwrap_or(usize::MAX),
+                    });
+                }
+            }
+            let joined;
+            let bytes: &[u8] = if let [only] = parts {
+                only
+            } else {
+                joined = parts.concat();
+                &joined
+            };
+            let xml = super::decode_xml_with_budget(bytes, maximum, None)?;
+            Self::parse_with_settings(&xml, settings)
+        })
+    }
+
+    /// Run `parse` under the settings of `policy`, its limit refusals
+    /// reported as the policy's typed violations.
+    fn under_policy(
+        policy: &impl XmlDocumentPolicy,
+        parse: impl FnOnce(DocumentParseSettings) -> Result<Self, XmlDocumentError>,
+    ) -> Result<Self, XmlDocumentError> {
         policy.resource_policy().validate()?;
         let settings = DocumentParseSettings::from_policy(
             *policy.xml_input_policy(),
             policy.resource_policy(),
         );
-        Self::parse_with_settings(xml, settings).map_err(|error| {
-            match error.into_policy_violation(settings) {
-                Ok(violation) => XmlDocumentError::Policy(violation),
-                Err(error) => error,
-            }
+        parse(settings).map_err(|error| match error.into_policy_violation(settings) {
+            Ok(violation) => XmlDocumentError::Policy(violation),
+            Err(error) => error,
         })
     }
 
@@ -223,11 +289,15 @@ impl OwnedTree {
         xml: &str,
         settings: DocumentParseSettings,
     ) -> Result<Self, XmlDocumentError> {
-        if xml.len() > settings.max_bytes {
-            return Err(XmlDocumentError::Parse(ParseError::ByteLimitReached {
-                maximum: settings.max_bytes,
-                actual: xml.len(),
-            }));
+        super::check_document_size(xml, settings)?;
+        // A document type declaration brings declarations and entity
+        // expansion: the lexical scan every other parse runs refuses one the
+        // policy does not allow before its internal subset is read, and
+        // bounds the entities it expands.
+        if !crate::xml::dom::XmlBackend::Xmloxide.records_positions(xml) {
+            let mut pass = super::LimitPass::new(settings, None, super::NativeXmlStorage)?;
+            crate::xml::dom::scan_declared_document(xml, settings.allow_dtd, &mut pass)
+                .map_err(|error| pass.refusal_or(XmlDocumentError::Parse(error)))?;
         }
         let tree = xmloxide::Document::try_with_storage(
             xmloxide::parser::initial_node_capacity(xml.len()).min(settings.nodes_limit as usize),
@@ -241,15 +311,15 @@ impl OwnedTree {
             tree,
         )
         .map_err(|error| XmlDocumentError::Parse(syntax(error)))?;
-        let document = parsed.map_err(|error| match counter.refusal() {
+        let mut document = parsed.map_err(|error| match counter.refusal() {
             Some(refusal) => super::limit_refusal(refusal),
             None => XmlDocumentError::Parse(syntax(error)),
         })?;
-        let has_dtd = document
-            .children(document.root())
-            .any(|id| matches!(document.node(id).kind, NodeKind::DocumentType { .. }));
-        if has_dtd && !settings.allow_dtd {
-            return Err(XmlDocumentError::Parse(ParseError::DtdDetected));
+        // The text is UTF-8 whatever the source declared, and so is every
+        // serialization (XML 1.0 section 4.3.3: the declaration names the
+        // encoding the bytes use).
+        if document.encoding.is_some() {
+            document.encoding = Some(String::from("UTF-8"));
         }
         let mut tree = Self {
             document,
@@ -268,17 +338,52 @@ impl OwnedTree {
     fn register_xml_ids(&mut self) {
         let mut pending = vec![self.document.root()];
         while let Some(id) = pending.pop() {
-            let value = self.document.attributes(id).iter().find_map(|attribute| {
-                (attribute.name == "id" && attribute.namespace.as_deref() == Some(XML_NAMESPACE))
-                    .then(|| attribute.value.clone())
-            });
-            if let Some(value) = value {
-                self.ids.entry(value).or_insert(TreeNode::of(id));
-            }
+            self.register_xml_id(id);
             let first = pending.len();
             pending.extend(self.document.children(id));
             // Children are popped first to last.
             pending[first..].reverse();
+        }
+    }
+
+    /// Normalize the `xml:id` attribute of `element`, if it has one, and
+    /// register its element under the normalized value unless a live element
+    /// in the document holds it: xml:id 1.0 section 4 normalizes the value as
+    /// an ID before assigning it and keeps the normalized value in the
+    /// infoset. Returns the undo record of a registration it made.
+    fn register_xml_id(&mut self, element: NodeId) -> Option<Undo> {
+        let NodeKind::Element { attributes, .. } = &mut self.document.node_mut(element).kind else {
+            return None;
+        };
+        let attribute = attributes.iter_mut().find(|attribute| {
+            attribute.name == "id" && attribute.namespace.as_deref() == Some(XML_NAMESPACE)
+        })?;
+        Native
+            .normalize_id(&mut attribute.value)
+            .expect("normalizing in place allocates nothing");
+        attribute.raw_value = None;
+        let value = attribute.value.clone();
+        let previous = self.ids.get(value.as_str()).copied();
+        if previous.is_some_and(|node| self.contains(node) && self.attached(node)) {
+            return None;
+        }
+        self.ids.insert(value.clone(), TreeNode::of(element));
+        Some(Undo::Id { value, previous })
+    }
+
+    /// Register the `xml:id` attributes of the inserted subtrees `built`,
+    /// after the edit unlinked what it replaces, so a restored element takes
+    /// the ID its replaced one held.
+    fn register_inserted_ids(&mut self, built: &[NodeId]) {
+        for &top in built {
+            let elements: Vec<NodeId> = core::iter::once(top)
+                .chain(self.document.descendants(top))
+                .collect();
+            for element in elements {
+                if let Some(undo) = self.register_xml_id(element) {
+                    self.journal.push(undo);
+                }
+            }
         }
     }
 
@@ -493,6 +598,7 @@ impl OwnedTree {
         local_name: &str,
         namespace: Option<&str>,
     ) -> Result<Option<&str>, TreeError> {
+        let namespace = namespace.filter(|uri| !uri.is_empty());
         Ok(self
             .attributes(node)?
             .find(|attribute| {
@@ -650,9 +756,14 @@ impl OwnedTree {
         value: &str,
     ) {
         let declaration = prefix == Some("xmlns") || (prefix.is_none() && local_name == "xmlns");
+        // An empty URI is no namespace, as the stored attribute keeps it.
+        let namespace = namespace.filter(|uri| !uri.is_empty());
         if let NodeKind::Element { attributes, .. } = &mut self.document.node_mut(id).kind {
+            // A declaration `xmlns:p` and an attribute `p` share a local name
+            // and no namespace; only one of the same sort is the same.
             let same = |attribute: &&mut Attribute| {
                 attribute.name == local_name
+                    && is_declaration(attribute) == declaration
                     && if declaration {
                         attribute.prefix.as_deref() == prefix
                     } else {
@@ -669,7 +780,7 @@ impl OwnedTree {
                     name: String::from(local_name),
                     value: String::from(value),
                     prefix: prefix.map(String::from),
-                    namespace: namespace.filter(|uri| !uri.is_empty()).map(String::from),
+                    namespace: namespace.map(String::from),
                     raw_value: None,
                 }),
             }
@@ -719,6 +830,7 @@ impl OwnedTree {
         let NodeKind::Element { attributes, .. } = &mut self.document.node_mut(id).kind else {
             return Err(TreeError::NotAnElement);
         };
+        let namespace = namespace.filter(|uri| !uri.is_empty());
         let before = attributes.len();
         attributes.retain(|attribute| {
             is_declaration(attribute)
@@ -844,18 +956,25 @@ impl OwnedTree {
             }
             self.freed[raw] = true;
             stack.extend(self.document.children(current));
+            // The number stays refused, but its names, text and attributes
+            // are released now rather than with the document.
+            self.document.node_mut(current).kind = NodeKind::Text {
+                content: String::new(),
+            };
         }
     }
 
     /// Report every node of the tree from `first` on to `sink`.
     fn walk(&self, first: Option<NodeId>, sink: &mut TreeSink<'_>) -> Result<(), ParseError> {
-        // Each entry is the next sibling to visit at one open level and
-        // whether an element closes when that level ends.
-        let mut stack: Vec<(Option<NodeId>, bool)> = alloc::vec![(first, false)];
+        // Each entry is the next sibling to visit at one open level and what
+        // closes when that level ends.
+        let mut stack: Vec<(Option<NodeId>, Closes)> = alloc::vec![(first, Closes::Nothing)];
         while let Some((current, closes)) = stack.pop() {
             let Some(id) = current else {
-                if closes {
-                    sink.end_element()?;
+                match closes {
+                    Closes::Nothing => {}
+                    Closes::Element => sink.end_element()?,
+                    Closes::Entity => sink.leave_entity()?,
                 }
                 continue;
             };
@@ -886,7 +1005,7 @@ impl OwnedTree {
                         }
                     }
                     sink.open_element()?;
-                    stack.push((self.document.first_child(id), true));
+                    stack.push((self.document.first_child(id), Closes::Element));
                 }
                 NodeKind::Text { content } | NodeKind::CData { content } => {
                     sink.text(reference, content)?;
@@ -895,12 +1014,12 @@ impl OwnedTree {
                 NodeKind::ProcessingInstruction { target, data } => {
                     sink.processing_instruction(reference, target, data.as_deref())?;
                 }
-                NodeKind::EntityRef { value, .. } => {
+                // The parser hangs the parsed replacement under the reference;
+                // its markup is markup (XML 1.0 section 4.4.2), so the children
+                // are reported, not the replacement text.
+                NodeKind::EntityRef { .. } => {
                     sink.enter_entity()?;
-                    if let Some(value) = value {
-                        sink.text(reference, value)?;
-                    }
-                    sink.leave_entity()?;
+                    stack.push((self.document.first_child(id), Closes::Entity));
                 }
                 NodeKind::DocumentType { .. } | NodeKind::Document => {}
             }
@@ -954,10 +1073,9 @@ impl OwnedTree {
                     value,
                 } => {
                     let element = *open.last().ok_or_else(|| edit_error("a stray attribute"))?;
+                    // An `xml:id` is registered once the edit is in place
+                    // (`register_inserted_ids`).
                     self.put_attribute(element, local_name, prefix, namespace, value);
-                    if prefix == Some("xml") && local_name == "id" {
-                        self.document.set_id(value, element);
-                    }
                     return Ok(());
                 }
                 FragmentEvent::OpenElement => return Ok(()),
@@ -988,8 +1106,8 @@ impl OwnedTree {
         Ok(top)
     }
 
-    fn attach(&mut self, parent: NodeId, next: Option<NodeId>, built: Vec<NodeId>) {
-        for node in built {
+    fn attach(&mut self, parent: NodeId, next: Option<NodeId>, built: &[NodeId]) {
+        for &node in built {
             match next {
                 Some(next) => self.document.insert_before(next, node),
                 None => self.document.append_child(parent, node),
@@ -1015,7 +1133,7 @@ impl OwnedTree {
                 }
                 if !text.is_empty() {
                     let created = self.document.create_text(text);
-                    self.attach(target, None, alloc::vec![created]);
+                    self.attach(target, None, &[created]);
                 }
             }
             TreeEdit::ReplaceContent { target, fragment } => {
@@ -1024,12 +1142,14 @@ impl OwnedTree {
                 while let Some(child) = self.document.first_child(target) {
                     self.detach_recorded(child);
                 }
-                self.attach(target, None, built);
+                self.attach(target, None, &built);
+                self.register_inserted_ids(&built);
             }
             TreeEdit::AppendChild { target, fragment } => {
                 let target = self.target(target)?;
                 let built = self.build(&fragment)?;
-                self.attach(target, None, built);
+                self.attach(target, None, &built);
+                self.register_inserted_ids(&built);
             }
             TreeEdit::InsertBefore { target, fragment }
             | TreeEdit::ReplaceNode { target, fragment } => {
@@ -1039,10 +1159,11 @@ impl OwnedTree {
                     .parent(target)
                     .ok_or_else(|| edit_error("the target has no parent"))?;
                 let built = self.build(&fragment)?;
-                self.attach(parent, Some(target), built);
+                self.attach(parent, Some(target), &built);
                 if matches!(edit, TreeEdit::ReplaceNode { .. }) {
                     self.detach_recorded(target);
                 }
+                self.register_inserted_ids(&built);
             }
         }
         Ok(())
@@ -1098,6 +1219,14 @@ impl ExternalTree for OwnedTree {
                     Some(next) => self.document.insert_before(next, node),
                     None => self.document.append_child(parent, node),
                 },
+                Some(Undo::Id { value, previous }) => match previous {
+                    Some(previous) => {
+                        self.ids.insert(value, previous);
+                    }
+                    None => {
+                        self.ids.remove(value.as_str());
+                    }
+                },
                 None => break,
             }
         }
@@ -1113,7 +1242,7 @@ impl ExternalTree for OwnedTree {
             .drain(mark..)
             .filter_map(|undo| match undo {
                 Undo::Unlinked { node, .. } => Some(node),
-                Undo::Linked(_) => None,
+                Undo::Linked(_) | Undo::Id { .. } => None,
             })
             .collect();
         for node in removed {
@@ -1123,6 +1252,17 @@ impl ExternalTree for OwnedTree {
             }
         }
     }
+}
+
+/// What ends with one open level of a walk.
+#[derive(Clone, Copy)]
+enum Closes {
+    /// The level of the walk's first node.
+    Nothing,
+    /// An element's content.
+    Element,
+    /// An entity reference's replacement.
+    Entity,
 }
 
 /// Whether `attribute` is a namespace declaration.

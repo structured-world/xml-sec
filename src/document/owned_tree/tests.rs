@@ -168,6 +168,209 @@ fn a_tree_lent_to_a_document_comes_back_with_its_nodes() {
 }
 
 #[test]
+fn freeing_a_node_releases_the_payload_of_its_subtree() {
+    // Freed numbers stay refused, but a long-lived document must not keep
+    // the text and attributes of every node it ever freed.
+    let mut tree = parsed(r#"<r><c a="value">text</c></r>"#);
+    let root = tree.root_element().expect("a document element");
+    let child = children(&tree, root)[0];
+    let text = children(&tree, child)[0];
+    tree.free(child).expect("a live node");
+    for node in [child, text] {
+        let kind = &tree.document.node(node.id().expect("not zero")).kind;
+        assert!(
+            matches!(kind, NodeKind::Text { content } if content.capacity() == 0),
+            "{kind:?}"
+        );
+    }
+}
+
+#[test]
+fn entity_replacement_markup_projects_as_markup() {
+    // XML 1.0 section 4.4.2: markup in an entity's replacement text is
+    // recognized as markup, so `&e;` is the element `b`, not the text "<b>".
+    let mut policy = VerificationPolicy::default();
+    policy.xml.allow_internal_dtd = true;
+    let xml = r#"<!DOCTYPE r [<!ENTITY e "<b>hi</b>">]><r>&e;</r>"#;
+    let tree = OwnedTree::parse_with_policy(xml, &policy).expect("the document parses");
+    let document =
+        XmlDocument::from_external_tree(Box::new(tree), &policy).expect("the tree projects");
+    let parsed = XmlDocument::parse_with_policy(xml, &policy).expect("the text parses");
+    let shape = |document: &XmlDocument| {
+        document.with_view(|view| {
+            let root = view.document().root_element();
+            let child = root.first_element_child().map(|child| {
+                (
+                    String::from(child.tag_name().name()),
+                    child.text().map(String::from),
+                )
+            });
+            (child, root.text().map(String::from))
+        })
+    };
+    assert_eq!(
+        shape(&document),
+        (Some((String::from("b"), Some(String::from("hi")))), None)
+    );
+    assert_eq!(shape(&document), shape(&parsed));
+}
+
+#[test]
+fn an_xml_id_value_is_normalized_before_it_is_registered() {
+    // xml:id 1.0 section 4: the value is normalized as an ID before it is
+    // assigned, and the attribute holds the normalized value.
+    let tree = parsed(r#"<r xml:id="  target   value "/>"#);
+    let root = tree.root_element().expect("a document element");
+    assert_eq!(tree.element_by_id("target value"), Some(root));
+    assert_eq!(
+        tree.attribute(root, "id", Some(XML_NAMESPACE)),
+        Ok(Some("target value"))
+    );
+}
+
+#[test]
+fn the_serialization_declares_the_encoding_of_its_bytes() {
+    // XML 1.0 section 4.3.3: the declared encoding is the one the bytes use,
+    // and the serialization is UTF-8 whatever the source declared.
+    let mut tree = parsed(r#"<?xml version="1.0" encoding="ISO-8859-1"?><r/>"#);
+    let root = tree.root_element().expect("a document element");
+    tree.set_text(root, "\u{e9}").expect("a live element");
+    let xml = tree.serialize();
+    assert!(xml.contains("encoding=\"UTF-8\""), "{xml}");
+    assert!(!xml.contains("ISO-8859-1"), "{xml}");
+}
+
+#[test]
+fn an_ordinary_attribute_never_replaces_a_namespace_declaration() {
+    // `xmlns:a` and an unqualified `a` share a local name; setting `a` must
+    // leave the declaration of the prefix `a` in place.
+    let mut tree = parsed(r#"<r xmlns:a="urn:a"><a:c/></r>"#);
+    let root = tree.root_element().expect("a document element");
+    tree.set_attribute(root, "a", None, None, "value")
+        .expect("an element");
+    let declarations: Vec<_> = tree
+        .namespace_declarations(root)
+        .expect("a live node")
+        .collect();
+    assert_eq!(
+        declarations,
+        [TreeNamespace {
+            prefix: Some("a"),
+            uri: "urn:a"
+        }]
+    );
+    assert_eq!(tree.attribute(root, "a", None), Ok(Some("value")));
+    // An empty namespace is no namespace: the same attribute is set again.
+    tree.set_attribute(root, "a", None, Some(""), "other")
+        .expect("an element");
+    let named_a = tree
+        .attributes(root)
+        .expect("a live node")
+        .filter(|attribute| attribute.local_name == "a")
+        .count();
+    assert_eq!(named_a, 1);
+    assert_eq!(tree.attribute(root, "a", None), Ok(Some("other")));
+}
+
+#[test]
+fn the_byte_ceiling_is_the_policy_violation() {
+    let mut policy = VerificationPolicy::default();
+    policy.resources.max_xml_document_bytes = 4;
+    assert!(matches!(
+        OwnedTree::parse_with_policy("<r></r>", &policy),
+        Err(XmlDocumentError::Policy(PolicyViolation::ResourceLimit {
+            resource: resource_name::XML_DOCUMENT,
+            maximum: 4,
+            actual: 7,
+        }))
+    ));
+}
+
+#[test]
+fn a_forbidden_document_type_is_refused_before_its_subset_is_read() {
+    // The recursive entities would fail only once the parser expands them;
+    // a policy without DTDs refuses the declaration before that.
+    let xml = r#"<!DOCTYPE r [<!ENTITY a "&b;"><!ENTITY b "&a;">]><r>&a;</r>"#;
+    assert!(matches!(
+        OwnedTree::parse_with_policy(xml, &VerificationPolicy::default()),
+        Err(XmlDocumentError::Parse(ParseError::DtdDetected))
+    ));
+}
+
+#[test]
+fn an_inserted_xml_id_is_registered_in_the_trees_id_table() {
+    // An element an edit inserts, such as one decryption restores, is found
+    // by its xml:id as a parsed one is.
+    let tree = parsed("<r/>");
+    let mut document =
+        XmlDocument::from_external_tree(Box::new(tree), &VerificationPolicy::default())
+            .expect("the tree projects");
+    let root = document.with_view(|view| view.node_identity(view.document().root_element()));
+    document
+        .append_child(root, r#"<c xml:id=" k "/>"#)
+        .expect("the fragment is appended");
+    let tree = document.into_owned_tree().expect("the lent tree");
+    let element = tree.element_by_id("k").expect("the xml:id is registered");
+    assert_eq!(tree.name(element), Ok(Some("c")));
+}
+
+#[test]
+fn a_snapshot_refuses_every_edit_and_keeps_its_content() {
+    // A snapshot keeps no tree and no serialization to edit: an edit is
+    // refused rather than spliced into nothing.
+    let tree = parsed("<!--before--><r><c/></r>");
+    let mut snapshot =
+        XmlDocument::snapshot_of_external_tree(&tree, &VerificationPolicy::default())
+            .expect("the tree projects");
+    let (root, child) = snapshot.with_view(|view| {
+        let root = view.root_element();
+        let child = view
+            .document()
+            .root_element()
+            .first_element_child()
+            .map(|child| view.node_identity(child))
+            .expect("a child element");
+        (root, child)
+    });
+    assert!(matches!(
+        snapshot.replace_element(root, "<n/>"),
+        Err(XmlDocumentError::ReadOnlySnapshot)
+    ));
+    assert!(matches!(
+        snapshot.replace_element(child, "<n/>"),
+        Err(XmlDocumentError::ReadOnlySnapshot)
+    ));
+    assert!(matches!(
+        snapshot.append_child(root, "<n/>"),
+        Err(XmlDocumentError::ReadOnlySnapshot)
+    ));
+    assert!(matches!(
+        snapshot.replace_content(root, "t"),
+        Err(XmlDocumentError::ReadOnlySnapshot)
+    ));
+    assert!(matches!(
+        snapshot.insert_before(child, "<n/>"),
+        Err(XmlDocumentError::ReadOnlySnapshot)
+    ));
+    snapshot.with_view(|view| {
+        let document = view.document();
+        assert!(
+            document
+                .root()
+                .first_child()
+                .is_some_and(|node| node.is_comment())
+        );
+        let root = document.root_element();
+        assert_eq!(root.tag_name().name(), "r");
+        assert_eq!(
+            root.first_element_child()
+                .map(|child| child.tag_name().name()),
+            Some("c")
+        );
+    });
+}
+
+#[test]
 fn operations_read_the_tree_through_a_tree_backed_document() {
     // The tree is an external tree of a core document: its projection is the
     // document every operation reads.

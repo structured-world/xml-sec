@@ -18,10 +18,7 @@ pub enum DocumentError {
     /// The library policy could not be compiled.
     #[error("the library policy is unavailable")]
     Policy,
-    /// The bytes are not UTF-8.
-    #[error("the document is not UTF-8")]
-    Encoding,
-    /// The core refused the document.
+    /// The core refused the document, its encoding included.
     #[error(transparent)]
     Document(#[from] XmlDocumentError),
 }
@@ -47,10 +44,24 @@ pub fn last_error() -> Option<(i32, String)> {
 /// Parse `bytes` under the library policy into a new document; its handle
 /// names the document node. A failure is also this thread's [`last_error`].
 ///
+/// The bytes are decoded in the encoding their byte-order mark or XML
+/// declaration selects, UTF-16 included.
+///
 /// # Errors
-/// Bytes that are not UTF-8, the core's refusal, or an unavailable policy.
+/// The core's refusal (an encoding error among them), or an unavailable
+/// policy.
 pub fn parse(bytes: &[u8]) -> Result<usize, DocumentError> {
-    let parsed = parse_tree(bytes);
+    parse_parts(&[bytes])
+}
+
+/// Parse the bytes of `parts` in sequence as [`parse`] parses one buffer.
+/// Their combined length meets the document byte limit before they are
+/// joined, so parts too large together are refused without a copy.
+///
+/// # Errors
+/// As for [`parse`].
+pub fn parse_parts(parts: &[&[u8]]) -> Result<usize, DocumentError> {
+    let parsed = parse_tree(parts);
     if let Err(error) = &parsed {
         let message = error.to_string();
         LAST_ERROR.with_borrow_mut(|last| *last = Some(message));
@@ -58,10 +69,9 @@ pub fn parse(bytes: &[u8]) -> Result<usize, DocumentError> {
     parsed
 }
 
-fn parse_tree(bytes: &[u8]) -> Result<usize, DocumentError> {
-    let xml = std::str::from_utf8(bytes).map_err(|_| DocumentError::Encoding)?;
+fn parse_tree(parts: &[&[u8]]) -> Result<usize, DocumentError> {
     let policy = crate::policy::library().ok_or(DocumentError::Policy)?;
-    let tree = OwnedTree::parse_with_policy(xml, policy)?;
+    let tree = OwnedTree::parse_parts_with_policy(parts, policy)?;
     Ok(handles::register(tree)?)
 }
 
@@ -102,8 +112,9 @@ pub fn snapshot<T>(
 /// refusal of the tree under `policy`; the tree stays the document's.
 ///
 /// # Panics
-/// Never: a document built from an owned tree gives it back, and a lent
-/// document's slot can be neither freed nor refilled.
+/// When `work` panics, after the tree is back in its slot; otherwise never:
+/// a document built from an owned tree gives it back, and a lent document's
+/// slot can be neither freed nor refilled.
 pub fn with_document<T, R>(
     node: *const T,
     policy: &impl XmlDocumentPolicy,
@@ -118,13 +129,19 @@ pub fn with_document<T, R>(
             return Err(error.into());
         }
     };
-    let result = work(&mut document, slot);
+    // The tree goes back to its slot even when `work` unwinds; otherwise the
+    // slot would stay lent, and the document unusable and unfreeable.
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&mut document, slot)));
     // A document built from an owned tree keeps it to the end.
     let tree = document
         .into_owned_tree()
         .expect("a document built from an owned tree returns it");
     restore(slot, tree);
-    Ok(result)
+    match result {
+        Ok(result) => Ok(result),
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }
 
 /// Return a lent tree to its slot, which no one else can fill or free while
@@ -132,3 +149,6 @@ pub fn with_document<T, R>(
 fn restore(slot: usize, tree: OwnedTree) {
     handles::give_back(slot, tree).expect("a lent document's slot waits for its tree");
 }
+
+#[cfg(test)]
+mod tests;

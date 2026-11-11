@@ -247,6 +247,30 @@ fn namespace_nodes_are_listed_by_their_element() {
     xml_sec_libxml2::document::free(doc);
 }
 
+/// A namespace node rendered on an element where its prefix is rebound to
+/// another URI is not that element's namespace node: libxmlsec1 compares the
+/// element, the prefix and the URI.
+#[test]
+fn a_shadowed_prefix_is_not_the_namespace_node_of_the_element() {
+    let doc = parse(br#"<r xmlns:p="urn:a"><c xmlns:p="urn:b"/></r>"#);
+    let root = nodes::root_element(doc);
+    let child = nodes::first_child(root);
+    let outer = nodes::namespace_node(root, Some("p"));
+    let inner = nodes::namespace_node(child, Some("p"));
+    // SAFETY: the set is used while live and owns its node list.
+    unsafe {
+        let set = xmlSecNodeSetCreate(doc, listing(&[inner]), NORMAL);
+        assert_eq!(xmlSecNodeSetContains(set, inner, child), 1);
+        assert_eq!(
+            xmlSecNodeSetContains(set, outer, child),
+            0,
+            "urn:a is not what p binds at c"
+        );
+        xmlSecNodeSetDestroy(set);
+    }
+    xml_sec_libxml2::document::free(doc);
+}
+
 /// CDATA characters are text (`XPath` 1.0 section 5.7), so the text dump
 /// that feeds Base64 writes them like any text node.
 #[test]

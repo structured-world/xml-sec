@@ -41,6 +41,26 @@ pub(crate) fn xmloxide_backend_options() -> crate::parser_xmloxide::parser::Pars
     xmloxide::backend_options()
 }
 
+/// The lexical scan a document with a document type declaration passes before
+/// xmloxide reads it into a tree other than the semantic arena: it refuses a
+/// DOCTYPE `allow_dtd` does not admit before its internal subset is read, and
+/// `observer` bounds the entities it expands.
+///
+/// # Errors
+/// [`ParseError::DtdDetected`], a lexical error, or the observer's refusal.
+#[cfg(all(
+    feature = "external-tree",
+    feature = "xml-backend-xmloxide",
+    any(feature = "xmldsig", feature = "xmlenc")
+))]
+pub(crate) fn scan_declared_document<'input, O: ScanObserver<'input>>(
+    input: &'input str,
+    allow_dtd: bool,
+    observer: &mut O,
+) -> Result<(), ParseError> {
+    LexicalPreflight::scan_observed(input, allow_dtd, XmlBackend::Xmloxide, observer).map(drop)
+}
+
 /// Parser-neutral options used after bounded lexical preflight.
 #[derive(Clone, Copy, Debug)]
 pub struct ParsingOptions {
