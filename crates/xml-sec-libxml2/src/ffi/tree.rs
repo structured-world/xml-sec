@@ -633,6 +633,71 @@ pub unsafe extern "C" fn xsFreeNode(node: *mut Node) {
     });
 }
 
+/// `xmlFreeNodeList`: free `node` and every sibling after it, each with its
+/// subtree; a node of a linked list is unlinked before it is freed.
+///
+/// # Safety
+/// Callable with any pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xsFreeNodeList(node: *mut Node) {
+    contain((), || nodes::free_list(node));
+}
+
+/// libxml2's `XML_ERR_INTERNAL_ERROR`, returned for a refused context.
+const XML_ERR_INTERNAL_ERROR: c_int = 1;
+/// libxml2's `XML_ERR_NO_MEMORY`.
+const XML_ERR_NO_MEMORY: c_int = 2;
+/// libxml2's `XML_ERR_DOCUMENT_END`: markup after the content, as a fragment
+/// that closes its context reports.
+const XML_ERR_DOCUMENT_END: c_int = 5;
+
+/// `xmlParseInNodeContext`: parse the `size` bytes at `data`, UTF-8, as
+/// content of the element `node`, under the library policy; the parsed
+/// nodes come back in `*list` as one run of unlinked siblings (null when
+/// there are none), which the caller links or frees with
+/// [`xsFreeNodeList`]. Returns 0, or a libxml2 error code: 1 for a refused
+/// context or bytes that are not UTF-8, 5 for content that is not
+/// well-formed or that the policy refuses. `options` is accepted for the
+/// shape of the call; nothing external is loaded.
+///
+/// # Safety
+/// `data` is null or holds `size` bytes; `list` is null or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xsParseInNodeContext(
+    node: *mut Node,
+    data: *const c_char,
+    size: c_int,
+    _options: c_int,
+    list: *mut *mut Node,
+) -> c_int {
+    contain(XML_ERR_NO_MEMORY, || {
+        let writable = !list.is_null() && list.is_aligned();
+        if writable {
+            // SAFETY: writable by the caller's contract.
+            unsafe { list.write(std::ptr::null_mut()) };
+        }
+        let (Ok(size), false) = (usize::try_from(size), data.is_null()) else {
+            return XML_ERR_INTERNAL_ERROR;
+        };
+        // SAFETY: `data` holds `size` bytes by the caller's contract.
+        let bytes = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), size) };
+        match nodes::parse_in_context(node, bytes) {
+            Ok(first) if writable => {
+                // SAFETY: as above.
+                unsafe { list.write(first) };
+                0
+            }
+            // Nodes no one receives could never be freed.
+            Ok(first) => {
+                nodes::free_list(first);
+                0
+            }
+            Err(nodes::FragmentError::Document(_)) => XML_ERR_DOCUMENT_END,
+            Err(_) => XML_ERR_INTERNAL_ERROR,
+        }
+    })
+}
+
 /// `xmlReplaceNode`: put `current` in the place of `old`, unlinking both
 /// first; returns `old`, unlinked, or null.
 ///

@@ -114,7 +114,14 @@ xmlNodePtr xsAddNextSibling(xmlNodePtr current, xmlNodePtr node);
 xmlNodePtr xsAddPrevSibling(xmlNodePtr current, xmlNodePtr node);
 void xsUnlinkNode(xmlNodePtr node);
 void xsFreeNode(xmlNodePtr node);
+/* Unlike libxml2's: a node of a linked list is unlinked before it is freed. */
+void xsFreeNodeList(xmlNodePtr node);
 xmlNodePtr xsReplaceNode(xmlNodePtr old, xmlNodePtr current);
+/* data is UTF-8. Unlike libxml2's, a refusal returns 1 (bad context or
+ * encoding) or 5 (content not well-formed or refused by the policy) rather
+ * than the parser's specific code. */
+int xsParseInNodeContext(xmlNodePtr node, const char *data, int size, int options,
+                         xmlNodePtr *list);
 
 /* Content and attributes. */
 xmlChar *xsNodeGetContent(const xmlNode *node);

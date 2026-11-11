@@ -388,6 +388,87 @@ fn a_snapshot_counts_its_projected_bytes() {
 }
 
 #[test]
+fn a_carriage_return_in_text_serializes_as_libxml2_writes_it() {
+    // xmlDocDumpMemory writes a carriage return in text as `&#xD;`; a
+    // document dumped through the tree layer must print the same bytes.
+    let mut tree = parsed("<r/>");
+    let root = tree.root_element().expect("a document element");
+    tree.set_text(root, "a\r\nb").expect("a live element");
+    assert_eq!(
+        tree.serialize(),
+        "<?xml version=\"1.0\"?>\n<r>a&#xD;\nb</r>\n"
+    );
+}
+
+#[test]
+fn unlinked_children_stay_a_sibling_run_without_a_parent() {
+    // As libxml2 hands back replaced content: the former children are
+    // unlinked, keep their order as siblings and report no parent; linking
+    // one moves it out of the run.
+    let mut tree = parsed("<r><a/>t<b/></r>");
+    let root = tree.root_element().expect("a document element");
+    let first = tree
+        .unlink_children(root)
+        .expect("a live element")
+        .expect("the element had children");
+    assert_eq!(children(&tree, root), [] as [TreeNode; 0]);
+    assert_eq!(tree.parent(first), Ok(None));
+    assert_eq!(tree.name(first), Ok(Some("a")));
+    let second = tree
+        .next_sibling(first)
+        .expect("a live node")
+        .expect("a sibling");
+    let third = tree
+        .next_sibling(second)
+        .expect("a live node")
+        .expect("a sibling");
+    assert_eq!(tree.text(second), Ok(Some("t")));
+    assert_eq!(tree.parent(third), Ok(None));
+    tree.append_child(root, third)
+        .expect("an unlinked node links");
+    assert_eq!(children(&tree, root), [third]);
+    assert_eq!(tree.next_sibling(second), Ok(None));
+    tree.free(first).expect("a live node");
+    tree.free(second).expect("a live node");
+    assert!(!tree.contains(second));
+    assert_eq!(
+        tree.unlink_children(root).map(|first| first.is_some()),
+        Ok(true)
+    );
+}
+
+#[test]
+fn a_fragment_parses_in_the_namespaces_of_its_context() {
+    // As libxml2's xmlParseInNodeContext: the fragment sees the bindings in
+    // scope at the context element and comes back as an unlinked run.
+    let mut tree = parsed(r#"<r xmlns:p="urn:p"><c/></r>"#);
+    let root = tree.root_element().expect("a document element");
+    let context = children(&tree, root)[0];
+    let first = tree
+        .parse_in_context(context, "<p:x>1</p:x><y/>", &VerificationPolicy::default())
+        .expect("the fragment parses")
+        .expect("the fragment has nodes");
+    assert_eq!(tree.parent(first), Ok(None));
+    assert_eq!(tree.namespace(first), Ok(Some("urn:p")));
+    assert_eq!(tree.prefix(first), Ok(Some("p")));
+    assert_eq!(tree.text_content(first), Ok(String::from("1")));
+    let second = tree
+        .next_sibling(first)
+        .expect("a live node")
+        .expect("a sibling");
+    assert_eq!(tree.name(second), Ok(Some("y")));
+    assert!(
+        tree.parse_in_context(context, "<p:x>", &VerificationPolicy::default())
+            .is_err()
+    );
+    assert!(
+        tree.parse_in_context(context, "<q:x/>", &VerificationPolicy::default())
+            .is_err(),
+        "an unbound prefix is refused"
+    );
+}
+
+#[test]
 fn a_cdata_terminator_in_edited_content_survives_serialization() {
     // XML 1.0 section 2.7: CDATA content cannot hold `]]>`, so the
     // serialization splits it across sections, as libxml2 writes it.

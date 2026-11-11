@@ -6,7 +6,11 @@ use super::contain;
 use super::errors::{self, check, here};
 use super::tree::{XML_DOCUMENT_NODE, XML_ELEMENT_NODE, XmlNode, give, nodes, same_text};
 
-/// C `isspace` in the "C" locale.
+mod content;
+mod edit;
+mod qname;
+
+/// C `isspace` in the "C" locale, which libxmlsec1 trims and tests with.
 const fn is_space(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
 }
