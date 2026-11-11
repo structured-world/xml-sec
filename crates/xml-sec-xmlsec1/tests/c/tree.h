@@ -15,6 +15,7 @@
 #include <libxml/xpathInternals.h>
 
 #include <libxml/xmlerror.h>
+#include <libxml/valid.h>
 
 #define xsSetGenericErrorFunc xmlSetGenericErrorFunc
 #define xsFree(mem) xmlFree(mem)
@@ -26,7 +27,14 @@
 #define xsNewDocNode xmlNewDocNode
 #define xsNodeGetContent xmlNodeGetContent
 #define xsFreeNode xmlFreeNode
+#define xsFreeNodeList xmlFreeNodeList
+#define xsNewDocText xmlNewDocText
 #define xsSearchNs xmlSearchNs
+/* libxml2's xmlNodeSetContent returns nothing before 2.13; the programs do
+ * not read the result. */
+#define xsNodeSetContent(node, content) (xmlNodeSetContent(node, content), 0)
+/* Only compared with NULL by the programs: an attribute against an element. */
+#define xsGetID(doc, value) ((void *)xmlGetID(doc, value))
 #define xsXPathNodeSetCreate xmlXPathNodeSetCreate
 #define xsXPathNodeSetAdd xmlXPathNodeSetAdd
 #define xsXPathNodeSetAddNs xmlXPathNodeSetAddNs
@@ -41,6 +49,16 @@ static inline xmlNodePtr xsNodeGetChildren(const xmlNode *node) {
 }
 static inline xmlNodePtr xsNodeGetNext(const xmlNode *node) {
     return node != NULL ? node->next : NULL;
+}
+static inline xmlNodePtr xsNodeGetPrev(const xmlNode *node) {
+    return node != NULL ? node->prev : NULL;
+}
+static inline xmlNodePtr xsNodeGetLast(const xmlNode *node) {
+    return node != NULL ? node->last : NULL;
+}
+static inline xmlChar *xsNodeGetNsPrefix(const xmlNode *node) {
+    return node != NULL && node->ns != NULL && node->ns->prefix != NULL ? xmlStrdup(node->ns->prefix)
+                                                                         : NULL;
 }
 static inline xmlNodePtr xsNodeGetParent(const xmlNode *node) {
     return node != NULL ? node->parent : NULL;

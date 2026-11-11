@@ -63,10 +63,16 @@ pub fn parse(bytes: &[u8]) -> Result<usize, DocumentError> {
 pub fn parse_parts(parts: &[&[u8]]) -> Result<usize, DocumentError> {
     let parsed = parse_tree(parts);
     if let Err(error) = &parsed {
-        let message = error.to_string();
-        LAST_ERROR.with_borrow_mut(|last| *last = Some(message));
+        record_error(error);
     }
     parsed
+}
+
+/// Make `error` this thread's [`last_error`], as libxml2 records each
+/// parser failure.
+pub(crate) fn record_error(error: &impl std::fmt::Display) {
+    let message = error.to_string();
+    LAST_ERROR.with_borrow_mut(|last| *last = Some(message));
 }
 
 fn parse_tree(parts: &[&[u8]]) -> Result<usize, DocumentError> {

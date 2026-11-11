@@ -36,6 +36,8 @@ pub(crate) const R_MALLOC_FAILED: c_int = 2;
 pub(crate) const R_STRDUP_FAILED: c_int = 3;
 /// `XMLSEC_ERRORS_R_XML_FAILED`.
 pub(crate) const R_XML_FAILED: c_int = 5;
+/// `XMLSEC_ERRORS_R_IO_FAILED`.
+pub(crate) const R_IO_FAILED: c_int = 7;
 /// `XMLSEC_ERRORS_R_NOT_IMPLEMENTED`.
 pub(crate) const R_NOT_IMPLEMENTED: c_int = 9;
 /// `XMLSEC_ERRORS_R_INVALID_CONFIG`.
@@ -620,6 +622,25 @@ pub(crate) unsafe fn unexpected_node(here: Here, node: *const XmlNode, object: *
 /// libxmlsec1's `xmlSecInvalidDataError`.
 pub(crate) fn invalid_data(here: Here, object: *const c_char, message: &str) {
     report(here, object, std::ptr::null(), R_INVALID_DATA, message);
+}
+
+/// libxmlsec1's `xmlSecInvalidStringDataError`: `name` is `actual` where
+/// `expected` was expected.
+pub(crate) fn invalid_string_data(
+    here: Here,
+    object: *const c_char,
+    name: &str,
+    actual: &[u8],
+    expected: &str,
+) {
+    invalid_data(
+        here,
+        object,
+        &format!(
+            "invalid data for '{name}': actual='{}' and expected {expected}",
+            String::from_utf8_lossy(actual)
+        ),
+    );
 }
 
 /// libxmlsec1's `xmlSecAssert2`: when `$condition` does not hold, reports the

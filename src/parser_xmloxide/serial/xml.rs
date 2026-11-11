@@ -357,9 +357,9 @@ fn write_hex_char_ref(out: &mut String, ch: char) {
 
 /// Escapes text content for XML output.
 ///
-/// Follows libxml2's `xmlEscapeEntities` behavior:
+/// Follows current libxml2's text escaping:
 /// - `<`, `>`, `&` are escaped with named entity references
-/// - `\r` is encoded as `&#13;`
+/// - `\r` is encoded as `&#xD;`, as `xmlDocDumpMemory` writes it
 /// - `\t` and `\n` are passed through
 /// - Control characters below 0x20 (other than `\t`, `\n`, `\r`) are hex-encoded
 /// - Non-ASCII characters are passed through as raw UTF-8
@@ -369,7 +369,7 @@ fn write_escaped_text(out: &mut String, text: &str, reencode_non_ascii: bool) {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
-            '\r' => out.push_str("&#13;"),
+            '\r' => out.push_str("&#xD;"),
             '\t' | '\n' => out.push(ch),
             c if (c as u32) < 0x20 => write_hex_char_ref(out, c),
             c if reencode_non_ascii && (c as u32) >= 0x80 => write_hex_char_ref(out, c),

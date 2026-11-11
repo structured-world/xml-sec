@@ -139,6 +139,7 @@ impl Target {
                 "tests/c/errors.c",
                 "tests/c/io.c",
                 "tests/c/library.c",
+                "tests/c/xmltree.c",
             ],
         }
     }
