@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/structured-world/xml-sec/compare/v0.6.0...v0.7.0) - 2026-11-11
+
+### Added
+
+- *(xmlsec1)* [**breaking**] own document tree for the libxmlsec1 surface, no libxml2 ([#454](https://github.com/structured-world/xml-sec/pull/454))
+- *(xmlsec1)* add error, I/O, library state and crypto table compatibility ([#450](https://github.com/structured-world/xml-sec/pull/450))
+- *(xmlsec1)* add the libxmlsec1 transform, key-data and extension ABI ([#448](https://github.com/structured-world/xml-sec/pull/448))
+- *(xmldsig)* [**breaking**] verify through the caller's provider alone ([#445](https://github.com/structured-world/xml-sec/pull/445))
+- *(libxml2)* operate on a caller's libxml2 document in place ([#444](https://github.com/structured-world/xml-sec/pull/444))
+- *(capi)* [**breaking**] add key lookup callbacks to verify and decrypt ([#438](https://github.com/structured-world/xml-sec/pull/438))
+- *(capi)* [**breaking**] add a clean C ABI over the policy-bound API ([#433](https://github.com/structured-world/xml-sec/pull/433))
+- *(policy)* [**breaking**] share policy snapshots and audit every operation ([#431](https://github.com/structured-world/xml-sec/pull/431))
+
+### Fixed
+
+- *(capi)* resolve lookup-supplied wrap and preset keys ([#442](https://github.com/structured-world/xml-sec/pull/442))
+- *(policy)* audit the OAEP digest and mask a key transport admits ([#436](https://github.com/structured-world/xml-sec/pull/436))
+
 ## [0.6.0](https://github.com/structured-world/xml-sec/compare/v0.5.1...v0.6.0) - 2026-11-07
 
 ### Added
