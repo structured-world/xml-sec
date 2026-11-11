@@ -75,7 +75,7 @@ mod hard_limits;
 #[cfg_attr(test, allow(clippy::unwrap_used))]
 #[path = "parser_roxmltree/lib.rs"]
 mod parser_roxmltree;
-#[cfg(feature = "xml-backend-xmloxide")]
+#[cfg(any(feature = "xml-backend-xmloxide", feature = "owned-tree"))]
 #[allow(dead_code, unused_imports, missing_docs)]
 #[cfg_attr(test, allow(clippy::unwrap_used))]
 #[path = "parser_xmloxide/lib.rs"]

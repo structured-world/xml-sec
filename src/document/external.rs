@@ -55,6 +55,14 @@ pub trait ExternalTree: Send + Sync {
     /// Keep every edit applied since `mark`: free the nodes they removed and
     /// forget how to undo them.
     fn release(&mut self, mark: usize);
+
+    /// This tree as the crate's own [`OwnedTree`](super::owned_tree::OwnedTree),
+    /// if it is one, so a caller that lent it to a document gets it back.
+    #[cfg(all(feature = "owned-tree", any(feature = "xmldsig", feature = "xmlenc")))]
+    #[must_use]
+    fn into_owned_tree(self: alloc::boxed::Box<Self>) -> Option<super::owned_tree::OwnedTree> {
+        None
+    }
 }
 
 /// A tree's failure to carry out an edit.

@@ -1,12 +1,16 @@
 //! `xmlsec1-headers [--check]`: the generic `xmlsec/*.h` headers of
-//! `xml-sec-xmlsec1` are the pinned libxmlsec1's installed headers, byte for
-//! byte, so C sources see exactly the declarations, layouts and macros they
-//! were written against; the string constants those headers declare
-//! (`strings.h`) carry the bytes the pinned library exports under the same
-//! names, read from its shared library. Without arguments the command copies
-//! the headers and generates the string table from the oracle installed under
-//! `XMLSEC1_PREFIX`; `--check` fails on any difference. Backend headers
-//! (`xmlsec/openssl/...`) are not part of the generic tier.
+//! `xml-sec-xmlsec1` are the pinned libxmlsec1's installed headers with two
+//! edits, so C sources see the declarations, layouts and macros they were
+//! written against: libxml2's headers are replaced by the library's own tree
+//! header (`xs_tree.h`), and the functions that read a file or an external
+//! entity themselves or take a libxml2 parser context ([`NOT_OFFERED`]) are
+//! left out. The string
+//! constants those headers declare (`strings.h`) carry the bytes the pinned
+//! library exports under the same names, read from its shared library.
+//! Without arguments the command writes the headers and generates the string
+//! table from the oracle installed under `XMLSEC1_PREFIX`; `--check` fails on
+//! any difference. Backend headers (`xmlsec/openssl/...`) are not part of the
+//! generic tier.
 
 use crate::repo::{Failure, root};
 use object::{NameOrOrdinal, Object as _, ObjectSection as _};
@@ -46,6 +50,81 @@ pub(crate) const HEADERS: [&str; 27] = [
     "xmlsec.h",
     "xmltree.h",
 ];
+
+/// libxmlsec1 functions the library does not offer, with why: they read a
+/// file or an external entity themselves, where the caller reads and passes
+/// bytes, or take a libxml2 parser context, which the library has none of.
+pub(crate) const NOT_OFFERED: [(&str, &str); 4] = [
+    (
+        "xmlSecBufferReadFile",
+        "the library reads no file; the caller passes the bytes",
+    ),
+    (
+        "xmlSecParseFile",
+        "the library reads no file; the caller passes the bytes",
+    ),
+    (
+        "xmlSecParsePrepareCtxt",
+        "the library parses with its own parser, not a libxml2 context",
+    ),
+    (
+        "xmlSecSetExternalEntityLoader",
+        "the library loads no external entity",
+    ),
+];
+
+/// The include that replaces libxml2's headers.
+const TREE_INCLUDE: &str = "#include <xs_tree.h>";
+
+/// Lines of libxmlsec1's headers that read a field of a tree type, which
+/// `xs_tree.h` declares incomplete, with the line that reads it through the
+/// tree's accessor instead.
+pub(crate) const FIELD_READS: [(&str, &str); 1] = [(
+    "    (((node)) ? ((const char*)((node)->name)) : NULL)",
+    "    (((node)) ? ((const char*)xsNodeName(node)) : NULL)",
+)];
+
+/// `header` with libxml2's includes replaced by one include of the tree
+/// header, every declaration of a [`NOT_OFFERED`] function replaced by a
+/// comment saying so, and every [`FIELD_READS`] line read through the
+/// accessor.
+pub(crate) fn adapted(header: &[u8]) -> Result<Vec<u8>, String> {
+    let text = std::str::from_utf8(header).map_err(|_| "a header is not UTF-8")?;
+    let mut lines = Vec::new();
+    let mut included = false;
+    let mut skipping = false;
+    for line in text.split_inclusive('\n') {
+        if skipping {
+            skipping = !line.contains(';');
+            continue;
+        }
+        if line.trim_start().starts_with("#include <libxml/") {
+            if !included {
+                lines.push(format!("{TREE_INCLUDE}\n"));
+                included = true;
+            }
+            continue;
+        }
+        let declared = NOT_OFFERED.iter().find(|(name, _)| {
+            line.starts_with("XMLSEC_EXPORT")
+                && line
+                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .any(|word| word == *name)
+        });
+        if let Some((name, reason)) = declared {
+            lines.push(format!("/* {name} is not offered: {reason}. */\n"));
+            skipping = !line.contains(';');
+            continue;
+        }
+        let body = line.trim_end_matches(['\r', '\n']);
+        if let Some((_, accessor)) = FIELD_READS.iter().find(|(field, _)| *field == body) {
+            lines.push(format!("{accessor}{}", &line[body.len()..]));
+            continue;
+        }
+        lines.push(line.to_owned());
+    }
+    Ok(lines.concat().into_bytes())
+}
 
 /// Where the crate keeps its copy.
 pub(crate) const TARGET: &str = "crates/xml-sec-xmlsec1/include/xmlsec";
@@ -193,8 +272,8 @@ pub(crate) fn source(prefix: &Path) -> PathBuf {
     prefix.join("include/xmlsec1/xmlsec")
 }
 
-/// Headers whose copy in `target` differs from `source`, or is missing in
-/// either directory.
+/// Headers whose copy in `target` differs from the [`adapted`] header of
+/// `source`, or is missing in either directory.
 pub(crate) fn differences(source: &Path, target: &Path) -> Result<Vec<String>, Failure> {
     let mut different = Vec::new();
     for header in HEADERS {
@@ -206,7 +285,8 @@ pub(crate) fn differences(source: &Path, target: &Path) -> Result<Vec<String>, F
                 Err(error) => Err(Failure::from(format!("read {}: {error}", path.display()))),
             }
         };
-        let (expected, actual) = (read(source)?, read(target)?);
+        let expected = read(source)?.map(|bytes| adapted(&bytes)).transpose()?;
+        let actual = read(target)?;
         if expected.is_none() || expected != actual {
             different.push(header.to_owned());
         }
@@ -214,15 +294,17 @@ pub(crate) fn differences(source: &Path, target: &Path) -> Result<Vec<String>, F
     Ok(different)
 }
 
-/// Copies every header from `source` to `target`.
+/// Writes the [`adapted`] copy of every header of `source` to `target`.
 pub(crate) fn copy(source: &Path, target: &Path) -> Result<(), Failure> {
     std::fs::create_dir_all(target)
         .map_err(|error| format!("create {}: {error}", target.display()))?;
     for header in HEADERS {
         let from = source.join(header);
         let to = target.join(header);
-        std::fs::copy(&from, &to)
-            .map_err(|error| format!("copy {} to {}: {error}", from.display(), to.display()))?;
+        let bytes =
+            std::fs::read(&from).map_err(|error| format!("read {}: {error}", from.display()))?;
+        std::fs::write(&to, adapted(&bytes)?)
+            .map_err(|error| format!("write {}: {error}", to.display()))?;
     }
     Ok(())
 }

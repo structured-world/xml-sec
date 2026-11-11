@@ -17,8 +17,7 @@
 
 #ifndef XMLSEC_NO_CRYPTO_DYNAMIC_LOADING
 
-#include <libxml/tree.h>
-#include <libxml/xmlIO.h>
+#include <xs_tree.h>
 
 #include <xmlsec/exports.h>
 #include <xmlsec/xmlsec.h>

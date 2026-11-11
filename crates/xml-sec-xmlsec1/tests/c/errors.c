@@ -1,6 +1,6 @@
 /* Error reporting as a libxmlsec1 caller sees it. The program is built
- * unmodified against the pinned libxmlsec1 and against this crate, and both
- * must print the same: the reason table, the fields and formatted message a
+ * against the pinned libxmlsec1 and against this crate, and both must print
+ * the same: the reason table, the fields and formatted message a
  * callback receives, the callback priority, the default callback's line
  * (after its location fields, which name each library's own code), and the
  * reports of failing library calls: the reason of the first report (the
@@ -10,7 +10,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include <libxml/xmlerror.h>
+#include "tree.h"
 #include <xmlsec/xmlsec.h>
 #include <xmlsec/errors.h>
 /* The system callback is the crypto layer's, declared privately. */
@@ -22,7 +22,6 @@
 #include <xmlsec/transforms.h>
 #include <xmlsec/keysdata.h>
 #include <xmlsec/xmltree.h>
-#include <libxml/parser.h>
 
 static int reports;
 static int first_reason;
@@ -63,8 +62,8 @@ static void other(const char *file, int line, const char *func, const char *obje
     printf("  system callback: reason=%d\n", reason);
 }
 
-/* libxml2's generic error handler, through which the default callback
- * writes: the part from "obj=" on is the same for both libraries. */
+/* The generic error handler, through which the default callback writes:
+ * the part from "obj=" on is the same for both libraries. */
 static void generic(void *ctx, const char *msg, ...) {
     va_list args;
     char line[2048];
@@ -122,7 +121,7 @@ static void truncation(void) {
 
     memset(long_text, 'z', sizeof(long_text) - 1);
     long_text[sizeof(long_text) - 1] = '\0';
-    xmlSetGenericErrorFunc(NULL, generic);
+    xsSetGenericErrorFunc(NULL, generic);
     xmlSecErrorsSetCallback(xmlSecErrorsDefaultCallback);
     printf("default callback\n");
     xmlSecError(XMLSEC_ERRORS_HERE, "obj", NULL, XMLSEC_ERRORS_R_INVALID_SIZE, "n=%d", 3);
@@ -193,13 +192,13 @@ static void transform_context(void) {
         "<Other/></Transform></L>"
         "<Other/>"
         "</T>";
-    xmlDocPtr doc = xmlReadMemory(document, (int)strlen(document), "doc.xml", NULL, 0);
-    xmlNodePtr root = xmlDocGetRootElement(doc);
-    xmlNodePtr bare = xmlSecGetNextElementNode(root->children);
-    xmlNodePtr unknown = xmlSecGetNextElementNode(bare->next);
-    xmlNodePtr enveloped = xmlSecGetNextElementNode(unknown->next);
-    xmlNodePtr xpath2 = xmlSecGetNextElementNode(enveloped->next);
-    xmlNodePtr xpath = xmlSecGetNextElementNode(xpath2->next);
+    xmlDocPtr doc = xsReadMemory(document, (int)strlen(document), "doc.xml", NULL, 0);
+    xmlNodePtr root = xsDocGetRootElement(doc);
+    xmlNodePtr bare = xmlSecGetNextElementNode(xsNodeGetChildren(root));
+    xmlNodePtr unknown = xmlSecGetNextElementNode(xsNodeGetNext(bare));
+    xmlNodePtr enveloped = xmlSecGetNextElementNode(xsNodeGetNext(unknown));
+    xmlNodePtr xpath2 = xmlSecGetNextElementNode(xsNodeGetNext(enveloped));
+    xmlNodePtr xpath = xmlSecGetNextElementNode(xsNodeGetNext(xpath2));
     xmlSecTransformCtx ctx;
 
     printing = 1;
@@ -278,7 +277,7 @@ static void transform_context(void) {
 
     printing = 0;
     xmlSecTransformIdsShutdown();
-    xmlFreeDoc(doc);
+    xsFreeDoc(doc);
 }
 
 /* Key-data failures: preconditions, a klass method missing and a lookup in

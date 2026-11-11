@@ -1,5 +1,7 @@
 //! `xmlsec/xmlsec.h`: library initialization and shutdown, the version
-//! check, the default crypto name and the external entity loader.
+//! check and the default crypto name. The core parser loads no external
+//! entity, so `xmlSecSetExternalEntityLoader`, which installs a loader that
+//! reads them, is not part of the surface.
 //!
 //! libxmlsec1 asks its caller to initialize and shut down once per process
 //! and not concurrently. This library serializes `xmlSecInit` and
@@ -9,9 +11,7 @@
 
 use std::ffi::{CString, c_int};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-
-use xml_sec_libxml2::ffi::libxml2::{self, EntityLoader};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::contain;
 use super::crypto::{xmlSecCryptoDLInit, xmlSecCryptoDLShutdown};
@@ -56,17 +56,8 @@ fn serialized<T>(body: impl FnOnce() -> T) -> T {
     body()
 }
 
-/// libxml2's external entity loader when the library was first initialized,
-/// which `xmlSecSetExternalEntityLoader(NULL)` restores.
-static DEFAULT_ENTITY_LOADER: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
-
 /// `xmlSecInit`: sets up error reporting, the I/O callback list, the crypto
-/// library list and the key-data and transform registries, and records
-/// libxml2's external entity loader.
-///
-/// The default parser options keep external entities out on every libxml2
-/// release, so no loader of this library's is installed (libxmlsec1 installs
-/// one before libxml2 2.13).
+/// library list and the key-data and transform registries.
 ///
 /// # Safety
 /// No operation of the library runs concurrently.
@@ -101,12 +92,6 @@ pub(crate) unsafe extern "C" fn xmlSecInit() -> c_int {
                     errors::internal(here, std::ptr::null(), c"xmlSecTransformIdsInit");
                     return -1;
                 }
-            }
-            if libxml2::available() && DEFAULT_ENTITY_LOADER.load(Ordering::Acquire).is_null() {
-                // SAFETY: libxml2 is available.
-                let loader = unsafe { libxml2::xml_get_external_entity_loader() };
-                let address = loader.map_or(std::ptr::null_mut(), |loader| loader as *mut ());
-                DEFAULT_ENTITY_LOADER.store(address, Ordering::Release);
             }
             0
         })
@@ -152,30 +137,6 @@ unsafe fn release() -> c_int {
         xmlSecErrorsShutdown();
     }
     result
-}
-
-/// `xmlSecSetExternalEntityLoader`: installs `loader` as libxml2's external
-/// entity loader, or the loader libxml2 had when the library was first
-/// initialized when `loader` is null.
-///
-/// # Safety
-/// `loader` is null or a function of libxml2's loader signature.
-#[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn xmlSecSetExternalEntityLoader(loader: Option<EntityLoader>) {
-    contain((), || {
-        if !libxml2::available() {
-            errors::no_libxml2(here!("xmlSecSetExternalEntityLoader"));
-            return;
-        }
-        let loader = loader.or_else(|| {
-            let address = DEFAULT_ENTITY_LOADER.load(Ordering::Acquire);
-            // SAFETY: a non-null address is the loader libxml2 returned.
-            (!address.is_null())
-                .then(|| unsafe { std::mem::transmute::<*mut (), EntityLoader>(address) })
-        });
-        // SAFETY: libxml2 is available; the loader is null or one.
-        unsafe { libxml2::xml_set_external_entity_loader(loader) };
-    });
 }
 
 /// `xmlSecGetDefaultCrypto`: the name of the built-in crypto provider, the

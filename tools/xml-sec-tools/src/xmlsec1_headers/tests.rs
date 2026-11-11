@@ -1,5 +1,52 @@
-use super::{HEADERS, copy, declared_strings, differences, render};
+use super::{HEADERS, adapted, copy, declared_strings, differences, render};
 use crate::test_support::read;
+
+/// libxml2's includes become one include of the tree header, and a
+/// function that reads a file is left out with a note, its continuation
+/// lines included; every other line stays as it is.
+#[test]
+fn the_headers_take_the_tree_header_and_leave_out_file_readers() {
+    let header = concat!(
+        "#include <libxml/tree.h>\n",
+        "#include <libxml/xpath.h>\n",
+        "#include <xmlsec/exports.h>\n",
+        "XMLSEC_EXPORT int xmlSecBufferReverse (xmlSecBufferPtr buf);\n",
+        "XMLSEC_EXPORT int xmlSecBufferReadFile (xmlSecBufferPtr buf,\n",
+        "                                        const char* filename);\n",
+        "XMLSEC_EXPORT xmlDocPtr xmlSecParseFile (const char *filename);\n",
+        "XMLSEC_EXPORT xmlDocPtr xmlSecParseFileX (const char *filename);\n",
+    );
+    let adapted = String::from_utf8(adapted(header.as_bytes()).expect("UTF-8")).expect("UTF-8");
+    assert_eq!(
+        adapted,
+        concat!(
+            "#include <xs_tree.h>\n",
+            "#include <xmlsec/exports.h>\n",
+            "XMLSEC_EXPORT int xmlSecBufferReverse (xmlSecBufferPtr buf);\n",
+            "/* xmlSecBufferReadFile is not offered: the library reads no file; the caller passes the bytes. */\n",
+            "/* xmlSecParseFile is not offered: the library reads no file; the caller passes the bytes. */\n",
+            "XMLSEC_EXPORT xmlDocPtr xmlSecParseFileX (const char *filename);\n",
+        )
+    );
+}
+
+/// A macro reading a field of an incomplete tree type would not compile:
+/// it reads the field through the accessor instead.
+#[test]
+fn a_field_read_goes_through_the_accessor() {
+    let header = concat!(
+        "#define xmlSecNodeGetName(node) \\\n",
+        "    (((node)) ? ((const char*)((node)->name)) : NULL)\n",
+    );
+    let adapted = String::from_utf8(adapted(header.as_bytes()).expect("UTF-8")).expect("UTF-8");
+    assert_eq!(
+        adapted,
+        concat!(
+            "#define xmlSecNodeGetName(node) \\\n",
+            "    (((node)) ? ((const char*)xsNodeName(node)) : NULL)\n",
+        )
+    );
+}
 
 /// A directory holding every header with its own name as content.
 fn installed(dir: &std::path::Path) {

@@ -13,8 +13,7 @@
  * @brief API reference for the xmlsec core library.
  */
 
-#include <libxml/tree.h>
-#include <libxml/parser.h>
+#include <xs_tree.h>
 
 #include <xmlsec/version.h>
 #include <xmlsec/exports.h>
@@ -122,7 +121,7 @@ XMLSEC_EXPORT int                               xmlSecInit              (void);
 XMLSEC_EXPORT int                               xmlSecShutdown          (void);
 XMLSEC_EXPORT const xmlChar *                   xmlSecGetDefaultCrypto  (void);
 
-XMLSEC_EXPORT void                              xmlSecSetExternalEntityLoader (xmlExternalEntityLoader entityLoader);
+/* xmlSecSetExternalEntityLoader is not offered: the library loads no external entity. */
 XMLSEC_EXPORT xmlSecSize                        xmlSecStrlen            (const xmlChar * str);
 
 

@@ -7,7 +7,7 @@
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
-use xml_sec_libxml2::ffi::XmlNode;
+use super::tree::XmlNode;
 
 use super::errors::{self, check, here};
 use super::{ALLOC_MODE_DOUBLE, contain, free, grown, malloc, realloc};
@@ -28,9 +28,6 @@ pub(crate) struct XmlSecBuffer {
 static DEFAULT_ALLOC_MODE: AtomicI32 = AtomicI32::new(ALLOC_MODE_DOUBLE);
 /// The smallest allocation of a buffer.
 static DEFAULT_INITIAL_SIZE: AtomicUsize = AtomicUsize::new(1024);
-
-/// The size libxmlsec1 reads a file in, which decides how the buffer grows.
-const FILE_CHUNK: usize = 1024;
 
 /// Zeroes `buf`'s bytes from `size` up to `maxSize`.
 ///
@@ -556,74 +553,6 @@ pub(crate) unsafe extern "C" fn xmlSecBufferReverse(buf: *mut XmlSecBuffer) -> c
     })
 }
 
-/// `xmlSecBufferReadFile`: appends the contents of the file `filename`.
-///
-/// # Safety
-/// `buf` is null or a valid buffer; `filename` is null or a NUL-terminated
-/// string.
-#[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn xmlSecBufferReadFile(
-    buf: *mut XmlSecBuffer,
-    filename: *const c_char,
-) -> c_int {
-    contain(-1, || {
-        check!(!buf.is_null(), "xmlSecBufferReadFile", c"buf != NULL", -1);
-        check!(
-            !filename.is_null(),
-            "xmlSecBufferReadFile",
-            c"filename != NULL",
-            -1
-        );
-        // SAFETY: the caller passes a NUL-terminated name.
-        let name = unsafe { CStr::from_ptr(filename) };
-        let contents = match std::fs::read(path(name)) {
-            Ok(contents) => contents,
-            Err(error) => {
-                errors::report(
-                    here!("xmlSecBufferReadFile"),
-                    std::ptr::null(),
-                    c"fopen".as_ptr(),
-                    errors::R_IO_FAILED,
-                    &format!(
-                        "name=\"{}\"; errno={}",
-                        name.to_string_lossy(),
-                        error.raw_os_error().unwrap_or(0)
-                    ),
-                );
-                return -1;
-            }
-        };
-        // Appended in libxmlsec1's read size, so the buffer grows the same way.
-        for chunk in contents.chunks(FILE_CHUNK) {
-            // SAFETY: `buf` is valid and `chunk` is readable.
-            if unsafe { xmlSecBufferAppend(buf, chunk.as_ptr(), chunk.len()) } < 0 {
-                errors::internal_with(
-                    here!("xmlSecBufferReadFile"),
-                    std::ptr::null(),
-                    c"xmlSecBufferAppend",
-                    &format!("size={}", chunk.len()),
-                );
-                return -1;
-            }
-        }
-        0
-    })
-}
-
-/// The file a C file name names: its bytes as the platform's path.
-#[cfg(unix)]
-fn path(name: &CStr) -> std::path::PathBuf {
-    use std::os::unix::ffi::OsStrExt;
-    std::ffi::OsStr::from_bytes(name.to_bytes()).into()
-}
-
-/// The file a C file name names; on Windows the narrow C runtime takes the
-/// active code page, which for the supported case is UTF-8.
-#[cfg(not(unix))]
-fn path(name: &CStr) -> std::path::PathBuf {
-    name.to_string_lossy().into_owned().into()
-}
-
 /// The value of an ASCII hex digit.
 fn hex_digit(ch: u8) -> Option<u8> {
     match ch {
@@ -810,8 +739,17 @@ pub(crate) unsafe extern "C" fn xmlSecBufferBase64NodeContentWrite(
                 );
                 return -1;
             }
-            super::tree::xmlNodeAddContent(node, content);
+            let text = super::tree::c_text(content).map(str::to_owned);
             free(content.cast());
+            // The encoding is ASCII, so it is text.
+            if text.is_none_or(|text| super::tree::nodes::add_content(node, &text).is_err()) {
+                errors::xml_failed(
+                    here!("xmlSecBufferBase64NodeContentWrite"),
+                    std::ptr::null(),
+                    c"xmlNodeAddContent",
+                );
+                return -1;
+            }
         }
         0
     })

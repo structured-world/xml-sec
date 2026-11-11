@@ -15,7 +15,7 @@ GnuTLS object shim. An unmodified C binary cannot load this Rust crate instead.
 | A subprocess using `xmlsec1` | Build the separate `xml-sec-cli` package and test the same argv, exit result and output bytes |
 | New or ported Rust application | Compile typed policy and use `XmlSecurity` with explicit provider, keys and expected targets |
 | C calls such as `xmlSecDSigCtxVerify` | Requires an application port; source/ABI compatibility is not delivered |
-| Documents held as an `xmlDocPtr` | Port the calls to the [C API](c-api.md#libxml2-documents) through `xml-sec-libxml2`, which signs, verifies, encrypts and decrypts the caller's tree in place (Linux and macOS) |
+| Documents held as an `xmlDocPtr` | Port the tree calls to the tree functions of `xml-sec-libxml2` (`xmlFoo` becomes `xsFoo`, node fields are read through accessors) and use the [C API](c-api.md#tree-documents) on a tree document, which signs, verifies, encrypts and decrypts the tree in place; no libxml2 is involved |
 | Backend-specific key pointers or custom transform classes | No pointer/layout equivalence; use provider-neutral Rust handles or retain the existing integration |
 
 The [CLI guide](cli.md) owns complete option, output and exit semantics. Use a
@@ -33,7 +33,7 @@ Do not overwrite an existing installation merely because the command name matche
 | Registered ID attributes / start node | Explicit `IdAttributeRegistration`, retained identities and request target selection |
 | URI callbacks | Caller-provided resource maps/resolvers within compiled URI and work limits |
 | Signature status | Typed processing result plus authenticated expected-target evidence |
-| In-place DOM changes | `XmlDocument` generation-aware sign/encrypt/decrypt commit; in a C program, node edits of the caller's libxml2 tree through `xml-sec-libxml2` |
+| In-place DOM changes | `XmlDocument` generation-aware sign/encrypt/decrypt commit; in a C program, edits of a tree document through the tree functions of `xml-sec-libxml2` |
 | Debug/global error queue | Typed errors; no shared OpenSSL error queue or credential-bearing token diagnostics |
 
 Use the [executable examples](examples.md). The sign/verify pair executes a

@@ -447,9 +447,13 @@ aws-lc-fips = ["std", "xmldsig", "rustcrypto", "dep:aws-lc-rs"]
 pkcs11 = ["std", "xmlenc", "dep:cryptoki"]
 xml-backend-xmloxide = []
 xml-backend-roxmltree = ["dep:memchr"]
-# Documents whose content is an application-owned tree (a libxml2 document,
-# for one) walked into the semantic view instead of parsed.
+# Documents whose content is an application-owned tree walked into the
+# semantic view instead of parsed.
 external-tree = []
+# The crate's own mutable document tree (`document::owned_tree`), built over
+# the xmloxide arena. It compiles that parser for the tree without making
+# xmloxide a parser backend, so it leaves the backend a build selects alone.
+owned-tree = ["external-tree"]
 xml-backends-all = ["xml-backend-xmloxide", "xml-backend-roxmltree"]
 # Compatibility alias for existing CI/fuzz builds. Unlike `xml-backends-all`,
 # this also selects differential parsing as the default runtime mode.

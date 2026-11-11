@@ -1,17 +1,18 @@
 //! `capi [--sanitize | --xmlsec1]`: qualifies the C ABI as C and C++ callers
-//! see it, for the clean C API and, on Linux and macOS, for the libxml2 bridge
-//! that exports it together with its own entry point. Cargo builds each shared
-//! library and names it in its artifact messages; the round-trip programs are
-//! built against the headers and that library with the platform's compiler
-//! and run, and the library must export exactly the functions its headers
-//! declare. `--sanitize`, on Linux, builds the libraries and runs the crates'
-//! tests with the address sanitizer on nightly, and builds the programs with
-//! the address (leak checking included) and undefined behavior sanitizers.
-//! `--xmlsec1` qualifies the libxmlsec1-compatible library against the pinned
-//! libxmlsec1 installed under `XMLSEC1_PREFIX`: every program, including one
-//! generated from the binary baseline that prints every recorded structure
-//! layout, is built once against the oracle and once against the library,
-//! unmodified, and both must print the same.
+//! see it, for the clean C API and for the document-tree library that exports
+//! it together with the tree functions and its own entry point. Cargo builds
+//! each shared library and names it in its artifact messages; the round-trip
+//! programs are built against the headers and that library with the
+//! platform's compiler and run, linking no other library, and the library
+//! must export exactly the functions its headers declare. `--sanitize`, on
+//! Linux, builds the libraries and runs the crates' tests with the address
+//! sanitizer on nightly, and builds the programs with the address (leak
+//! checking included) and undefined behavior sanitizers. `--xmlsec1`
+//! qualifies the libxmlsec1-compatible library against the pinned libxmlsec1
+//! installed under `XMLSEC1_PREFIX`: every program, including one generated
+//! from the binary baseline that prints every recorded structure layout, is
+//! built once against the oracle (with `XS_ORACLE`, so its tree calls are
+//! libxml2's) and once against the library, and both must print the same.
 
 use crate::repo::{Failure, Run, Step, System, describe, require, root};
 use object::{NameOrOrdinal, Object as _};
@@ -25,9 +26,8 @@ mod tests;
 const HEADER: &str = "crates/xml-sec-capi/include/xml_sec.h";
 /// Declared for libraries built with the FIPS engine only.
 const FIPS_ONLY: &str = "xs_provider_new_aws_lc_fips";
-/// The libxml2 package `pkg-config` resolves for the bridge's programs, as
-/// the bridge's build script does for the bridge itself.
-const LIBXML2: &str = "libxml-2.0";
+/// The tree functions' header.
+const TREE_HEADER: &str = "crates/xml-sec-libxml2/include/xs_tree.h";
 
 /// How the library and the programs are built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +41,7 @@ pub(crate) enum Mode {
 pub(crate) enum Target {
     /// The clean C API.
     Clean,
-    /// The libxml2 bridge, which reexports the clean C API.
+    /// The document-tree library, which reexports the clean C API.
     Libxml2,
     /// The libxmlsec1-compatible library, which reexports both.
     Xmlsec1,
@@ -84,25 +84,30 @@ impl Target {
     pub(crate) const fn headers(self) -> &'static [&'static str] {
         match self {
             Self::Clean => &[HEADER],
-            Self::Libxml2 | Self::Xmlsec1 => {
-                &[HEADER, "crates/xml-sec-libxml2/include/xml_sec_libxml2.h"]
-            }
+            Self::Libxml2 | Self::Xmlsec1 => &[
+                HEADER,
+                "crates/xml-sec-libxml2/include/xml_sec_libxml2.h",
+                TREE_HEADER,
+            ],
         }
     }
 
     /// The include directories the target's programs compile with.
     fn includes(self) -> Vec<String> {
         if self == Self::Xmlsec1 {
-            // Programs include `<xmlsec/...>` from the crate's tree.
-            return vec![
-                root()
-                    .join(XMLSEC1_CRATE)
-                    .join("include")
-                    .display()
-                    .to_string(),
-            ];
+            // Programs include `<xmlsec/...>` from the crate's tree, the tree
+            // header it includes, and the programs' shared `tree.h`.
+            return [
+                root().join(XMLSEC1_CRATE).join("include"),
+                root().join(TREE_HEADER).with_file_name(""),
+                root().join(XMLSEC1_CRATE).join("tests/c"),
+            ]
+            .iter()
+            .map(|directory| directory.display().to_string())
+            .collect();
         }
-        self.headers()
+        let mut directories: Vec<String> = self
+            .headers()
             .iter()
             .map(|header| {
                 let header = root().join(header);
@@ -112,7 +117,10 @@ impl Target {
                     .display()
                     .to_string()
             })
-            .collect()
+            .collect();
+        // Headers of one directory are listed together.
+        directories.dedup();
+        directories
     }
 
     /// The round-trip programs, relative to the crate.
@@ -136,14 +144,9 @@ impl Target {
     }
 }
 
-/// The libraries qualified on this platform. The bridge has no claimed support
-/// level on other systems; it is reported as not qualified rather than built.
+/// The libraries qualified here: both build wherever the core does.
 pub(crate) const fn targets() -> &'static [Target] {
-    if cfg!(any(target_os = "linux", target_os = "macos")) {
-        &[Target::Clean, Target::Libxml2]
-    } else {
-        &[Target::Clean]
-    }
+    &[Target::Clean, Target::Libxml2]
 }
 
 /// The library build: cargo's own messages name the artifacts, whatever the
@@ -170,10 +173,7 @@ pub(crate) fn test_step(host: &str, rustflags: Option<&str>) -> Step {
     for target in targets() {
         args.extend(["-p", target.package()]);
     }
-    // The libxmlsec1-compatible library builds where the bridge does.
-    if targets().contains(&Target::Libxml2) {
-        args.extend(["-p", Target::Xmlsec1.package()]);
-    }
+    args.extend(["-p", Target::Xmlsec1.package()]);
     cargo_step("sanitized tests", Mode::Sanitized, host, rustflags, &args)
 }
 
@@ -253,9 +253,10 @@ pub(crate) fn library(messages: &str, target: Target, suffix: &str) -> Result<Li
     Err(format!("cargo reported no artifact for {package}"))
 }
 
-/// Function names of the clean surface `header` declares.
+/// Function names of the clean surface and the tree functions `header`
+/// declares.
 pub(crate) fn declared(header: &str) -> BTreeSet<String> {
-    declared_with(header, "xs_")
+    declared_with(header, "xs")
 }
 
 /// Function names starting with `prefix` that `header` declares: the
@@ -292,9 +293,10 @@ pub(crate) fn declared_with(header: &str, prefix: &str) -> BTreeSet<String> {
     names
 }
 
-/// Function names of the clean surface the shared library at `path` exports.
+/// Function names of the clean surface and the tree functions the shared
+/// library at `path` exports.
 pub(crate) fn exported(path: &Path) -> Result<BTreeSet<String>, String> {
-    exported_with(path, "xs_")
+    exported_with(path, "xs")
 }
 
 /// Names starting with `prefix` the shared library at `path` exports.
@@ -588,18 +590,6 @@ fn declarations(target: Target) -> Result<BTreeSet<String>, Failure> {
     Ok(names)
 }
 
-/// The compiler and linker flags the bridge's programs need for libxml2.
-fn libxml2_flags(runner: &mut impl Run) -> Result<Vec<String>, Failure> {
-    let step = Step::new(
-        "libxml2 flags",
-        "pkg-config",
-        &["--cflags", "--libs", LIBXML2],
-    );
-    let (status, flags) = runner.stdout(&step)?;
-    require(status)?;
-    Ok(flags.split_whitespace().map(str::to_owned).collect())
-}
-
 pub(crate) fn execute(mode: Mode, runner: &mut impl Run) -> Result<(), Failure> {
     let rustc = match mode {
         Mode::Plain => Step::new("rustc", "rustc", &["-vV"]),
@@ -620,17 +610,8 @@ pub(crate) fn execute(mode: Mode, runner: &mut impl Run) -> Result<(), Failure> 
             runner,
         )?;
     }
-    if !targets().contains(&Target::Libxml2) {
-        println!(
-            "{}: no support level is claimed on {}; not qualified",
-            Target::Libxml2.package(),
-            std::env::consts::OS
-        );
-    }
     if mode == Mode::Sanitized {
-        if targets().contains(&Target::Libxml2) {
-            sanitize_xmlsec1(&host, rustflags.as_deref(), scratch.path(), runner)?;
-        }
+        sanitize_xmlsec1(&host, rustflags.as_deref(), scratch.path(), runner)?;
         require(runner.status(&test_step(&host, rustflags.as_deref()))?)?;
     }
     Ok(())
@@ -653,8 +634,7 @@ fn sanitize_xmlsec1(
     let template =
         std::fs::read_to_string(root().join(XMLSEC1_CRATE).join("xml-sec-xmlsec1.pc.in"))
             .map_err(|error| format!("read the pkg-config template: {error}"))?;
-    let mut flags = template_defines(&template)?;
-    flags.extend(libxml2_flags(runner)?);
+    let flags = template_defines(&template)?;
     for source in target.sources() {
         let source = root().join(XMLSEC1_CRATE).join(source);
         let compiler = compiler(host, &source)?;
@@ -694,10 +674,8 @@ fn qualify(
     if let Some(mismatch) = symbol_mismatch(&declarations(target)?, &exported(&library.shared)?) {
         return Err(format!("{}: {mismatch}", target.package()).into());
     }
-    let flags = match target {
-        Target::Clean => Vec::new(),
-        Target::Libxml2 | Target::Xmlsec1 => libxml2_flags(runner)?,
-    };
+    // The programs link the target's library and nothing else.
+    let flags: Vec<String> = Vec::new();
     let keys = root().join("tests/fixtures/keys/rsa");
     // Every program receives the RSA recipient's private and public key.
     let key_files = [
@@ -860,9 +838,14 @@ fn qualify_xmlsec1(
     let template =
         std::fs::read_to_string(root().join(XMLSEC1_CRATE).join("xml-sec-xmlsec1.pc.in"))
             .map_err(|error| format!("read the pkg-config template: {error}"))?;
-    let mut ours = template_defines(&template)?;
-    ours.extend(libxml2_flags(runner)?);
-    let oracle = oracle_flags(runner, prefix)?;
+    let ours = template_defines(&template)?;
+    let mut oracle = oracle_flags(runner, prefix)?;
+    // The same programs, with their tree calls mapped onto the oracle's
+    // libxml2 by their shared `tree.h`.
+    oracle.extend([
+        "-DXS_ORACLE".to_owned(),
+        format!("-I{}", root().join(XMLSEC1_CRATE).join("tests/c").display()),
+    ]);
     let baseline = std::fs::read_to_string(root().join(ABI_BASELINE))
         .map_err(|error| format!("read {ABI_BASELINE}: {error}"))?;
     let layout = scratch.join("layout.c");

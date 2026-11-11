@@ -1,14 +1,13 @@
 /* The XPath, XPath Filter 2.0, XPointer and Visa3D transforms as a
  * libxmlsec1 caller uses them: read from transform elements, and created by
- * a context for a same-document URI. Built unmodified against the pinned
- * libxmlsec1 and against this crate, both must print the same canonical
- * results and statuses. */
+ * a context for a same-document URI. Built against the pinned libxmlsec1
+ * and against this crate, both must print the same canonical results and
+ * statuses. */
 
 #include <stdio.h>
 #include <string.h>
 
-#include <libxml/parser.h>
-#include <libxml/tree.h>
+#include "tree.h"
 #include <xmlsec/xmlsec.h>
 #include <xmlsec/xmltree.h>
 #include <xmlsec/transforms.h>
@@ -66,7 +65,7 @@ static void result(const char *label, xmlSecTransformCtxPtr ctx, int ret) {
 /* Reads the transforms of group `name` and runs them over the document. */
 static void group(xmlDocPtr doc, const char *name) {
     xmlSecTransformCtxPtr ctx = xmlSecTransformCtxCreate();
-    xmlNodePtr node = xmlSecFindNode(xmlDocGetRootElement(doc), BAD_CAST name, BAD_CAST "urn:t");
+    xmlNodePtr node = xmlSecFindNode(xsDocGetRootElement(doc), BAD_CAST name, BAD_CAST "urn:t");
     xmlSecNodeSetPtr nodes;
     int ret = xmlSecTransformCtxNodesListRead(ctx, node, xmlSecTransformUsageDSigTransform);
     printf("%s read: %d\n", name, ret);
@@ -84,7 +83,7 @@ static void uri(xmlDocPtr doc, const char *uri, unsigned int flags) {
     xmlSecTransformCtxPtr ctx = xmlSecTransformCtxCreate();
     int ret;
     ctx->flags = flags;
-    ret = xmlSecTransformCtxSetUri(ctx, BAD_CAST uri, xmlDocGetRootElement(doc));
+    ret = xmlSecTransformCtxSetUri(ctx, BAD_CAST uri, xsDocGetRootElement(doc));
     printf("%s set: %d first=%s\n", uri, ret,
            ctx->first != NULL ? (const char *)xmlSecTransformGetName(ctx->first) : "none");
     if (ret == 0) {
@@ -96,7 +95,8 @@ static void uri(xmlDocPtr doc, const char *uri, unsigned int flags) {
 }
 
 int main(void) {
-    xmlDocPtr doc = xmlReadMemory(document, (int)strlen(document), "doc.xml", NULL, 0);
+    xmlDocPtr doc = xsReadMemory(document, (int)strlen(document), "doc.xml", NULL, 0);
+    xmlNodePtr root = xsDocGetRootElement(doc);
     xmlSecTransformPtr transform;
 
     printf("ids init: %d\n", xmlSecTransformIdsInit());
@@ -119,14 +119,14 @@ int main(void) {
     transform = xmlSecTransformCreate(xmlSecTransformXPathId);
     printf("set expr on xpath: %d\n",
            xmlSecTransformXPointerSetExpr(transform, BAD_CAST "xpointer(/)", xmlSecNodeSetTree,
-                                          xmlDocGetRootElement(doc)));
+                                          root));
     xmlSecTransformDestroy(transform);
     transform = xmlSecTransformCreate(xmlSecTransformXPointerId);
     printf("set expr: %d again: %d\n",
            xmlSecTransformXPointerSetExpr(transform, BAD_CAST "xpointer(/)", xmlSecNodeSetTree,
-                                          xmlDocGetRootElement(doc)),
+                                          root),
            xmlSecTransformXPointerSetExpr(transform, BAD_CAST "xpointer(/)", xmlSecNodeSetTree,
-                                          xmlDocGetRootElement(doc)));
+                                          root));
     xmlSecTransformDestroy(transform);
     transform = xmlSecTransformCreate(xmlSecTransformVisa3DHackId);
     printf("set id: %d again: %d\n", xmlSecTransformVisa3DHackSetID(transform, BAD_CAST "k"),
@@ -140,7 +140,7 @@ int main(void) {
            xmlSecTransformVisa3DHackId->objSize == sizeof(xmlSecTransform) + sizeof(void *));
 
     xmlSecTransformIdsShutdown();
-    xmlFreeDoc(doc);
+    xsFreeDoc(doc);
     printf("done\n");
     return 0;
 }

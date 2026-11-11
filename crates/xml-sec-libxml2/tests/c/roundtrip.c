@@ -1,13 +1,11 @@
 /*
- * Signs, verifies, encrypts and decrypts documents libxml2 parsed, in place,
- * through the C ABI only, and checks the pointer contract a libxml2 caller
- * relies on.
+ * Signs, verifies, encrypts and decrypts tree documents in place, through
+ * the C ABI only, and checks the handle contract a caller relies on. The
+ * program links no XML library: the tree functions are the library's.
  *
  * Usage: roundtrip <private key PEM> <public key PEM>
  */
 #include "xml_sec_libxml2.h"
-
-#include <libxml/parser.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,33 +59,39 @@ static char *read_file(const char *path, size_t *len) {
 }
 
 static xmlDocPtr parse(const char *xml) {
-    xmlDocPtr doc = xmlReadMemory(xml, (int)strlen(xml), NULL, NULL, XML_PARSE_NONET);
+    xmlDocPtr doc = xsReadMemory(xml, (int)strlen(xml), NULL, NULL, 0);
     if (doc == NULL) {
-        fprintf(stderr, "libxml2 could not parse a fixture\n");
+        fprintf(stderr, "a fixture did not parse\n");
         exit(1);
     }
     return doc;
 }
 
-/* The document as libxml2 serializes it, NUL-terminated; free with xmlFree. */
+/* The document serialized, NUL-terminated; free with xsFree. */
 static char *dump(xmlDocPtr doc) {
     xmlChar *memory = NULL;
     int size = 0;
-    xmlDocDumpMemory(doc, &memory, &size);
+    xsDocDumpMemory(doc, &memory, &size);
     if (memory == NULL) {
         exit(1);
     }
     return (char *)memory;
 }
 
-/* The first element named `name` under `node`, depth first. */
+/* The first element named `name` among `node`, its siblings and their
+ * descendants, depth first. */
 static xmlNodePtr element(xmlNodePtr node, const char *name) {
-    for (; node != NULL; node = node->next) {
+    for (; node != NULL; node = xsNodeGetNext(node)) {
         xmlNodePtr found;
-        if (node->type == XML_ELEMENT_NODE && strcmp((const char *)node->name, name) == 0) {
-            return node;
+        if (xsNodeGetType(node) == XML_ELEMENT_NODE) {
+            xmlChar *actual = xsNodeGetName(node);
+            int same = actual != NULL && strcmp((const char *)actual, name) == 0;
+            xsFree(actual);
+            if (same) {
+                return node;
+            }
         }
-        found = element(node->children, name);
+        found = element(xsNodeGetChildren(node), name);
         if (found != NULL) {
             return found;
         }
@@ -97,7 +101,7 @@ static xmlNodePtr element(xmlNodePtr node, const char *name) {
 
 static XsDocument handle(XsPolicy policy, uint32_t operation, xmlDocPtr doc) {
     XsDocument document = {0};
-    MUST(xs_libxml2_document(policy, operation, doc, &document, NULL));
+    MUST(xs_tree_document(policy, operation, doc, &document, NULL));
     return document;
 }
 
@@ -169,7 +173,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: roundtrip <private key PEM> <public key PEM>\n");
         return 2;
     }
-    LIBXML_TEST_VERSION
     private_pem = read_file(argv[1], &private_len);
     public_pem = read_file(argv[2], &public_len);
 
@@ -178,11 +181,11 @@ int main(int argc, char **argv) {
                              NULL));
     MUST(xs_policy_store_load(store, &policy, NULL));
 
-    /* Sign the template in the caller's tree, verify it there, then see a
-     * change the caller makes between calls. */
+    /* Sign the template in the tree, verify it there, then see a change the
+     * caller makes between calls. */
     {
         xmlDocPtr doc = parse(TEMPLATE);
-        xmlNodePtr root = xmlDocGetRootElement(doc);
+        xmlNodePtr root = xsDocGetRootElement(doc);
         xmlNodePtr payload = element(root, "p");
         xmlNodePtr other = element(root, "other");
         xmlNodePtr signature = element(root, "Signature");
@@ -203,7 +206,7 @@ int main(int argc, char **argv) {
         CHECK(xs_document_serialize(document, &buffer, NULL) == XS_DOCUMENT);
         CHECK(xs_document_destroy(document) == XS_OK);
 
-        CHECK(xmlDocGetRootElement(doc) == root);
+        CHECK(xsDocGetRootElement(doc) == root);
         CHECK(element(root, "p") == payload);
         CHECK(element(root, "other") == other);
         CHECK(element(root, "Signature") == signature);
@@ -214,32 +217,33 @@ int main(int argc, char **argv) {
         MUST(xs_verifier_new(policy, provider, verify_keys, &verifier, NULL));
         document = handle(policy, XS_OPERATION_VERIFY, doc);
         CHECK(verified(verifier, document));
-        /* The same bytes, parsed again by libxml2, verify as a new tree. */
+        /* The same bytes, parsed again, verify as a new tree. */
         {
             xmlDocPtr reparsed = parse(signed_xml);
             XsDocument copy = handle(policy, XS_OPERATION_VERIFY, reparsed);
             CHECK(verified(verifier, copy));
             CHECK(xs_document_destroy(copy) == XS_OK);
-            xmlFreeDoc(reparsed);
+            xsFreeDoc(reparsed);
         }
-        xmlNodeSetContent(payload, BAD_CAST "Signed");
+        CHECK(xsNodeSetContent(payload, BAD_CAST "Signed") == 0);
         CHECK(!verified(verifier, document));
         CHECK(xs_document_destroy(document) == XS_OK);
 
-        xmlFree(signed_xml);
+        xsFree(signed_xml);
         CHECK(xs_verifier_destroy(verifier) == XS_OK);
         CHECK(xs_signer_destroy(signer) == XS_OK);
         CHECK(xs_keys_destroy(verify_keys) == XS_OK);
         CHECK(xs_keys_destroy(keys) == XS_OK);
-        xmlFreeDoc(doc);
+        xsFreeDoc(doc);
     }
 
-    /* Encrypt an element in the caller's tree and recover it there. */
+    /* Encrypt an element in the tree and recover it there. */
     {
         xmlDocPtr doc = parse("<root><secret Id=\"s\">42<inner a=\"1\"/></secret>"
                               "<public>kept</public></root>");
-        xmlNodePtr root = xmlDocGetRootElement(doc);
+        xmlNodePtr root = xsDocGetRootElement(doc);
         xmlNodePtr public_element = element(root, "public");
+        xmlNodePtr secret = element(root, "secret");
         XsKeys encrypt_keys = keys_with(policy, XS_OPERATION_ENCRYPT, "recipient", public_pem,
                                         public_len, 0, XS_KEY_USAGE_ENCRYPT);
         XsKeys decrypt_keys = keys_with(policy, XS_OPERATION_DECRYPT, "recipient", private_pem,
@@ -255,10 +259,12 @@ int main(int argc, char **argv) {
         CHECK(xs_document_destroy(document) == XS_OK);
         xml = dump(doc);
         CHECK(strstr(xml, "EncryptedData") != NULL);
-        CHECK(strstr(xml, ">42<") == NULL);
-        xmlFree(xml);
+        CHECK(strstr(xml, "<secret") == NULL);
+        xsFree(xml);
         CHECK(element(root, "secret") == NULL);
         CHECK(element(root, "public") == public_element);
+        /* The replaced element's handle names nothing now. */
+        CHECK(xsNodeGetType(secret) == 0);
 
         MUST(xs_decryptor_new(policy, provider, decrypt_keys, text("recipient"), &decryptor,
                               NULL));
@@ -268,27 +274,30 @@ int main(int argc, char **argv) {
         xml = dump(doc);
         CHECK(strstr(xml, "<secret Id=\"s\">42<inner a=\"1\"/></secret>") != NULL);
         CHECK(strstr(xml, "EncryptedData") == NULL);
-        xmlFree(xml);
+        xsFree(xml);
         CHECK(element(root, "public") == public_element);
 
         CHECK(xs_encryptor_destroy(encryptor) == XS_OK);
         CHECK(xs_decryptor_destroy(decryptor) == XS_OK);
         CHECK(xs_keys_destroy(encrypt_keys) == XS_OK);
         CHECK(xs_keys_destroy(decrypt_keys) == XS_OK);
-        xmlFreeDoc(doc);
+        xsFreeDoc(doc);
     }
 
-    /* A null pointer or a node that is not a document is refused. */
+    /* Null, a node that is not a document and a freed document are refused. */
     {
         xmlDocPtr doc = parse("<root/>");
+        xmlDocPtr freed = parse("<gone/>");
         XsDocument unused = {0};
-        CHECK(xs_libxml2_document(policy, XS_OPERATION_VERIFY, NULL, &unused, NULL) ==
+        xsFreeDoc(freed);
+        CHECK(xs_tree_document(policy, XS_OPERATION_VERIFY, NULL, &unused, NULL) ==
               XS_INVALID_ARGUMENT);
-        CHECK(xs_libxml2_document(policy, XS_OPERATION_VERIFY,
-                                  (xmlDocPtr)xmlDocGetRootElement(doc), &unused, NULL) ==
+        CHECK(xs_tree_document(policy, XS_OPERATION_VERIFY, (xmlDocPtr)xsDocGetRootElement(doc),
+                               &unused, NULL) == XS_INVALID_ARGUMENT);
+        CHECK(xs_tree_document(policy, XS_OPERATION_VERIFY, freed, &unused, NULL) ==
               XS_INVALID_ARGUMENT);
         CHECK(unused.value == 0);
-        xmlFreeDoc(doc);
+        xsFreeDoc(doc);
     }
 
     CHECK(xs_policy_destroy(policy) == XS_OK);
@@ -296,7 +305,6 @@ int main(int argc, char **argv) {
     CHECK(xs_provider_destroy(provider) == XS_OK);
     free(private_pem);
     free(public_pem);
-    xmlCleanupParser();
 
     if (failures != 0) {
         fprintf(stderr, "%d checks failed\n", failures);

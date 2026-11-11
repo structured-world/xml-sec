@@ -15,6 +15,7 @@ use super::{
 };
 use crate::ffi::buffer::{xmlSecBufferGetData, xmlSecBufferGetSize};
 use crate::ffi::list::{xmlSecPtrListGetItem, xmlSecPtrListGetSize};
+use crate::ffi::tree::nodes;
 use std::ffi::{CStr, c_int};
 
 fn name(klass: *const XmlSecTransformKlass) -> String {
@@ -111,11 +112,11 @@ fn base64_first_decodes_the_text_of_xml_input() {
         assert_eq!(text, b"foobar");
         xmlSecTransformCtxDestroy(ctx);
         crate::ffi::nodeset::xmlSecNodeSetDestroy(nodes);
-        crate::ffi::tree::xmlFreeDoc(doc);
+        xml_sec_libxml2::document::free(doc);
     }
 }
 
-/// Adjacent text and CDATA nodes of a libxml2 tree are one text node in the
+/// Adjacent text and CDATA nodes of a tree are one text node in the
 /// canonical form (Canonical XML 1.0 section 2.1): the whole document
 /// canonicalizes, and a node set selecting only part of that text is refused
 /// rather than canonicalized as all of it or none of it.
@@ -124,8 +125,8 @@ fn adjacent_text_and_cdata_canonicalize_as_one_text() {
     let xml = b"<r>a<![CDATA[b]]>c</r>";
     // SAFETY: the document, node sets and contexts are used while live.
     unsafe {
-        // Recovery parses with libxml2's parser alone, which keeps CDATA.
-        let doc = crate::ffi::parser::xmlSecParseMemory(xml.as_ptr(), xml.len(), 1);
+        // The core keeps the CDATA section as its own node.
+        let doc = crate::ffi::parser::xmlSecParseMemory(xml.as_ptr(), xml.len(), 0);
         assert!(!doc.is_null());
         let run = |nodes| {
             let ctx = xmlSecTransformCtxCreate();
@@ -144,14 +145,14 @@ fn adjacent_text_and_cdata_canonicalize_as_one_text() {
         let whole = crate::ffi::nodeset::xmlSecNodeSetGetChildren(doc, std::ptr::null_mut(), 1, 0);
         assert_eq!(run(whole), (0, b"<r>abc</r>".to_vec()));
         crate::ffi::nodeset::xmlSecNodeSetDestroy(whole);
-        let root = (*doc).children;
-        let listed = crate::ffi::tree::xmlXPathNodeSetCreate(root);
-        crate::ffi::tree::xmlXPathNodeSetAdd(listed, (*root).children);
+        let root = nodes::first_child(doc);
+        let listed = nodes::node_set(root);
+        nodes::node_set_add(listed, nodes::first_child(root)).expect("a live node");
         let part =
             crate::ffi::nodeset::xmlSecNodeSetCreate(doc, listed, crate::ffi::nodeset::NORMAL);
         assert_eq!(run(part).0, -1);
         crate::ffi::nodeset::xmlSecNodeSetDestroy(part);
-        crate::ffi::tree::xmlFreeDoc(doc);
+        xml_sec_libxml2::document::free(doc);
     }
 }
 
@@ -276,10 +277,10 @@ fn xml_parser_pop_is_bounded_by_the_document_limit() {
     assert_eq!(run(&document_of(limit + 1)), -1);
 }
 
-/// The parser klass parses without libxml2's `XML_PARSE_HUGE`, so libxml2's
-/// own depth and size limits stay in force while it builds the tree.
+/// The parser klass parses under the library policy, whose depth limit stays
+/// in force while the core builds the tree.
 #[test]
-fn xml_parser_keeps_libxml2_limits() {
+fn xml_parser_keeps_the_policy_depth_limit() {
     let mut xml = b"<a>".repeat(1000);
     xml.extend(b"</a>".repeat(1000));
     // SAFETY: the context and its transform are used while live.
@@ -359,8 +360,11 @@ fn bare_fragment_cannot_break_out_of_the_id_literal() {
         assert!(!doc.is_null());
         let set = |uri: &CStr| {
             let ctx = xmlSecTransformCtxCreate();
-            let status =
-                super::ctx::xmlSecTransformCtxSetUri(ctx, uri.as_ptr().cast(), (*doc).children);
+            let status = super::ctx::xmlSecTransformCtxSetUri(
+                ctx,
+                uri.as_ptr().cast(),
+                nodes::first_child(doc),
+            );
             xmlSecTransformCtxDestroy(ctx);
             status
         };
@@ -368,7 +372,7 @@ fn bare_fragment_cannot_break_out_of_the_id_literal() {
         assert_eq!(set(c"#x')|//Secret|id('"), -1);
         assert_eq!(set(c"#x)"), -1);
         assert_eq!(set(c"#x^"), -1);
-        crate::ffi::tree::xmlFreeDoc(doc);
+        xml_sec_libxml2::document::free(doc);
     }
 }
 
@@ -392,19 +396,18 @@ fn relationship_transform_keeps_the_incoming_selection() {
         let template =
             crate::ffi::parser::xmlSecParseMemory(selectors.as_ptr(), selectors.len(), 0);
         assert!(!doc.is_null() && !template.is_null());
-        let root = (*doc).children;
-        let excluded = crate::ffi::xmltree::xmlSecGetNextElementNode(
-            (*crate::ffi::xmltree::xmlSecGetNextElementNode((*root).children)).next,
-        );
+        let root = nodes::first_child(doc);
+        let first = crate::ffi::xmltree::next_element(nodes::first_child(root));
+        let excluded = crate::ffi::xmltree::next_element(nodes::next(first));
         // Everything but the rId3 relationship.
-        let nodes = crate::ffi::nodeset::xmlSecNodeSetGetChildren(doc, excluded, 0, 1);
+        let selection = crate::ffi::nodeset::xmlSecNodeSetGetChildren(doc, excluded, 0, 1);
         let ctx = xmlSecTransformCtxCreate();
         let transform = xmlSecTransformCtxCreateAndAppend(ctx, super::relationship::relationship());
         let read = (*super::relationship::relationship())
             .read_node
             .expect("the klass reads its node");
-        assert_eq!(read(transform, (*template).children, ctx), 0);
-        assert_eq!(super::ctx::xmlSecTransformCtxXmlExecute(ctx, nodes), 0);
+        assert_eq!(read(transform, nodes::first_child(template), ctx), 0);
+        assert_eq!(super::ctx::xmlSecTransformCtxXmlExecute(ctx, selection), 0);
         let result = (*ctx).result;
         let output = String::from_utf8(
             std::slice::from_raw_parts(xmlSecBufferGetData(result), xmlSecBufferGetSize(result))
@@ -414,9 +417,9 @@ fn relationship_transform_keeps_the_incoming_selection() {
         assert!(output.contains("rId1"), "{output}");
         assert!(!output.contains("rId3"), "{output}");
         xmlSecTransformCtxDestroy(ctx);
-        crate::ffi::nodeset::xmlSecNodeSetDestroy(nodes);
-        crate::ffi::tree::xmlFreeDoc(template);
-        crate::ffi::tree::xmlFreeDoc(doc);
+        crate::ffi::nodeset::xmlSecNodeSetDestroy(selection);
+        xml_sec_libxml2::document::free(template);
+        xml_sec_libxml2::document::free(doc);
     }
 }
 

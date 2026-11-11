@@ -23,16 +23,10 @@ fn template_defines(manifest: &Path) -> Vec<String> {
 }
 
 /// The layout record of the crate's headers: `tests/layout.c` compiled
-/// against them and the installed libxml2 headers, and run. The library is
-/// built without any C, so the record is produced here.
+/// against them and the tree header, and run. The library is built without
+/// any C, so the record is produced here.
 fn header_layout() -> Vec<usize> {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let cflags = Command::new("pkg-config")
-        .args(["--cflags", "libxml-2.0"])
-        .output()
-        .expect("pkg-config runs");
-    assert!(cflags.status.success(), "libxml2 headers are installed");
-    let cflags = String::from_utf8(cflags.stdout).expect("UTF-8 flags");
     // Removed on every exit path, a failed assertion included.
     let directory = tempfile::tempdir().expect("a temporary directory");
     let program = directory.path().join("layout");
@@ -42,14 +36,11 @@ fn header_layout() -> Vec<usize> {
         .arg("-o")
         .arg(&program)
         .arg(format!("-I{}", manifest.join("include").display()))
+        .arg(format!(
+            "-I{}",
+            manifest.join("../xml-sec-libxml2/include").display()
+        ))
         .args(template_defines(manifest));
-    for flag in cflags.split_whitespace() {
-        compile.arg(flag);
-        // Some distributions point at the parent of `libxml/`.
-        if let Some(include) = flag.strip_prefix("-I") {
-            compile.arg(format!("-I{include}/libxml2"));
-        }
-    }
     assert!(
         compile.status().expect("the C compiler runs").success(),
         "the layout program compiles"

@@ -1,61 +1,57 @@
-# Safety of the libxml2 bridge
+# Safety of the document-tree library
 
-`src/ffi.rs` and its submodules are the crate's only code with `unsafe`. It reads
-and links the caller's libxml2 nodes directly and calls the libxml2 functions
-that create, unlink and free them. The crate does not link libxml2:
-`src/ffi/libxml2.rs` resolves those functions, and libxml2's allocator globals, by
-name in the running process, where the caller's libxml2 is loaded; the globals
-are read on every allocation, so an allocator the caller installs later is the
-one used. The clean C API it
-reexports keeps its own contract
-([`xml-sec-capi/SAFETY.md`](../xml-sec-capi/SAFETY.md)); this file records what
-the bridge adds.
+`src/ffi.rs` and its submodules are the crate's only code with `unsafe`. They
+are the C boundary: they read the strings and buffers C code passes, write
+the outputs it provides, call the callbacks it installs, and hand out heap
+memory. The tree itself is never reached through a pointer: documents are
+core `OwnedTree`s kept in the handle table (`src/handles.rs`, safe code), and
+every tree pointer C code holds is a handle value, never an address. The
+clean C API it reexports keeps its own contract
+([`xml-sec-capi/SAFETY.md`](../xml-sec-capi/SAFETY.md)); this file records
+what this library adds.
 
 ## What callers guarantee
 
-1. The `xmlDocPtr` given to `xs_libxml2_document` is a live document and stays
-   live until the handle is destroyed.
-2. While a call on the handle runs, no other code reads, changes or frees the
-   document. Between calls the caller may change it freely.
-3. The document is not freed while the handle exists.
+1. Strings passed as `const xmlChar *` or `const char *` are null or
+   NUL-terminated; buffers hold the length passed with them.
+2. Output pointers are null or writable.
+3. Memory passed to `xsFree` or `xsRealloc` is null or a live block one of the
+   library's functions returned, released once, as with `free`.
+4. Callbacks installed for I/O buffers or the generic error channel are
+   callable with the context given with them until the buffer is closed or the
+   handler replaced. A generic error handler is the installing thread's own,
+   as libxml2's is.
+5. While a call on a clean C API document handle runs, no other code changes
+   its tree.
 
-## What the bridge checks
+## What the library checks
 
-- A null, misaligned or non-document pointer is refused with
-  `XS_INVALID_ARGUMENT` before anything else is read.
-- The structure members and constants the bridge uses are declared in Rust:
-  only the leading members every libxml2 release from 2.9 on shares. Before a
-  tree is touched, the libxml2 loaded in the process must report a release in
-  that range (`xmlParserVersion`) and provide every function the bridge calls;
-  otherwise the handle is refused with `XS_INTERNAL` and a projection on an
-  existing handle fails, so no tree is read through a wrong declaration or a
-  missing function. The crate's tests compile a program against installed
-  headers (`tests/layout.c`) and compare its offsets with the declarations.
-  Structure sizes are not compared: the bridge never allocates a libxml2
-  structure itself, and later releases append members.
-- Several libxml2 copies in one process are not supported: the functions come
-  from the one the process resolves by default.
-- Each operation projects the whole tree into the library's semantic model
-  under the operation's compiled policy (depth, node count, namespace bindings,
-  bytes, DTD admission) before anything is evaluated; a tree beyond those limits
-  is refused, as text would be.
-- Every edit names a node the last projection reported. Fragments are parsed and
-  checked by the library before any libxml2 node is created for them.
+- Every tree handle (`xmlDocPtr`, `xmlNodePtr`, `xmlNsPtr`, `xmlAttrPtr`,
+  `xmlNodeSetPtr`, I/O buffer) is looked up in its table before use. A value
+  that names nothing live (null, forged, a freed node or document, a removed
+  attribute or declaration) is refused with null, 0 or -1; none is
+  dereferenced, so a stale or forged handle cannot reach freed memory.
+- Handle values and document numbers come from a counter that never repeats,
+  so a stale handle never names a later object.
+- Each document has its own lock, so work on one document does not wait for
+  another. Locks are taken in one order, a document's and then the handle
+  table's for a short step, never the other way, so they cannot deadlock. A
+  change and the dropping of the handles it ended happen under one hold of
+  the document's lock, so a removed attribute's handle never names a later
+  attribute of the same name.
+- Documents are parsed by the core under the library policy, with its limits
+  enforced while parsing; no file, URL or external entity is read.
 
-## What the bridge guarantees
+## What the library guarantees
 
-- Nodes are created only with libxml2's own constructors (`xmlNewDocNode`,
-  `xmlNewNs`, `xmlNewNsProp`, `xmlNewDocText` and the comment and processing
-  instruction counterparts) and freed only with `xmlFreeNode`, so the
-  document's allocator and dictionary own them.
-- Edits link nodes by hand rather than through `xmlAddChild`, so adjacent text
-  nodes are never merged and the pointers the projection recorded stay valid.
-- Every edit is journaled. A failed operation unlinks and frees what it created
-  and relinks what it removed, newest first, leaving the tree as it was. Removed
-  nodes are freed only when the outermost operation succeeds; until then nothing
-  in the tree points to them and they can be restored.
-- Nodes an operation does not edit keep their addresses and contents.
-- No libxml2 global state is changed: no parser options, error handlers,
-  allocators or dictionaries are installed.
-- No unwinding crosses the boundary; the entry point and every operation run
-  under the clean C API's `catch_unwind`.
+- No C code writes into the tree's memory: every change is a core tree edit,
+  validated like any other.
+- Strings returned for the caller to own are copies on the C heap; strings
+  libxmlsec1 returns as `const xmlChar *` into the tree are copies the
+  document keeps until it is freed.
+- No lock is held while a caller's callback runs, so a callback may call the
+  library again.
+- No unwinding crosses the boundary: every exported function runs under
+  `catch_unwind`.
+- The library links no C library besides the platform's C runtime and
+  resolves no symbol at run time.

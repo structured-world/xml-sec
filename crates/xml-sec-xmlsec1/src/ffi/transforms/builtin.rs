@@ -7,12 +7,12 @@
 //! projected under the library's policy and canonicalized with exactly the
 //! nodes, attributes and namespace nodes the input node set contains.
 
-use std::ffi::{CStr, c_int, c_uint, c_void};
+use std::ffi::{CStr, c_int, c_uint};
 
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, SelectedNodes, canonicalize_selected};
 use xml_sec::document::external::ExternalNode;
-use xml_sec::{DocumentView, Node, XmlDocument};
-use xml_sec_libxml2::ffi::{LibxmlTree, XmlAttr, XmlNode};
+use xml_sec::document::owned_tree::TreeNode;
+use xml_sec::{DocumentView, Node};
 
 use super::super::base64::{
     self, XmlSecBase64Ctx, decode_size, encode_size, xmlSecBase64CtxFinal_ex,
@@ -40,20 +40,20 @@ use super::super::strings::{
     xmlSecNameEnveloped, xmlSecNameExcC14N, xmlSecNameExcC14NWithComments, xmlSecNameMemBuf,
     xmlSecNodeInclusiveNamespaces, xmlSecNodeSignature, xmlSecNsExcC14N,
 };
-use super::super::tree::{readable, xmlGetProp, xmlSearchNs};
-use super::super::xmltree::{xmlSecCheckNodeName, xmlSecFindParent, xmlSecGetNextElementNode};
+use super::super::tree::{XmlNode, c_text, nodes};
+use super::super::xmltree::{next_element, xmlSecCheckNodeName, xmlSecFindParent};
 use super::super::{contain, free, policy};
 use super::ctx::{Limit, charge, run_budget};
 use super::io::{
-    xmlOutputBufferClose, xmlOutputBufferWrite, xmlSecBufferCreateOutputBuffer,
+    OutputBuffer, xmlOutputBufferClose, xmlOutputBufferWrite, xmlSecBufferCreateOutputBuffer,
     xmlSecTransformCreateOutputBuffer,
 };
 use super::{
     OPERATION_DECODE, OPERATION_ENCODE, STATUS_FINISHED, STATUS_NONE, STATUS_WORKING,
     USAGE_C14N_METHOD, USAGE_DSIG_TRANSFORM, WithContext, XmlSecTransform, XmlSecTransformCtx,
-    XmlSecTransformKlass, context, context_or, klass_text, valid,
-    xmlSecTransformDefaultGetDataType, xmlSecTransformDefaultPopBin, xmlSecTransformDefaultPopXml,
-    xmlSecTransformDefaultPushBin, xmlSecTransformDefaultPushXml, xmlSecTransformPopXml,
+    XmlSecTransformKlass, context, context_or, valid, xmlSecTransformDefaultGetDataType,
+    xmlSecTransformDefaultPopBin, xmlSecTransformDefaultPopXml, xmlSecTransformDefaultPushBin,
+    xmlSecTransformDefaultPushXml, xmlSecTransformPopXml,
 };
 use super::{relationship, xpath};
 
@@ -761,7 +761,7 @@ unsafe extern "C" fn c14n_read_node(
     // SAFETY: an exclusive C14N transform and a live element of its document.
     unsafe {
         let name = name_of(transform);
-        let mut current = xmlSecGetNextElementNode((*node).children);
+        let mut current = next_element(nodes::first_child(node));
         if !current.is_null() {
             if xmlSecCheckNodeName(
                 current,
@@ -772,15 +772,13 @@ unsafe extern "C" fn c14n_read_node(
                 errors::invalid_node(here, current, "InclusiveNamespaces", name);
                 return -1;
             }
-            let prefixes = xmlGetProp(current, xmlSecAttrPrefixList.as_ptr());
-            if prefixes.is_null() {
+            let Some(text) = c_text(xmlSecAttrPrefixList.as_ptr())
+                .and_then(|attribute| nodes::property(current, attribute))
+                .map(String::into_bytes)
+            else {
                 errors::invalid_node_attribute(here, current, c"PrefixList", name, "empty");
                 return -1;
-            }
-            let text = std::ffi::CStr::from_ptr(prefixes.cast())
-                .to_bytes()
-                .to_vec();
-            free(prefixes.cast());
+            };
             // Single spaces separate the prefixes, as libxmlsec1 splits
             // them: a space ends a prefix, so two spaces give an empty one
             // and a trailing space none.
@@ -808,7 +806,7 @@ unsafe extern "C" fn c14n_read_node(
                 errors::internal(here, name, c"xmlSecPtrListAdd");
                 return -1;
             }
-            current = xmlSecGetNextElementNode((*current).next);
+            current = next_element(nodes::next(current));
         }
         if !current.is_null() {
             errors::unexpected_node(here, current, std::ptr::null());
@@ -818,28 +816,33 @@ unsafe extern "C" fn c14n_read_node(
     }
 }
 
-/// The caller's node set read node by node for the core's serializer.
-struct Selection<'v> {
-    nodes: *mut XmlSecNodeSet,
-    view: DocumentView<'v>,
-}
-
-/// The libxml2 node an external record names.
-fn node_of(record: ExternalNode) -> *mut XmlNode {
-    std::ptr::with_exposed_provenance_mut(usize::try_from(record.0).unwrap_or(0))
+/// The caller's node set read node by node for the core's serializer, over
+/// a snapshot of the document in `slot`.
+pub(super) struct Selection<'v> {
+    pub(super) nodes: *mut XmlSecNodeSet,
+    pub(super) view: DocumentView<'v>,
+    pub(super) slot: usize,
 }
 
 impl Selection<'_> {
+    /// The tree node a snapshot node came from, as a handle.
+    fn node_of(&self, record: ExternalNode) -> *mut XmlNode {
+        TreeNode::try_from(record).map_or(std::ptr::null_mut(), |node| {
+            nodes::node_pointer(self.slot, node)
+        })
+    }
+
     /// libxmlsec1's visibility test: a membership check that fails (-1)
     /// counts as visible, as the C truth test does.
     fn contains(&self, node: *mut XmlNode, parent: *mut XmlNode) -> bool {
-        // SAFETY: the node set and the projected tree's nodes are live for the
-        // canonicalization, which runs inside the call that owns them.
+        // SAFETY: the node set is live for the canonicalization, which runs
+        // inside the call that owns it.
         unsafe { xmlSecNodeSetContains(self.nodes, node, parent) != 0 }
     }
 
     fn element(&self, owner: Node<'_, '_>) -> Option<*mut XmlNode> {
-        self.view.external_node_of(owner).map(node_of)
+        let element = self.node_of(self.view.external_node_of(owner)?);
+        (!element.is_null()).then_some(element)
     }
 }
 
@@ -854,9 +857,8 @@ impl SelectedNodes for Selection<'_> {
         if let Some(run) = self.view.external_text_run_of(node) {
             let mut verdict = None;
             for part in run {
-                let part = node_of((*part)?);
-                // SAFETY: a live node of the projected tree.
-                let contained = self.contains(part, unsafe { (*part).parent });
+                let part = self.node_of((*part)?);
+                let contained = self.contains(part, nodes::parent(part));
                 match verdict {
                     None => verdict = Some(contained),
                     Some(previous) if previous != contained => return None,
@@ -866,8 +868,7 @@ impl SelectedNodes for Selection<'_> {
             return verdict;
         }
         let node = self.element(node)?;
-        // SAFETY: a live node of the projected tree.
-        Some(self.contains(node, unsafe { (*node).parent }))
+        Some(self.contains(node, nodes::parent(node)))
     }
 
     fn attribute(
@@ -877,50 +878,29 @@ impl SelectedNodes for Selection<'_> {
         local_name: &str,
     ) -> Option<bool> {
         let element = self.element(owner)?;
-        // SAFETY: the element's attributes, names and namespaces are live.
-        unsafe {
-            let mut attribute: *mut XmlAttr = (*element).properties;
-            while !attribute.is_null() {
-                let name = std::ffi::CStr::from_ptr((*attribute).name.cast()).to_bytes();
-                let href = (*attribute)
-                    .ns
-                    .as_ref()
-                    .map(|ns| std::ffi::CStr::from_ptr(ns.href.cast()).to_bytes());
-                if name == local_name.as_bytes() && href == namespace.map(str::as_bytes) {
-                    return Some(self.contains(attribute.cast(), element));
-                }
-                attribute = (*attribute).next;
-            }
-        }
-        None
+        let attribute = nodes::attribute(element, local_name, namespace);
+        (!attribute.is_null()).then(|| self.contains(attribute.cast(), element))
     }
 
     fn namespace(&self, owner: Node<'_, '_>, prefix: &str, _uri: &str) -> Option<bool> {
         let element = self.element(owner)?;
-        let prefix = std::ffi::CString::new(prefix).ok()?;
-        // SAFETY: a live element of a live document; the nearest declaration
-        // of the prefix is the namespace node libxml2's canonicalizer tests.
-        unsafe {
-            let prefix = if prefix.is_empty() {
-                std::ptr::null()
-            } else {
-                prefix.as_ptr().cast()
-            };
-            let declaration = xmlSearchNs((*element).doc, element, prefix);
-            if declaration.is_null() {
-                // An undeclared default namespace has no node to test.
-                return Some(self.contains(element, (*element).parent));
-            }
-            Some(self.contains(declaration.cast(), element))
+        // The binding in scope at the element is the namespace node the
+        // canonicalizer tests.
+        let prefix = (!prefix.is_empty()).then_some(prefix);
+        let namespace = nodes::namespace_node(element, prefix);
+        if namespace.is_null() {
+            // An undeclared default namespace has no node to test.
+            return Some(self.contains(element, nodes::parent(element)));
         }
+        Some(self.contains(namespace, element))
     }
 }
 
 /// The canonical form of `nodes` under `mode`, or why the tree cannot be
-/// projected or canonicalized under the library's policy.
+/// read or canonicalized under the library's policy.
 ///
 /// # Safety
-/// `nodes` is a live node set over a live document.
+/// `nodes` is a live node set.
 unsafe fn canonical(
     nodes: *mut XmlSecNodeSet,
     mode: C14nMode,
@@ -928,10 +908,10 @@ unsafe fn canonical(
     prefixes: Option<String>,
 ) -> Result<Vec<u8>, String> {
     let policy = policy::verification().ok_or("the library policy did not compile")?;
-    // SAFETY: the node set's document is live for the call.
-    let tree = unsafe { LibxmlTree::new((*nodes).doc) }.ok_or("the document cannot be read")?;
-    let document = XmlDocument::from_external_tree(Box::new(tree), policy)
-        .map_err(|error| error.to_string())?;
+    // SAFETY: a live node set by the caller's contract.
+    let doc = unsafe { (*nodes).doc };
+    let (document, slot) =
+        xml_sec_libxml2::document::snapshot(doc, policy).map_err(|error| error.to_string())?;
     let mut algorithm = C14nAlgorithm::new(mode, comments);
     if let Some(prefixes) = prefixes {
         algorithm = algorithm.with_prefix_list(&prefixes);
@@ -939,42 +919,43 @@ unsafe fn canonical(
     let mut output = Vec::new();
     document
         .with_view(|view| {
-            let selection = Selection { nodes, view };
+            let selection = Selection { nodes, view, slot };
             canonicalize_selected(view, &selection, &algorithm, &policy.resources, &mut output)
         })
         .map_err(|error| error.to_string())?;
     Ok(output)
 }
 
-/// The octets of `nodes` over `view`, its projection: inclusive C14N 1.0
-/// without comments, the conversion of a node set to octets (`XMLDSig` 1.1
-/// section 4.4.3.2).
+/// The octets of `nodes` over `view`, a snapshot of the document in `slot`:
+/// inclusive C14N 1.0 without comments, the conversion of a node set to
+/// octets (`XMLDSig` 1.1 section 4.4.3.2).
 ///
 /// # Safety
-/// `nodes` is a live node set over the document `view` projects.
+/// `nodes` is a live node set over the document `view` reads.
 pub(super) unsafe fn selected_octets(
     view: DocumentView<'_>,
+    slot: usize,
     nodes: *mut XmlSecNodeSet,
     resources: &xml_sec::policy::ResourcePolicy,
 ) -> Option<Vec<u8>> {
     let algorithm = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
-    let selection = Selection { nodes, view };
+    let selection = Selection { nodes, view, slot };
     let mut output = Vec::new();
     canonicalize_selected(view, &selection, &algorithm, resources, &mut output).ok()?;
     Some(output)
 }
 
-/// Writes the C14N form of `nodes` for klass `id` to the libxml2 output
-/// buffer `out`.
+/// Writes the C14N form of `nodes` for klass `id` to the output buffer
+/// `out`.
 ///
 /// # Safety
-/// `nodes` is a live node set over a live document; `list` is the
-/// transform's prefix list; `out` is a live output buffer.
+/// `nodes` is a live node set; `list` is the transform's prefix list;
+/// `out`'s callbacks are callable.
 unsafe fn c14n_execute(
     id: *const XmlSecTransformKlass,
     nodes: *mut XmlSecNodeSet,
     list: &XmlSecPtrList,
-    out: *mut c_void,
+    out: *mut OutputBuffer,
 ) -> c_int {
     check!(
         !id.is_null(),
@@ -1002,10 +983,6 @@ unsafe fn c14n_execute(
         -1
     );
     let here = here!("xmlSecTransformC14NExecute");
-    if !readable() {
-        errors::no_libxml2(here);
-        return -1;
-    }
     // SAFETY: by the caller's contract.
     unsafe {
         let name = (*id).name.cast();
@@ -1098,7 +1075,10 @@ pub(crate) unsafe fn push_rendered(
     transform: *mut XmlSecTransform,
     nodes: *mut XmlSecNodeSet,
     ctx: *mut XmlSecTransformCtx,
-    (render, rendered): (impl FnOnce(*mut XmlSecNodeSet, *mut c_void) -> c_int, &CStr),
+    (render, rendered): (
+        impl FnOnce(*mut XmlSecNodeSet, *mut OutputBuffer) -> c_int,
+        &CStr,
+    ),
     here: errors::Here,
 ) -> c_int {
     if nodes.is_null() {
@@ -1213,7 +1193,10 @@ pub(crate) unsafe fn pop_rendered(
     transform: *mut XmlSecTransform,
     target: PopTarget,
     ctx: *mut XmlSecTransformCtx,
-    (render, rendered): (impl FnOnce(*mut XmlSecNodeSet, *mut c_void) -> c_int, &CStr),
+    (render, rendered): (
+        impl FnOnce(*mut XmlSecNodeSet, *mut OutputBuffer) -> c_int,
+        &CStr,
+    ),
     here: errors::Here,
 ) -> c_int {
     let PopTarget {
@@ -1368,7 +1351,7 @@ unsafe extern "C" fn enveloped_execute(
     // SAFETY: an enveloped transform read from a live `dsig:Transform`.
     unsafe {
         let name = name_of(transform);
-        if !object.in_nodes.is_null() && (*object.in_nodes).doc != (*object.here_node).doc {
+        if !object.in_nodes.is_null() && (*object.in_nodes).doc != nodes::doc(object.here_node) {
             errors::other(here, errors::R_TRANSFORM_SAME_DOCUMENT_REQUIRED, name, None);
             return -1;
         }
@@ -1387,13 +1370,16 @@ unsafe extern "C" fn enveloped_execute(
             );
             return -1;
         }
-        let outside = xmlSecNodeSetGetChildren((*signature).doc, signature, 1, 1);
+        let outside = xmlSecNodeSetGetChildren(nodes::doc(signature), signature, 1, 1);
         if outside.is_null() {
             errors::internal_with(
                 here,
                 name,
                 c"xmlSecNodeSetGetChildren",
-                &format!("node={}", klass_text((*signature).name)),
+                &format!(
+                    "node={}",
+                    nodes::name(signature).unwrap_or_else(|| "NULL".to_owned())
+                ),
             );
             return -1;
         }

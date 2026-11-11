@@ -32,41 +32,31 @@ pub(crate) const ALLOC_MODE_EXACT: c_int = 0;
 /// `xmlSecAllocModeDouble`: grow to twice the requested size.
 pub(crate) const ALLOC_MODE_DOUBLE: c_int = 1;
 
-use xml_sec_libxml2::ffi::libxml2;
+use xml_sec_libxml2::ffi::memory;
 
-/// Allocates `size` bytes with the caller's libxml2 allocator, which
-/// libxmlsec1 hands memory out from and callers release with `xmlFree`; null
-/// when it fails or no libxml2 is loaded.
+/// Allocates `size` bytes of the library's heap, which libxmlsec1 hands
+/// memory out from and callers release with `xmlFree`; null when it fails.
 fn malloc(size: usize) -> *mut c_void {
-    if !libxml2::available() {
-        return std::ptr::null_mut();
-    }
-    // SAFETY: libxml2 is available; `xmlMalloc` accepts any size and reports
-    // failure as null.
-    unsafe { libxml2::xml_malloc(size) }
+    memory::malloc(size)
 }
 
-/// Resizes `mem`, which libxml2's allocator returned, to `size` bytes; null
-/// when it fails, leaving `mem` allocated.
+/// Resizes `mem` to `size` bytes; null when it fails, leaving `mem`
+/// allocated.
 ///
 /// # Safety
 /// `mem` came from [`malloc`] or [`realloc`] and was not freed.
 unsafe fn realloc(mem: *mut c_void, size: usize) -> *mut c_void {
-    // SAFETY: a live allocation proves libxml2 was available, and it stays
-    // resolved; the caller passes such an allocation.
-    unsafe { libxml2::xml_realloc(mem, size) }
+    // SAFETY: by the caller's contract.
+    unsafe { memory::realloc(mem, size) }
 }
 
-/// Releases `mem`, which libxml2's allocator returned.
+/// Releases `mem`.
 ///
 /// # Safety
 /// `mem` is null or came from [`malloc`] or [`realloc`] and was not freed.
 unsafe fn free(mem: *mut c_void) {
-    if mem.is_null() {
-        return;
-    }
-    // SAFETY: as for `realloc`.
-    unsafe { libxml2::xml_free(mem) }
+    // SAFETY: by the caller's contract.
+    unsafe { memory::free(mem) }
 }
 
 /// Writes `text` to the C stream `stream`; text with an interior NUL is
