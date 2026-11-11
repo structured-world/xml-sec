@@ -1,11 +1,11 @@
-/* The Base64 codec as a libxmlsec1 caller sees it. Built unmodified against
- * the pinned libxmlsec1 and against this crate, both must print the same
- * encodings, decodings, chunked streaming results and refusals. */
+/* The Base64 codec as a libxmlsec1 caller sees it. Built against the pinned
+ * libxmlsec1 and against this crate, both must print the same encodings,
+ * decodings, chunked streaming results and refusals. */
 
 #include <stdio.h>
 #include <string.h>
 
-#include <libxml/xmlmemory.h>
+#include "tree.h"
 #include <xmlsec/xmlsec.h>
 #include <xmlsec/base64.h>
 
@@ -13,7 +13,7 @@ static void encode(const char *label, const xmlSecByte *data, xmlSecSize size, i
     xmlChar *text = xmlSecBase64Encode(data, size, columns);
     printf("encode %s/%d: %s\n", label, columns, text != NULL ? (const char *)text : "(null)");
     if (text != NULL) {
-        xmlFree(text);
+        xsFree(text);
     }
 }
 

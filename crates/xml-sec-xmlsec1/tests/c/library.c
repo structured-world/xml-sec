@@ -1,6 +1,6 @@
 /* Library state and the crypto function table as a libxmlsec1 caller sees
- * them. The program is built unmodified against the pinned libxmlsec1 and
- * against this crate, and both must print the same: the version check and
+ * them. The program is built against the pinned libxmlsec1 and against
+ * this crate, and both must print the same: the version check and
  * its reports, the layout of xmlSecCryptoDLFunctions, and dispatch through a
  * table the caller installs itself (which loads no crypto library): its
  * methods and klasses, a missing method, and the registration of its
@@ -11,8 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <libxml/parser.h>
-
+#include "tree.h"
 #include <xmlsec/xmlsec.h>
 #include <xmlsec/errors.h>
 #include <xmlsec/app.h>
@@ -61,9 +60,6 @@ int main(void) {
     xmlSecSize before;
     int ret;
 
-    /* A libxmlsec1 caller works with libxml2, which provides the allocator;
-     * initializing it also keeps the linker from dropping it. */
-    xmlInitParser();
     xmlSecErrorsSetCallback(record);
 
     printf("layout: size=%d init=%d keydata=%d store=%d aes=%d sha1=%d appinit=%d pwd=%d\n",

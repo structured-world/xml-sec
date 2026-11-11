@@ -37,9 +37,9 @@
 pub mod encoding;
 pub mod error;
 pub mod parser;
-// Only upstream parser regression tests use this serializer. Production
-// canonicalization stays in xml-sec's existing C14N implementation.
-#[cfg(test)]
+// Writes the crate's own mutable trees the way libxml2 writes a document.
+// Canonicalization stays in xml-sec's existing C14N implementation.
+#[cfg(any(test, feature = "external-tree"))]
 pub mod serial;
 pub mod tree;
 pub mod validation;

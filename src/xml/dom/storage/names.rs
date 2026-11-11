@@ -15,7 +15,7 @@ pub(crate) trait Names<K, V, S: Storage> {
     fn get_mut(&mut self, name: &str, storage: S) -> Result<Option<&mut V>, ParseError>;
     fn insert(&mut self, name: K, value: V) -> Result<Option<V>, ParseError>;
     fn remove(&mut self, name: &str, storage: S) -> Result<Option<V>, ParseError>;
-    #[cfg(feature = "xml-backend-xmloxide")]
+    #[cfg(any(feature = "xml-backend-xmloxide", feature = "owned-tree"))]
     fn entries<'a>(
         &'a self,
         storage: S,
@@ -23,7 +23,7 @@ pub(crate) trait Names<K, V, S: Storage> {
     where
         K: 'a,
         V: 'a;
-    #[cfg(feature = "xml-backend-xmloxide")]
+    #[cfg(any(feature = "xml-backend-xmloxide", feature = "owned-tree"))]
     fn key_value(&self, name: &str, storage: S) -> Result<Option<(&K, &V)>, ParseError>;
 }
 
@@ -97,7 +97,7 @@ impl<K: AsRef<str>, V> Names<K, V, Native> for Map<Name<K>, V> {
     fn remove(&mut self, name: &str, _: Native) -> Result<Option<V>, ParseError> {
         Ok(Map::remove(self, name))
     }
-    #[cfg(feature = "xml-backend-xmloxide")]
+    #[cfg(any(feature = "xml-backend-xmloxide", feature = "owned-tree"))]
     fn entries<'a>(
         &'a self,
         _: Native,
@@ -108,7 +108,7 @@ impl<K: AsRef<str>, V> Names<K, V, Native> for Map<Name<K>, V> {
     {
         Ok(self.iter().map(|(key, value)| (&key.0, value)))
     }
-    #[cfg(feature = "xml-backend-xmloxide")]
+    #[cfg(any(feature = "xml-backend-xmloxide", feature = "owned-tree"))]
     fn key_value(&self, name: &str, _: Native) -> Result<Option<(&K, &V)>, ParseError> {
         Ok(self.get_key_value(name).map(|(key, value)| (&key.0, value)))
     }
@@ -151,7 +151,7 @@ impl<K: AsRef<str>, V, W: structured_asn1::memory::Work> Names<K, V, super::Acco
     ) -> Result<Option<V>, ParseError> {
         Ok(self.remove_borrowed(name, storage.0)?)
     }
-    #[cfg(feature = "xml-backend-xmloxide")]
+    #[cfg(any(feature = "xml-backend-xmloxide", feature = "owned-tree"))]
     fn entries<'a>(
         &'a self,
         storage: super::Accounted<'_, W>,
@@ -164,7 +164,7 @@ impl<K: AsRef<str>, V, W: structured_asn1::memory::Work> Names<K, V, super::Acco
             .try_iter(storage.0)?
             .map(|(key, value)| (&key.0, value)))
     }
-    #[cfg(feature = "xml-backend-xmloxide")]
+    #[cfg(any(feature = "xml-backend-xmloxide", feature = "owned-tree"))]
     fn key_value(
         &self,
         name: &str,

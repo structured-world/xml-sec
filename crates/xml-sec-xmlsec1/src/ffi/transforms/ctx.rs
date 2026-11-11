@@ -3,8 +3,6 @@
 use std::ffi::{CStr, c_int, c_uint, c_void};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-use xml_sec_libxml2::ffi::{XmlDoc, XmlNode};
-
 use super::super::buffer::XmlSecBuffer;
 use super::super::errors::{self, check, here};
 use super::super::keysdata::{
@@ -19,8 +17,8 @@ use super::super::nodeset::{
     NORMAL, XmlSecNodeSet, xmlSecNodeSetCreate, xmlSecNodeSetDestroy, xmlSecNodeSetGetChildren,
 };
 use super::super::strings::{xmlSecAttrAlgorithm, xmlSecDSigNs, xmlSecNodeTransform};
-use super::super::tree::readable;
-use super::super::xmltree::{xmlSecCheckNodeName, xmlSecGetNextElementNode};
+use super::super::tree::{XmlDoc, XmlNode, c_text, name_for_report, nodes};
+use super::super::xmltree::{next_element, xmlSecCheckNodeName};
 use super::super::{contain, free, malloc, policy, write_stream};
 use super::{
     DATA_BIN, DATA_UNKNOWN, DATA_XML, FLAGS_USER_SPECIFIED, MODE_PUSH, STATUS_FINISHED,
@@ -728,8 +726,6 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxCreateAndPrepend(
     })
 }
 
-use super::super::tree::xmlGetProp;
-
 /// `xmlSecTransformNodeRead`: creates the registered transform named by the
 /// node's `Algorithm` attribute for `usage`, if the context enables it, and
 /// lets the klass read its parameters from the node.
@@ -758,22 +754,19 @@ pub(crate) unsafe extern "C" fn xmlSecTransformNodeRead(
             null
         );
         let here = here!("xmlSecTransformNodeRead");
-        if !readable() {
-            errors::no_libxml2(here);
-            return null;
-        }
-        // SAFETY: a live element and an initialized context; the attribute
-        // value is a libxml2 string released with `xmlFree`.
-        unsafe {
-            let href = xmlGetProp(node, xmlSecAttrAlgorithm.as_ptr());
-            if href.is_null() {
+        // SAFETY: the attribute name is a NUL-terminated constant.
+        let href = unsafe { c_text(xmlSecAttrAlgorithm.as_ptr()) }
+            .and_then(|attribute| nodes::property(node, attribute))
+            .and_then(|href| std::ffi::CString::new(href).ok());
+        let Some(href) = href else {
+            // SAFETY: a report about the caller's node.
+            unsafe {
                 errors::invalid_node_attribute(here, node, c"Algorithm", std::ptr::null(), "empty");
-                return null;
             }
-            let transform = read_algorithm(node, href, usage, ctx);
-            free(href.cast::<c_void>());
-            transform
-        }
+            return null;
+        };
+        // SAFETY: an initialized context; the value is NUL-terminated.
+        unsafe { read_algorithm(node, href.as_ptr().cast(), usage, ctx) }
     })
 }
 
@@ -855,7 +848,8 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxNodeRead(
         unsafe {
             let transform = xmlSecTransformNodeRead(node, usage, ctx);
             if transform.is_null() {
-                errors::internal(here, (*node).name.cast(), c"xmlSecTransformNodeRead");
+                let name = name_for_report(node);
+                errors::internal(here, name.as_ptr(), c"xmlSecTransformNodeRead");
                 return transform;
             }
             if xmlSecTransformCtxAppend(ctx, transform) < 0 {
@@ -893,21 +887,17 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxNodesListRead(
             -1
         );
         let here = here!("xmlSecTransformCtxNodesListRead");
-        if !readable() {
-            errors::no_libxml2(here);
-            return -1;
-        }
-        // SAFETY: by the caller's contract; the children of a live element
-        // are live.
+        // SAFETY: by the caller's contract.
         unsafe {
-            let mut current = xmlSecGetNextElementNode((*node).children);
+            let mut current = next_element(nodes::first_child(node));
             while !current.is_null()
                 && xmlSecCheckNodeName(current, xmlSecNodeTransform.as_ptr(), xmlSecDSigNs.as_ptr())
                     != 0
             {
                 let transform = xmlSecTransformNodeRead(current, usage, ctx);
                 if transform.is_null() {
-                    errors::internal(here, (*current).name.cast(), c"xmlSecTransformNodeRead");
+                    let name = name_for_report(current);
+                    errors::internal(here, name.as_ptr(), c"xmlSecTransformNodeRead");
                     return -1;
                 }
                 (*transform).flags |= FLAGS_USER_SPECIFIED;
@@ -920,7 +910,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxNodesListRead(
                     xmlSecTransformDestroy(transform);
                     return -1;
                 }
-                current = xmlSecGetNextElementNode((*current).next);
+                current = next_element(nodes::next(current));
             }
             if current.is_null() {
                 0

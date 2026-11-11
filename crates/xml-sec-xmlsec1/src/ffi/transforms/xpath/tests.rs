@@ -6,8 +6,9 @@ use crate::ffi::nodeset::{xmlSecNodeSetContains, xmlSecNodeSetDestroy, xmlSecNod
 use crate::ffi::parser::xmlSecParseMemory;
 use crate::ffi::transforms::ctx::{xmlSecTransformCtxCreate, xmlSecTransformCtxDestroy};
 use crate::ffi::transforms::{xmlSecTransformCreate, xmlSecTransformDestroy};
-use crate::ffi::tree::xmlFreeDoc;
+use crate::ffi::tree::nodes;
 use crate::ffi::xmltree::xmlSecFindNode;
+use xml_sec_libxml2::document::free as xmlFreeDoc;
 
 /// A Filter 2.0 union cannot add nodes outside the input: the output is the
 /// input intersected with the filter (`XPath` Filter 2.0 section 3.4), where
@@ -21,7 +22,7 @@ fn filter2_union_stays_within_the_input() {
     unsafe {
         let doc = xmlSecParseMemory(xml.as_ptr(), xml.len(), 0);
         assert!(!doc.is_null());
-        let root = (*doc).children;
+        let root = nodes::first_child(doc);
         let find =
             |name: &std::ffi::CStr| xmlSecFindNode(root, name.as_ptr().cast(), std::ptr::null());
         let (a, b, t) = (find(c"a"), find(c"b"), find(c"t"));
@@ -35,7 +36,7 @@ fn filter2_union_stays_within_the_input() {
         (*transform).in_nodes = input;
         assert_eq!(execute(transform, 1, ctx), 0);
         let output = (*transform).out_nodes;
-        assert_ne!(xmlSecNodeSetContains(output, (*a).children, a), 0);
+        assert_ne!(xmlSecNodeSetContains(output, nodes::first_child(a), a), 0);
         assert_eq!(xmlSecNodeSetContains(output, b, root), 0);
         xmlSecTransformDestroy(transform);
         xmlSecNodeSetDestroy(input);
@@ -55,7 +56,7 @@ fn here_is_the_element_holding_the_expression() {
     unsafe {
         let doc = xmlSecParseMemory(xml.as_ptr(), xml.len(), 0);
         assert!(!doc.is_null());
-        let root = (*doc).children;
+        let root = nodes::first_child(doc);
         let a = xmlSecFindNode(root, c"a".as_ptr().cast(), std::ptr::null());
         let t = xmlSecFindNode(
             root,

@@ -17,8 +17,7 @@
 
 #include <stdio.h>
 
-#include <libxml/tree.h>
-#include <libxml/xpath.h>
+#include <xs_tree.h>
 
 #include <xmlsec/exports.h>
 #include <xmlsec/xmlsec.h>
@@ -38,7 +37,7 @@ extern "C" {
  * @param node the pointer to node.
  */
 #define xmlSecNodeGetName(node) \
-    (((node)) ? ((const char*)((node)->name)) : NULL)
+    (((node)) ? ((const char*)xsNodeName(node)) : NULL)
 
 XMLSEC_EXPORT const xmlChar*    xmlSecGetDefaultLineFeed(void);
 XMLSEC_EXPORT void        xmlSecSetDefaultLineFeed(const xmlChar *linefeed);

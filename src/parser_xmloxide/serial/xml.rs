@@ -3,6 +3,7 @@
 //! Serializes a `Document` tree into a well-formed XML string.
 
 use crate::parser_xmloxide::tree::{Document, NodeId, NodeKind};
+use alloc::string::{String, ToString};
 
 /// Options controlling XML serialization output.
 ///
@@ -178,8 +179,10 @@ fn serialize_node(
             write_escaped_text(out, content, reencode_non_ascii);
         }
         NodeKind::CData { content } => {
+            // XML 1.0 section 2.7: content cannot hold `]]>`, so each one is
+            // split across adjacent sections, as libxml2 writes it.
             out.push_str("<![CDATA[");
-            out.push_str(content);
+            out.push_str(&content.replace("]]>", "]]]]><![CDATA[>"));
             out.push_str("]]>");
         }
         NodeKind::Comment { content } => {
@@ -348,7 +351,7 @@ fn serialize_element_node(
 
 /// Writes a hexadecimal character reference (`&#xHH;`) for a Unicode code point.
 fn write_hex_char_ref(out: &mut String, ch: char) {
-    use std::fmt::Write;
+    use core::fmt::Write;
     let _ = write!(out, "&#x{:X};", ch as u32);
 }
 

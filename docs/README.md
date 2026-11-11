@@ -13,7 +13,7 @@ implied by this documentation.
 | --- | --- |
 | Sign, authorize signed targets, encrypt and decrypt in Rust | [Policy-bound Rust API](rust-api.md) |
 | Call the policy-bound API from C or C++ | [C API](c-api.md) |
-| Sign, encrypt or decrypt a libxml2 `xmlDocPtr` in place | [libxml2 documents](c-api.md#libxml2-documents) |
+| Sign, encrypt or decrypt an `xmlDocPtr` tree document in place, without libxml2 | [Tree documents](c-api.md#tree-documents) |
 | Run high-level and low-level examples | [Executable examples](examples.md) |
 | Select a deployment profile and compose restrictions | [Profiles](policy-profiles.md), [deployment runbook](deployment.md) |
 | Load explicit policy configuration | [Configuration](policy-configuration.md), [schema v1](policy-schema-v1.md) |

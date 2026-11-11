@@ -5,9 +5,9 @@ use super::{
     XmlSecBuffer, xmlSecBufferAppend, xmlSecBufferCreate, xmlSecBufferDestroy, xmlSecBufferEmpty,
     xmlSecBufferFinalize, xmlSecBufferGetData, xmlSecBufferGetMaxSize, xmlSecBufferGetSize,
     xmlSecBufferHexRead, xmlSecBufferInitialize, xmlSecBufferIsEmpty, xmlSecBufferPrepend,
-    xmlSecBufferReadFile, xmlSecBufferRemoveHead, xmlSecBufferRemoveTail, xmlSecBufferReverse,
-    xmlSecBufferSetData, xmlSecBufferSetDefaultAllocMode, xmlSecBufferSetMaxSize,
-    xmlSecBufferSetSize, xmlSecBufferSwap, xmlSecMemEqual,
+    xmlSecBufferRemoveHead, xmlSecBufferRemoveTail, xmlSecBufferReverse, xmlSecBufferSetData,
+    xmlSecBufferSetDefaultAllocMode, xmlSecBufferSetMaxSize, xmlSecBufferSetSize, xmlSecBufferSwap,
+    xmlSecMemEqual,
 };
 use crate::ffi::{ALLOC_MODE_DOUBLE, ALLOC_MODE_EXACT};
 use std::mem::MaybeUninit;
@@ -254,31 +254,6 @@ fn reverse_in_place() {
     assert_eq!(buf.contents(), b"cba");
 }
 
-/// A file is appended in libxmlsec1's 1024-byte reads, which decides the
-/// allocation: 1030 bytes leave 2080 bytes allocated, not 2 * 1030 + 32.
-#[test]
-fn read_file_appends_in_libxmlsec1_chunks() {
-    let _defaults = defaults();
-    let dir = tempfile::tempdir().expect("scratch directory");
-    let path = dir.path().join("data.bin");
-    let contents: Vec<u8> = (0..1030u32)
-        .map(|i| u8::try_from(i % 251).expect("byte"))
-        .collect();
-    std::fs::write(&path, &contents).expect("write the file");
-    let name = std::ffi::CString::new(path.to_str().expect("UTF-8 path")).expect("no NUL");
-    let buf = Buffer::new(0);
-    // SAFETY: the buffer is live and the names NUL-terminated.
-    unsafe {
-        assert_eq!(xmlSecBufferReadFile(buf.0, name.as_ptr()), 0);
-        assert_eq!(
-            xmlSecBufferReadFile(buf.0, c"/nonexistent/file".as_ptr()),
-            -1
-        );
-    }
-    assert_eq!(buf.contents(), contents);
-    assert_eq!(buf.max_size(), 2080);
-}
-
 /// Equality is a 1/0 answer over exactly `size` bytes; null pointers are an
 /// error unless nothing is compared.
 #[test]
@@ -314,7 +289,6 @@ fn null_buffers_are_refused() {
         assert_eq!(xmlSecBufferRemoveTail(null, 1), -1);
         assert_eq!(xmlSecBufferReverse(null), -1);
         assert_eq!(xmlSecBufferHexRead(null, c"00".as_ptr().cast()), -1);
-        assert_eq!(xmlSecBufferReadFile(null, c"x".as_ptr()), -1);
         xmlSecBufferEmpty(null);
         xmlSecBufferFinalize(null);
         xmlSecBufferDestroy(null);

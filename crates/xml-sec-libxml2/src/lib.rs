@@ -1,18 +1,20 @@
-//! xml-sec operations on a caller's libxml2 document, in place.
+//! The document tree of the libxmlsec1 surface, without libxml2 or any other
+//! C library.
 //!
-//! `xs_libxml2_document` turns an `xmlDocPtr` into a document handle of the
-//! clean C API: signing a template, verification, encryption and decryption
-//! through that handle read and change the caller's tree itself. Nodes an
-//! operation does not touch keep their pointers; nodes it creates belong to
-//! the document. Every operation reads the tree as it is when it starts.
+//! A document is a core [`OwnedTree`](xml_sec::document::owned_tree::OwnedTree)
+//! kept in the [`handles`] table. C code holds opaque handles (`xmlDocPtr`,
+//! `xmlNodePtr`, ...) and reads and changes the tree through our own tree
+//! functions, shaped like libxml2's and exported under the `xs` prefix
+//! (`include/xs_tree.h`); every handle is validated, none is dereferenced.
+//! [`nodes`] is the same tree for Rust code, such as the libxmlsec1-compatible
+//! library. No function reads a file or a URL.
 //!
-//! The library does not link libxml2: it calls the caller's, which a program
-//! handing it an `xmlDocPtr` has loaded, resolving the functions in the
-//! process and refusing every tree when no supported release is loaded.
-//!
-//! The library exports the clean C API (`xml_sec.h`) as well; the header is
-//! `include/xml_sec_libxml2.h`, and `SAFETY.md` records the invariants of the
-//! crate's single `unsafe` module.
+//! `xs_tree_document` (`include/xml_sec_libxml2.h`) makes a clean C API
+//! document handle over a tree document: signing, verification, encryption
+//! and decryption read and change the tree itself, and nodes an operation
+//! leaves keep their handles. The library exports the clean C API
+//! (`xml_sec.h`) as well; `SAFETY.md` records the invariants of the crate's
+//! single `unsafe` module.
 
 #![deny(
     unsafe_op_in_unsafe_fn,
@@ -21,10 +23,16 @@
     clippy::unnecessary_safety_doc
 )]
 
-// The one boundary where libxml2 pointers are read and written.
+pub mod document;
+pub mod handles;
+pub mod nodes;
+pub mod policy;
+pub mod slot_tree;
+
+// The one boundary where C pointers are read and written.
 #[expect(
     unsafe_code,
-    reason = "the libxml2 boundary; its invariants are recorded in SAFETY.md"
+    reason = "the C boundary; its invariants are recorded in SAFETY.md"
 )]
 pub mod ffi;
 

@@ -2,7 +2,10 @@
 
 `src/ffi.rs` and its submodules are the crate's only `unsafe` code. They export
 libxmlsec1's functions under their own names, read and write the C structures
-of `include/xmlsec/`, and allocate with libxml2's allocator.
+of `include/xmlsec/`, and allocate on the library heap of `xml-sec-libxml2`.
+Document trees are never reached through a pointer: every node, node set and
+I/O buffer is an opaque handle of `xml-sec-libxml2`, validated on each use
+(its `SAFETY.md`).
 
 ## What callers guarantee
 
@@ -15,7 +18,7 @@ function:
 2. A pointer with a length is readable (or writable) for that many bytes and
    does not alias the object it is copied into, unless the function says so.
 3. Objects the library returns are released with the matching `Destroy`
-   function, strings and data with `xmlFree`; objects the caller initialized
+   function, strings and data with `xsFree`; objects the caller initialized
    are released with `Finalize`.
 4. One object is used by one thread at a time, as in libxmlsec1. The process
    defaults (`xmlSec*SetDefaultAllocMode`) and the report callbacks may be set
@@ -41,17 +44,18 @@ function:
 ## What the library guarantees
 
 - Memory handed to the caller, and the data inside structures the caller can
-  reach, comes from libxml2's `xmlMalloc`/`xmlRealloc` and is released only
-  with `xmlFree`: the allocator globals of the caller's libxml2, read in the
-  running process by `xml-sec-libxml2`, so a caller-installed libxml2 allocator
-  owns it. The library links no libxml2 and compiles no C; with no supported
-  libxml2 loaded, allocation fails and every tree-reading function refuses.
+  reach, comes from the library heap (`xsMalloc`/`xsRealloc`) and is released
+  only with `xsFree`. The library links no C library besides the platform's C
+  runtime, compiles no C and resolves no symbol at run time.
+- No function reads a file, a URL or an external entity itself; documents are
+  parsed from bytes by the core under the library policy.
 - The bytes of a buffer between its size and its allocation are zero, as
   libxmlsec1 keeps them.
 - The Rust declarations of the C structures equal the layouts of the crate's
   headers (checked by the crate's tests, which compile and run
-  `tests/layout.c`); the headers
-  equal libxmlsec1's (checked by `xml-sec-tools xmlsec1-headers --check`).
+  `tests/layout.c`); the headers equal libxmlsec1's with the library's tree
+  header in place of libxml2's and the functions it does not offer left out
+  (checked by `xml-sec-tools xmlsec1-headers --check`).
 - No unwinding crosses the boundary: every exported function runs its body
   under `catch_unwind`, reports a panic as an internal error and returns its
   failure value.

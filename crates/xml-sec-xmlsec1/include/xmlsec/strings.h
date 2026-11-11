@@ -12,7 +12,7 @@
  * @brief XMLDSig/XMLEnc string constants.
  */
 
-#include <libxml/tree.h>
+#include <xs_tree.h>
 
 #include <xmlsec/exports.h>
 #include <xmlsec/xmlsec.h>

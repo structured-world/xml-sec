@@ -497,13 +497,13 @@ unsafe extern "C" fn input_uri_pop_bin(
     0
 }
 
-pub(crate) use xml_sec_libxml2::ffi::libxml2::{
-    xml_output_buffer_close as xmlOutputBufferClose,
-    xml_output_buffer_write as xmlOutputBufferWrite,
+pub(crate) use xml_sec_libxml2::ffi::io::{
+    InputBuffer, OutputBuffer, xsOutputBufferClose as xmlOutputBufferClose,
+    xsOutputBufferWrite as xmlOutputBufferWrite,
 };
-use xml_sec_libxml2::ffi::libxml2::{
-    xml_output_buffer_create_io as xmlOutputBufferCreateIO,
-    xml_parser_input_buffer_create_io as xmlParserInputBufferCreateIO,
+use xml_sec_libxml2::ffi::io::{
+    xsOutputBufferCreateIO as xmlOutputBufferCreateIO,
+    xsParserInputBufferCreateIO as xmlParserInputBufferCreateIO,
 };
 
 /// `XML_CHAR_ENCODING_NONE`.
@@ -699,8 +699,8 @@ unsafe fn buffer_target(
     Some(name)
 }
 
-/// `xmlSecTransformCreateOutputBuffer`: a libxml2 output buffer whose writes
-/// push binary data into `transform`; closing it pushes the final call.
+/// `xmlSecTransformCreateOutputBuffer`: an output buffer whose writes push
+/// binary data into `transform`; closing it pushes the final call.
 ///
 /// # Safety
 /// `transform` is null or a valid transform; `ctx` is null or a context;
@@ -709,7 +709,7 @@ unsafe fn buffer_target(
 pub(crate) unsafe extern "C" fn xmlSecTransformCreateOutputBuffer(
     transform: *mut XmlSecTransform,
     ctx: *mut XmlSecTransformCtx,
-) -> *mut c_void {
+) -> *mut OutputBuffer {
     contain(std::ptr::null_mut(), || {
         let here = here!("xmlSecTransformCreateOutputBuffer");
         // SAFETY: by the caller's contract.
@@ -728,9 +728,9 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCreateOutputBuffer(
         );
         if io.is_null() {
             errors::internal(here, name, c"xmlSecTransformIOBufferCreate");
-            return io;
+            return std::ptr::null_mut();
         }
-        // SAFETY: libxml2 keeps the state as the callbacks' context.
+        // SAFETY: the buffer keeps the state as the callbacks' context.
         let output = unsafe {
             xmlOutputBufferCreateIO(
                 Some(transform_write),
@@ -741,14 +741,14 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCreateOutputBuffer(
         };
         if output.is_null() {
             errors::xml_failed(here, name, c"xmlOutputBufferCreateIO");
-            // SAFETY: the state libxml2 did not take.
+            // SAFETY: the state the buffer did not take.
             unsafe { free(io) };
         }
         output
     })
 }
 
-/// `xmlSecTransformCreateInputBuffer`: a libxml2 input buffer whose reads pop
+/// `xmlSecTransformCreateInputBuffer`: an input buffer whose reads pop
 /// binary data from `transform`.
 ///
 /// # Safety
@@ -757,7 +757,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCreateOutputBuffer(
 pub(crate) unsafe extern "C" fn xmlSecTransformCreateInputBuffer(
     transform: *mut XmlSecTransform,
     ctx: *mut XmlSecTransformCtx,
-) -> *mut c_void {
+) -> *mut InputBuffer {
     contain(std::ptr::null_mut(), || {
         let unbounded = Limit {
             name: "none",
@@ -775,8 +775,8 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCreateInputBuffer(
     })
 }
 
-/// A libxml2 input buffer popping binary data from `transform` that fails a
-/// read past `limit` in all; failures are reported from the entry point at
+/// An input buffer popping binary data from `transform` that fails a read
+/// past `limit` in all; failures are reported from the entry point at
 /// `here`.
 ///
 /// # Safety
@@ -786,7 +786,7 @@ pub(crate) unsafe fn bounded_input_buffer(
     ctx: *mut XmlSecTransformCtx,
     limit: Limit,
     here: errors::Here,
-) -> *mut c_void {
+) -> *mut InputBuffer {
     // SAFETY: by the caller's contract.
     let Some(name) = (unsafe { buffer_target(transform, ctx, MODE_POP, here) }) else {
         return std::ptr::null_mut();
@@ -799,9 +799,9 @@ pub(crate) unsafe fn bounded_input_buffer(
     );
     if io.is_null() {
         errors::internal(here, name, c"xmlSecTransformIOBufferCreate");
-        return io;
+        return std::ptr::null_mut();
     }
-    // SAFETY: libxml2 keeps the state as the callbacks' context.
+    // SAFETY: the buffer keeps the state as the callbacks' context.
     let input = unsafe {
         xmlParserInputBufferCreateIO(
             Some(transform_read),
@@ -812,7 +812,7 @@ pub(crate) unsafe fn bounded_input_buffer(
     };
     if input.is_null() {
         errors::xml_failed(here, name, c"xmlParserInputBufferCreateIO");
-        // SAFETY: the state libxml2 did not take.
+        // SAFETY: the state the buffer did not take.
         unsafe { free(io) };
     }
     input
@@ -855,17 +855,17 @@ unsafe extern "C" fn buffer_close(context: *mut c_void) -> c_int {
     0
 }
 
-/// `xmlSecBufferCreateOutputBuffer`: a libxml2 output buffer appending to
-/// `buf`, which the caller keeps owning.
+/// `xmlSecBufferCreateOutputBuffer`: an output buffer appending to `buf`,
+/// which the caller keeps owning.
 ///
 /// # Safety
 /// `buf` is null or a valid buffer that outlives the output buffer.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecBufferCreateOutputBuffer(
     buf: *mut XmlSecBuffer,
-) -> *mut c_void {
+) -> *mut OutputBuffer {
     contain(std::ptr::null_mut(), || {
-        // SAFETY: libxml2 keeps `buf` as the callbacks' context only.
+        // SAFETY: the buffer keeps `buf` as the callbacks' context only.
         unsafe {
             xmlOutputBufferCreateIO(
                 Some(buffer_write),

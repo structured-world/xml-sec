@@ -1,15 +1,14 @@
 /* Transform chains as a libxmlsec1 caller builds them, with representative
  * extension klasses: an octet transform written on the default push/pop
  * methods, one with its own push method, and a node-set transform. Built
- * unmodified against the pinned libxmlsec1 and against this crate, both must
- * print the same results, statuses, adapters and callback observations. */
+ * against the pinned libxmlsec1 and against this crate, both must print the
+ * same results, statuses, adapters and callback observations. */
 
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
 
-#include <libxml/parser.h>
-#include <libxml/tree.h>
+#include "tree.h"
 #include <xmlsec/xmlsec.h>
 #include <xmlsec/xmltree.h>
 #include <xmlsec/transforms.h>
@@ -93,7 +92,7 @@ static int keep_execute(xmlSecTransformPtr transform, int last, xmlSecTransformC
     if (transform->inNodes == NULL) {
         return -1;
     }
-    root = xmlDocGetRootElement(transform->inNodes->doc);
+    root = xsDocGetRootElement(transform->inNodes->doc);
     keep = xmlSecNodeSetGetChildren(transform->inNodes->doc,
                                     xmlSecFindNode(root, BAD_CAST "keep", BAD_CAST "urn:t"), 0, 0);
     transform->outNodes = xmlSecNodeSetAdd(transform->inNodes, keep, xmlSecNodeSetIntersection);
@@ -162,8 +161,8 @@ static const char document[] =
     "</root>";
 
 int main(void) {
-    xmlDocPtr doc = xmlReadMemory(document, (int)strlen(document), "doc.xml", NULL, 0);
-    xmlNodePtr root = xmlDocGetRootElement(doc);
+    xmlDocPtr doc = xsReadMemory(document, (int)strlen(document), "doc.xml", NULL, 0);
+    xmlNodePtr root = xsDocGetRootElement(doc);
     xmlSecTransformCtxPtr ctx;
     xmlSecTransformPtr transform;
     xmlSecNodeSetPtr nodes;
@@ -318,7 +317,7 @@ int main(void) {
            xmlSecTransformEnvelopedId->objSize == sizeof(xmlSecTransform));
 
     xmlSecTransformIdsShutdown();
-    xmlFreeDoc(doc);
+    xsFreeDoc(doc);
     printf("done\n");
     return 0;
 }

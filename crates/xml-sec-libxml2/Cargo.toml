@@ -5,26 +5,29 @@ edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0 AND MIT"
 publish = false
-description = "xml-sec operations on a caller's libxml2 document tree, in place"
+description = "The document tree of the libxmlsec1 surface, without libxml2"
 
 [lib]
-# The library exports the clean C API together with the libxml2 entry point;
+# The library exports the clean C API together with the tree functions;
 # `rlib` lets the crate's own Rust tests call the exported functions.
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-xml-sec = { path = "../..", default-features = false, features = ["std", "xmldsig", "xmldsig-sign", "xmlenc", "c14n", "external-tree"] }
+# The owned tree is the documents' storage whichever parser backend the
+# clean C API selects.
+xml-sec = { path = "../..", default-features = false, features = ["std", "xmldsig", "xmldsig-sign", "xmlenc", "c14n", "owned-tree"] }
 xml-sec-capi = { path = "../xml-sec-capi", default-features = false, features = ["external-tree"] }
-# The caller's libxml2 is found in the running process (`dlsym`), never linked.
+# The C heap the library hands memory out from, released with `xsFree`.
 libc = "0.2"
+# The handle table is process-global, as C handles are.
+parking_lot = "0.13"
+thiserror = "2"
 
 [dev-dependencies]
 tempfile = "3"
 
 [features]
 default = ["xml-backend-xmloxide"]
-# Loads the system libxml2 into a test process, as a C caller has it loaded.
-test-support = []
 xml-backend-xmloxide = ["xml-sec-capi/xml-backend-xmloxide"]
 xml-backend-roxmltree = ["xml-sec-capi/xml-backend-roxmltree"]
 

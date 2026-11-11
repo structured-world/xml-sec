@@ -137,20 +137,8 @@ impl XmlBackendImplementation for XmloxideBackend {
     }
 }
 
-pub(super) fn backend_options() -> xmloxide::parser::ParseOptions {
-    // The shared preflight owns the backend-neutral contract. These absolute
-    // limits are defense in depth against a backend regression allocating
-    // expanded entity data before returning control to the semantic tree.
-    xmloxide::parser::ParseOptions::default()
-        .max_depth(
-            u32::try_from(crate::hard_limits::XML_DOCUMENT_DEPTH_CEILING)
-                .expect("XML depth ceiling fits into u32"),
-        )
-        .max_attributes(u32::MAX)
-        .max_attribute_length(usize::MAX)
-        .max_text_length(crate::hard_limits::XML_ENTITY_EXPANSION_WORK_BYTE_CEILING)
-        .max_name_length(usize::MAX)
-        .max_entity_expansions(crate::hard_limits::XML_ENTITY_EXPANSION_CEILING)
+fn backend_options() -> xmloxide::parser::ParseOptions {
+    super::xmloxide_parse_options()
 }
 
 /// The semantic arena as the tree the parser builds: each node the parser
