@@ -311,7 +311,12 @@ impl HmacPolicy {
         Ok(())
     }
 
-    pub(crate) fn validate_key_bytes(self, key_bytes: usize) -> Result<(), PolicyViolation> {
+    /// Check an HMAC secret of `key_bytes` bytes against the configured
+    /// minimum key length.
+    ///
+    /// # Errors
+    /// [`PolicyViolation::InvalidKeyMaterial`] for a shorter secret.
+    pub fn validate_key_bytes(self, key_bytes: usize) -> Result<(), PolicyViolation> {
         self.validate_key_bits(key_bytes.saturating_mul(8))
     }
 
@@ -326,7 +331,14 @@ impl HmacPolicy {
         Ok(())
     }
 
-    pub(crate) fn validate_output(
+    /// Check a selected HMAC output length of `algorithm` against this policy
+    /// and the `XMLDSig` floor: at least the configured minimum, 80 bits and
+    /// half the digest width, and at most the digest width.
+    ///
+    /// # Errors
+    /// [`PolicyViolation::Algorithm`] for a method that is no HMAC,
+    /// [`PolicyViolation::HmacOutputLength`] for a length out of range.
+    pub fn validate_output(
         self,
         algorithm: SignatureAlgorithm,
         selected_bits: usize,

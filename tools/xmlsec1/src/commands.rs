@@ -1354,7 +1354,14 @@ fn prepare_signing_key_candidate_inner(
         )?;
         inventory.signing_key_with_provider(name, algorithm, policy, provider)?
     } else {
-        key_material::decode_signing_key(Path::new(path), &key_bytes, format, algorithm, password)?
+        key_material::decode_signing_key(
+            Path::new(path),
+            &key_bytes,
+            format,
+            algorithm,
+            password,
+            resources,
+        )?
     };
     validate_signing_key(key.as_ref(), algorithm, policy)
         .map_err(|error| CommandError::Signature(error.to_string()))?;
