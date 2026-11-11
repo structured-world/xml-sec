@@ -3,6 +3,7 @@
 //! Serializes a `Document` tree into a well-formed XML string.
 
 use crate::parser_xmloxide::tree::{Document, NodeId, NodeKind};
+use alloc::string::{String, ToString};
 
 /// Options controlling XML serialization output.
 ///
@@ -348,7 +349,7 @@ fn serialize_element_node(
 
 /// Writes a hexadecimal character reference (`&#xHH;`) for a Unicode code point.
 fn write_hex_char_ref(out: &mut String, ch: char) {
-    use std::fmt::Write;
+    use core::fmt::Write;
     let _ = write!(out, "&#x{:X};", ch as u32);
 }
 

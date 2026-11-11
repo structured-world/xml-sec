@@ -15,8 +15,7 @@
 #error "this file contains private xmlsec definitions and should not be used outside xmlsec or xmlsec-$crypto libraries"
 #endif /* XMLSEC_PRIVATE */
 
-#include <libxml/tree.h>
-#include <libxml/xmlIO.h>
+#include <xs_tree.h>
 
 #include <xmlsec/xmlsec.h>
 #include <xmlsec/list.h>

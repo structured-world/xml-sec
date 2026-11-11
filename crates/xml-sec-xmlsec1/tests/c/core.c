@@ -1,12 +1,12 @@
 /* Buffers and pointer lists as a libxmlsec1 caller sees them. The program is
- * built unmodified against the pinned libxmlsec1 and against this crate, and
- * both must print the same: sizes, allocation sizes, the zeroed bytes past the
- * data, item order and ownership, and every refusal's return value. */
+ * built against the pinned libxmlsec1 and against this crate, and both must
+ * print the same: sizes, allocation sizes, the zeroed bytes past the data,
+ * item order and ownership, and every refusal's return value. */
 
 #include <stdio.h>
 #include <string.h>
 
-#include <libxml/xmlmemory.h>
+#include "tree.h"
 #include <xmlsec/xmlsec.h>
 #include <xmlsec/buffer.h>
 #include <xmlsec/list.h>
@@ -178,7 +178,7 @@ static void lists(void) {
     strings = xmlSecPtrListCreate(xmlSecStringListId);
     printf("strings name: %s\n", xmlSecPtrListGetName(strings));
     printf("copy across klasses: %d\n", xmlSecPtrListCopy(strings, list));
-    xmlSecPtrListAdd(strings, xmlStrdup(BAD_CAST "first"));
+    xmlSecPtrListAdd(strings, xsStrdup(BAD_CAST "first"));
     copy = xmlSecPtrListDuplicate(strings);
     printf("duplicate: " XMLSEC_SIZE_FMT " %s %s\n", xmlSecPtrListGetSize(copy),
            (char *)xmlSecPtrListGetItem(copy, 0),

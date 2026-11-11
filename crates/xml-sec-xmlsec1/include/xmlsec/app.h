@@ -20,8 +20,7 @@
 #error To use dynamic crypto engines loading define XMLSEC_CRYPTO_DYNAMIC_LOADING
 #endif /* !defined(IN_XMLSEC) && !defined(XMLSEC_CRYPTO_DYNAMIC_LOADING) */
 
-#include <libxml/tree.h>
-#include <libxml/xmlIO.h>
+#include <xs_tree.h>
 
 #include <xmlsec/exports.h>
 #include <xmlsec/xmlsec.h>

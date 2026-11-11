@@ -30,6 +30,17 @@ pub use tree::{
     Namespaces, Node, NodeId, NodeType, PI, XmlIdError,
 };
 
+/// The xmloxide parser options every parse of this crate uses, for a parse
+/// into a tree other than the semantic arena (the owned tree's).
+#[cfg(all(
+    feature = "external-tree",
+    feature = "xml-backend-xmloxide",
+    any(feature = "xmldsig", feature = "xmlenc")
+))]
+pub(crate) fn xmloxide_backend_options() -> crate::parser_xmloxide::parser::ParseOptions {
+    xmloxide::backend_options()
+}
+
 /// Parser-neutral options used after bounded lexical preflight.
 #[derive(Clone, Copy, Debug)]
 pub struct ParsingOptions {

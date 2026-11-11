@@ -10,7 +10,7 @@
 use std::ffi::{CStr, VaList, c_char, c_int, c_void};
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
-use xml_sec_libxml2::ffi::{XmlNode, libxml2};
+use super::tree::{XmlNode, nodes};
 
 use super::contain;
 
@@ -36,8 +36,6 @@ pub(crate) const R_MALLOC_FAILED: c_int = 2;
 pub(crate) const R_STRDUP_FAILED: c_int = 3;
 /// `XMLSEC_ERRORS_R_XML_FAILED`.
 pub(crate) const R_XML_FAILED: c_int = 5;
-/// `XMLSEC_ERRORS_R_IO_FAILED`.
-pub(crate) const R_IO_FAILED: c_int = 7;
 /// `XMLSEC_ERRORS_R_NOT_IMPLEMENTED`.
 pub(crate) const R_NOT_IMPLEMENTED: c_int = 9;
 /// `XMLSEC_ERRORS_R_INVALID_CONFIG`.
@@ -333,16 +331,9 @@ pub(crate) unsafe extern "C" fn xmlSecErrorsDefaultCallback(
             text.extend_from_slice(bytes_or(msg, b""));
         }
         text.extend_from_slice(b"\n");
-        let Ok(text) = std::ffi::CString::new(text) else {
-            return;
-        };
-        if libxml2::available() {
-            // SAFETY: libxml2 is available.
-            unsafe { libxml2::xml_generic_error(&text) };
-        } else {
-            // libxml2's own handler writes to the standard error stream.
-            eprint!("{}", text.to_string_lossy());
-        }
+        // Written through the generic error channel, as libxmlsec1 writes
+        // through libxml2's.
+        xml_sec_libxml2::ffi::errors::generic_error(&String::from_utf8_lossy(&text));
     });
 }
 
@@ -454,22 +445,9 @@ pub(crate) fn internal_with(here: Here, object: *const c_char, failed: &CStr, me
 /// The name of `node` for a report (libxmlsec1's `xmlSecNodeGetName`).
 ///
 /// # Safety
-/// `node` is null or a live node.
+/// Callable with any pointer; `unsafe` keeps the reporting helpers' shape.
 unsafe fn node_name(node: *const XmlNode) -> String {
-    // SAFETY: by the caller's contract; a node's name is null or
-    // NUL-terminated.
-    unsafe {
-        node.as_ref()
-            .filter(|node| !node.name.is_null())
-            .map_or_else(
-                || "NULL".to_owned(),
-                |node| {
-                    CStr::from_ptr(node.name.cast())
-                        .to_string_lossy()
-                        .into_owned()
-                },
-            )
-    }
+    nodes::name(node).unwrap_or_else(|| "NULL".to_owned())
 }
 
 /// libxmlsec1's `xmlSecInvalidNodeContentError`.
@@ -529,21 +507,16 @@ pub(crate) fn int_to_size_impossible(here: Here, value: c_int) {
     );
 }
 
-/// libxml2's last error as libxmlsec1 writes it: `xml error: <code>: <msg>`.
+/// The tree layer's last error on this thread as libxmlsec1 writes
+/// libxml2's: `xml error: <code>: <msg>`.
 fn last_xml_error() -> String {
-    let (code, message) = if libxml2::available() {
-        // SAFETY: libxml2 is available.
-        unsafe { libxml2::xml_last_error() }
-    } else {
-        (0, std::ptr::null())
-    };
-    // SAFETY: libxml2's message is null or NUL-terminated.
-    let message = unsafe { bytes_or(message, b"NULL") };
-    format!("xml error: {code}: {}", String::from_utf8_lossy(message))
+    let (code, message) =
+        xml_sec_libxml2::document::last_error().unwrap_or_else(|| (0, String::from("NULL")));
+    format!("xml error: {code}: {message}")
 }
 
-/// libxmlsec1's `xmlSecXmlError`: the libxml2 call `failed` failed, with
-/// libxml2's last error.
+/// libxmlsec1's `xmlSecXmlError`: the tree call `failed` failed, with the
+/// tree layer's last error.
 pub(crate) fn xml_failed(here: Here, object: *const c_char, failed: &CStr) {
     report(
         here,
@@ -578,18 +551,6 @@ pub(crate) fn size_to_int_impossible(here: Here, value: usize) {
             c_int::MIN,
             c_int::MAX
         ),
-    );
-}
-
-/// The process has no libxml2 this library can use: a libxml2 call it needs
-/// cannot be made.
-pub(crate) fn no_libxml2(here: Here) {
-    report(
-        here,
-        std::ptr::null(),
-        std::ptr::null(),
-        R_XML_FAILED,
-        "no supported libxml2 is loaded in the process",
     );
 }
 

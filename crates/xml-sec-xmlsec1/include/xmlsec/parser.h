@@ -15,7 +15,7 @@
  * @{
  */
 
-#include <libxml/tree.h>
+#include <xs_tree.h>
 
 #include <xmlsec/exports.h>
 #include <xmlsec/xmlsec.h>
@@ -25,7 +25,7 @@
 extern "C" {
 #endif /* __cplusplus */
 
-XMLSEC_EXPORT xmlDocPtr         xmlSecParseFile         (const char *filename);
+/* xmlSecParseFile is not offered: the library reads no file; the caller passes the bytes. */
 XMLSEC_EXPORT xmlDocPtr         xmlSecParseMemory       (const xmlSecByte *buffer,
                                                          xmlSecSize size,
                                                          int recovery);
@@ -35,7 +35,7 @@ XMLSEC_EXPORT xmlDocPtr         xmlSecParseMemoryExt    (const xmlSecByte *prefi
                                                          xmlSecSize bufferSize,
                                                          const xmlSecByte *postfix,
                                                          xmlSecSize postfixSize);
-XMLSEC_EXPORT void              xmlSecParsePrepareCtxt  (xmlParserCtxtPtr ctxt);
+/* xmlSecParsePrepareCtxt is not offered: the library parses with its own parser, not a libxml2 context. */
 
 XMLSEC_EXPORT int               xmlSecParserGetDefaultOptions(void);
 XMLSEC_EXPORT void              xmlSecParserSetDefaultOptions(int options);

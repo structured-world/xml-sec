@@ -1,0 +1,177 @@
+//! The tree functions as C code calls them: through opaque handles only.
+
+use std::ffi::CStr;
+
+use super::*;
+use crate::ffi::memory::xsFree;
+use crate::nodes::{XML_ATTRIBUTE_NODE, XML_ELEMENT_NODE, XML_NAMESPACE_DECL};
+
+/// The text of a string a tree function returned, released afterwards.
+fn take(pointer: *mut XmlChar) -> Option<String> {
+    if pointer.is_null() {
+        return None;
+    }
+    // SAFETY: a NUL-terminated string `give` issued, read before release.
+    let text = unsafe { CStr::from_ptr(pointer.cast()) }
+        .to_string_lossy()
+        .into_owned();
+    // SAFETY: released once.
+    unsafe { xsFree(pointer.cast()) };
+    Some(text)
+}
+
+fn parse(xml: &str) -> *mut Doc {
+    let size = c_int::try_from(xml.len()).expect("a small document");
+    // SAFETY: `xml` holds `size` bytes; the other arguments may be null.
+    unsafe {
+        xsReadMemory(
+            xml.as_ptr().cast(),
+            size,
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        )
+    }
+}
+
+fn dump(doc: *mut Doc) -> String {
+    let mut mem = std::ptr::null_mut();
+    let mut size = 0;
+    // SAFETY: both out-pointers are writable locals.
+    unsafe { xsDocDumpMemory(doc, &raw mut mem, &raw mut size) };
+    let text = take(mem).expect("a dump");
+    assert_eq!(usize::try_from(size).expect("a length"), text.len());
+    text
+}
+
+#[test]
+fn a_parsed_document_is_read_and_edited_through_handles() {
+    // SAFETY: every call takes handles the calls above returned, or strings
+    // these literals provide.
+    unsafe {
+        let doc = parse(r#"<r xmlns:p="urn:p"><c a="1"/></r>"#);
+        assert!(!doc.is_null(), "the document parses");
+        let root = xsDocGetRootElement(doc);
+        assert_eq!(xsNodeGetType(root), XML_ELEMENT_NODE);
+        assert_eq!(take(xsNodeGetName(root)).as_deref(), Some("r"));
+        assert_eq!(xsNodeGetDoc(root), doc);
+        let child = xsNodeGetChildren(root);
+        assert_eq!(xsNodeGetParent(child), root);
+        assert_eq!(
+            take(xsGetProp(child, c"a".as_ptr().cast())).as_deref(),
+            Some("1")
+        );
+        // A new element in a declared namespace, linked last.
+        let ns = xsSearchNs(doc, root, c"p".as_ptr().cast());
+        assert!(!ns.is_null());
+        assert_eq!(take(xsNsGetHref(ns)).as_deref(), Some("urn:p"));
+        let added = xsNewDocNode(doc, ns, c"d".as_ptr().cast(), c"t".as_ptr().cast());
+        assert_eq!(xsAddChild(root, added), added);
+        assert_eq!(xsNodeGetLast(root), added);
+        assert!(!xsSetProp(added, c"b".as_ptr().cast(), c"2".as_ptr().cast()).is_null());
+        assert_eq!(
+            dump(doc),
+            "<?xml version=\"1.0\"?>\n<r xmlns:p=\"urn:p\"><c a=\"1\"/><p:d b=\"2\">t</p:d></r>\n"
+        );
+        xsFreeDoc(doc);
+        assert!(
+            xsDocGetRootElement(doc).is_null(),
+            "a freed document is refused"
+        );
+    }
+}
+
+#[test]
+fn a_freed_node_and_forged_handles_are_refused_without_dereference() {
+    // SAFETY: as above; the forged values are never dereferenced.
+    unsafe {
+        let doc = parse("<r><c/></r>");
+        let root = xsDocGetRootElement(doc);
+        let child = xsNodeGetChildren(root);
+        xsFreeNode(child);
+        assert!(xsNodeGetChildren(root).is_null());
+        assert_eq!(xsNodeGetType(child), 0);
+        assert!(take(xsNodeGetName(child)).is_none());
+        let forged: *mut Node = pointer_of(usize::MAX - 7);
+        assert!(xsNodeGetParent(forged).is_null());
+        assert_eq!(xsNodeSetContent(forged, c"x".as_ptr().cast()), -1);
+        xsFreeDoc(doc);
+    }
+}
+
+#[test]
+fn attributes_and_namespace_nodes_are_nodes_of_node_sets() {
+    // SAFETY: as above.
+    unsafe {
+        let doc = parse(r#"<r xmlns:p="urn:p"><c a="1" p:b="2"/></r>"#);
+        let root = xsDocGetRootElement(doc);
+        let child = xsNodeGetChildren(root);
+        // The attribute list, in document order, with each attribute's type
+        // and element.
+        let first = xsNodeGetProperties(child);
+        let second = xsAttrGetNext(first);
+        assert!(xsAttrGetNext(second).is_null());
+        assert_eq!(xsNodeGetType(first.cast()), XML_ATTRIBUTE_NODE);
+        assert_eq!(xsNodeGetParent(second.cast()), child);
+        assert_eq!(
+            take(xsNodeGetNsHref(second.cast())).as_deref(),
+            Some("urn:p")
+        );
+        // A declaration inherited by `c` gives `c` its own namespace node.
+        let ns = xsSearchNs(doc, child, c"p".as_ptr().cast());
+        let set = xsXPathNodeSetCreate(child);
+        assert_eq!(xsXPathNodeSetAddNs(set, child, ns), 0);
+        assert_eq!(xsXPathNodeSetAdd(set, first.cast()), 0);
+        assert_eq!(
+            xsXPathNodeSetAdd(set, child),
+            0,
+            "a listed node is kept once"
+        );
+        assert_eq!(xsXPathNodeSetGetLength(set), 3);
+        let namespace_node = xsXPathNodeSetItem(set, 1);
+        assert_eq!(xsNodeGetType(namespace_node), XML_NAMESPACE_DECL);
+        assert_eq!(xsNodeGetParent(namespace_node), child);
+        assert_eq!(
+            take(xsNsGetHref(namespace_node.cast())).as_deref(),
+            Some("urn:p")
+        );
+        assert_eq!(xsXPathNodeSetContains(set, first.cast()), 1);
+        assert_eq!(xsXPathNodeSetContains(set, root), 0);
+        // Document order: the root precedes its child, not the reverse.
+        assert_eq!(xsXPathCmpNodes(root, child), 1);
+        assert_eq!(xsXPathCmpNodes(child, root), -1);
+        xsXPathFreeNodeSet(set);
+        assert_eq!(xsXPathNodeSetGetLength(set), 0, "a freed set lists nothing");
+        xsFreeDoc(doc);
+    }
+}
+
+#[test]
+fn content_ids_and_root_replacement_follow_libxml2() {
+    // SAFETY: as above.
+    unsafe {
+        let doc = parse(r#"<r><c id="x">a<b/>c</c></r>"#);
+        let root = xsDocGetRootElement(doc);
+        let child = xsNodeGetChildren(root);
+        assert_eq!(take(xsNodeGetContent(child)).as_deref(), Some("ac"));
+        let attribute = xsHasProp(child, c"id".as_ptr().cast());
+        assert_eq!(xsAddID(doc, c"x".as_ptr().cast(), attribute), 0);
+        assert_eq!(xsGetID(doc, c"x".as_ptr().cast()), child);
+        assert_eq!(xsNodeSetContent(child, c"new".as_ptr().cast()), 0);
+        assert_eq!(xsNodeAddContent(child, c"er".as_ptr().cast()), 0);
+        assert_eq!(take(xsNodeGetContent(child)).as_deref(), Some("newer"));
+        let replacement = xsNewDocNode(
+            doc,
+            std::ptr::null_mut(),
+            c"s".as_ptr().cast(),
+            std::ptr::null(),
+        );
+        assert_eq!(xsDocSetRootElement(doc, replacement), root);
+        assert_eq!(xsDocGetRootElement(doc), replacement);
+        assert!(
+            xsNodeGetParent(root).is_null(),
+            "the former root is unlinked"
+        );
+        xsFreeDoc(doc);
+    }
+}

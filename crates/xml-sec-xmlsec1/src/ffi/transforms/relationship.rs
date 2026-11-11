@@ -6,27 +6,25 @@
 //! input node set followed by its canonicalization, as the core produces it
 //! for a reference.
 
-use std::ffi::{CStr, c_char, c_int, c_void};
+use std::ffi::{CStr, c_char, c_int};
 
-use xml_sec::XmlDocument;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::xmldsig::transforms::{
     RelationshipSelector, Transform, execute_transforms_with_policy,
 };
 use xml_sec::xmldsig::types::TransformData;
-use xml_sec_libxml2::ffi::{LibxmlTree, XmlNode};
 
 use super::super::errors::{self, check, here};
 use super::super::nodeset::XmlSecNodeSet;
+use super::super::policy;
 use super::super::strings::{
     xmlSecHrefRelationship, xmlSecNameRelationship, xmlSecNodeRelationshipReference,
     xmlSecRelationshipAttrSourceId, xmlSecRelationshipReferenceNs,
 };
-use super::super::tree::{readable, xmlGetProp};
+use super::super::tree::{XmlNode, c_text, nodes};
 use super::super::xmltree::xmlSecCheckNodeName;
-use super::super::{free, policy};
 use super::builtin::{PopTarget, klass, pop_rendered, push_rendered, selected_octets};
-use super::io::xmlOutputBufferWrite;
+use super::io::{OutputBuffer, xmlOutputBufferWrite};
 use super::{
     USAGE_DSIG_TRANSFORM, WithContext, XmlSecTransform, XmlSecTransformCtx, XmlSecTransformKlass,
     context_or,
@@ -92,21 +90,12 @@ unsafe extern "C" fn finalize(transform: *mut XmlSecTransform) {
 /// The value of attribute `name` of `node`, or why it has none.
 ///
 /// # Safety
-/// `node` is a live element.
+/// `name` is NUL-terminated.
 unsafe fn attribute(node: *mut XmlNode, name: *const u8) -> Result<String, &'static str> {
-    // SAFETY: by the caller's contract; the copy is freed after reading.
-    unsafe {
-        let value = xmlGetProp(node, name);
-        if value.is_null() {
-            return Err("empty");
-        }
-        let text = CStr::from_ptr(value.cast())
-            .to_str()
-            .map(str::to_owned)
-            .map_err(|_| "not UTF-8");
-        free(value.cast());
-        text
-    }
+    // SAFETY: by the caller's contract.
+    unsafe { c_text(name) }
+        .and_then(|name| nodes::property(node, name))
+        .ok_or("empty")
 }
 
 /// Reads the selectors: every `RelationshipReference` needs its `SourceId`,
@@ -140,7 +129,7 @@ unsafe extern "C" fn read_node(
     // SAFETY: a Relationship transform and a live element of its document.
     unsafe {
         let list = &mut **slot;
-        let mut current = (*node).children;
+        let mut current = nodes::first_child(node);
         while !current.is_null() {
             let ns = xmlSecRelationshipReferenceNs.as_ptr();
             if xmlSecCheckNodeName(current, xmlSecNodeRelationshipReference.as_ptr(), ns) != 0 {
@@ -179,29 +168,28 @@ unsafe extern "C" fn read_node(
                     }
                 }
             }
-            current = (*current).next;
+            current = nodes::next(current);
         }
         0
     }
 }
 
-/// Writes the transform's output for the document of `nodes` to the libxml2
+/// Writes the transform's output for the document of `selected` to the
 /// output buffer `out`.
 ///
 /// # Safety
-/// `nodes` is a live node set over a live document; `out` is a live output
-/// buffer.
-unsafe fn render(selectors: &Selectors, nodes: *mut XmlSecNodeSet, out: *mut c_void) -> c_int {
+/// `selected` is a live node set; `out`'s callbacks are callable.
+unsafe fn render(
+    selectors: &Selectors,
+    selected: *mut XmlSecNodeSet,
+    out: *mut OutputBuffer,
+) -> c_int {
     let here = here!("xmlSecTransformRelationshipExecute");
     let Some(policy) = policy::verification_at(here) else {
         return -1;
     };
-    if !readable() {
-        errors::no_libxml2(here);
-        return -1;
-    }
     // SAFETY: by the caller's contract.
-    let doc = unsafe { (*nodes).doc };
+    let doc = unsafe { (*selected).doc };
     // The core runs the transform in place of libxmlsec1's node-list walk;
     // its error is the cause.
     let failed = |error: &str| {
@@ -212,13 +200,8 @@ unsafe fn render(selectors: &Selectors, nodes: *mut XmlSecNodeSet, out: *mut c_v
             error,
         );
     };
-    // SAFETY: the node set's document is live for the call.
-    let Some(tree) = (unsafe { LibxmlTree::new(doc) }) else {
-        failed("the document cannot be read");
-        return -1;
-    };
-    let document = match XmlDocument::from_external_tree(Box::new(tree), policy) {
-        Ok(document) => document,
+    let (document, slot) = match xml_sec_libxml2::document::snapshot(doc, policy) {
+        Ok(snapshot) => snapshot,
         Err(error) => {
             failed(&error.to_string());
             return -1;
@@ -234,8 +217,9 @@ unsafe fn render(selectors: &Selectors, nodes: *mut XmlSecNodeSet, out: *mut c_v
     // converts a relationship transform's node-set input, so what a
     // preceding filter removed stays removed.
     let bytes = document.with_view(|view| {
-        // SAFETY: `nodes` is over the document `view` projects.
-        let Some(input) = (unsafe { selected_octets(view, nodes, &policy.resources) }) else {
+        // SAFETY: `selected` is over the document `view` reads.
+        let Some(input) = (unsafe { selected_octets(view, slot, selected, &policy.resources) })
+        else {
             return Err("the input node set cannot be canonicalized".to_owned());
         };
         execute_transforms_with_policy(

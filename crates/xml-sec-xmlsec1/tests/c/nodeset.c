@@ -1,15 +1,12 @@
-/* Node sets over a libxml2 tree as a libxmlsec1 caller sees them. Built
- * unmodified against the pinned libxmlsec1 and against this crate, both must
- * print the same membership for every node, attribute and namespace node,
- * under every set type and operation, and the same walks and dumps. */
+/* Node sets over a document tree as a libxmlsec1 caller sees them. Built
+ * against the pinned libxmlsec1 and against this crate, both must print the
+ * same membership for every node, attribute and namespace node, under every
+ * set type and operation, and the same walks and dumps. */
 
 #include <stdio.h>
 #include <string.h>
 
-#include <libxml/parser.h>
-#include <libxml/tree.h>
-#include <libxml/xpath.h>
-#include <libxml/xpathInternals.h>
+#include "tree.h"
 #include <xmlsec/xmlsec.h>
 #include <xmlsec/nodeset.h>
 #include <xmlsec/xmltree.h>
@@ -21,21 +18,30 @@ static const char document[] =
     "<second xmlns:b='urn:b'><!--inside-->text two<b:leaf/></second>"
     "</root>";
 
+/* Prints `text` and releases it. */
+static const char *shown(xmlChar *text, char *out, size_t size) {
+    snprintf(out, size, "%s", text != NULL ? (const char *)text : "");
+    xsFree(text);
+    return out;
+}
+
 /* A printable name for any node a walk or set can hold. */
 static void describe(xmlNodePtr node, xmlNodePtr parent, char *out, size_t size) {
-    if (node->type == XML_NAMESPACE_DECL) {
-        xmlNsPtr ns = (xmlNsPtr)node;
-        snprintf(out, size, "ns:%s@%s", ns->prefix ? (const char *)ns->prefix : "",
-                 parent && parent->name ? (const char *)parent->name : "?");
-    } else if (node->type == XML_TEXT_NODE || node->type == XML_COMMENT_NODE) {
-        snprintf(out, size, "%s:%s", node->type == XML_TEXT_NODE ? "text" : "comment",
-                 node->content ? (const char *)node->content : "");
-    } else if (node->type == XML_ATTRIBUTE_NODE) {
-        snprintf(out, size, "@%s", (const char *)node->name);
-    } else if (node->type == XML_DOCUMENT_NODE) {
+    char first[64];
+    char second[64];
+    int type = xsNodeGetType(node);
+    if (type == XML_NAMESPACE_DECL) {
+        snprintf(out, size, "ns:%s@%s", shown(xsNsGetPrefix((xmlNsPtr)node), first, sizeof(first)),
+                 parent != NULL ? shown(xsNodeGetName(parent), second, sizeof(second)) : "?");
+    } else if (type == XML_TEXT_NODE || type == XML_COMMENT_NODE) {
+        snprintf(out, size, "%s:%s", type == XML_TEXT_NODE ? "text" : "comment",
+                 shown(xsNodeGetContent(node), first, sizeof(first)));
+    } else if (type == XML_ATTRIBUTE_NODE) {
+        snprintf(out, size, "@%s", shown(xsNodeGetName(node), first, sizeof(first)));
+    } else if (type == XML_DOCUMENT_NODE) {
         snprintf(out, size, "#document");
     } else {
-        snprintf(out, size, "%s", (const char *)node->name);
+        snprintf(out, size, "%s", shown(xsNodeGetName(node), first, sizeof(first)));
     }
 }
 
@@ -61,15 +67,16 @@ static int check_member(xmlNodePtr cur, void *data) {
     char name[128];
     xmlAttrPtr attr;
     xmlNsPtr ns;
+    xmlNodePtr parent = xsNodeGetParent(cur);
 
-    describe(cur, cur->parent, name, sizeof(name));
-    printf(" %s=%d", name, xmlSecNodeSetContains(nset, cur, cur->parent));
-    if (cur->type == XML_ELEMENT_NODE) {
-        for (attr = cur->properties; attr != NULL; attr = attr->next) {
+    describe(cur, parent, name, sizeof(name));
+    printf(" %s=%d", name, xmlSecNodeSetContains(nset, cur, parent));
+    if (xsNodeGetType(cur) == XML_ELEMENT_NODE) {
+        for (attr = xsNodeGetProperties(cur); attr != NULL; attr = xsAttrGetNext(attr)) {
             describe((xmlNodePtr)attr, cur, name, sizeof(name));
             printf(" %s=%d", name, xmlSecNodeSetContains(nset, (xmlNodePtr)attr, cur));
         }
-        for (ns = cur->nsDef; ns != NULL; ns = ns->next) {
+        for (ns = xsNodeGetNsDef(cur); ns != NULL; ns = xsNsGetNext(ns)) {
             describe((xmlNodePtr)ns, cur, name, sizeof(name));
             printf(" %s=%d", name, xmlSecNodeSetContains(nset, (xmlNodePtr)ns, cur));
         }
@@ -83,25 +90,40 @@ static void contains(const char *label, xmlDocPtr doc, xmlSecNodeSetPtr nset) {
     printf("\n");
 }
 
-/* An XPath result over `doc`, given up to the node set. */
-static xmlNodeSetPtr select_nodes(xmlDocPtr doc, const char *expression) {
-    xmlXPathContextPtr ctx = xmlXPathNewContext(doc);
-    xmlXPathObjectPtr result;
-    xmlNodeSetPtr nodes;
-
-    xmlXPathRegisterNs(ctx, BAD_CAST "d", BAD_CAST "urn:default");
-    xmlXPathRegisterNs(ctx, BAD_CAST "a", BAD_CAST "urn:a");
-    xmlXPathRegisterNs(ctx, BAD_CAST "b", BAD_CAST "urn:b");
-    result = xmlXPathEvalExpression(BAD_CAST expression, ctx);
-    nodes = result->nodesetval;
-    result->nodesetval = NULL;
-    xmlXPathFreeObject(result);
-    xmlXPathFreeContext(ctx);
-    return nodes;
+static xmlNodePtr find(xmlDocPtr doc, const char *name, const char *ns) {
+    return xmlSecFindNode(xsDocGetRootElement(doc), BAD_CAST name, BAD_CAST ns);
 }
 
-static xmlNodePtr find(xmlDocPtr doc, const char *name, const char *ns) {
-    return xmlSecFindNode(xmlDocGetRootElement(doc), BAD_CAST name, BAD_CAST ns);
+/* The first child of `node` of type `type`. */
+static xmlNodePtr child_of_type(xmlNodePtr node, int type) {
+    xmlNodePtr child;
+    for (child = xsNodeGetChildren(node); child != NULL; child = xsNodeGetNext(child)) {
+        if (xsNodeGetType(child) == type) {
+            return child;
+        }
+    }
+    return NULL;
+}
+
+/* Adds every text node the walk visits to the node set in `data`. */
+static int add_text(xmlNodePtr cur, void *data) {
+    if (xsNodeGetType(cur) == XML_TEXT_NODE) {
+        xsXPathNodeSetAdd((xmlNodeSetPtr)data, cur);
+    }
+    return 1;
+}
+
+/* An element, an attribute, a namespace node and text, none inside
+ * another's subtree, listed in document order as an XPath result is
+ * (libxmlsec1 walks a list in its own order). */
+static xmlNodeSetPtr mixed_nodes(xmlDocPtr doc) {
+    xmlNodePtr first = find(doc, "first", "urn:a");
+    xmlNodePtr second = find(doc, "second", "urn:default");
+    xmlNodeSetPtr nodes = xsXPathNodeSetCreate((xmlNodePtr)xsNodeGetProperties(first));
+    xsXPathNodeSetAdd(nodes, find(doc, "inner", "urn:default"));
+    xsXPathNodeSetAddNs(nodes, second, xsSearchNs(doc, second, BAD_CAST "b"));
+    xsXPathNodeSetAdd(nodes, child_of_type(second, XML_TEXT_NODE));
+    return nodes;
 }
 
 int main(void) {
@@ -109,20 +131,20 @@ int main(void) {
         "normal", "invert", "tree", "tree-without-comments", "tree-invert",
         "tree-without-comments-invert",
     };
-    xmlDocPtr doc = xmlReadMemory(document, (int)strlen(document), "doc.xml", NULL, 0);
+    xmlDocPtr doc = xsReadMemory(document, (int)strlen(document), "doc.xml", NULL, 0);
     xmlSecNodeSetPtr nset;
     xmlSecNodeSetPtr other;
     xmlOutputBufferPtr out;
+    xmlNodeSetPtr nodes;
+    xmlNodePtr second;
     int type;
 
-    /* Every type over one XPath result holding an element, an attribute, a
+    /* Every type over one node list holding an element, an attribute, a
      * namespace node and text, none inside another's subtree: where listed
      * subtrees nest, libxmlsec1 walks the nested nodes again, and this
      * library visits each node once as the walk's contract states. */
     for (type = xmlSecNodeSetNormal; type <= xmlSecNodeSetTreeWithoutCommentsInvert; ++type) {
-        nset = xmlSecNodeSetCreate(doc,
-            select_nodes(doc, "//d:inner | //@attr | //d:second/namespace::b | //d:second/text()"),
-            (xmlSecNodeSetType)type);
+        nset = xmlSecNodeSetCreate(doc, mixed_nodes(doc), (xmlSecNodeSetType)type);
         contains(types[type], doc, nset);
         walk(types[type], nset);
         xmlSecNodeSetDestroy(nset);
@@ -144,22 +166,30 @@ int main(void) {
     other = xmlSecNodeSetGetChildren(doc, find(doc, "first", "urn:a"), 1, 1);
     printf("add: %s\n", xmlSecNodeSetAdd(nset, other, xmlSecNodeSetIntersection) == nset ? "same" : "other");
     contains("document minus first", doc, nset);
-    other = xmlSecNodeSetCreate(doc, select_nodes(doc, "//d:inner"), xmlSecNodeSetTree);
+    other = xmlSecNodeSetCreate(doc, xsXPathNodeSetCreate(find(doc, "inner", "urn:default")),
+                                xmlSecNodeSetTree);
     xmlSecNodeSetAdd(nset, other, xmlSecNodeSetUnion);
     contains("plus inner", doc, nset);
-    other = xmlSecNodeSetCreate(doc, select_nodes(doc, "//text()"), xmlSecNodeSetNormal);
+    nodes = xsXPathNodeSetCreate(NULL);
+    xmlSecDepthFirstTreeWalk((xmlNodePtr)doc, add_text, nodes);
+    other = xmlSecNodeSetCreate(doc, nodes, xmlSecNodeSetNormal);
     xmlSecNodeSetAdd(nset, other, xmlSecNodeSetSubtraction);
     contains("minus text", doc, nset);
     walk("minus text", nset);
 
-    out = xmlAllocOutputBuffer(NULL);
+    out = xsAllocOutputBuffer(NULL);
     printf("dump text: %d", xmlSecNodeSetDumpTextNodes(nset, out));
-    xmlOutputBufferFlush(out);
-    printf(" [%.*s]\n", (int)xmlOutputBufferGetSize(out), (const char *)xmlOutputBufferGetContent(out));
-    xmlOutputBufferClose(out);
+    xsOutputBufferFlush(out);
+    printf(" [%.*s]\n", (int)xsOutputBufferGetSize(out), (const char *)xsOutputBufferGetContent(out));
+    xsOutputBufferClose(out);
     xmlSecNodeSetDestroy(nset);
 
-    nset = xmlSecNodeSetCreate(doc, select_nodes(doc, "//d:second | //d:second/namespace::*"), xmlSecNodeSetNormal);
+    /* An element and the namespace nodes its own declarations make. */
+    second = find(doc, "second", "urn:default");
+    nodes = xsXPathNodeSetCreate(second);
+    xsXPathNodeSetAddNs(nodes, second, xsSearchNs(doc, second, BAD_CAST "b"));
+    xsXPathNodeSetAddNs(nodes, second, xsSearchNs(doc, second, BAD_CAST "a"));
+    nset = xmlSecNodeSetCreate(doc, nodes, xmlSecNodeSetNormal);
     fflush(stdout);
     xmlSecNodeSetDebugDump(nset, stdout);
     fflush(stdout);

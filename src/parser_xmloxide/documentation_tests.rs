@@ -296,7 +296,7 @@ fn validation_dtd_rs_example_2() -> impl std::process::Termination {
     assert!(result.is_valid);
 }
 
-// serial/xml.rs:11; original runnable example.
+// serial/xml.rs:12; original runnable example.
 #[test]
 fn serial_xml_rs_example_1() -> impl std::process::Termination {
     use crate::parser_xmloxide as xmloxide;
@@ -308,7 +308,7 @@ fn serial_xml_rs_example_1() -> impl std::process::Termination {
     assert!(xml.contains("  <child>"));
 }
 
-// serial/xml.rs:68; original runnable example.
+// serial/xml.rs:69; original runnable example.
 #[test]
 fn serial_xml_rs_example_2() -> impl std::process::Termination {
     use crate::parser_xmloxide as xmloxide;
@@ -320,7 +320,7 @@ fn serial_xml_rs_example_2() -> impl std::process::Termination {
     assert!(xml.contains("<root>"));
 }
 
-// serial/xml.rs:88; original runnable example.
+// serial/xml.rs:89; original runnable example.
 #[test]
 fn serial_xml_rs_example_3() -> impl std::process::Termination {
     use crate::parser_xmloxide as xmloxide;

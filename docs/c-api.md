@@ -164,47 +164,52 @@ xs_verify(verifier, document, &request, &key_lookup, &evidence, &error);
 - The callback may call the library. Destroying a handle the running call
   uses, or operating on its document, returns `XS_BUSY`.
 
-## libxml2 documents
+## Tree documents
 
-An application that already holds its document as a libxml2 tree links
-`xml-sec-libxml2` instead. That library exports the whole C API above together
-with one entry point, declared in
-`crates/xml-sec-libxml2/include/xml_sec_libxml2.h`:
+An application that works on its document as a tree links `xml-sec-libxml2`
+instead. That library exports the whole C API above, the tree functions of
+`crates/xml-sec-libxml2/include/xs_tree.h` (shaped like libxml2's tree
+interface, under the `xs` prefix where libxml2 has `xml`) and one entry
+point, declared in `crates/xml-sec-libxml2/include/xml_sec_libxml2.h`. It
+links no XML library: the tree is the library's own, parsed by its core.
 
 ```c
-xmlDocPtr doc = xmlReadMemory(xml, len, NULL, NULL, 0);
+xmlDocPtr doc = xsReadMemory(xml, len, NULL, NULL, 0);
 XsDocument document;
-xs_libxml2_document(policy, XS_OPERATION_SIGN, doc, &document, &error);
+xs_tree_document(policy, XS_OPERATION_SIGN, doc, &document, &error);
 xs_sign(signer, document, &audit, &error);  /* fills the template in doc */
 xs_document_destroy(document);              /* doc stays the caller's */
-xmlDocDumpMemory(doc, &bytes, &size);
+xsDocDumpMemory(doc, &bytes, &size);
+xsFree(bytes);
+xsFreeDoc(doc);
 ```
 
-- The handle reads the tree as it is when each operation starts, under that
-  operation's compiled policy, so the application may change the tree between
-  calls. While a call runs, nothing else uses the tree.
+- The tree types (`xmlDoc`, `xmlNode`, `xmlNs`, `xmlAttr`, `xmlNodeSet`) are
+  incomplete: a pointer is a handle the library validates on every call, and
+  a handle that names nothing live is refused, never dereferenced. Node
+  fields are read through accessors (`xsNodeGetChildren`, `xsNodeGetName`,
+  ...); strings they return are copies released with `xsFree`.
+- No function reads a file or a URL: the application reads its document and
+  passes the bytes.
+- The document handle reads the tree as it is when each operation starts,
+  under that operation's compiled policy, so the application may change the
+  tree through the tree functions between calls. While a call runs, nothing
+  else uses the tree.
 - Operations change the tree itself: signing writes the template's values,
   encryption replaces the element by `EncryptedData`, decryption restores it.
-  Nodes an operation does not touch keep their pointers; nodes it removes are
-  freed before the call returns. A failed call leaves the tree as it was.
+  Nodes an operation does not touch keep their handles; handles of nodes it
+  removes are refused afterwards. A failed call leaves the tree as it was.
 - `xs_document_serialize` refuses the handle with `XS_DOCUMENT`: the
-  application serializes its tree with libxml2.
-- The library does not link libxml2: it uses the program's, found by symbol
-  name in the process when the first handle is created. The process must have
-  loaded a libxml2 release from 2.9 up to, not including, 3.0, with its symbols
-  in the global scope: a shared libxml2, or a static one linked so that it
-  exports them. Otherwise, and always on targets that are not Unix-like,
-  `xs_libxml2_document` returns `XS_INTERNAL`.
+  application serializes its tree with `xsDocDumpMemory`.
 
 ```sh
 cargo build --release -p xml-sec-libxml2
 # target/release/libxml_sec_libxml2.{so,dylib,a}
 ```
 
-Qualified platforms: Linux x86_64 with the distribution's libxml2 and macOS
-arm64 with Homebrew's, with the default features; one passing platform claims
-nothing for another, and no support level is claimed on Windows. The crate's
-`SAFETY.md` records what the bridge assumes and guarantees.
+Nothing is loaded or resolved at run time, so the library is qualified
+wherever the clean C API is. The crate's `SAFETY.md` records what it assumes
+and guarantees.
 
 ## Qualification
 
@@ -216,11 +221,11 @@ declares. The C program signs, verifies a valid and a tampered document,
 encrypts, decrypts, verifies and decrypts with keys from a lookup, replaces the
 policy and exercises policy refusals, callback reentry and failure, and wrong,
 destroyed and invalid arguments; the C++ program verifies through a lambda
-lookup. On Linux and macOS it also builds the libxml2 bridge, checks its
-exports against both headers, and runs `crates/xml-sec-libxml2/tests/c/roundtrip.c`
-against the system libxml2: it signs and verifies a tree libxml2 parsed, sees a
-change the caller makes between calls, encrypts and decrypts in place, and
-checks that untouched nodes keep their pointers. CI runs them on Linux, macOS
+lookup. It also builds the tree library, checks its exports against its
+headers, and runs `crates/xml-sec-libxml2/tests/c/roundtrip.c`, which links
+nothing else: it signs and verifies a tree document, sees a change the caller
+makes between calls, encrypts and decrypts in place, and checks that untouched
+nodes keep their handles and removed ones are refused. CI runs them on Linux, macOS
 and Windows. `capi --sanitize` repeats them on Linux with the libraries and the
 crates' own tests (handle table, concurrent destroy, argument validation,
 callbacks, panic containment, redacted diagnostics, tree layout and edits)

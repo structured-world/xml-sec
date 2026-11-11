@@ -22,8 +22,6 @@ structured-base64 = "0.21"
 
 [dev-dependencies]
 tempfile = "3"
-# The tests are the C caller: they load the system libxml2 into the process.
-xml-sec-libxml2 = { path = "../xml-sec-libxml2", features = ["test-support"] }
 
 [lints]
 workspace = true

@@ -9,11 +9,10 @@
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 
-use xml_sec::XmlDocument;
 use xml_sec::document::external::ExternalNode;
+use xml_sec::document::owned_tree::TreeNode;
 use xml_sec::xmldsig::select::{SelectedNode, Selector, XPathForm};
 use xml_sec::xmldsig::transforms::XPathExpression;
-use xml_sec_libxml2::ffi::{LibxmlTree, XML_NAMESPACE_DECL, XmlAttr, XmlDoc, XmlNode, XmlNodeSet};
 
 use super::super::errors::{self, check, here};
 use super::super::list::{
@@ -31,11 +30,8 @@ use super::super::strings::{
     xmlSecXPath2FilterSubtract, xmlSecXPath2FilterUnion, xmlSecXPath2Ns, xmlSecXPathNs,
     xmlSecXPointerNs,
 };
-use super::super::tree::{
-    readable, xmlGetID, xmlGetProp, xmlNodeGetContent, xmlSearchNs, xmlStrEqual,
-    xmlXPathFreeNodeSet, xmlXPathNodeSetAdd, xmlXPathNodeSetAddNs, xmlXPathNodeSetCreate,
-};
-use super::super::xmltree::{xmlSecCheckNodeName, xmlSecGetNextElementNode};
+use super::super::tree::{XmlDoc, XmlNode, XmlNodeSet, c_text, nodes, same_text};
+use super::super::xmltree::{next_element, xmlSecCheckNodeName};
 use super::super::{contain, free, malloc, policy};
 use super::builtin::klass;
 use super::{
@@ -46,9 +42,6 @@ use super::{
 
 #[cfg(test)]
 mod tests;
-
-/// libxml2's element node type.
-const ELEMENT_NODE: c_int = 1;
 
 /// How one expression is evaluated.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -233,88 +226,39 @@ unsafe extern "C" fn finalize(transform: *mut XmlSecTransform) {
     }
 }
 
-/// A NUL-terminated libxml2 string as text, `None` when it is null or not
-/// UTF-8.
-///
-/// # Safety
-/// `text` is null or NUL-terminated.
-unsafe fn text_of<'a>(text: *const u8) -> Option<&'a str> {
-    if text.is_null() {
-        return None;
-    }
-    // SAFETY: by the caller's contract.
-    unsafe { CStr::from_ptr(text.cast()) }.to_str().ok()
-}
-
 /// The prefixes in scope at `node`: each prefix's nearest declaration on
-/// `node` or an ancestor element; the default namespace is not bound.
-/// `None` when a prefix is not UTF-8.
-///
-/// # Safety
-/// `node` is a live element.
-unsafe fn namespaces_at(node: *mut XmlNode) -> Option<Vec<(String, String)>> {
-    let mut namespaces: Vec<(String, String)> = Vec::new();
-    let mut current = node;
-    // SAFETY: the element and its ancestors are live; only elements carry
-    // declarations.
-    unsafe {
-        while !current.is_null() && (*current).kind == ELEMENT_NODE {
-            let mut ns = (*current).ns_def;
-            while !ns.is_null() {
-                if !(*ns).prefix.is_null() {
-                    let prefix = text_of((*ns).prefix)?;
-                    if !namespaces.iter().any(|(bound, _)| bound == prefix) {
-                        let href = text_of((*ns).href).unwrap_or_default();
-                        namespaces.push((prefix.to_owned(), href.to_owned()));
-                    }
-                }
-                ns = (*ns).next;
-            }
-            current = (*current).parent;
-        }
-    }
-    Some(namespaces)
+/// `node` or an ancestor element; the default namespace and the implicit
+/// `xml` binding are not registered, as libxmlsec1 registers only declared
+/// prefixes.
+fn namespaces_at(node: *mut XmlNode) -> Vec<(String, String)> {
+    nodes::namespace_nodes(node)
+        .into_iter()
+        .filter_map(|namespace| match nodes::binding(namespace)? {
+            (Some(prefix), uri) if prefix != "xml" => Some((prefix, uri)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The expression of the element `node`: its text content and the
 /// namespaces in scope there (libxmlsec1's `xmlSecXPathDataNodeRead`, whose
 /// failures it reports).
-///
-/// # Safety
-/// `node` is a live element.
-unsafe fn read_data(
-    kind: Kind,
-    node: *mut XmlNode,
-    op: c_int,
-    node_set_type: c_int,
-) -> Option<Data> {
+fn read_data(kind: Kind, node: *mut XmlNode, op: c_int, node_set_type: c_int) -> Option<Data> {
     let here = here!("xmlSecXPathDataNodeRead");
-    // SAFETY: by the caller's contract; the content is freed after copying.
-    unsafe {
-        let Some(namespaces) = namespaces_at(node) else {
-            errors::internal(here, std::ptr::null(), c"xmlSecXPathDataRegisterNamespaces");
-            return None;
-        };
-        let content = xmlNodeGetContent(node);
-        if content.is_null() {
-            errors::invalid_node_content(here, node, std::ptr::null(), "empty");
-            return None;
-        }
-        let expression = text_of(content).map(str::to_owned);
-        free(content.cast());
-        let Some(expression) = expression else {
-            errors::invalid_node_content(here, node, std::ptr::null(), "not UTF-8");
-            return None;
-        };
-        Some(Data {
-            kind,
-            expression,
-            namespaces,
-            here: node,
-            op,
-            node_set_type,
-        })
-    }
+    let namespaces = namespaces_at(node);
+    let Some(expression) = nodes::content(node) else {
+        // SAFETY: a report about the caller's node.
+        unsafe { errors::invalid_node_content(here, node, std::ptr::null(), "empty") };
+        return None;
+    };
+    Some(Data {
+        kind,
+        expression,
+        namespaces,
+        here: node,
+        op,
+        node_set_type,
+    })
 }
 
 /// Adds `data` to `list`, taking ownership of it; a failure is reported for
@@ -355,7 +299,7 @@ unsafe fn read_single(
 ) -> c_int {
     // SAFETY: by the caller's contract.
     unsafe {
-        let current = xmlSecGetNextElementNode((*node).children);
+        let current = next_element(nodes::first_child(node));
         if current.is_null()
             || xmlSecCheckNodeName(current, expected.as_ptr().cast(), ns.as_ptr().cast()) == 0
         {
@@ -370,7 +314,7 @@ unsafe fn read_single(
         if add(list, data, here, name) < 0 {
             return -1;
         }
-        let next = xmlSecGetNextElementNode((*current).next);
+        let next = next_element(nodes::next(current));
         if !next.is_null() {
             errors::unexpected_node(here, next, name);
             return -1;
@@ -452,7 +396,7 @@ unsafe extern "C" fn xpath2_read_node(
     // document.
     unsafe {
         let name = name_of(transform);
-        let mut current = xmlSecGetNextElementNode((*node).children);
+        let mut current = next_element(nodes::first_child(node));
         while !current.is_null()
             && xmlSecCheckNodeName(current, xmlSecNodeXPath2.as_ptr(), xmlSecXPath2Ns.as_ptr()) != 0
         {
@@ -464,20 +408,20 @@ unsafe extern "C" fn xpath2_read_node(
                 return -1;
             }
             // libxmlsec1 reads the operation after listing the expression.
-            let filter = xmlGetProp(current, xmlSecAttrFilter.as_ptr());
-            if filter.is_null() {
+            let Some(filter) =
+                c_text(xmlSecAttrFilter.as_ptr()).and_then(|name| nodes::property(current, name))
+            else {
                 errors::invalid_node_attribute(here, current, c"Filter", name, "empty");
                 return -1;
-            }
+            };
             let op = [
                 (xmlSecXPath2FilterIntersect.as_ptr(), INTERSECTION),
                 (xmlSecXPath2FilterSubtract.as_ptr(), SUBTRACTION),
                 (xmlSecXPath2FilterUnion.as_ptr(), UNION),
             ]
             .into_iter()
-            .find(|(name, _)| xmlStrEqual(filter, *name) != 0)
+            .find(|(name, _)| same_text(Some(&filter), *name))
             .map(|(_, op)| op);
-            free(filter.cast());
             let Some(op) = op else {
                 errors::invalid_node_attribute(here, current, c"Filter", name, "unknown");
                 return -1;
@@ -485,7 +429,7 @@ unsafe extern "C" fn xpath2_read_node(
             // The expression just listed; the list is not empty.
             let newest = xmlSecPtrListGetSize(list) - 1;
             (*xmlSecPtrListGetItem(list, newest).cast::<Data>()).op = op;
-            current = xmlSecGetNextElementNode((*current).next);
+            current = next_element(nodes::next(current));
         }
         if !current.is_null() {
             errors::unexpected_node(here, current, name);
@@ -584,11 +528,8 @@ pub(crate) unsafe extern "C" fn xmlSecTransformXPointerSetExpr(
         // SAFETY: by the caller's contract.
         unsafe {
             let name = name_of(transform);
-            let Some(namespaces) = namespaces_at(here) else {
-                errors::internal(location, name, c"xmlSecXPathDataRegisterNamespaces");
-                return -1;
-            };
-            let Some(expression) = text_of(expr) else {
+            let namespaces = namespaces_at(here);
+            let Some(expression) = c_text(expr) else {
                 errors::internal(location, name, c"xmlSecXPathDataSetExpr");
                 return -1;
             };
@@ -605,104 +546,44 @@ pub(crate) unsafe extern "C" fn xmlSecTransformXPointerSetExpr(
     })
 }
 
-/// The libxml2 node an external record names.
-fn node_of(record: ExternalNode) -> *mut XmlNode {
-    std::ptr::with_exposed_provenance_mut(usize::try_from(record.0).unwrap_or(0))
+/// The tree node of the document in `slot` a snapshot node came from.
+fn node_of(slot: usize, record: ExternalNode) -> *mut XmlNode {
+    TreeNode::try_from(record).map_or(std::ptr::null_mut(), |node| nodes::node_pointer(slot, node))
 }
 
-/// The attribute of `owner` with this name and namespace.
-///
-/// # Safety
-/// `owner` is a live element.
-unsafe fn attribute_of(
-    owner: *mut XmlNode,
-    namespace: Option<&str>,
-    local_name: &str,
-) -> *mut XmlAttr {
-    // SAFETY: the element's attributes, names and namespaces are live.
-    unsafe {
-        let mut attribute = (*owner).properties;
-        while !attribute.is_null() {
-            let name = CStr::from_ptr((*attribute).name.cast()).to_bytes();
-            let href = (*attribute)
-                .ns
-                .as_ref()
-                .map(|ns| CStr::from_ptr(ns.href.cast()).to_bytes());
-            if name == local_name.as_bytes() && href == namespace.map(str::as_bytes) {
-                return attribute;
-            }
-            attribute = (*attribute).next;
-        }
+/// The `XPath` node set of the nodes `selected` names in the document in
+/// `slot`.
+fn node_set(slot: usize, selected: &[SelectedNode<'_>]) -> Option<*mut XmlNodeSet> {
+    let set = nodes::node_set(std::ptr::null::<XmlNode>());
+    if set.is_null() {
+        return None;
     }
-    std::ptr::null_mut()
-}
-
-/// The `XPath` node set of the tree's nodes `selected` names.
-///
-/// # Safety
-/// The nodes are live nodes of `doc`.
-unsafe fn node_set(doc: *mut XmlDoc, selected: &[SelectedNode<'_>]) -> Option<*mut XmlNodeSet> {
-    // SAFETY: by the caller's contract; the set is freed on failure.
-    unsafe {
-        let set = xmlXPathNodeSetCreate(std::ptr::null_mut());
-        if set.is_null() {
+    for member in selected {
+        let node = match *member {
+            SelectedNode::Node(node) => node_of(slot, node),
+            SelectedNode::Attribute {
+                owner,
+                namespace,
+                local_name,
+            } => nodes::attribute(node_of(slot, owner), local_name, namespace).cast(),
+            SelectedNode::Namespace { owner, prefix, .. } => {
+                nodes::namespace_node(node_of(slot, owner), prefix)
+            }
+        };
+        if nodes::node_set_add(set, node).is_err() {
+            nodes::node_set_free(set);
             return None;
         }
-        for member in selected {
-            let added = match *member {
-                SelectedNode::Node(node) => xmlXPathNodeSetAdd(set, node_of(node)),
-                SelectedNode::Attribute {
-                    owner,
-                    namespace,
-                    local_name,
-                } => {
-                    let attribute = attribute_of(node_of(owner), namespace, local_name);
-                    if attribute.is_null() {
-                        -1
-                    } else {
-                        xmlXPathNodeSetAdd(set, attribute.cast())
-                    }
-                }
-                SelectedNode::Namespace { owner, prefix, .. } => {
-                    let owner = node_of(owner);
-                    let prefix = prefix.map(std::ffi::CString::new).transpose().ok();
-                    match prefix {
-                        Some(prefix) => {
-                            let declaration = xmlSearchNs(
-                                doc,
-                                owner,
-                                prefix
-                                    .as_ref()
-                                    .map_or(std::ptr::null(), |p| p.as_ptr().cast()),
-                            );
-                            if declaration.is_null() {
-                                -1
-                            } else {
-                                xmlXPathNodeSetAddNs(set, owner, declaration)
-                            }
-                        }
-                        None => -1,
-                    }
-                }
-            };
-            if added < 0 {
-                xmlXPathFreeNodeSet(set);
-                return None;
-            }
-        }
-        Some(set)
     }
+    Some(set)
 }
 
-/// Evaluates `data` through `selector`, whose document projects `doc`
-/// (libxmlsec1's `xmlSecXPathDataExecute`, whose failures it reports).
-///
-/// # Safety
-/// `doc` is the live document the selector's view projects; `data.here` is
-/// a live node.
-unsafe fn evaluate(
+/// Evaluates `data` through `selector`, whose view is a snapshot of `doc`,
+/// in `slot` (libxmlsec1's `xmlSecXPathDataExecute`, whose failures it
+/// reports).
+fn evaluate(
     data: &Data,
-    doc: *mut XmlDoc,
+    (doc, slot): (*mut XmlDoc, usize),
     selector: &mut Selector<'_, '_>,
 ) -> Option<*mut XmlSecNodeSet> {
     let here = here!("xmlSecXPathDataExecute");
@@ -722,9 +603,9 @@ unsafe fn evaluate(
         );
     };
     // here() is defined only within the expression's own document.
-    // SAFETY: by the caller's contract.
-    let here_node = (!data.here.is_null() && unsafe { (*data.here).doc } == doc)
-        .then(|| ExternalNode(data.here.expose_provenance() as u64));
+    let here_node = nodes::tree_node(data.here)
+        .filter(|(document, _)| *document == slot)
+        .map(|(_, node)| ExternalNode::from(node));
     if let Err(error) = selector.set_here(here_node) {
         failed(&error.to_string());
         return None;
@@ -750,8 +631,7 @@ unsafe fn evaluate(
             return None;
         }
     };
-    // SAFETY: the selected nodes are nodes of `doc`.
-    let Some(selected) = (unsafe { node_set(doc, &nodes) }) else {
+    let Some(selected) = node_set(slot, &nodes) else {
         errors::xml_failed_with(
             here,
             std::ptr::null(),
@@ -760,7 +640,7 @@ unsafe fn evaluate(
         );
         return None;
     };
-    // SAFETY: the node set is the caller's to give up.
+    // SAFETY: the node set is ours to give up.
     let nodes = unsafe { xmlSecNodeSetCreate(doc, selected, data.node_set_type) };
     if nodes.is_null() {
         errors::internal_with(
@@ -769,8 +649,7 @@ unsafe fn evaluate(
             c"xmlSecNodeSetCreate",
             &format!("type={}", data.node_set_type),
         );
-        // SAFETY: the node set was not adopted.
-        unsafe { xmlXPathFreeNodeSet(selected) };
+        xml_sec_libxml2::nodes::node_set_free(selected);
         return None;
     }
     Some(nodes)
@@ -817,13 +696,11 @@ unsafe extern "C" fn execute(
         c"xmlSecPtrListGetSize(dataList) > 0",
         -1
     );
-    // SAFETY: the input set and the here node are live.
-    let doc = unsafe {
-        if object.in_nodes.is_null() {
-            (*object.here_node).doc
-        } else {
-            (*object.in_nodes).doc
-        }
+    let doc = if object.in_nodes.is_null() {
+        nodes::doc(object.here_node)
+    } else {
+        // SAFETY: a live node set.
+        unsafe { (*object.in_nodes).doc }
     };
     check!(
         !doc.is_null(),
@@ -831,10 +708,6 @@ unsafe extern "C" fn execute(
         c"doc != NULL",
         -1
     );
-    if !readable() {
-        errors::no_libxml2(here);
-        return -1;
-    }
     // SAFETY: an expression transform read from a live element.
     let Some(output) = (unsafe { evaluate_list(expressions, object.in_nodes, doc) }) else {
         // SAFETY: a valid transform.
@@ -859,17 +732,13 @@ unsafe fn evaluate_list(
 ) -> Option<*mut XmlSecNodeSet> {
     let here = here!("xmlSecXPathDataListExecute");
     let policy = policy::verification_at(here)?;
-    // The core projects the tree in place of libxml2's evaluation context.
+    // The core evaluates over a snapshot of the tree in place of libxml2's
+    // evaluation context.
     let failed = |error: &str| {
         errors::internal_with(here, std::ptr::null(), c"xmlSecXPathDataExecute", error);
     };
-    // SAFETY: the document is live for the call.
-    let Some(tree) = (unsafe { LibxmlTree::new(doc) }) else {
-        failed("the document cannot be read");
-        return None;
-    };
-    let document = match XmlDocument::from_external_tree(Box::new(tree), policy) {
-        Ok(document) => document,
+    let (document, slot) = match xml_sec_libxml2::document::snapshot(doc, policy) {
+        Ok(snapshot) => snapshot,
         Err(error) => {
             failed(&error.to_string());
             return None;
@@ -891,21 +760,20 @@ unsafe fn evaluate_list(
                 return None;
             }
         };
-        // SAFETY: the input is a live set over `doc`, which the view
-        // projects.
-        unsafe { combined_output(input, &items, doc, &mut selector) }
+        // SAFETY: the input is a live set over `doc`, which the view reads.
+        unsafe { combined_output(input, &items, (doc, slot), &mut selector) }
     })
 }
 
 /// The transform's output for `input`.
 ///
 /// # Safety
-/// `input` is null or a live node set over `doc`, which the selector's view
-/// projects.
+/// `input` is null or a live node set over `doc`, in `slot`, of which the
+/// selector's view is a snapshot.
 unsafe fn combined_output(
     input: *mut XmlSecNodeSet,
     items: &[&Data],
-    doc: *mut XmlDoc,
+    (doc, slot): (*mut XmlDoc, usize),
     selector: &mut Selector<'_, '_>,
 ) -> Option<*mut XmlSecNodeSet> {
     let filter2 = items.iter().any(|data| data.kind == Kind::XPath2);
@@ -916,7 +784,7 @@ unsafe fn combined_output(
     // operation would apply to nothing; libxmlsec1 does both.
     if !(filter2 && (input.is_null() || items.iter().any(|data| data.op == UNION))) {
         // SAFETY: by the caller's contract.
-        return unsafe { combine(input, input, items, doc, selector) };
+        return unsafe { combine(input, input, items, (doc, slot), selector) };
     }
     let here = here!("xmlSecXPathDataListExecute");
     // SAFETY: by the caller's contract; every set made here is released on
@@ -927,7 +795,7 @@ unsafe fn combined_output(
             errors::internal(here, std::ptr::null(), c"xmlSecNodeSetGetChildren");
             return None;
         }
-        let filter = combine(whole, std::ptr::null_mut(), items, doc, selector)?;
+        let filter = combine(whole, std::ptr::null_mut(), items, (doc, slot), selector)?;
         if input.is_null() {
             return Some(filter);
         }
@@ -953,13 +821,13 @@ unsafe fn combined_output(
 /// failure every set but `kept` (the caller's input) is destroyed.
 ///
 /// # Safety
-/// `start` is null or a live node set over `doc`, which the selector's view
-/// projects.
+/// `start` is null or a live node set over `target`'s document, of which
+/// the selector's view is a snapshot.
 unsafe fn combine(
     start: *mut XmlSecNodeSet,
     kept: *mut XmlSecNodeSet,
     items: &[&Data],
-    doc: *mut XmlDoc,
+    target: (*mut XmlDoc, usize),
     selector: &mut Selector<'_, '_>,
 ) -> Option<*mut XmlSecNodeSet> {
     let here = here!("xmlSecXPathDataListExecute");
@@ -967,7 +835,7 @@ unsafe fn combine(
     // SAFETY: by the caller's contract; failed sets are released here.
     unsafe {
         for data in items {
-            let Some(nodes) = evaluate(data, doc, selector) else {
+            let Some(nodes) = evaluate(data, target, selector) else {
                 errors::internal(here, std::ptr::null(), c"xmlSecXPathDataExecute");
                 if result != kept {
                     xmlSecNodeSetDestroy(result);
@@ -994,22 +862,18 @@ unsafe fn combine(
     Some(result)
 }
 
-/// Adds each visited node to the `XPath` node set in `data`; a namespace
-/// node is added for its element, as libxml2 represents it.
+/// Adds each visited node, namespace nodes included, to the `XPath` node set
+/// in `data`.
 unsafe extern "C" fn collect(
     _set: *mut XmlSecNodeSet,
     node: *mut XmlNode,
-    parent: *mut XmlNode,
+    _parent: *mut XmlNode,
     data: *mut c_void,
 ) -> c_int {
-    // SAFETY: the walk passes live nodes and the set `materialize` owns.
-    unsafe {
-        let set = data.cast::<XmlNodeSet>();
-        if (*node).kind == XML_NAMESPACE_DECL {
-            xmlXPathNodeSetAddNs(set, parent, node.cast())
-        } else {
-            xmlXPathNodeSetAdd(set, node)
-        }
+    if nodes::node_set_add(data.cast::<XmlNodeSet>(), node).is_ok() {
+        0
+    } else {
+        -1
     }
 }
 
@@ -1017,25 +881,25 @@ unsafe extern "C" fn collect(
 /// reported.
 ///
 /// # Safety
-/// `set` is a live node set over the live document `doc`.
+/// `set` is a live node set over `doc`.
 unsafe fn materialize(set: *mut XmlSecNodeSet, doc: *mut XmlDoc) -> Option<*mut XmlSecNodeSet> {
     let here = here!("xmlSecXPathDataListExecute");
+    let listed = nodes::node_set(std::ptr::null::<XmlNode>());
+    if listed.is_null() {
+        errors::xml_failed(here, std::ptr::null(), c"xmlXPathNodeSetCreate");
+        return None;
+    }
     // SAFETY: by the caller's contract; the XPath set is freed on failure.
     unsafe {
-        let nodes = xmlXPathNodeSetCreate(std::ptr::null_mut());
-        if nodes.is_null() {
-            errors::xml_failed(here, std::ptr::null(), c"xmlXPathNodeSetCreate");
-            return None;
-        }
-        if xmlSecNodeSetWalk(set, Some(collect), nodes.cast()) < 0 {
+        if xmlSecNodeSetWalk(set, Some(collect), listed.cast()) < 0 {
             errors::internal(here, std::ptr::null(), c"xmlSecNodeSetWalk");
-            xmlXPathFreeNodeSet(nodes);
+            nodes::node_set_free(listed);
             return None;
         }
-        let explicit = xmlSecNodeSetCreate(doc, nodes, NORMAL);
+        let explicit = xmlSecNodeSetCreate(doc, listed, NORMAL);
         if explicit.is_null() {
             errors::internal(here, std::ptr::null(), c"xmlSecNodeSetCreate");
-            xmlXPathFreeNodeSet(nodes);
+            nodes::node_set_free(listed);
             return None;
         }
         Some(explicit)
@@ -1147,13 +1011,11 @@ unsafe extern "C" fn visa3d_execute(
         c"transform->hereNode != NULL",
         -1
     );
-    // SAFETY: the input set or the here node is live.
-    let doc = unsafe {
-        if object.in_nodes.is_null() {
-            (*object.here_node).doc
-        } else {
-            (*object.in_nodes).doc
-        }
+    let doc = if object.in_nodes.is_null() {
+        nodes::doc(object.here_node)
+    } else {
+        // SAFETY: a live node set.
+        unsafe { (*object.in_nodes).doc }
     };
     check!(
         !doc.is_null(),
@@ -1162,21 +1024,17 @@ unsafe extern "C" fn visa3d_execute(
         -1
     );
     let here = here!("xmlSecTransformVisa3DHackExecute");
-    if !readable() {
-        errors::no_libxml2(here);
-        return -1;
-    }
     // SAFETY: a `Visa3D` transform with its id set, over a live document.
     unsafe {
         let name = name_of(transform);
         let detail = || format!("id=\"{}\"", klass_text(id));
         // The tree's own ID table, which its builder filled.
-        let attribute = xmlGetID(doc, id);
-        if attribute.is_null() || (*attribute).parent.is_null() {
+        let element = c_text(id).map_or(std::ptr::null_mut(), |id| nodes::element_by_id(doc, id));
+        if element.is_null() {
             errors::xml_failed_with(here, name, c"xmlGetID", &detail());
             return -1;
         }
-        let set = xmlXPathNodeSetCreate((*attribute).parent);
+        let set = nodes::node_set(element);
         if set.is_null() {
             errors::xml_failed_with(here, name, c"xmlXPathNodeSetCreate", &detail());
             return -1;
@@ -1184,7 +1042,7 @@ unsafe extern "C" fn visa3d_execute(
         object.out_nodes = xmlSecNodeSetCreate(doc, set, TREE_WITHOUT_COMMENTS);
         if object.out_nodes.is_null() {
             errors::internal(here, name, c"xmlSecNodeSetCreate");
-            xmlXPathFreeNodeSet(set);
+            nodes::node_set_free(set);
             return -1;
         }
         0

@@ -1175,27 +1175,61 @@ impl XmlDocument {
         tree: alloc::boxed::Box<dyn external::ExternalTree>,
         policy: &impl XmlDocumentPolicy,
     ) -> Result<Self, XmlDocumentError> {
-        policy.resource_policy().validate()?;
-        let settings = DocumentParseSettings::from_policy(
-            *policy.xml_input_policy(),
-            policy.resource_policy(),
-        );
-        let (cell, has_dtd) = project_external(tree.as_ref(), settings)?;
-        let identity = allocate_document_identity(&NEXT_DOCUMENT_ID)?;
-        Ok(Self {
-            identity,
-            generation: 0,
-            requires_internal_dtd: has_dtd,
-            settings,
-            cell,
-            #[cfg(feature = "xmldsig-sign")]
-            atomic: Vec::new(),
-            #[cfg(feature = "xmldsig-sign")]
-            issued: 0,
-            tree: Some(tree),
-            #[cfg(feature = "xmldsig-sign")]
-            tree_marks: Vec::new(),
-        })
+        let projected = Projected::of(tree.as_ref(), policy)?;
+        Ok(projected.into_document(Some(tree)))
+    }
+
+    /// A document reading `tree` as it is now, under the XML input policy
+    /// and resource limits of `policy`'s operation, that keeps no hold on
+    /// it: [`DocumentView::external_node_of`] names the tree's nodes, so a
+    /// read-only operation can answer in terms of the tree while the tree's
+    /// owner keeps it, but edits change this document only and never reach
+    /// the tree.
+    ///
+    /// # Errors
+    /// As for [`Self::from_external_tree`].
+    #[cfg(all(
+        feature = "external-tree",
+        any(feature = "xmldsig", feature = "xmlenc")
+    ))]
+    pub fn snapshot_of_external_tree(
+        tree: &dyn external::ExternalTree,
+        policy: &impl XmlDocumentPolicy,
+    ) -> Result<Self, XmlDocumentError> {
+        Ok(Projected::of(tree, policy)?.into_document(None))
+    }
+
+    /// As [`Self::from_external_tree`] for the crate's own tree, which is
+    /// handed back with the error when the tree is refused, so a caller
+    /// lending it keeps its document.
+    ///
+    /// # Errors
+    /// As for [`Self::from_external_tree`].
+    #[cfg(all(
+        feature = "external-tree",
+        feature = "xml-backend-xmloxide",
+        any(feature = "xmldsig", feature = "xmlenc")
+    ))]
+    pub fn from_owned_tree(
+        tree: owned_tree::OwnedTree,
+        policy: &impl XmlDocumentPolicy,
+    ) -> Result<Self, alloc::boxed::Box<(XmlDocumentError, owned_tree::OwnedTree)>> {
+        match Projected::of(&tree, policy) {
+            Ok(projected) => Ok(projected.into_document(Some(alloc::boxed::Box::new(tree)))),
+            Err(error) => Err(alloc::boxed::Box::new((error, tree))),
+        }
+    }
+
+    /// The crate's own tree this document reads and edits, given back to the
+    /// caller that lent it; `None` for a parsed document or another tree.
+    #[cfg(all(
+        feature = "external-tree",
+        feature = "xml-backend-xmloxide",
+        any(feature = "xmldsig", feature = "xmlenc")
+    ))]
+    #[must_use]
+    pub fn into_owned_tree(mut self) -> Option<owned_tree::OwnedTree> {
+        self.tree.take()?.into_owned_tree()
     }
 
     /// The external node `identity` came from, for a tree-backed document.
@@ -3346,6 +3380,66 @@ fn carry_external(
     Ok(())
 }
 
+/// A tree's first generation, built before the document takes the tree.
+#[cfg(all(
+    feature = "external-tree",
+    any(feature = "xmldsig", feature = "xmlenc")
+))]
+struct Projected {
+    settings: DocumentParseSettings,
+    cell: DocumentCell,
+    has_dtd: bool,
+    identity: DocumentIdentity,
+}
+
+#[cfg(all(
+    feature = "external-tree",
+    any(feature = "xmldsig", feature = "xmlenc")
+))]
+impl Projected {
+    /// Walk `tree` under `policy`'s XML input policy and resource limits.
+    fn of(
+        tree: &dyn external::ExternalTree,
+        policy: &impl XmlDocumentPolicy,
+    ) -> Result<Self, XmlDocumentError> {
+        policy.resource_policy().validate()?;
+        let settings = DocumentParseSettings::from_policy(
+            *policy.xml_input_policy(),
+            policy.resource_policy(),
+        );
+        let (cell, has_dtd) = project_external(tree, settings)?;
+        let identity = allocate_document_identity(&NEXT_DOCUMENT_ID)?;
+        Ok(Self {
+            settings,
+            cell,
+            has_dtd,
+            identity,
+        })
+    }
+
+    /// The document over `tree`, which this generation projects; without a
+    /// tree, a snapshot that edits only itself.
+    fn into_document(
+        self,
+        tree: Option<alloc::boxed::Box<dyn external::ExternalTree>>,
+    ) -> XmlDocument {
+        XmlDocument {
+            identity: self.identity,
+            generation: 0,
+            requires_internal_dtd: self.has_dtd,
+            settings: self.settings,
+            cell: self.cell,
+            #[cfg(feature = "xmldsig-sign")]
+            atomic: Vec::new(),
+            #[cfg(feature = "xmldsig-sign")]
+            issued: 0,
+            tree,
+            #[cfg(feature = "xmldsig-sign")]
+            tree_marks: Vec::new(),
+        }
+    }
+}
+
 /// Builds a generation by walking `tree`, and returns whether the tree has a
 /// document type declaration.
 #[cfg(feature = "external-tree")]
@@ -5452,6 +5546,12 @@ fn element_opening_end(element: &str) -> Result<usize, XmlDocumentError> {
 pub mod external;
 #[cfg(feature = "external-tree")]
 mod markup;
+#[cfg(all(
+    feature = "external-tree",
+    feature = "xml-backend-xmloxide",
+    any(feature = "xmldsig", feature = "xmlenc")
+))]
+pub mod owned_tree;
 #[cfg(feature = "external-tree")]
 mod tree_edits;
 #[cfg(all(feature = "external-tree", feature = "xmldsig-sign"))]

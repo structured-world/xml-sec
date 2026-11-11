@@ -1,15 +1,14 @@
 /* Input callbacks as a libxmlsec1 caller sees them. The program is built
- * unmodified against the pinned libxmlsec1 and against this crate, and both
- * must print the same: which registered set reads a URI, the URI each
- * callback receives, the bytes a chain reads through them, and the outcome
- * and reports of a set that cannot open or read. Each library's own default
+ * against the pinned libxmlsec1 and against this crate, and both must print
+ * the same: which registered set reads a URI, the URI each callback
+ * receives, the bytes a chain reads through them, and the outcome and
+ * reports of a set that cannot open or read. Each library's own default
  * callbacks are removed first; this program registers its own. */
 
 #include <stdio.h>
 #include <string.h>
 
-#include <libxml/parser.h>
-
+#include "tree.h"
 #include <xmlsec/xmlsec.h>
 #include <xmlsec/errors.h>
 #include <xmlsec/io.h>
@@ -99,9 +98,6 @@ int main(void) {
     xmlSecTransformPtr transform;
     int closed;
 
-    /* A libxmlsec1 caller works with libxml2, which provides the allocator;
-     * initializing it also keeps the linker from dropping it. */
-    xmlInitParser();
     xmlSecErrorsSetCallback(record);
     printf("io init: %d\n", xmlSecIOInit());
     xmlSecIOCleanupCallbacks();

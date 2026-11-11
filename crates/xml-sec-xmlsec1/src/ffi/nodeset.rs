@@ -1,23 +1,17 @@
-//! `xmlsec/nodeset.h`: libxmlsec1's node sets over a libxml2 tree.
+//! `xmlsec/nodeset.h`: libxmlsec1's node sets over the document tree.
 //!
-//! A node set is a circular list of member sets, each a libxml2 `XPath` node
-//! set read by a type (the listed nodes, their subtrees, with or without
+//! A node set is a circular list of member sets, each an `XPath` node set
+//! read by a type (the listed nodes, their subtrees, with or without
 //! comments, or the inverse) and combined with the members before it by an
-//! operation. Membership is decided per node, as libxmlsec1 decides it,
-//! through libxml2's own `xmlXPathNodeSetContains`.
+//! operation. Membership is decided per node, as libxmlsec1 decides it.
 
-use std::ffi::{c_char, c_int, c_void};
-
-use xml_sec_libxml2::ffi::{
-    XML_ATTRIBUTE_NODE, XML_CDATA_SECTION_NODE, XML_COMMENT_NODE, XML_DOCUMENT_NODE,
-    XML_ELEMENT_NODE, XML_NAMESPACE_DECL, XML_TEXT_NODE, XmlAttr, XmlDoc, XmlNode, XmlNodeSet,
-    XmlNs,
-};
+use std::ffi::{c_int, c_void};
 
 use super::errors::{self, check, here};
+use super::transforms::io::{OutputBuffer, xmlOutputBufferWrite};
 use super::tree::{
-    readable, xmlFreeDoc, xmlOutputBufferWriteString, xmlSearchNs, xmlXPathCmpNodes,
-    xmlXPathFreeNodeSet, xmlXPathNodeSetAdd, xmlXPathNodeSetContains, xmlXPathNodeSetCreate,
+    XML_ATTRIBUTE_NODE, XML_CDATA_SECTION_NODE, XML_COMMENT_NODE, XML_DOCUMENT_NODE,
+    XML_ELEMENT_NODE, XML_NAMESPACE_DECL, XML_TEXT_NODE, XmlDoc, XmlNode, XmlNodeSet, nodes,
 };
 use super::xmltree::xmlSecDepthFirstTreeWalk;
 use super::{contain, free, malloc, write_stream};
@@ -66,114 +60,76 @@ pub(crate) type WalkCallback = Option<
     unsafe extern "C" fn(*mut XmlSecNodeSet, *mut XmlNode, *mut XmlNode, *mut c_void) -> c_int,
 >;
 
-/// The parent of a tree node, or the element a namespace node belongs to.
-///
-/// # Safety
-/// `node` is a live node or namespace node of an `XPath` node set.
-unsafe fn parent_of(node: *mut XmlNode) -> *mut XmlNode {
-    // SAFETY: by the caller's contract; a namespace node's `next` is its
-    // element, as libxml2's XPath sets it.
-    unsafe {
-        if (*node).kind == XML_NAMESPACE_DECL {
-            (*node.cast::<XmlNs>()).next.cast::<XmlNode>()
-        } else {
-            (*node).parent
-        }
-    }
-}
-
 /// Whether `node`, whose parent is `parent`, is listed in `nodes`; a null
-/// list contains every node.
-///
-/// # Safety
-/// `nodes` is null or a live `XPath` node set; `node` and `parent` are live.
-unsafe fn listed(nodes: *mut XmlNodeSet, node: *mut XmlNode, parent: *mut XmlNode) -> bool {
-    if nodes.is_null() {
+/// list contains every node. A namespace node is listed as the namespace
+/// node of the element it is rendered on: `parent`, or an attribute
+/// parent's element, as libxmlsec1 compares it.
+fn listed(set: *mut XmlNodeSet, node: *mut XmlNode, parent: *mut XmlNode) -> bool {
+    if set.is_null() {
         return true;
     }
-    // SAFETY: the caller passes live nodes.
-    unsafe {
-        if (*node).kind != XML_NAMESPACE_DECL {
-            return xmlXPathNodeSetContains(nodes, node) != 0;
-        }
-        // libxml2's XPath identifies a namespace node by its prefix and the
-        // element in its `next`; libxmlsec1 compares a copy whose `next` is
-        // the element the namespace is rendered on (the attribute's owner
-        // for an attribute parent). The copy is as large as libxml2's
-        // `xmlNs` and only its leading members are read.
-        let mut storage = [0usize; 8];
-        let copy = storage.as_mut_ptr().cast::<XmlNs>();
-        node.cast::<XmlNs>().copy_to_nonoverlapping(copy, 1);
-        (*copy).next = if !parent.is_null() && (*parent).kind == XML_ATTRIBUTE_NODE {
-            (*parent).parent.cast::<XmlNs>()
-        } else {
-            parent.cast::<XmlNs>()
-        };
-        xmlXPathNodeSetContains(nodes, copy.cast::<XmlNode>()) != 0
+    if nodes::kind(node) != XML_NAMESPACE_DECL {
+        return nodes::node_set_contains(set, node);
     }
+    let element = if nodes::kind(parent) == XML_ATTRIBUTE_NODE {
+        nodes::parent(parent)
+    } else {
+        parent
+    };
+    let Some((prefix, _)) = nodes::binding(node) else {
+        return false;
+    };
+    nodes::node_set_contains(set, nodes::namespace_node(element, prefix.as_deref()))
 }
 
 /// Whether `node` or one of its element ancestors is listed in `nodes`.
-///
-/// # Safety
-/// As for [`listed`]; the ancestors of `parent` are live.
-unsafe fn listed_or_ancestor(
-    nodes: *mut XmlNodeSet,
+fn listed_or_ancestor(
+    set: *mut XmlNodeSet,
     mut node: *mut XmlNode,
     mut parent: *mut XmlNode,
 ) -> bool {
-    if nodes.is_null() {
+    if set.is_null() {
         return true;
     }
     while !node.is_null() {
-        // SAFETY: `node` and `parent` are live by the caller's contract.
-        unsafe {
-            if listed(nodes, node, parent) {
-                return true;
-            }
-            // Elements and the document have children, so the walk up
-            // reaches the document node: a tree set listing it holds the
-            // whole document (XPath Filter 2.0 section 3.4: nodes with an
-            // ancestor in the set). libxmlsec1 stops at the root element.
-            if !parent.is_null() && matches!((*parent).kind, XML_ELEMENT_NODE | XML_DOCUMENT_NODE) {
-                node = parent;
-                parent = (*parent).parent;
-            } else {
-                node = std::ptr::null_mut();
-                parent = std::ptr::null_mut();
-            }
+        if listed(set, node, parent) {
+            return true;
+        }
+        // Elements and the document have children, so the walk up reaches
+        // the document node: a tree set listing it holds the whole document
+        // (XPath Filter 2.0 section 3.4: nodes with an ancestor in the set).
+        // libxmlsec1 stops at the root element.
+        if !parent.is_null() && matches!(nodes::kind(parent), XML_ELEMENT_NODE | XML_DOCUMENT_NODE)
+        {
+            node = parent;
+            parent = nodes::parent(parent);
+        } else {
+            node = std::ptr::null_mut();
+            parent = std::ptr::null_mut();
         }
     }
     false
 }
 
 /// Whether `node` belongs to the member set `set` alone, by its type.
-///
-/// # Safety
-/// `set` is a live member set; `node` and `parent` are live.
-unsafe fn member_contains(set: &XmlSecNodeSet, node: *mut XmlNode, parent: *mut XmlNode) -> bool {
-    // SAFETY: by the caller's contract.
-    unsafe {
-        let comment = (*node).kind == XML_COMMENT_NODE;
-        match set.kind {
-            NORMAL => listed(set.nodes, node, parent),
-            INVERT => !listed(set.nodes, node, parent),
-            TREE => listed_or_ancestor(set.nodes, node, parent),
-            TREE_WITHOUT_COMMENTS => !comment && listed_or_ancestor(set.nodes, node, parent),
-            TREE_INVERT => !listed_or_ancestor(set.nodes, node, parent),
-            TREE_WITHOUT_COMMENTS_INVERT => {
-                !comment && !listed_or_ancestor(set.nodes, node, parent)
-            }
-            // libxmlsec1 reports an unsupported type and answers 0.
-            kind => {
-                errors::unsupported_enum(
-                    here!("xmlSecNodeSetContains"),
-                    std::ptr::null(),
-                    "node set type",
-                    kind,
-                );
-                false
-            }
+fn member_contains(set: &XmlSecNodeSet, node: *mut XmlNode, parent: *mut XmlNode) -> bool {
+    let comment = nodes::kind(node) == XML_COMMENT_NODE;
+    match set.kind {
+        NORMAL => listed(set.nodes, node, parent),
+        INVERT => !listed(set.nodes, node, parent),
+        TREE => listed_or_ancestor(set.nodes, node, parent),
+        TREE_WITHOUT_COMMENTS => !comment && listed_or_ancestor(set.nodes, node, parent),
+        TREE_INVERT => !listed_or_ancestor(set.nodes, node, parent),
+        TREE_WITHOUT_COMMENTS_INVERT => !comment && !listed_or_ancestor(set.nodes, node, parent),
+        // libxmlsec1 reports an unsupported type and answers 0.
+        kind => {
+            errors::unsupported_enum(
+                here!("xmlSecNodeSetContains"),
+                std::ptr::null(),
+                "node set type",
+                kind,
+            );
+            false
         }
     }
 }
@@ -182,7 +138,7 @@ unsafe fn member_contains(set: &XmlSecNodeSet, node: *mut XmlNode, parent: *mut 
 /// now owns; released with [`xmlSecNodeSetDestroy`].
 ///
 /// # Safety
-/// `nodes` is null or an `XPath` node set the caller gives up.
+/// Callable with any pointers; `nodes` is given up.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecNodeSetCreate(
     doc: *mut XmlDoc,
@@ -241,9 +197,7 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetDestroy(set: *mut XmlSecNodeSet) {
                 } else {
                     current = std::ptr::null_mut();
                 }
-                if !(*member).nodes.is_null() {
-                    xmlXPathFreeNodeSet((*member).nodes);
-                }
+                nodes::node_set_free((*member).nodes);
                 if !(*member).doc.is_null() && (*member).destroy_doc != 0 {
                     // Freed once, after every member: the others share it.
                     destroy_doc = (*member).doc;
@@ -252,10 +206,7 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetDestroy(set: *mut XmlSecNodeSet) {
                 free(member.cast::<c_void>());
             }
         }
-        if !destroy_doc.is_null() {
-            // SAFETY: a member owned the document and no member remains.
-            unsafe { xmlFreeDoc(destroy_doc) };
-        }
+        xml_sec_libxml2::document::free(destroy_doc);
     });
 }
 
@@ -272,13 +223,63 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetDocDestroy(set: *mut XmlSecNodeSet)
     });
 }
 
+/// Whether `node` (with parent `parent`) is in the set; `None` for an
+/// unknown operation, which is reported.
+///
+/// # Safety
+/// `set` is a live node set.
+unsafe fn contains(
+    set: *mut XmlSecNodeSet,
+    node: *mut XmlNode,
+    parent: *mut XmlNode,
+) -> Option<bool> {
+    let mut status = true;
+    let mut current = set;
+    loop {
+        // SAFETY: the ring's members are live while the set is.
+        let member = unsafe { &*current };
+        // Each member is checked only when it can change the result.
+        match member.op {
+            INTERSECTION => {
+                if status && !member_contains(member, node, parent) {
+                    status = false;
+                }
+            }
+            SUBTRACTION => {
+                if status && member_contains(member, node, parent) {
+                    status = false;
+                }
+            }
+            UNION => {
+                if !status && member_contains(member, node, parent) {
+                    status = true;
+                }
+            }
+            op => {
+                errors::report(
+                    here!("xmlSecNodeSetContains"),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    errors::R_INVALID_OPERATION,
+                    &format!("node set operation={op}"),
+                );
+                return None;
+            }
+        }
+        current = member.next;
+        if current == set {
+            break;
+        }
+    }
+    Some(status)
+}
+
 /// `xmlSecNodeSetContains`: 1 when `node` (with parent `parent`) is in the
 /// set, 0 when not, -1 for an unknown operation; a null set contains every
 /// node.
 ///
 /// # Safety
-/// `set` is null or a live node set; `node` and `parent` are live nodes of
-/// its document.
+/// `set` is null or a live node set.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecNodeSetContains(
     set: *mut XmlSecNodeSet,
@@ -290,53 +291,8 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetContains(
         if set.is_null() {
             return 1;
         }
-        if !readable() {
-            errors::no_libxml2(here!("xmlSecNodeSetContains"));
-            return -1;
-        }
-        let inside = |member: &XmlSecNodeSet| {
-            // SAFETY: the caller passes live nodes of the set's document.
-            unsafe { member_contains(member, node, parent) }
-        };
-        let mut status = true;
-        let mut current = set;
-        loop {
-            // SAFETY: the ring's members are live while the set is.
-            let member = unsafe { &*current };
-            // Each member is checked only when it can change the result.
-            match member.op {
-                INTERSECTION => {
-                    if status && !inside(member) {
-                        status = false;
-                    }
-                }
-                SUBTRACTION => {
-                    if status && inside(member) {
-                        status = false;
-                    }
-                }
-                UNION => {
-                    if !status && inside(member) {
-                        status = true;
-                    }
-                }
-                op => {
-                    errors::report(
-                        here!("xmlSecNodeSetContains"),
-                        std::ptr::null(),
-                        std::ptr::null(),
-                        errors::R_INVALID_OPERATION,
-                        &format!("node set operation={op}"),
-                    );
-                    return -1;
-                }
-            }
-            current = member.next;
-            if current == set {
-                break;
-            }
-        }
-        c_int::from(status)
+        // SAFETY: by the caller's contract.
+        unsafe { contains(set, node, parent) }.map_or(-1, c_int::from)
     })
 }
 
@@ -408,7 +364,7 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetAddList(
 /// when null), with or without comments, or everything else when `invert`.
 ///
 /// # Safety
-/// `doc` is null or a live document; `parent` is null or one of its nodes.
+/// Callable with any pointers.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecNodeSetGetChildren(
     doc: *mut XmlDoc,
@@ -424,26 +380,22 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetGetChildren(
             std::ptr::null_mut()
         );
         let here = here!("xmlSecNodeSetGetChildren");
-        if !readable() {
-            errors::no_libxml2(here);
-            return std::ptr::null_mut();
-        }
-        // SAFETY: libxml2 creates a set holding `parent` (none for null).
-        let nodes = unsafe { xmlXPathNodeSetCreate(parent) };
-        if nodes.is_null() {
+        let set = nodes::node_set(parent);
+        if set.is_null() {
             errors::xml_failed(here, std::ptr::null(), c"xmlXPathNodeSetCreate");
             return std::ptr::null_mut();
         }
         if parent.is_null() {
-            // SAFETY: the document's top-level nodes are live.
-            unsafe {
-                let mut current = (*doc).children;
-                while !current.is_null() {
-                    if with_comments != 0 || (*current).kind != XML_COMMENT_NODE {
-                        xmlXPathNodeSetAdd(nodes, current);
-                    }
-                    current = (*current).next;
+            let mut current = nodes::first_child(doc);
+            while !current.is_null() {
+                if (with_comments != 0 || nodes::kind(current) != XML_COMMENT_NODE)
+                    && nodes::node_set_add(set, current).is_err()
+                {
+                    errors::xml_failed(here, std::ptr::null(), c"xmlXPathNodeSetAdd");
+                    nodes::node_set_free(set);
+                    return std::ptr::null_mut();
                 }
+                current = nodes::next(current);
             }
         }
         let kind = match (with_comments != 0, invert != 0) {
@@ -452,14 +404,13 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetGetChildren(
             (false, true) => TREE_WITHOUT_COMMENTS_INVERT,
             (false, false) => TREE_WITHOUT_COMMENTS,
         };
-        // SAFETY: `nodes` is ours to give to the new set.
-        let set = unsafe { xmlSecNodeSetCreate(doc, nodes, kind) };
-        if set.is_null() {
+        // SAFETY: `set` is ours to give to the new set.
+        let created = unsafe { xmlSecNodeSetCreate(doc, set, kind) };
+        if created.is_null() {
             errors::internal(here, std::ptr::null(), c"xmlSecNodeSetCreate");
-            // SAFETY: the set was not created, so `nodes` is still ours.
-            unsafe { xmlXPathFreeNodeSet(nodes) };
+            nodes::node_set_free(set);
         }
-        set
+        created
     })
 }
 
@@ -472,111 +423,83 @@ struct Walk {
 }
 
 /// Calls the walk's callback for `node` unless the set excludes it; like
-/// libxmlsec1's truth test, a failed membership check (-1) counts as
-/// contained.
+/// libxmlsec1's truth test, a failed membership check counts as contained.
 ///
 /// # Safety
-/// `walk.set` is live; `node` and `parent` are live nodes of its document.
+/// `walk.set` is live; the callback is callable with the walk's data.
 unsafe fn visit(walk: &Walk, node: *mut XmlNode, parent: *mut XmlNode) -> bool {
     // SAFETY: by the caller's contract.
     unsafe {
-        xmlSecNodeSetContains(walk.set, node, parent) == 0
+        contains(walk.set, node, parent) == Some(false)
             || (walk.callback)(walk.set, node, parent, walk.data) >= 0
     }
 }
 
 /// The tree walk's callback: the node, then for an element or document its
-/// attributes and the namespace declarations in scope at it.
+/// attributes and the namespace nodes in scope at it, the nearest
+/// declaration of each prefix, as libxmlsec1 visits them; the implicit `xml`
+/// binding is not declared, so it is not visited.
 unsafe extern "C" fn walk_node(current: *mut XmlNode, data: *mut c_void) -> c_int {
-    // SAFETY: `data` is the walk the caller set up; `current` is a live node
-    // of the walked tree.
-    unsafe {
-        let walk = &*data.cast::<Walk>();
-        if !visit(walk, current, parent_of(current)) {
+    // SAFETY: `data` is the walk the caller set up.
+    let walk = unsafe { &*data.cast::<Walk>() };
+    // SAFETY: as above.
+    if !unsafe { visit(walk, current, nodes::parent(current)) } {
+        return -1;
+    }
+    let kind = nodes::kind(current);
+    if kind != XML_ELEMENT_NODE && kind != XML_DOCUMENT_NODE {
+        return 1;
+    }
+    for attribute in nodes::attributes(current) {
+        // SAFETY: as above.
+        if !unsafe { visit(walk, attribute.cast(), current) } {
             return -1;
         }
-        let kind = (*current).kind;
-        if kind != XML_ELEMENT_NODE && kind != XML_DOCUMENT_NODE {
-            return 1;
-        }
-        let mut attribute: *mut XmlAttr = (*current).properties;
-        while !attribute.is_null() {
-            if !visit(walk, attribute.cast::<XmlNode>(), current) {
-                return -1;
-            }
-            attribute = (*attribute).next;
-        }
-        // A declaration is in scope when the nearest one of its prefix is it.
-        let mut scope = current;
-        while !scope.is_null() {
-            let mut declaration = (*scope).ns_def;
-            while !declaration.is_null() {
-                let nearest = xmlSearchNs((*walk.set).doc, current, (*declaration).prefix);
-                if nearest == declaration && !visit(walk, declaration.cast::<XmlNode>(), current) {
-                    return -1;
-                }
-                declaration = (*declaration).next;
-            }
-            scope = (*scope).parent;
-        }
-        1
     }
+    for namespace in nodes::namespace_nodes(current) {
+        if nodes::name(namespace).as_deref() == Some("xml") {
+            continue;
+        }
+        // SAFETY: as above.
+        if !unsafe { visit(walk, namespace, current) } {
+            return -1;
+        }
+    }
+    1
 }
 
 /// Whether no listed node lies inside the subtree of another listed node.
-///
-/// # Safety
-/// `nodes` and its nodes are live.
-unsafe fn disjoint(nodes: &XmlNodeSet) -> bool {
-    let count = usize::try_from(nodes.node_nr).unwrap_or(0);
-    // SAFETY: the table holds `node_nr` live nodes; ancestors are live.
-    unsafe {
-        (0..count).all(|index| {
-            let mut ancestor = parent_of(nodes.node_tab.add(index).read());
-            while !ancestor.is_null() {
-                if xmlXPathNodeSetContains((&raw const *nodes).cast_mut(), ancestor) != 0 {
-                    return false;
-                }
-                ancestor = parent_of(ancestor);
+fn disjoint(set: *mut XmlNodeSet) -> bool {
+    nodes::node_set_members(set).into_iter().all(|member| {
+        let mut ancestor = nodes::parent(member);
+        while !ancestor.is_null() {
+            if nodes::node_set_contains(set, ancestor) {
+                return false;
             }
-            true
-        })
-    }
+            ancestor = nodes::parent(ancestor);
+        }
+        true
+    })
 }
 
 /// The listed nodes in document order, which a caller-built list need not
 /// follow; `None` when the list holds attribute or namespace nodes, which
-/// `xmlXPathCmpNodes` does not order among their element's other nodes, or
-/// libxml2 cannot order two of them.
-///
-/// # Safety
-/// `nodes` and its nodes are live.
-unsafe fn in_document_order(nodes: &XmlNodeSet) -> Option<Vec<*mut XmlNode>> {
-    let count = usize::try_from(nodes.node_nr).unwrap_or(0);
-    // SAFETY: the table holds `node_nr` live nodes.
-    let mut seeds: Vec<*mut XmlNode> = (0..count)
-        .map(|index| unsafe { nodes.node_tab.add(index).read() })
-        .collect();
-    if seeds.iter().any(|seed| {
-        // SAFETY: live nodes; a namespace member's `type` sits where a
-        // node's does.
-        let kind = unsafe { (**seed).kind };
-        matches!(kind, XML_ATTRIBUTE_NODE | XML_NAMESPACE_DECL)
-    }) {
+/// are not ordered among their element's other nodes here, or two nodes
+/// cannot be ordered.
+fn in_document_order(set: *mut XmlNodeSet) -> Option<Vec<*mut XmlNode>> {
+    let mut seeds = nodes::node_set_members(set);
+    if seeds
+        .iter()
+        .any(|&seed| matches!(nodes::kind(seed), XML_ATTRIBUTE_NODE | XML_NAMESPACE_DECL))
+    {
         return None;
     }
     let mut unordered = false;
-    seeds.sort_by(|left, right| {
-        // SAFETY: live nodes of one document.
-        match unsafe { xmlXPathCmpNodes(*left, *right) } {
-            1 => std::cmp::Ordering::Less,
-            -1 => std::cmp::Ordering::Greater,
-            0 => std::cmp::Ordering::Equal,
-            _ => {
-                unordered = true;
-                std::cmp::Ordering::Equal
-            }
-        }
+    seeds.sort_by(|&left, &right| {
+        nodes::compare_order(left, right).unwrap_or_else(|| {
+            unordered = true;
+            std::cmp::Ordering::Equal
+        })
     });
     (!unordered).then_some(seeds)
 }
@@ -585,8 +508,7 @@ unsafe fn in_document_order(nodes: &XmlNodeSet) -> Option<Vec<*mut XmlNode>> {
 /// document order, stopping at the first negative return.
 ///
 /// # Safety
-/// `set` is null or a live node set with a live document; `walk_func` is
-/// called with `data`.
+/// `set` is null or a live node set; `walk_func` is called with `data`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecNodeSetWalk(
     set: *mut XmlSecNodeSet,
@@ -607,10 +529,6 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetWalk(
             errors::assertion(here!("xmlSecNodeSetWalk"), c"walkFunc != NULL");
             return -1;
         };
-        if !readable() {
-            errors::no_libxml2(here!("xmlSecNodeSetWalk"));
-            return -1;
-        }
         let walk = Walk {
             set,
             callback,
@@ -623,81 +541,79 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetWalk(
         // visited once and in order (libxmlsec1 takes the shortcut for any
         // listing member, in list order, and then repeats nested nodes and
         // misses nodes a union or a subtraction holds outside the list).
-        // SAFETY: the set's XPath nodes and document are live.
-        unsafe {
-            if !member.nodes.is_null()
-                && std::ptr::eq(member.next, set)
-                && member.op == INTERSECTION
-                && matches!(member.kind, NORMAL | TREE | TREE_WITHOUT_COMMENTS)
-                && disjoint(&*member.nodes)
-                && let Some(seeds) = in_document_order(&*member.nodes)
-            {
-                for start in seeds {
-                    if xmlSecDepthFirstTreeWalk(start, Some(walk_node), walk_data) < 0 {
-                        errors::internal(
-                            here!("xmlSecNodeSetWalk"),
-                            std::ptr::null(),
-                            c"xmlSecNodeSetWalkRecursive",
-                        );
-                        return -1;
-                    }
-                }
-                return 0;
-            }
-            let mut current = (*member.doc).children;
+        let starts = if !member.nodes.is_null()
+            && std::ptr::eq(member.next, set)
+            && member.op == INTERSECTION
+            && matches!(member.kind, NORMAL | TREE | TREE_WITHOUT_COMMENTS)
+            && disjoint(member.nodes)
+            && let Some(seeds) = in_document_order(member.nodes)
+        {
+            seeds
+        } else {
+            let mut top = Vec::new();
+            let mut current = nodes::first_child(member.doc);
             while !current.is_null() {
-                if xmlSecDepthFirstTreeWalk(current, Some(walk_node), walk_data) < 0 {
-                    errors::internal(
-                        here!("xmlSecNodeSetWalk"),
-                        std::ptr::null(),
-                        c"xmlSecNodeSetWalkRecursive",
-                    );
-                    return -1;
-                }
-                current = (*current).next;
+                top.push(current);
+                current = nodes::next(current);
+            }
+            top
+        };
+        for start in starts {
+            // SAFETY: the walk outlives the call.
+            if unsafe { xmlSecDepthFirstTreeWalk(start, Some(walk_node), walk_data) } < 0 {
+                errors::internal(
+                    here!("xmlSecNodeSetWalk"),
+                    std::ptr::null(),
+                    c"xmlSecNodeSetWalkRecursive",
+                );
+                return -1;
             }
         }
         0
     })
 }
 
-/// Writes a text node's content to the libxml2 output buffer in `data`.
+/// Writes a text node's content to the output buffer in `data`.
 unsafe extern "C" fn dump_text(
     _set: *mut XmlSecNodeSet,
     node: *mut XmlNode,
     _parent: *mut XmlNode,
     data: *mut c_void,
 ) -> c_int {
-    // SAFETY: `node` is a live node of the walked set; `data` is the output
-    // buffer the caller passed.
-    unsafe {
-        // CDATA characters are text (XPath 1.0 section 5.7); libxmlsec1
-        // writes only text nodes and drops them.
-        if !matches!((*node).kind, XML_TEXT_NODE | XML_CDATA_SECTION_NODE) {
-            return 0;
-        }
-        if xmlOutputBufferWriteString(data, (*node).content.cast::<c_char>()) < 0 {
-            errors::xml_failed(
-                here!("xmlSecNodeSetDumpTextNodes"),
-                std::ptr::null(),
-                c"xmlOutputBufferWriteString",
-            );
-            return -1;
-        }
+    // CDATA characters are text (XPath 1.0 section 5.7); libxmlsec1 writes
+    // only text nodes and drops them.
+    if !matches!(nodes::kind(node), XML_TEXT_NODE | XML_CDATA_SECTION_NODE) {
+        return 0;
+    }
+    let text = nodes::text(node).unwrap_or_default();
+    let written = c_int::try_from(text.len()).is_ok_and(|length| {
+        // SAFETY: `data` is the output buffer the caller passed; `text`
+        // holds `length` bytes.
+        let result = unsafe {
+            xmlOutputBufferWrite(data.cast::<OutputBuffer>(), length, text.as_ptr().cast())
+        };
+        result >= 0
+    });
+    if !written {
+        errors::xml_failed(
+            here!("xmlSecNodeSetDumpTextNodes"),
+            std::ptr::null(),
+            c"xmlOutputBufferWriteString",
+        );
+        return -1;
     }
     0
 }
 
 /// `xmlSecNodeSetDumpTextNodes`: writes the content of the set's text
-/// nodes, in document order, to the libxml2 output buffer `out`.
+/// nodes, in document order, to the output buffer `out`.
 ///
 /// # Safety
-/// `set` is null or a live node set; `out` is null or a live
-/// `xmlOutputBuffer`.
+/// `set` is null or a live node set; `out`'s callbacks are callable.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecNodeSetDumpTextNodes(
     set: *mut XmlSecNodeSet,
-    out: *mut c_void,
+    out: *mut OutputBuffer,
 ) -> c_int {
     contain(-1, || {
         check!(
@@ -713,22 +629,13 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetDumpTextNodes(
             -1
         );
         // SAFETY: as the caller passes.
-        unsafe { xmlSecNodeSetWalk(set, Some(dump_text), out) }
+        unsafe { xmlSecNodeSetWalk(set, Some(dump_text), out.cast()) }
     })
 }
 
-/// A NUL-terminated libxml2 string for display, `null` for a null pointer.
-///
-/// # Safety
-/// `text` is null or a NUL-terminated string.
-unsafe fn shown(text: *const u8) -> String {
-    if text.is_null() {
-        return "null".to_owned();
-    }
-    // SAFETY: by the caller's contract.
-    unsafe { std::ffi::CStr::from_ptr(text.cast::<c_char>()) }
-        .to_string_lossy()
-        .into_owned()
+/// A string for display, `null` when absent.
+fn shown(text: Option<String>) -> String {
+    text.unwrap_or_else(|| "null".to_owned())
 }
 
 /// `xmlSecNodeSetDebugDump`: prints the first member's type and listed
@@ -750,10 +657,6 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetDebugDump(
         );
         // SAFETY: the caller passes a live node set.
         let set = unsafe { &*set };
-        if !readable() {
-            errors::no_libxml2(here!("xmlSecNodeSetDebugDump"));
-            return;
-        }
         let kind = match set.kind {
             NORMAL => "(xmlSecNodeSetNormal)\n",
             INVERT => "(xmlSecNodeSetInvert)\n",
@@ -765,31 +668,23 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetDebugDump(
             _ => "",
         };
         let mut lines = vec![format!("== Nodes set {kind}")];
-        // SAFETY: the listed nodes are live nodes and namespace nodes of the
-        // set's document; a namespace node's `next` is its element.
-        unsafe {
-            if let Some(nodes) = set.nodes.as_ref() {
-                for index in 0..usize::try_from(nodes.node_nr).unwrap_or(0) {
-                    let node = nodes.node_tab.add(index).read();
-                    let kind = (*node).kind;
-                    lines.push(if kind == XML_NAMESPACE_DECL {
-                        let ns = &*node.cast::<XmlNs>();
-                        let element = &*ns.next.cast::<XmlNode>();
-                        let element_prefix =
-                            element.ns.as_ref().map_or(std::ptr::null(), |ns| ns.prefix);
-                        format!(
-                            "{kind}: {}={} ({}:{})\n",
-                            shown(ns.prefix),
-                            shown(ns.href),
-                            shown(element_prefix),
-                            shown(element.name),
-                        )
-                    } else {
-                        format!("{kind}: {}\n", shown((*node).name))
-                    });
-                }
-            }
-            write_stream(output, &lines.concat());
+        for node in nodes::node_set_members(set.nodes) {
+            let kind = nodes::kind(node);
+            lines.push(if kind == XML_NAMESPACE_DECL {
+                let (prefix, href) = nodes::binding(node).unzip();
+                let element = nodes::parent(node);
+                format!(
+                    "{kind}: {}={} ({}:{})\n",
+                    shown(prefix.flatten()),
+                    shown(href),
+                    shown(nodes::prefix(element)),
+                    shown(nodes::name(element)),
+                )
+            } else {
+                format!("{kind}: {}\n", shown(nodes::name(node)))
+            });
         }
+        // SAFETY: a C stream by the caller's contract.
+        unsafe { write_stream(output, &lines.concat()) };
     });
 }
