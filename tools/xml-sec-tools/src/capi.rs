@@ -145,6 +145,10 @@ impl Target {
                 "tests/c/symkeys.c",
                 "tests/c/asymkeys.c",
                 "tests/c/keyinfo.c",
+                "tests/c/digests.c",
+                "tests/c/hmac.c",
+                "tests/c/signatures.c",
+                "tests/c/app.c",
             ],
         }
     }
@@ -158,19 +162,19 @@ pub(crate) const fn targets() -> &'static [Target] {
 /// The library build: cargo's own messages name the artifacts, whatever the
 /// build-directory layout.
 pub(crate) fn build_step(target: Target, mode: Mode, host: &str, rustflags: Option<&str>) -> Step {
-    cargo_step(
-        "build library",
-        mode,
-        host,
-        rustflags,
-        &[
-            "build",
-            "-p",
-            target.package(),
-            "--lib",
-            "--message-format=json-render-diagnostics",
-        ],
-    )
+    let mut args = vec![
+        "build",
+        "-p",
+        target.package(),
+        "--lib",
+        "--message-format=json-render-diagnostics",
+    ];
+    // The oracle libxmlsec1 is configured with MD5 and RIPEMD-160, so the
+    // library under comparison carries the same klasses.
+    if target == Target::Xmlsec1 {
+        args.extend(["--features", "legacy-algorithms"]);
+    }
+    cargo_step("build library", mode, host, rustflags, &args)
 }
 
 /// The crates' own tests, run under the sanitizer with their libraries.
@@ -561,7 +565,9 @@ pub(crate) fn program_step(program: &Path, args: &[PathBuf], library: &Library) 
         args,
         env: Vec::new(),
         unset: Vec::new(),
-        directory: None,
+        // From the repository root, so a program names fixtures by their
+        // repository path.
+        directory: Some(root()),
     };
     if cfg!(windows) {
         // Windows finds a DLL on PATH; elsewhere the program's rpath names it.

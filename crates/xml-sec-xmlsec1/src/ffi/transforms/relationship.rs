@@ -200,7 +200,7 @@ unsafe fn render(
             error,
         );
     };
-    let (document, slot) = match xml_sec_libxml2::document::snapshot(doc, policy) {
+    let (document, slot) = match xml_sec_libxml2::document::snapshot(doc, &*policy) {
         Ok(snapshot) => snapshot,
         Err(error) => {
             failed(&error.to_string());
@@ -226,7 +226,7 @@ unsafe fn render(
             view.document().root(),
             TransformData::Binary(input),
             &transforms,
-            policy,
+            &policy,
         )
         .map_err(|error| error.to_string())
     });

@@ -9,6 +9,7 @@
 use std::ffi::{c_int, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+pub(crate) mod app;
 pub(crate) mod asymkeys;
 pub(crate) mod base64;
 pub(crate) mod buffer;

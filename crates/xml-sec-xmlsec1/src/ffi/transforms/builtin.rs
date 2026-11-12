@@ -911,7 +911,7 @@ unsafe fn canonical(
     // SAFETY: a live node set by the caller's contract.
     let doc = unsafe { (*nodes).doc };
     let (document, slot) =
-        xml_sec_libxml2::document::snapshot(doc, policy).map_err(|error| error.to_string())?;
+        xml_sec_libxml2::document::snapshot(doc, &*policy).map_err(|error| error.to_string())?;
     let mut algorithm = C14nAlgorithm::new(mode, comments);
     if let Some(prefixes) = prefixes {
         algorithm = algorithm.with_prefix_list(&prefixes);

@@ -10,7 +10,10 @@ mod content;
 mod edit;
 mod qname;
 
-pub(crate) use content::{xmlSecIsEmptyNode, xmlSecNodeEncodeAndSetContent, xmlSecPrintXmlString};
+pub(crate) use content::{
+    xmlSecGetNodeContentAsSize, xmlSecIsEmptyNode, xmlSecNodeEncodeAndSetContent,
+    xmlSecPrintXmlString,
+};
 pub(crate) use edit::{
     xmlSecAddChild, xmlSecAddNextSibling, xmlSecAddPrevSibling, xmlSecGetDefaultLineFeed,
     xmlSecReplaceContent,

@@ -77,7 +77,7 @@ pub(crate) fn record_error(error: &impl std::fmt::Display) {
 
 fn parse_tree(parts: &[&[u8]]) -> Result<usize, DocumentError> {
     let policy = crate::policy::library().ok_or(DocumentError::Policy)?;
-    let tree = OwnedTree::parse_parts_with_policy(parts, policy)?;
+    let tree = OwnedTree::parse_parts_with_policy(parts, &*policy)?;
     Ok(handles::register(tree)?)
 }
 

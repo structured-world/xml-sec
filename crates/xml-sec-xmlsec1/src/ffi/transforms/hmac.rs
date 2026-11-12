@@ -1,0 +1,636 @@
+//! The built-in provider's HMAC signature transform klasses and the
+//! library's HMAC minimum output length.
+//!
+//! A klass reads `HMACOutputLength` and checks it against the library
+//! policy's HMAC output minimum and the `XMLDSig` floor the core applies,
+//! takes an HMAC key of the binary value klass, computes the MAC through
+//! the core's incremental HMAC and writes or compares it truncated to the
+//! selected length. `xmlSecTransformHmacSetMinOutputBitsSize` republishes
+//! the library policy with the new minimum.
+
+use std::ffi::{c_char, c_int, c_uint, c_void};
+
+use xml_sec::xmldsig::{
+    HmacSigningKey, IncrementalHmac, SignatureAlgorithm, constant_time_eq, validate_signing_key,
+};
+
+use super::super::buffer::{
+    xmlSecBufferAppend, xmlSecBufferGetData, xmlSecBufferGetSize, xmlSecBufferRemoveHead,
+};
+use super::super::errors::{self, Here, here};
+use super::super::keys::{TYPE_SYMMETRIC, XmlSecKey, xmlSecKeyGetValue};
+use super::super::keysdata::{check_id, xmlSecKeyDataBinaryValueGetBuffer};
+use super::super::strings::{
+    xmlSecDSigNs, xmlSecHrefHmacSha1, xmlSecHrefHmacSha224, xmlSecHrefHmacSha256,
+    xmlSecHrefHmacSha384, xmlSecHrefHmacSha512, xmlSecNameHmacSha1, xmlSecNameHmacSha224,
+    xmlSecNameHmacSha256, xmlSecNameHmacSha384, xmlSecNameHmacSha512, xmlSecNodeHMACOutputLength,
+};
+#[cfg(feature = "legacy-algorithms")]
+use super::super::strings::{
+    xmlSecHrefHmacMd5, xmlSecHrefHmacRipemd160, xmlSecNameHmacMd5, xmlSecNameHmacRipemd160,
+};
+use super::super::symkeys;
+use super::super::tree::{XmlNode, nodes};
+use super::super::xmltree::{
+    xmlSecCheckNodeName, xmlSecGetNextElementNode, xmlSecGetNodeContentAsSize,
+};
+use super::super::{contain, policy};
+use super::builtin::klass;
+use super::{
+    OPERATION_SIGN, OPERATION_VERIFY, STATUS_FAIL, STATUS_FINISHED, STATUS_NONE, STATUS_OK,
+    STATUS_WORKING, USAGE_SIGNATURE_METHOD, WithContext, XmlSecKeyReq, XmlSecTransform,
+    XmlSecTransformCtx, XmlSecTransformKlass, valid, xmlSecTransformDefaultPopBin,
+    xmlSecTransformDefaultPushBin,
+};
+
+/// `xmlSecKeyUsageSign`.
+const KEY_USAGE_SIGN: c_uint = 0x0000_0001;
+/// `xmlSecKeyUsageVerify`.
+const KEY_USAGE_VERIFY: c_uint = 0x0000_0002;
+/// The bits kept of a truncated MAC's last byte, by the selected length
+/// modulo 8 (`XMLDSig` 1.1 section 6.3.1: the leftmost bits).
+const LAST_BYTE_MASKS: [u8; 8] = [0xFF, 0x80, 0xC0, 0xE0, 0xF0, 0xF8, 0xFC, 0xFE];
+
+/// The state of an HMAC transform.
+struct Hmac {
+    /// The running MAC, from the key until the last chunk; boxed, as its
+    /// state is more aligned than the libxml2 allocation holding the object.
+    mac: Option<Box<IncrementalHmac>>,
+    /// The selected output length in bits, zero for the full MAC.
+    output_bits: usize,
+    /// The full MAC once finished.
+    result: Vec<u8>,
+}
+
+/// An HMAC klass of `name` and `href`.
+const fn hmac_klass(name: &'static [u8], href: &'static [u8]) -> XmlSecTransformKlass {
+    XmlSecTransformKlass {
+        initialize: Some(initialize),
+        finalize: Some(finalize),
+        read_node: Some(read_node),
+        set_key_req: Some(set_key_req),
+        set_key: Some(set_key),
+        verify: Some(verify),
+        push_bin: Some(xmlSecTransformDefaultPushBin),
+        pop_bin: Some(xmlSecTransformDefaultPopBin),
+        execute: Some(execute),
+        ..klass(
+            size_of::<WithContext<Hmac>>(),
+            name.as_ptr(),
+            href.as_ptr(),
+            USAGE_SIGNATURE_METHOD,
+        )
+    }
+}
+
+macro_rules! hmacs {
+    ($($(#[$meta:meta])* $klass:ident, $getter:ident, $name:ident, $href:ident, $algorithm:ident;)*) => {
+        $(
+            $(#[$meta])*
+            static $klass: XmlSecTransformKlass = hmac_klass(&$name, &$href);
+
+            $(#[$meta])*
+            #[doc = concat!("The built-in table's `", stringify!($klass), "` klass.")]
+            pub(crate) extern "C" fn $getter() -> *const XmlSecTransformKlass {
+                &raw const $klass
+            }
+        )*
+
+        /// The signature method of klass `id`, `None` for any other klass.
+        fn algorithm(id: *const XmlSecTransformKlass) -> Option<SignatureAlgorithm> {
+            $(
+                $(#[$meta])*
+                if std::ptr::eq(id, &raw const $klass) {
+                    return Some(SignatureAlgorithm::$algorithm);
+                }
+            )*
+            None
+        }
+    };
+}
+
+hmacs! {
+    #[cfg(feature = "legacy-algorithms")]
+    HMAC_MD5, hmac_md5, xmlSecNameHmacMd5, xmlSecHrefHmacMd5, HmacMd5;
+    #[cfg(feature = "legacy-algorithms")]
+    HMAC_RIPEMD160, hmac_ripemd160, xmlSecNameHmacRipemd160, xmlSecHrefHmacRipemd160, HmacRipemd160;
+    HMAC_SHA1, hmac_sha1, xmlSecNameHmacSha1, xmlSecHrefHmacSha1, HmacSha1;
+    HMAC_SHA224, hmac_sha224, xmlSecNameHmacSha224, xmlSecHrefHmacSha224, HmacSha224;
+    HMAC_SHA256, hmac_sha256, xmlSecNameHmacSha256, xmlSecHrefHmacSha256, HmacSha256;
+    HMAC_SHA384, hmac_sha384, xmlSecNameHmacSha384, xmlSecHrefHmacSha384, HmacSha384;
+    HMAC_SHA512, hmac_sha512, xmlSecNameHmacSha512, xmlSecHrefHmacSha512, HmacSha512;
+}
+
+/// The HMAC object of a valid transform of these klasses, after
+/// libxmlsec1's assertion at `here`.
+///
+/// # Safety
+/// `transform` is null or a transform; a transform of these klasses was
+/// initialized.
+unsafe fn object<'a>(
+    transform: *mut XmlSecTransform,
+    here: Here,
+) -> Option<(&'a mut XmlSecTransform, SignatureAlgorithm, &'a mut Hmac)> {
+    // SAFETY: by the caller's contract; a valid object of these klasses has
+    // the HMAC layout.
+    unsafe {
+        let found = valid(transform).and_then(|(object, klass)| {
+            let algorithm = algorithm(object.id)?;
+            (klass.obj_size >= size_of::<WithContext<Hmac>>()).then_some(algorithm)
+        });
+        let Some(algorithm) = found else {
+            errors::assertion(here, c"xmlSecOpenSSLHmacCheckId(transform)");
+            return None;
+        };
+        let with = &mut *transform.cast::<WithContext<Hmac>>();
+        Some((&mut with.transform, algorithm, &mut with.context))
+    }
+}
+
+/// The transform's name for a report.
+fn name_of(transform: &XmlSecTransform) -> *const c_char {
+    // SAFETY: a valid transform's klass outlives it.
+    unsafe { (*transform.id).name.cast() }
+}
+
+/// Whether `transform` signs or verifies, after libxmlsec1's assertion.
+fn signs_or_verifies(transform: &XmlSecTransform, here: Here) -> bool {
+    let holds = transform.operation == OPERATION_SIGN || transform.operation == OPERATION_VERIFY;
+    if !holds {
+        errors::assertion(
+            here,
+            c"(transform->operation == xmlSecTransformOperationSign) || (transform->operation == xmlSecTransformOperationVerify)",
+        );
+    }
+    holds
+}
+
+unsafe extern "C" fn initialize(transform: *mut XmlSecTransform) -> c_int {
+    contain(-1, || {
+        // SAFETY: the dispatcher passes a transform of these klasses, whose
+        // zeroed tail is written here.
+        unsafe {
+            if valid(transform)
+                .and_then(|(object, _)| algorithm(object.id))
+                .is_none()
+            {
+                errors::assertion(
+                    here!("xmlSecOpenSSLHmacInitialize"),
+                    c"xmlSecOpenSSLHmacCheckId(transform)",
+                );
+                return -1;
+            }
+            (&raw mut (*transform.cast::<WithContext<Hmac>>()).context).write(Hmac {
+                mac: None,
+                output_bits: 0,
+                result: Vec::new(),
+            });
+        }
+        0
+    })
+}
+
+unsafe extern "C" fn finalize(transform: *mut XmlSecTransform) {
+    contain((), || {
+        // SAFETY: an initialized transform of these klasses; its state is
+        // dropped once.
+        unsafe {
+            if valid(transform)
+                .and_then(|(object, _)| algorithm(object.id))
+                .is_some()
+            {
+                std::ptr::drop_in_place(&raw mut (*transform.cast::<WithContext<Hmac>>()).context);
+            }
+        }
+    });
+}
+
+/// `readNode`: the optional `HMACOutputLength` child of the signature
+/// method, checked against the library policy.
+unsafe extern "C" fn read_node(
+    transform: *mut XmlSecTransform,
+    node: *mut XmlNode,
+    _ctx: *mut XmlSecTransformCtx,
+) -> c_int {
+    contain(-1, || {
+        let here = here!("xmlSecTransformHmacReadOutputBitsSize");
+        // SAFETY: the dispatcher passes a transform.
+        let Some((object, algorithm, hmac)) =
+            (unsafe { object(transform, here!("xmlSecOpenSSLHmacNodeRead")) })
+        else {
+            return -1;
+        };
+        if node.is_null() {
+            errors::assertion(here, c"node != NULL");
+            return -1;
+        }
+        let name = name_of(object);
+        // SAFETY: the out-pointer is a local.
+        unsafe {
+            let mut child = xmlSecGetNextElementNode(nodes::first_child(node));
+            if !child.is_null()
+                && xmlSecCheckNodeName(
+                    child,
+                    xmlSecNodeHMACOutputLength.as_ptr(),
+                    xmlSecDSigNs.as_ptr(),
+                ) != 0
+            {
+                let mut bits = hmac.output_bits;
+                if xmlSecGetNodeContentAsSize(child, hmac.output_bits, &raw mut bits) != 0 {
+                    errors::internal(
+                        here,
+                        std::ptr::null(),
+                        c"xmlSecGetNodeContentAsSize(HMACOutputLength)",
+                    );
+                    return -1;
+                }
+                let Some(policy) = policy::verification_at(here) else {
+                    return -1;
+                };
+                if let Err(violation) = policy.hmac.validate_output(algorithm, bits) {
+                    errors::invalid_node_content(
+                        here,
+                        child,
+                        std::ptr::null(),
+                        &violation.to_string(),
+                    );
+                    return -1;
+                }
+                hmac.output_bits = bits;
+                child = xmlSecGetNextElementNode(nodes::next(child));
+            }
+            if !child.is_null() {
+                errors::unexpected_node(here, child, std::ptr::null());
+                errors::internal(
+                    here!("xmlSecOpenSSLHmacNodeRead"),
+                    name,
+                    c"xmlSecTransformHmacReadOutputBitsSize()",
+                );
+                return -1;
+            }
+        }
+        0
+    })
+}
+
+/// `setKeyReq`: a symmetric HMAC key for signing or verifying.
+unsafe extern "C" fn set_key_req(transform: *mut XmlSecTransform, req: *mut XmlSecKeyReq) -> c_int {
+    contain(-1, || {
+        let here = here!("xmlSecOpenSSLHmacSetKeyReq");
+        // SAFETY: the dispatcher passes a transform.
+        let Some((object, _, _)) = (unsafe { object(transform, here) }) else {
+            return -1;
+        };
+        if !signs_or_verifies(object, here) {
+            return -1;
+        }
+        // SAFETY: null or the caller's key requirements.
+        let Some(req) = (unsafe { req.as_mut() }) else {
+            errors::assertion(here, c"keyReq != NULL");
+            return -1;
+        };
+        req.key_id = symkeys::hmac().cast();
+        req.key_type = TYPE_SYMMETRIC;
+        req.key_usage = if object.operation == OPERATION_SIGN {
+            KEY_USAGE_SIGN
+        } else {
+            KEY_USAGE_VERIFY
+        };
+        0
+    })
+}
+
+/// `setKey`: the secret of the key's HMAC value starts the MAC.
+unsafe extern "C" fn set_key(transform: *mut XmlSecTransform, key: *mut c_void) -> c_int {
+    let key = key.cast::<XmlSecKey>();
+    contain(-1, || {
+        let here = here!("xmlSecOpenSSLHmacSetKey");
+        // SAFETY: the dispatcher passes a transform.
+        let Some((object, algorithm, hmac)) = (unsafe { object(transform, here) }) else {
+            return -1;
+        };
+        if !signs_or_verifies(object, here) {
+            return -1;
+        }
+        if key.is_null() {
+            errors::assertion(here, c"key != NULL");
+            return -1;
+        }
+        if hmac.mac.is_some() {
+            errors::assertion(here, c"ctx->ctxInitialized == 0");
+            return -1;
+        }
+        let name = name_of(object);
+        // SAFETY: a key whose value is null or key data.
+        unsafe {
+            let value = xmlSecKeyGetValue(key);
+            if !check_id(value, symkeys::hmac()) {
+                errors::assertion(
+                    here,
+                    c"xmlSecKeyDataCheckId(value, xmlSecOpenSSLKeyDataHmacId)",
+                );
+                return -1;
+            }
+            let buffer = xmlSecKeyDataBinaryValueGetBuffer(value);
+            let size = xmlSecBufferGetSize(buffer);
+            if size == 0 {
+                errors::report(
+                    here,
+                    name,
+                    std::ptr::null(),
+                    errors::R_INVALID_KEY_DATA_SIZE,
+                    "invalid zero key data size",
+                );
+                return -1;
+            }
+            let secret = std::slice::from_raw_parts(xmlSecBufferGetData(buffer), size);
+            match admit(object.operation, algorithm, secret, hmac.output_bits, here) {
+                Ok(()) => {}
+                Err(Some(refusal)) => {
+                    errors::internal_with(here, name, c"policy", &refusal);
+                    return -1;
+                }
+                // The unavailable policy is already reported.
+                Err(None) => return -1,
+            }
+            match IncrementalHmac::begin(algorithm, secret) {
+                Ok(mac) => hmac.mac = Some(Box::new(mac)),
+                Err(error) => {
+                    errors::internal_with(
+                        here,
+                        name,
+                        c"IncrementalHmac::begin",
+                        &error.to_string(),
+                    );
+                    return -1;
+                }
+            }
+        }
+        0
+    })
+}
+
+/// Checks the method, the secret and the output length, the full MAC when
+/// none is selected, against the library policy of `operation`; `Err(None)`
+/// after the unavailable policy is reported at `here`.
+fn admit(
+    operation: c_int,
+    algorithm: SignatureAlgorithm,
+    secret: &[u8],
+    output_bits: usize,
+    here: Here,
+) -> Result<(), Option<String>> {
+    let refused = |error: &dyn std::fmt::Display| Some(error.to_string());
+    let full = algorithm
+        .hmac_output_bits()
+        .ok_or_else(|| Some("not an HMAC method".to_owned()))?;
+    let bits = if output_bits == 0 { full } else { output_bits };
+    if operation == OPERATION_SIGN {
+        let policy = policy::signing_at(here).ok_or(None)?;
+        let key = HmacSigningKey::new(secret.to_vec()).map_err(|error| refused(&error))?;
+        validate_signing_key(&key, algorithm, &policy).map_err(|error| refused(&error))?;
+        policy
+            .hmac
+            .validate_output(algorithm, bits)
+            .map_err(|error| refused(&error))
+    } else {
+        let policy = policy::verification_at(here).ok_or(None)?;
+        policy
+            .check_signature_algorithm(algorithm)
+            .map_err(|error| refused(&error))?;
+        policy
+            .hmac
+            .validate_key_bytes(secret.len())
+            .map_err(|error| refused(&error))?;
+        policy
+            .hmac
+            .validate_output(algorithm, bits)
+            .map_err(|error| refused(&error))
+    }
+}
+
+/// The selected output length of `hmac` in bytes, with the mask of its
+/// last byte.
+fn selected(hmac: &Hmac) -> (usize, u8) {
+    (
+        hmac.output_bits.div_ceil(8),
+        LAST_BYTE_MASKS[hmac.output_bits % 8],
+    )
+}
+
+/// `verify`: the truncated MAC against `size` bytes at `data`, in constant
+/// time; a mismatch is a failed status, not an error.
+unsafe extern "C" fn verify(
+    transform: *mut XmlSecTransform,
+    data: *const u8,
+    size: usize,
+    _ctx: *mut XmlSecTransformCtx,
+) -> c_int {
+    contain(-1, || {
+        let here = here!("xmlSecOpenSSLHmacVerify");
+        // SAFETY: the dispatcher passes a transform.
+        let Some((object, _, hmac)) = (unsafe { object(transform, here) }) else {
+            return -1;
+        };
+        for (holds, expression) in [
+            (
+                object.operation == OPERATION_VERIFY,
+                c"transform->operation == xmlSecTransformOperationVerify",
+            ),
+            (
+                object.status == STATUS_FINISHED,
+                c"transform->status == xmlSecTransformStatusFinished",
+            ),
+            (!data.is_null(), c"data != NULL"),
+            (hmac.output_bits > 0, c"ctx->dgstSizeInBits > 0"),
+        ] {
+            if !holds {
+                errors::assertion(here, expression);
+                return -1;
+            }
+        }
+        let helper = here!("xmlSecTransformHmacVerify");
+        if size == 0 {
+            errors::assertion(helper, c"dataSize > 0");
+            return -1;
+        }
+        let (length, mask) = selected(hmac);
+        if size != length {
+            errors::report(
+                helper,
+                std::ptr::null(),
+                std::ptr::null(),
+                errors::R_INVALID_SIZE,
+                &format!(
+                    "invalid size for 'HMAC digest': actual={size} is not equal to expected={length}"
+                ),
+            );
+            object.status = STATUS_FAIL;
+            return 0;
+        }
+        // SAFETY: the caller's `size` bytes.
+        let expected = unsafe { std::slice::from_raw_parts(data, size) };
+        let last = (hmac.result[length - 1] ^ expected[length - 1]) & mask;
+        // Both parts are computed before either decides, so the time does
+        // not depend on where the values differ.
+        let body = constant_time_eq(&hmac.result[..length - 1], &expected[..length - 1]);
+        let tail = last == 0;
+        if body && tail {
+            object.status = STATUS_OK;
+        } else {
+            errors::other(
+                helper,
+                errors::R_DATA_NOT_MATCH,
+                std::ptr::null(),
+                Some("data and digest do not match"),
+            );
+            object.status = STATUS_FAIL;
+        }
+        0
+    })
+}
+
+/// Absorbs the input buffer of a working transform; on the `last` chunk
+/// finishes the MAC and, when signing, writes it truncated to the output.
+fn absorb(object: &mut XmlSecTransform, hmac: &mut Hmac, last: bool, here: Here) -> c_int {
+    let name = name_of(object);
+    let Some(mac) = hmac.mac.as_mut() else {
+        errors::invalid_status(here, name, object.status);
+        return -1;
+    };
+    let input = &raw mut object.in_buf;
+    // SAFETY: the transform's own input buffer.
+    unsafe {
+        let size = xmlSecBufferGetSize(input);
+        if size > 0 {
+            mac.update(std::slice::from_raw_parts(xmlSecBufferGetData(input), size));
+            if xmlSecBufferRemoveHead(input, size) < 0 {
+                errors::internal_with(
+                    here,
+                    name,
+                    c"xmlSecBufferRemoveHead",
+                    &format!("size={size}"),
+                );
+                return -1;
+            }
+        }
+    }
+    if !last {
+        return 0;
+    }
+    let Some(mac) = hmac.mac.take() else {
+        return -1;
+    };
+    hmac.result = mac.finish();
+    let full = hmac.result.len();
+    if hmac.output_bits == 0 {
+        hmac.output_bits = full * 8;
+    }
+    let (length, mask) = selected(hmac);
+    if length > full {
+        errors::report(
+            here,
+            name,
+            std::ptr::null(),
+            errors::R_NOT_IMPLEMENTED,
+            &format!(
+                "invalid size for 'HMAC output length': actual={length} is more than expected={full}"
+            ),
+        );
+        return -1;
+    }
+    if object.operation == OPERATION_SIGN {
+        let mut output = hmac.result[..length].to_vec();
+        output[length - 1] &= mask;
+        // SAFETY: the transform's own output buffer.
+        if unsafe { xmlSecBufferAppend(&raw mut object.out_buf, output.as_ptr(), length) } < 0 {
+            errors::internal_with(here, name, c"xmlSecBufferAppend", &format!("size={length}"));
+            return -1;
+        }
+    }
+    object.status = STATUS_FINISHED;
+    0
+}
+
+/// `execute`: libxmlsec1's state machine over [`absorb`]; the key must have
+/// been set.
+unsafe extern "C" fn execute(
+    transform: *mut XmlSecTransform,
+    last: c_int,
+    ctx: *mut XmlSecTransformCtx,
+) -> c_int {
+    contain(-1, || {
+        let here = here!("xmlSecOpenSSLHmacExecute");
+        // SAFETY: the dispatcher passes a transform.
+        let Some((object, _, hmac)) = (unsafe { object(transform, here) }) else {
+            return -1;
+        };
+        if !signs_or_verifies(object, here) {
+            return -1;
+        }
+        if ctx.is_null() {
+            errors::assertion(here, c"transformCtx != NULL");
+            return -1;
+        }
+        if object.status == STATUS_NONE {
+            if hmac.mac.is_none() {
+                errors::assertion(here, c"ctx->ctxInitialized != 0");
+                return -1;
+            }
+            object.status = STATUS_WORKING;
+        }
+        match object.status {
+            STATUS_WORKING => absorb(object, hmac, last != 0, here),
+            // Only reached without input.
+            STATUS_FINISHED => {
+                // SAFETY: the transform's own input buffer.
+                if unsafe { xmlSecBufferGetSize(&raw mut object.in_buf) } != 0 {
+                    errors::assertion(here, c"xmlSecBufferGetSize(in) == 0");
+                    return -1;
+                }
+                0
+            }
+            status => {
+                errors::invalid_status(here, name_of(object), status);
+                -1
+            }
+        }
+    })
+}
+
+/// `xmlSecTransformHmacGetMinOutputBitsSize`: the library policy's minimum
+/// HMAC output length in bits.
+///
+/// # Safety
+/// Callable at any time.
+#[unsafe(no_mangle)]
+pub(crate) extern "C" fn xmlSecTransformHmacGetMinOutputBitsSize() -> usize {
+    contain(0, || {
+        policy::verification().map_or(0, |policy| policy.hmac.minimum_output_bits)
+    })
+}
+
+/// `xmlSecTransformHmacSetMinOutputBitsSize`: republishes the library policy
+/// with `val` as its minimum HMAC output length. The `XMLDSig` floor (80 bits
+/// and half the digest) still applies below it, so a smaller value cannot
+/// weaken verification; zero is kept as one, the policy's least value.
+///
+/// # Safety
+/// Callable at any time; like libxmlsec1's setter, it is meant for
+/// initialization, and a run already started keeps its snapshot.
+#[unsafe(no_mangle)]
+pub(crate) extern "C" fn xmlSecTransformHmacSetMinOutputBitsSize(val: usize) {
+    contain((), || {
+        let minimum = val.max(1);
+        let published = policy::republish(
+            |policy| policy.hmac.minimum_output_bits = minimum,
+            |policy| policy.hmac.minimum_output_bits = minimum,
+        );
+        if published.is_none() {
+            errors::policy_unavailable(here!("xmlSecTransformHmacSetMinOutputBitsSize"));
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests;

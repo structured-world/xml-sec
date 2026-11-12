@@ -737,7 +737,7 @@ unsafe fn evaluate_list(
     let failed = |error: &str| {
         errors::internal_with(here, std::ptr::null(), c"xmlSecXPathDataExecute", error);
     };
-    let (document, slot) = match xml_sec_libxml2::document::snapshot(doc, policy) {
+    let (document, slot) = match xml_sec_libxml2::document::snapshot(doc, &*policy) {
         Ok(snapshot) => snapshot,
         Err(error) => {
             failed(&error.to_string());
