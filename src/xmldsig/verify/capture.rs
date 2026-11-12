@@ -29,13 +29,9 @@ pub(super) trait VerificationCapture {
         key: &dyn VerifyingKey,
         input: crate::provider::SignatureVerificationInput<'_>,
     ) -> Result<bool, DsigError> {
-        provider.verify_with_context(
-            key,
-            input.algorithm,
-            input.context,
-            input.data,
-            input.signature,
-        )
+        // The receipt entry point carries the input's certificate session to
+        // a provider that reads key material itself; nothing is observed.
+        provider.verify_with_key_receipt(key, input, &mut |_| Ok(()))
     }
     fn method(
         &self,

@@ -32,8 +32,9 @@ use super::super::strings::{
 };
 use super::super::tree::{XmlDoc, XmlNode, XmlNodeSet, c_text, nodes, same_text};
 use super::super::xmltree::{next_element, xmlSecCheckNodeName};
-use super::super::{contain, free, malloc, policy};
+use super::super::{contain, free, malloc};
 use super::builtin::klass;
+use super::ctx::run_policy;
 use super::{
     USAGE_DSIG_TRANSFORM, WithContext, XmlSecTransform, XmlSecTransformCtx, XmlSecTransformKlass,
     context, context_or, klass_text, valid, xmlSecTransformDefaultPopXml,
@@ -708,8 +709,14 @@ unsafe extern "C" fn execute(
         c"doc != NULL",
         -1
     );
+    // SAFETY: an initialized context.
+    let Some(pinned) = (unsafe { run_policy(ctx, here) }) else {
+        return -1;
+    };
     // SAFETY: an expression transform read from a live element.
-    let Some(output) = (unsafe { evaluate_list(expressions, object.in_nodes, doc) }) else {
+    let Some(output) =
+        (unsafe { evaluate_list(expressions, object.in_nodes, doc, &pinned.verification) })
+    else {
         // SAFETY: a valid transform.
         let name = unsafe { name_of(transform) };
         errors::internal(here, name, c"xmlSecXPathDataListExecute");
@@ -720,7 +727,8 @@ unsafe extern "C" fn execute(
 }
 
 /// The node set the expressions of `list` make from `input` over `doc`
-/// (libxmlsec1's `xmlSecXPathDataListExecute`, whose failures it reports).
+/// under `policy` (libxmlsec1's `xmlSecXPathDataListExecute`, whose failures
+/// it reports).
 ///
 /// # Safety
 /// `list` is a data list; `input` is null or a live node set over the live
@@ -729,9 +737,9 @@ unsafe fn evaluate_list(
     list: &mut XmlSecPtrList,
     input: *mut XmlSecNodeSet,
     doc: *mut XmlDoc,
+    policy: &xml_sec::policy::VerificationPolicy,
 ) -> Option<*mut XmlSecNodeSet> {
     let here = here!("xmlSecXPathDataListExecute");
-    let policy = policy::verification_at(here)?;
     // The core evaluates over a snapshot of the tree in place of libxml2's
     // evaluation context.
     let failed = |error: &str| {

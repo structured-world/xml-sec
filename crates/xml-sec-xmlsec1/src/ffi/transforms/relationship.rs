@@ -24,6 +24,7 @@ use super::super::strings::{
 use super::super::tree::{XmlNode, c_text, nodes};
 use super::super::xmltree::xmlSecCheckNodeName;
 use super::builtin::{PopTarget, klass, pop_rendered, push_rendered, selected_octets};
+use super::ctx::run_policy;
 use super::io::{OutputBuffer, xmlOutputBufferWrite};
 use super::{
     USAGE_DSIG_TRANSFORM, WithContext, XmlSecTransform, XmlSecTransformCtx, XmlSecTransformKlass,
@@ -175,19 +176,28 @@ unsafe extern "C" fn read_node(
 }
 
 /// Writes the transform's output for the document of `selected` to the
-/// output buffer `out`.
+/// output buffer `out`, under the policy of the run of `ctx`.
 ///
 /// # Safety
-/// `selected` is a live node set; `out`'s callbacks are callable.
+/// `selected` is a live node set; `out`'s callbacks are callable; `ctx` is
+/// null or an initialized context.
 unsafe fn render(
     selectors: &Selectors,
     selected: *mut XmlSecNodeSet,
     out: *mut OutputBuffer,
+    ctx: *mut XmlSecTransformCtx,
 ) -> c_int {
     let here = here!("xmlSecTransformRelationshipExecute");
-    let Some(policy) = policy::verification_at(here) else {
+    let pinned = if ctx.is_null() {
+        policy::Pinned::current(here)
+    } else {
+        // SAFETY: by the caller's contract.
+        unsafe { run_policy(ctx, here) }
+    };
+    let Some(pinned) = pinned else {
         return -1;
     };
+    let policy = &pinned.verification;
     // SAFETY: by the caller's contract.
     let doc = unsafe { (*selected).doc };
     // The core runs the transform in place of libxmlsec1's node-list walk;
@@ -200,7 +210,7 @@ unsafe fn render(
             error,
         );
     };
-    let (document, slot) = match xml_sec_libxml2::document::snapshot(doc, policy) {
+    let (document, slot) = match xml_sec_libxml2::document::snapshot(doc, &**policy) {
         Ok(snapshot) => snapshot,
         Err(error) => {
             failed(&error.to_string());
@@ -260,8 +270,9 @@ unsafe extern "C" fn push_xml(
         return -1;
     };
     let render = |nodes, out| {
-        // SAFETY: the node set and the output buffer are live for the call.
-        unsafe { render(list, nodes, out) }
+        // SAFETY: the node set, the output buffer and the context are live
+        // for the call.
+        unsafe { render(list, nodes, out, ctx) }
     };
     // SAFETY: a Relationship transform, its chain and context.
     unsafe {
@@ -289,8 +300,9 @@ unsafe extern "C" fn pop_bin(
         return -1;
     };
     let render = |nodes, out| {
-        // SAFETY: the node set and the output buffer are live for the call.
-        unsafe { render(list, nodes, out) }
+        // SAFETY: the node set, the output buffer and the context are live
+        // for the call.
+        unsafe { render(list, nodes, out, ctx) }
     };
     let target = PopTarget {
         data,

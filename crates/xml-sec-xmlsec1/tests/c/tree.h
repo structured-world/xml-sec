@@ -15,18 +15,27 @@
 #include <libxml/xpathInternals.h>
 
 #include <libxml/xmlerror.h>
+#include <libxml/valid.h>
 
 #define xsSetGenericErrorFunc xmlSetGenericErrorFunc
 #define xsFree(mem) xmlFree(mem)
 #define xsStrdup xmlStrdup
 #define xsReadMemory xmlReadMemory
+#define xsNewDoc xmlNewDoc
 #define xsFreeDoc xmlFreeDoc
 #define xsDocGetRootElement xmlDocGetRootElement
+#define xsDocSetRootElement xmlDocSetRootElement
+#define xsAddChild xmlAddChild
+#define xsGetProp xmlGetProp
 #define xsDocDumpMemory xmlDocDumpMemory
 #define xsNewDocNode xmlNewDocNode
 #define xsNodeGetContent xmlNodeGetContent
 #define xsFreeNode xmlFreeNode
+#define xsFreeNodeList xmlFreeNodeList
+#define xsNewDocText xmlNewDocText
 #define xsSearchNs xmlSearchNs
+/* Only compared with NULL by the programs: an attribute against an element. */
+#define xsGetID(doc, value) ((void *)xmlGetID(doc, value))
 #define xsXPathNodeSetCreate xmlXPathNodeSetCreate
 #define xsXPathNodeSetAdd xmlXPathNodeSetAdd
 #define xsXPathNodeSetAddNs xmlXPathNodeSetAddNs
@@ -41,6 +50,23 @@ static inline xmlNodePtr xsNodeGetChildren(const xmlNode *node) {
 }
 static inline xmlNodePtr xsNodeGetNext(const xmlNode *node) {
     return node != NULL ? node->next : NULL;
+}
+/* libxml2's xmlNodeSetContent returns nothing before 2.13 and an int from
+ * then on; a function gives one shape whatever the version, and a caller
+ * that ignores the result compiles without a warning. */
+static inline int xsNodeSetContent(xmlNodePtr node, const xmlChar *content) {
+    xmlNodeSetContent(node, content);
+    return 0;
+}
+static inline xmlNodePtr xsNodeGetPrev(const xmlNode *node) {
+    return node != NULL ? node->prev : NULL;
+}
+static inline xmlNodePtr xsNodeGetLast(const xmlNode *node) {
+    return node != NULL ? node->last : NULL;
+}
+static inline xmlChar *xsNodeGetNsPrefix(const xmlNode *node) {
+    return node != NULL && node->ns != NULL && node->ns->prefix != NULL ? xmlStrdup(node->ns->prefix)
+                                                                         : NULL;
 }
 static inline xmlNodePtr xsNodeGetParent(const xmlNode *node) {
     return node != NULL ? node->parent : NULL;
