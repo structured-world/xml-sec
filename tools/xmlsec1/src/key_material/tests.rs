@@ -124,6 +124,40 @@ fn rsa_pkcs8_pem_keeps_label_and_protected_failure_contracts() {
 }
 
 #[test]
+fn both_private_key_import_paths_stop_lax_search_alike() {
+    // A policy refusal is terminal whichever importer reports it, and a
+    // store error wrapping one is classified the same.
+    let invalid_policy = ResourcePolicy {
+        max_external_resource_bytes: usize::MAX,
+        ..ResourcePolicy::default()
+    };
+    let pem = include_bytes!("../../../../tests/fixtures/keys/rsa/rsa-2048-key.pem");
+    let mut inventory = xml_sec::key_manager::KeyInventory::default();
+    let imported = import_private_key(
+        &mut inventory,
+        pem,
+        &PrivateKeyImport {
+            path: Path::new("key.pem"),
+            name: "key",
+            format: PrivateKeyFormat::Pem,
+            password: None,
+            usages: xml_sec::key_manager::KeyUsages::SIGN,
+            resources: &invalid_policy,
+        },
+    );
+    let error = imported.expect_err("an invalid policy refuses the import");
+    assert!(!error.is_candidate_miss(), "{error:?}");
+    for wrapped in [
+        xml_sec::key_manager::KeyStoreError::ProtectedContainer,
+        xml_sec::key_manager::KeyStoreError::Policy(
+            xml_sec::policy::PolicyViolation::AuthorizationExpired,
+        ),
+    ] {
+        assert!(!KeyMaterialError::KeyStore(wrapped).is_candidate_miss());
+    }
+}
+
+#[test]
 fn protected_rsa_container_failure_is_not_a_lax_candidate_miss() {
     // A wrong or missing password must stop lax search before a later
     // unprotected candidate can silently replace the requested key.

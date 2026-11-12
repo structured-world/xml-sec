@@ -2660,8 +2660,10 @@ impl KeyValueInfo {
             // which RSAKeyValue cannot express.
             SpkiAlgorithm::RsaPss => Err(KeyResolutionError::AlgorithmMismatch),
             SpkiAlgorithm::RsaEncryption => {
+                // RFC 3279 section 2.3.1: rsaEncryption parameters are NULL
+                // (or, as readers accept, absent); any other value is refused.
                 let Some(key) = session
-                    .admitted_rsa_public_key(spki_der, |_, _| Ok(true))
+                    .rsa_public_key(spki_der, None)
                     .map_err(|error| structured_key_error(&session, error))?
                 else {
                     return Err(KeyResolutionError::InvalidPublicKey);

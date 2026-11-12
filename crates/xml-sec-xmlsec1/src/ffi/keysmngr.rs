@@ -264,8 +264,13 @@ pub(crate) unsafe extern "C" fn xmlSecKeysMngrAdoptKeysStore(
             c"xmlSecKeyStoreIsValid(store)",
             -1
         );
-        // SAFETY: a manager owning its store.
+        // SAFETY: a manager owning its store. The store it already owns is
+        // kept, as libxmlsec1 1.3.13 does: releasing it would leave the
+        // manager a freed store.
         unsafe {
+            if std::ptr::eq((*mngr).keys_store, store) {
+                return 0;
+            }
             if !(*mngr).keys_store.is_null() {
                 xmlSecKeyStoreDestroy((*mngr).keys_store);
             }
@@ -337,10 +342,12 @@ pub(crate) unsafe extern "C" fn xmlSecKeysMngrAdoptDataStore(
             c"xmlSecKeyDataStoreIsValid(store)",
             -1
         );
-        // SAFETY: a manager and a valid data store.
+        // SAFETY: a manager and a valid data store. The store already held
+        // is kept; another of its klass replaces it.
         unsafe {
             let list = &raw mut (*mngr).stores_list;
             match data_store_position(mngr, (*store).id.cast()) {
+                Some(pos) if std::ptr::eq(xmlSecPtrListGetItem(list, pos), store.cast()) => 0,
                 Some(pos) => xmlSecPtrListSet(list, store.cast(), pos),
                 None => xmlSecPtrListAdd(list, store.cast()),
             }

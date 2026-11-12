@@ -116,21 +116,27 @@ static xmlSecSize der_of(const char *path, xmlSecByte *out, xmlSecSize capacity)
 }
 
 /* Signs `input` with `private_key` by `id`; prints the signature when
- * `print`, then verifies it with `public_key`. */
-static void sign(xmlSecTransformId id, xmlSecKeyPtr private_key, xmlSecKeyPtr public_key,
-                 int print) {
+ * `print`, then verifies it with `public_key`. Returns 0 only when the key
+ * was set, both runs executed and the verification reported success: a
+ * failed status is not a nonzero return, so the status is checked too. */
+static int sign(xmlSecTransformId id, xmlSecKeyPtr private_key, xmlSecKeyPtr public_key,
+                int print) {
     xmlSecByte value[1024];
     xmlSecSize size = 0;
     xmlSecSize i;
     int ret;
+    int set;
+    int ok;
     xmlSecTransformCtxPtr ctx = xmlSecTransformCtxCreate();
     xmlSecTransformPtr transform = xmlSecTransformCtxCreateAndAppend(ctx, id);
     transform->operation = xmlSecTransformOperationSign;
-    printf("%s sign: set key=%d", id->name, xmlSecTransformSetKey(transform, private_key));
+    set = xmlSecTransformSetKey(transform, private_key);
+    printf("%s sign: set key=%d", id->name, set);
     /* C leaves the order of argument evaluation unspecified, so a call and
      * the status it sets are never printed in one statement. */
     ret = xmlSecTransformCtxBinaryExecute(ctx, input, sizeof(input) - 1);
     printf(" execute=%d status=%d", ret, transform->status);
+    ok = set == 0 && ret == 0;
     if (ctx->result != NULL) {
         size = xmlSecBufferGetSize(ctx->result);
         if (size <= sizeof(value)) {
@@ -138,9 +144,10 @@ static void sign(xmlSecTransformId id, xmlSecKeyPtr private_key, xmlSecKeyPtr pu
         }
     }
     printf(" size=%u\n", (unsigned)size);
+    ok = ok && size > 0 && size <= sizeof(value);
     if (print) {
         printf("  ");
-        for (i = 0; i < size; ++i) {
+        for (i = 0; i < size && i < sizeof(value); ++i) {
             printf("%02x", value[i]);
         }
         printf("\n");
@@ -150,11 +157,16 @@ static void sign(xmlSecTransformId id, xmlSecKeyPtr private_key, xmlSecKeyPtr pu
     ctx = xmlSecTransformCtxCreate();
     transform = xmlSecTransformCtxCreateAndAppend(ctx, id);
     transform->operation = xmlSecTransformOperationVerify;
-    printf("  verify: set key=%d", xmlSecTransformSetKey(transform, public_key));
-    printf(" execute=%d", xmlSecTransformCtxBinaryExecute(ctx, input, sizeof(input) - 1));
+    set = xmlSecTransformSetKey(transform, public_key);
+    printf("  verify: set key=%d", set);
+    ret = xmlSecTransformCtxBinaryExecute(ctx, input, sizeof(input) - 1);
+    printf(" execute=%d", ret);
+    ok = ok && set == 0 && ret == 0;
     ret = xmlSecTransformVerify(transform, value, size, ctx);
     printf(" verify=%d status=%d\n", ret, transform->status);
+    ok = ok && ret == 0 && transform->status == xmlSecTransformStatusOk;
     xmlSecTransformCtxDestroy(ctx);
+    return ok ? 0 : -1;
 }
 
 /* Signing with a key that holds no private half fails. */
@@ -221,15 +233,25 @@ int main(void) {
                0);
     xmlSecKeyDestroy(key);
 
+    /* The encrypted key must load both ways: printing "no key" alone would
+     * let the run pass without exercising either. */
     key = show("rsa encrypted with password",
                load(RSA_ENCRYPTED, xmlSecKeyDataFormatPem,
                                       "legacy-rsa-password", NULL, NULL),
                1);
+    if (key == NULL) {
+        printf("the encrypted key did not load with its password\n");
+        return 1;
+    }
     xmlSecKeyDestroy(key);
     key = show("rsa encrypted with callback",
                load(RSA_ENCRYPTED, xmlSecKeyDataFormatPem, NULL,
                                       (void *)password, (void *)"legacy-rsa-password"),
                1);
+    if (key == NULL) {
+        printf("the encrypted key did not load through the callback\n");
+        return 1;
+    }
     xmlSecKeyDestroy(key);
 
     quiet = 1;
@@ -256,10 +278,16 @@ int main(void) {
         printf("a required key fixture did not load\n");
         return 1;
     }
-    sign(xmlSecTransformRsaSha256Id, rsa, rsa_public, 1);
-    sign(xmlSecTransformRsaPssSha256Id, rsa, rsa_public, 0);
+    if (sign(xmlSecTransformRsaSha256Id, rsa, rsa_public, 1) < 0 ||
+        sign(xmlSecTransformRsaPssSha256Id, rsa, rsa_public, 0) < 0) {
+        printf("an RSA signature did not verify\n");
+        return 1;
+    }
     sign_public(xmlSecTransformRsaSha256Id, rsa_public);
-    sign(xmlSecTransformEcdsaSha256Id, ec, ec_public, 0);
+    if (sign(xmlSecTransformEcdsaSha256Id, ec, ec_public, 0) < 0) {
+        printf("an ECDSA signature did not verify\n");
+        return 1;
+    }
 
     xmlSecKeyDestroy(rsa);
     xmlSecKeyDestroy(rsa_public);

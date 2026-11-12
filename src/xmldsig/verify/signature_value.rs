@@ -49,6 +49,9 @@ pub fn verify_signature_value(
     // The complete snapshot first, its authorization interval included, as
     // document verification admits a policy.
     policy.validate()?;
+    // This call takes no expected targets: a profile that requires them is
+    // refused, as document verification refuses it without any.
+    policy.signature_constraints.require_targets(false)?;
     policy.check_signature_algorithm(algorithm)?;
     // A supplied key is a pre-resolved one: the policy must permit that
     // source, as document verification requires before it charges the key.

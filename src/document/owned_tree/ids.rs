@@ -59,10 +59,43 @@ impl IdTable {
     /// Records `source` as a further carrier of `value`, which another
     /// attribute holds.
     pub(super) fn shadow(&mut self, value: String, source: IdSource) {
-        let carriers = self.shadowed.entry(value.clone()).or_default();
-        if !carriers.contains(&source) {
-            carriers.push(source.clone());
-            self.shadowed_sources.insert((source, value));
+        // The ordered index answers whether the pair is recorded, so many
+        // carriers of one value cost no scan of the earlier ones.
+        if self
+            .shadowed_sources
+            .insert((source.clone(), value.clone()))
+        {
+            self.shadowed.entry(value).or_default().push(source);
+        }
+    }
+
+    /// Whether `source` is recorded as a further carrier of some value.
+    pub(super) fn is_shadowed(&self, source: &IdSource) -> bool {
+        let first = (source.clone(), String::new());
+        self.shadowed_sources
+            .range(first..)
+            .next()
+            .is_some_and(|(recorded, _)| recorded == source)
+    }
+
+    /// Forget `source` as a further carrier of any value.
+    pub(super) fn unshadow(&mut self, source: &IdSource) {
+        let first = (source.clone(), String::new());
+        let values: alloc::vec::Vec<String> = self
+            .shadowed_sources
+            .range(first..)
+            .take_while(|(recorded, _)| recorded == source)
+            .map(|(_, value)| value.clone())
+            .collect();
+        for value in values {
+            self.shadowed_sources
+                .remove(&(source.clone(), value.clone()));
+            if let Some(carriers) = self.shadowed.get_mut(&value) {
+                carriers.retain(|carrier| carrier != source);
+                if carriers.is_empty() {
+                    self.shadowed.remove(&value);
+                }
+            }
         }
     }
 

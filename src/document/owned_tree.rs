@@ -563,14 +563,17 @@ impl OwnedTree {
 
     /// Take `id` out of the run its holder keeps, freeing the holder with its
     /// last node.
-    fn leave_holder(&mut self, id: NodeId) {
+    /// Take `id` out of the holder of an unlinked run, when it is in one;
+    /// whether it was.
+    fn leave_holder(&mut self, id: NodeId) -> bool {
         let Some(holder) = self.document.parent(id).filter(|&p| self.is_holder(p)) else {
-            return;
+            return false;
         };
         self.document.detach(id);
         if self.document.first_child(holder).is_none() {
             self.mark_freed(holder);
         }
+        true
     }
 
     /// A new holder keeping `nodes`, unlinked and in this order, as one run of
@@ -647,11 +650,14 @@ impl OwnedTree {
             wrapped.push('"');
         }
         wrapped.push('>');
-        wrapped.push_str(fragment);
-        wrapped.push_str("</w>");
-        // A fragment closing the wrapper early leaves a second document
+        // The parts meet the document byte limit together before they are
+        // joined, so an oversized fragment is refused without a copy. A
+        // fragment closing the wrapper early leaves a second document
         // element or stray content, which the parse refuses.
-        let parsed = Self::parse_with_policy(&wrapped, policy)?;
+        let parsed = Self::parse_parts_with_policy(
+            &[wrapped.as_bytes(), fragment.as_bytes(), b"</w>"],
+            policy,
+        )?;
         let Some(element) = parsed.document.root_element() else {
             return Ok(None);
         };
@@ -682,11 +688,12 @@ impl OwnedTree {
         }
         let mut copied = Vec::new();
         let copy = self.import(&source.document, from, Some(&mut copied));
-        if source.linked_parent(from).is_none() {
-            // An unlinked node has no ancestors to inherit from, yet may use
-            // bindings it was parsed or edited under: its copy declares what
-            // it uses, as libxml2's copy reconciles namespaces.
-            self.declare_used_bindings(copy);
+        if !source.attached(node) {
+            // A node outside the document, or inside an unlinked run, has no
+            // ancestors that show the bindings it was parsed or edited under:
+            // its copy declares what it uses, as libxml2's copy reconciles
+            // namespaces.
+            self.declare_used_bindings(copy, BindingScope::new());
         } else if let Some(parent) = source.linked_parent(from) {
             let declared: Vec<Option<String>> = source
                 .document
@@ -745,23 +752,29 @@ impl OwnedTree {
                 }
             }
         }
-        Ok(TreeNode::of(copy))
+        // Held as an unlinked run of one, so linking it reconciles its names
+        // with the scope it lands in.
+        Ok(self.hold(&[copy]).unwrap_or(TreeNode::of(copy)))
     }
 
     /// Declare, on each element of the subtree at `top`, the bindings its
     /// name and attributes use that no declaration in scope within the
     /// subtree provides, so the subtree reads the same on its own.
-    fn declare_used_bindings(&mut self, top: NodeId) {
-        type Scope = Vec<(Option<String>, String)>;
-        fn bound<'a>(scope: &'a Scope, prefix: Option<&str>) -> Option<&'a str> {
+    fn declare_used_bindings(&mut self, top: NodeId, inherited: BindingScope) {
+        fn bound<'a>(scope: &'a BindingScope, prefix: Option<&str>) -> Option<&'a str> {
             scope
                 .iter()
                 .rev()
                 .find(|(declared, _)| declared.as_deref() == prefix)
                 .map(|(_, uri)| uri.as_str())
         }
-        let mut pending: Vec<(NodeId, Scope)> = vec![(top, Vec::new())];
-        while let Some((id, mut scope)) = pending.pop() {
+        // One scope stack serves the whole walk: each pending node carries
+        // the length of its parent's scope, which the stack is cut back to
+        // before the node's own declarations are pushed.
+        let mut scope = inherited;
+        let mut pending: Vec<(NodeId, usize)> = vec![(top, scope.len())];
+        while let Some((id, parent_scope)) = pending.pop() {
+            scope.truncate(parent_scope);
             let NodeKind::Element {
                 prefix,
                 namespace,
@@ -798,7 +811,7 @@ impl OwnedTree {
                     uses.push((Some(prefix), uri));
                 }
             }
-            let missing: Scope = uses
+            let missing: BindingScope = uses
                 .into_iter()
                 .filter(|(prefix, uri)| {
                     *prefix != Some("xml") && bound(&scope, *prefix) != Some(*uri)
@@ -812,11 +825,32 @@ impl OwnedTree {
                 }
                 scope.push((prefix, uri));
             }
+            let own_scope = scope.len();
             let children: Vec<NodeId> = self.document.children(id).collect();
             for child in children.into_iter().rev() {
-                pending.push((child, scope.clone()));
+                pending.push((child, own_scope));
             }
         }
+    }
+
+    /// Declare on the subtree at `node`, just linked, the bindings its
+    /// names use that are not in scope where it now stands: a fragment or a
+    /// copy linked away from the context it was read in keeps its names,
+    /// and an element in no namespace undeclares a default one above it.
+    /// Linked where its bindings are in scope, nothing is added.
+    fn reconcile_linked(&mut self, node: NodeId) {
+        if !matches!(self.document.node(node).kind, NodeKind::Element { .. }) {
+            return;
+        }
+        let Some(parent) = self.linked_parent(node) else {
+            return;
+        };
+        let inherited: BindingScope = self
+            .bindings_in_scope(parent)
+            .into_iter()
+            .map(|(prefix, uri)| (prefix.map(String::from), String::from(uri)))
+            .collect();
+        self.declare_used_bindings(node, inherited);
     }
 
     /// Register the `xml:id` attributes of the imported subtree at `top`; a
@@ -1246,7 +1280,10 @@ impl OwnedTree {
         // (xml:id 1.0 section 4: a repeated ID is an error).
         let source = id_source(element, local_name, namespace);
         let xml_id = is_xml_id(local_name, namespace);
-        let carries = self.ids.carries(&source);
+        // A further carrier of a value another attribute held is an ID
+        // attribute too: its new value is registered for it.
+        let shadowed = self.ids.is_shadowed(&source);
+        let carries = self.ids.carries(&source) || shadowed;
         if xml_id || carries {
             let mut next = String::from(value);
             if xml_id {
@@ -1255,6 +1292,9 @@ impl OwnedTree {
             self.check_claim(&next, &source, &[])?;
         }
         self.ids.remove_source(&source);
+        if shadowed {
+            self.ids.unshadow(&source);
+        }
         self.put_attribute(id, local_name, prefix, namespace, value);
         // A caller's edit is not journaled, so its undo records are not kept;
         // the check above already admitted the value.
@@ -1396,8 +1436,11 @@ impl OwnedTree {
     /// `child`, or a link that would make `child` its own ancestor.
     pub fn append_child(&mut self, parent: TreeNode, child: TreeNode) -> Result<(), TreeError> {
         let (parent, child) = self.linkable(parent, child)?;
-        self.leave_holder(child);
+        let held = self.leave_holder(child);
         self.document.append_child(parent, child);
+        if held {
+            self.reconcile_linked(child);
+        }
         Ok(())
     }
 
@@ -1409,8 +1452,11 @@ impl OwnedTree {
         let parent = self.parent(reference)?.ok_or(TreeError::NoParent)?;
         let (_, node) = self.linkable(parent, node)?;
         let reference = self.live(reference)?;
-        self.leave_holder(node);
+        let held = self.leave_holder(node);
         self.document.insert_before(reference, node);
+        if held {
+            self.reconcile_linked(node);
+        }
         Ok(())
     }
 
@@ -1437,8 +1483,11 @@ impl OwnedTree {
             self.linkable(parent, TreeNode::of(id))?;
         }
         for &id in &run {
-            self.leave_holder(id);
+            let held = self.leave_holder(id);
             self.document.insert_before(old_id, id);
+            if held {
+                self.reconcile_linked(id);
+            }
         }
         self.unlink(old)?;
         // The run's IDs were claimed while `old` held them; with `old`
@@ -1464,8 +1513,11 @@ impl OwnedTree {
         let parent = self.parent(reference)?.ok_or(TreeError::NoParent)?;
         let (_, node) = self.linkable(parent, node)?;
         let reference = self.live(reference)?;
-        self.leave_holder(node);
+        let held = self.leave_holder(node);
         self.document.insert_after(reference, node);
+        if held {
+            self.reconcile_linked(node);
+        }
         Ok(())
     }
 
@@ -1888,6 +1940,10 @@ fn xml_id_source(element: TreeNode) -> IdSource {
     }
 }
 
+/// Namespace bindings in scope, prefix (none for the default) and URI, the
+/// innermost last.
+type BindingScope = Vec<(Option<String>, String)>;
+
 /// Whether `local_name` in `namespace` names `xml:id` (xml:id 1.0 section 4).
 fn is_xml_id(local_name: &str, namespace: Option<&str>) -> bool {
     local_name == "id" && namespace == Some(XML_NAMESPACE)
@@ -1924,6 +1980,12 @@ fn push_attribute_value(out: &mut String, value: &str) {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '"' => out.push_str("&quot;"),
+            // XML 1.0 section 3.3.3: attribute-value normalization turns a
+            // literal tab, line feed or carriage return into a space; a
+            // character reference keeps it.
+            '\t' => out.push_str("&#x9;"),
+            '\n' => out.push_str("&#xA;"),
+            '\r' => out.push_str("&#xD;"),
             other => out.push(other),
         }
     }

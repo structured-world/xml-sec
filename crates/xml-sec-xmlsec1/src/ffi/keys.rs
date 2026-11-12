@@ -121,29 +121,42 @@ unsafe fn klass_name(id: *const XmlSecKeyDataKlass) -> *const u8 {
     unsafe { id.as_ref() }.map_or(std::ptr::null(), |klass| klass.name)
 }
 
+/// A copy of `value` in libxml2's allocator, null for null; `Err` after
+/// libxmlsec1's report when the copy fails.
+///
+/// # Safety
+/// `value` is null or NUL-terminated.
+unsafe fn copy_of(value: *const u8, here: errors::Here) -> Result<*mut u8, ()> {
+    if value.is_null() {
+        return Ok(std::ptr::null_mut());
+    }
+    // SAFETY: by the caller's contract.
+    let bytes = unsafe { CStr::from_ptr(value.cast()) }.to_bytes();
+    let copy = duplicate(bytes);
+    if copy.is_null() {
+        errors::strdup_failed(here, std::ptr::null(), bytes);
+        return Err(());
+    }
+    Ok(copy)
+}
+
 /// Replaces the string at `slot` with a copy of `value` (or nothing for
-/// null); false with libxmlsec1's report when the copy fails.
+/// null); false with libxmlsec1's report when the copy fails. The copy is
+/// made first, so `value` may be the string at `slot` or a part of it.
 ///
 /// # Safety
 /// `slot` holds null or a string of libxml2's allocator; `value` is null or
 /// NUL-terminated.
 unsafe fn replace(slot: &mut *mut u8, value: *const u8, here: errors::Here) -> bool {
     // SAFETY: by the caller's contract.
-    unsafe {
-        if !slot.is_null() {
-            free(slot.cast());
-            *slot = std::ptr::null_mut();
-        }
-        if value.is_null() {
-            return true;
-        }
-        let bytes = CStr::from_ptr(value.cast()).to_bytes();
-        *slot = duplicate(bytes);
-        if slot.is_null() {
-            errors::strdup_failed(here, std::ptr::null(), bytes);
-            return false;
-        }
+    let Ok(copy) = (unsafe { copy_of(value, here) }) else {
+        return false;
+    };
+    if !slot.is_null() {
+        // SAFETY: a string of libxml2's allocator, no longer read.
+        unsafe { free(slot.cast()) };
     }
+    *slot = copy;
     true
 }
 
@@ -334,22 +347,34 @@ pub(crate) unsafe extern "C" fn xmlSecKeyUseWithSet(
             -1
         );
         let here = here!("xmlSecKeyUseWithSet");
-        // SAFETY: an initialized record; libxmlsec1 frees both strings
-        // before copying either.
+        // SAFETY: an initialized record. Both inputs are copied before
+        // either string of the record is released, since an input may be
+        // one of them; on a failed copy the record keeps nothing, as
+        // libxmlsec1's leaves it.
         unsafe {
             let record = &mut *key_use_with;
-            if !record.application.is_null() {
-                free(record.application.cast());
-                record.application = std::ptr::null_mut();
+            let application = copy_of(application, here);
+            let identifier = copy_of(identifier, here);
+            for old in [record.application, record.identifier] {
+                if !old.is_null() {
+                    free(old.cast());
+                }
             }
-            if !record.identifier.is_null() {
-                free(record.identifier.cast());
-                record.identifier = std::ptr::null_mut();
-            }
-            if !replace(&mut record.application, application, here)
-                || !replace(&mut record.identifier, identifier, here)
-            {
-                return -1;
+            record.application = std::ptr::null_mut();
+            record.identifier = std::ptr::null_mut();
+            match (application, identifier) {
+                (Ok(application), Ok(identifier)) => {
+                    record.application = application;
+                    record.identifier = identifier;
+                }
+                (application, identifier) => {
+                    for copy in [application, identifier].into_iter().flatten() {
+                        if !copy.is_null() {
+                            free(copy.cast());
+                        }
+                    }
+                    return -1;
+                }
             }
         }
         0
@@ -568,12 +593,14 @@ pub(crate) unsafe extern "C" fn xmlSecKeyReqCopy(
         check!(!src.is_null(), "xmlSecKeyReqCopy", c"src != NULL", -1);
         // Requirements copied onto themselves are already the copy; copying
         // a list into itself would append to it while reading it. Distinct
-        // requirements append the use-with records, as libxmlsec1 does.
+        // requirements replace the destination's use-with records, as
+        // libxmlsec1 1.3.13 empties the list before copying.
         if std::ptr::eq(dst, src) {
             return 0;
         }
         // SAFETY: initialized requirements.
         unsafe {
+            xmlSecPtrListEmpty(&raw mut (*dst).key_use_with_list);
             (*dst).key_id = (*src).key_id;
             (*dst).key_type = (*src).key_type;
             (*dst).key_usage = (*src).key_usage;
@@ -1015,30 +1042,34 @@ pub(crate) unsafe extern "C" fn xmlSecKeySetNameEx(
     contain(-1, || {
         check!(!key.is_null(), "xmlSecKeySetNameEx", c"key != NULL", -1);
         let here = here!("xmlSecKeySetNameEx");
-        // SAFETY: a key; libxml2's `xmlStrndup` stops at a NUL too.
+        // SAFETY: a key; `name` holds `name_size` bytes or a NUL before
+        // them, so the scan reads no further than the first of the two.
+        // libxml2's `xmlStrndup` stops at a NUL too. The copy is made before
+        // the old name is released: `name` may point into it.
         unsafe {
             let owned = &mut *key;
+            let copy = if name.is_null() || name_size == 0 {
+                std::ptr::null_mut()
+            } else {
+                if c_int::try_from(name_size).is_err() {
+                    errors::size_to_int_impossible(here, name_size);
+                    return -1;
+                }
+                let end = (0..name_size)
+                    .find(|&at| *name.add(at) == 0)
+                    .unwrap_or(name_size);
+                let bytes = std::slice::from_raw_parts(name, end);
+                let copy = duplicate(bytes);
+                if copy.is_null() {
+                    errors::strdup_failed(here, std::ptr::null(), bytes);
+                    return -1;
+                }
+                copy
+            };
             if !owned.name.is_null() {
                 free(owned.name.cast());
-                owned.name = std::ptr::null_mut();
             }
-            if name.is_null() || name_size == 0 {
-                return 0;
-            }
-            if c_int::try_from(name_size).is_err() {
-                errors::size_to_int_impossible(here, name_size);
-                return -1;
-            }
-            let bytes = std::slice::from_raw_parts(name, name_size);
-            let end = bytes
-                .iter()
-                .position(|&byte| byte == 0)
-                .unwrap_or(name_size);
-            owned.name = duplicate(&bytes[..end]);
-            if owned.name.is_null() {
-                errors::strdup_failed(here, std::ptr::null(), &bytes[..end]);
-                return -1;
-            }
+            owned.name = copy;
         }
         0
     })

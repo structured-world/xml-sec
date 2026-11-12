@@ -1,12 +1,15 @@
 //! The nodes an edit returns are the ones left in the tree.
 
 use xml_sec_libxml2::ffi::tree::{
-    xsDocGetRootElement, xsFreeDoc, xsFreeNode, xsGetID, xsNewDocNode, xsNewDocText, xsUnlinkNode,
+    xsDocGetRootElement, xsFreeDoc, xsFreeNode, xsGetID, xsHasProp, xsNewDocNode, xsNewDocText,
+    xsUnlinkNode,
 };
 
+use super::super::xmlSecCheckNodeName;
 use super::{
-    xmlSecAddChildNode, xmlSecAddNextSibling, xmlSecAddPrevSibling, xmlSecEnsureEmptyChild,
-    xmlSecReplaceContentAndReturn, xmlSecReplaceNodeBufferAndReturn,
+    xmlSecAddChild, xmlSecAddChildNode, xmlSecAddNextSibling, xmlSecAddPrevSibling,
+    xmlSecEnsureEmptyChild, xmlSecReplaceContent, xmlSecReplaceContentAndReturn,
+    xmlSecReplaceNodeBufferAndReturn,
 };
 use crate::ffi::parser::xmlSecParseMemory;
 use crate::ffi::tree::{XmlNode, nodes};
@@ -210,6 +213,71 @@ fn a_sibling_of_a_detached_node_fails_instead_of_staying_detached() {
             "the document is unchanged"
         );
         xsFreeNode(detached);
+        xsFreeDoc(doc);
+    }
+}
+
+#[test]
+fn a_child_added_without_a_namespace_takes_its_parents() {
+    // `xmlNewChild` with no namespace gives the child the parent's, as
+    // libxmlsec1 adds it.
+    let xml = r#"<p:a xmlns:p="urn:p"/>"#;
+    // SAFETY: handles are validated by each call; the document is freed once.
+    unsafe {
+        let doc = xmlSecParseMemory(xml.as_ptr(), xml.len(), 1);
+        let root = xsDocGetRootElement(doc);
+        let child = xmlSecAddChild(root, c"c".as_ptr().cast(), std::ptr::null());
+        assert!(!child.is_null());
+        assert_ne!(
+            xmlSecCheckNodeName(child, c"c".as_ptr().cast(), c"urn:p".as_ptr().cast()),
+            0
+        );
+        xsFreeDoc(doc);
+    }
+}
+
+#[test]
+fn an_element_whose_namespace_cannot_be_declared_is_not_left_linked() {
+    // A namespace the tree cannot hold fails the edit: the new element is
+    // taken back instead of staying linked without its namespace.
+    let xml = "<r><s/></r>";
+    let bad = b"\xff\0";
+    // SAFETY: handles are validated by each call; the document is freed once.
+    unsafe {
+        let doc = xmlSecParseMemory(xml.as_ptr(), xml.len(), 1);
+        let root = xsDocGetRootElement(doc);
+        let sibling = nodes::first_child(root);
+        assert!(xmlSecAddChild(root, c"c".as_ptr().cast(), bad.as_ptr()).is_null());
+        assert!(xmlSecAddNextSibling(sibling, c"n".as_ptr().cast(), bad.as_ptr()).is_null());
+        assert!(xmlSecAddPrevSibling(sibling, c"p".as_ptr().cast(), bad.as_ptr()).is_null());
+        let mut child = nodes::first_child(root);
+        while !child.is_null() {
+            assert!(
+                !nodes::is_element(child) || std::ptr::eq(child, sibling),
+                "only the original element remains"
+            );
+            child = nodes::next(child);
+        }
+        xsFreeDoc(doc);
+    }
+}
+
+#[test]
+fn content_is_kept_when_the_replacement_is_not_a_tree_node() {
+    // An attribute cannot become content: the call fails before the old
+    // children are released.
+    let xml = r#"<r a="1"><b/></r>"#;
+    // SAFETY: handles are validated by each call; the document is freed once.
+    unsafe {
+        let doc = xmlSecParseMemory(xml.as_ptr(), xml.len(), 1);
+        let root = xsDocGetRootElement(doc);
+        let attribute = xsHasProp(root, c"a".as_ptr().cast());
+        assert!(!attribute.is_null());
+        assert_eq!(xmlSecReplaceContent(root, attribute.cast()), -1);
+        assert!(
+            nodes::is_element(nodes::first_child(root)),
+            "b is still there"
+        );
         xsFreeDoc(doc);
     }
 }

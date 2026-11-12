@@ -74,6 +74,10 @@ impl KeyMaterialError {
                 | Self::PrivateKeyComponents(_)
                 | Self::Policy(_)
                 | Self::KeyMaterialTooLarge { .. }
+                | Self::KeyStore(
+                    xml_sec::key_manager::KeyStoreError::ProtectedContainer
+                        | xml_sec::key_manager::KeyStoreError::Policy(_)
+                )
         )
     }
 }
@@ -717,12 +721,23 @@ fn import_openssl_pkcs8<'i>(
 /// The CLI error of a failed container import.
 fn container_error(error: KeyStoreError, path: &Path) -> KeyMaterialError {
     match error {
-        KeyStoreError::ProtectedContainer => KeyMaterialError::ProtectedContainer,
         KeyStoreError::Policy(violation) => violation.into(),
+        error => terminal_import_error(error)
+            .unwrap_or_else(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned())),
+    }
+}
+
+/// The import failures each importer classifies alike, both terminal to lax
+/// key search: a failed protected-container authentication and a component
+/// safety limit. Any other error comes back; a policy refusal is terminal in
+/// whichever form an importer reports it.
+fn terminal_import_error(error: KeyStoreError) -> Result<KeyMaterialError, KeyStoreError> {
+    match error {
+        KeyStoreError::ProtectedContainer => Ok(KeyMaterialError::ProtectedContainer),
         KeyStoreError::Selection(reason) if reason.contains("safety limit") => {
-            KeyMaterialError::PrivateKeyComponents(error)
+            Ok(KeyMaterialError::PrivateKeyComponents(error))
         }
-        _ => KeyMaterialError::UnsupportedPrivateKey(path.to_owned()),
+        error => Err(error),
     }
 }
 
@@ -773,12 +788,13 @@ pub(crate) fn import_private_key(
             usages,
             resources,
         )
-        .map_err(|error| match error {
-            KeyStoreError::Selection("unsupported private key container") => {
-                KeyMaterialError::UnsupportedPrivateKey(path.to_owned())
-            }
-            KeyStoreError::ProtectedContainer => KeyMaterialError::ProtectedContainer,
-            error => KeyMaterialError::KeyStore(error),
+        .map_err(|error| {
+            terminal_import_error(error).unwrap_or_else(|error| match error {
+                KeyStoreError::Selection("unsupported private key container") => {
+                    KeyMaterialError::UnsupportedPrivateKey(path.to_owned())
+                }
+                error => KeyMaterialError::KeyStore(error),
+            })
         })
 }
 

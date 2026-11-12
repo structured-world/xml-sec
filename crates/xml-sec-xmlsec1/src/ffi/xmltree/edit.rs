@@ -15,7 +15,7 @@ use super::super::contain;
 use super::super::errors::{self, check, here};
 use super::super::parser::xmlSecParserGetDefaultOptions;
 use super::super::strings::xmlSecStringCR;
-use super::super::tree::{XML_ELEMENT_NODE, XmlDoc, XmlNode, c_text, nodes};
+use super::super::tree::{XML_DOCUMENT_NODE, XML_ELEMENT_NODE, XmlDoc, XmlNode, c_text, nodes};
 use super::content::xmlSecIsEmptyNode;
 use super::{xmlSecDepthFirstTreeWalk, xmlSecFindChild, xmlSecFindSibling};
 
@@ -122,12 +122,13 @@ pub(crate) unsafe extern "C" fn xmlSecAddChild(
         // SAFETY: handles are validated by each call; the names are
         // NUL-terminated by the caller's contract.
         unsafe {
-            let created = xsNewDocNode(
-                nodes::doc(parent),
-                std::ptr::null_mut(),
-                name,
-                std::ptr::null(),
-            );
+            // `xmlNewChild` without a namespace gives the child its parent's.
+            let inherited = if nodes::namespace(parent).is_some() {
+                nodes::search_namespace(parent, nodes::prefix(parent).as_deref())
+            } else {
+                std::ptr::null_mut()
+            };
+            let created = xsNewDocNode(nodes::doc(parent), inherited, name, std::ptr::null());
             let cur = if created.is_null() {
                 std::ptr::null_mut()
             } else {
@@ -140,7 +141,10 @@ pub(crate) unsafe extern "C" fn xmlSecAddChild(
             if !ns.is_null() {
                 let declared = namespace_for(cur, ns);
                 if declared.is_null() {
+                    // libxmlsec1 1.3.13 takes the element back.
                     errors::xml_failed(here, std::ptr::null(), c"xmlNewNs");
+                    xsUnlinkNode(cur);
+                    xsFreeNode(cur);
                     return std::ptr::null_mut();
                 }
                 xsSetNs(cur, declared);
@@ -204,7 +208,8 @@ enum Side {
 
 /// `xmlSecAddNextSibling` and `xmlSecAddPrevSibling`: a new element beside
 /// `node` with a line feed between them. A namespace declaration that
-/// cannot be created leaves the element without one, as in libxmlsec1.
+/// cannot be created fails the call and takes the element back, as in
+/// libxmlsec1 1.3.13.
 ///
 /// # Safety
 /// `name` is NUL-terminated and `ns` null or NUL-terminated.
@@ -241,7 +246,15 @@ unsafe fn add_sibling(
             return std::ptr::null_mut();
         }
         if !ns.is_null() {
-            xsSetNs(cur, namespace_for(cur, ns));
+            let declared = namespace_for(cur, ns);
+            if declared.is_null() {
+                // libxmlsec1 1.3.13 takes the element back.
+                errors::xml_failed(here, std::ptr::null(), c"xmlNewNs");
+                xsUnlinkNode(cur);
+                xsFreeNode(cur);
+                return std::ptr::null_mut();
+            }
+            xsSetNs(cur, declared);
         }
         let text = line_feed(node, here);
         if text.is_null() || add(node, text).is_null() {
@@ -475,9 +488,20 @@ pub(crate) unsafe extern "C" fn xmlSecReplaceContentAndReturn(
             -1
         );
         // The link must be possible before anything moves: a node of another
-        // document, `node` itself or an ancestor of it could not become the
-        // content, and unlinking it first would lose the old content or move
-        // `node` out of its place.
+        // document, an attribute, namespace or document node, `node` itself
+        // or an ancestor of it could not become the content, and unlinking it
+        // first would lose the old content or move `node` out of its place.
+        let linkable = nodes::tree_node(node).is_some()
+            && nodes::tree_node(new_node).is_some()
+            && nodes::kind(new_node) != XML_DOCUMENT_NODE;
+        if !linkable {
+            errors::xml_failed(
+                here!("xmlSecReplaceContentAndReturn"),
+                std::ptr::null(),
+                c"xmlAddChild",
+            );
+            return -1;
+        }
         let mut ancestor = node;
         while !ancestor.is_null() {
             if std::ptr::eq(ancestor, new_node) {

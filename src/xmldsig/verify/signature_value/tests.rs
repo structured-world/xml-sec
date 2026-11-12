@@ -201,6 +201,32 @@ mod selected_provider {
     }
 
     #[test]
+    fn a_profile_needing_expected_targets_is_refused() {
+        // A signature profile demands the targets the signature must cover;
+        // a value checked without any is refused, as document verification
+        // refuses the profile without expected targets.
+        for constraints in [
+            crate::policy::SignatureConstraints::Saml,
+            crate::policy::SignatureConstraints::WsSecurity,
+            crate::policy::SignatureConstraints::Xades,
+        ] {
+            let policy = VerificationPolicy {
+                signature_constraints: constraints,
+                ..VerificationPolicy::default()
+            };
+            let refused = verify_signature_value(
+                &policy,
+                default_provider(),
+                &key(),
+                SignatureAlgorithm::HmacSha256,
+                DATA,
+                &mac(),
+            );
+            assert!(matches!(refused, Err(DsigError::Policy(_))), "{refused:?}");
+        }
+    }
+
+    #[test]
     fn a_supplied_key_needs_the_preset_key_source() {
         // The supplied key is a pre-resolved key: a policy without that
         // source refuses it, as document verification does.

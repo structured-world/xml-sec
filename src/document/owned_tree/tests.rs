@@ -457,15 +457,135 @@ fn a_fragment_parses_in_the_namespaces_of_its_context() {
         .expect("a live node")
         .expect("a sibling");
     assert_eq!(tree.name(second), Ok(Some("y")));
+    let parse_failed = |result: Result<Option<TreeNode>, XmlDocumentError>| {
+        matches!(
+            result,
+            Err(XmlDocumentError::Parse(_) | XmlDocumentError::AccountedParse(_))
+        )
+    };
+    assert!(parse_failed(tree.parse_in_context(
+        context,
+        "<p:x>",
+        &VerificationPolicy::default()
+    )));
     assert!(
-        tree.parse_in_context(context, "<p:x>", &VerificationPolicy::default())
-            .is_err()
-    );
-    assert!(
-        tree.parse_in_context(context, "<q:x/>", &VerificationPolicy::default())
-            .is_err(),
+        parse_failed(tree.parse_in_context(context, "<q:x/>", &VerificationPolicy::default())),
         "an unbound prefix is refused"
     );
+}
+
+#[test]
+fn a_context_namespace_with_whitespace_reaches_the_fragment_unchanged() {
+    // The context's bindings are written into the wrapper the fragment is
+    // parsed in; a tab in a namespace name survives attribute-value
+    // normalization (XML 1.0 section 3.3.3) as a character reference.
+    let mut tree = parsed("<r/>");
+    let root = tree.root_element().expect("a document element");
+    tree.declare_namespace(root, Some("p"), "urn:a\tb")
+        .expect("an element");
+    let first = tree
+        .parse_in_context(root, "<p:x/>", &VerificationPolicy::default())
+        .expect("the fragment parses")
+        .expect("the fragment has nodes");
+    assert_eq!(tree.namespace(first), Ok(Some("urn:a\tb")));
+}
+
+#[test]
+fn a_fragment_linked_outside_its_context_declares_what_it_uses() {
+    // Linked where its context's binding is in scope, the fragment adds no
+    // declaration; linked elsewhere, it declares the prefix it uses, so the
+    // document reads the same names.
+    let mut tree = parsed(r#"<r><a xmlns:p="urn:p"><c/></a><d/></r>"#);
+    let root = tree.root_element().expect("a document element");
+    let a = children(&tree, root)[0];
+    let d = children(&tree, root)[1];
+    let c = children(&tree, a)[0];
+    let inside = tree
+        .parse_in_context(c, "<p:x/>", &VerificationPolicy::default())
+        .expect("the fragment parses")
+        .expect("the fragment has nodes");
+    tree.append_child(c, inside)
+        .expect("an unlinked node links");
+    let outside = tree
+        .parse_in_context(c, "<p:y/>", &VerificationPolicy::default())
+        .expect("the fragment parses")
+        .expect("the fragment has nodes");
+    tree.append_child(d, outside)
+        .expect("an unlinked node links");
+    assert_eq!(
+        tree.serialize(),
+        "<?xml version=\"1.0\"?>\n<r><a xmlns:p=\"urn:p\"><c><p:x/></c></a>\
+         <d><p:y xmlns:p=\"urn:p\"/></d></r>\n"
+    );
+}
+
+#[test]
+fn a_copy_of_a_fragment_descendant_declares_what_it_uses() {
+    // The descendant's binding came from the fragment's context, which the
+    // copy's source tree no longer shows above it; linked in another tree,
+    // the copy declares it.
+    let mut source = parsed(r#"<s xmlns:p="urn:p"><c/></s>"#);
+    let root = source.root_element().expect("a document element");
+    let c = children(&source, root)[0];
+    let wrapper = source
+        .parse_in_context(c, "<w><p:x/></w>", &VerificationPolicy::default())
+        .expect("the fragment parses")
+        .expect("the fragment has nodes");
+    let x = children(&source, wrapper)[0];
+    let mut target = parsed("<t/>");
+    let target_root = target.root_element().expect("a document element");
+    let copy = target.copy_from(&source, x).expect("a live node");
+    target
+        .append_child(target_root, copy)
+        .expect("an unlinked node links");
+    assert_eq!(
+        target.serialize(),
+        "<?xml version=\"1.0\"?>\n<t><p:x xmlns:p=\"urn:p\"/></t>\n"
+    );
+}
+
+#[test]
+fn a_copy_without_a_namespace_stays_without_one_under_a_default() {
+    // Linked under a default namespace, an element in no namespace
+    // undeclares it, or it would read as one of the default's.
+    let source = parsed("<s><a/></s>");
+    let a = children(&source, source.root_element().expect("a root"))[0];
+    let mut target = parsed(r#"<t xmlns="urn:t"/>"#);
+    let root = target.root_element().expect("a document element");
+    let copy = target.copy_from(&source, a).expect("a live node");
+    target
+        .append_child(root, copy)
+        .expect("an unlinked node links");
+    assert_eq!(
+        target.serialize(),
+        "<?xml version=\"1.0\"?>\n<t xmlns=\"urn:t\"><a xmlns=\"\"/></t>\n"
+    );
+}
+
+#[test]
+fn a_shadowed_id_carrier_moves_its_id_when_its_value_changes() {
+    // A copy shadowed for a value the target holds still carries its ID: a
+    // new value is registered for it.
+    let mut source = parsed(r#"<s><b id="x"/></s>"#);
+    let carrier = children(&source, source.root_element().expect("a root"))[0];
+    source
+        .register_id(carrier, "id", None, "x")
+        .expect("the attribute carries the value");
+    let mut target = parsed(r#"<t><a id="x"/></t>"#);
+    let root = target.root_element().expect("a root");
+    let holder = children(&target, root)[0];
+    target
+        .register_id(holder, "id", None, "x")
+        .expect("the attribute carries the value");
+    let copy = target.copy_from(&source, carrier).expect("a live node");
+    target
+        .append_child(root, copy)
+        .expect("an unlinked node links");
+    target
+        .set_attribute(copy, "id", None, None, "y")
+        .expect("an element");
+    assert_eq!(target.element_by_id("y"), Some(copy));
+    assert_eq!(target.element_by_id("x"), Some(holder));
 }
 
 #[test]

@@ -571,11 +571,27 @@ unsafe extern "C" fn xml_write(
             return -1;
         }
         // SAFETY: the key's key data.
-        let value = unsafe { check_id(data, id).then(|| value_of(data)).flatten() };
-        let Some(value) = value else {
+        let material = unsafe { check_id(data, id).then(|| material_of(data)).flatten() };
+        let Some(material) = material else {
             errors::internal(here, object_name, c"xmlSecKeyDataCheckId");
             return -1;
         };
+        // libxmlsec1 writes RSA's PrivateExponent and DSA's X when the
+        // context asks for the private key and the key holds one. Those
+        // components are not written here, so the request fails before the
+        // node is edited instead of producing a public-only value.
+        // SAFETY: a context.
+        let private_requested = unsafe { (*ctx).key_req.key_type } & TYPE_PRIVATE != 0;
+        if private_requested && material.private.is_some() && family != Family::Ec {
+            errors::other(
+                here,
+                errors::R_INVALID_KEY_DATA,
+                object_name,
+                Some("private key components are not written"),
+            );
+            return -1;
+        }
+        let value = &material.value;
         // SAFETY: a live element of a live document.
         if let Err(failed) = unsafe { write_value(node, value) } {
             errors::internal(here, object_name, failed);
@@ -757,18 +773,29 @@ unsafe fn der_adopt(
     let object_name = xmlSecNameDEREncodedKeyValue.as_ptr().cast::<c_char>();
     // The key is external material: what its Base64 text decodes to is
     // bounded before the reader allocates for it. Whitespace decodes to
-    // nothing; every four other characters decode to at most three octets.
+    // nothing; every four other characters decode to at most three octets,
+    // less one for each trailing pad (RFC 4648 section 4). The reader still
+    // validates the text.
     let max = resources.max_external_resource_bytes;
-    let encoded = nodes::content(node).map_or(0, |text| {
-        text.bytes()
-            .filter(|byte| !byte.is_ascii_whitespace())
-            .count()
+    let (encoded, padding) = nodes::content(node).map_or((0, 0), |text| {
+        let mut significant = text.bytes().filter(|byte| !byte.is_ascii_whitespace());
+        let encoded = significant.clone().count();
+        let padding = significant
+            .by_ref()
+            .rev()
+            .take(2)
+            .take_while(|&byte| byte == b'=')
+            .count();
+        (encoded, padding)
     });
-    if encoded
-        .div_ceil(4)
-        .checked_mul(3)
-        .is_none_or(|decoded| decoded > max)
-    {
+    let decoded = encoded.div_ceil(4).checked_mul(3).map(|bound| {
+        if encoded % 4 == 0 {
+            bound - padding
+        } else {
+            bound
+        }
+    });
+    if decoded.is_none_or(|decoded| decoded > max) {
         errors::limit_exceeded(here, object_name, "max_external_resource_bytes", max);
         return -1;
     }

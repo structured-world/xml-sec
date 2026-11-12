@@ -101,6 +101,86 @@ fn an_hmac_key_under_an_expired_policy_is_refused() {
     }
 }
 
+/// An HMAC-SHA256 key holding `secret`.
+///
+/// # Safety
+/// The caller destroys the key.
+unsafe fn hmac_key(secret: &[u8]) -> *mut super::super::super::keys::XmlSecKey {
+    // SAFETY: a klass of the built-in table; the key adopts the data.
+    unsafe {
+        let key = xmlSecKeyCreate();
+        let data = xmlSecKeyDataCreate(symkeys::hmac());
+        assert_eq!(
+            xmlSecBufferSetData(
+                xmlSecKeyDataBinaryValueGetBuffer(data),
+                secret.as_ptr(),
+                secret.len()
+            ),
+            0
+        );
+        assert_eq!(xmlSecKeySetValue(key, data), 0);
+        key
+    }
+}
+
+#[test]
+fn a_finished_mac_keeps_its_key() {
+    // Once the MAC has run, its result belongs to the key it ran with: a
+    // second key is refused, as libxmlsec1 refuses a key for an initialized
+    // context.
+    // SAFETY: every object is created and released here.
+    unsafe {
+        let (first, second) = (hmac_key(&[0x42; 32]), hmac_key(&[0x43; 32]));
+        let ctx = xmlSecTransformCtxCreate();
+        let transform = xmlSecTransformCtxCreateAndAppend(ctx, hmac_sha256());
+        (*transform).operation = OPERATION_SIGN;
+        assert_eq!(xmlSecTransformSetKey(transform, first.cast()), 0);
+        assert_eq!(xmlSecTransformCtxBinaryExecute(ctx, b"data".as_ptr(), 4), 0);
+        assert_eq!(xmlSecTransformSetKey(transform, second.cast()), -1);
+        xmlSecTransformCtxDestroy(ctx);
+        xmlSecKeyDestroy(first);
+        xmlSecKeyDestroy(second);
+    }
+}
+
+#[test]
+fn a_key_is_admitted_under_the_revision_its_method_was_read_with() {
+    // The output length read under one revision is the run's; a minimum
+    // raised before the key is set does not refuse the key, since the run
+    // keeps the revision it started with.
+    own_process();
+    let xml = "<SignatureMethod xmlns=\"http://www.w3.org/2000/09/xmldsig#\" \
+               Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#hmac-sha256\">\
+               <HMACOutputLength>128</HMACOutputLength></SignatureMethod>";
+    // SAFETY: every object is created and released here.
+    unsafe {
+        let doc = xsReadMemory(
+            xml.as_ptr().cast(),
+            c_int::try_from(xml.len()).expect("a short document"),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        let key = hmac_key(&[0x42; 32]);
+        let ctx = xmlSecTransformCtxCreate();
+        let transform = xmlSecTransformCtxCreateAndAppend(ctx, hmac_sha256());
+        (*transform).operation = OPERATION_VERIFY;
+        assert_eq!(
+            read_node(transform, xsDocGetRootElement(doc).cast(), ctx),
+            0
+        );
+        policy::republish(
+            |verification| verification.hmac.minimum_output_bits = 256,
+            |_| {},
+        )
+        .expect("the library policy compiles");
+        assert_eq!(xmlSecTransformSetKey(transform, key.cast()), 0);
+        xmlSecTransformCtxDestroy(ctx);
+        xmlSecKeyDestroy(key);
+        xsFreeDoc(doc);
+    }
+}
+
 #[test]
 fn a_verification_key_needs_the_preset_key_source() {
     // A key set on a verifying transform is one the caller resolved: a

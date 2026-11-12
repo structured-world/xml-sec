@@ -61,6 +61,11 @@ struct Hmac {
     /// The length of the secret the MAC was started with, admitted again
     /// under the run's policy revision.
     secret_len: usize,
+    /// Whether a key started the MAC; it stays set after the MAC finishes,
+    /// so the result keeps the key it was computed with.
+    keyed: bool,
+    /// The revision the method was read under, which admits the key.
+    pinned: Option<policy::Pinned>,
     /// The full MAC once finished.
     result: Vec<u8>,
 }
@@ -187,6 +192,8 @@ unsafe extern "C" fn initialize(transform: *mut XmlSecTransform) -> c_int {
                 mac: None,
                 output_bits: 0,
                 secret_len: 0,
+                keyed: false,
+                pinned: None,
                 result: Vec::new(),
             });
         }
@@ -278,6 +285,7 @@ unsafe extern "C" fn read_node(
                     return -1;
                 }
                 hmac.output_bits = bits;
+                hmac.pinned = Some(pinned);
                 child = xmlSecGetNextElementNode(nodes::next(child));
             }
             if !child.is_null() {
@@ -337,7 +345,7 @@ unsafe extern "C" fn set_key(transform: *mut XmlSecTransform, key: *mut c_void) 
             errors::assertion(here, c"key != NULL");
             return -1;
         }
-        if hmac.mac.is_some() {
+        if hmac.keyed {
             errors::assertion(here, c"ctx->ctxInitialized == 0");
             return -1;
         }
@@ -365,9 +373,14 @@ unsafe extern "C" fn set_key(transform: *mut XmlSecTransform, key: *mut c_void) 
                 return -1;
             }
             let secret = std::slice::from_raw_parts(xmlSecBufferGetData(buffer), size);
-            // No run is known here: the current revision admits the key, and
-            // the run's revision admits it again before taking input.
-            let Some(pinned) = policy::Pinned::current(here) else {
+            // The revision the method was read under admits the key, else
+            // the current one; the run's revision admits it again before
+            // taking input.
+            let Some(pinned) = hmac
+                .pinned
+                .clone()
+                .or_else(|| policy::Pinned::current(here))
+            else {
                 return -1;
             };
             if let Err(refusal) =
@@ -378,7 +391,10 @@ unsafe extern "C" fn set_key(transform: *mut XmlSecTransform, key: *mut c_void) 
             }
             hmac.secret_len = size;
             match IncrementalHmac::begin(algorithm, secret) {
-                Ok(mac) => hmac.mac = Some(Box::new(mac)),
+                Ok(mac) => {
+                    hmac.mac = Some(Box::new(mac));
+                    hmac.keyed = true;
+                }
                 Err(error) => {
                     errors::internal_with(
                         here,

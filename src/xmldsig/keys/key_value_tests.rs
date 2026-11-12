@@ -34,6 +34,26 @@ fn every_supported_spki_round_trips_through_its_key_value() {
 }
 
 #[test]
+fn an_rsa_spki_with_parameters_other_than_null_is_refused() {
+    // RFC 3279 section 2.3.1: rsaEncryption parameters are NULL. An SPKI
+    // carrying anything else is not converted into an ordinary RSA value.
+    let mut der = spki(include_str!(
+        "../../../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"
+    ));
+    // rsaEncryption followed by its NULL parameter.
+    let identifier = [
+        0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00,
+    ];
+    let at = der
+        .windows(identifier.len())
+        .position(|window| window == identifier)
+        .expect("an rsaEncryption identifier");
+    // An empty OCTET STRING in place of NULL keeps every length unchanged.
+    der[at + identifier.len() - 2] = 0x04;
+    assert!(KeyValueInfo::from_spki_der(&der, &ResourcePolicy::default()).is_err());
+}
+
+#[test]
 fn key_value_families_without_an_spki_are_refused() {
     // DSA without its domain parameters, DH and unsupported elements carry
     // no complete public key; reporting one would invent key material.

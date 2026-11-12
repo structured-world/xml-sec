@@ -423,6 +423,45 @@ fn a_key_reference_opens_its_uri_under_the_key_reference_classes() {
 }
 
 #[test]
+fn a_der_encoded_key_value_that_fits_the_limit_exactly_is_read() {
+    // A P-256 SubjectPublicKeyInfo is 91 octets: 124 Base64 characters,
+    // two of them padding. Under a limit of exactly 91 octets it is read;
+    // the padding is not counted as decoded data.
+    const PEM: &str =
+        include_str!("../../../../../tests/fixtures/keys/ec/ec-prime256v1-pubkey.pem");
+    own_process();
+    let body: String = PEM
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect();
+    policy::republish(
+        |verification| verification.resources.max_external_resource_bytes = 91,
+        |_| {},
+    )
+    .expect("the library policy compiles");
+    let doc = parse(&format!(
+        "<DEREncodedKeyValue xmlns=\"http://www.w3.org/2009/xmldsig11#\">{body}</DEREncodedKeyValue>"
+    ));
+    // SAFETY: objects created and destroyed here.
+    unsafe {
+        assert_eq!(xmlSecKeyDataIdsInit(), 0);
+        let ctx = xmlSecKeyInfoCtxCreate(std::ptr::null_mut());
+        let key = xmlSecKeyCreate();
+        let read = xmlSecKeyDataXmlRead(
+            asymkeys::der_encoded_key_value(),
+            key.cast(),
+            xsDocGetRootElement(doc).cast(),
+            ctx.cast(),
+        );
+        assert_eq!(read, 0);
+        assert!(!xmlSecKeyGetValue(key).is_null(), "the key has a value");
+        xmlSecKeyDestroy(key);
+        xmlSecKeyInfoCtxDestroy(ctx);
+        xsFreeDoc(doc);
+    }
+}
+
+#[test]
 fn a_der_encoded_key_value_past_the_resource_limit_is_refused_before_decoding() {
     // The encoded text is bounded by what it can decode to, against the
     // per-resource limit, before any buffer is sized for it.

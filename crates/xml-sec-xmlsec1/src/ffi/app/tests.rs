@@ -39,3 +39,56 @@ fn a_protected_key_without_its_password_stays_a_protected_failure() {
         .expect("a format it reads");
     assert!(public.private.is_none());
 }
+
+#[test]
+fn a_private_key_value_is_refused_rather_than_written_public() {
+    // A context asking for the private key gets a failure, not a KeyValue
+    // holding only the public part; asking for the public key writes it.
+    use crate::ffi::asymkeys;
+    use crate::ffi::keyinfo::{MODE_WRITE, xmlSecKeyInfoCtxCreate, xmlSecKeyInfoCtxDestroy};
+    use crate::ffi::keys::{
+        TYPE_PRIVATE, TYPE_PUBLIC, xmlSecKeyCreate, xmlSecKeyDestroy, xmlSecKeySetValue,
+    };
+    use crate::ffi::keysdata::xmlSecKeyDataXmlWrite;
+    use crate::ffi::tree::nodes;
+    use xml_sec_libxml2::ffi::tree::{xsDocGetRootElement, xsFreeDoc, xsReadMemory};
+    const RSA_PRIVATE: &[u8] =
+        include_bytes!("../../../../../tests/fixtures/keys/rsa/rsa-2048-key.pem");
+    let private = material(
+        RSA_PRIVATE,
+        FORMAT_PEM,
+        &password(None),
+        &ResourcePolicy::default(),
+    )
+    .expect("a private key reads")
+    .expect("a format it reads");
+    assert!(private.private.is_some());
+    let xml = "<RSAKeyValue xmlns=\"http://www.w3.org/2000/09/xmldsig#\"/>";
+    // SAFETY: objects created and destroyed here.
+    unsafe {
+        let key = xmlSecKeyCreate();
+        assert_eq!(xmlSecKeySetValue(key, asymkeys::adopt(private)), 0);
+        let ctx = xmlSecKeyInfoCtxCreate(std::ptr::null_mut());
+        (*ctx).mode = MODE_WRITE;
+        for (key_type, expected) in [(TYPE_PRIVATE, -1), (TYPE_PUBLIC, 0)] {
+            let doc = xsReadMemory(
+                xml.as_ptr().cast(),
+                i32::try_from(xml.len()).expect("a short document"),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+            );
+            let node = xsDocGetRootElement(doc);
+            (*ctx).key_req.key_type = key_type;
+            assert_eq!(
+                xmlSecKeyDataXmlWrite(asymkeys::rsa(), key.cast(), node.cast(), ctx.cast()),
+                expected,
+                "key type {key_type}"
+            );
+            assert_eq!(nodes::first_child(node).is_null(), expected < 0);
+            xsFreeDoc(doc);
+        }
+        xmlSecKeyInfoCtxDestroy(ctx);
+        xmlSecKeyDestroy(key);
+    }
+}
