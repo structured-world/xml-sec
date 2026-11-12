@@ -18,12 +18,12 @@ use super::super::nodeset::{
 };
 use super::super::strings::{xmlSecAttrAlgorithm, xmlSecDSigNs, xmlSecNodeTransform};
 use super::super::tree::{XmlDoc, XmlNode, c_text, name_for_report, nodes};
-use super::super::xmltree::{next_element, xmlSecCheckNodeName};
+use super::super::xmltree::{next_element, xmlSecCheckNodeName, xmlSecPrintXmlString};
 use super::super::{contain, free, malloc, policy, write_stream};
 use super::{
     DATA_BIN, DATA_UNKNOWN, DATA_XML, FLAGS_USER_SPECIFIED, MODE_PUSH, STATUS_FINISHED,
     STATUS_NONE, STATUS_WORKING, XmlSecTransform, XmlSecTransformKlass, builtin, io, klass_text,
-    parser, valid, valid_or, xml_text, xmlSecTransformConnect, xmlSecTransformCreate,
+    parser, valid, valid_or, xmlSecTransformConnect, xmlSecTransformCreate,
     xmlSecTransformDebugDump, xmlSecTransformDebugXmlDump, xmlSecTransformDestroy,
     xmlSecTransformGetDataType, xmlSecTransformIdListDebugDump, xmlSecTransformIdListDebugXmlDump,
     xmlSecTransformIdListFind, xmlSecTransformIdListFindByHref, xmlSecTransformIdListGetKlass,
@@ -64,16 +64,50 @@ pub(crate) struct XmlSecTransformCtx {
     pub(crate) reserved0: *mut c_void,
 }
 
-/// What one run of a context has spent of the policy's per-chain budgets.
-/// Every transform of the chain charges the same budget, as the core charges
-/// one budget across a reference's transforms; the context's `reserved0`
-/// holds it from its first charge until the context is reset.
+/// One run of a context: the policy it runs under and what it has spent of
+/// the policy's per-chain budgets. Every transform of the chain charges the
+/// same budget under the same policy revision, as the core charges one
+/// budget across a reference's transforms; the context's `reserved0` holds
+/// it from its first use until the context is reset.
 #[derive(Default)]
 pub(crate) struct RunBudget {
     pub(crate) base64_input: usize,
     pub(crate) base64_output: usize,
     /// Octets read from external resources through the input callbacks.
     pub(crate) external_resources: usize,
+    /// The policy revision of the run, pinned at its first read or handed
+    /// down by the `KeyInfo` read that runs the chain.
+    policy: Option<policy::Pinned>,
+}
+
+/// The policy revision the run of `ctx` runs under, pinned at its first
+/// read; reported at `here` when the profile is unavailable.
+///
+/// # Safety
+/// `ctx` is an initialized context.
+pub(crate) unsafe fn run_policy(
+    ctx: *mut XmlSecTransformCtx,
+    here: errors::Here,
+) -> Option<policy::Pinned> {
+    // SAFETY: by the caller's contract.
+    let run = unsafe { run_budget(ctx) };
+    if run.policy.is_none() {
+        run.policy = Some(policy::Pinned::current(here)?);
+    }
+    run.policy.clone()
+}
+
+/// Makes `pinned` the policy of the run of `ctx` unless the run has one, so
+/// a chain a `KeyInfo` read runs reads the revision of that read.
+///
+/// # Safety
+/// `ctx` is an initialized context.
+pub(crate) unsafe fn seed_policy(ctx: *mut XmlSecTransformCtx, pinned: &policy::Pinned) {
+    // SAFETY: by the caller's contract.
+    let run = unsafe { run_budget(ctx) };
+    if run.policy.is_none() {
+        run.policy = Some(pinned.clone());
+    }
 }
 
 /// The run budget of `ctx`, created on first use.
@@ -1157,10 +1191,11 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxPrepare(
         // The chain is bounded by the policy as a core reference's is:
         // every execution passes here, before any transform runs, and
         // the bound also limits the push recursion through the chain.
-        let Some(policy) = policy::verification_at(here) else {
+        // SAFETY: an initialized context, reached through its borrow.
+        let Some(pinned) = (unsafe { run_policy(&raw mut *context, here) }) else {
             return -1;
         };
-        let max = policy.resources.max_transforms_per_reference;
+        let max = pinned.verification.resources.max_transforms_per_reference;
         let mut length = 0usize;
         let mut current = context.first;
         while !current.is_null() {
@@ -1318,7 +1353,11 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxUriExecute(
                 return -1;
             }
             let name = (*(*input).id).name.cast();
-            if io::xmlSecTransformInputURIOpen(input, uri) < 0 {
+            // The URI is admitted under the run's policy revision.
+            let Some(pinned) = run_policy(ctx, here) else {
+                return -1;
+            };
+            if io::open(input, uri, Some(&pinned)) < 0 {
                 errors::internal_with(
                     here,
                     std::ptr::null(),
@@ -1555,21 +1594,13 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxDebugXmlDump(
             } else {
                 write_stream(output, "<EnabledTransforms>all</EnabledTransforms>\n");
             }
-            let printed = |text: *mut u8| {
-                if text.is_null() {
-                    String::new()
-                } else {
-                    xml_text(&klass_text(text))
-                }
-            };
-            write_stream(
-                output,
-                &format!(
-                    "<Uri>{}</Uri>\n<UriXPointer>{}</UriXPointer>\n",
-                    printed(context.uri),
-                    printed(context.xptr_expr)
-                ),
-            );
+            // libxmlsec1 prints both through xmlSecPrintXmlString, which
+            // writes `NULL` for an unset one.
+            write_stream(output, "<Uri>");
+            xmlSecPrintXmlString(output, context.uri);
+            write_stream(output, "</Uri>\n<UriXPointer>");
+            xmlSecPrintXmlString(output, context.xptr_expr);
+            write_stream(output, "</UriXPointer>\n");
             let mut transform = context.first;
             while !transform.is_null() {
                 xmlSecTransformDebugXmlDump(transform, output);

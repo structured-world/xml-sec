@@ -20,8 +20,17 @@ fn cli_loads_every_eddsa_variant_from_donor_pkcs8() {
                 "tests/fixtures/xmldsig/keys/eddsa/eddsa-{stem}-key.der"
             ));
         let bytes = std::fs::read(&path).unwrap();
+        let resources = ResourcePolicy::default();
         assert!(
-            decode_signing_key(&path, &bytes, PrivateKeyFormat::Pkcs8Der, algorithm, None).is_ok(),
+            decode_signing_key(
+                &path,
+                &bytes,
+                PrivateKeyFormat::Pkcs8Der,
+                algorithm,
+                None,
+                &resources
+            )
+            .is_ok(),
             "{algorithm:?}"
         );
         assert!(
@@ -30,7 +39,8 @@ fn cli_loads_every_eddsa_variant_from_donor_pkcs8() {
                 &bytes[..bytes.len() - 1],
                 PrivateKeyFormat::Pkcs8Der,
                 algorithm,
-                None
+                None,
+                &resources
             )
             .is_err()
         );

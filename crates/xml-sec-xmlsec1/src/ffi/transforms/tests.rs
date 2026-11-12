@@ -459,7 +459,7 @@ fn library_policy_runs_the_relationship_transform() {
             document.root(),
             TransformData::NodeSet(NodeSet::entire_document_without_comments(document)?),
             &transforms,
-            policy,
+            &policy,
         )
     });
     let output = String::from_utf8(output.expect("relationship transform")).expect("UTF-8");

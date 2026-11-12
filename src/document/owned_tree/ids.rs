@@ -48,6 +48,19 @@ impl IdTable {
         previous
     }
 
+    /// The attributes of `element` that carry an ID, with their values.
+    pub(super) fn of_element(&self, element: TreeNode) -> impl Iterator<Item = (&IdSource, &str)> {
+        let first = IdSource {
+            element,
+            name: String::new(),
+            namespace: None,
+        };
+        self.by_source
+            .range(first..)
+            .take_while(move |(source, _)| source.element == element)
+            .map(|(source, value)| (source, value.as_str()))
+    }
+
     /// Whether `source` carries an ID.
     pub(super) fn carries(&self, source: &IdSource) -> bool {
         self.by_source.contains_key(source)

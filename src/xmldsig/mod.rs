@@ -70,6 +70,8 @@ pub mod digest;
 pub(crate) mod dstu4145;
 pub mod extension;
 pub mod keys;
+#[cfg(feature = "rustcrypto")]
+mod mac;
 pub(crate) mod modern;
 #[cfg(feature = "experimental-pq")]
 pub(crate) mod post_quantum;
@@ -105,19 +107,21 @@ pub use builder::{
 pub use digest::compute_digest;
 pub(crate) use digest::finish_digest;
 pub use digest::{
-    DigestAlgorithm, DigestOutput, MAX_DIGEST_OUTPUT, compute_digest_with_provider,
-    constant_time_eq,
+    DigestAlgorithm, DigestOutput, IncrementalDigest, MAX_DIGEST_OUTPUT,
+    compute_digest_with_provider, constant_time_eq,
 };
 pub use keys::{
     DefaultKeyResolver, HmacSha1VerificationKey, HmacVerificationKey, InspectedKeyCandidateBudget,
     KeyResolutionError, KeyResolverConfig, VerificationKey,
 };
+#[cfg(feature = "rustcrypto")]
+pub use mac::IncrementalHmac;
 #[cfg(feature = "xmldsig-sign")]
 pub use modern::EdDsaSigningKey;
 pub use parse::{
     KeyInfo, KeyInfoSource, KeyValueInfo, ParseError, Reference, RetrievalMethodTransforms,
     RsaPssParameters, SignatureAlgorithm, SignatureContext, SignedInfo, X509DataInfo,
-    find_signature_node, parse_key_info, parse_reference, parse_signed_info,
+    find_signature_node, parse_key_info, parse_key_value_child, parse_reference, parse_signed_info,
     x509_certificate_matches_selectors,
 };
 pub use pkix::CertificatePathVerifier;

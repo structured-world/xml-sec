@@ -22,7 +22,7 @@ use super::super::list::{
 };
 use super::super::{contain, free, malloc, policy};
 use super::builtin::klass;
-use super::ctx::{Limit, charge, run_budget};
+use super::ctx::{Limit, charge, run_budget, run_policy};
 use super::{
     DATA_BIN, Global, MODE_POP, MODE_PUSH, WithContext, XmlSecTransform, XmlSecTransformCtx,
     XmlSecTransformKlass, context_or, valid, xmlSecTransformDefaultGetDataType,
@@ -293,6 +293,20 @@ pub(crate) unsafe extern "C" fn xmlSecTransformInputURIOpen(
     transform: *mut XmlSecTransform,
     uri: *const u8,
 ) -> c_int {
+    // SAFETY: by the caller's contract.
+    unsafe { open(transform, uri, None) }
+}
+
+/// [`xmlSecTransformInputURIOpen`] under the policy revision `pinned` of the
+/// run that opens the URI, or the current one for a caller outside a run.
+///
+/// # Safety
+/// As for [`xmlSecTransformInputURIOpen`].
+pub(crate) unsafe fn open(
+    transform: *mut XmlSecTransform,
+    uri: *const u8,
+    pinned: Option<&policy::Pinned>,
+) -> c_int {
     contain(-1, || {
         let state = input_uri_or!(transform, "xmlSecTransformInputURIOpen", -1);
         check!(
@@ -316,7 +330,10 @@ pub(crate) unsafe extern "C" fn xmlSecTransformInputURIOpen(
         // SAFETY: `uri` is NUL-terminated.
         let text = unsafe { CStr::from_ptr(uri.cast()) }.to_bytes();
         let here = here!("xmlSecTransformInputURIOpen");
-        let Some(policy) = policy::verification_at(here) else {
+        let Some(policy) = pinned
+            .map(|pinned| std::sync::Arc::clone(&pinned.verification))
+            .or_else(|| policy::verification_at(here))
+        else {
             return -1;
         };
         if !admits(policy.uris.references, text) {
@@ -449,10 +466,11 @@ unsafe extern "C" fn input_uri_pop_bin(
         unsafe { size.write(0) };
         return 0;
     };
-    let Some(policy) = policy::verification_at(here) else {
+    // SAFETY: an initialized context.
+    let Some(pinned) = (unsafe { run_policy(ctx, here) }) else {
         return -1;
     };
-    let resources = &policy.resources;
+    let resources = &pinned.verification.resources;
     // SAFETY: the context's run budget.
     let budget = unsafe { run_budget(ctx) };
     let per_resource = Limit {

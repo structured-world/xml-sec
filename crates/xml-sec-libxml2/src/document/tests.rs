@@ -70,7 +70,9 @@ fn a_panicking_operation_gives_the_tree_back() {
     let policy = crate::policy::library().expect("the library policy");
     let node = pointer_of::<u8>(doc).cast_const();
     let unwound = std::panic::catch_unwind(|| {
-        with_document(node, policy, |_, _| -> () { panic!("an operation fails") })
+        with_document(node, &*policy, |_, _| -> () {
+            panic!("an operation fails")
+        })
     });
     assert!(unwound.is_err());
     assert!(

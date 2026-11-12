@@ -43,7 +43,7 @@ use super::super::strings::{
 use super::super::tree::{XmlNode, c_text, nodes};
 use super::super::xmltree::{next_element, xmlSecCheckNodeName, xmlSecFindParent};
 use super::super::{contain, free, policy};
-use super::ctx::{Limit, charge, run_budget};
+use super::ctx::{Limit, charge, run_budget, run_policy};
 use super::io::{
     OutputBuffer, xmlOutputBufferClose, xmlOutputBufferWrite, xmlSecBufferCreateOutputBuffer,
     xmlSecTransformCreateOutputBuffer,
@@ -425,8 +425,9 @@ unsafe fn base64_step(
 ) -> Option<()> {
     let here = here!("xmlSecBase64Execute");
     let name = xmlSecNameBase64.as_ptr().cast();
-    let policy = policy::verification_at(here)?;
-    let resources = &policy.resources;
+    // SAFETY: by the caller's contract.
+    let pinned = unsafe { run_policy(ctx, here) }?;
+    let resources = &pinned.verification.resources;
     // SAFETY: by the caller's contract.
     unsafe {
         let budget = run_budget(ctx);
@@ -906,8 +907,8 @@ unsafe fn canonical(
     mode: C14nMode,
     comments: bool,
     prefixes: Option<String>,
+    policy: &xml_sec::policy::VerificationPolicy,
 ) -> Result<Vec<u8>, String> {
-    let policy = policy::verification().ok_or("the library policy did not compile")?;
     // SAFETY: a live node set by the caller's contract.
     let doc = unsafe { (*nodes).doc };
     let (document, slot) =
@@ -946,16 +947,17 @@ pub(super) unsafe fn selected_octets(
 }
 
 /// Writes the C14N form of `nodes` for klass `id` to the output buffer
-/// `out`.
+/// `out`, under the policy of the run of `ctx`.
 ///
 /// # Safety
 /// `nodes` is a live node set; `list` is the transform's prefix list;
-/// `out`'s callbacks are callable.
+/// `out`'s callbacks are callable; `ctx` is null or an initialized context.
 unsafe fn c14n_execute(
     id: *const XmlSecTransformKlass,
     nodes: *mut XmlSecNodeSet,
     list: &XmlSecPtrList,
     out: *mut OutputBuffer,
+    ctx: *mut XmlSecTransformCtx,
 ) -> c_int {
     check!(
         !id.is_null(),
@@ -1009,7 +1011,15 @@ unsafe fn c14n_execute(
                 .collect::<Vec<_>>()
                 .join(" ")
         });
-        let bytes = match canonical(nodes, mode, comments, prefixes) {
+        let pinned = if ctx.is_null() {
+            policy::Pinned::current(here)
+        } else {
+            run_policy(ctx, here)
+        };
+        let Some(pinned) = pinned else {
+            return -1;
+        };
+        let bytes = match canonical(nodes, mode, comments, prefixes, &pinned.verification) {
             Ok(bytes) => bytes,
             Err(error) => {
                 // The core canonicalizes in place of libxml2's
@@ -1047,9 +1057,9 @@ unsafe extern "C" fn c14n_push_xml(
     // SAFETY: a valid transform.
     let id = unsafe { (*transform).id };
     let render = |nodes, out| {
-        // SAFETY: the node set, the prefix list and the output buffer are
-        // live for the call.
-        unsafe { c14n_execute(id, nodes, list, out) }
+        // SAFETY: the node set, the prefix list, the output buffer and the
+        // context are live for the call.
+        unsafe { c14n_execute(id, nodes, list, out, ctx) }
     };
     // SAFETY: a C14N-family transform, its chain and context.
     unsafe {
@@ -1150,9 +1160,9 @@ unsafe extern "C" fn c14n_pop_bin(
     // SAFETY: a valid transform.
     let id = unsafe { (*transform).id };
     let render = |nodes, out| {
-        // SAFETY: the node set, the prefix list and the output buffer are
-        // live for the call.
-        unsafe { c14n_execute(id, nodes, list, out) }
+        // SAFETY: the node set, the prefix list, the output buffer and the
+        // context are live for the call.
+        unsafe { c14n_execute(id, nodes, list, out, ctx) }
     };
     let target = PopTarget {
         data,
