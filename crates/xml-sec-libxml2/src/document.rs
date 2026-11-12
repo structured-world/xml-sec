@@ -4,7 +4,7 @@
 use xml_sec::XmlDocument;
 use xml_sec::XmlDocumentError;
 use xml_sec::document::XmlDocumentPolicy;
-use xml_sec::document::owned_tree::OwnedTree;
+use xml_sec::document::owned_tree::{OwnedTree, TreeError, TreeNodeKind};
 
 use crate::handles::{self, HandleError};
 use crate::nodes::handle_of;
@@ -107,6 +107,32 @@ pub fn snapshot<T>(
         XmlDocument::snapshot_of_external_tree(tree, policy)
     })??;
     Ok((document, slot))
+}
+
+/// The element `node` and its subtree as a document of its own, read under
+/// `policy`: the element is copied, declaring the bindings it inherited, so
+/// it reads as it does in place while only its subtree is projected.
+///
+/// # Errors
+/// A handle that names no live element or a lent document, or the core's
+/// refusal of the copy under `policy`.
+pub fn subtree<T>(
+    node: *const T,
+    policy: &impl XmlDocumentPolicy,
+) -> Result<XmlDocument, DocumentError> {
+    let (slot, element) = handles::node(handle_of(node))?;
+    let staged = handles::read_document(slot, |tree| {
+        if tree.kind(element)? != TreeNodeKind::Element {
+            return Err(TreeError::NotAnElement);
+        }
+        let mut staged = OwnedTree::new();
+        let copy = staged.copy_from(tree, element)?;
+        let root = staged.document_node();
+        staged.append_child(root, copy)?;
+        Ok(staged)
+    })?
+    .map_err(HandleError::from)?;
+    XmlDocument::from_owned_tree(staged, policy).map_err(|refused| refused.0.into())
 }
 
 /// Run `work` over the document `node` belongs to, read under `policy`,

@@ -10,9 +10,10 @@ mod content;
 mod edit;
 mod qname;
 
-pub(crate) use content::xmlSecNodeEncodeAndSetContent;
+pub(crate) use content::{xmlSecIsEmptyNode, xmlSecNodeEncodeAndSetContent, xmlSecPrintXmlString};
 pub(crate) use edit::{
-    xmlSecAddChild, xmlSecAddNextSibling, xmlSecAddPrevSibling, xmlSecReplaceContent,
+    xmlSecAddChild, xmlSecAddNextSibling, xmlSecAddPrevSibling, xmlSecGetDefaultLineFeed,
+    xmlSecReplaceContent,
 };
 
 /// C `isspace` in the "C" locale, which libxmlsec1 trims and tests with.

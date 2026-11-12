@@ -141,6 +141,10 @@ impl Target {
                 "tests/c/library.c",
                 "tests/c/xmltree.c",
                 "tests/c/templates.c",
+                "tests/c/keys.c",
+                "tests/c/symkeys.c",
+                "tests/c/asymkeys.c",
+                "tests/c/keyinfo.c",
             ],
         }
     }

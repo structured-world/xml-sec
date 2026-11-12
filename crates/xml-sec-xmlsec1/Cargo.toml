@@ -19,6 +19,8 @@ xml-sec-libxml2 = { path = "../xml-sec-libxml2" }
 libc = "0.2"
 # The resumable Base64 codec behind `xmlSecBase64Ctx`.
 structured-base64 = "0.21"
+# Private keys held by key data are wiped when released.
+zeroize = "1"
 
 [dev-dependencies]
 tempfile = "3"

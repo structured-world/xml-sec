@@ -18,12 +18,12 @@ use super::super::nodeset::{
 };
 use super::super::strings::{xmlSecAttrAlgorithm, xmlSecDSigNs, xmlSecNodeTransform};
 use super::super::tree::{XmlDoc, XmlNode, c_text, name_for_report, nodes};
-use super::super::xmltree::{next_element, xmlSecCheckNodeName};
+use super::super::xmltree::{next_element, xmlSecCheckNodeName, xmlSecPrintXmlString};
 use super::super::{contain, free, malloc, policy, write_stream};
 use super::{
     DATA_BIN, DATA_UNKNOWN, DATA_XML, FLAGS_USER_SPECIFIED, MODE_PUSH, STATUS_FINISHED,
     STATUS_NONE, STATUS_WORKING, XmlSecTransform, XmlSecTransformKlass, builtin, io, klass_text,
-    parser, valid, valid_or, xml_text, xmlSecTransformConnect, xmlSecTransformCreate,
+    parser, valid, valid_or, xmlSecTransformConnect, xmlSecTransformCreate,
     xmlSecTransformDebugDump, xmlSecTransformDebugXmlDump, xmlSecTransformDestroy,
     xmlSecTransformGetDataType, xmlSecTransformIdListDebugDump, xmlSecTransformIdListDebugXmlDump,
     xmlSecTransformIdListFind, xmlSecTransformIdListFindByHref, xmlSecTransformIdListGetKlass,
@@ -1555,21 +1555,13 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxDebugXmlDump(
             } else {
                 write_stream(output, "<EnabledTransforms>all</EnabledTransforms>\n");
             }
-            let printed = |text: *mut u8| {
-                if text.is_null() {
-                    String::new()
-                } else {
-                    xml_text(&klass_text(text))
-                }
-            };
-            write_stream(
-                output,
-                &format!(
-                    "<Uri>{}</Uri>\n<UriXPointer>{}</UriXPointer>\n",
-                    printed(context.uri),
-                    printed(context.xptr_expr)
-                ),
-            );
+            // libxmlsec1 prints both through xmlSecPrintXmlString, which
+            // writes `NULL` for an unset one.
+            write_stream(output, "<Uri>");
+            xmlSecPrintXmlString(output, context.uri);
+            write_stream(output, "</Uri>\n<UriXPointer>");
+            xmlSecPrintXmlString(output, context.xptr_expr);
+            write_stream(output, "</UriXPointer>\n");
             let mut transform = context.first;
             while !transform.is_null() {
                 xmlSecTransformDebugXmlDump(transform, output);
