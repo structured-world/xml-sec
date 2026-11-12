@@ -68,6 +68,16 @@ pub(crate) unsafe fn read_policy(
     }
 }
 
+/// Whether a key-store search of the read with `ctx` was refused for the
+/// read's candidate allowance: a policy failure, not an unknown name.
+///
+/// # Safety
+/// `ctx` is a context.
+unsafe fn candidates_exhausted(ctx: *mut XmlSecKeyInfoCtx) -> bool {
+    // SAFETY: by the caller's contract; the slot is null or a pin.
+    unsafe { policy::key_candidates((*ctx).reserved0) }.is_some_and(|tally| tally.get().exhausted)
+}
+
 /// The key source of the document the klass `id` reads, as the verification
 /// policy's `key_sources` names it: a key the document names, carries or
 /// references. `None` for a klass whose result another klass reads (a
@@ -781,6 +791,10 @@ pub(crate) unsafe extern "C" fn name_xml_read(
             }
             let result = if (*key).value.is_null() && !(*ctx).keys_mngr.is_null() {
                 let found = xmlSecKeysMngrFindKey((*ctx).keys_mngr, new_name, ctx);
+                if found.is_null() && candidates_exhausted(ctx) {
+                    free(new_name.cast());
+                    return -1;
+                }
                 if found.is_null() {
                     // keyinfo.h documents this flag as stopping on a name the
                     // manager does not know; libxmlsec1 1.3.13 defines it

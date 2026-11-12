@@ -402,9 +402,7 @@ pub(crate) fn report(baseline_run: &Run, candidate_run: &Run) -> Result<Value, S
         (_, None) => Vec::new(),
     };
     let candidates = index(candidate.0, candidate.1);
-    let baselines = baseline
-        .map(|baseline| index(baseline.0, baseline.1))
-        .unwrap_or_default();
+    let baselines = baseline.map_or_default(|baseline| index(baseline.0, baseline.1));
     let mut names: Vec<&String> = baselines.iter().map(|(name, _)| name).collect();
     for (name, _) in &candidates {
         if !names.contains(&name) {
@@ -448,12 +446,7 @@ pub(crate) fn report(baseline_run: &Run, candidate_run: &Run) -> Result<Value, S
         counts.insert(label, Value::from(count));
         let mut ordered = Map::new();
         ordered.insert("case".into(), Value::from(name.clone()));
-        ordered.extend(
-            entry
-                .as_object_mut()
-                .map(std::mem::take)
-                .unwrap_or_default(),
-        );
+        ordered.extend(entry.as_object_mut().map_or_default(std::mem::take));
         entries.push(Value::Object(ordered));
     }
     let revision = |cli: &Value| {

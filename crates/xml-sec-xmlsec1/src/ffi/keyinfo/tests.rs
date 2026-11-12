@@ -17,7 +17,7 @@ use crate::ffi::keysdata::{
 };
 use crate::ffi::keysmngr::{
     xmlSecKeyStoreCreate, xmlSecKeysMngrAdoptKeysStore, xmlSecKeysMngrCreate,
-    xmlSecKeysMngrDestroy, xmlSecSimpleKeysStoreGetKlass,
+    xmlSecKeysMngrDestroy, xmlSecSimpleKeysStoreAdoptKey, xmlSecSimpleKeysStoreGetKlass,
 };
 use crate::ffi::list::xmlSecPtrListAdd;
 use crate::ffi::policy;
@@ -158,6 +158,54 @@ fn an_unknown_key_name_stops_the_read_when_the_flag_asks() {
         xmlSecKeyInfoCtxDestroy(ctx);
         xmlSecKeysMngrDestroy(mngr);
         xsFreeDoc(doc);
+    }
+}
+
+#[test]
+fn key_store_searches_of_one_read_share_the_candidate_budget() {
+    // Every store entry a KeyName search inspects is a key candidate of the
+    // read: once an unknown name has used the policy's allowance, a later
+    // name of the same read fails it instead of searching the store again.
+    own_process();
+    // SAFETY: objects created and destroyed here.
+    unsafe {
+        assert_eq!(xmlSecKeyDataIdsInit(), 0);
+        policy::republish(
+            |verification| verification.resources.max_key_candidates = 3,
+            |_| {},
+        )
+        .expect("the library policy compiles");
+        let mngr = xmlSecKeysMngrCreate();
+        let store = xmlSecKeyStoreCreate(xmlSecSimpleKeysStoreGetKlass());
+        assert_eq!(xmlSecKeysMngrAdoptKeysStore(mngr, store), 0);
+        for name in [c"k1", c"k2", c"k3"] {
+            let key = xmlSecKeyCreate();
+            let data = xmlSecKeyDataCreate(symkeys::hmac());
+            assert_eq!(
+                xmlSecKeyDataBinaryValueSetBuffer(data, b"secret".as_ptr(), 6),
+                0
+            );
+            assert_eq!(xmlSecKeySetValue(key, data), 0);
+            assert_eq!(xmlSecKeySetName(key, name.as_ptr().cast()), 0);
+            assert_eq!(xmlSecSimpleKeysStoreAdoptKey(store, key), 0);
+        }
+        let ctx = xmlSecKeyInfoCtxCreate(mngr);
+        let (read, reasons) = read_reported(
+            "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\">\
+             <KeyName>k3</KeyName></KeyInfo>",
+            ctx,
+        );
+        assert_eq!(read, 0, "a name within the allowance is found");
+        assert_eq!(reasons, [] as [i32; 0]);
+        let (read, reasons) = read_reported(
+            "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\">\
+             <KeyName>unknown</KeyName><KeyName>k3</KeyName></KeyInfo>",
+            ctx,
+        );
+        assert_eq!(read, -1, "the second search finds the allowance spent");
+        assert_eq!(reasons.first(), Some(&errors::R_INVALID_SIZE));
+        xmlSecKeyInfoCtxDestroy(ctx);
+        xmlSecKeysMngrDestroy(mngr);
     }
 }
 
@@ -419,6 +467,47 @@ fn a_key_reference_opens_its_uri_under_the_key_reference_classes() {
         assert_eq!((read, reasons), (0, Vec::new()));
         xmlSecKeyInfoCtxDestroy(ctx);
         xmlSecIOShutdown();
+    }
+}
+
+#[test]
+fn a_key_value_the_requirements_refuse_leaves_the_key_for_a_later_one() {
+    // An EC value read while an RSA key is required is no candidate: the key
+    // stays empty, so the RSA value that follows can still become its value.
+    const EC: &str = include_str!("../../../../../tests/fixtures/keys/ec/ec-prime256v1-pubkey.pem");
+    const RSA: &str = include_str!("../../../../../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    let body = |pem: &str| -> String {
+        pem.lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect()
+    };
+    let element = |pem: &str| {
+        parse(&format!(
+            "<DEREncodedKeyValue xmlns=\"http://www.w3.org/2009/xmldsig11#\">{}</DEREncodedKeyValue>",
+            body(pem)
+        ))
+    };
+    let (ec, rsa) = (element(EC), element(RSA));
+    // SAFETY: objects created and destroyed here.
+    unsafe {
+        assert_eq!(xmlSecKeyDataIdsInit(), 0);
+        let ctx = xmlSecKeyInfoCtxCreate(std::ptr::null_mut());
+        (*ctx).key_req.key_id = asymkeys::rsa().cast();
+        let key = xmlSecKeyCreate();
+        for (doc, expected_value) in [(ec, false), (rsa, true)] {
+            let read = xmlSecKeyDataXmlRead(
+                asymkeys::der_encoded_key_value(),
+                key.cast(),
+                xsDocGetRootElement(doc).cast(),
+                ctx.cast(),
+            );
+            assert_eq!(read, 0);
+            assert_eq!(!xmlSecKeyGetValue(key).is_null(), expected_value);
+        }
+        xmlSecKeyDestroy(key);
+        xmlSecKeyInfoCtxDestroy(ctx);
+        xsFreeDoc(ec);
+        xsFreeDoc(rsa);
     }
 }
 

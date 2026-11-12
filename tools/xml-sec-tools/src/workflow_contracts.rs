@@ -620,14 +620,13 @@ fn the_required_aggregate_reaches_every_job_and_checks_every_direct_result() {
     let needs = |body: &str| -> Vec<String> {
         body.lines()
             .find_map(|line| line.strip_prefix("    needs: "))
-            .map(|value| {
+            .map_or_default(|value| {
                 value
                     .trim_matches(['[', ']'])
                     .split(',')
                     .map(|need| need.trim().to_owned())
                     .collect()
             })
-            .unwrap_or_default()
     };
     let mut seen = std::collections::BTreeSet::new();
     let mut pending = vec!["test".to_owned()];

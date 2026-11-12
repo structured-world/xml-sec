@@ -1496,27 +1496,22 @@ fn dns_name_has_valid_syntax(value: &str, allow_leading_dot: bool) -> bool {
     } else {
         value
     };
-    if domain.is_empty()
-        || domain.len() > 253
-        || domain.split('.').any(|label| {
-            label.is_empty()
-                || label.len() > 63
-                || !label
+    !domain.is_empty()
+        && domain.len() <= 253
+        && domain.split('.').all(|label| {
+            label.len() <= 63
+                && label
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-                || !label
+                && label
                     .as_bytes()
                     .first()
                     .is_some_and(u8::is_ascii_alphanumeric)
-                || !label
+                && label
                     .as_bytes()
                     .last()
                     .is_some_and(u8::is_ascii_alphanumeric)
         })
-    {
-        return false;
-    }
-    true
 }
 
 #[cfg(test)]

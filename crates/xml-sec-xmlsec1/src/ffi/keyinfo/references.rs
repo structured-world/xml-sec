@@ -156,12 +156,7 @@ unsafe fn dereference(
         // The chain runs under the read's revision, not a later one, opens
         // the URI under the classes admitted for this key reference, and
         // charges what the read's earlier references spent.
-        seed_run(
-            context,
-            pinned,
-            admitted,
-            spent.map(Cell::get).unwrap_or_default(),
-        );
+        seed_run(context, pinned, admitted, spent.map_or_default(Cell::get));
         if xmlSecTransformCtxSetUri(context, uri, node) < 0 {
             let shown = if uri.is_null() {
                 "NULL".to_owned()

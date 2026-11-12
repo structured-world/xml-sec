@@ -7,10 +7,11 @@
 //! klass works as with libxmlsec1. The simple store keeps a list of keys and
 //! finds a key by name and requirements.
 
+use std::cell::Cell;
 use std::ffi::{c_char, c_int, c_uint, c_void};
 
 use super::errors::{self, check, here};
-use super::keyinfo::{XmlSecKeyInfoCtx, xmlSecKeyInfoNodeRead};
+use super::keyinfo::{XmlSecKeyInfoCtx, read_policy, xmlSecKeyInfoNodeRead};
 use super::keys::{
     XmlSecKey, xmlSecKeyCreate, xmlSecKeyDestroy, xmlSecKeyDuplicate, xmlSecKeyMatch,
     xmlSecKeyPtrListGetKlass,
@@ -20,6 +21,7 @@ use super::list::{
     XmlSecPtrList, xmlSecPtrListAdd, xmlSecPtrListFinalize, xmlSecPtrListGetItem,
     xmlSecPtrListGetSize, xmlSecPtrListInitialize, xmlSecPtrListSet,
 };
+use super::policy;
 use super::transforms::zero_list;
 use super::tree::{XmlNode, nodes};
 use super::{contain, free, malloc};
@@ -729,14 +731,34 @@ unsafe extern "C" fn simple_find_key(
         if !keys_list(list, here) {
             return std::ptr::null_mut();
         }
+        let Some(pinned) = read_policy(ctx, here) else {
+            return std::ptr::null_mut();
+        };
+        let max = pinned.verification.resources.max_key_candidates;
+        // Every entry inspected is a key candidate of the read, charged to
+        // the allowance all its searches share, as the core charges a named
+        // lookup; a search outside a read is an operation of its own.
+        let shared = policy::key_candidates((*ctx).reserved0);
+        let mut tally = shared.map_or_default(Cell::get);
+        let mut found = std::ptr::null_mut();
         for pos in 0..xmlSecPtrListGetSize(list) {
+            if tally.inspected >= max {
+                tally.exhausted = true;
+                errors::limit_exceeded(here, (*(*store).id).name.cast(), "max_key_candidates", max);
+                break;
+            }
+            tally.inspected += 1;
             let key = xmlSecPtrListGetItem(list, pos).cast::<XmlSecKey>();
             if !key.is_null() && xmlSecKeyMatch(key, name, &raw mut (*ctx).key_req) == 1 {
-                return xmlSecKeyDuplicate(key);
+                found = xmlSecKeyDuplicate(key);
+                break;
             }
         }
+        if let Some(shared) = shared {
+            shared.set(tally);
+        }
+        found
     }
-    std::ptr::null_mut()
 }
 
 /// `xmlSecSimpleKeysStoreGetKlass`: the simple keys store klass.

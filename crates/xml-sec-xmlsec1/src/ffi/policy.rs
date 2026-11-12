@@ -62,11 +62,22 @@ pub(crate) struct Spent {
     pub(crate) external_resources: usize,
 }
 
+/// The key candidates one `KeyInfo` read has inspected of the policy's
+/// `max_key_candidates`, across every key-store search it makes.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct KeyCandidates {
+    pub(crate) inspected: usize,
+    /// A search was refused for the allowance; the read fails rather than
+    /// taking the refusal for a missing key.
+    pub(crate) exhausted: bool,
+}
+
 /// What a context's reserved slot holds during an operation: its policy
 /// revision and what its runs have spent so far.
 struct Operation {
     pinned: Pinned,
     spent: Cell<Spent>,
+    key_candidates: Cell<KeyCandidates>,
 }
 
 /// A pin in a context's reserved slot for one call: the outermost call of an
@@ -92,6 +103,7 @@ impl SlotPin {
             let operation = Operation {
                 pinned: Pinned::current(here)?,
                 spent: Cell::default(),
+                key_candidates: Cell::default(),
             };
             *slot = Box::into_raw(Box::new(operation)).cast();
         }
@@ -139,6 +151,16 @@ pub(crate) unsafe fn pinned<'a>(slot: *mut c_void) -> Option<&'a Pinned> {
 pub(crate) unsafe fn spent<'a>(slot: *mut c_void) -> Option<&'a Cell<Spent>> {
     // SAFETY: by the caller's contract.
     unsafe { slot.cast::<Operation>().as_ref() }.map(|operation| &operation.spent)
+}
+
+/// The key candidates the operation pinned in `slot` has inspected, if one
+/// is pinned.
+///
+/// # Safety
+/// As for [`pinned`].
+pub(crate) unsafe fn key_candidates<'a>(slot: *mut c_void) -> Option<&'a Cell<KeyCandidates>> {
+    // SAFETY: by the caller's contract.
+    unsafe { slot.cast::<Operation>().as_ref() }.map(|operation| &operation.key_candidates)
 }
 
 /// Publishes the current snapshots with the edits applied, as a libxmlsec1

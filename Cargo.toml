@@ -6,7 +6,6 @@ rust-version = "1.92"
 license = "Apache-2.0 AND MIT"
 description = "Pure Rust XML Security: XMLDSig, XMLEnc, C14N with explicit policy and providers."
 repository = "https://github.com/structured-world/xml-sec"
-homepage = "https://github.com/structured-world/xml-sec"
 documentation = "https://docs.rs/xml-sec"
 keywords = ["xml", "xmldsig", "xmlenc", "c14n", "saml"]
 categories = ["cryptography", "web-programming", "authentication"]

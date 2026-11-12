@@ -23,7 +23,8 @@ use super::buffer::{
 use super::errors::{self, Here, here};
 use super::keyinfo::{MODE_READ, MODE_WRITE, XmlSecKeyInfoCtx, read_policy};
 use super::keys::{
-    TYPE_PRIVATE, TYPE_PUBLIC, TYPE_UNKNOWN, XmlSecKey, xmlSecKeyGetValue, xmlSecKeySetValue,
+    TYPE_PRIVATE, TYPE_PUBLIC, TYPE_UNKNOWN, XmlSecKey, XmlSecKeyReq, xmlSecKeyGetValue,
+    xmlSecKeyReqMatchKeyValue, xmlSecKeySetValue,
 };
 use super::keysdata::{
     USAGE_KEY_INFO_NODE, USAGE_KEY_VALUE_NODE, USAGE_READ_FROM_FILE,
@@ -426,13 +427,8 @@ unsafe extern "C" fn xml_read(
                     private: None,
                 },
             );
-            if xmlSecKeySetValue(key, data) < 0 {
-                errors::internal(here, object_name, c"xmlSecKeySetValue");
-                xmlSecKeyDataDestroy(data);
-                return -1;
-            }
+            install_value(here, object_name, key, data, &raw mut (*ctx).key_req)
         }
-        0
     })
 }
 
@@ -751,7 +747,14 @@ unsafe extern "C" fn der_xml_read(
                 errors::internal(here, object_name, c"xmlSecBufferInitialize");
                 return -1;
             }
-            let result = der_adopt(here, key, node, buffer, &policy.resources);
+            let result = der_adopt(
+                here,
+                key,
+                node,
+                buffer,
+                &policy.resources,
+                &raw mut (*ctx).key_req,
+            );
             xmlSecBufferFinalize(buffer);
             result
         }
@@ -759,16 +762,18 @@ unsafe extern "C" fn der_xml_read(
 }
 
 /// Reads the Base64 content of `node` into `buffer` and makes the SPKI it
-/// holds the value of `key`.
+/// holds the value of `key`, when it meets `req`.
 ///
 /// # Safety
-/// `key` is a key, `node` a live element and `buffer` an initialized buffer.
+/// `key` is a key, `node` a live element, `buffer` an initialized buffer and
+/// `req` initialized requirements.
 unsafe fn der_adopt(
     here: Here,
     key: *mut XmlSecKey,
     node: *mut XmlNode,
     buffer: *mut XmlSecBuffer,
     resources: &xml_sec::policy::ResourcePolicy,
+    req: *mut XmlSecKeyReq,
 ) -> c_int {
     let object_name = xmlSecNameDEREncodedKeyValue.as_ptr().cast::<c_char>();
     // The key is external material: what its Base64 text decodes to is
@@ -829,6 +834,32 @@ unsafe fn der_adopt(
         if data.is_null() {
             errors::internal(here, object_name, c"xmlSecKeyDataCreate");
             return -1;
+        }
+        install_value(here, object_name, key, data, req)
+    }
+}
+
+/// Makes `data` the value of `key` when it meets `req`; a value the
+/// requirements refuse is released and the key keeps none, so a later
+/// candidate of the same `KeyInfo` can still supply it. libxmlsec1 installs
+/// the first value whatever it is and then fails the next reader with "key
+/// already has a value".
+///
+/// # Safety
+/// `key` is a key without a value, `data` key data it may adopt, `req`
+/// initialized requirements.
+unsafe fn install_value(
+    here: Here,
+    object_name: *const c_char,
+    key: *mut XmlSecKey,
+    data: *mut XmlSecKeyData,
+    req: *mut XmlSecKeyReq,
+) -> c_int {
+    // SAFETY: by the caller's contract.
+    unsafe {
+        if xmlSecKeyReqMatchKeyValue(req, data) != 1 {
+            xmlSecKeyDataDestroy(data);
+            return 0;
         }
         if xmlSecKeySetValue(key, data) < 0 {
             errors::internal(here, object_name, c"xmlSecKeySetValue");
