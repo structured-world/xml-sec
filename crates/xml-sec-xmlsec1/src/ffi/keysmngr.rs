@@ -24,8 +24,6 @@ use super::transforms::zero_list;
 use super::tree::{XmlNode, nodes};
 use super::{contain, free, malloc};
 
-/// `XMLSEC_ERRORS_R_KEY_NOT_FOUND`.
-const R_KEY_NOT_FOUND: c_int = 45;
 /// `XMLSEC_KEYINFO_FLAGS_LAX_KEY_SEARCH`.
 const FLAGS_LAX_KEY_SEARCH: c_uint = 0x0000_8000;
 
@@ -453,7 +451,7 @@ unsafe fn lax_search(ctx: *mut XmlSecKeyInfoCtx) -> *mut XmlSecKey {
             xmlSecKeyDestroy(key);
         }
     }
-    errors::other(here, R_KEY_NOT_FOUND, std::ptr::null(), None);
+    errors::other(here, errors::R_KEY_NOT_FOUND, std::ptr::null(), None);
     std::ptr::null_mut()
 }
 

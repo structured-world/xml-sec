@@ -165,16 +165,20 @@ static void content(void) {
     xmlNodePtr node;
     xmlSecBuffer buffer;
     xmlSecSize size = 0;
+    int ret;
 
     printf("content\n");
     xmlSecBufferInitialize(&buffer, 0);
+    /* C leaves the order of argument evaluation unspecified, so a call and
+     * the output it writes are never printed in one statement. */
     for (node = first; node != NULL; node = xsNodeGetNext(node)) {
         printf("  %s: empty=%d", name_of(node), xmlSecIsEmptyNode(node));
         size = 99;
-        printf(" size=%d/%d\n", xmlSecGetNodeContentAsSize(node, 7, &size), (int)size);
+        ret = xmlSecGetNodeContentAsSize(node, 7, &size);
+        printf(" size=%d/%d\n", ret, (int)size);
     }
-    printf("  hex read: %d size=%d\n", xmlSecGetNodeContentAsHex(first, &buffer),
-           (int)xmlSecBufferGetSize(&buffer));
+    ret = xmlSecGetNodeContentAsHex(first, &buffer);
+    printf("  hex read: %d size=%d\n", ret, (int)xmlSecBufferGetSize(&buffer));
     printf("  hex write: %d\n", xmlSecSetNodeContentAsHex(first, BAD_CAST "\x01\xab\x00\xff", 4));
     printf("  bad hex: %d\n",
            xmlSecGetNodeContentAsHex(xsNodeGetNext(xsNodeGetNext(xsNodeGetNext(first))), &buffer));

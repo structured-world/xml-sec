@@ -695,6 +695,19 @@ unsafe extern "C" fn der_xml_read(
             return -1;
         }
         let object_name = xmlSecNameDEREncodedKeyValue.as_ptr().cast::<c_char>();
+        // A key that already has a value keeps it, as the other key-value
+        // readers keep it: replacing it would leave a key resolved from one
+        // source (a manager entry, say) holding another source's material.
+        // SAFETY: a key.
+        if !unsafe { xmlSecKeyGetValue(key) }.is_null() {
+            errors::other(
+                here,
+                errors::R_INVALID_KEY_DATA,
+                object_name,
+                Some("key already has a value"),
+            );
+            return -1;
+        }
         // SAFETY: a live element; its children are live.
         let child = unsafe { xmlSecGetNextElementNode(nodes::first_child(node)) };
         if !child.is_null() {

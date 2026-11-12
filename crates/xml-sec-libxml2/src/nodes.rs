@@ -733,13 +733,14 @@ pub enum FragmentError {
     Document(#[from] xml_sec::XmlDocumentError),
 }
 
-/// `xmlParseInNodeContext`: parse `bytes` as content of the element `node`
-/// under the library policy, seeing the namespace bindings in scope there,
-/// and return the first parsed node; the nodes come back unlinked as one run
-/// of siblings. Null for a fragment without nodes.
+/// `xmlParseInNodeContext`: parse `bytes` as content of `node`, an element
+/// or the document node, under the library policy, seeing the namespace
+/// bindings in scope there, and return the first parsed node; the nodes come
+/// back unlinked as one run of siblings. Null for a fragment without nodes.
 ///
 /// # Errors
-/// A context naming nothing live or not an element, bytes that are not
+/// A context naming nothing live or neither an element nor the document
+/// node, bytes that are not
 /// UTF-8, an unavailable policy, or the core's refusal of the fragment,
 /// which is also this thread's [`crate::document::last_error`].
 pub fn parse_in_context(node: *const Node, bytes: &[u8]) -> Result<*mut Node, FragmentError> {

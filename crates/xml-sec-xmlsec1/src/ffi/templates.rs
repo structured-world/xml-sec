@@ -175,6 +175,23 @@ unsafe fn required(
     }
 }
 
+/// Whether a template has the document it is built in, reported at `here`
+/// when not. libxmlsec1 also builds one without a document for the caller
+/// to attach later; the tree keeps no node outside a document.
+fn has_document(doc: *mut XmlDoc, here: Here) -> bool {
+    if doc.is_null() {
+        errors::report(
+            here,
+            std::ptr::null(),
+            std::ptr::null(),
+            errors::R_NOT_IMPLEMENTED,
+            "doc=NULL: a template is built in the document it belongs to",
+        );
+        return false;
+    }
+    true
+}
+
 /// The klass `id`'s href after libxmlsec1's assertions `id != NULL` and
 /// `id->href != NULL` at `here`.
 ///
@@ -258,6 +275,9 @@ pub(crate) unsafe extern "C" fn xmlSecTmplSignatureCreateNsPref(
         }) else {
             return std::ptr::null_mut();
         };
+        if !has_document(doc, here) {
+            return std::ptr::null_mut();
+        }
         // SAFETY: handles are validated by each call; the node is freed on
         // every failure.
         unsafe {
@@ -868,6 +888,9 @@ pub(crate) unsafe extern "C" fn xmlSecTmplEncDataCreate(
 ) -> *mut XmlNode {
     contain(std::ptr::null_mut(), || {
         let here = here!("xmlSecTmplEncDataCreate");
+        if !has_document(doc, here) {
+            return std::ptr::null_mut();
+        }
         // SAFETY: handles are validated by each call; the node is freed on
         // failure.
         unsafe {

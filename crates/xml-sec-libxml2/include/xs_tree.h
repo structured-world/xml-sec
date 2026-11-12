@@ -105,7 +105,9 @@ xmlNsPtr xsNsGetNext(const xmlNs *ns);
 xmlChar *xsNsGetHref(const xmlNs *ns);
 xmlChar *xsNsGetPrefix(const xmlNs *ns);
 
-/* Building and linking. */
+/* Building and linking. A node is created in a document and stays in it:
+ * a NULL doc returns NULL where libxml2 creates a free node, so the
+ * libxmlsec1 template constructors need the document they build in. */
 xmlNodePtr xsNewDocNode(xmlDocPtr doc, xmlNsPtr ns, const xmlChar *name, const xmlChar *content);
 xmlNodePtr xsNewDocText(xmlDocPtr doc, const xmlChar *content);
 xmlNodePtr xsNewDocComment(xmlDocPtr doc, const xmlChar *content);

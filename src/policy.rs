@@ -1443,7 +1443,11 @@ pub struct VerificationPolicy {
 
 #[cfg(feature = "xmldsig")]
 impl VerificationPolicy {
-    pub(crate) fn check_digest_algorithm(
+    /// Whether verification admits the digest method `algorithm`.
+    ///
+    /// # Errors
+    /// [`PolicyViolation::Algorithm`] for a method the policy excludes.
+    pub fn check_digest_algorithm(
         &self,
         algorithm: DigestAlgorithm,
     ) -> Result<(), PolicyViolation> {
@@ -1610,7 +1614,11 @@ impl SigningPolicy {
         )
     }
 
-    pub(crate) fn check_digest_algorithm(
+    /// Whether signing admits the digest method `algorithm`.
+    ///
+    /// # Errors
+    /// [`PolicyViolation::Algorithm`] for a method the policy excludes.
+    pub fn check_digest_algorithm(
         &self,
         algorithm: DigestAlgorithm,
     ) -> Result<(), PolicyViolation> {

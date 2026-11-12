@@ -11,7 +11,7 @@ use alloc::{string::String, vec, vec::Vec};
 
 use aes::cipher::{BlockModeDecrypt as _, KeyIvInit as _, block_padding::Pkcs7};
 use crypto_bigint::{
-    BoxedUint,
+    BoxedUint, Resize as _,
     modular::{BoxedMontyForm, BoxedMontyParams},
 };
 use der::{
@@ -171,7 +171,13 @@ impl KeyInventory {
                     "DSA PRIVATE KEY" => Family::Dsa,
                     _ => return Err(UNSUPPORTED),
                 };
-                let traditional = decode_pem(&block, password, bytes.len(), resources)?;
+                // The inventory's material and the new name stay retained
+                // beside the input while it is decoded.
+                let source = self
+                    .retained_with_name(&name, resources)?
+                    .checked_add(bytes.len())
+                    .ok_or_else(|| aggregate_limit(resources))?;
+                let traditional = decode_pem(&block, password, source, resources)?;
                 // Besides the decoded DER, the encoded input and the DER
                 // buffer's unused capacity stay live while the key is
                 // normalized and imported.
@@ -217,15 +223,21 @@ impl KeyInventory {
         let live = outside
             .checked_add(der.len())
             .ok_or_else(|| aggregate_limit(resources))?;
+        // Normalization also runs beside the inventory's retained material
+        // and the new name, which the import below counts itself.
+        let peak = self
+            .retained_with_name(&name, resources)?
+            .checked_add(live)
+            .ok_or_else(|| aggregate_limit(resources))?;
         let normalized = match family {
             // The label promises PKCS#1, never another container.
             Some(Family::Rsa) if is_pkcs8(der) => return Err(UNSUPPORTED),
             Some(Family::Rsa) => None,
-            Some(Family::Ec) => Some(normalize_ec(der, resources, live)?.ok_or(UNSUPPORTED)?),
-            Some(Family::Dsa) => Some(normalize_dsa(der, resources, live)?.ok_or(UNSUPPORTED)?),
-            None => match normalize_ec(der, resources, live)? {
+            Some(Family::Ec) => Some(normalize_ec(der, resources, peak)?.ok_or(UNSUPPORTED)?),
+            Some(Family::Dsa) => Some(normalize_dsa(der, resources, peak)?.ok_or(UNSUPPORTED)?),
+            None => match normalize_ec(der, resources, peak)? {
                 Some(normalized) => Some(normalized),
-                None => normalize_dsa(der, resources, live)?,
+                None => normalize_dsa(der, resources, peak)?,
             },
         };
         match normalized {
@@ -236,6 +248,16 @@ impl KeyInventory {
             // The inventory counts `der` and wraps PKCS#1 RSA itself.
             None => self.add_private_der_inner(name, der, None, usages, resources, outside),
         }
+    }
+
+    /// The material the inventory retains with an entry named `name` added,
+    /// within the aggregate budget.
+    fn retained_with_name(
+        &self,
+        name: &str,
+        resources: &ResourcePolicy,
+    ) -> Result<usize, KeyStoreError> {
+        self.check_material_capacity(super::named_material_length(name, 0, 1)?, resources)
     }
 }
 
@@ -316,9 +338,12 @@ fn decode_pem(
             .and_then(|value| value.split_once(','))
             .ok_or(KeyStoreError::ProtectedContainer)?;
         let cipher = Cipher::named(cipher).ok_or(KeyStoreError::ProtectedContainer)?;
-        let iv = decode_hex(encoded_iv)
-            .filter(|iv| iv.len() == cipher.iv_len())
-            .ok_or(KeyStoreError::ProtectedContainer)?;
+        // Two hex digits per IV octet: any other length is refused before
+        // it is decoded.
+        if encoded_iv.len() != 2 * cipher.iv_len() {
+            return Err(KeyStoreError::ProtectedContainer);
+        }
+        let iv = decode_hex(encoded_iv).ok_or(KeyStoreError::ProtectedContainer)?;
         Some((
             cipher,
             iv,
@@ -524,11 +549,17 @@ fn normalize_dsa(
     let q = BoxedUint::from_be_slice_vartime(key.q.as_bytes());
     let g = BoxedUint::from_be_slice_vartime(key.g.as_bytes());
     let public = BoxedUint::from_be_slice_vartime(key.y.as_bytes());
-    let secret = BoxedUint::from_be_slice_vartime(key.x.as_bytes());
+    // The private exponent is wiped on every path out, refusals included.
+    let secret = Zeroizing::new(BoxedUint::from_be_slice_vartime(key.x.as_bytes()));
     let components = DsaComponents::from_components(p, q, g).map_err(|_| UNSUPPORTED)?;
-    // FIPS 186-4 4.1: the stored public key must equal g^x mod p.
+    // FIPS 186-4 4.1: the stored public key must equal g^x mod p. The
+    // Montgomery form needs g at p's precision; a g that does not fit there
+    // is not below p (FIPS 186-4 4.1 requires 1 < g < p).
+    let generator = BoxedUint::clone(components.g())
+        .try_resize(components.p().bits_precision())
+        .ok_or(UNSUPPORTED)?;
     let params = BoxedMontyParams::new(components.p().clone());
-    let expected = BoxedMontyForm::new((**components.g()).clone(), &params)
+    let expected = BoxedMontyForm::new(generator, &params)
         .pow(&secret)
         .retrieve();
     if expected != public {
@@ -551,8 +582,9 @@ fn normalize_dsa(
     reserve(resources, with_document, document)?;
     let verifying =
         DsaVerifyingKey::from_components(components, public).map_err(|_| UNSUPPORTED)?;
-    let signing =
-        NativeDsaSigningKey::from_components(verifying, secret).map_err(|_| UNSUPPORTED)?;
+    // The signing key owns its copy and zeroizes it on drop.
+    let signing = NativeDsaSigningKey::from_components(verifying, BoxedUint::clone(&secret))
+        .map_err(|_| UNSUPPORTED)?;
     let normalized = signing.to_pkcs8_der().map_err(|_| UNSUPPORTED)?;
     Ok(Some(Zeroizing::new(normalized.as_bytes().to_vec())))
 }

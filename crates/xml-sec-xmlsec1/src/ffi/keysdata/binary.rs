@@ -284,6 +284,9 @@ pub(crate) unsafe extern "C" fn value_xml_read(
                 errors::invalid_node_content(here, node, object, "empty");
                 return -1;
             }
+            // The text and the bytes decoded over it are the secret: the
+            // whole string is wiped before the allocation is released.
+            let length = std::ffi::CStr::from_ptr(text.cast()).count_bytes();
             let mut size = 0;
             let result = if xmlSecBase64DecodeInPlace(text, &raw mut size) < 0 {
                 errors::internal(here, object, c"xmlSecBase64Decode_ex");
@@ -291,6 +294,7 @@ pub(crate) unsafe extern "C" fn value_xml_read(
             } else {
                 adopt_value(here, id, key, text, size, &raw mut (*ctx).key_req)
             };
+            zeroize::Zeroize::zeroize(std::slice::from_raw_parts_mut(text, length));
             free(text.cast());
             result
         }

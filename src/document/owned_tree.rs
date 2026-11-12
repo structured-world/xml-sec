@@ -572,6 +572,7 @@ impl OwnedTree {
     /// node, as libxml2's `xmlParseInNodeContext` does: the fragment sees the
     /// namespace bindings in scope at `context`, and its nodes come back
     /// unlinked as one run of siblings. `None` for a fragment without nodes.
+    /// The context is an element or the document node, which binds nothing.
     ///
     /// The fragment is parsed under `policy` as a document whose element
     /// declares those bindings, so its bytes count against the document
@@ -579,20 +580,29 @@ impl OwnedTree {
     ///
     /// # Errors
     /// [`XmlDocumentError::MissingNode`] for a `context` that is not live,
-    /// [`XmlDocumentError::TargetNotElement`] for one that is no element, or
-    /// the parse error of a fragment that is not well-formed content.
+    /// [`XmlDocumentError::TargetNotElement`] for one that is neither an
+    /// element nor the document node, or the parse error of a fragment that
+    /// is not well-formed content.
     pub fn parse_in_context(
         &mut self,
         context: TreeNode,
         fragment: &str,
         policy: &impl XmlDocumentPolicy,
     ) -> Result<Option<TreeNode>, XmlDocumentError> {
-        let context = self.element(context).map_err(|error| match error {
-            TreeError::NotAnElement => XmlDocumentError::TargetNotElement,
-            _ => XmlDocumentError::MissingNode,
-        })?;
+        let id = self
+            .live(context)
+            .map_err(|_| XmlDocumentError::MissingNode)?;
+        let bindings = if id == self.document.root() {
+            Vec::new()
+        } else {
+            let element = self.element(context).map_err(|error| match error {
+                TreeError::NotAnElement => XmlDocumentError::TargetNotElement,
+                _ => XmlDocumentError::MissingNode,
+            })?;
+            self.bindings_in_scope(element)
+        };
         let mut wrapped = String::from("<w");
-        for (prefix, uri) in self.bindings_in_scope(context) {
+        for (prefix, uri) in bindings {
             match prefix {
                 Some(prefix) => {
                     wrapped.push_str(" xmlns:");
@@ -616,7 +626,7 @@ impl OwnedTree {
         let tops: Vec<NodeId> = parsed
             .document
             .children(element)
-            .map(|child| self.import(&parsed.document, child))
+            .map(|child| self.import(&parsed.document, child, None))
             .collect();
         for &top in &tops {
             self.register_imported_ids(top);
@@ -638,7 +648,8 @@ impl OwnedTree {
         if from == source.document.root() {
             return Err(TreeError::DocumentNode);
         }
-        let copy = self.import(&source.document, from);
+        let mut copied = Vec::new();
+        let copy = self.import(&source.document, from, Some(&mut copied));
         if let Some(parent) = source.linked_parent(from) {
             let declared: Vec<Option<String>> = source
                 .document
@@ -664,6 +675,19 @@ impl OwnedTree {
             }
         }
         self.register_imported_ids(copy);
+        // The IDs a caller registered on attributes of the subtree carry over
+        // with the attributes, as libxml2's copy re-adds a copied ID
+        // attribute; a value held here already keeps its element.
+        for (original, element) in copied {
+            for (attribute, value) in source.ids.of_element(TreeNode::of(original)) {
+                let carrier = id_source(
+                    TreeNode::of(element),
+                    &attribute.name,
+                    attribute.namespace.as_deref(),
+                );
+                drop(self.claim(String::from(value), carrier, &[]));
+            }
+        }
         Ok(TreeNode::of(copy))
     }
 
@@ -700,10 +724,18 @@ impl OwnedTree {
     }
 
     /// A copy of the subtree at `from` of `source` in this tree, unlinked.
-    fn import(&mut self, source: &xmloxide::Document, from: NodeId) -> NodeId {
+    fn import(
+        &mut self,
+        source: &xmloxide::Document,
+        from: NodeId,
+        mut copied: Option<&mut Vec<(NodeId, NodeId)>>,
+    ) -> NodeId {
         let top = self.document.create_node(source.node(from).kind.clone());
         let mut pending = vec![(from, top)];
         while let Some((original, copy)) = pending.pop() {
+            if let Some(copied) = copied.as_deref_mut() {
+                copied.push((original, copy));
+            }
             for child in source.children(original) {
                 let child_copy = self.document.create_node(source.node(child).kind.clone());
                 self.document.append_child(copy, child_copy);

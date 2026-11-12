@@ -183,6 +183,24 @@ mod selected_provider {
     }
 
     #[test]
+    fn the_supplied_key_is_charged_as_an_inspected_candidate() {
+        // The caller's key is one inspected candidate, as document
+        // verification charges its root key: a budget of none refuses it,
+        // and one admits it.
+        let algorithm = SignatureAlgorithm::HmacSha256;
+        let value = mac();
+        let mut policy = VerificationPolicy::default();
+        policy.resources.max_key_candidates = 0;
+        let refused =
+            verify_signature_value(&policy, default_provider(), &key(), algorithm, DATA, &value);
+        assert!(matches!(refused, Err(DsigError::Policy(_))), "{refused:?}");
+        policy.resources.max_key_candidates = 1;
+        let admitted =
+            verify_signature_value(&policy, default_provider(), &key(), algorithm, DATA, &value);
+        assert!(matches!(admitted, Ok(true)), "{admitted:?}");
+    }
+
+    #[test]
     fn verification_runs_through_the_selected_provider() {
         // The provider that offers the method also executes it: its refusal
         // is the result, never a verification by the key behind its back.

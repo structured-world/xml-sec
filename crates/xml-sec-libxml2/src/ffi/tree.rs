@@ -673,7 +673,8 @@ const XML_ERR_NO_MEMORY: c_int = 2;
 const XML_ERR_DOCUMENT_END: c_int = 5;
 
 /// `xmlParseInNodeContext`: parse the `size` bytes at `data`, UTF-8, as
-/// content of the element `node`, under the library policy; the parsed
+/// content of `node`, an element or the document node, under the library
+/// policy; the parsed
 /// nodes come back in `*list` as one run of unlinked siblings (null when
 /// there are none), which the caller links or frees with
 /// [`xsFreeNodeList`]. Returns 0, or a libxml2 error code: 1 for a refused
@@ -713,6 +714,12 @@ pub unsafe extern "C" fn xsParseInNodeContext(
                 nodes::free_list(first);
                 0
             }
+            // A context that is neither an element nor the document node is
+            // the refused context, not malformed content.
+            Err(nodes::FragmentError::Document(
+                xml_sec::XmlDocumentError::TargetNotElement
+                | xml_sec::XmlDocumentError::MissingNode,
+            )) => XML_ERR_INTERNAL_ERROR,
             Err(nodes::FragmentError::Document(_)) => XML_ERR_DOCUMENT_END,
             Err(_) => XML_ERR_INTERNAL_ERROR,
         }

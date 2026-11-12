@@ -29,8 +29,6 @@ const FORMAT_DER: c_int = 3;
 const FORMAT_PKCS8_PEM: c_int = 4;
 /// `xmlSecKeyDataFormatPkcs8Der`.
 const FORMAT_PKCS8_DER: c_int = 5;
-/// `XMLSEC_ERRORS_R_INVALID_FORMAT`.
-const R_INVALID_FORMAT: c_int = 13;
 /// The largest password a callback may return, as OpenSSL's `PEM_BUFSIZE`
 /// buffer (1024 bytes).
 const PASSWORD_CAPACITY: c_int = 1024;
@@ -199,7 +197,7 @@ unsafe fn load(
                 here,
                 std::ptr::null(),
                 std::ptr::null(),
-                R_INVALID_FORMAT,
+                errors::R_INVALID_FORMAT,
                 &format!("format={format}"),
             );
             return null;

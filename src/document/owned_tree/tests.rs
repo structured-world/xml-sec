@@ -469,6 +469,25 @@ fn a_fragment_parses_in_the_namespaces_of_its_context() {
 }
 
 #[test]
+fn a_fragment_parses_in_the_document_context() {
+    // libxml2 accepts the document node as the context, which binds no
+    // prefix: the document element can be replaced from a buffer.
+    let mut tree = parsed(r#"<r xmlns:p="urn:p"/>"#);
+    let document = tree.document_node();
+    let first = tree
+        .parse_in_context(document, "<n>1</n>", &VerificationPolicy::default())
+        .expect("the fragment parses")
+        .expect("the fragment has nodes");
+    assert_eq!(tree.parent(first), Ok(None));
+    assert_eq!(tree.name(first), Ok(Some("n")));
+    assert!(
+        tree.parse_in_context(document, "<p:x/>", &VerificationPolicy::default())
+            .is_err(),
+        "the document binds no prefix"
+    );
+}
+
+#[test]
 fn a_node_copied_from_another_tree_keeps_its_namespaces() {
     // As libxml2's xmlDocCopyNode: the copy is unlinked in the target tree
     // and declares the bindings its source inherited, so it reads the same
@@ -490,6 +509,32 @@ fn a_node_copied_from_another_tree_keeps_its_namespaces() {
     assert_eq!(
         target.copy_from(&source, source.document_node()),
         Err(TreeError::DocumentNode)
+    );
+}
+
+#[test]
+fn a_copy_keeps_the_ids_a_caller_registered() {
+    // An ID registered on an attribute of the copied subtree carries over
+    // with the attribute, as libxml2's copy re-adds a copied ID attribute.
+    let mut source = parsed(r#"<s><a Id="target"><b ref="inner"/></a></s>"#);
+    let element = children(&source, source.root_element().expect("a root"))[0];
+    let inner = children(&source, element)[0];
+    source
+        .register_id(element, "Id", None, "target")
+        .expect("the attribute carries the value");
+    source
+        .register_id(inner, "ref", None, "inner")
+        .expect("the attribute carries the value");
+    let mut target = parsed("<t/>");
+    let copy = target.copy_from(&source, element).expect("a live node");
+    let root = target.root_element().expect("a root");
+    target
+        .append_child(root, copy)
+        .expect("an unlinked node links");
+    assert_eq!(target.element_by_id("target"), Some(copy));
+    assert_eq!(
+        target.element_by_id("inner"),
+        Some(children(&target, copy)[0])
     );
 }
 

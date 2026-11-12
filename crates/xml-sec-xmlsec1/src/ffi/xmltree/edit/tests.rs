@@ -70,6 +70,82 @@ fn replaced_content_comes_back_as_an_unlinked_run_of_siblings() {
 }
 
 #[test]
+fn a_child_can_become_the_whole_content_of_its_parent() {
+    // The new node may be one of the children it replaces: it is taken out
+    // before the others are freed, and stays as the only content.
+    let xml = "<r><a/><n>kept</n><b/></r>";
+    // SAFETY: handles are validated by each call; the document is freed once.
+    unsafe {
+        let doc = xmlSecParseMemory(xml.as_ptr(), xml.len(), 1);
+        assert!(!doc.is_null(), "the document parses");
+        let root = xsDocGetRootElement(doc);
+        let child = nodes::next(nodes::first_child(root));
+        assert_eq!(
+            xmlSecReplaceContentAndReturn(root, child, std::ptr::null_mut()),
+            0
+        );
+        assert_eq!(nodes::first_child(root), child);
+        assert!(nodes::next(child).is_null());
+        assert_eq!(nodes::content(root).as_deref(), Some("kept"));
+        xsFreeDoc(doc);
+    }
+}
+
+#[test]
+fn a_node_that_cannot_be_linked_fails_the_replacement() {
+    // A node of another document cannot become the content: the call fails
+    // rather than reporting success over an emptied element.
+    let xml = "<r>x</r>";
+    // SAFETY: handles are validated by each call; both documents are freed
+    // once.
+    unsafe {
+        let doc = xmlSecParseMemory(xml.as_ptr(), xml.len(), 1);
+        let other = xmlSecParseMemory(xml.as_ptr(), xml.len(), 1);
+        assert!(!doc.is_null() && !other.is_null(), "the documents parse");
+        let foreign = xsNewDocNode(
+            other,
+            std::ptr::null_mut(),
+            c"n".as_ptr().cast(),
+            std::ptr::null(),
+        );
+        assert_eq!(
+            xmlSecReplaceContentAndReturn(xsDocGetRootElement(doc), foreign, std::ptr::null_mut()),
+            -1
+        );
+        xsFreeNode(foreign);
+        xsFreeDoc(other);
+        xsFreeDoc(doc);
+    }
+}
+
+#[test]
+fn a_buffer_replaces_the_document_element() {
+    // The document element's parent is the document node, which libxml2
+    // accepts as a parsing context: the buffer becomes the new root.
+    let xml = "<old/>";
+    let buffer = "<replacement>new</replacement>";
+    // SAFETY: handles are validated by each call; the document is freed once.
+    unsafe {
+        let doc = xmlSecParseMemory(xml.as_ptr(), xml.len(), 1);
+        assert!(!doc.is_null(), "the document parses");
+        let old = xsDocGetRootElement(doc);
+        assert_eq!(
+            xmlSecReplaceNodeBufferAndReturn(
+                old,
+                buffer.as_ptr(),
+                buffer.len(),
+                std::ptr::null_mut()
+            ),
+            0
+        );
+        let root = xsDocGetRootElement(doc);
+        assert_eq!(nodes::name(root).as_deref(), Some("replacement"));
+        assert_eq!(nodes::content(root).as_deref(), Some("new"));
+        xsFreeDoc(doc);
+    }
+}
+
+#[test]
 fn a_buffer_replaces_a_node_in_the_namespaces_of_its_parent() {
     // libxml2 parses the buffer in the context of the node's parent, so a
     // prefix declared there is bound in the replacement.

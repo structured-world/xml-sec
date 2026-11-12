@@ -51,6 +51,9 @@ pub fn verify_signature_value(
     policy.validate()?;
     policy.check_signature_algorithm(algorithm)?;
     let candidates = RefCell::new(crate::xmldsig::InspectedKeyCandidateBudget::new(policy));
+    // The supplied key is one inspected candidate, as document verification
+    // charges the key it inspects.
+    candidates.borrow_mut().charge()?;
     let certificates = candidates.borrow().certificates().share();
     let scope = VerificationScope::new(policy, &certificates);
     key.validate_policy(&scope)?;
@@ -68,8 +71,17 @@ pub fn verify_signature_value(
         candidate_refusal: &candidate_refusal,
     };
     let context = crate::xmldsig::SignatureContext::new(&[])?;
-    let result =
-        provider.verify_with_context(&verifier, algorithm, &context, signed_data, signature_value);
+    let input = crate::provider::SignatureVerificationInput::new(
+        algorithm,
+        &context,
+        signed_data,
+        signature_value,
+    );
+    // A provider that reads the key material itself does so under this
+    // call's certificate account, as in document verification.
+    #[cfg(feature = "aws-lc-fips")]
+    let input = input.with_certificates(&certificates);
+    let result = provider.verify_with_key_receipt(&verifier, input, &mut |_| Ok(()));
     if let Some(error) = candidate_refusal.into_inner() {
         return Err(error.into());
     }

@@ -250,14 +250,16 @@ int main(void) {
     quiet = 0;
     fails("garbage der", key);
 
-    if (rsa != NULL && rsa_public != NULL) {
-        sign(xmlSecTransformRsaSha256Id, rsa, rsa_public, 1);
-        sign(xmlSecTransformRsaPssSha256Id, rsa, rsa_public, 0);
-        sign_public(xmlSecTransformRsaSha256Id, rsa_public);
+    /* The signing checks below need every key: a fixture that does not load
+     * fails the run rather than skipping them. */
+    if (rsa == NULL || rsa_public == NULL || ec == NULL || ec_public == NULL) {
+        printf("a required key fixture did not load\n");
+        return 1;
     }
-    if (ec != NULL && ec_public != NULL) {
-        sign(xmlSecTransformEcdsaSha256Id, ec, ec_public, 0);
-    }
+    sign(xmlSecTransformRsaSha256Id, rsa, rsa_public, 1);
+    sign(xmlSecTransformRsaPssSha256Id, rsa, rsa_public, 0);
+    sign_public(xmlSecTransformRsaSha256Id, rsa_public);
+    sign(xmlSecTransformEcdsaSha256Id, ec, ec_public, 0);
 
     xmlSecKeyDestroy(rsa);
     xmlSecKeyDestroy(rsa_public);

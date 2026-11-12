@@ -457,18 +457,26 @@ pub(crate) unsafe extern "C" fn xmlSecReplaceContentAndReturn(
             c"newNode != NULL",
             -1
         );
-        let former = nodes::unlink_children(node);
         // SAFETY: handles are validated by each call; `replaced` is writable
         // by the caller's contract.
         unsafe {
+            // libxmlsec1 links `new_node` alone. It is unlinked first: it may
+            // be one of the children about to be freed.
+            xsUnlinkNode(new_node);
+            let former = nodes::unlink_children(node);
             if replaced.is_null() {
                 xsFreeNodeList(former);
             } else {
                 replaced.write(former);
             }
-            // libxmlsec1 links `new_node` alone, after unlinking it.
-            xsUnlinkNode(new_node);
-            xsAddChild(node, new_node);
+            if xsAddChild(node, new_node).is_null() {
+                errors::xml_failed(
+                    here!("xmlSecReplaceContentAndReturn"),
+                    std::ptr::null(),
+                    c"xmlAddChild",
+                );
+                return -1;
+            }
         }
         0
     })
@@ -537,9 +545,22 @@ pub(crate) unsafe extern "C" fn xmlSecReplaceNodeBufferAndReturn(
                 errors::xml_failed(here, std::ptr::null(), c"xmlParseInNodeContext");
                 return -1;
             }
+            // A node the tree refuses to link takes the edit back: the nodes
+            // already linked and the rest of the run are freed, and `node`
+            // stays in place.
+            let mut linked = Vec::new();
             while !results.is_null() {
                 let next = nodes::next(results);
-                xsAddPrevSibling(node, results);
+                if xsAddPrevSibling(node, results).is_null() {
+                    xsFreeNodeList(results);
+                    for done in linked {
+                        xsUnlinkNode(done);
+                        xsFreeNode(done);
+                    }
+                    errors::xml_failed(here, std::ptr::null(), c"xmlAddPrevSibling");
+                    return -1;
+                }
+                linked.push(results);
                 results = next;
             }
             xsUnlinkNode(node);

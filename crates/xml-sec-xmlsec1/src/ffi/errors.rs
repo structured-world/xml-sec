@@ -54,6 +54,8 @@ pub(crate) const R_INVALID_TYPE: c_int = 14;
 pub(crate) const R_INVALID_OPERATION: c_int = 15;
 /// `XMLSEC_ERRORS_R_INVALID_STATUS`.
 pub(crate) const R_INVALID_STATUS: c_int = 16;
+/// `XMLSEC_ERRORS_R_INVALID_FORMAT`.
+pub(crate) const R_INVALID_FORMAT: c_int = 17;
 /// `XMLSEC_ERRORS_R_DATA_NOT_MATCH`.
 pub(crate) const R_DATA_NOT_MATCH: c_int = 18;
 /// `XMLSEC_ERRORS_R_INVALID_VERSION`.
@@ -84,6 +86,8 @@ pub(crate) const R_INVALID_KEY_DATA: c_int = 41;
 pub(crate) const R_KEY_DATA_ALREADY_EXIST: c_int = 43;
 /// `XMLSEC_ERRORS_R_INVALID_KEY_DATA_SIZE`.
 pub(crate) const R_INVALID_KEY_DATA_SIZE: c_int = 44;
+/// `XMLSEC_ERRORS_R_KEY_NOT_FOUND`.
+pub(crate) const R_KEY_NOT_FOUND: c_int = 45;
 /// `XMLSEC_ERRORS_R_ASSERTION`.
 pub(crate) const R_ASSERTION: c_int = 100;
 /// `XMLSEC_ERROR_R_CAST_IMPOSSIBLE`.

@@ -10,7 +10,6 @@ use xml_sec::xmldsig::{DigestAlgorithm, IncrementalDigest, constant_time_eq};
 use super::super::buffer::{
     xmlSecBufferAppend, xmlSecBufferGetData, xmlSecBufferGetSize, xmlSecBufferRemoveHead,
 };
-use super::super::contain;
 use super::super::errors::{self, Here, here};
 #[cfg(feature = "legacy-algorithms")]
 use super::super::strings::{
@@ -22,6 +21,7 @@ use super::super::strings::{
     xmlSecNameSha3_224, xmlSecNameSha3_256, xmlSecNameSha3_384, xmlSecNameSha3_512,
     xmlSecNameSha224, xmlSecNameSha256, xmlSecNameSha384, xmlSecNameSha512,
 };
+use super::super::{contain, policy};
 use super::builtin::klass;
 use super::{
     OPERATION_SIGN, OPERATION_VERIFY, STATUS_FAIL, STATUS_FINISHED, STATUS_NONE, STATUS_OK,
@@ -321,6 +321,35 @@ unsafe extern "C" fn execute(
             );
         };
         if object.status == STATUS_NONE {
+            // The operation's policy admits the method before any input is
+            // hashed: the provider's capability alone does not.
+            let admitted = if object.operation == OPERATION_SIGN {
+                policy::signing_at(here).map(|policy| {
+                    policy
+                        .validate()
+                        .and_then(|()| policy.check_digest_algorithm(algorithm))
+                })
+            } else {
+                policy::verification_at(here).map(|policy| {
+                    policy
+                        .validate()
+                        .and_then(|()| policy.check_digest_algorithm(algorithm))
+                })
+            };
+            match admitted {
+                Some(Ok(())) => {}
+                Some(Err(violation)) => {
+                    errors::report(
+                        here,
+                        name,
+                        std::ptr::null(),
+                        errors::R_TRANSFORM_DISABLED,
+                        &violation.to_string(),
+                    );
+                    return -1;
+                }
+                None => return -1,
+            }
             match IncrementalDigest::begin(xml_sec::provider::default_provider(), algorithm) {
                 Ok(state) => digest.state = Some(state),
                 Err(error) => {
@@ -348,3 +377,6 @@ unsafe extern "C" fn execute(
         }
     })
 }
+
+#[cfg(test)]
+mod tests;

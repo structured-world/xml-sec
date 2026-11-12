@@ -1,4 +1,4 @@
-/* The RSA, RSA-PSS and ECDSA signature transform klasses of the default
+/* The RSA, RSA-PSS, ECDSA and DSA signature transform klasses of the default
  * crypto library as a libxmlsec1 caller uses them to verify: their
  * identities, the key requirements, a key of the wrong family, and
  * verifying a valid signature and a tampered one through a transform
@@ -67,6 +67,36 @@ static const char rsaPssSha256[] =
 static const char ecdsaSha256[] =
     "7982809FC2C645877938A246A4362D30A016A43B45B966639A03A3A2EE2EEF69"
     "6BA50A3EAF0EDC6B3EF8FF77F052E855AB0B4497CFA242D10B0DC762BD087F2D";
+
+/* tests/fixtures/keys/dsa/dsa-2048-public.pem */
+static const char dsaP[] =
+    "ee6053a5eddb044cebe039fbef8731678ba7ea05dad44a661db4021944a9d3b13b641e54ae6027f37543881d815e"
+    "e9677aa601a1b23bef7125258174ef86d5102f888f0266360925a868365042157c4dc0baa1fa3dcf9d347aff8d5df"
+    "2e2ef5ed320e6014ef58b5b0cf40038ef5820e1dcc77ea754e352a1a642a28ff674ec36019d9ce503043d5401cafb"
+    "06d50bb270421542a94bb469a82c385e8b91f4d70fb5ebb98480cf67838aa3afee90181bc2e84dfae530ed7162ff"
+    "2d2788a8e2cfbf9b20dfaa75de56c942ccb7cd91a6d35ab4fda05e116a98273df686bf6ab7848ef40b4519083018"
+    "1774df7cc09fc8a863242d8e68cc3b83f00dfdee3f41019ab9";
+static const char dsaQ[] = "d094a9173ea610840178a01a279c6cc08977fe113d1b36e1c1e4a1d4dfc3c177";
+static const char dsaG[] =
+    "49d14f2709557a09525d5bb21dcea4838ab19b6cdb1a87019d53db1174ddf4ff32e9d34cb54d0456b55baa8377c6"
+    "7af8a65e6930b78a0b0ba39fdfe7dda17b4866bcf6063dab6d9d59d201ef40d71b26f800fa8ac5f7fac9143fe4fb"
+    "f3692087ce9a09c73da1d71fcee3ec7790b0f94220dfed60dba7ba722bc59b7c6765418b6347f1b859fe73064de8"
+    "332f45d229679501e1964eef0e1f6e6f6b19be5de69da8f0141900b60e6f700b7c4cb531951ff5033e92a717eade"
+    "2f92114f506aff8327a2fd445a7971cb7acbf948bdbb8dfc9b0c2d26451004ab0f7ef742d7ab41a4aee8bb6147c2"
+    "f74efb43e961157755b6f94d3aacb595733d4a30a6c9b290a930";
+static const char dsaY[] =
+    "98f63ce54659626e49fb4205aa9d51890bafef71a39af1a0bbf16fffa5ec9ed47662f492d7e6ed93db44ebfa9209"
+    "7e9cc8fa5a00e5c07642f2554986a16057d707767e295601c74a37b86b12da05daa0c4f7245c20e010ef3abd34bc"
+    "0cbd3115aec6a12540133fec2d7097c78757e1bda306a8d7c3581d34718380cbc1c02a2d9fd9ac57ca5222427fc0"
+    "44febc99bd97e39924ac58cc73c594dd86f2ca0f77fd0cc2c713c564821eaece8ae959bcaf4485c0ee97a48e6e23"
+    "f8f47b6fdfd615a65caa4b38f3474f6977fc2e72b211053521d0ff21770374dad1759d869693cffa3488de9fde42"
+    "5333e2efc05bd80f757c5d9356337484c5bbd80b4adb967a9010";
+
+/* DSA with SHA-256 by the key of dsa-2048-key-traditional-encrypted.pem, as
+ * XMLDSig's r || s */
+static const char dsaSha256[] =
+    "10B4194C0B4372D2F636014E89D6D05A5A3832B4A1D3E4A0F145C959ABD36A02"
+    "73EE7E07418772FF0F7FD98A852F48544CE726245FA5B04C7DA36F420A1D55D5";
 
 /* The bytes of the hex digits of `hex`; returns their number. */
 static xmlSecSize unhex(const char *hex, xmlSecByte *out) {
@@ -156,8 +186,13 @@ static void check(xmlSecTransformId id, xmlSecKeyPtr key, xmlSecKeyPtr other, co
 int main(void) {
     static char xml[2048];
     xmlChar *encoded;
+    xmlChar *p;
+    xmlChar *q;
+    xmlChar *g;
+    xmlChar *y;
     xmlSecKeyPtr rsa;
     xmlSecKeyPtr ec;
+    xmlSecKeyPtr dsa;
 
     xmlSecErrorsSetCallback(record);
     if (xmlSecInit() < 0 || xmlSecCryptoDLLoadLibrary(xmlSecGetDefaultCrypto()) < 0) {
@@ -184,13 +219,28 @@ int main(void) {
              encoded);
     xsFree(encoded);
     ec = read_key(xmlSecKeyDataEcId, xml);
+    p = base64(dsaP);
+    q = base64(dsaQ);
+    g = base64(dsaG);
+    y = base64(dsaY);
+    snprintf(xml, sizeof(xml),
+             "<DSAKeyValue xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><P>%s</P><Q>%s</Q>"
+             "<G>%s</G><Y>%s</Y></DSAKeyValue>",
+             p, q, g, y);
+    xsFree(p);
+    xsFree(q);
+    xsFree(g);
+    xsFree(y);
+    dsa = read_key(xmlSecKeyDataDsaId, xml);
 
     check(xmlSecTransformRsaSha256Id, rsa, ec, rsaSha256);
     check(xmlSecTransformRsaPssSha256Id, rsa, ec, rsaPssSha256);
     check(xmlSecTransformEcdsaSha256Id, ec, rsa, ecdsaSha256);
+    check(xmlSecTransformDsaSha256Id, dsa, rsa, dsaSha256);
 
     xmlSecKeyDestroy(rsa);
     xmlSecKeyDestroy(ec);
+    xmlSecKeyDestroy(dsa);
     xmlSecCryptoShutdown();
     xmlSecCryptoAppShutdown();
     xmlSecShutdown();

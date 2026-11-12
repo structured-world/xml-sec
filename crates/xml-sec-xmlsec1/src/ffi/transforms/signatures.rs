@@ -9,8 +9,10 @@
 //! RSA, DSA or EC klass the method requires.
 
 use std::ffi::{c_char, c_int, c_uint, c_void};
+use std::sync::Arc;
 
 use xml_sec::key_manager::{KeyInventory, KeyUsages};
+use xml_sec::policy::{SigningPolicy, VerificationPolicy};
 use xml_sec::xmldsig::verify::verify_signature_value;
 use xml_sec::xmldsig::{SignatureAlgorithm, VerificationKey};
 use zeroize::Zeroizing;
@@ -65,6 +67,34 @@ struct Signature {
     private: Option<Zeroizing<Vec<u8>>>,
     /// The signed bytes collected so far.
     data: Vec<u8>,
+    /// The library policy the run started under: taken at the first
+    /// `execute` and kept, so a republish mid-run never splits the bound on
+    /// the collected bytes from the rules the value is signed or verified by.
+    policy: Option<RunPolicy>,
+}
+
+/// The policy snapshot of one signing or verifying run.
+enum RunPolicy {
+    Signing(Arc<SigningPolicy>),
+    Verification(Arc<VerificationPolicy>),
+}
+
+impl RunPolicy {
+    /// The snapshot for `operation`, reported at `here` when unavailable.
+    fn take(operation: c_int, here: Here) -> Option<Self> {
+        if operation == OPERATION_SIGN {
+            policy::signing_at(here).map(Self::Signing)
+        } else {
+            policy::verification_at(here).map(Self::Verification)
+        }
+    }
+
+    fn max_canonicalized_bytes(&self) -> usize {
+        match self {
+            Self::Signing(policy) => policy.resources.max_canonicalized_bytes,
+            Self::Verification(policy) => policy.resources.max_canonicalized_bytes,
+        }
+    }
 }
 
 /// A signature klass of `name` and `href`.
@@ -216,6 +246,7 @@ unsafe extern "C" fn initialize(transform: *mut XmlSecTransform) -> c_int {
                 key: None,
                 private: None,
                 data: Vec::new(),
+                policy: None,
             });
         }
         0
@@ -365,13 +396,15 @@ unsafe extern "C" fn verify(
             return -1;
         };
         let name = name_of(object);
-        let Some(policy) = policy::verification_at(here) else {
+        // A finished verifying run captured its snapshot in `execute`.
+        let Some(RunPolicy::Verification(policy)) = signature.policy.as_ref() else {
+            errors::assertion(here, c"ctx->policy != NULL");
             return -1;
         };
         // SAFETY: the caller's `size` bytes.
         let value = unsafe { std::slice::from_raw_parts(data, size) };
         match verify_signature_value(
-            &policy,
+            policy,
             xml_sec::provider::default_provider(),
             key,
             algorithm,
@@ -412,14 +445,14 @@ fn collect(
     unsafe {
         let size = xmlSecBufferGetSize(input);
         if size > 0 {
-            // The collected bytes are signed data: the policy of the
-            // operation bounds them before the buffer grows.
-            let maximum = if object.operation == OPERATION_SIGN {
-                policy::signing_at(here).map(|policy| policy.resources.max_canonicalized_bytes)
-            } else {
-                policy::verification_at(here).map(|policy| policy.resources.max_canonicalized_bytes)
-            };
-            let Some(maximum) = maximum else {
+            // The collected bytes are signed data: the run's policy bounds
+            // them before the buffer grows.
+            let Some(maximum) = signature
+                .policy
+                .as_ref()
+                .map(RunPolicy::max_canonicalized_bytes)
+            else {
+                errors::assertion(here, c"ctx->policy != NULL");
                 return -1;
             };
             if signature
@@ -454,7 +487,11 @@ fn collect(
             errors::assertion(here, c"ctx->pKey != NULL");
             return -1;
         };
-        let value = match sign(here, algorithm, private, &signature.data) {
+        let Some(RunPolicy::Signing(policy)) = signature.policy.as_ref() else {
+            errors::assertion(here, c"ctx->policy != NULL");
+            return -1;
+        };
+        let value = match sign(policy, algorithm, private, &signature.data) {
             Ok(value) => value,
             Err(error) => {
                 errors::internal_with(here, name, c"SigningKey::sign", &error);
@@ -479,14 +516,13 @@ fn collect(
 }
 
 /// The signature value of `data` by the PKCS#8 key `private` under the
-/// library's signing policy, which admits the method and the key.
+/// run's signing `policy`, which admits the method and the key.
 fn sign(
-    here: Here,
+    policy: &SigningPolicy,
     algorithm: SignatureAlgorithm,
     private: &[u8],
     data: &[u8],
 ) -> Result<Vec<u8>, String> {
-    let policy = policy::signing_at(here).ok_or("the library policy is unavailable")?;
     let mut inventory = KeyInventory::default();
     inventory
         .add_private_der(
@@ -498,7 +534,7 @@ fn sign(
         )
         .map_err(|error| error.to_string())?;
     let key = inventory
-        .signing_key("key", algorithm, &policy)
+        .signing_key("key", algorithm, policy)
         .map_err(|error| error.to_string())?;
     key.sign_with_provider(xml_sec::provider::default_provider(), algorithm, data)
         .map_err(|error| error.to_string())
@@ -529,6 +565,10 @@ unsafe extern "C" fn execute(
             return -1;
         }
         if object.status == STATUS_NONE {
+            let Some(run) = RunPolicy::take(object.operation, here) else {
+                return -1;
+            };
+            signature.policy = Some(run);
             object.status = STATUS_WORKING;
         }
         match object.status {

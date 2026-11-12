@@ -29,11 +29,12 @@ use super::super::transforms::ctx::{
 };
 use super::super::tree::{XmlDoc, XmlNode, nodes};
 use super::super::xmltree::{xmlSecCheckNodeName, xmlSecGetNextElementNode};
-use super::super::{contain, free};
+use super::super::{contain, free, policy};
 use super::{
     FLAGS_KEYVALUE_STOP_ON_UNKNOWN_CHILD, MODE_READ, MODE_WRITE, XmlSecKeyInfoCtx, child_klass,
     klass_name, node_name, xmlSecKeyInfoNodeRead,
 };
+use xml_sec::xmldsig::UriTypeSet;
 
 /// `XMLSEC_KEYINFO_FLAGS_RETRMETHOD_STOP_ON_UNKNOWN_HREF`.
 const FLAGS_RETRMETHOD_STOP_ON_UNKNOWN_HREF: c_uint = 0x0000_0010;
@@ -109,7 +110,10 @@ unsafe fn enabled(ctx: *mut XmlSecKeyInfoCtx) -> *mut super::super::list::XmlSec
 }
 
 /// Resolves the URI of `node` with the optional `Transforms` child in
-/// `transforms` of `context` and executes it on the node's document.
+/// `transforms` of `context` and executes it on the node's document. The
+/// URI must be of a class `admitted` permits: the library policy's classes
+/// for this kind of key reference, apart from the ones it grants a
+/// signature's references.
 ///
 /// # Safety
 /// `context` is a transform context; `node` a live element of a document.
@@ -120,7 +124,19 @@ unsafe fn dereference(
     node: *mut XmlNode,
     uri: *const u8,
     transforms: bool,
+    admitted: UriTypeSet,
 ) -> bool {
+    let text = if uri.is_null() {
+        &[][..]
+    } else {
+        // SAFETY: a NUL-terminated attribute value.
+        unsafe { std::ffi::CStr::from_ptr(uri.cast()) }.to_bytes()
+    };
+    // A URI that is not UTF-8 is of no class the policy admits.
+    if !std::str::from_utf8(text).is_ok_and(|text| admitted.allows(text)) {
+        errors::uri_refused(here, object, text);
+        return false;
+    }
     // SAFETY: by the caller's contract.
     unsafe {
         xmlSecTransformCtxReset(context);
@@ -302,9 +318,20 @@ unsafe fn retrieve(
             }
             return 0;
         }
+        let Some(policy) = policy::verification_at(here) else {
+            return -1;
+        };
         let context = &raw mut (*ctx).retrieval_method_ctx;
         let uri = xsGetProp(node, xmlSecAttrURI.as_ptr());
-        let dereferenced = dereference(here, object, context, node, uri, true);
+        let dereferenced = dereference(
+            here,
+            object,
+            context,
+            node,
+            uri,
+            true,
+            policy.uris.retrieval_methods,
+        );
         free(uri.cast());
         if !dereferenced {
             return -1;
@@ -459,6 +486,25 @@ pub(crate) unsafe extern "C" fn reference_xml_read(
                 );
                 return -1;
             }
+            // The context's level is libxmlsec1's; the library policy bounds
+            // the depth as well, whatever the caller set there.
+            let Some(policy) = policy::verification_at(here) else {
+                return -1;
+            };
+            let depth = usize::try_from(current).map_or(usize::MAX, |depth| depth + 1);
+            if policy
+                .resources
+                .validate_key_info_reference_depth(depth)
+                .is_err()
+            {
+                errors::limit_exceeded(
+                    here,
+                    object,
+                    "KeyInfoReference depth",
+                    policy.resources.max_key_info_reference_depth,
+                );
+                return -1;
+            }
             (*ctx).cur_key_info_reference_level += 1;
             let result = dereference_key_info(here, object, key, node, ctx);
             (*ctx).cur_key_info_reference_level -= 1;
@@ -485,8 +531,20 @@ unsafe fn dereference_key_info(
             errors::invalid_node_attribute(here, node, c"URI", object, "empty");
             return -1;
         }
+        let Some(policy) = policy::verification_at(here) else {
+            free(uri.cast());
+            return -1;
+        };
         let context = &raw mut (*ctx).key_info_reference_ctx;
-        let dereferenced = dereference(here, object, context, node, uri, false);
+        let dereferenced = dereference(
+            here,
+            object,
+            context,
+            node,
+            uri,
+            false,
+            policy.uris.key_info_references,
+        );
         free(uri.cast());
         if !dereferenced {
             return -1;

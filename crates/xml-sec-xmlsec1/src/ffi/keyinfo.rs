@@ -45,6 +45,8 @@ use super::xmltree::{
 use super::{contain, free, malloc, write_stream};
 
 mod references;
+#[cfg(test)]
+mod tests;
 pub(crate) use references::{
     reference_xml_read, reference_xml_write, retrieval_xml_read, retrieval_xml_write,
 };
@@ -58,6 +60,8 @@ pub(crate) const MODE_WRITE: c_int = 1;
 pub(crate) const FLAGS_DONT_STOP_ON_KEY_FOUND: c_uint = 0x0000_0001;
 /// `XMLSEC_KEYINFO_FLAGS_STOP_ON_UNKNOWN_CHILD`.
 const FLAGS_STOP_ON_UNKNOWN_CHILD: c_uint = 0x0000_0002;
+/// `XMLSEC_KEYINFO_FLAGS_KEYNAME_STOP_ON_UNKNOWN`.
+const FLAGS_KEYNAME_STOP_ON_UNKNOWN: c_uint = 0x0000_0004;
 /// `XMLSEC_KEYINFO_FLAGS_KEYVALUE_STOP_ON_UNKNOWN_CHILD`.
 const FLAGS_KEYVALUE_STOP_ON_UNKNOWN_CHILD: c_uint = 0x0000_0008;
 
@@ -705,6 +709,20 @@ pub(crate) unsafe extern "C" fn name_xml_read(
             let result = if (*key).value.is_null() && !(*ctx).keys_mngr.is_null() {
                 let found = xmlSecKeysMngrFindKey((*ctx).keys_mngr, new_name, ctx);
                 if found.is_null() {
+                    // keyinfo.h documents this flag as stopping on a name the
+                    // manager does not know; libxmlsec1 1.3.13 defines it
+                    // without reading it.
+                    if (*ctx).flags & FLAGS_KEYNAME_STOP_ON_UNKNOWN != 0 {
+                        let shown = std::ffi::CStr::from_ptr(new_name.cast()).to_string_lossy();
+                        errors::other(
+                            here,
+                            errors::R_KEY_NOT_FOUND,
+                            object,
+                            Some(&format!("name={shown}")),
+                        );
+                        free(new_name.cast());
+                        return -1;
+                    }
                     0
                 } else {
                     xmlSecKeyEmpty(key);
@@ -950,8 +968,16 @@ pub(crate) unsafe extern "C" fn value_xml_write(
             if !data_valid(value) || (*(*value).id).usage & USAGE_KEY_VALUE_NODE_WRITE == 0 {
                 return 0;
             }
+            // An enabled list admits the KeyValue element and, as when it is
+            // read (`child_klass`), the value klass inside it: a klass the
+            // list leaves out is never written, so a key requirement that
+            // admits symmetric keys cannot export a disabled secret.
+            // libxmlsec1 checks the KeyValue klass alone.
             let enabled = &raw mut (*ctx).enabled_key_data;
-            if xmlSecPtrListGetSize(enabled) > 0 && xmlSecKeyDataIdListFind(enabled, id) != 1 {
+            if xmlSecPtrListGetSize(enabled) > 0
+                && (xmlSecKeyDataIdListFind(enabled, id) != 1
+                    || xmlSecKeyDataIdListFind(enabled, (*value).id) != 1)
+            {
                 return 0;
             }
             if xmlSecKeyReqMatchKey(&raw mut (*ctx).key_req, key) != 1 {

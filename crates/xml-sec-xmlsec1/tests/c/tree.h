@@ -34,9 +34,6 @@
 #define xsFreeNodeList xmlFreeNodeList
 #define xsNewDocText xmlNewDocText
 #define xsSearchNs xmlSearchNs
-/* libxml2's xmlNodeSetContent returns nothing before 2.13; the programs do
- * not read the result. */
-#define xsNodeSetContent(node, content) (xmlNodeSetContent(node, content), 0)
 /* Only compared with NULL by the programs: an attribute against an element. */
 #define xsGetID(doc, value) ((void *)xmlGetID(doc, value))
 #define xsXPathNodeSetCreate xmlXPathNodeSetCreate
@@ -53,6 +50,13 @@ static inline xmlNodePtr xsNodeGetChildren(const xmlNode *node) {
 }
 static inline xmlNodePtr xsNodeGetNext(const xmlNode *node) {
     return node != NULL ? node->next : NULL;
+}
+/* libxml2's xmlNodeSetContent returns nothing before 2.13 and an int from
+ * then on; a function gives one shape whatever the version, and a caller
+ * that ignores the result compiles without a warning. */
+static inline int xsNodeSetContent(xmlNodePtr node, const xmlChar *content) {
+    xmlNodeSetContent(node, content);
+    return 0;
 }
 static inline xmlNodePtr xsNodeGetPrev(const xmlNode *node) {
     return node != NULL ? node->prev : NULL;

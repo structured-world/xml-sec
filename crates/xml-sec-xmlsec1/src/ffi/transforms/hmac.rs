@@ -244,10 +244,23 @@ unsafe extern "C" fn read_node(
                     );
                     return -1;
                 }
-                let Some(policy) = policy::verification_at(here) else {
+                // The method is read before its operation may be set: a
+                // length is refused here when the operation's policy refuses
+                // it, or with no operation yet when neither policy admits it.
+                // `set_key` checks it again under the operation's policy.
+                let (Some(verification), Some(signing)) =
+                    (policy::verification_at(here), policy::signing_at(here))
+                else {
                     return -1;
                 };
-                if let Err(violation) = policy.hmac.validate_output(algorithm, bits) {
+                let verifying = verification.hmac.validate_output(algorithm, bits);
+                let signing = signing.hmac.validate_output(algorithm, bits);
+                let admitted = match object.operation {
+                    OPERATION_SIGN => signing,
+                    OPERATION_VERIFY => verifying,
+                    _ => signing.or(verifying),
+                };
+                if let Err(violation) = admitted {
                     errors::invalid_node_content(
                         here,
                         child,
@@ -385,8 +398,11 @@ fn admit(
         .hmac_output_bits()
         .ok_or_else(|| Some("not an HMAC method".to_owned()))?;
     let bits = if output_bits == 0 { full } else { output_bits };
+    // Each branch first checks the snapshot itself, its authorization
+    // lifetime included, before any of its rules admits the key.
     if operation == OPERATION_SIGN {
         let policy = policy::signing_at(here).ok_or(None)?;
+        policy.validate().map_err(|error| refused(&error))?;
         let key = HmacSigningKey::new(secret.to_vec()).map_err(|error| refused(&error))?;
         validate_signing_key(&key, algorithm, &policy).map_err(|error| refused(&error))?;
         policy
@@ -395,6 +411,7 @@ fn admit(
             .map_err(|error| refused(&error))
     } else {
         let policy = policy::verification_at(here).ok_or(None)?;
+        policy.validate().map_err(|error| refused(&error))?;
         policy
             .check_signature_algorithm(algorithm)
             .map_err(|error| refused(&error))?;

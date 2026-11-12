@@ -220,6 +220,11 @@ pub(crate) unsafe extern "C" fn xmlSecKeyUseWithCopy(
     contain(-1, || {
         check!(!dst.is_null(), "xmlSecKeyUseWithCopy", c"dst != NULL", -1);
         check!(!src.is_null(), "xmlSecKeyUseWithCopy", c"src != NULL", -1);
+        // A record copied onto itself is already the copy; the setter would
+        // free the strings it is given before reading them.
+        if std::ptr::eq(dst, src) {
+            return 0;
+        }
         // SAFETY: initialized records.
         unsafe { xmlSecKeyUseWithSet(dst, (*src).application, (*src).identifier) }
     })
@@ -561,6 +566,12 @@ pub(crate) unsafe extern "C" fn xmlSecKeyReqCopy(
     contain(-1, || {
         check!(!dst.is_null(), "xmlSecKeyReqCopy", c"dst != NULL", -1);
         check!(!src.is_null(), "xmlSecKeyReqCopy", c"src != NULL", -1);
+        // Requirements copied onto themselves are already the copy; copying
+        // a list into itself would append to it while reading it. Distinct
+        // requirements append the use-with records, as libxmlsec1 does.
+        if std::ptr::eq(dst, src) {
+            return 0;
+        }
         // SAFETY: initialized requirements.
         unsafe {
             (*dst).key_id = (*src).key_id;
@@ -822,6 +833,11 @@ pub(crate) unsafe extern "C" fn xmlSecKeyCopy(
         check!(!key_dst.is_null(), "xmlSecKeyCopy", c"keyDst != NULL", -1);
         check!(!key_src.is_null(), "xmlSecKeyCopy", c"keySrc != NULL", -1);
         let here = here!("xmlSecKeyCopy");
+        // A key copied onto itself is already the copy; emptying the
+        // destination would destroy the source.
+        if std::ptr::eq(key_dst, key_src) {
+            return 0;
+        }
         // SAFETY: keys owning their members.
         unsafe {
             xmlSecKeyEmpty(key_dst);
@@ -1061,6 +1077,11 @@ pub(crate) unsafe extern "C" fn xmlSecKeySetValue(
         // SAFETY: a key owning its value.
         unsafe {
             let owned = &mut *key;
+            // The value set again stays; destroying it would leave the key
+            // holding freed data.
+            if std::ptr::eq(owned.value, value) {
+                return 0;
+            }
             if !owned.value.is_null() {
                 xmlSecKeyDataDestroy(owned.value);
             }
@@ -1214,6 +1235,15 @@ pub(crate) unsafe extern "C" fn xmlSecKeyAdoptData(
         );
         // SAFETY: a key and valid key data.
         unsafe {
+            // Data the key already owns stays where it is: adopting it again
+            // would make two owners of one allocation or destroy it in place.
+            if std::ptr::eq((*key).value, data)
+                || find_data(key, (*data).id).is_some_and(|pos| {
+                    std::ptr::eq(xmlSecPtrListGetItem((*key).data_list, pos), data.cast())
+                })
+            {
+                return 0;
+            }
             if std::ptr::eq((*data).id, xmlSecKeyDataValueGetKlass()) {
                 let owned = &mut *key;
                 if !owned.value.is_null() {
@@ -1596,3 +1626,6 @@ static KEY_LIST: XmlSecPtrListKlass = XmlSecPtrListKlass {
 pub(crate) extern "C" fn xmlSecKeyPtrListGetKlass() -> *const XmlSecPtrListKlass {
     &raw const KEY_LIST
 }
+
+#[cfg(test)]
+mod tests;

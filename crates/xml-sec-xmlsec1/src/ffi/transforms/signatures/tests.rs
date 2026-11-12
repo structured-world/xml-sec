@@ -15,9 +15,11 @@ use super::super::ctx::{
     xmlSecTransformCtxDestroy,
 };
 use super::super::{
-    OPERATION_SIGN, OPERATION_VERIFY, STATUS_OK, xmlSecTransformSetKey, xmlSecTransformVerify,
+    OPERATION_SIGN, OPERATION_VERIFY, STATUS_OK, xmlSecTransformPushBin, xmlSecTransformSetKey,
+    xmlSecTransformVerify,
 };
 use super::rsa_sha256;
+use xml_sec::xmldsig::SignatureAlgorithm;
 
 /// `xmlSecKeyDataFormatPem`.
 const FORMAT_PEM: c_int = 2;
@@ -105,6 +107,49 @@ fn the_signed_bytes_are_bounded_by_the_policy() {
         run(OPERATION_VERIFY, public_key(), &[0x41; 16], &[0; 256]),
         Err(-1)
     );
+}
+
+#[test]
+fn a_run_keeps_the_policy_it_started_under() {
+    // A policy republished between two chunks of one verifying run reaches
+    // neither the bound on the collected bytes nor the verification: the run
+    // finishes under the snapshot it took at its first chunk.
+    own_process();
+    let value = run(OPERATION_SIGN, private_key(), &[0x41; 16], &[]).expect("the message signs");
+    let key = public_key();
+    // SAFETY: every object is created and released here.
+    unsafe {
+        let ctx = xmlSecTransformCtxCreate();
+        let transform = xmlSecTransformCtxCreateAndAppend(ctx, rsa_sha256());
+        (*transform).operation = OPERATION_VERIFY;
+        assert_eq!(xmlSecTransformSetKey(transform, key.cast()), 0);
+        let half = [0x41_u8; 8];
+        assert_eq!(
+            xmlSecTransformPushBin(transform, half.as_ptr(), half.len(), 0, ctx),
+            0
+        );
+        policy::republish(
+            |verification| {
+                verification.resources.max_canonicalized_bytes = 8;
+                if let Some(methods) = verification.signature_algorithms.as_mut() {
+                    methods.remove(&SignatureAlgorithm::RsaSha256);
+                }
+            },
+            |_| {},
+        )
+        .expect("the library policy compiles");
+        assert_eq!(
+            xmlSecTransformPushBin(transform, half.as_ptr(), half.len(), 1, ctx),
+            0
+        );
+        assert_eq!(
+            xmlSecTransformVerify(transform, value.as_ptr(), value.len(), ctx),
+            0
+        );
+        assert_eq!((*transform).status, STATUS_OK);
+        xmlSecTransformCtxDestroy(ctx);
+        xmlSecKeyDestroy(key);
+    }
 }
 
 #[test]

@@ -10,7 +10,7 @@
 //! that changes a policy value builds complete replacements from the current
 //! snapshots and publishes them ([`republish`]).
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use xml_sec::policy::{
     PolicyCompileContext, PolicyCompiler, PolicyProfile, SigningPolicy, VerificationPolicy,
@@ -26,6 +26,11 @@ struct Published {
 
 // no-std: spin::RwLock
 static PUBLISHED: RwLock<Option<Published>> = RwLock::new(None);
+
+/// The turn of a republishing caller, held from reading the current
+/// snapshots to publishing their replacements.
+// no-std: spin::Mutex
+static WRITER: Mutex<()> = Mutex::new(());
 
 /// The profile compiled for the default provider; `None` when it cannot be
 /// compiled.
@@ -100,22 +105,32 @@ pub fn signing() -> Option<Arc<SigningPolicy>> {
 /// Publishes the current snapshots with the edits applied, as complete
 /// replacements; runs that already took the previous ones keep them. `None`
 /// when the profile cannot be compiled.
+///
+/// Republishing callers take turns, so no edit is lost to a concurrent one.
+/// The edits run on copies without holding the snapshot lock: an edit may
+/// read the current snapshots, and one that panics leaves them published
+/// unchanged. An edit must not republish itself, which would wait for its
+/// own turn.
 pub fn republish(
     edit_verification: impl FnOnce(&mut VerificationPolicy),
     edit_signing: impl FnOnce(&mut SigningPolicy),
 ) -> Option<()> {
-    let mut slot = PUBLISHED.write().ok()?;
-    let current = match slot.take() {
-        Some(current) => current,
-        None => compile()?,
+    // The lock guards no data, only the turn: a turn whose edit panicked
+    // published nothing, so its poison is cleared.
+    let _turn = WRITER.lock().unwrap_or_else(PoisonError::into_inner);
+    let (Some(verification), Some(signing)) = (library(), signing()) else {
+        return None;
     };
-    let mut verification = VerificationPolicy::clone(&current.verification);
-    let mut signing = SigningPolicy::clone(&current.signing);
+    let mut verification = VerificationPolicy::clone(&verification);
+    let mut signing = SigningPolicy::clone(&signing);
     edit_verification(&mut verification);
     edit_signing(&mut signing);
-    *slot = Some(Published {
+    *PUBLISHED.write().ok()? = Some(Published {
         verification: Arc::new(verification),
         signing: Arc::new(signing),
     });
     Some(())
 }
+
+#[cfg(test)]
+mod tests;

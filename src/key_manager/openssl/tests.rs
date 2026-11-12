@@ -145,11 +145,12 @@ fn malformed_protection_is_refused_before_the_payload_is_decoded() {
 
 #[test]
 fn decoded_payload_is_reserved_against_the_aggregate_budget() {
-    // The source and its decoded DER fit exactly; one byte less fails with a
-    // policy violation before the DER is allocated.
+    // The new entry's name, the source and its decoded DER fit exactly; one
+    // byte less fails with a policy violation before the DER is allocated.
     let pem = plain_pem("RSA PRIVATE KEY", &[1, 2, 3]);
+    let name = crate::key_manager::named_material_length("key", 0, 1).expect("a short name");
     let mut resources = ResourcePolicy {
-        max_external_resource_total_bytes: pem.len() + 3,
+        max_external_resource_total_bytes: name + pem.len() + 3,
         ..ResourcePolicy::default()
     };
     assert!(!matches!(
@@ -325,6 +326,47 @@ fn pkcs8_containers_accept_nothing_else() {
             None,
             &resources
         ),
+        unsupported!()
+    ));
+}
+
+/// The traditional DER of the DSA fixture.
+fn dsa_der() -> Zeroizing<Vec<u8>> {
+    let block = pem::parse(DSA_ENCRYPTED).expect("the DSA fixture");
+    let (cipher, iv) = block
+        .headers()
+        .get("DEK-Info")
+        .and_then(|value| value.split_once(','))
+        .expect("the envelope header");
+    Cipher::named(cipher)
+        .expect("a known cipher")
+        .decrypt(
+            &decode_hex(iv).expect("a hex IV"),
+            Zeroizing::new(block.into_contents()),
+            b"legacy-dsa-password",
+        )
+        .expect("the fixture password decrypts the key")
+}
+
+#[test]
+fn a_dsa_generator_shorter_than_the_modulus_is_refused() {
+    // A generator encoded in fewer octets than p reaches the g^x check at
+    // p's precision; it does not match the stored public key and is refused
+    // as an error, not a panic.
+    let resources = ResourcePolicy::default();
+    let der = dsa_der();
+    normalize_dsa(&der, &resources, 0)
+        .expect("the fixture normalizes")
+        .expect("the fixture is a DSA key");
+    let key = TraditionalDsaPrivateKey::from_der(&der).expect("a DSA key");
+    let short = TraditionalDsaPrivateKey {
+        g: UintRef::new(&[2]).expect("a positive integer"),
+        ..key
+    }
+    .to_der()
+    .expect("the key encodes");
+    assert!(matches!(
+        normalize_dsa(&short, &resources, 0),
         unsupported!()
     ));
 }

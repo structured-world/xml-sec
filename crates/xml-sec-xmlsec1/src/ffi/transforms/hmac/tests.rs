@@ -16,8 +16,10 @@ use super::super::ctx::{
     xmlSecTransformCtxCreate, xmlSecTransformCtxCreateAndAppend, xmlSecTransformCtxDestroy,
 };
 use super::super::{OPERATION_SIGN, OPERATION_VERIFY, xmlSecTransformSetKey};
-use super::{hmac_sha256, xmlSecTransformHmacSetMinOutputBitsSize};
+use super::{hmac_sha256, read_node, xmlSecTransformHmacSetMinOutputBitsSize};
+use xml_sec::policy::{Instant, PolicyValidity};
 use xml_sec::xmldsig::SignatureAlgorithm;
+use xml_sec_libxml2::ffi::tree::{xsDocGetRootElement, xsFreeDoc, xsReadMemory};
 
 /// `setKey` of an HMAC-SHA256 transform of `operation` with `secret`.
 fn set_key(operation: c_int, secret: &[u8]) -> c_int {
@@ -72,6 +74,72 @@ fn a_method_the_policy_excludes_is_refused() {
     for operation in [OPERATION_SIGN, OPERATION_VERIFY] {
         assert_eq!(set_key(operation, &[0x42; 32]), -1, "operation {operation}");
     }
+}
+
+#[test]
+fn an_hmac_key_under_an_expired_policy_is_refused() {
+    // A snapshot whose authorized lifetime has ended admits no key, as a core
+    // operation checks the lifetime at entry.
+    own_process();
+    let expired = || {
+        Some(PolicyValidity {
+            authorization_id: "test".to_owned(),
+            authority: "test".to_owned(),
+            reason: "an ended authorization".to_owned(),
+            not_before: Instant::new(0, 0).expect("the epoch"),
+            expires_at: Instant::new(1, 0).expect("one second later"),
+        })
+    };
+    policy::republish(
+        |verification| verification.validity = expired(),
+        |signing| signing.validity = expired(),
+    )
+    .expect("the library policy compiles");
+    for operation in [OPERATION_SIGN, OPERATION_VERIFY] {
+        assert_eq!(set_key(operation, &[0x42; 32]), -1, "operation {operation}");
+    }
+}
+
+/// `readNode` of an HMAC-SHA256 transform of `operation` over a signature
+/// method truncated to `bits`.
+fn read_output_length(operation: c_int, bits: usize) -> c_int {
+    let xml = format!(
+        "<SignatureMethod xmlns=\"http://www.w3.org/2000/09/xmldsig#\" \
+         Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#hmac-sha256\">\
+         <HMACOutputLength>{bits}</HMACOutputLength></SignatureMethod>"
+    );
+    // SAFETY: every object is created and released here.
+    unsafe {
+        let doc = xsReadMemory(
+            xml.as_ptr().cast(),
+            c_int::try_from(xml.len()).expect("a short document"),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        assert!(!doc.is_null(), "the document parses");
+        let ctx = xmlSecTransformCtxCreate();
+        let transform = xmlSecTransformCtxCreateAndAppend(ctx, hmac_sha256());
+        (*transform).operation = operation;
+        let result = read_node(transform, xsDocGetRootElement(doc).cast(), ctx);
+        xmlSecTransformCtxDestroy(ctx);
+        xsFreeDoc(doc);
+        result
+    }
+}
+
+#[test]
+fn an_output_length_is_read_under_the_policy_of_the_operation() {
+    // A signing transform takes its output length from the signing policy:
+    // a length the verification policy admits but the signing policy does
+    // not is refused when signing and still read when verifying.
+    own_process();
+    // Half the SHA-256 output, the shortest truncation the method permits.
+    let bits = 128;
+    policy::republish(|_| {}, |signing| signing.hmac.minimum_output_bits = 256)
+        .expect("the library policy compiles");
+    assert_eq!(read_output_length(OPERATION_VERIFY, bits), 0);
+    assert_eq!(read_output_length(OPERATION_SIGN, bits), -1);
 }
 
 #[test]

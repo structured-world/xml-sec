@@ -184,6 +184,8 @@ fn name_of(klass: &XmlSecKeyDataKlass) -> *const c_char {
 
 // Declared after `key_data_or!`, which it uses.
 mod binary;
+#[cfg(test)]
+pub(crate) use binary::xmlSecKeyDataBinaryValueSetBuffer;
 pub(crate) use binary::{
     value_bin_read, value_bin_write, value_debug_dump, value_debug_xml_dump, value_duplicate,
     value_finalize, value_initialize, value_xml_read, value_xml_write,
