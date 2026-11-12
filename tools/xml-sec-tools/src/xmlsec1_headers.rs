@@ -54,14 +54,30 @@ pub(crate) const HEADERS: [&str; 27] = [
 /// libxmlsec1 functions the library does not offer, with why: they read a
 /// file or an external entity themselves, where the caller reads and passes
 /// bytes, or take a libxml2 parser context, which the library has none of.
-pub(crate) const NOT_OFFERED: [(&str, &str); 4] = [
+pub(crate) const NOT_OFFERED: [(&str, &str); 8] = [
     (
         "xmlSecBufferReadFile",
         "the library reads no file; the caller passes the bytes",
     ),
     (
+        "xmlSecKeyReadBinaryFile",
+        "the library reads no file; the caller passes the bytes to xmlSecKeyReadMemory",
+    ),
+    (
         "xmlSecParseFile",
         "the library reads no file; the caller passes the bytes",
+    ),
+    (
+        "xmlSecSimpleKeysStoreLoad",
+        "the library reads no file; the caller reads its keys and adopts them",
+    ),
+    (
+        "xmlSecSimpleKeysStoreLoad_ex",
+        "the library reads no file; the caller reads its keys and adopts them",
+    ),
+    (
+        "xmlSecSimpleKeysStoreSave",
+        "the library writes no file; the caller writes its keys",
     ),
     (
         "xmlSecParsePrepareCtxt",

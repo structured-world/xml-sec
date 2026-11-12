@@ -571,11 +571,14 @@ pub(crate) unsafe extern "C" fn xmlSecBase64Decode_ex(
         let here = here!("xmlSecBase64Decode_ex");
         // Decoding never writes ahead of reading (three bytes out per four
         // characters in), so `out` may alias `text`. The input is copied
-        // first so that the slices do not alias.
+        // first so that the slices do not alias. The text may encode a
+        // secret key, so the copy is wiped on every path out.
         // SAFETY: `text` is NUL-terminated.
-        let input = unsafe { CStr::from_ptr(text.cast::<c_char>()) }
-            .to_bytes()
-            .to_vec();
+        let input = zeroize::Zeroizing::new(
+            unsafe { CStr::from_ptr(text.cast::<c_char>()) }
+                .to_bytes()
+                .to_vec(),
+        );
         let mut ctx = XmlSecBase64Ctx::empty();
         let (mut written, mut last) = (0, 0);
         // SAFETY: `ctx` is on the stack; `out` is writable for `out_size`

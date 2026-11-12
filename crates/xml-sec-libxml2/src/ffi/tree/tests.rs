@@ -282,3 +282,30 @@ fn content_ids_and_root_replacement_follow_libxml2() {
         xsFreeDoc(doc);
     }
 }
+
+#[test]
+fn a_fragment_reports_a_bad_context_apart_from_bad_content() {
+    // xs_tree.h: 1 for a context that is neither an element nor the
+    // document node, 5 for content that is not well-formed.
+    let fragment = "<x/>";
+    let size = c_int::try_from(fragment.len()).expect("a short fragment");
+    // SAFETY: every call takes handles the calls above returned, or bytes
+    // these literals provide; the out-pointer is a writable local.
+    unsafe {
+        let doc = parse("<r>text</r>");
+        let root = xsDocGetRootElement(doc);
+        let text = xsNodeGetChildren(root);
+        let mut list = std::ptr::null_mut();
+        assert_eq!(
+            xsParseInNodeContext(text, fragment.as_ptr().cast(), size, 0, &raw mut list),
+            1
+        );
+        assert!(list.is_null());
+        assert_eq!(
+            xsParseInNodeContext(root, c"<x>".as_ptr(), 3, 0, &raw mut list),
+            5
+        );
+        assert!(list.is_null());
+        xsFreeDoc(doc);
+    }
+}

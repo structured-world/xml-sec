@@ -311,7 +311,12 @@ impl HmacPolicy {
         Ok(())
     }
 
-    pub(crate) fn validate_key_bytes(self, key_bytes: usize) -> Result<(), PolicyViolation> {
+    /// Check an HMAC secret of `key_bytes` bytes against the configured
+    /// minimum key length.
+    ///
+    /// # Errors
+    /// [`PolicyViolation::InvalidKeyMaterial`] for a shorter secret.
+    pub fn validate_key_bytes(self, key_bytes: usize) -> Result<(), PolicyViolation> {
         self.validate_key_bits(key_bytes.saturating_mul(8))
     }
 
@@ -326,7 +331,14 @@ impl HmacPolicy {
         Ok(())
     }
 
-    pub(crate) fn validate_output(
+    /// Check a selected HMAC output length of `algorithm` against this policy
+    /// and the `XMLDSig` floor: at least the configured minimum, 80 bits and
+    /// half the digest width, and at most the digest width.
+    ///
+    /// # Errors
+    /// [`PolicyViolation::Algorithm`] for a method that is no HMAC,
+    /// [`PolicyViolation::HmacOutputLength`] for a length out of range.
+    pub fn validate_output(
         self,
         algorithm: SignatureAlgorithm,
         selected_bits: usize,
@@ -1431,7 +1443,11 @@ pub struct VerificationPolicy {
 
 #[cfg(feature = "xmldsig")]
 impl VerificationPolicy {
-    pub(crate) fn check_digest_algorithm(
+    /// Whether verification admits the digest method `algorithm`.
+    ///
+    /// # Errors
+    /// [`PolicyViolation::Algorithm`] for a method the policy excludes.
+    pub fn check_digest_algorithm(
         &self,
         algorithm: DigestAlgorithm,
     ) -> Result<(), PolicyViolation> {
@@ -1583,7 +1599,14 @@ impl SigningPolicy {
         self.hmac.validate()
     }
 
-    pub(crate) fn check_signature_algorithm(
+    /// Whether this policy admits signing with `algorithm`: the explicit
+    /// method list or the parameterized RSA-PSS permission, and the
+    /// method's own signing permission.
+    ///
+    /// # Errors
+    /// [`PolicyViolation::Algorithm`] for a method the policy does not
+    /// admit for signing.
+    pub fn check_signature_algorithm(
         &self,
         algorithm: SignatureAlgorithm,
     ) -> Result<(), PolicyViolation> {
@@ -1598,7 +1621,11 @@ impl SigningPolicy {
         )
     }
 
-    pub(crate) fn check_digest_algorithm(
+    /// Whether signing admits the digest method `algorithm`.
+    ///
+    /// # Errors
+    /// [`PolicyViolation::Algorithm`] for a method the policy excludes.
+    pub fn check_digest_algorithm(
         &self,
         algorithm: DigestAlgorithm,
     ) -> Result<(), PolicyViolation> {
