@@ -3109,6 +3109,9 @@ fn find_named_entry<'a, T>(
 /// The refusal of a private key imported to decrypt whose family cannot
 /// recover encryption keys: a usage mismatch, distinct from a container the
 /// password failed to open.
+/// The selection refusal of a private key imported for decryption whose
+/// algorithm cannot recover encryption keys.
+#[cfg(feature = "xmldsig-sign")]
 pub(crate) const CANNOT_DECRYPT: &str = "private key cannot recover encryption keys";
 
 fn named_material_length(
