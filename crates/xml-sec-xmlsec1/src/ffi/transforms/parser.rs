@@ -152,7 +152,7 @@ unsafe extern "C" fn push_bin(
                 return -1;
             };
             let mut count = pushed.len();
-            if charge(&mut count, size, document_limit(policy), here, name()).is_none() {
+            if charge(&mut count, size, document_limit(&policy), here, name()).is_none() {
                 return -1;
             }
             pushed.extend_from_slice(std::slice::from_raw_parts(data, size));
@@ -225,7 +225,7 @@ unsafe extern "C" fn pop_xml(
         let input = bounded_input_buffer(
             object.prev,
             ctx,
-            document_limit(policy),
+            document_limit(&policy),
             here!("xmlSecTransformCreateInputBuffer"),
         );
         if input.is_null() {

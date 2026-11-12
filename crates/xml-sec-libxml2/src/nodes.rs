@@ -751,7 +751,7 @@ fn parse_fragment(node: *const Node, bytes: &[u8]) -> Result<*mut Node, Fragment
     let fragment = std::str::from_utf8(bytes).map_err(|_| FragmentError::Encoding)?;
     let policy = crate::policy::library().ok_or(FragmentError::Policy)?;
     let first = handles::update_document(document, |tree| {
-        tree.parse_in_context(context, fragment, policy)
+        tree.parse_in_context(context, fragment, &*policy)
     })??;
     Ok(first.map_or(std::ptr::null_mut(), |first| node_pointer(document, first)))
 }

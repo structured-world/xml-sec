@@ -335,7 +335,7 @@ fn set_content(node: *mut XmlNode, content: &str) {
 unsafe fn read_value(here: Here, node: *mut XmlNode) -> Result<KeyValueInfo, String> {
     let policy = policy::verification_at(here).ok_or("the library policy is unavailable")?;
     let document =
-        xml_sec_libxml2::document::subtree(node, policy).map_err(|error| error.to_string())?;
+        xml_sec_libxml2::document::subtree(node, &*policy).map_err(|error| error.to_string())?;
     document.with_view(|view| {
         parse_key_value_child(view.document().root_element()).map_err(|error| error.to_string())
     })
