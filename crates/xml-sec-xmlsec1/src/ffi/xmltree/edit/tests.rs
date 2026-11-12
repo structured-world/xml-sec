@@ -4,7 +4,10 @@ use xml_sec_libxml2::ffi::tree::{
     xsDocGetRootElement, xsFreeDoc, xsFreeNode, xsGetID, xsNewDocNode, xsNewDocText, xsUnlinkNode,
 };
 
-use super::{xmlSecAddChildNode, xmlSecReplaceContentAndReturn, xmlSecReplaceNodeBufferAndReturn};
+use super::{
+    xmlSecAddChildNode, xmlSecAddNextSibling, xmlSecAddPrevSibling, xmlSecEnsureEmptyChild,
+    xmlSecReplaceContentAndReturn, xmlSecReplaceNodeBufferAndReturn,
+};
 use crate::ffi::parser::xmlSecParseMemory;
 use crate::ffi::tree::{XmlNode, nodes};
 
@@ -158,6 +161,81 @@ fn a_buffer_replacement_takes_over_the_ids_of_the_node_it_replaces() {
             }
             xsFreeDoc(doc);
         }
+    }
+}
+
+#[test]
+fn an_ensured_child_is_a_direct_child() {
+    // libxmlsec1 documents the search as one among the direct children: an
+    // element of the name deeper down is neither returned nor joined.
+    let xml = "<r><wrapper><slot/></wrapper></r>";
+    // SAFETY: handles are validated by each call; the document is freed once.
+    unsafe {
+        let doc = xmlSecParseMemory(xml.as_ptr(), xml.len(), 1);
+        assert!(!doc.is_null(), "the document parses");
+        let root = xsDocGetRootElement(doc);
+        let ensured = xmlSecEnsureEmptyChild(root, c"slot".as_ptr().cast(), std::ptr::null());
+        assert!(!ensured.is_null());
+        assert_eq!(nodes::parent(ensured), root);
+        assert_eq!(
+            xmlSecEnsureEmptyChild(root, c"slot".as_ptr().cast(), std::ptr::null()),
+            ensured,
+            "the direct empty child is found again"
+        );
+        xsFreeDoc(doc);
+    }
+}
+
+#[test]
+fn a_sibling_of_a_detached_node_fails_instead_of_staying_detached() {
+    // A node without a parent has no place for a sibling: the call fails
+    // and returns no detached element as if it had been linked.
+    let xml = "<r/>";
+    // SAFETY: handles are validated by each call; the document is freed once.
+    unsafe {
+        let doc = xmlSecParseMemory(xml.as_ptr(), xml.len(), 1);
+        assert!(!doc.is_null(), "the document parses");
+        let detached = xsNewDocNode(
+            doc,
+            std::ptr::null_mut(),
+            c"d".as_ptr().cast(),
+            std::ptr::null(),
+        );
+        for side in [xmlSecAddNextSibling, xmlSecAddPrevSibling] {
+            assert!(side(detached, c"s".as_ptr().cast(), std::ptr::null()).is_null());
+        }
+        let root = xsDocGetRootElement(doc);
+        assert!(
+            nodes::first_child(root).is_null(),
+            "the document is unchanged"
+        );
+        xsFreeNode(detached);
+        xsFreeDoc(doc);
+    }
+}
+
+#[test]
+fn a_content_setter_reports_a_node_that_cannot_hold_text() {
+    // The document node holds no text: the setters that return a status say
+    // so instead of reporting success over unchanged content.
+    let xml = "<r/>";
+    // SAFETY: handles are validated by each call; the document is freed once.
+    unsafe {
+        let doc = xmlSecParseMemory(xml.as_ptr(), xml.len(), 1);
+        assert!(!doc.is_null(), "the document parses");
+        let document = doc.cast::<XmlNode>();
+        assert_eq!(
+            crate::ffi::xmltree::content::xmlSecSetNodeContentAsHex(document, b"\x01".as_ptr(), 1),
+            -1
+        );
+        assert_eq!(
+            crate::ffi::xmltree::content::xmlSecNodeEncodeAndSetContent(
+                document,
+                c"x".as_ptr().cast()
+            ),
+            -1
+        );
+        xsFreeDoc(doc);
     }
 }
 

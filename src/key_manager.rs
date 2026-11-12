@@ -2050,9 +2050,7 @@ impl KeyInventory {
         }
         let identity = PrivateKeyIdentity::decode(&der)?;
         if usages.allows(KeyUsage::Decrypt) && !identity.can_decrypt() {
-            return Err(KeyStoreError::Selection(
-                "private key cannot recover encryption keys",
-            ));
+            return Err(KeyStoreError::Selection(CANNOT_DECRYPT));
         }
         #[cfg(feature = "experimental-pq")]
         identity.validate_usages(usages)?;
@@ -3107,6 +3105,11 @@ fn find_named_entry<'a, T>(
     }
     Ok(None)
 }
+
+/// The refusal of a private key imported to decrypt whose family cannot
+/// recover encryption keys: a usage mismatch, distinct from a container the
+/// password failed to open.
+pub(crate) const CANNOT_DECRYPT: &str = "private key cannot recover encryption keys";
 
 fn named_material_length(
     name: &str,

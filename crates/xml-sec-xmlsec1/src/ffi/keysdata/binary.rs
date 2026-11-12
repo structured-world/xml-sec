@@ -370,13 +370,22 @@ pub(crate) unsafe extern "C" fn value_xml_write(
                 );
                 return -1;
             }
-            // Base64 holds no markup; libxmlsec1 ignores the setter's outcome.
-            if let Some(content) = c_text(text)
-                && nodes::set_content(node, content).is_err()
-            {
-                // libxml2's setter returns nothing libxmlsec1 reads.
-            }
+            // Base64 holds no markup. A refused edit fails the write rather
+            // than passing for one with no key written.
+            let set = c_text(text).is_some_and(|content| nodes::set_content(node, content).is_ok());
+            // The text is the secret in Base64: it is wiped before it is
+            // released, as the read path wipes what it decodes.
+            let length = std::ffi::CStr::from_ptr(text.cast()).count_bytes();
+            zeroize::Zeroize::zeroize(std::slice::from_raw_parts_mut(text, length));
             free(text.cast());
+            if !set {
+                errors::xml_failed(
+                    here!("xmlSecKeyDataBinaryValueXmlWrite"),
+                    klass_name(id),
+                    c"xmlNodeSetContent",
+                );
+                return -1;
+            }
         }
         0
     })

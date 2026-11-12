@@ -366,6 +366,16 @@ pub fn decode_signing_key(
     password: Option<&[u8]>,
     resources: &ResourcePolicy,
 ) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
+    // Every container decodes to at most its own size (PEM's Base64 to less,
+    // DER to itself), and the source stays live beside what it decodes to:
+    // both fit what the operation has left before any decoder allocates.
+    let maximum = resources.max_external_resource_total_bytes;
+    if bytes.len().checked_mul(2).is_none_or(|peak| peak > maximum) {
+        return Err(KeyMaterialError::KeyMaterialTooLarge {
+            path: path.to_owned(),
+            maximum,
+        });
+    }
     let key = KeySource {
         path,
         bytes,

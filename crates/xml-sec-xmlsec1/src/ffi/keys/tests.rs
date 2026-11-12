@@ -96,3 +96,27 @@ fn setting_or_adopting_a_value_the_key_owns_keeps_it() {
         xmlSecKeyDestroy(key);
     }
 }
+
+#[test]
+fn a_key_store_klass_too_small_for_its_object_is_refused() {
+    // A store klass whose object cannot hold the store header, or which has
+    // no name, is refused before anything is allocated or written.
+    use crate::ffi::keysmngr::{XmlSecKeyStore, XmlSecKeyStoreKlass, xmlSecKeyStoreCreate};
+    let klass = |obj_size: usize, name: *const u8| XmlSecKeyStoreKlass {
+        klass_size: size_of::<XmlSecKeyStoreKlass>(),
+        obj_size,
+        name,
+        initialize: None,
+        finalize: None,
+        find_key: None,
+        find_key_from_x509_data: None,
+        reserved0: std::ptr::null_mut(),
+    };
+    let short = klass(size_of::<XmlSecKeyStore>() - 1, c"short".as_ptr().cast());
+    let unnamed = klass(size_of::<XmlSecKeyStore>(), std::ptr::null());
+    // SAFETY: klasses that outlive the calls; nothing is created.
+    unsafe {
+        assert!(xmlSecKeyStoreCreate(&raw const short).is_null());
+        assert!(xmlSecKeyStoreCreate(&raw const unnamed).is_null());
+    }
+}

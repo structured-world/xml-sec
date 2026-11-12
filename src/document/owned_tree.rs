@@ -357,8 +357,9 @@ impl OwnedTree {
                 }
             }
             // A value repeated later keeps its first element, as libxml2's
-            // parser keeps the first: the repeat is not registered.
-            drop(self.register_xml_id(id, &[]));
+            // parser keeps the first: the repeat is not registered, only
+            // shadowed, so a lookup of the value finds it ambiguous.
+            self.register_or_shadow_xml_id(id, &[]);
             let first = pending.len();
             pending.extend(self.document.children(id));
             // Children are popped first to last.
@@ -393,6 +394,37 @@ impl OwnedTree {
         attribute.raw_value = None;
         let value = attribute.value.clone();
         self.claim(value, xml_id_source(TreeNode::of(element)), released)
+    }
+
+    /// Register the `xml:id` of `element` as [`Self::register_xml_id`] does,
+    /// for a path that does not refuse a repeated value: a value another
+    /// element holds leaves this one shadowed rather than unseen, and a
+    /// registration taken over from a released element shadows that one, so
+    /// a lookup finds the value ambiguous once both are linked.
+    fn register_or_shadow_xml_id(&mut self, element: NodeId, released: &[NodeId]) {
+        match self.register_xml_id(element, released) {
+            Ok(Some(Undo::Id {
+                value,
+                previous: Some(previous),
+            })) => self.ids.shadow(value, previous),
+            Err(TreeError::DuplicateId) => {
+                if let Some(value) = self.xml_id_value(element) {
+                    self.ids.shadow(value, xml_id_source(TreeNode::of(element)));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The `xml:id` value `element` carries, if any.
+    fn xml_id_value(&self, element: NodeId) -> Option<String> {
+        let NodeKind::Element { attributes, .. } = &self.document.node(element).kind else {
+            return None;
+        };
+        attributes
+            .iter()
+            .find(|attribute| is_xml_id(&attribute.name, attribute.namespace.as_deref()))
+            .map(|attribute| attribute.value.clone())
     }
 
     /// Make `value` the ID `source` carries. The undo record of a change is
@@ -682,7 +714,9 @@ impl OwnedTree {
         self.register_imported_ids(copy);
         // The IDs a caller registered on attributes of the subtree carry over
         // with the attributes, as libxml2's copy re-adds a copied ID
-        // attribute; a value held here already keeps its element.
+        // attribute; a value held here already keeps its element, and the
+        // copy is shadowed, so a lookup finds the value ambiguous once both
+        // are linked.
         for (original, element) in copied {
             for (attribute, value) in source.ids.of_element(TreeNode::of(original)) {
                 let carrier = id_source(
@@ -690,7 +724,11 @@ impl OwnedTree {
                     &attribute.name,
                     attribute.namespace.as_deref(),
                 );
-                drop(self.claim(String::from(value), carrier, &[]));
+                if let Err(TreeError::DuplicateId) =
+                    self.claim(String::from(value), carrier.clone(), &[])
+                {
+                    self.ids.shadow(String::from(value), carrier);
+                }
             }
         }
         Ok(TreeNode::of(copy))
@@ -769,13 +807,13 @@ impl OwnedTree {
 
     /// Register the `xml:id` attributes of the imported subtree at `top`; a
     /// value another element holds keeps that element, as libxml2's parser
-    /// keeps the first.
+    /// keeps the first, and the repeat is shadowed.
     fn register_imported_ids(&mut self, top: NodeId) {
         let elements: Vec<NodeId> = core::iter::once(top)
             .chain(self.document.descendants(top))
             .collect();
         for element in elements {
-            drop(self.register_xml_id(element, &[]));
+            self.register_or_shadow_xml_id(element, &[]);
         }
     }
 
@@ -1008,11 +1046,39 @@ impl OwnedTree {
             .map(|attribute| attribute.value))
     }
 
-    /// The element registered for the ID `value`, if it is live and linked.
+    /// The one live, linked element whose attribute carries the ID `value`:
+    /// the registered one or a carrier the table shadows. `None` when no
+    /// linked element carries it, or when two do, since a reference to an
+    /// ambiguous ID names neither (an ID is unique in a valid document, XML
+    /// 1.0 section 3.3.1, and xml:id 1.0 section 4).
     #[must_use]
     pub fn element_by_id(&self, value: &str) -> Option<TreeNode> {
-        let node = self.ids.get(value)?.element;
-        (self.contains(node) && self.attached(node)).then_some(node)
+        let carries = |source: &IdSource| {
+            self.contains(source.element)
+                && self.attached(source.element)
+                && self
+                    .attribute(source.element, &source.name, source.namespace.as_deref())
+                    .ok()
+                    .flatten()
+                    == Some(value)
+        };
+        let mut found = None;
+        for source in self
+            .ids
+            .get(value)
+            .into_iter()
+            .chain(self.ids.shadowed(value))
+        {
+            if !carries(source) {
+                continue;
+            }
+            match found {
+                None => found = Some(source.element),
+                Some(element) if element == source.element => {}
+                Some(_) => return None,
+            }
+        }
+        found
     }
 
     /// Whether `node` hangs under the document node.
@@ -1362,14 +1428,15 @@ impl OwnedTree {
         }
         self.unlink(old)?;
         // The run's IDs were claimed while `old` held them; with `old`
-        // released they take them, and a value held elsewhere keeps its
-        // element.
+        // released they take them and `old` is shadowed, so linking it again
+        // makes the value ambiguous rather than silently taken. A value held
+        // elsewhere keeps its element and shadows the run's.
         for &top in &run {
             let elements: Vec<NodeId> = core::iter::once(top)
                 .chain(self.document.descendants(top))
                 .collect();
             for element in elements {
-                drop(self.register_xml_id(element, &[old_id]));
+                self.register_or_shadow_xml_id(element, &[old_id]);
             }
         }
         Ok(())
@@ -1518,19 +1585,20 @@ impl OwnedTree {
     }
 
     /// Whether `attribute` of `element` is an ID: `xml:id` (xml:id 1.0
-    /// section 4) or registered in the document's ID table.
+    /// section 4), registered in the document's ID table, or a further
+    /// carrier of a registered value the table shadows.
     fn is_id(&self, element: NodeId, attribute: &Attribute) -> bool {
+        let value = attribute.value.as_str();
+        let this = |source: &IdSource| {
+            source.is(
+                TreeNode::of(element),
+                &attribute.name,
+                attribute.namespace.as_deref(),
+            )
+        };
         is_xml_id(&attribute.name, attribute.namespace.as_deref())
-            || self
-                .ids
-                .get(attribute.value.as_str())
-                .is_some_and(|source| {
-                    source.is(
-                        TreeNode::of(element),
-                        &attribute.name,
-                        attribute.namespace.as_deref(),
-                    )
-                })
+            || self.ids.get(value).is_some_and(this)
+            || self.ids.shadowed(value).iter().any(this)
     }
 
     /// Build the fragment's nodes unlinked, in order.

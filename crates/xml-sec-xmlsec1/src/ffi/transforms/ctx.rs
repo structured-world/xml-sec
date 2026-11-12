@@ -97,16 +97,40 @@ pub(crate) unsafe fn run_policy(
     run.policy.clone()
 }
 
-/// Makes `pinned` the policy of the run of `ctx` unless the run has one, so
-/// a chain a `KeyInfo` read runs reads the revision of that read.
+/// Starts the fresh run of `ctx` under `pinned` with `spent` already charged,
+/// so a chain a `KeyInfo` read runs reads the revision of that read and
+/// charges the budgets that read has drawn on.
 ///
 /// # Safety
 /// `ctx` is an initialized context.
-pub(crate) unsafe fn seed_policy(ctx: *mut XmlSecTransformCtx, pinned: &policy::Pinned) {
+pub(crate) unsafe fn seed_run(
+    ctx: *mut XmlSecTransformCtx,
+    pinned: &policy::Pinned,
+    spent: policy::Spent,
+) {
     // SAFETY: by the caller's contract.
     let run = unsafe { run_budget(ctx) };
     if run.policy.is_none() {
         run.policy = Some(pinned.clone());
+    }
+    run.base64_input = spent.base64_input;
+    run.base64_output = spent.base64_output;
+    run.external_resources = spent.external_resources;
+}
+
+/// What the run of `ctx` has spent; nothing when no run has started.
+///
+/// # Safety
+/// `ctx` is an initialized context.
+pub(crate) unsafe fn run_spent(ctx: *mut XmlSecTransformCtx) -> policy::Spent {
+    // SAFETY: by the caller's contract; the slot is null or the run.
+    match unsafe { (*ctx).reserved0.cast::<RunBudget>().as_ref() } {
+        Some(run) => policy::Spent {
+            base64_input: run.base64_input,
+            base64_output: run.base64_output,
+            external_resources: run.external_resources,
+        },
+        None => policy::Spent::default(),
     }
 }
 

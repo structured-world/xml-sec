@@ -10,9 +10,7 @@
 
 use std::ffi::{c_char, c_int, c_uint, c_void};
 
-use xml_sec::xmldsig::{
-    HmacSigningKey, IncrementalHmac, SignatureAlgorithm, constant_time_eq, validate_signing_key,
-};
+use xml_sec::xmldsig::{IncrementalHmac, SignatureAlgorithm, constant_time_eq};
 
 use super::super::buffer::{
     xmlSecBufferAppend, xmlSecBufferGetData, xmlSecBufferGetSize, xmlSecBufferRemoveHead,
@@ -36,6 +34,7 @@ use super::super::xmltree::{
 };
 use super::super::{contain, policy};
 use super::builtin::klass;
+use super::ctx::run_policy;
 use super::{
     OPERATION_SIGN, OPERATION_VERIFY, STATUS_FAIL, STATUS_FINISHED, STATUS_NONE, STATUS_OK,
     STATUS_WORKING, USAGE_SIGNATURE_METHOD, WithContext, XmlSecKeyReq, XmlSecTransform,
@@ -58,6 +57,9 @@ struct Hmac {
     mac: Option<Box<IncrementalHmac>>,
     /// The selected output length in bits, zero for the full MAC.
     output_bits: usize,
+    /// The length of the secret the MAC was started with, admitted again
+    /// under the run's policy revision.
+    secret_len: usize,
     /// The full MAC once finished.
     result: Vec<u8>,
 }
@@ -183,6 +185,7 @@ unsafe extern "C" fn initialize(transform: *mut XmlSecTransform) -> c_int {
             (&raw mut (*transform.cast::<WithContext<Hmac>>()).context).write(Hmac {
                 mac: None,
                 output_bits: 0,
+                secret_len: 0,
                 result: Vec::new(),
             });
         }
@@ -210,7 +213,7 @@ unsafe extern "C" fn finalize(transform: *mut XmlSecTransform) {
 unsafe extern "C" fn read_node(
     transform: *mut XmlSecTransform,
     node: *mut XmlNode,
-    _ctx: *mut XmlSecTransformCtx,
+    ctx: *mut XmlSecTransformCtx,
 ) -> c_int {
     contain(-1, || {
         let here = here!("xmlSecTransformHmacReadOutputBitsSize");
@@ -247,14 +250,18 @@ unsafe extern "C" fn read_node(
                 // The method is read before its operation may be set: a
                 // length is refused here when the operation's policy refuses
                 // it, or with no operation yet when neither policy admits it.
-                // `set_key` checks it again under the operation's policy.
-                let (Some(verification), Some(signing)) =
-                    (policy::verification_at(here), policy::signing_at(here))
-                else {
+                // `set_key` checks it again under the operation's policy. The
+                // revision is the context's run's, when there is a context.
+                let pinned = if ctx.is_null() {
+                    policy::Pinned::current(here)
+                } else {
+                    run_policy(ctx, here)
+                };
+                let Some(pinned) = pinned else {
                     return -1;
                 };
-                let verifying = verification.hmac.validate_output(algorithm, bits);
-                let signing = signing.hmac.validate_output(algorithm, bits);
+                let verifying = pinned.verification.hmac.validate_output(algorithm, bits);
+                let signing = pinned.signing.hmac.validate_output(algorithm, bits);
                 let admitted = match object.operation {
                     OPERATION_SIGN => signing,
                     OPERATION_VERIFY => verifying,
@@ -357,15 +364,18 @@ unsafe extern "C" fn set_key(transform: *mut XmlSecTransform, key: *mut c_void) 
                 return -1;
             }
             let secret = std::slice::from_raw_parts(xmlSecBufferGetData(buffer), size);
-            match admit(object.operation, algorithm, secret, hmac.output_bits, here) {
-                Ok(()) => {}
-                Err(Some(refusal)) => {
-                    errors::internal_with(here, name, c"policy", &refusal);
-                    return -1;
-                }
-                // The unavailable policy is already reported.
-                Err(None) => return -1,
+            // No run is known here: the current revision admits the key, and
+            // the run's revision admits it again before taking input.
+            let Some(pinned) = policy::Pinned::current(here) else {
+                return -1;
+            };
+            if let Err(refusal) =
+                admit(object.operation, algorithm, size, hmac.output_bits, &pinned)
+            {
+                errors::internal_with(here, name, c"policy", &refusal);
+                return -1;
             }
+            hmac.secret_len = size;
             match IncrementalHmac::begin(algorithm, secret) {
                 Ok(mac) => hmac.mac = Some(Box::new(mac)),
                 Err(error) => {
@@ -383,41 +393,51 @@ unsafe extern "C" fn set_key(transform: *mut XmlSecTransform, key: *mut c_void) 
     })
 }
 
-/// Checks the method, the secret and the output length, the full MAC when
-/// none is selected, against the library policy of `operation`; `Err(None)`
-/// after the unavailable policy is reported at `here`.
+/// Checks the method, a secret of `secret_len` bytes and the output length,
+/// the full MAC when none is selected, against the policy of `operation` in
+/// `pinned`, as signing-key validation and signature verification admit an
+/// HMAC key.
 fn admit(
     operation: c_int,
     algorithm: SignatureAlgorithm,
-    secret: &[u8],
+    secret_len: usize,
     output_bits: usize,
-    here: Here,
-) -> Result<(), Option<String>> {
-    let refused = |error: &dyn std::fmt::Display| Some(error.to_string());
+    pinned: &policy::Pinned,
+) -> Result<(), String> {
+    let refused = |error: &dyn std::fmt::Display| error.to_string();
     let full = algorithm
         .hmac_output_bits()
-        .ok_or_else(|| Some("not an HMAC method".to_owned()))?;
+        .ok_or_else(|| "not an HMAC method".to_owned())?;
     let bits = if output_bits == 0 { full } else { output_bits };
     // Each branch first checks the snapshot itself, its authorization
     // lifetime included, before any of its rules admits the key.
     if operation == OPERATION_SIGN {
-        let policy = policy::signing_at(here).ok_or(None)?;
+        let policy = &pinned.signing;
         policy.validate().map_err(|error| refused(&error))?;
-        let key = HmacSigningKey::new(secret.to_vec()).map_err(|error| refused(&error))?;
-        validate_signing_key(&key, algorithm, &policy).map_err(|error| refused(&error))?;
+        policy
+            .resources
+            .validate_key_candidates(1)
+            .map_err(|error| refused(&error))?;
+        policy
+            .check_signature_algorithm(algorithm)
+            .map_err(|error| refused(&error))?;
+        policy
+            .hmac
+            .validate_key_bytes(secret_len)
+            .map_err(|error| refused(&error))?;
         policy
             .hmac
             .validate_output(algorithm, bits)
             .map_err(|error| refused(&error))
     } else {
-        let policy = policy::verification_at(here).ok_or(None)?;
+        let policy = &pinned.verification;
         policy.validate().map_err(|error| refused(&error))?;
         policy
             .check_signature_algorithm(algorithm)
             .map_err(|error| refused(&error))?;
         policy
             .hmac
-            .validate_key_bytes(secret.len())
+            .validate_key_bytes(secret_len)
             .map_err(|error| refused(&error))?;
         policy
             .hmac
@@ -579,7 +599,7 @@ unsafe extern "C" fn execute(
     contain(-1, || {
         let here = here!("xmlSecOpenSSLHmacExecute");
         // SAFETY: the dispatcher passes a transform.
-        let Some((object, _, hmac)) = (unsafe { object(transform, here) }) else {
+        let Some((object, algorithm, hmac)) = (unsafe { object(transform, here) }) else {
             return -1;
         };
         if !signs_or_verifies(object, here) {
@@ -592,6 +612,30 @@ unsafe extern "C" fn execute(
         if object.status == STATUS_NONE {
             if hmac.mac.is_none() {
                 errors::assertion(here, c"ctx->ctxInitialized != 0");
+                return -1;
+            }
+            // The run's revision admits the method, the key and the output
+            // length again before the first chunk: the key was admitted
+            // under the revision current when it was set.
+            // SAFETY: a non-null context, initialized by the dispatcher's
+            // contract.
+            let Some(pinned) = (unsafe { run_policy(ctx, here) }) else {
+                return -1;
+            };
+            if let Err(refusal) = admit(
+                object.operation,
+                algorithm,
+                hmac.secret_len,
+                hmac.output_bits,
+                &pinned,
+            ) {
+                errors::report(
+                    here,
+                    name_of(object),
+                    std::ptr::null(),
+                    errors::R_TRANSFORM_DISABLED,
+                    &refusal,
+                );
                 return -1;
             }
             object.status = STATUS_WORKING;

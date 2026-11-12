@@ -320,12 +320,10 @@ unsafe extern "C" fn get_size(data: *mut XmlSecKeyData) -> usize {
     })
 }
 
-/// `xmlNodeSetContent(node, content)` for content without markup, whose
-/// outcome libxmlsec1 does not read.
-fn set_content(node: *mut XmlNode, content: &str) {
-    if nodes::set_content(node, content).is_err() {
-        // libxml2's setter returns nothing libxmlsec1 reads.
-    }
+/// `xmlNodeSetContent(node, content)` for content without markup; a refused
+/// edit is the write's failure, not a success over an empty element.
+fn set_content(node: *mut XmlNode, content: &str) -> Result<(), &'static CStr> {
+    nodes::set_content(node, content).map_err(|_| c"xmlNodeSetContent")
 }
 
 /// The key value the core reads from the key-value element `node`, under the
@@ -463,16 +461,16 @@ unsafe fn write_component(
         );
         if text.is_null() {
             // libxmlsec1 has set the leading line feed by then.
-            set_content(child, line_feed);
+            set_content(child, line_feed)?;
             return Err(c"xmlSecBase64Encode");
         }
         let encoded = c_text(text).unwrap_or_default();
         // The line feed, the Base64 and the line feed, which libxmlsec1 sets
         // and appends in three calls that end as this one text.
-        set_content(child, &format!("{line_feed}{encoded}{line_feed}"));
+        let set = set_content(child, &format!("{line_feed}{encoded}{line_feed}"));
         free(text.cast());
+        set
     }
-    Ok(())
 }
 
 /// Writes the children of the key-value element `node` for `value`.
@@ -516,7 +514,9 @@ unsafe fn write_value(node: *mut XmlNode, value: &KeyValueInfo) -> Result<(), &'
                 // its OID (RFC 3061).
                 let uri =
                     CString::new(format!("urn:oid:{curve_oid}")).map_err(|_| c"xmlSetProp")?;
-                xsSetProp(curve, xmlSecAttrURI.as_ptr(), uri.as_ptr().cast());
+                if xsSetProp(curve, xmlSecAttrURI.as_ptr(), uri.as_ptr().cast()).is_null() {
+                    return Err(c"xmlSetProp");
+                }
                 write_component(node, &xmlSecNodePublicKey, &xmlSecDSig11Ns, public_key)
             }
             _ => Err(c"KeyValueInfo"),
@@ -755,6 +755,23 @@ unsafe fn der_adopt(
     resources: &xml_sec::policy::ResourcePolicy,
 ) -> c_int {
     let object_name = xmlSecNameDEREncodedKeyValue.as_ptr().cast::<c_char>();
+    // The key is external material: what its Base64 text decodes to is
+    // bounded before the reader allocates for it. Whitespace decodes to
+    // nothing; every four other characters decode to at most three octets.
+    let max = resources.max_external_resource_bytes;
+    let encoded = nodes::content(node).map_or(0, |text| {
+        text.bytes()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .count()
+    });
+    if encoded
+        .div_ceil(4)
+        .checked_mul(3)
+        .is_none_or(|decoded| decoded > max)
+    {
+        errors::limit_exceeded(here, object_name, "max_external_resource_bytes", max);
+        return -1;
+    }
     // SAFETY: by the caller's contract.
     unsafe {
         if xmlSecBufferBase64NodeContentRead(buffer, node) < 0 {
@@ -829,13 +846,15 @@ unsafe extern "C" fn der_xml_write(
                 errors::internal(here, object_name, c"xmlSecBase64Encode");
                 return -1;
             }
-            // xmlNodeAddContent, which libxmlsec1 ignores the outcome of.
-            if let Some(encoded) = c_text(text)
-                && nodes::add_content(node, encoded).is_err()
-            {
-                // libxml2's function returns nothing libxmlsec1 reads.
-            }
+            // xmlNodeAddContent; a refused edit is the write's failure, not a
+            // success with no key written.
+            let added =
+                c_text(text).is_some_and(|encoded| nodes::add_content(node, encoded).is_ok());
             free(text.cast());
+            if !added {
+                errors::xml_failed(here, object_name, c"xmlNodeAddContent");
+                return -1;
+            }
         }
         0
     })

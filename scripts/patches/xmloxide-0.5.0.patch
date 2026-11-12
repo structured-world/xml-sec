@@ -11618,7 +11618,7 @@
                  out.push_str(" [");
                  out.push_str(subset);
                  out.push_str("]>");
-@@ -327,17 +257,115 @@
+@@ -327,17 +257,118 @@
      }
  }
  
@@ -11652,8 +11652,11 @@
 +        out.push(':');
 +    }
 +    out.push_str(name);
-+    let is_ns_decl =
-+        |attr: &&Attribute| attr.name == "xmlns" || attr.prefix.as_deref() == Some("xmlns");
++    // Only an unprefixed `xmlns` and the `xmlns:` prefix declare a namespace
++    // (Namespaces in XML 1.0 section 3); `p:xmlns` is an ordinary attribute.
++    let is_ns_decl = |attr: &&Attribute| {
++        (attr.prefix.is_none() && attr.name == "xmlns") || attr.prefix.as_deref() == Some("xmlns")
++    };
 +    // libxml2 writes an element's namespace declarations before its
 +    // attributes, each group in its own order.
 +    let declarations = attributes.iter().filter(is_ns_decl);
@@ -11737,7 +11740,7 @@
  /// - `\t` and `\n` are passed through
  /// - Control characters below 0x20 (other than `\t`, `\n`, `\r`) are hex-encoded
  /// - Non-ASCII characters are passed through as raw UTF-8
-@@ -347,7 +375,7 @@
+@@ -347,7 +378,7 @@
              '&' => out.push_str("&amp;"),
              '<' => out.push_str("&lt;"),
              '>' => out.push_str("&gt;"),
@@ -11746,7 +11749,7 @@
              '\t' | '\n' => out.push(ch),
              c if (c as u32) < 0x20 => write_hex_char_ref(out, c),
              c if reencode_non_ascii && (c as u32) >= 0x80 => write_hex_char_ref(out, c),
-@@ -549,7 +577,38 @@
+@@ -549,7 +580,38 @@
  #[allow(clippy::unwrap_used)]
  mod tests {
      use super::*;

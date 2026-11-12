@@ -13,7 +13,8 @@ use super::super::super::keysdata::{xmlSecKeyDataBinaryValueGetBuffer, xmlSecKey
 use super::super::super::policy;
 use super::super::super::symkeys;
 use super::super::ctx::{
-    xmlSecTransformCtxCreate, xmlSecTransformCtxCreateAndAppend, xmlSecTransformCtxDestroy,
+    xmlSecTransformCtxBinaryExecute, xmlSecTransformCtxCreate, xmlSecTransformCtxCreateAndAppend,
+    xmlSecTransformCtxDestroy,
 };
 use super::super::{OPERATION_SIGN, OPERATION_VERIFY, xmlSecTransformSetKey};
 use super::{hmac_sha256, read_node, xmlSecTransformHmacSetMinOutputBitsSize};
@@ -140,6 +141,43 @@ fn an_output_length_is_read_under_the_policy_of_the_operation() {
         .expect("the library policy compiles");
     assert_eq!(read_output_length(OPERATION_VERIFY, bits), 0);
     assert_eq!(read_output_length(OPERATION_SIGN, bits), -1);
+}
+
+#[test]
+fn a_run_admits_the_key_again_under_its_own_policy() {
+    // A key admitted when it was set is admitted again under the revision
+    // the run starts with: a minimum raised in between refuses the run.
+    own_process();
+    for operation in [OPERATION_SIGN, OPERATION_VERIFY] {
+        // SAFETY: every object is created and released here.
+        unsafe {
+            let key = xmlSecKeyCreate();
+            let data = xmlSecKeyDataCreate(symkeys::hmac());
+            let secret = [0x42_u8; 32];
+            assert_eq!(
+                xmlSecBufferSetData(
+                    xmlSecKeyDataBinaryValueGetBuffer(data),
+                    secret.as_ptr(),
+                    secret.len()
+                ),
+                0
+            );
+            assert_eq!(xmlSecKeySetValue(key, data), 0);
+            let ctx = xmlSecTransformCtxCreate();
+            let transform = xmlSecTransformCtxCreateAndAppend(ctx, hmac_sha256());
+            (*transform).operation = operation;
+            assert_eq!(xmlSecTransformSetKey(transform, key.cast()), 0);
+            xmlSecTransformHmacSetMinOutputBitsSize(512);
+            assert_eq!(
+                xmlSecTransformCtxBinaryExecute(ctx, b"data".as_ptr(), 4),
+                -1,
+                "operation {operation}"
+            );
+            xmlSecTransformHmacSetMinOutputBitsSize(0);
+            xmlSecTransformCtxDestroy(ctx);
+            xmlSecKeyDestroy(key);
+        }
+    }
 }
 
 #[test]

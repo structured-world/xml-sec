@@ -287,8 +287,11 @@ fn serialize_element_node(
         out.push(':');
     }
     out.push_str(name);
-    let is_ns_decl =
-        |attr: &&Attribute| attr.name == "xmlns" || attr.prefix.as_deref() == Some("xmlns");
+    // Only an unprefixed `xmlns` and the `xmlns:` prefix declare a namespace
+    // (Namespaces in XML 1.0 section 3); `p:xmlns` is an ordinary attribute.
+    let is_ns_decl = |attr: &&Attribute| {
+        (attr.prefix.is_none() && attr.name == "xmlns") || attr.prefix.as_deref() == Some("xmlns")
+    };
     // libxml2 writes an element's namespace declarations before its
     // attributes, each group in its own order.
     let declarations = attributes.iter().filter(is_ns_decl);

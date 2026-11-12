@@ -476,8 +476,14 @@ pub(crate) unsafe extern "C" fn xmlSecKeyStoreCreate(
         );
         // SAFETY: a klass.
         let klass = unsafe { &*id };
+        // The klass meets the contract a valid store needs before anything
+        // is allocated: libxmlsec1 checks only a nonzero object size, which
+        // lets a short object take the `id` write past its end and leaves a
+        // store its destroy refuses, and leaks, when initialization fails.
         check!(
-            klass.obj_size > 0,
+            klass.klass_size >= size_of::<XmlSecKeyStoreKlass>()
+                && klass.obj_size >= size_of::<XmlSecKeyStore>()
+                && !klass.name.is_null(),
             "xmlSecKeyStoreCreate",
             c"id->objSize > 0",
             std::ptr::null_mut()

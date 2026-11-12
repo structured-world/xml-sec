@@ -50,6 +50,28 @@ pub fn verify_signature_value(
     // document verification admits a policy.
     policy.validate()?;
     policy.check_signature_algorithm(algorithm)?;
+    // A supplied key is a pre-resolved one: the policy must permit that
+    // source, as document verification requires before it charges the key.
+    if !policy
+        .key_sources
+        .contains(crate::policy::KeySourceKind::PresetKey)
+    {
+        return Err(crate::policy::PolicyViolation::KeyTrust {
+            reason: "pre-resolved verification keys are disabled",
+        }
+        .into());
+    }
+    // An HMAC value is its own output length: it meets the policy's minimum
+    // before any key hook sees it, as document verification checks the
+    // length it selects.
+    if algorithm.hmac_output_bits().is_some() {
+        let bits = signature_value.len().checked_mul(8).ok_or(
+            crate::policy::PolicyViolation::KeyTrust {
+                reason: "HMAC value length overflows",
+            },
+        )?;
+        policy.hmac.validate_output(algorithm, bits)?;
+    }
     let candidates = RefCell::new(crate::xmldsig::InspectedKeyCandidateBudget::new(policy));
     // The supplied key is one inspected candidate, as document verification
     // charges the key it inspects.

@@ -123,17 +123,23 @@ pub(crate) unsafe extern "C" fn xmlSecSetNodeContentAsHex(
             content.push(char::from(DIGITS[usize::from(byte >> 4)]));
             content.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
         }
-        set_ignoring(node, &content);
+        if !set_reported(node, &content, here!("xmlSecSetNodeContentAsHex")) {
+            return -1;
+        }
         0
     })
 }
 
-/// `xmlNodeSetContent(node, content)` as libxmlsec1 calls it, which does
-/// not look at the outcome: a refused node keeps its content.
-pub(super) fn set_ignoring(node: *mut XmlNode, content: &str) {
-    if nodes::set_content(node, content).is_err() {
-        // libxml2's setter returns nothing libxmlsec1 reads.
+/// `xmlNodeSetContent(node, content)` for a function that returns a status:
+/// a node the tree refuses to edit (a document node, a stale handle) keeps
+/// its content and fails the call, reported at `here`, rather than passing
+/// for a success.
+pub(super) fn set_reported(node: *mut XmlNode, content: &str, here: errors::Here) -> bool {
+    let set = nodes::set_content(node, content).is_ok();
+    if !set {
+        errors::xml_failed(here, std::ptr::null(), c"xmlNodeSetContent");
     }
+    set
 }
 
 /// `strtol(text, &end, 10)` over `text`, which has no leading white space:
@@ -294,8 +300,7 @@ pub(crate) unsafe extern "C" fn xmlSecNodeEncodeAndSetContent(
         );
         let here = here!("xmlSecNodeEncodeAndSetContent");
         if buffer.is_null() {
-            set_ignoring(node, "");
-            return 0;
+            return if set_reported(node, "", here) { 0 } else { -1 };
         }
         // SAFETY: NUL-terminated by the caller's contract.
         let Some(text) = (unsafe { c_text(buffer) }) else {
@@ -307,7 +312,9 @@ pub(crate) unsafe extern "C" fn xmlSecNodeEncodeAndSetContent(
         } else {
             encode_special(text)
         };
-        set_ignoring(node, &stored);
+        if !set_reported(node, &stored, here) {
+            return -1;
+        }
         0
     })
 }

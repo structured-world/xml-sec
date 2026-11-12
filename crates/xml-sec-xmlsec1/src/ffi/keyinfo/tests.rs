@@ -84,6 +84,7 @@ unsafe fn read_reported(
 
 #[test]
 fn a_retrieval_method_reaches_only_the_uri_classes_policy_admits_for_keys() {
+    own_process();
     // The library admits every URI class for a signature's references but
     // only same-document ones for key retrieval: an external RetrievalMethod
     // is refused for its class before anything is dereferenced.
@@ -112,6 +113,7 @@ fn a_retrieval_method_reaches_only_the_uri_classes_policy_admits_for_keys() {
 
 #[test]
 fn key_info_reference_depth_is_bounded_by_policy_whatever_the_context_says() {
+    own_process();
     // A KeyInfo referring to itself recurses until a bound stops it: the
     // policy's depth limit, not the far higher level the caller set.
     // SAFETY: a context created and destroyed here.
@@ -305,6 +307,122 @@ fn a_key_info_read_keeps_the_policy_it_started_under() {
         xsFreeDoc(doc);
         xmlSecKeyInfoCtxDestroy(ctx);
         xmlSecIOShutdown();
+    }
+}
+
+/// An empty `KeyInfo`, which finds no key, so a read goes on to the next
+/// reference.
+const EMPTY: &str = "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"/>";
+/// The octets of [`EMPTY`] not yet read from the open resource.
+static EMPTY_SENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+unsafe extern "C" fn open_empty(_uri: *const std::ffi::c_char) -> *mut std::ffi::c_void {
+    EMPTY_SENT.store(0, std::sync::atomic::Ordering::Relaxed);
+    std::ptr::NonNull::<u8>::dangling().as_ptr().cast()
+}
+
+unsafe extern "C" fn read_empty(
+    _context: *mut std::ffi::c_void,
+    buffer: *mut std::ffi::c_char,
+    len: std::ffi::c_int,
+) -> std::ffi::c_int {
+    let sent = EMPTY_SENT.load(std::sync::atomic::Ordering::Relaxed);
+    let rest = &EMPTY.as_bytes()[sent..];
+    let count = rest
+        .len()
+        .min(usize::try_from(len).expect("a non-negative length"));
+    // SAFETY: the transform passes `len` writable bytes.
+    unsafe { std::ptr::copy_nonoverlapping(rest.as_ptr(), buffer.cast(), count) };
+    EMPTY_SENT.store(sent + count, std::sync::atomic::Ordering::Relaxed);
+    std::ffi::c_int::try_from(count).expect("at most `len` octets")
+}
+
+#[test]
+fn the_references_of_one_read_share_its_resource_budget() {
+    // Each reference fits the per-resource limit, but one read may not take
+    // more than the aggregate limit across all of them: the second resource
+    // passes it, so the read fails.
+    own_process();
+    let size = EMPTY.len();
+    policy::republish(
+        |verification| {
+            verification.uris.key_info_references = UriTypeSet::ALL;
+            verification.resources.max_external_resource_bytes = size;
+            verification.resources.max_external_resource_total_bytes = size + size / 2;
+        },
+        |_| {},
+    )
+    .expect("the library policy compiles");
+    let two = "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\" \
+               xmlns:dsig11=\"http://www.w3.org/2009/xmldsig11#\">\
+               <dsig11:KeyInfoReference URI=\"test:a\"/>\
+               <dsig11:KeyInfoReference URI=\"test:b\"/></KeyInfo>";
+    let one = "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\" \
+               xmlns:dsig11=\"http://www.w3.org/2009/xmldsig11#\">\
+               <dsig11:KeyInfoReference URI=\"test:a\"/></KeyInfo>";
+    // SAFETY: the callback list and the context are used by this test alone
+    // and released here.
+    unsafe {
+        assert_eq!(xmlSecKeyDataIdsInit(), 0);
+        assert_eq!(xmlSecIOInit(), 0);
+        assert_eq!(
+            xmlSecIORegisterCallbacks(
+                Some(matches),
+                Some(open_empty),
+                Some(read_empty),
+                Some(close)
+            ),
+            0
+        );
+        let ctx = xmlSecKeyInfoCtxCreate(std::ptr::null_mut());
+        assert_eq!(read_reported(one, ctx).0, 0, "one resource fits");
+        assert_eq!(read_reported(two, ctx).0, -1, "two pass the aggregate");
+        assert_eq!(read_reported(one, ctx).0, 0, "a new read starts afresh");
+        xmlSecKeyInfoCtxDestroy(ctx);
+        xmlSecIOShutdown();
+    }
+}
+
+#[test]
+fn a_der_encoded_key_value_past_the_resource_limit_is_refused_before_decoding() {
+    // The encoded text is bounded by what it can decode to, against the
+    // per-resource limit, before any buffer is sized for it.
+    const PEM: &str = include_str!("../../../../../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    own_process();
+    let body: String = PEM
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect();
+    policy::republish(
+        |verification| verification.resources.max_external_resource_bytes = 64,
+        |_| {},
+    )
+    .expect("the library policy compiles");
+    let doc = parse(&format!(
+        "<DEREncodedKeyValue xmlns=\"http://www.w3.org/2009/xmldsig11#\">{body}</DEREncodedKeyValue>"
+    ));
+    // SAFETY: objects created and destroyed here; the callback has the
+    // callback's signature.
+    unsafe {
+        assert_eq!(xmlSecKeyDataIdsInit(), 0);
+        REASONS.lock().expect("reasons").clear();
+        errors::xmlSecErrorsSetCallback(Some(record as errors::ErrorsCallback));
+        let ctx = xmlSecKeyInfoCtxCreate(std::ptr::null_mut());
+        let key = xmlSecKeyCreate();
+        let read = xmlSecKeyDataXmlRead(
+            asymkeys::der_encoded_key_value(),
+            key.cast(),
+            xsDocGetRootElement(doc).cast(),
+            ctx.cast(),
+        );
+        assert_eq!(read, -1);
+        assert_eq!(
+            REASONS.lock().expect("reasons").first(),
+            Some(&errors::R_INVALID_SIZE)
+        );
+        xmlSecKeyDestroy(key);
+        xmlSecKeyInfoCtxDestroy(ctx);
+        xsFreeDoc(doc);
     }
 }
 

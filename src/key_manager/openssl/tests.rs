@@ -144,6 +144,29 @@ fn malformed_protection_is_refused_before_the_payload_is_decoded() {
 }
 
 #[test]
+fn a_decrypted_key_of_the_wrong_usage_is_not_a_password_failure() {
+    // With the right password, an EC key imported to decrypt is refused for
+    // its usage, a candidate a lax search may pass over, not reported as a
+    // protected container the password failed to open.
+    let mut inventory = KeyInventory::default();
+    let refused = inventory.add_openssl_private_key(
+        "key".to_owned(),
+        EC_ENCRYPTED,
+        PrivateKeyContainer::Pem,
+        Some(b"legacy-ec-password"),
+        KeyUsages::DECRYPT,
+        &ResourcePolicy::default(),
+    );
+    assert!(
+        matches!(
+            refused,
+            Err(KeyStoreError::Selection(crate::key_manager::CANNOT_DECRYPT))
+        ),
+        "{refused:?}"
+    );
+}
+
+#[test]
 fn decoded_payload_is_reserved_against_the_aggregate_budget() {
     // The new entry's name, the source and its decoded DER fit exactly; one
     // byte less fails with a policy violation before the DER is allocated.

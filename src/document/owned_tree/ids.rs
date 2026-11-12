@@ -23,11 +23,16 @@ impl IdSource {
     }
 }
 
-/// ID values and the attributes that carry them, indexed both ways.
+/// ID values and the attributes that carry them, indexed both ways, with the
+/// further attributes that carried a value another one already held when
+/// they arrived (a repeated `xml:id` in a parse, a copy, a replacement).
+/// Those stay unregistered, as libxml2 leaves them, but a lookup sees them,
+/// so a value two linked elements carry names neither.
 #[derive(Default)]
 pub(super) struct IdTable {
     by_value: BTreeMap<String, IdSource>,
     by_source: BTreeMap<IdSource, String>,
+    shadowed: BTreeMap<String, Vec<IdSource>>,
 }
 
 impl IdTable {
@@ -46,6 +51,21 @@ impl IdTable {
         }
         self.by_source.insert(source, value);
         previous
+    }
+
+    /// Records `source` as a further carrier of `value`, which another
+    /// attribute holds.
+    pub(super) fn shadow(&mut self, value: String, source: IdSource) {
+        let carriers = self.shadowed.entry(value).or_default();
+        if !carriers.contains(&source) {
+            carriers.push(source);
+        }
+    }
+
+    /// The further carriers recorded for `value`; some may no longer carry
+    /// it or no longer be live.
+    pub(super) fn shadowed(&self, value: &str) -> &[IdSource] {
+        self.shadowed.get(value).map_or(&[], Vec::as_slice)
     }
 
     /// The attributes of `element` that carry an ID, with their values.

@@ -9,6 +9,33 @@ use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng as _};
 use super::*;
 
 #[test]
+fn a_signing_key_decodes_only_within_the_remaining_budget() {
+    // The source and the DER it decodes to coexist: a remaining allowance of
+    // twice the source admits a PKCS#8 key, one octet less refuses it before
+    // the decoder allocates.
+    let pem = include_bytes!("../../../../tests/fixtures/keys/ec/ec-prime256v1-key.pem");
+    let decode = |total: usize| {
+        let resources = ResourcePolicy {
+            max_external_resource_total_bytes: total,
+            ..ResourcePolicy::default()
+        };
+        decode_signing_key(
+            Path::new("key.pem"),
+            pem,
+            PrivateKeyFormat::Pem,
+            SignatureAlgorithm::EcdsaSha256,
+            None,
+            &resources,
+        )
+    };
+    assert!(decode(pem.len() * 2).is_ok());
+    assert!(matches!(
+        decode(pem.len() * 2 - 1),
+        Err(KeyMaterialError::KeyMaterialTooLarge { .. })
+    ));
+}
+
+#[test]
 fn rsa_containers_preflight_components_before_native_decode() {
     // Every CLI container must reject excessive borrowed components before
     // bigint allocation, including traditional PEM after decryption.

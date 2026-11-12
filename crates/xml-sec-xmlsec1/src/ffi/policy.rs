@@ -4,6 +4,7 @@
 //! budgets and XML input rules as a core operation, and sign and verify
 //! under its algorithm, key and HMAC rules.
 
+use std::cell::Cell;
 use std::ffi::c_void;
 use std::sync::Arc;
 
@@ -20,16 +21,6 @@ pub(crate) fn verification() -> Option<Arc<VerificationPolicy>> {
 /// failure when the profile is unavailable.
 pub(crate) fn verification_at(here: Here) -> Option<Arc<VerificationPolicy>> {
     let policy = verification();
-    if policy.is_none() {
-        errors::policy_unavailable(here);
-    }
-    policy
-}
-
-/// The current signing snapshot for the entry point at `here`, which
-/// reports the failure when the profile is unavailable.
-pub(crate) fn signing_at(here: Here) -> Option<Arc<SigningPolicy>> {
-    let policy = xml_sec_libxml2::policy::signing();
     if policy.is_none() {
         errors::policy_unavailable(here);
     }
@@ -60,6 +51,24 @@ impl Pinned {
     }
 }
 
+/// What one operation has spent of the policy's per-operation budgets,
+/// carried from one transform run it drives to the next, as the core
+/// charges one budget across a whole operation.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Spent {
+    pub(crate) base64_input: usize,
+    pub(crate) base64_output: usize,
+    /// Octets read from external resources through the input callbacks.
+    pub(crate) external_resources: usize,
+}
+
+/// What a context's reserved slot holds during an operation: its policy
+/// revision and what its runs have spent so far.
+struct Operation {
+    pinned: Pinned,
+    spent: Cell<Spent>,
+}
+
 /// A pin in a context's reserved slot for one call: the outermost call of an
 /// operation pins the current revision and its guard releases it on return,
 /// unwinding included; nested calls find the pin and leave it.
@@ -80,7 +89,11 @@ impl SlotPin {
             if !(*slot).is_null() {
                 return Some(Self { slot, owned: false });
             }
-            *slot = Box::into_raw(Box::new(Pinned::current(here)?)).cast();
+            let operation = Operation {
+                pinned: Pinned::current(here)?,
+                spent: Cell::default(),
+            };
+            *slot = Box::into_raw(Box::new(operation)).cast();
         }
         Some(Self { slot, owned: true })
     }
@@ -104,19 +117,28 @@ pub(crate) unsafe fn release(slot: *mut *mut c_void) {
     // SAFETY: by the caller's contract.
     unsafe {
         if !(*slot).is_null() {
-            drop(Box::from_raw((*slot).cast::<Pinned>()));
+            drop(Box::from_raw((*slot).cast::<Operation>()));
             *slot = std::ptr::null_mut();
         }
     }
 }
 
-/// The pin `slot` holds, if any.
+/// The policy revision the pin in `slot` holds, if any.
 ///
 /// # Safety
 /// `slot` is null or a pin that outlives the borrow.
 pub(crate) unsafe fn pinned<'a>(slot: *mut c_void) -> Option<&'a Pinned> {
     // SAFETY: by the caller's contract.
-    unsafe { slot.cast::<Pinned>().as_ref() }
+    unsafe { slot.cast::<Operation>().as_ref() }.map(|operation| &operation.pinned)
+}
+
+/// What the operation pinned in `slot` has spent so far, if one is pinned.
+///
+/// # Safety
+/// As for [`pinned`].
+pub(crate) unsafe fn spent<'a>(slot: *mut c_void) -> Option<&'a Cell<Spent>> {
+    // SAFETY: by the caller's contract.
+    unsafe { slot.cast::<Operation>().as_ref() }.map(|operation| &operation.spent)
 }
 
 /// Publishes the current snapshots with the edits applied, as a libxmlsec1

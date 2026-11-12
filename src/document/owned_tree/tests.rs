@@ -542,6 +542,56 @@ fn a_copy_of_an_unlinked_node_declares_the_prefixes_it_uses() {
 }
 
 #[test]
+fn a_prefixed_attribute_named_xmlns_stays_an_ordinary_attribute() {
+    // Only an unprefixed `xmlns` and the `xmlns:` prefix declare a namespace
+    // (Namespaces in XML 1.0 section 3): `p:xmlns` keeps its place among the
+    // attributes and its source text.
+    let xml = r#"<r xmlns:p="urn:p" a="1" p:xmlns="&amp;"/>"#;
+    let tree = parsed(xml);
+    assert_eq!(
+        tree.serialize(),
+        format!("<?xml version=\"1.0\"?>\n{xml}\n")
+    );
+}
+
+#[test]
+fn an_id_two_linked_elements_carry_names_neither() {
+    // A copy bringing an ID the target already holds is linked, as libxml2
+    // links it, but a lookup of the value names no element while both are
+    // linked, and the copy once the original leaves.
+    let source = parsed(r#"<s><b xml:id="x"/></s>"#);
+    let copied = children(&source, source.root_element().expect("a root"))[0];
+    let mut target = parsed(r#"<t><a xml:id="x"/></t>"#);
+    let root = target.root_element().expect("a root");
+    let original = children(&target, root)[0];
+    let copy = target.copy_from(&source, copied).expect("a live node");
+    target
+        .append_child(root, copy)
+        .expect("an unlinked node links");
+    assert_eq!(target.element_by_id("x"), None, "two linked carriers");
+    target.unlink(original).expect("a linked node unlinks");
+    assert_eq!(target.element_by_id("x"), Some(copy));
+}
+
+#[test]
+fn a_replaced_node_linked_again_makes_its_id_ambiguous() {
+    // The replacement takes the ID the replaced node held; linking that node
+    // again does not take it back silently.
+    let mut tree = parsed(r#"<r><old xml:id="x"/></r>"#);
+    let root = tree.root_element().expect("a root");
+    let old = children(&tree, root)[0];
+    let first = tree
+        .parse_in_context(root, r#"<new xml:id="x"/>"#, &VerificationPolicy::default())
+        .expect("the fragment parses")
+        .expect("the fragment has nodes");
+    tree.replace_with_run(old, first).expect("the run links");
+    assert_eq!(tree.element_by_id("x"), Some(first));
+    tree.append_child(root, old)
+        .expect("the old node links again");
+    assert_eq!(tree.element_by_id("x"), None);
+}
+
+#[test]
 fn a_copy_keeps_the_ids_a_caller_registered() {
     // An ID registered on an attribute of the copied subtree carries over
     // with the attribute, as libxml2's copy re-adds a copied ID attribute.

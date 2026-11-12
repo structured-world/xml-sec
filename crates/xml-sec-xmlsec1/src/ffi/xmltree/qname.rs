@@ -9,7 +9,7 @@ use xml_sec_libxml2::ffi::tree::{xsGetProp, xsSetProp};
 use super::super::errors::{self, Here, check, here};
 use super::super::tree::{XmlNode, c_text, nodes, xmlStrEqual};
 use super::super::{contain, free, write_stream};
-use super::content::{set_ignoring, xmlSecGetQName};
+use super::content::{set_reported, xmlSecGetQName};
 use super::edit::xmlSecAddChild;
 use super::{xmlSecCheckNodeName, xmlSecGetNextElementNode, xmlSecGetNodeContentAndTrim};
 
@@ -456,23 +456,25 @@ pub(crate) unsafe extern "C" fn xmlSecQName2IntegerNodeWrite(
                 free(qname.cast());
                 return -1;
             }
-            set_qname(cur, qname);
+            let set = set_qname(cur, qname, here);
             free(qname.cast());
+            if !set {
+                return -1;
+            }
         }
         0
     })
 }
 
 /// `xmlNodeSetContent(node, qname)`: a qualified name holds no markup, so
-/// it is stored as it reads.
+/// it is stored as it reads; whether the tree took it, reported at `here`
+/// when not.
 ///
 /// # Safety
 /// `qname` is NUL-terminated.
-unsafe fn set_qname(node: *mut XmlNode, qname: *const u8) {
+unsafe fn set_qname(node: *mut XmlNode, qname: *const u8, here: errors::Here) -> bool {
     // SAFETY: by the caller's contract.
-    if let Some(qname) = unsafe { c_text(qname) } {
-        set_ignoring(node, qname);
-    }
+    unsafe { c_text(qname) }.is_none_or(|qname| set_reported(node, qname, here))
 }
 
 /// `xmlSecQName2IntegerAttributeRead`: the integer of the qualified name in
@@ -1051,8 +1053,11 @@ pub(crate) unsafe extern "C" fn xmlSecQName2BitMaskNodesWrite(
                     free(qname.cast());
                     return -1;
                 }
-                set_qname(cur, qname);
+                let set = set_qname(cur, qname, here);
                 free(qname.cast());
+                if !set {
+                    return -1;
+                }
             }
         }
         0

@@ -201,6 +201,56 @@ mod selected_provider {
     }
 
     #[test]
+    fn a_supplied_key_needs_the_preset_key_source() {
+        // The supplied key is a pre-resolved key: a policy without that
+        // source refuses it, as document verification does.
+        let mut policy = VerificationPolicy::default();
+        policy
+            .key_sources
+            .remove(crate::policy::KeySourceKind::PresetKey);
+        let refused = verify_signature_value(
+            &policy,
+            default_provider(),
+            &key(),
+            SignatureAlgorithm::HmacSha256,
+            DATA,
+            &mac(),
+        );
+        assert!(matches!(refused, Err(DsigError::Policy(_))), "{refused:?}");
+    }
+
+    /// An opaque caller key with no policy hooks of its own that accepts
+    /// every value it is given.
+    struct AcceptingKey;
+
+    impl VerifyingKey for AcceptingKey {
+        fn verify(
+            &self,
+            _algorithm: SignatureAlgorithm,
+            _signed_data: &[u8],
+            _signature_value: &[u8],
+        ) -> Result<bool, DsigError> {
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn a_truncated_hmac_value_is_refused_before_the_key_sees_it() {
+        // A one-byte HMAC value is below the policy's output minimum. The
+        // operation refuses it itself, so a caller key that checks nothing
+        // (and would accept it) never decides the result.
+        let refused = verify_signature_value(
+            &VerificationPolicy::default(),
+            default_provider(),
+            &AcceptingKey,
+            SignatureAlgorithm::HmacSha256,
+            DATA,
+            &mac()[..1],
+        );
+        assert!(matches!(refused, Err(DsigError::Policy(_))), "{refused:?}");
+    }
+
+    #[test]
     fn verification_runs_through_the_selected_provider() {
         // The provider that offers the method also executes it: its refusal
         // is the result, never a verification by the key behind its back.

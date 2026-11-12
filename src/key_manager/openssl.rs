@@ -194,11 +194,14 @@ impl KeyInventory {
                     outside,
                 )
                 .map_err(|error| match error {
-                    // A decrypted key over a safety ceiling is that key's
+                    // A decrypted key over a safety ceiling, or of a family
+                    // that cannot serve the requested usage, is that key's
                     // failure, not the password's.
                     KeyStoreError::Policy(_)
                     | KeyStoreError::Selection(
-                        "RSA modulus exceeds safety limit" | "RSA component exceeds safety limit",
+                        "RSA modulus exceeds safety limit"
+                        | "RSA component exceeds safety limit"
+                        | super::CANNOT_DECRYPT,
                     ) => error,
                     _ if traditional.encrypted => KeyStoreError::ProtectedContainer,
                     _ => error,

@@ -5,6 +5,7 @@
 //! the library policy's URI and transform rules and budgets bound it; the
 //! context's levels bound how deep references may chain.
 
+use std::cell::Cell;
 use std::ffi::{c_int, c_uint, c_void};
 
 use xml_sec_libxml2::ffi::tree::{xsDocGetRootElement, xsFreeDoc, xsGetProp};
@@ -23,7 +24,7 @@ use super::super::strings::{
 };
 use super::super::transforms::XmlSecTransformCtx;
 use super::super::transforms::ctx::{
-    seed_policy, xmlSecTransformCtxExecute, xmlSecTransformCtxNodesListRead,
+    run_spent, seed_run, xmlSecTransformCtxExecute, xmlSecTransformCtxNodesListRead,
     xmlSecTransformCtxReset, xmlSecTransformCtxSetUri,
 };
 use super::super::tree::{XmlDoc, XmlNode, nodes};
@@ -106,11 +107,21 @@ unsafe fn enabled(ctx: *mut XmlSecKeyInfoCtx) -> *mut super::super::list::XmlSec
     }
 }
 
+/// The policy terms one dereference runs under: the read's revision, the URI
+/// classes admitted for this kind of key reference, and what the read has
+/// spent of its budgets, when the read is pinned.
+struct Terms<'a> {
+    pinned: &'a policy::Pinned,
+    admitted: UriTypeSet,
+    spent: Option<&'a Cell<policy::Spent>>,
+}
+
 /// Resolves the URI of `node` with the optional `Transforms` child in
 /// `transforms` of `context` and executes it on the node's document, under
-/// the read's policy revision `pinned`. The URI must be of a class
-/// `admitted` permits: the policy's classes for this kind of key reference,
-/// apart from the ones it grants a signature's references.
+/// `terms`. The URI must be of a class the terms admit: the policy's classes
+/// for this kind of key reference, apart from the ones it grants a
+/// signature's references. The chain charges the read's budgets, so all the
+/// references of one read share them.
 ///
 /// # Safety
 /// `context` is a transform context; `node` a live element of a document.
@@ -121,8 +132,13 @@ unsafe fn dereference(
     node: *mut XmlNode,
     uri: *const u8,
     transforms: bool,
-    (pinned, admitted): (&policy::Pinned, UriTypeSet),
+    terms: &Terms<'_>,
 ) -> bool {
+    let Terms {
+        pinned,
+        admitted,
+        spent,
+    } = *terms;
     let text = if uri.is_null() {
         &[][..]
     } else {
@@ -137,8 +153,9 @@ unsafe fn dereference(
     // SAFETY: by the caller's contract.
     unsafe {
         xmlSecTransformCtxReset(context);
-        // The chain runs under the read's revision, not a later one.
-        seed_policy(context, pinned);
+        // The chain runs under the read's revision, not a later one, with
+        // what the read's earlier references spent already charged.
+        seed_run(context, pinned, spent.map(Cell::get).unwrap_or_default());
         if xmlSecTransformCtxSetUri(context, uri, node) < 0 {
             let shown = if uri.is_null() {
                 "NULL".to_owned()
@@ -175,7 +192,11 @@ unsafe fn dereference(
             errors::unexpected_node(here, cur, object);
             return false;
         }
-        if xmlSecTransformCtxExecute(context, nodes::doc(node)) < 0
+        let executed = xmlSecTransformCtxExecute(context, nodes::doc(node));
+        if let Some(spent) = spent {
+            spent.set(run_spent(context));
+        }
+        if executed < 0
             || (*context).result.is_null()
             || xmlSecBufferGetData((*context).result).is_null()
         {
@@ -333,7 +354,11 @@ unsafe fn retrieve(
             node,
             uri,
             true,
-            (&pinned, pinned.verification.uris.retrieval_methods),
+            &Terms {
+                pinned: &pinned,
+                admitted: pinned.verification.uris.retrieval_methods,
+                spent: policy::spent((*ctx).reserved0),
+            },
         );
         free(uri.cast());
         if !dereferenced {
@@ -547,7 +572,11 @@ unsafe fn dereference_key_info(
             node,
             uri,
             false,
-            (pinned, pinned.verification.uris.key_info_references),
+            &Terms {
+                pinned,
+                admitted: pinned.verification.uris.key_info_references,
+                spent: policy::spent((*ctx).reserved0),
+            },
         );
         free(uri.cast());
         if !dereferenced {

@@ -17,7 +17,7 @@ use super::super::parser::xmlSecParserGetDefaultOptions;
 use super::super::strings::xmlSecStringCR;
 use super::super::tree::{XML_ELEMENT_NODE, XmlDoc, XmlNode, c_text, nodes};
 use super::content::xmlSecIsEmptyNode;
-use super::{xmlSecDepthFirstTreeWalk, xmlSecFindNode, xmlSecFindSibling};
+use super::{xmlSecDepthFirstTreeWalk, xmlSecFindChild, xmlSecFindSibling};
 
 /// The line feed written around added elements; libxmlsec1 starts with
 /// `xmlSecStringCR`, which is a line feed despite its name.
@@ -232,15 +232,29 @@ unsafe fn add_sibling(
             errors::xml_failed(here, std::ptr::null(), c"xmlNewNode");
             return std::ptr::null_mut();
         }
-        add(node, cur);
+        // A node without a parent has no place for a sibling in this tree:
+        // the new element is freed and the call fails, rather than handing
+        // back a detached element as if it were linked.
+        if add(node, cur).is_null() {
+            xsFreeNode(cur);
+            errors::xml_failed(here, std::ptr::null(), c"xmlAddSibling");
+            return std::ptr::null_mut();
+        }
         if !ns.is_null() {
             xsSetNs(cur, namespace_for(cur, ns));
         }
         let text = line_feed(node, here);
-        if text.is_null() {
+        if text.is_null() || add(node, text).is_null() {
+            // The edit is taken back whole: the element leaves with the line
+            // feed that could not follow it.
+            if !text.is_null() {
+                xsFreeNode(text);
+                errors::xml_failed(here, std::ptr::null(), c"xmlAddSibling");
+            }
+            xsUnlinkNode(cur);
+            xsFreeNode(cur);
             return std::ptr::null_mut();
         }
-        add(node, text);
         cur
     }
 }
@@ -304,9 +318,8 @@ pub(crate) unsafe extern "C" fn xmlSecAddPrevSibling(
 }
 
 /// `xmlSecEnsureEmptyChild`: the first empty element `name` in namespace
-/// `ns` among the descendants of `parent` and their following siblings, or a
-/// new one after the last such element (or at the end of `parent` when
-/// there is none).
+/// `ns` among the direct children of `parent`, or a new one after the last
+/// such child (or at the end of `parent` when there is none).
 ///
 /// # Safety
 /// `name` and `ns` are null or NUL-terminated.
@@ -332,7 +345,11 @@ pub(crate) unsafe extern "C" fn xmlSecEnsureEmptyChild(
         // SAFETY: the names are NUL-terminated by the caller's contract.
         unsafe {
             let mut last = std::ptr::null_mut();
-            let mut found = xmlSecFindNode(parent, name, ns);
+            // libxmlsec1 documents the search as one among the direct
+            // children of `parent` (xmltree.h), though its code searches the
+            // whole subtree and may return, or add beside, an element deeper
+            // down; the documented contract is followed.
+            let mut found = xmlSecFindChild(parent, name, ns);
             while !found.is_null() {
                 last = found;
                 if xmlSecIsEmptyNode(found) == 1 {
