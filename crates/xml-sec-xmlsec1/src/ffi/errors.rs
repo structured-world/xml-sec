@@ -34,6 +34,8 @@ pub(crate) const R_XMLSEC_FAILED: c_int = 1;
 pub(crate) const R_MALLOC_FAILED: c_int = 2;
 /// `XMLSEC_ERRORS_R_STRDUP_FAILED`.
 pub(crate) const R_STRDUP_FAILED: c_int = 3;
+/// `XMLSEC_ERRORS_R_CRYPTO_FAILED`.
+pub(crate) const R_CRYPTO_FAILED: c_int = 4;
 /// `XMLSEC_ERRORS_R_XML_FAILED`.
 pub(crate) const R_XML_FAILED: c_int = 5;
 /// `XMLSEC_ERRORS_R_IO_FAILED`.
@@ -74,6 +76,10 @@ pub(crate) const R_INVALID_URI_TYPE: c_int = 33;
 pub(crate) const R_TRANSFORM_DISABLED: c_int = 35;
 /// `XMLSEC_ERRORS_R_TRANSFORM_SAME_DOCUMENT_REQUIRED`.
 pub(crate) const R_TRANSFORM_SAME_DOCUMENT_REQUIRED: c_int = 34;
+/// `XMLSEC_ERRORS_R_INVALID_KEY_DATA`.
+pub(crate) const R_INVALID_KEY_DATA: c_int = 41;
+/// `XMLSEC_ERRORS_R_KEY_DATA_ALREADY_EXIST`.
+pub(crate) const R_KEY_DATA_ALREADY_EXIST: c_int = 43;
 /// `XMLSEC_ERRORS_R_INVALID_KEY_DATA_SIZE`.
 pub(crate) const R_INVALID_KEY_DATA_SIZE: c_int = 44;
 /// `XMLSEC_ERRORS_R_ASSERTION`.

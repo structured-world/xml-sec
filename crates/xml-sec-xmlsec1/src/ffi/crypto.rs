@@ -26,6 +26,7 @@ use super::list::{
     xmlSecPtrListInitialize, xmlSecPtrListRemove,
 };
 use super::transforms::{Global, XmlSecTransformKlass, xmlSecTransformIdsRegister, zero_list};
+use super::{asymkeys, symkeys};
 
 /// An opaque `xmlSecKeysMngrPtr`, `xmlSecKeyPtr` or `xmlSecKeyInfoCtxPtr`.
 type Opaque = *mut c_void;
@@ -183,6 +184,18 @@ functions_table! {
 static BUILTIN: Global<XmlSecCryptoDLFunctions> = Global::new(XmlSecCryptoDLFunctions {
     crypto_init: Some(builtin_crypto_init),
     crypto_shutdown: Some(builtin_crypto_shutdown),
+    key_data_aes: Some(symkeys::aes),
+    key_data_camellia: Some(symkeys::camellia),
+    key_data_chacha20: Some(symkeys::chacha20),
+    key_data_concat_kdf: Some(symkeys::concat_kdf),
+    key_data_des: Some(symkeys::des),
+    key_data_der_encoded_key_value: Some(asymkeys::der_encoded_key_value),
+    key_data_dsa: Some(asymkeys::dsa),
+    key_data_ec: Some(asymkeys::ec),
+    key_data_rsa: Some(asymkeys::rsa),
+    key_data_hkdf: Some(symkeys::hkdf),
+    key_data_hmac: Some(symkeys::hmac),
+    key_data_pbkdf2: Some(symkeys::pbkdf2),
     crypto_app_init: Some(builtin_crypto_app_init),
     crypto_app_shutdown: Some(builtin_crypto_app_shutdown),
     ..XmlSecCryptoDLFunctions::empty()

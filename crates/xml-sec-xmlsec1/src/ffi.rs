@@ -9,17 +9,22 @@
 use std::ffi::{c_int, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+pub(crate) mod asymkeys;
 pub(crate) mod base64;
 pub(crate) mod buffer;
 pub(crate) mod crypto;
 pub(crate) mod errors;
+pub(crate) mod keyinfo;
+pub(crate) mod keys;
 pub(crate) mod keysdata;
+pub(crate) mod keysmngr;
 pub(crate) mod library;
 pub(crate) mod list;
 pub(crate) mod nodeset;
 pub(crate) mod parser;
 pub(crate) mod policy;
 pub(crate) mod strings;
+pub(crate) mod symkeys;
 pub(crate) mod templates;
 pub(crate) mod transforms;
 pub(crate) mod tree;
@@ -39,6 +44,12 @@ use xml_sec_libxml2::ffi::memory;
 /// memory out from and callers release with `xmlFree`; null when it fails.
 fn malloc(size: usize) -> *mut c_void {
     memory::malloc(size)
+}
+
+/// A copy of `bytes` with a NUL on the library's heap; null when the
+/// allocation fails.
+fn duplicate(bytes: &[u8]) -> *mut u8 {
+    memory::copy(bytes)
 }
 
 /// Resizes `mem` to `size` bytes; null when it fails, leaving `mem`

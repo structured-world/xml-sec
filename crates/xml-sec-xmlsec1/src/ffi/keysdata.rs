@@ -12,8 +12,9 @@
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::sync::atomic::{AtomicI32, Ordering};
 
-use super::buffer::{XmlSecBuffer, xmlSecBufferGetSize, xmlSecBufferSetData};
+use super::buffer::XmlSecBuffer;
 use super::errors::{self, check, here};
+use super::keys::TYPE_UNKNOWN;
 use super::list::{
     XmlSecPtrList, XmlSecPtrListKlass, xmlSecPtrListAdd, xmlSecPtrListFinalize,
     xmlSecPtrListInitialize,
@@ -29,16 +30,18 @@ use super::strings::{
 };
 use super::transforms::{Global, klass_text, xml_text, zero_list};
 use super::tree::xmlStrEqual;
-use super::{contain, free, malloc, write_stream};
+use super::{contain, free, keyinfo, malloc, write_stream};
 
 #[cfg(test)]
 mod tests;
 
 /// `xmlSecKeyDataUsage` bits of the `KeyInfo` child klasses.
-const USAGE_KEY_INFO_NODE: c_uint = 0x0003;
-const USAGE_RETRIEVAL_METHOD_NODE_XML: c_uint = 0x0010;
-/// `xmlSecKeyDataTypeUnknown`.
-const TYPE_UNKNOWN: c_uint = 0;
+pub(crate) const USAGE_KEY_INFO_NODE: c_uint = 0x0003;
+pub(crate) const USAGE_RETRIEVAL_METHOD_NODE_XML: c_uint = 0x0010;
+/// `xmlSecKeyDataUsageKeyValueNode`.
+pub(crate) const USAGE_KEY_VALUE_NODE: c_uint = 0x000C;
+/// `xmlSecKeyDataUsageReadFromFile`.
+pub(crate) const USAGE_READ_FROM_FILE: c_uint = 0x0040;
 
 /// An opaque `xmlSecKeyPtr` or `xmlSecKeyInfoCtxPtr`, passed through.
 type Opaque = *mut c_void;
@@ -124,6 +127,9 @@ struct XmlSecKeyDataBinary {
     buffer: XmlSecBuffer,
 }
 
+/// `xmlSecKeyDataBinarySize`: the object size of a binary klass.
+pub(crate) const BINARY_SIZE: usize = size_of::<XmlSecKeyDataBinary>();
+
 /// `xmlSecKeyDataIsValid`: the klass is complete and named.
 ///
 /// # Safety
@@ -138,6 +144,24 @@ unsafe fn valid<'a>(data: *mut XmlSecKeyData) -> Option<&'a XmlSecKeyDataKlass> 
             && !klass.name.is_null())
         .then_some(klass)
     }
+}
+
+/// libxmlsec1's `xmlSecKeyDataIsValid` for callers outside this module.
+///
+/// # Safety
+/// `data` is null or a key-data object whose `id` is null or a klass.
+pub(crate) unsafe fn data_valid(data: *mut XmlSecKeyData) -> bool {
+    // SAFETY: by the caller's contract.
+    unsafe { valid(data) }.is_some()
+}
+
+/// libxmlsec1's `xmlSecKeyDataCheckId`: valid key data of klass `id`.
+///
+/// # Safety
+/// As for [`data_valid`].
+pub(crate) unsafe fn check_id(data: *mut XmlSecKeyData, id: *const XmlSecKeyDataKlass) -> bool {
+    // SAFETY: by the caller's contract.
+    unsafe { valid(data) }.is_some_and(|klass| std::ptr::eq(klass, id))
 }
 
 /// The klass of a valid key-data object `$data`, after libxmlsec1's
@@ -157,6 +181,14 @@ macro_rules! key_data_or {
 fn name_of(klass: &XmlSecKeyDataKlass) -> *const c_char {
     klass.name.cast()
 }
+
+// Declared after `key_data_or!`, which it uses.
+mod binary;
+pub(crate) use binary::{
+    value_bin_read, value_bin_write, value_debug_dump, value_debug_xml_dump, value_duplicate,
+    value_finalize, value_initialize, value_xml_read, value_xml_write,
+    xmlSecKeyDataBinaryValueGetBuffer, xmlSecKeyDataBinaryValueGetSize,
+};
 
 // ----------------------------------------------------------------------------
 // The registry
@@ -725,88 +757,6 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataBinWrite(
 }
 
 // ----------------------------------------------------------------------------
-// Binary key data
-
-/// The value buffer of the binary key-data object `$data`, after
-/// libxmlsec1's assertions inside the entry point `$func`, or `$ret`.
-macro_rules! binary_buffer_or {
-    ($data:expr, $func:literal, $ret:expr) => {{
-        let klass = key_data_or!($data, $func, $ret);
-        check!(
-            klass.obj_size >= size_of::<XmlSecKeyDataBinary>(),
-            $func,
-            c"xmlSecKeyDataCheckSize(data, xmlSecKeyDataBinarySize)",
-            $ret
-        );
-        // SAFETY: a valid object at least the binary layout's size starts
-        // with that layout.
-        unsafe { &raw mut (*$data.cast::<XmlSecKeyDataBinary>()).buffer }
-    }};
-}
-
-/// `xmlSecKeyDataBinaryValueGetSize`: the value's size in bits.
-///
-/// # Safety
-/// `data` is null or a key-data object.
-#[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn xmlSecKeyDataBinaryValueGetSize(data: *mut XmlSecKeyData) -> usize {
-    contain(0, || {
-        let buffer = binary_buffer_or!(data, "xmlSecKeyDataBinaryValueGetSize", 0);
-        // libxmlsec1 computes `8 * size` in `xmlSecSize`, which wraps for a
-        // value of more than `SIZE_MAX / 8` bytes; the same number here.
-        // SAFETY: the object's value buffer.
-        unsafe { xmlSecBufferGetSize(buffer) }.wrapping_mul(8)
-    })
-}
-
-/// `xmlSecKeyDataBinaryValueGetBuffer`: the value buffer.
-///
-/// # Safety
-/// `data` is null or a key-data object.
-#[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn xmlSecKeyDataBinaryValueGetBuffer(
-    data: *mut XmlSecKeyData,
-) -> *mut XmlSecBuffer {
-    contain(std::ptr::null_mut(), || {
-        binary_buffer_or!(
-            data,
-            "xmlSecKeyDataBinaryValueGetBuffer",
-            std::ptr::null_mut()
-        )
-    })
-}
-
-/// `xmlSecKeyDataBinaryValueSetBuffer`: replaces the value with `size`
-/// bytes.
-///
-/// # Safety
-/// `data` is null or a key-data object; `buf` holds `size` bytes.
-#[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn xmlSecKeyDataBinaryValueSetBuffer(
-    data: *mut XmlSecKeyData,
-    buf: *const u8,
-    size: usize,
-) -> c_int {
-    contain(-1, || {
-        let buffer = binary_buffer_or!(data, "xmlSecKeyDataBinaryValueSetBuffer", -1);
-        check!(
-            !buf.is_null(),
-            "xmlSecKeyDataBinaryValueSetBuffer",
-            c"buf != NULL",
-            -1
-        );
-        check!(
-            size > 0,
-            "xmlSecKeyDataBinaryValueSetBuffer",
-            c"bufSize > 0",
-            -1
-        );
-        // SAFETY: the object's value buffer; `buf` holds `size` bytes.
-        unsafe { xmlSecBufferSetData(buffer, buf, size) }
-    })
-}
-
-// ----------------------------------------------------------------------------
 // Lists
 
 unsafe extern "C" fn duplicate_item(item: *mut c_void) -> *mut c_void {
@@ -1161,6 +1111,15 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataIdListDebugXmlDump(
 // ----------------------------------------------------------------------------
 // Stores
 
+/// libxmlsec1's `xmlSecKeyDataStoreIsValid`: a store with a klass.
+///
+/// # Safety
+/// `store` is null or a store.
+pub(crate) unsafe fn store_valid(store: *mut XmlSecKeyDataStore) -> bool {
+    // SAFETY: by the caller's contract.
+    unsafe { store.as_ref() }.is_some_and(|store| !store.id.is_null())
+}
+
 /// `xmlSecKeyDataStoreCreate`: a zeroed store of the klass's size,
 /// initialized.
 ///
@@ -1263,13 +1222,19 @@ pub(crate) unsafe extern "C" fn xmlSecImportGetPersistKey() -> c_int {
 // ----------------------------------------------------------------------------
 // The KeyInfo child klasses
 
+/// The `xmlRead`/`xmlWrite` method type of a key-data klass.
+pub(crate) type XmlMethod =
+    Option<unsafe extern "C" fn(*const XmlSecKeyDataKlass, Opaque, *mut c_void, Opaque) -> c_int>;
+
 /// A `KeyInfo` child klass: plain key-data objects identified by their
-/// element.
+/// element, read and written by `xml_read` and `xml_write`.
 const fn key_info_child(
     name: *const u8,
     href: *const u8,
     node: *const u8,
     ns: *const u8,
+    xml_read: XmlMethod,
+    xml_write: XmlMethod,
 ) -> XmlSecKeyDataKlass {
     XmlSecKeyDataKlass {
         klass_size: size_of::<XmlSecKeyDataKlass>(),
@@ -1286,8 +1251,8 @@ const fn key_info_child(
         get_type: None,
         get_size: None,
         deprecated0: std::ptr::null_mut(),
-        xml_read: None,
-        xml_write: None,
+        xml_read,
+        xml_write,
         bin_read: None,
         bin_write: None,
         debug_dump: None,
@@ -1302,48 +1267,64 @@ static NAME: XmlSecKeyDataKlass = key_info_child(
     std::ptr::null(),
     xmlSecNodeKeyName.as_ptr(),
     xmlSecDSigNs.as_ptr(),
+    Some(keyinfo::name_xml_read),
+    Some(keyinfo::name_xml_write),
 );
 static VALUE: XmlSecKeyDataKlass = key_info_child(
     xmlSecNameKeyValue.as_ptr(),
     std::ptr::null(),
     xmlSecNodeKeyValue.as_ptr(),
     xmlSecDSigNs.as_ptr(),
+    Some(keyinfo::value_xml_read),
+    Some(keyinfo::value_xml_write),
 );
 static RETRIEVAL_METHOD: XmlSecKeyDataKlass = key_info_child(
     xmlSecNameRetrievalMethod.as_ptr(),
     std::ptr::null(),
     xmlSecNodeRetrievalMethod.as_ptr(),
     xmlSecDSigNs.as_ptr(),
+    Some(keyinfo::retrieval_xml_read),
+    Some(keyinfo::retrieval_xml_write),
 );
 static KEY_INFO_REFERENCE: XmlSecKeyDataKlass = key_info_child(
     xmlSecNameKeyInfoReference.as_ptr(),
     std::ptr::null(),
     xmlSecNodeKeyInfoReference.as_ptr(),
     xmlSecDSig11Ns.as_ptr(),
+    Some(keyinfo::reference_xml_read),
+    Some(keyinfo::reference_xml_write),
 );
 static ENCRYPTED_KEY: XmlSecKeyDataKlass = key_info_child(
     xmlSecNameEncryptedKey.as_ptr(),
     xmlSecHrefEncryptedKey.as_ptr(),
     xmlSecNodeEncryptedKey.as_ptr(),
     xmlSecEncNs.as_ptr(),
+    None,
+    None,
 );
 static DERIVED_KEY: XmlSecKeyDataKlass = key_info_child(
     xmlSecNameDerivedKey.as_ptr(),
     xmlSecHrefDerivedKey.as_ptr(),
     xmlSecNodeDerivedKey.as_ptr(),
     xmlSecEnc11Ns.as_ptr(),
+    None,
+    None,
 );
 static AGREEMENT_METHOD: XmlSecKeyDataKlass = key_info_child(
     xmlSecNameAgreementMethod.as_ptr(),
     xmlSecHrefAgreementMethod.as_ptr(),
     xmlSecNodeAgreementMethod.as_ptr(),
     xmlSecEncNs.as_ptr(),
+    None,
+    None,
 );
 static ENCAPSULATION_MECHANISM: XmlSecKeyDataKlass = key_info_child(
     xmlSecNameEncapsulationMechanism.as_ptr(),
     xmlSecHrefEncapsulationMechanism.as_ptr(),
     xmlSecNodeEncapsulationMechanism.as_ptr(),
     xmlSecExperimental202512Ns.as_ptr(),
+    None,
+    None,
 );
 
 macro_rules! key_data_getter {
@@ -1354,7 +1335,7 @@ macro_rules! key_data_getter {
             /// # Safety
             /// Callable at any time.
             #[unsafe(no_mangle)]
-            pub(crate) unsafe extern "C" fn $name() -> *const XmlSecKeyDataKlass {
+            pub(crate) extern "C" fn $name() -> *const XmlSecKeyDataKlass {
                 &raw const $klass
             }
         )*
