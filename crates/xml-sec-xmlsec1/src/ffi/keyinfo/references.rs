@@ -304,7 +304,10 @@ unsafe fn retrieve(
             xmlSecKeyDataIdListFindByHref(enabled(ctx), retrieval_type, USAGE_RETRIEVAL_METHOD_NODE)
         };
         free(retrieval_type.cast());
-        // Lax schema validation unless the caller stops on unknown types.
+        // Lax schema validation unless the caller stops on unknown types. An
+        // absent Type names no klass either, so the retrieval is skipped,
+        // as libxmlsec1 1.3.13's xmlSecKeyDataRetrievalMethodXmlRead does:
+        // it never guesses the result's type from the retrieved XML.
         if data_id.is_null() {
             if (*ctx).flags & FLAGS_RETRMETHOD_STOP_ON_UNKNOWN_HREF != 0 {
                 errors::invalid_node_attribute(
