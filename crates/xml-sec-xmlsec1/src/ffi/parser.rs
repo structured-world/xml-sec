@@ -57,7 +57,7 @@ pub(crate) fn parse(bytes: &[u8], here: errors::Here) -> *mut XmlDoc {
 pub(crate) fn parse_under(
     bytes: &[u8],
     here: errors::Here,
-    policy: &xml_sec::policy::VerificationPolicy,
+    policy: &impl xml_sec::document::XmlDocumentPolicy,
 ) -> *mut XmlDoc {
     parsed(
         &xml_sec_libxml2::document::parse_parts_under(&[bytes], policy),

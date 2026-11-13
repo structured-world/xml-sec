@@ -742,12 +742,9 @@ unsafe extern "C" fn simple_find_key(
         let mut tally = shared.map_or_default(Cell::get);
         let mut found = std::ptr::null_mut();
         for pos in 0..xmlSecPtrListGetSize(list) {
-            if tally.inspected >= max {
-                tally.exhausted = true;
-                errors::limit_exceeded(here, (*(*store).id).name.cast(), "max_key_candidates", max);
+            if !tally.charge(max, here, (*(*store).id).name.cast()) {
                 break;
             }
-            tally.inspected += 1;
             let key = xmlSecPtrListGetItem(list, pos).cast::<XmlSecKey>();
             if !key.is_null() && xmlSecKeyMatch(key, name, &raw mut (*ctx).key_req) == 1 {
                 found = xmlSecKeyDuplicate(key);

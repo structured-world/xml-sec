@@ -162,6 +162,73 @@ fn an_unknown_key_name_stops_the_read_when_the_flag_asks() {
 }
 
 #[test]
+fn a_binary_value_is_written_only_by_its_own_klass() {
+    // An HMAC secret handed to the AES writer would be written as an AES
+    // key; both writers refuse a value of another klass.
+    let doc = parse("<AESKeyValue xmlns=\"http://www.aleksey.com/xmlsec/2002\"/>");
+    // SAFETY: objects created and destroyed here.
+    unsafe {
+        assert_eq!(xmlSecKeyDataIdsInit(), 0);
+        let ctx = xmlSecKeyInfoCtxCreate(std::ptr::null_mut());
+        (*ctx).mode = MODE_WRITE;
+        (*ctx).key_req.key_type = TYPE_SYMMETRIC;
+        let key = xmlSecKeyCreate();
+        let data = xmlSecKeyDataCreate(symkeys::hmac());
+        assert_eq!(
+            xmlSecKeyDataBinaryValueSetBuffer(data, b"secret".as_ptr(), 6),
+            0
+        );
+        assert_eq!(xmlSecKeySetValue(key, data), 0);
+        let written = xmlSecKeyDataXmlWrite(
+            symkeys::aes(),
+            key.cast(),
+            xsDocGetRootElement(doc).cast(),
+            ctx.cast(),
+        );
+        assert_eq!(written, -1, "the XML writer refuses another klass");
+        let mut buf = std::ptr::null_mut();
+        let mut size = 0usize;
+        let written = crate::ffi::keysdata::xmlSecKeyDataBinWrite(
+            symkeys::aes(),
+            key.cast(),
+            &raw mut buf,
+            &raw mut size,
+            ctx.cast(),
+        );
+        assert_eq!(written, -1, "the binary writer refuses another klass");
+        assert!(buf.is_null(), "nothing is handed out");
+        xmlSecKeyDestroy(key);
+        xmlSecKeyInfoCtxDestroy(ctx);
+        xsFreeDoc(doc);
+    }
+}
+
+#[test]
+fn a_copy_onto_itself_is_refused() {
+    // Copying a context or a list onto itself would alias the destination
+    // with the source; the call is refused and leaves both as they were.
+    // SAFETY: a context created and destroyed here.
+    unsafe {
+        assert_eq!(xmlSecKeyDataIdsInit(), 0);
+        let ctx = xmlSecKeyInfoCtxCreate(std::ptr::null_mut());
+        let enabled = &raw mut (*ctx).enabled_key_data;
+        assert_eq!(
+            xmlSecPtrListAdd(enabled, asymkeys::rsa().cast_mut().cast()),
+            0
+        );
+        assert_eq!(super::xmlSecKeyInfoCtxCopyUserPref(ctx, ctx), -1);
+        let transforms = &raw mut (*ctx).retrieval_method_ctx;
+        assert_eq!(
+            crate::ffi::transforms::ctx::xmlSecTransformCtxCopyUserPref(transforms, transforms),
+            -1
+        );
+        assert_eq!(crate::ffi::list::xmlSecPtrListCopy(enabled, enabled), -1);
+        assert_eq!(crate::ffi::list::xmlSecPtrListGetSize(enabled), 1);
+        xmlSecKeyInfoCtxDestroy(ctx);
+    }
+}
+
+#[test]
 fn key_store_searches_of_one_read_share_the_candidate_budget() {
     // Every store entry a KeyName search inspects is a key candidate of the
     // read: once an unknown name has used the policy's allowance, a later
@@ -508,6 +575,56 @@ fn a_key_value_the_requirements_refuse_leaves_the_key_for_a_later_one() {
         xmlSecKeyInfoCtxDestroy(ctx);
         xsFreeDoc(ec);
         xsFreeDoc(rsa);
+    }
+}
+
+#[test]
+fn every_key_value_read_is_a_candidate_of_the_read() {
+    // Values the requirements refuse are decoded all the same: each one is a
+    // candidate of the read, so two EC values before the RSA one that is
+    // wanted spend an allowance of two, and the RSA value is never decoded.
+    const EC: &str = include_str!("../../../../../tests/fixtures/keys/ec/ec-prime256v1-pubkey.pem");
+    const RSA: &str = include_str!("../../../../../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    own_process();
+    let der = |pem: &str| -> String {
+        let body: String = pem
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect();
+        format!("<dsig11:DEREncodedKeyValue>{body}</dsig11:DEREncodedKeyValue>")
+    };
+    let xml = format!(
+        "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\" \
+         xmlns:dsig11=\"http://www.w3.org/2009/xmldsig11#\">{}{}{}</KeyInfo>",
+        der(EC),
+        der(EC),
+        der(RSA)
+    );
+    // SAFETY: a context created and destroyed here.
+    unsafe {
+        assert_eq!(xmlSecKeyDataIdsInit(), 0);
+        let ctx = xmlSecKeyInfoCtxCreate(std::ptr::null_mut());
+        (*ctx).key_req.key_id = asymkeys::rsa().cast();
+        let enabled = &raw mut (*ctx).enabled_key_data;
+        assert_eq!(
+            xmlSecPtrListAdd(enabled, asymkeys::der_encoded_key_value().cast_mut().cast()),
+            0
+        );
+        policy::republish(
+            |verification| verification.resources.max_key_candidates = 3,
+            |_| {},
+        )
+        .expect("the library policy compiles");
+        assert_eq!(read_reported(&xml, ctx).0, 0, "three candidates fit three");
+        policy::republish(
+            |verification| verification.resources.max_key_candidates = 2,
+            |_| {},
+        )
+        .expect("the library policy compiles");
+        let (read, reasons) = read_reported(&xml, ctx);
+        assert_eq!(read, -1, "the third value finds the allowance spent");
+        assert_eq!(reasons.first(), Some(&errors::R_INVALID_SIZE));
+        xmlSecKeyInfoCtxDestroy(ctx);
     }
 }
 

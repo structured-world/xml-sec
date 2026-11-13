@@ -520,6 +520,65 @@ fn a_fragment_linked_outside_its_context_declares_what_it_uses() {
 }
 
 #[test]
+fn a_fragment_unlinked_and_linked_elsewhere_declares_what_it_uses() {
+    // Taken out of its run by an explicit unlink, the fragment no longer
+    // knows its context when it is linked; it keeps the binding it uses, so
+    // the document still reads `p:x` in `urn:p`.
+    let mut tree = parsed(r#"<r><a xmlns:p="urn:p"/><b/></r>"#);
+    let root = tree.root_element().expect("a document element");
+    let [a, b] = children(&tree, root)[..] else {
+        panic!("two children");
+    };
+    let x = tree
+        .parse_in_context(a, "<p:x/>", &VerificationPolicy::default())
+        .expect("the fragment parses")
+        .expect("the fragment has nodes");
+    tree.unlink(x).expect("a live node");
+    tree.append_child(b, x).expect("an unlinked node links");
+    assert_eq!(
+        tree.serialize(),
+        "<?xml version=\"1.0\"?>\n<r><a xmlns:p=\"urn:p\"/><b><p:x xmlns:p=\"urn:p\"/></b></r>\n"
+    );
+}
+
+#[test]
+fn only_an_element_or_the_document_takes_children() {
+    // A child under a text node would vanish from the serialization, which
+    // writes a text node's payload alone.
+    let mut tree = parsed("<r>t<b/></r>");
+    let root = tree.root_element().expect("a document element");
+    let [text, b] = children(&tree, root)[..] else {
+        panic!("two children");
+    };
+    tree.unlink(b).expect("a live node");
+    assert_eq!(tree.append_child(text, b), Err(TreeError::NotAnElement));
+    tree.append_child(root, b)
+        .expect("an element takes children");
+}
+
+#[test]
+fn freed_id_carriers_leave_the_id_table() {
+    // Parsing and freeing the same `xml:id` again and again must not leave
+    // a record per freed element behind, or every later claim of the value
+    // scans the dead ones.
+    let mut tree = parsed("<r/>");
+    let root = tree.root_element().expect("a document element");
+    for _ in 0..3 {
+        let x = tree
+            .parse_in_context(
+                root,
+                r#"<x xml:id="same"/>"#,
+                &VerificationPolicy::default(),
+            )
+            .expect("the fragment parses")
+            .expect("the fragment has nodes");
+        tree.free(x).expect("a live node");
+    }
+    assert_eq!(tree.ids.recorded(), 0);
+    assert_eq!(tree.element_by_id("same"), None);
+}
+
+#[test]
 fn a_copy_of_a_fragment_descendant_declares_what_it_uses() {
     // The descendant's binding came from the fragment's context, which the
     // copy's source tree no longer shows above it; linked in another tree,

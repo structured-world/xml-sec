@@ -43,7 +43,7 @@ use super::super::strings::{
 use super::super::tree::{XmlNode, c_text, nodes};
 use super::super::xmltree::{next_element, xmlSecCheckNodeName, xmlSecFindParent};
 use super::super::{contain, free, policy};
-use super::ctx::{Limit, charge, run_budget, run_policy};
+use super::ctx::{Limit, charge, run_budget, run_scope};
 use super::io::{
     OutputBuffer, xmlOutputBufferClose, xmlOutputBufferWrite, xmlSecBufferCreateOutputBuffer,
     xmlSecTransformCreateOutputBuffer,
@@ -426,8 +426,8 @@ unsafe fn base64_step(
     let here = here!("xmlSecBase64Execute");
     let name = xmlSecNameBase64.as_ptr().cast();
     // SAFETY: by the caller's contract.
-    let pinned = unsafe { run_policy(ctx, here) }?;
-    let resources = &pinned.verification.resources;
+    let (pinned, side) = unsafe { run_scope(ctx, here) }?;
+    let resources = pinned.of(side).resources();
     // SAFETY: by the caller's contract.
     unsafe {
         let budget = run_budget(ctx);
@@ -907,7 +907,7 @@ unsafe fn canonical(
     mode: C14nMode,
     comments: bool,
     prefixes: Option<String>,
-    policy: &xml_sec::policy::VerificationPolicy,
+    policy: &impl xml_sec::document::XmlDocumentPolicy,
 ) -> Result<Vec<u8>, String> {
     // SAFETY: a live node set by the caller's contract.
     let doc = unsafe { (*nodes).doc };
@@ -921,7 +921,13 @@ unsafe fn canonical(
     document
         .with_view(|view| {
             let selection = Selection { nodes, view, slot };
-            canonicalize_selected(view, &selection, &algorithm, &policy.resources, &mut output)
+            canonicalize_selected(
+                view,
+                &selection,
+                &algorithm,
+                policy.resource_policy(),
+                &mut output,
+            )
         })
         .map_err(|error| error.to_string())?;
     Ok(output)
@@ -1011,15 +1017,19 @@ unsafe fn c14n_execute(
                 .collect::<Vec<_>>()
                 .join(" ")
         });
-        let pinned = if ctx.is_null() {
-            policy::Pinned::current(here)
+        // Without a context no operation is known, and the work is a
+        // verifier's, as libxmlsec1's direct C14N call.
+        let scope = if ctx.is_null() {
+            policy::Pinned::current(here).map(|pinned| (pinned, policy::Side::Verify))
         } else {
-            run_policy(ctx, here)
+            run_scope(ctx, here)
         };
-        let Some(pinned) = pinned else {
+        let Some((pinned, side)) = scope else {
             return -1;
         };
-        let bytes = match canonical(nodes, mode, comments, prefixes, &pinned.verification) {
+        let bytes = match policy::with_document_policy!(pinned.of(side), |policy| canonical(
+            nodes, mode, comments, prefixes, policy
+        )) {
             Ok(bytes) => bytes,
             Err(error) => {
                 // The core canonicalizes in place of libxml2's

@@ -103,13 +103,16 @@ static xmlSecSize der_of(const char *path, xmlSecByte *out, xmlSecSize capacity)
     length = fread(text, 1, sizeof(text) - 1, file);
     fclose(file);
     text[length] = '\0';
-    body = strstr(text, "-----\n");
-    end = strstr(text, "\n-----END");
+    /* The body runs from the line after the BEGIN line to the END line, with
+     * either line ending; the decoder skips the line breaks inside it. */
+    body = strstr(text, "-----BEGIN");
+    body = body != NULL ? strchr(body, '\n') : NULL;
+    end = body != NULL ? strstr(body, "-----END") : NULL;
     if (body == NULL || end == NULL) {
         return 0;
     }
     *end = '\0';
-    if (xmlSecBase64Decode_ex((const xmlChar *)(body + 6), out, capacity, &written) < 0) {
+    if (xmlSecBase64Decode_ex((const xmlChar *)(body + 1), out, capacity, &written) < 0) {
         return 0;
     }
     return written;
@@ -222,15 +225,25 @@ int main(void) {
                load(RSA_KEY, xmlSecKeyDataFormatPkcs8Pem, NULL, NULL, NULL), 1);
     xmlSecKeyDestroy(key);
 
+    /* Both DER keys must load: "no key" alone would let the comparison pass
+     * without exercising the DER import. */
     size = der_of(RSA_KEY, der, sizeof(der));
     key = show("rsa der memory",
                xmlSecCryptoAppKeyLoadMemory(der, size, xmlSecKeyDataFormatDer, NULL, NULL, NULL),
                1);
+    if (key == NULL) {
+        printf("the DER private key did not load\n");
+        return 1;
+    }
     xmlSecKeyDestroy(key);
     size = der_of(RSA_PUBLIC, der, sizeof(der));
     key = show("rsa public der memory",
                xmlSecCryptoAppKeyLoadMemory(der, size, xmlSecKeyDataFormatDer, NULL, NULL, NULL),
                0);
+    if (key == NULL) {
+        printf("the DER public key did not load\n");
+        return 1;
+    }
     xmlSecKeyDestroy(key);
 
     /* The encrypted key must load both ways: printing "no key" alone would

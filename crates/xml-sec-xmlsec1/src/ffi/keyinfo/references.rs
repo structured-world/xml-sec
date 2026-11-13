@@ -236,7 +236,7 @@ unsafe fn result_document(
         // refused. It parses under the read's revision.
         let doc: *mut XmlDoc = xml_sec_libxml2::document::parse_parts_under(
             &[std::slice::from_raw_parts(data, size)],
-            &pinned.verification,
+            &*pinned.verification,
         )
         .map_or(std::ptr::null_mut(), xml_sec_libxml2::nodes::pointer_of);
         if doc.is_null() {

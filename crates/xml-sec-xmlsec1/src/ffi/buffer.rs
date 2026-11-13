@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use super::tree::XmlNode;
 
 use super::errors::{self, check, here};
-use super::{ALLOC_MODE_DOUBLE, contain, free, grown, malloc, realloc};
+use super::{ALLOC_MODE_DOUBLE, contain, free, grown, malloc};
 
 #[cfg(test)]
 mod tests;
@@ -41,6 +41,17 @@ unsafe fn zero_tail(buf: &mut XmlSecBuffer) {
             .add(buf.size)
             .write_bytes(0, buf.max_size - buf.size);
     }
+}
+
+/// Zeroes the `len` bytes at `data` in writes the compiler keeps, even when
+/// the block is freed right after: a buffer may hold key material.
+///
+/// # Safety
+/// `data` holds `len` writable bytes.
+unsafe fn wipe(data: *mut u8, len: usize) {
+    use zeroize::Zeroize as _;
+    // SAFETY: by the caller's contract.
+    unsafe { std::slice::from_raw_parts_mut(data, len) }.zeroize();
 }
 
 /// `xmlSecBufferSetDefaultAllocMode`: the mode and smallest allocation of
@@ -173,7 +184,7 @@ pub(crate) unsafe extern "C" fn xmlSecBufferEmpty(buf: *mut XmlSecBuffer) {
         if !buf.data.is_null() {
             check!(buf.max_size > 0, "xmlSecBufferEmpty", c"buf->maxSize > 0",);
             // SAFETY: `data` holds `maxSize` bytes.
-            unsafe { buf.data.write_bytes(0, buf.max_size) };
+            unsafe { wipe(buf.data, buf.max_size) };
         }
         buf.size = 0;
     });
@@ -335,17 +346,24 @@ pub(crate) unsafe extern "C" fn xmlSecBufferSetMaxSize(
             errors::malloc_failed(here!("xmlSecBufferSetMaxSize"), std::ptr::null(), size);
             return -1;
         };
-        let data = if buf.data.is_null() {
-            malloc(new_size)
-        } else {
-            // SAFETY: a non-null `data` is the buffer's libxml2 allocation.
-            unsafe { realloc(buf.data.cast::<c_void>(), new_size) }
-        };
+        // Not `realloc`: a block it moves stays in the heap with the old
+        // bytes, a key's among them. The new block takes the contents and the
+        // old one is wiped before it is freed.
+        let data = malloc(new_size).cast::<u8>();
         if data.is_null() {
             errors::malloc_failed(here!("xmlSecBufferSetMaxSize"), std::ptr::null(), new_size);
             return -1;
         }
-        buf.data = data.cast::<u8>();
+        if !buf.data.is_null() {
+            // SAFETY: the old block holds `maxSize >= size` bytes and the new
+            // one `new_size > maxSize`; they are distinct allocations.
+            unsafe {
+                data.copy_from_nonoverlapping(buf.data, buf.size);
+                wipe(buf.data, buf.max_size);
+                free(buf.data.cast::<c_void>());
+            }
+        }
+        buf.data = data;
         buf.max_size = new_size;
         if buf.size < buf.max_size {
             // SAFETY: `data` now holds `maxSize > size` bytes.

@@ -356,6 +356,10 @@ unsafe extern "C" fn set_key(transform: *mut XmlSecTransform, key: *mut c_void) 
                     return -1;
                 };
                 signature.private = Some(private);
+            } else {
+                // The last key set is the transform's key: a private key from
+                // an earlier one must not sign after a switch of operation.
+                signature.private = None;
             }
             signature.key = Some(VerificationKey {
                 algorithm,
@@ -413,11 +417,13 @@ unsafe extern "C" fn verify(
         };
         // SAFETY: the caller's `size` bytes.
         let value = unsafe { std::slice::from_raw_parts(data, size) };
+        // libxmlsec1's signature klasses carry no context string.
         match verify_signature_value(
             policy,
             xml_sec::provider::default_provider(),
             key,
             algorithm,
+            &xml_sec::xmldsig::SignatureContext::default(),
             &signature.data,
             value,
         ) {

@@ -1542,6 +1542,15 @@ impl OwnedTree {
     fn linkable(&self, parent: TreeNode, child: TreeNode) -> Result<(NodeId, NodeId), TreeError> {
         let parent_id = self.live(parent)?;
         let child_id = self.live(child)?;
+        // Only an element or a document holds children: the serialization
+        // writes any other node's payload alone, so a child there would be
+        // lost.
+        if !matches!(
+            self.document.node(parent_id).kind,
+            NodeKind::Element { .. } | NodeKind::Document
+        ) {
+            return Err(TreeError::NotAnElement);
+        }
         if child_id == self.document.root() {
             return Err(TreeError::DocumentNode);
         }
@@ -1569,7 +1578,12 @@ impl OwnedTree {
         if id == self.document.root() {
             return Err(TreeError::DocumentNode);
         }
-        self.leave_holder(id);
+        // A node leaving its run forgets the context it was parsed or copied
+        // in, so it declares the bindings it uses now, while they are known;
+        // a later link elsewhere then reads the same names.
+        if self.leave_holder(id) {
+            self.declare_used_bindings(id, BindingScope::new());
+        }
         self.document.detach(id);
         Ok(())
     }
@@ -1580,8 +1594,14 @@ impl OwnedTree {
     /// # Errors
     /// [`TreeError::StaleNode`] or [`TreeError::DocumentNode`].
     pub fn free(&mut self, node: TreeNode) -> Result<(), TreeError> {
-        self.unlink(node)?;
         let id = self.live(node)?;
+        if id == self.document.root() {
+            return Err(TreeError::DocumentNode);
+        }
+        // Not through `unlink`: a node about to be freed needs no
+        // declarations.
+        self.leave_holder(id);
+        self.document.detach(id);
         self.mark_freed(id);
         Ok(())
     }
@@ -1595,6 +1615,9 @@ impl OwnedTree {
             }
             self.freed[raw] = true;
             stack.extend(self.document.children(current));
+            if matches!(self.document.node(current).kind, NodeKind::Element { .. }) {
+                self.ids.forget_element(TreeNode::of(current));
+            }
             // The number stays refused, but its names, text and attributes
             // are released now rather than with the document.
             self.document.node_mut(current).kind = NodeKind::Text {

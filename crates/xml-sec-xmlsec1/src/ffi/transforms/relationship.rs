@@ -10,7 +10,7 @@ use std::ffi::{CStr, c_char, c_int};
 
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::xmldsig::transforms::{
-    RelationshipSelector, Transform, execute_transforms_with_policy,
+    RelationshipSelector, Transform, TransformChainPolicy, execute_transforms_with_policy,
 };
 use xml_sec::xmldsig::types::TransformData;
 
@@ -24,7 +24,7 @@ use super::super::strings::{
 use super::super::tree::{XmlNode, c_text, nodes};
 use super::super::xmltree::xmlSecCheckNodeName;
 use super::builtin::{PopTarget, klass, pop_rendered, push_rendered, selected_octets};
-use super::ctx::run_policy;
+use super::ctx::run_scope;
 use super::io::{OutputBuffer, xmlOutputBufferWrite};
 use super::{
     USAGE_DSIG_TRANSFORM, WithContext, XmlSecTransform, XmlSecTransformCtx, XmlSecTransformKlass,
@@ -188,16 +188,33 @@ unsafe fn render(
     ctx: *mut XmlSecTransformCtx,
 ) -> c_int {
     let here = here!("xmlSecTransformRelationshipExecute");
-    let pinned = if ctx.is_null() {
-        policy::Pinned::current(here)
+    // Without a context no operation is known, and the work is a verifier's.
+    let scope = if ctx.is_null() {
+        policy::Pinned::current(here).map(|pinned| (pinned, policy::Side::Verify))
     } else {
         // SAFETY: by the caller's contract.
-        unsafe { run_policy(ctx, here) }
+        unsafe { run_scope(ctx, here) }
     };
-    let Some(pinned) = pinned else {
+    let Some((pinned, side)) = scope else {
         return -1;
     };
-    let policy = &pinned.verification;
+    policy::with_document_policy!(pinned.of(side), |policy| {
+        // SAFETY: by the caller's contract.
+        unsafe { render_under(selectors, selected, out, policy, here) }
+    })
+}
+
+/// [`render`] under the operation policy `policy`.
+///
+/// # Safety
+/// As for [`render`].
+unsafe fn render_under(
+    selectors: &Selectors,
+    selected: *mut XmlSecNodeSet,
+    out: *mut OutputBuffer,
+    policy: &(impl xml_sec::document::XmlDocumentPolicy + TransformChainPolicy),
+    here: errors::Here,
+) -> c_int {
     // SAFETY: by the caller's contract.
     let doc = unsafe { (*selected).doc };
     // The core runs the transform in place of libxmlsec1's node-list walk;
@@ -210,7 +227,7 @@ unsafe fn render(
             error,
         );
     };
-    let (document, slot) = match xml_sec_libxml2::document::snapshot(doc, &**policy) {
+    let (document, slot) = match xml_sec_libxml2::document::snapshot(doc, policy) {
         Ok(snapshot) => snapshot,
         Err(error) => {
             failed(&error.to_string());
@@ -228,7 +245,8 @@ unsafe fn render(
     // preceding filter removed stays removed.
     let bytes = document.with_view(|view| {
         // SAFETY: `selected` is over the document `view` reads.
-        let Some(input) = (unsafe { selected_octets(view, slot, selected, &policy.resources) })
+        let Some(input) =
+            (unsafe { selected_octets(view, slot, selected, policy.resource_policy()) })
         else {
             return Err("the input node set cannot be canonicalized".to_owned());
         };

@@ -685,6 +685,7 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataXmlRead(
             // read may use, whatever klasses the context enables.
             if super::policy::pinned((*info).reserved0)
                 .is_some_and(|pinned| super::keyinfo::source_refused(id, pinned, here))
+                || !super::keyinfo::charge_key_value(info, id, here)
             {
                 return -1;
             }

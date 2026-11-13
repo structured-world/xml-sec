@@ -150,6 +150,34 @@ impl IdTable {
         }
     }
 
+    /// How many entries all the indexes hold.
+    #[cfg(test)]
+    pub(super) fn recorded(&self) -> usize {
+        self.by_value.len()
+            + self.by_source.len()
+            + self.shadowed.len()
+            + self.shadowed_sources.len()
+    }
+
+    /// Forget every ID the attributes of `element` carry, registered or
+    /// shadowed, as libxml2 drops an attribute's ID when it frees it.
+    pub(super) fn forget_element(&mut self, element: TreeNode) {
+        let registered: alloc::vec::Vec<IdSource> = self
+            .of_element(element)
+            .map(|(source, _)| source.clone())
+            .collect();
+        for source in registered {
+            self.remove_source(&source);
+        }
+        let shadowed: alloc::vec::Vec<IdSource> = self
+            .shadowed_of_element(element)
+            .map(|(source, _)| source.clone())
+            .collect();
+        for source in shadowed {
+            self.unshadow(&source);
+        }
+    }
+
     /// Drop the entry `source` carries; its value is returned.
     pub(super) fn remove_source(&mut self, source: &IdSource) -> Option<String> {
         let value = self.by_source.remove(source)?;

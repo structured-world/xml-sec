@@ -195,6 +195,70 @@ fn a_run_under_a_policy_not_in_force_takes_no_input() {
 }
 
 #[test]
+fn a_signing_chain_runs_under_the_signing_policy() {
+    // The chain's shared limits come from the operation it serves: with a
+    // signing limit of one transform and a verification limit of sixteen, a
+    // two-transform chain is refused when it signs and runs when it verifies.
+    own_process();
+    policy::republish(
+        |verification| verification.resources.max_transforms_per_reference = 16,
+        |signing| signing.resources.max_transforms_per_reference = 1,
+    )
+    .expect("the library policy compiles");
+    let input = b"QUFB";
+    for (operation, key, expected) in [
+        (OPERATION_SIGN, private_key(), -1),
+        (OPERATION_VERIFY, public_key(), 0),
+    ] {
+        // SAFETY: every object is created and released here.
+        unsafe {
+            let ctx = xmlSecTransformCtxCreate();
+            let base64 = xmlSecTransformCtxCreateAndAppend(
+                ctx,
+                super::super::builtin::xmlSecTransformBase64GetKlass(),
+            );
+            (*base64).operation = super::super::OPERATION_DECODE;
+            let transform = xmlSecTransformCtxCreateAndAppend(ctx, rsa_sha256());
+            (*transform).operation = operation;
+            assert_eq!(xmlSecTransformSetKey(transform, key.cast()), 0);
+            assert_eq!(
+                xmlSecTransformCtxBinaryExecute(ctx, input.as_ptr(), input.len()),
+                expected,
+                "operation {operation}"
+            );
+            xmlSecTransformCtxDestroy(ctx);
+            xmlSecKeyDestroy(key);
+        }
+    }
+}
+
+#[test]
+fn a_verification_key_drops_the_private_key_set_before() {
+    // The last key set is the transform's key: a public key installed after
+    // a private one leaves nothing to sign with, so switching the operation
+    // back cannot sign with the earlier key.
+    let (private, public) = (private_key(), public_key());
+    // SAFETY: every object is created and released here.
+    unsafe {
+        let ctx = xmlSecTransformCtxCreate();
+        let transform = xmlSecTransformCtxCreateAndAppend(ctx, rsa_sha256());
+        (*transform).operation = OPERATION_SIGN;
+        assert_eq!(xmlSecTransformSetKey(transform, private.cast()), 0);
+        (*transform).operation = OPERATION_VERIFY;
+        assert_eq!(xmlSecTransformSetKey(transform, public.cast()), 0);
+        (*transform).operation = OPERATION_SIGN;
+        let input = [0x41_u8; 16];
+        assert_eq!(
+            xmlSecTransformCtxBinaryExecute(ctx, input.as_ptr(), input.len()),
+            -1
+        );
+        xmlSecTransformCtxDestroy(ctx);
+        xmlSecKeyDestroy(private);
+        xmlSecKeyDestroy(public);
+    }
+}
+
+#[test]
 fn a_signature_over_the_empty_message_verifies() {
     // The empty message is signed and its signature verifies, as libxmlsec1
     // accepts it.

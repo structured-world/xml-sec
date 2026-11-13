@@ -346,6 +346,16 @@ pub(crate) unsafe extern "C" fn value_xml_write(
             c"xmlSecKeyDataIsValid(value)",
             -1
         );
+        // A writer called directly with another klass would write one key
+        // type's bytes as another's.
+        // SAFETY: valid key data and a klass.
+        let own = unsafe { check_id(value, id) };
+        check!(
+            own,
+            "xmlSecKeyDataBinaryValueXmlWrite",
+            c"xmlSecKeyDataCheckId(value, id)",
+            -1
+        );
         // SAFETY: valid key data.
         let buffer = unsafe { xmlSecKeyDataBinaryValueGetBuffer(value) };
         check!(
@@ -485,6 +495,15 @@ pub(crate) unsafe extern "C" fn value_bin_write(
             valid_value,
             "xmlSecKeyDataBinaryValueBinWrite",
             c"xmlSecKeyDataIsValid(value)",
+            -1
+        );
+        // As for the XML writer: only the value's own klass exports it.
+        // SAFETY: valid key data and a klass.
+        let own = unsafe { check_id(value, id) };
+        check!(
+            own,
+            "xmlSecKeyDataBinaryValueBinWrite",
+            c"xmlSecKeyDataCheckId(value, id)",
             -1
         );
         // SAFETY: valid key data.

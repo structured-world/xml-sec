@@ -9,7 +9,8 @@ use super::{DsigError, SignatureAlgorithm, VerificationScope, VerifyingKey};
 /// verification does under `policy`: the method must be permitted, the key
 /// must meet the policy's strength and the value its wire framing, and the
 /// provider must offer the method. For a caller that has the signed bytes
-/// itself, such as a transform chain.
+/// itself, such as a transform chain. `context` is the context string of a
+/// method that takes one (Ed25519ctx, Ed448, ML-DSA); empty for the others.
 ///
 /// # Errors
 /// Returns a policy refusal, an unsupported method or the key's
@@ -23,7 +24,9 @@ use super::{DsigError, SignatureAlgorithm, VerificationScope, VerifyingKey};
 /// # {
 /// use xml_sec::policy::VerificationPolicy;
 /// use xml_sec::xmldsig::verify::verify_signature_value;
-/// use xml_sec::xmldsig::{HmacVerificationKey, IncrementalHmac, SignatureAlgorithm};
+/// use xml_sec::xmldsig::{
+///     HmacVerificationKey, IncrementalHmac, SignatureAlgorithm, SignatureContext,
+/// };
 ///
 /// let secret = [0x42; 32];
 /// let mut mac = IncrementalHmac::begin(SignatureAlgorithm::HmacSha256, &secret)?;
@@ -33,8 +36,12 @@ use super::{DsigError, SignatureAlgorithm, VerificationScope, VerifyingKey};
 /// let policy = VerificationPolicy::default();
 /// let provider = xml_sec::provider::default_provider();
 /// let algorithm = SignatureAlgorithm::HmacSha256;
-/// assert!(verify_signature_value(&policy, provider, &key, algorithm, b"signed bytes", &value)?);
-/// assert!(!verify_signature_value(&policy, provider, &key, algorithm, b"other bytes", &value)?);
+/// let none = SignatureContext::default();
+/// let verify = |data: &[u8]| {
+///     verify_signature_value(&policy, provider, &key, algorithm, &none, data, &value)
+/// };
+/// assert!(verify(b"signed bytes")?);
+/// assert!(!verify(b"other bytes")?);
 /// # }
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
@@ -43,6 +50,7 @@ pub fn verify_signature_value(
     provider: &dyn crate::provider::CryptoProvider,
     key: &dyn VerifyingKey,
     algorithm: SignatureAlgorithm,
+    context: &crate::xmldsig::SignatureContext,
     signed_data: &[u8],
     signature_value: &[u8],
 ) -> Result<bool, DsigError> {
@@ -81,10 +89,9 @@ pub fn verify_signature_value(
         candidates: &candidates,
         candidate_refusal: &candidate_refusal,
     };
-    let context = crate::xmldsig::SignatureContext::new(&[])?;
     let input = crate::provider::SignatureVerificationInput::new(
         algorithm,
-        &context,
+        context,
         signed_data,
         signature_value,
     );

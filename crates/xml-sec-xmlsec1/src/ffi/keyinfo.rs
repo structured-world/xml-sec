@@ -102,6 +102,50 @@ pub(crate) fn key_source(id: *const XmlSecKeyDataKlass) -> Option<KeySourceKind>
     (usage & USAGE_KEY_VALUE_NODE_READ != 0).then_some(KeySourceKind::KeyValue)
 }
 
+/// Charges one key candidate to the read with `ctx` when the klass `id`
+/// reads a key value (a `KeyValue` child or `DEREncodedKeyValue`), before
+/// its material is decoded: a value the key requirements later refuse costs
+/// its decoding all the same. False, reported at `here`, once the read's
+/// `max_key_candidates` is spent; the `KeyValue` container only hands its
+/// child to such a reader and is not charged.
+///
+/// # Safety
+/// `ctx` is a context whose slot holds the read's pin; `id` a klass.
+pub(crate) unsafe fn charge_key_value(
+    ctx: *mut XmlSecKeyInfoCtx,
+    id: *const XmlSecKeyDataKlass,
+    here: errors::Here,
+) -> bool {
+    if std::ptr::eq(id, xmlSecKeyDataValueGetKlass())
+        || key_source(id).is_none_or(|source| {
+            !matches!(
+                source,
+                KeySourceKind::KeyValue | KeySourceKind::DerEncodedKeyValue
+            )
+        })
+    {
+        return true;
+    }
+    // SAFETY: by the caller's contract; the slot is the read's pin.
+    let (Some(pinned), Some(tally)) = (unsafe {
+        (
+            policy::pinned((*ctx).reserved0),
+            policy::key_candidates((*ctx).reserved0),
+        )
+    }) else {
+        return true;
+    };
+    let mut current = tally.get();
+    // SAFETY: a klass by the caller's contract.
+    let charged = current.charge(
+        pinned.verification.resources.max_key_candidates,
+        here,
+        unsafe { klass_name(id) },
+    );
+    tally.set(current);
+    charged
+}
+
 /// Whether `pinned` refuses the document key source the klass `id` reads,
 /// reported at `here` when it does.
 pub(crate) fn source_refused(
@@ -550,6 +594,14 @@ pub(crate) unsafe extern "C" fn xmlSecKeyInfoCtxCopyUserPref(
             !src.is_null(),
             "xmlSecKeyInfoCtxCopyUserPref",
             c"src != NULL",
+            -1
+        );
+        // The contexts are borrowed apart below; one context as both would
+        // alias them.
+        check!(
+            dst != src,
+            "xmlSecKeyInfoCtxCopyUserPref",
+            c"dst != src",
             -1
         );
         let here = here!("xmlSecKeyInfoCtxCopyUserPref");

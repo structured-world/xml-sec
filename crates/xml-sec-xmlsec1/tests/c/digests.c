@@ -34,7 +34,11 @@ static void describe(xmlSecTransformId id) {
            id->execute != NULL);
 }
 
-/* The digest of `input` by `id`, written into `out`; returns its size. */
+/* The largest digest the klasses produce, SHA-512's. */
+#define DIGEST_CAPACITY 64
+
+/* The digest of `input` by `id`, written into `out` of DIGEST_CAPACITY
+ * bytes; returns its size, zero when none was produced or it does not fit. */
 static xmlSecSize digest(xmlSecTransformId id, xmlSecSize chunk, xmlSecByte *out) {
     xmlSecTransformCtxPtr ctx = xmlSecTransformCtxCreate();
     xmlSecTransformPtr transform = xmlSecTransformCtxCreateAndAppend(ctx, id);
@@ -45,7 +49,7 @@ static xmlSecSize digest(xmlSecTransformId id, xmlSecSize chunk, xmlSecByte *out
         ctx->binaryChunkSize = chunk;
     }
     ret = xmlSecTransformCtxBinaryExecute(ctx, input, sizeof(input) - 1);
-    if (ret == 0 && ctx->result != NULL) {
+    if (ret == 0 && ctx->result != NULL && xmlSecBufferGetSize(ctx->result) <= DIGEST_CAPACITY) {
         size = xmlSecBufferGetSize(ctx->result);
         memcpy(out, xmlSecBufferGetData(ctx->result), size);
     }
@@ -77,22 +81,29 @@ static void verify(const char *label, xmlSecTransformId id, const xmlSecByte *ex
     xmlSecTransformCtxDestroy(ctx);
 }
 
-static void check(xmlSecTransformId id) {
-    xmlSecByte one[64];
-    xmlSecByte many[64];
+/* Runs the checks of `id`; nonzero when a digest was not produced, since
+ * the comparisons below need one of a known size. */
+static int check(xmlSecTransformId id) {
+    xmlSecByte one[DIGEST_CAPACITY];
+    xmlSecByte many[DIGEST_CAPACITY];
     xmlSecSize size;
     describe(id);
     size = digest(id, 0, one);
+    if (size == 0 || digest(id, 5, many) != size) {
+        printf("  %s: no digest\n", id->name);
+        return 1;
+    }
     print_hex(one, size);
-    digest(id, 5, many);
     printf("  chunked equal: %d\n", memcmp(one, many, size) == 0);
     verify("match", id, one, size);
     verify("short", id, one, size - 1);
     one[0] ^= 0x01;
     verify("mismatch", id, one, size);
+    return 0;
 }
 
 int main(void) {
+    int failed = 0;
     xmlSecErrorsSetCallback(record);
     if (xmlSecInit() < 0 || xmlSecCryptoDLLoadLibrary(xmlSecGetDefaultCrypto()) < 0) {
         printf("no default crypto library\n");
@@ -103,20 +114,20 @@ int main(void) {
         return 1;
     }
 
-    check(xmlSecTransformMd5Id);
-    check(xmlSecTransformRipemd160Id);
-    check(xmlSecTransformSha1Id);
-    check(xmlSecTransformSha224Id);
-    check(xmlSecTransformSha256Id);
-    check(xmlSecTransformSha384Id);
-    check(xmlSecTransformSha512Id);
-    check(xmlSecTransformSha3_224Id);
-    check(xmlSecTransformSha3_256Id);
-    check(xmlSecTransformSha3_384Id);
-    check(xmlSecTransformSha3_512Id);
+    failed |= check(xmlSecTransformMd5Id);
+    failed |= check(xmlSecTransformRipemd160Id);
+    failed |= check(xmlSecTransformSha1Id);
+    failed |= check(xmlSecTransformSha224Id);
+    failed |= check(xmlSecTransformSha256Id);
+    failed |= check(xmlSecTransformSha384Id);
+    failed |= check(xmlSecTransformSha512Id);
+    failed |= check(xmlSecTransformSha3_224Id);
+    failed |= check(xmlSecTransformSha3_256Id);
+    failed |= check(xmlSecTransformSha3_384Id);
+    failed |= check(xmlSecTransformSha3_512Id);
 
     xmlSecCryptoShutdown();
     xmlSecCryptoAppShutdown();
     xmlSecShutdown();
-    return 0;
+    return failed;
 }

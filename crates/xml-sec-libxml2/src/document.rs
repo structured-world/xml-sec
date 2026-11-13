@@ -62,7 +62,7 @@ pub fn parse(bytes: &[u8]) -> Result<usize, DocumentError> {
 /// As for [`parse`].
 pub fn parse_parts(parts: &[&[u8]]) -> Result<usize, DocumentError> {
     let policy = crate::policy::library().ok_or(DocumentError::Policy);
-    let parsed = policy.and_then(|policy| parse_tree(parts, &policy));
+    let parsed = policy.and_then(|policy| parse_tree(parts, &*policy));
     if let Err(error) = &parsed {
         record_error(error);
     }
@@ -76,7 +76,7 @@ pub fn parse_parts(parts: &[&[u8]]) -> Result<usize, DocumentError> {
 /// The core's refusal, an encoding error among them.
 pub fn parse_parts_under(
     parts: &[&[u8]],
-    policy: &xml_sec::policy::VerificationPolicy,
+    policy: &impl XmlDocumentPolicy,
 ) -> Result<usize, DocumentError> {
     let parsed = parse_tree(parts, policy);
     if let Err(error) = &parsed {
@@ -92,10 +92,7 @@ pub(crate) fn record_error(error: &impl std::fmt::Display) {
     LAST_ERROR.with_borrow_mut(|last| *last = Some(message));
 }
 
-fn parse_tree(
-    parts: &[&[u8]],
-    policy: &xml_sec::policy::VerificationPolicy,
-) -> Result<usize, DocumentError> {
+fn parse_tree(parts: &[&[u8]], policy: &impl XmlDocumentPolicy) -> Result<usize, DocumentError> {
     let tree = OwnedTree::parse_parts_with_policy(parts, policy)?;
     Ok(handles::register(tree)?)
 }

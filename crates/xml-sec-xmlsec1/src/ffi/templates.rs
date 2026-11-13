@@ -38,6 +38,9 @@ use super::xmltree::{
 };
 use super::{contain, free};
 
+#[cfg(test)]
+mod tests;
+
 /// libxml2's `XML_PARSE_PEDANTIC`.
 const XML_PARSE_PEDANTIC: c_int = 1 << 7;
 /// libxml2's `XML_PARSE_NODICT`.
@@ -56,16 +59,62 @@ fn text(value: &'static [u8]) -> &'static str {
         .unwrap_or("NULL")
 }
 
-/// Sets the attribute `attr` of `node` to `value` when `value` is set,
-/// ignoring libxml2's result as libxmlsec1 does for optional attributes.
+/// Sets the attribute `attr` of `node` to `value` when `value` is set; false,
+/// reported at `here`, when the tree refuses it. libxmlsec1 ignores the
+/// result, which libxml2 fails only without memory; this tree also refuses
+/// an ID another element holds and text that is not UTF-8, and a template
+/// built without the attribute asked for is not the one requested.
 ///
 /// # Safety
 /// `node` is a live node; `value` is null or NUL-terminated.
-unsafe fn optional(node: *mut XmlNode, attr: &'static [u8], value: *const u8) {
-    if !value.is_null() {
-        // SAFETY: by the caller's contract.
-        unsafe { xsSetProp(node, name(attr), value) };
+unsafe fn optional(node: *mut XmlNode, attr: &'static [u8], value: *const u8, here: Here) -> bool {
+    // SAFETY: by the caller's contract.
+    if value.is_null() || !unsafe { xsSetProp(node, name(attr), value) }.is_null() {
+        return true;
     }
+    errors::xml_failed_with(
+        here,
+        std::ptr::null(),
+        c"xmlSetProp",
+        &format!("name={}", text(attr)),
+    );
+    false
+}
+
+/// The element an `Ensure` function returns, `created` by it or found in
+/// place, with `Id` set to `id`; null on a refusal, after taking back an
+/// element it created. A found element keeps its old `Id`, and the call fails
+/// rather than return it as updated.
+///
+/// # Safety
+/// `node` is a live node; `id` is null or NUL-terminated.
+unsafe fn ensured(node: *mut XmlNode, created: bool, id: *const u8, here: Here) -> *mut XmlNode {
+    // SAFETY: by the caller's contract.
+    unsafe {
+        if optional(node, &xmlSecAttrId, id, here) {
+            return node;
+        }
+        if created {
+            discard(node);
+        }
+    }
+    std::ptr::null_mut()
+}
+
+/// Sets each `(attr, value)` of `attributes` on `node` as [`optional`] does;
+/// false at the first refusal.
+///
+/// # Safety
+/// As for [`optional`], for each value.
+unsafe fn optionals(
+    node: *mut XmlNode,
+    attributes: &[(&'static [u8], *const u8)],
+    here: Here,
+) -> bool {
+    attributes
+        .iter()
+        // SAFETY: by the caller's contract.
+        .all(|&(attr, value)| unsafe { optional(node, attr, value, here) })
 }
 
 /// Sets the `Algorithm` attribute of `node` to `href`; false with
@@ -303,7 +352,10 @@ pub(crate) unsafe extern "C" fn xmlSecTmplSignatureCreateNsPref(
                 return std::ptr::null_mut();
             }
             xsSetNs(sign_node, ns);
-            optional(sign_node, b"Id\0", id);
+            if !optional(sign_node, b"Id\0", id, here) {
+                xsFreeNode(sign_node);
+                return std::ptr::null_mut();
+            }
             let built = (|| {
                 let signed_info = add(
                     sign_node,
@@ -373,7 +425,8 @@ pub(crate) unsafe extern "C" fn xmlSecTmplSignatureEnsureKeyInfo(
         // SAFETY: `sign_node` is live.
         unsafe {
             let mut res = xmlSecFindChild(sign_node, name(&xmlSecNodeKeyInfo), name(&xmlSecDSigNs));
-            if res.is_null() {
+            let created = res.is_null();
+            if created {
                 let value = required(sign_node, &xmlSecNodeSignatureValue, &xmlSecDSigNs, here);
                 if value.is_null() {
                     return std::ptr::null_mut();
@@ -388,8 +441,7 @@ pub(crate) unsafe extern "C" fn xmlSecTmplSignatureEnsureKeyInfo(
                     return std::ptr::null_mut();
                 }
             }
-            optional(res, &xmlSecAttrId, id);
-            res
+            ensured(res, created, id, here)
         }
     })
 }
@@ -420,9 +472,18 @@ unsafe fn add_reference(
         if res.is_null() {
             return res;
         }
-        optional(res, &xmlSecAttrId, id);
-        optional(res, &xmlSecAttrType, kind);
-        optional(res, &xmlSecAttrURI, uri);
+        if !optionals(
+            res,
+            &[
+                (&xmlSecAttrId, id),
+                (&xmlSecAttrType, kind),
+                (&xmlSecAttrURI, uri),
+            ],
+            here,
+        ) {
+            discard(res);
+            return std::ptr::null_mut();
+        }
         let method = add(
             res,
             &xmlSecNodeDigestMethod,
@@ -528,10 +589,19 @@ pub(crate) unsafe extern "C" fn xmlSecTmplSignatureAddObject(
                 c"xmlSecAddChild(xmlSecNodeObject)",
                 here,
             );
-            if !res.is_null() {
-                optional(res, &xmlSecAttrId, id);
-                optional(res, &xmlSecAttrMimeType, mime_type);
-                optional(res, &xmlSecAttrEncoding, encoding);
+            if !res.is_null()
+                && !optionals(
+                    res,
+                    &[
+                        (&xmlSecAttrId, id),
+                        (&xmlSecAttrMimeType, mime_type),
+                        (&xmlSecAttrEncoding, encoding),
+                    ],
+                    here,
+                )
+            {
+                discard(res);
+                return std::ptr::null_mut();
             }
             res
         }
@@ -748,9 +818,15 @@ pub(crate) unsafe extern "C" fn xmlSecTmplObjectAddSignProperties(
                 c"xmlSecAddChild(xmlSecNodeSignatureProperties)",
                 here,
             );
-            if !res.is_null() {
-                optional(res, &xmlSecAttrId, id);
-                optional(res, &xmlSecAttrTarget, target);
+            if !res.is_null()
+                && !optionals(
+                    res,
+                    &[(&xmlSecAttrId, id), (&xmlSecAttrTarget, target)],
+                    here,
+                )
+            {
+                discard(res);
+                return std::ptr::null_mut();
             }
             res
         }
@@ -783,8 +859,9 @@ pub(crate) unsafe extern "C" fn xmlSecTmplObjectAddManifest(
                 c"xmlSecAddChild(xmlSecNodeManifest)",
                 here,
             );
-            if !res.is_null() {
-                optional(res, &xmlSecAttrId, id);
+            if !res.is_null() && !optional(res, &xmlSecAttrId, id, here) {
+                discard(res);
+                return std::ptr::null_mut();
             }
             res
         }
@@ -922,11 +999,14 @@ pub(crate) unsafe extern "C" fn xmlSecTmplEncDataCreate(
                 return std::ptr::null_mut();
             }
             xsSetNs(enc_node, ns);
-            optional(enc_node, &xmlSecAttrId, id);
-            optional(enc_node, &xmlSecAttrType, kind);
-            optional(enc_node, &xmlSecAttrMimeType, mime_type);
-            optional(enc_node, &xmlSecAttrEncoding, encoding);
-            if !prepare_enc_data(enc_node, enc_method_id) {
+            let attributes = [
+                (&xmlSecAttrId[..], id),
+                (&xmlSecAttrType[..], kind),
+                (&xmlSecAttrMimeType[..], mime_type),
+                (&xmlSecAttrEncoding[..], encoding),
+            ];
+            if !optionals(enc_node, &attributes, here) || !prepare_enc_data(enc_node, enc_method_id)
+            {
                 xsFreeNode(enc_node);
                 return std::ptr::null_mut();
             }
@@ -956,7 +1036,8 @@ pub(crate) unsafe extern "C" fn xmlSecTmplEncDataEnsureKeyInfo(
         // SAFETY: `enc_node` is live.
         unsafe {
             let mut res = xmlSecFindChild(enc_node, name(&xmlSecNodeKeyInfo), name(&xmlSecDSigNs));
-            if res.is_null() {
+            let created = res.is_null();
+            if created {
                 let cipher_data = required(enc_node, &xmlSecNodeCipherData, &xmlSecEncNs, here);
                 if cipher_data.is_null() {
                     return std::ptr::null_mut();
@@ -975,8 +1056,7 @@ pub(crate) unsafe extern "C" fn xmlSecTmplEncDataEnsureKeyInfo(
                     return std::ptr::null_mut();
                 }
             }
-            optional(res, &xmlSecAttrId, id);
-            res
+            ensured(res, created, id, here)
         }
     })
 }
@@ -1006,7 +1086,8 @@ pub(crate) unsafe extern "C" fn xmlSecTmplEncDataEnsureEncProperties(
                 name(&xmlSecNodeEncryptionProperties),
                 name(&xmlSecEncNs),
             );
-            if res.is_null() {
+            let created = res.is_null();
+            if created {
                 res = add(
                     enc_node,
                     &xmlSecNodeEncryptionProperties,
@@ -1018,8 +1099,7 @@ pub(crate) unsafe extern "C" fn xmlSecTmplEncDataEnsureEncProperties(
                     return res;
                 }
             }
-            optional(res, &xmlSecAttrId, id);
-            res
+            ensured(res, created, id, here)
         }
     })
 }
@@ -1062,9 +1142,15 @@ pub(crate) unsafe extern "C" fn xmlSecTmplEncDataAddEncProperty(
                 c"xmlSecAddChild(xmlSecNodeEncryptionProperty)",
                 here,
             );
-            if !res.is_null() {
-                optional(res, &xmlSecAttrId, id);
-                optional(res, &xmlSecAttrTarget, target);
+            if !res.is_null()
+                && !optionals(
+                    res,
+                    &[(&xmlSecAttrId, id), (&xmlSecAttrTarget, target)],
+                    here,
+                )
+            {
+                discard(res);
+                return std::ptr::null_mut();
             }
             res
         }
@@ -1072,7 +1158,7 @@ pub(crate) unsafe extern "C" fn xmlSecTmplEncDataAddEncProperty(
 }
 
 /// The `CipherData` child `want` of `enc_node` when its sibling form
-/// `other` is absent, appended when missing.
+/// `other` is absent, appended when missing, and whether it was appended.
 ///
 /// # Safety
 /// `enc_node` is a live node.
@@ -1082,18 +1168,18 @@ unsafe fn ensure_cipher(
     other: &'static [u8],
     failed: &CStr,
     here: Here,
-) -> *mut XmlNode {
+) -> (*mut XmlNode, bool) {
     // SAFETY: by the caller's contract.
     unsafe {
         let cipher_data = required(enc_node, &xmlSecNodeCipherData, &xmlSecEncNs, here);
         if cipher_data.is_null() || present(cipher_data, other, &xmlSecEncNs, here) {
-            return std::ptr::null_mut();
+            return (std::ptr::null_mut(), false);
         }
         let res = xmlSecFindChild(cipher_data, name(want), name(&xmlSecEncNs));
         if !res.is_null() {
-            return res;
+            return (res, false);
         }
-        add(cipher_data, want, &xmlSecEncNs, failed, here)
+        (add(cipher_data, want, &xmlSecEncNs, failed, here), true)
     }
 }
 
@@ -1122,6 +1208,7 @@ pub(crate) unsafe extern "C" fn xmlSecTmplEncDataEnsureCipherValue(
                 c"xmlSecAddChild(xmlSecNodeCipherValue)",
                 here!("xmlSecTmplEncDataEnsureCipherValue"),
             )
+            .0
         }
     })
 }
@@ -1144,17 +1231,23 @@ pub(crate) unsafe extern "C" fn xmlSecTmplEncDataEnsureCipherReference(
             c"encNode != NULL",
             std::ptr::null_mut()
         );
+        let here = here!("xmlSecTmplEncDataEnsureCipherReference");
         // SAFETY: `enc_node` is live.
         unsafe {
-            let res = ensure_cipher(
+            let (res, created) = ensure_cipher(
                 enc_node,
                 &xmlSecNodeCipherReference,
                 &xmlSecNodeCipherValue,
                 c"xmlSecAddChild(xmlSecNodeCipherReference)",
-                here!("xmlSecTmplEncDataEnsureCipherReference"),
+                here,
             );
-            if !res.is_null() {
-                optional(res, &xmlSecAttrURI, uri);
+            // A reference found in place keeps its old `URI` on a refusal,
+            // and the call fails rather than return it as updated.
+            if !res.is_null() && !optional(res, &xmlSecAttrURI, uri, here) {
+                if created {
+                    discard(res);
+                }
+                return std::ptr::null_mut();
             }
             res
         }
@@ -1474,9 +1567,11 @@ pub(crate) unsafe extern "C" fn xmlSecTmplKeyInfoAddRetrievalMethod(
                 c"xmlSecAddChild(xmlSecNodeRetrievalMethod)",
                 here,
             );
-            if !res.is_null() {
-                optional(res, &xmlSecAttrURI, uri);
-                optional(res, &xmlSecAttrType, kind);
+            if !res.is_null()
+                && !optionals(res, &[(&xmlSecAttrURI, uri), (&xmlSecAttrType, kind)], here)
+            {
+                discard(res);
+                return std::ptr::null_mut();
             }
             res
         }
@@ -1560,10 +1655,12 @@ pub(crate) unsafe extern "C" fn xmlSecTmplKeyInfoAddEncryptedKey(
             if res.is_null() {
                 return res;
             }
-            optional(res, &xmlSecAttrId, id);
-            optional(res, &xmlSecAttrType, kind);
-            optional(res, &xmlSecAttrRecipient, recipient);
-            if !prepare_enc_data(res, enc_method_id) {
+            let attributes = [
+                (&xmlSecAttrId[..], id),
+                (&xmlSecAttrType[..], kind),
+                (&xmlSecAttrRecipient[..], recipient),
+            ];
+            if !optionals(res, &attributes, here) || !prepare_enc_data(res, enc_method_id) {
                 discard(res);
                 return std::ptr::null_mut();
             }

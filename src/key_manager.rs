@@ -1958,7 +1958,7 @@ impl KeyInventory {
                     components.modulus.as_bytes(),
                     components.public_exponent.as_bytes(),
                 )
-                .map_err(|_| KeyStoreError::Selection("RSA public key exceeds safety limit"))?;
+                .map_err(|_| KeyStoreError::Selection(RSA_PUBLIC_KEY_LIMIT))?;
                 // Wrap borrowed PKCS#1 bytes directly; the final SPKI importer
                 // performs native RSA validation once, without an intermediate key.
                 let spki = pkcs8::SubjectPublicKeyInfoRef {
@@ -3114,6 +3114,25 @@ fn find_named_entry<'a, T>(
 #[cfg(feature = "xmldsig-sign")]
 pub(crate) const CANNOT_DECRYPT: &str = "private key cannot recover encryption keys";
 
+/// The selection refusals of an RSA key whose components pass the
+/// implementation's safety ceiling.
+const RSA_PUBLIC_KEY_LIMIT: &str = "RSA public key exceeds safety limit";
+const RSA_MODULUS_LIMIT: &str = "RSA modulus exceeds safety limit";
+const RSA_COMPONENT_LIMIT: &str = "RSA component exceeds safety limit";
+
+impl KeyStoreError {
+    /// Whether this is the refusal of a key whose components pass the
+    /// implementation's safety ceiling: the key's own failure, which no other
+    /// password or importer can turn into success.
+    #[must_use]
+    pub fn is_component_limit(&self) -> bool {
+        matches!(
+            self,
+            Self::Selection(RSA_PUBLIC_KEY_LIMIT | RSA_MODULUS_LIMIT | RSA_COMPONENT_LIMIT)
+        )
+    }
+}
+
 fn named_material_length(
     name: &str,
     payload: usize,
@@ -3424,7 +3443,7 @@ pub fn preflight_rsa_pkcs1_components(der: &[u8]) -> Result<(), KeyStoreError> {
             .first()
             .is_some_and(|first| modulus.len() * 8 - first.leading_zeros() as usize > maximum)
     {
-        return Err(KeyStoreError::Selection("RSA modulus exceeds safety limit"));
+        return Err(KeyStoreError::Selection(RSA_MODULUS_LIMIT));
     }
     if [
         key.public_exponent,
@@ -3445,9 +3464,7 @@ pub fn preflight_rsa_pkcs1_components(der: &[u8]) -> Result<(), KeyStoreError> {
             })
         })
     {
-        return Err(KeyStoreError::Selection(
-            "RSA component exceeds safety limit",
-        ));
+        return Err(KeyStoreError::Selection(RSA_COMPONENT_LIMIT));
     }
     Ok(())
 }

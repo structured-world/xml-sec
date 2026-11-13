@@ -131,3 +131,18 @@ fn an_spki_of_another_family_or_malformed_is_no_key_value() {
         ));
     }
 }
+
+#[test]
+fn a_node_that_is_no_element_is_no_key_value() {
+    // A text node or the document node has an empty name; read as an
+    // unsupported key value, a caller skipping those would skip malformed
+    // input in silence.
+    let doc = crate::Document::parse("<r>text</r>").expect("a document");
+    let text = doc.root_element().first_child().expect("a text node");
+    for node in [text, doc.root()] {
+        assert!(matches!(
+            crate::xmldsig::parse_key_value_child(node),
+            Err(crate::xmldsig::ParseError::InvalidStructure(_))
+        ));
+    }
+}

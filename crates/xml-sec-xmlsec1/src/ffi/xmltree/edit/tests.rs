@@ -353,6 +353,69 @@ fn a_qname_that_is_not_text_fails_the_write_before_a_child_is_added() {
 }
 
 #[test]
+fn a_qname_the_child_would_read_as_another_name_is_refused() {
+    // The name `one` of `{urn:a}one` is written for the parent's default
+    // namespace; the child in `urn:b` declares its own default, under which
+    // the same text reads `{urn:b}one`. The writers refuse rather than write
+    // a name that reads back as another entry, and take the child back.
+    use crate::ffi::xmltree::qname::{
+        QName2BitMaskInfo, QName2IntegerInfo, xmlSecQName2BitMaskNodesWrite,
+        xmlSecQName2IntegerNodeWrite,
+    };
+    let (href, local) = (b"urn:a\0", b"one\0");
+    let integers = [
+        QName2IntegerInfo {
+            href: href.as_ptr(),
+            local: local.as_ptr(),
+            value: 1,
+        },
+        QName2IntegerInfo {
+            href: std::ptr::null(),
+            local: std::ptr::null(),
+            value: 0,
+        },
+    ];
+    let masks = [
+        QName2BitMaskInfo {
+            href: href.as_ptr(),
+            local: local.as_ptr(),
+            mask: 1,
+        },
+        QName2BitMaskInfo {
+            href: std::ptr::null(),
+            local: std::ptr::null(),
+            mask: 0,
+        },
+    ];
+    let xml = r#"<r xmlns="urn:a"/>"#;
+    // SAFETY: tables that outlive the calls; the document is freed once.
+    unsafe {
+        let doc = xmlSecParseMemory(xml.as_ptr(), xml.len(), 1);
+        assert!(!doc.is_null(), "the document parses");
+        let root = xsDocGetRootElement(doc);
+        let (name, ns) = (c"c".as_ptr().cast(), c"urn:b".as_ptr().cast());
+        assert_eq!(
+            xmlSecQName2IntegerNodeWrite(integers.as_ptr(), root, name, ns, 1),
+            -1
+        );
+        assert_eq!(
+            xmlSecQName2BitMaskNodesWrite(masks.as_ptr(), root, name, ns, 1),
+            -1
+        );
+        assert!(
+            crate::ffi::xmltree::xmlSecGetNextElementNode(nodes::first_child(root)).is_null(),
+            "no child element is left behind"
+        );
+        // In the parent's own namespace the name reads as written.
+        assert_eq!(
+            xmlSecQName2IntegerNodeWrite(integers.as_ptr(), root, name, href.as_ptr(), 1),
+            0
+        );
+        xsFreeDoc(doc);
+    }
+}
+
+#[test]
 fn a_content_setter_reports_a_node_that_cannot_hold_text() {
     // The document node holds no text: the setters that return a status say
     // so instead of reporting success over unchanged content.

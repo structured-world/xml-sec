@@ -197,12 +197,10 @@ impl KeyInventory {
                     // A decrypted key over a safety ceiling, or of a family
                     // that cannot serve the requested usage, is that key's
                     // failure, not the password's.
-                    KeyStoreError::Policy(_)
-                    | KeyStoreError::Selection(
-                        "RSA modulus exceeds safety limit"
-                        | "RSA component exceeds safety limit"
-                        | super::CANNOT_DECRYPT,
-                    ) => error,
+                    KeyStoreError::Policy(_) | KeyStoreError::Selection(super::CANNOT_DECRYPT) => {
+                        error
+                    }
+                    _ if error.is_component_limit() => error,
                     _ if traditional.encrypted => KeyStoreError::ProtectedContainer,
                     _ => error,
                 })

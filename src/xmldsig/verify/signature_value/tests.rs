@@ -10,6 +10,11 @@ fn key() -> HmacVerificationKey {
     HmacVerificationKey::new(SECRET.to_vec()).expect("a 256-bit HMAC key")
 }
 
+/// The empty context of a method that takes none.
+fn none() -> crate::xmldsig::SignatureContext {
+    crate::xmldsig::SignatureContext::default()
+}
+
 #[test]
 fn an_expired_policy_is_refused_before_verification() {
     // A policy whose authorization interval has ended admits nothing, as
@@ -35,6 +40,7 @@ fn an_expired_policy_is_refused_before_verification() {
         default_provider(),
         &key(),
         SignatureAlgorithm::HmacSha256,
+        &none(),
         DATA,
         &[0; 32],
     );
@@ -191,12 +197,26 @@ mod selected_provider {
         let value = mac();
         let mut policy = VerificationPolicy::default();
         policy.resources.max_key_candidates = 0;
-        let refused =
-            verify_signature_value(&policy, default_provider(), &key(), algorithm, DATA, &value);
+        let refused = verify_signature_value(
+            &policy,
+            default_provider(),
+            &key(),
+            algorithm,
+            &none(),
+            DATA,
+            &value,
+        );
         assert!(matches!(refused, Err(DsigError::Policy(_))), "{refused:?}");
         policy.resources.max_key_candidates = 1;
-        let admitted =
-            verify_signature_value(&policy, default_provider(), &key(), algorithm, DATA, &value);
+        let admitted = verify_signature_value(
+            &policy,
+            default_provider(),
+            &key(),
+            algorithm,
+            &none(),
+            DATA,
+            &value,
+        );
         assert!(matches!(admitted, Ok(true)), "{admitted:?}");
     }
 
@@ -219,6 +239,7 @@ mod selected_provider {
                 default_provider(),
                 &key(),
                 SignatureAlgorithm::HmacSha256,
+                &none(),
                 DATA,
                 &mac(),
             );
@@ -239,6 +260,7 @@ mod selected_provider {
             default_provider(),
             &key(),
             SignatureAlgorithm::HmacSha256,
+            &none(),
             DATA,
             &mac(),
         );
@@ -270,10 +292,61 @@ mod selected_provider {
             default_provider(),
             &AcceptingKey,
             SignatureAlgorithm::HmacSha256,
+            &none(),
             DATA,
             &mac()[..1],
         );
         assert!(matches!(refused, Err(DsigError::Policy(_))), "{refused:?}");
+    }
+
+    /// Lowercase hex as bytes.
+    fn hex(text: &str) -> Vec<u8> {
+        (0..text.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&text[at..at + 2], 16).expect("hex"))
+            .collect()
+    }
+
+    #[test]
+    fn a_method_with_a_context_verifies_under_that_context() {
+        // RFC 8032 section 7.2, Ed25519ctx with the context "foo": the value
+        // verifies under that context and under no other, so the caller's
+        // context reaches the provider rather than an empty one.
+        let algorithm = SignatureAlgorithm::Ed25519Ctx;
+        let mut spki = hex("302a300506032b6570032100");
+        spki.extend(hex(
+            "dfc9425e4f968f7f0c29f0259cf5f9aed6851c2bb4ad8bfb860cfee0ab248292",
+        ));
+        let key = crate::xmldsig::VerificationKey {
+            algorithm,
+            public_key_bytes: spki,
+            certificate_der: None,
+            name: None,
+        };
+        let message = hex("f726936d19c800494e3fdaff20b276a8");
+        let value = hex(
+            "55a4cc2f70a54e04288c5f4cd1e45a7bb520b36292911876cada7323198dd87a\
+             8b36950b95130022907a7fb7c4e9b2d5f6cca685a587b4b21f4b888e4e7edb0d",
+        );
+        let policy = VerificationPolicy::default();
+        let foo = crate::xmldsig::SignatureContext::new(b"foo").expect("a short context");
+        let verify = |context: &crate::xmldsig::SignatureContext| {
+            verify_signature_value(
+                &policy,
+                default_provider(),
+                &key,
+                algorithm,
+                context,
+                &message,
+                &value,
+            )
+        };
+        assert!(matches!(verify(&foo), Ok(true)), "{:?}", verify(&foo));
+        assert!(
+            matches!(verify(&none()), Ok(false)),
+            "{:?}",
+            verify(&none())
+        );
     }
 
     #[test]
@@ -283,14 +356,22 @@ mod selected_provider {
         let policy = VerificationPolicy::default();
         let algorithm = SignatureAlgorithm::HmacSha256;
         let value = mac();
-        let built_in =
-            verify_signature_value(&policy, default_provider(), &key(), algorithm, DATA, &value);
+        let built_in = verify_signature_value(
+            &policy,
+            default_provider(),
+            &key(),
+            algorithm,
+            &none(),
+            DATA,
+            &value,
+        );
         assert!(matches!(built_in, Ok(true)), "{built_in:?}");
         let refused = verify_signature_value(
             &policy,
             &RefusingVerification,
             &key(),
             algorithm,
+            &none(),
             DATA,
             &value,
         );

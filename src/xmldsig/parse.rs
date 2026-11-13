@@ -2302,8 +2302,8 @@ pub(crate) fn parse_key_value_dispatch(node: Node) -> Result<KeyValueInfo, Parse
 /// cannot use is [`KeyValueInfo::InvalidEcKeyValue`].
 ///
 /// # Errors
-/// Returns [`ParseError`] for a supported element whose structure or
-/// `CryptoBinary` content is malformed.
+/// Returns [`ParseError`] for a node that is no element, or a supported
+/// element whose structure or `CryptoBinary` content is malformed.
 ///
 /// # Examples
 ///
@@ -2322,6 +2322,13 @@ pub(crate) fn parse_key_value_dispatch(node: Node) -> Result<KeyValueInfo, Parse
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub fn parse_key_value_child(node: Node) -> Result<KeyValueInfo, ParseError> {
+    // Only an element names a key value; any other node has an empty name
+    // that would read as an unsupported one.
+    if !node.is_element() {
+        return Err(ParseError::InvalidStructure(
+            "a key value must be an element".into(),
+        ));
+    }
     match (node.tag_name().namespace(), node.tag_name().name()) {
         (Some(XMLDSIG_NS), "RSAKeyValue") => parse_rsa_key_value(node),
         (Some(XMLDSIG_NS), "DSAKeyValue") => parse_dsa_key_value(node),

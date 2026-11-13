@@ -84,6 +84,50 @@ pub(crate) struct RunBudget {
     /// dereferences; a run of its own opens the classes of a signature's
     /// references.
     uris: Option<UriTypeSet>,
+    /// The operation the run serves, fixed with its policy revision: a
+    /// `KeyInfo` read verifies, any other run signs when one of its
+    /// transforms signs.
+    side: Option<policy::Side>,
+}
+
+/// The operation the chain of `ctx` serves: signing when one of its
+/// transforms signs.
+///
+/// # Safety
+/// `ctx` is an initialized context whose chain is live.
+unsafe fn chain_side(ctx: *mut XmlSecTransformCtx) -> policy::Side {
+    // SAFETY: by the caller's contract.
+    let mut current = unsafe { (*ctx).first };
+    while !current.is_null() {
+        // SAFETY: the chain's transforms are live.
+        unsafe {
+            if (*current).operation == super::OPERATION_SIGN {
+                return policy::Side::Sign;
+            }
+            current = (*current).next;
+        }
+    }
+    policy::Side::Verify
+}
+
+/// The policy revision the run of `ctx` runs under and the side of it that
+/// governs the chain's shared work (budgets, URIs, parsing, canonicalization
+/// and selection), fixed at its first read; reported at `here` when the
+/// profile is unavailable.
+///
+/// # Safety
+/// `ctx` is an initialized context whose chain is live.
+pub(crate) unsafe fn run_scope(
+    ctx: *mut XmlSecTransformCtx,
+    here: errors::Here,
+) -> Option<(policy::Pinned, policy::Side)> {
+    // SAFETY: by the caller's contract.
+    unsafe {
+        let pinned = run_policy(ctx, here)?;
+        let side = chain_side(ctx);
+        let run = run_budget(ctx);
+        Some((pinned, *run.side.get_or_insert(side)))
+    }
 }
 
 /// The policy revision the run of `ctx` runs under, pinned at its first
@@ -121,6 +165,8 @@ pub(crate) unsafe fn seed_run(
     if run.policy.is_none() {
         run.policy = Some(pinned.clone());
     }
+    // A key read verifies whatever the chain's transforms say.
+    run.side = Some(policy::Side::Verify);
     run.uris = Some(uris);
     run.base64_input = spent.base64_input;
     run.base64_output = spent.base64_output;
@@ -566,6 +612,14 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxCopyUserPref(
             !src.is_null(),
             "xmlSecTransformCtxCopyUserPref",
             c"src != NULL",
+            -1
+        );
+        // The contexts are borrowed apart below; one context as both would
+        // alias them.
+        check!(
+            dst != src,
+            "xmlSecTransformCtxCopyUserPref",
+            c"dst != src",
             -1
         );
         // SAFETY: initialized contexts.
@@ -1225,10 +1279,10 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxPrepare(
         // every execution passes here, before any transform runs, and
         // the bound also limits the push recursion through the chain.
         // SAFETY: an initialized context, reached through its borrow.
-        let Some(pinned) = (unsafe { run_policy(&raw mut *context, here) }) else {
+        let Some((pinned, side)) = (unsafe { run_scope(&raw mut *context, here) }) else {
             return -1;
         };
-        let max = pinned.verification.resources.max_transforms_per_reference;
+        let max = pinned.of(side).resources().max_transforms_per_reference;
         let mut length = 0usize;
         let mut current = context.first;
         while !current.is_null() {
@@ -1388,13 +1442,11 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxUriExecute(
             let name = (*(*input).id).name.cast();
             // The URI is admitted under the run's policy revision, by the
             // classes of the key reference a KeyInfo read runs it for, or
-            // else of a signature's references.
-            let Some(pinned) = run_policy(ctx, here) else {
+            // else of the references of the operation the chain serves.
+            let Some((pinned, side)) = run_scope(ctx, here) else {
                 return -1;
             };
-            let classes = run_budget(ctx)
-                .uris
-                .unwrap_or(pinned.verification.uris.references);
+            let classes = run_budget(ctx).uris.unwrap_or(pinned.of(side).references());
             if io::open(input, uri, Some(classes)) < 0 {
                 errors::internal_with(
                     here,

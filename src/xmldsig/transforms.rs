@@ -1293,7 +1293,58 @@ pub fn execute_transforms<'a>(
     )
 }
 
-/// Execute a standalone reference chain with a trusted verification policy snapshot.
+mod chain_policy_sealed {
+    pub trait Sealed {}
+}
+
+/// An operation policy snapshot that governs a reference chain: the
+/// verification policy of a verifier, the signing policy of a signer, each
+/// with its own transform permissions, XML allowances and limits.
+pub trait TransformChainPolicy: chain_policy_sealed::Sealed {
+    #[doc(hidden)]
+    fn validate_snapshot(&self) -> Result<(), crate::policy::PolicyViolation>;
+
+    #[doc(hidden)]
+    fn transform_policy(&self) -> &crate::policy::TransformPolicy;
+
+    #[doc(hidden)]
+    fn xml_policy(&self) -> &crate::policy::XmlInputPolicy;
+
+    #[doc(hidden)]
+    fn resources_policy(&self) -> &crate::policy::ResourcePolicy;
+}
+
+macro_rules! impl_chain_policy {
+    ($policy:ty) => {
+        impl chain_policy_sealed::Sealed for $policy {}
+
+        impl TransformChainPolicy for $policy {
+            fn validate_snapshot(&self) -> Result<(), crate::policy::PolicyViolation> {
+                self.validate()
+            }
+
+            fn transform_policy(&self) -> &crate::policy::TransformPolicy {
+                &self.transforms
+            }
+
+            fn xml_policy(&self) -> &crate::policy::XmlInputPolicy {
+                &self.xml
+            }
+
+            fn resources_policy(&self) -> &crate::policy::ResourcePolicy {
+                &self.resources
+            }
+        }
+    };
+}
+
+impl_chain_policy!(crate::policy::VerificationPolicy);
+impl_chain_policy!(crate::policy::SigningPolicy);
+
+/// Execute a standalone reference chain under a trusted operation policy
+/// snapshot: a [`VerificationPolicy`](crate::policy::VerificationPolicy) for
+/// a chain that verifies, a [`SigningPolicy`](crate::policy::SigningPolicy)
+/// for one that signs.
 ///
 /// Applies transform permissions, OPC edition, `XPath` semantics, XML allowances,
 /// and aggregate resource limits. This does not verify a signature or resolve keys.
@@ -1307,18 +1358,18 @@ pub fn execute_transforms_with_policy<'a>(
     signature_node: Node<'a, 'a>,
     initial_data: TransformData<'a>,
     transforms: &[Transform],
-    policy: &crate::policy::VerificationPolicy,
+    policy: &impl TransformChainPolicy,
 ) -> Result<Vec<u8>, TransformError> {
-    policy.validate()?;
-    if transforms.len() > policy.resources.max_transforms_per_reference {
+    policy.validate_snapshot()?;
+    let resources = policy.resources_policy();
+    if transforms.len() > resources.max_transforms_per_reference {
         return Err(transform_resource_limit(
             crate::policy::resource_name::REFERENCE_TRANSFORMS,
-            policy.resources.max_transforms_per_reference,
+            resources.max_transforms_per_reference,
             transforms.len(),
         ));
     }
-    let parameters =
-        relationship::WorkspaceBudget::parameters(policy.resources.max_opc_parameter_bytes);
+    let parameters = relationship::WorkspaceBudget::parameters(resources.max_opc_parameter_bytes);
     for transform in transforms {
         if let Transform::Relationship(selectors) = transform {
             relationship::validate_owned_selectors(selectors, &parameters)?;
@@ -1332,15 +1383,16 @@ pub fn execute_transforms_with_policy<'a>(
                 | TransformData::Resource { .. }
         ),
         transforms,
-        policy.transforms.allowed_algorithms.as_ref(),
+        policy.transform_policy().allowed_algorithms.as_ref(),
         "transform execution",
     )?;
+    let permissions = policy.transform_policy();
     let options = TransformOptions::default()
-        .opc_relationship_edition(policy.transforms.opc_relationship_edition)
-        .xpath_here_semantics(policy.transforms.xpath_here_semantics)
-        .xslt_stylesheet_semantics(policy.transforms.xslt_stylesheet_semantics)
-        .allow_internal_dtd(policy.xml.allow_internal_dtd);
-    let budget = TransformExecutionBudget::from_resources(&policy.resources);
+        .opc_relationship_edition(permissions.opc_relationship_edition)
+        .xpath_here_semantics(permissions.xpath_here_semantics)
+        .xslt_stylesheet_semantics(permissions.xslt_stylesheet_semantics)
+        .allow_internal_dtd(policy.xml_policy().allow_internal_dtd);
+    let budget = TransformExecutionBudget::from_resources(resources);
     execute_transforms_with_options_and_budget(
         signature_node,
         initial_data,

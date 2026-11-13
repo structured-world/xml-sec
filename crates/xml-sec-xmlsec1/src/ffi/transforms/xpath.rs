@@ -24,6 +24,7 @@ use super::super::nodeset::{
     xmlSecNodeSetAdd, xmlSecNodeSetCreate, xmlSecNodeSetDestroy, xmlSecNodeSetGetChildren,
     xmlSecNodeSetWalk,
 };
+use super::super::policy;
 use super::super::strings::{
     xmlSecAttrFilter, xmlSecDSigNs, xmlSecNameXPath, xmlSecNameXPath2, xmlSecNameXPointer,
     xmlSecNodeXPath, xmlSecNodeXPath2, xmlSecNodeXPointer, xmlSecXPath2FilterIntersect,
@@ -34,7 +35,7 @@ use super::super::tree::{XmlDoc, XmlNode, XmlNodeSet, c_text, nodes, same_text};
 use super::super::xmltree::{next_element, xmlSecCheckNodeName};
 use super::super::{contain, free, malloc};
 use super::builtin::klass;
-use super::ctx::run_policy;
+use super::ctx::run_scope;
 use super::{
     USAGE_DSIG_TRANSFORM, WithContext, XmlSecTransform, XmlSecTransformCtx, XmlSecTransformKlass,
     context, context_or, klass_text, valid, xmlSecTransformDefaultPopXml,
@@ -710,13 +711,13 @@ unsafe extern "C" fn execute(
         -1
     );
     // SAFETY: an initialized context.
-    let Some(pinned) = (unsafe { run_policy(ctx, here) }) else {
+    let Some((pinned, side)) = (unsafe { run_scope(ctx, here) }) else {
         return -1;
     };
     // SAFETY: an expression transform read from a live element.
-    let Some(output) =
-        (unsafe { evaluate_list(expressions, object.in_nodes, doc, &pinned.verification) })
-    else {
+    let Some(output) = policy::with_document_policy!(pinned.of(side), |policy| unsafe {
+        evaluate_list(expressions, object.in_nodes, doc, policy)
+    }) else {
         // SAFETY: a valid transform.
         let name = unsafe { name_of(transform) };
         errors::internal(here, name, c"xmlSecXPathDataListExecute");
@@ -737,7 +738,7 @@ unsafe fn evaluate_list(
     list: &mut XmlSecPtrList,
     input: *mut XmlSecNodeSet,
     doc: *mut XmlDoc,
-    policy: &xml_sec::policy::VerificationPolicy,
+    policy: &impl xml_sec::document::XmlDocumentPolicy,
 ) -> Option<*mut XmlSecNodeSet> {
     let here = here!("xmlSecXPathDataListExecute");
     // The core evaluates over a snapshot of the tree in place of libxml2's
@@ -761,7 +762,7 @@ unsafe fn evaluate_list(
     // One selector for the whole transform: its expressions charge the same
     // budgets, each with its own here().
     document.with_view(|view| {
-        let mut selector = match Selector::new(view, None, &[], &policy.resources) {
+        let mut selector = match Selector::new(view, None, &[], policy.resource_policy()) {
             Ok(selector) => selector,
             Err(error) => {
                 failed(&error.to_string());

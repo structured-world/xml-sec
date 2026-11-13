@@ -5,12 +5,13 @@
 //! under its algorithm, key and HMAC rules.
 
 use std::cell::Cell;
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 use std::sync::Arc;
 
 use super::errors::{self, Here};
 
-use xml_sec::policy::{SigningPolicy, VerificationPolicy};
+use xml_sec::policy::{ResourcePolicy, SigningPolicy, VerificationPolicy};
+use xml_sec::xmldsig::UriTypeSet;
 
 /// The current verification snapshot; `None` when it cannot be compiled.
 pub(crate) fn verification() -> Option<Arc<VerificationPolicy>> {
@@ -49,7 +50,62 @@ impl Pinned {
             signing,
         })
     }
+
+    /// The snapshot of this revision that governs work on `side`.
+    pub(crate) fn of(&self, side: Side) -> OperationPolicy<'_> {
+        match side {
+            Side::Verify => OperationPolicy::Verify(&self.verification),
+            Side::Sign => OperationPolicy::Sign(&self.signing),
+        }
+    }
 }
+
+/// The operation a run of a transform chain serves: signing when one of its
+/// transforms signs (a signature method, or a reference's digest method set
+/// to sign), verification otherwise, as libxmlsec1 marks each transform with
+/// its operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Side {
+    Verify,
+    Sign,
+}
+
+/// The snapshot of one side of a pinned revision.
+#[derive(Clone, Copy)]
+pub(crate) enum OperationPolicy<'a> {
+    Verify(&'a VerificationPolicy),
+    Sign(&'a SigningPolicy),
+}
+
+impl<'a> OperationPolicy<'a> {
+    /// The resource ceilings of the operation.
+    pub(crate) fn resources(self) -> &'a ResourcePolicy {
+        match self {
+            Self::Verify(policy) => &policy.resources,
+            Self::Sign(policy) => &policy.resources,
+        }
+    }
+
+    /// The URI classes the operation admits for a signature's references.
+    pub(crate) fn references(self) -> UriTypeSet {
+        match self {
+            Self::Verify(policy) => policy.uris.references,
+            Self::Sign(policy) => policy.uris.references,
+        }
+    }
+}
+
+/// `$body` with `$policy` bound to the snapshot `$operation` selects, typed
+/// as that policy, for a call that takes `&impl XmlDocumentPolicy`.
+macro_rules! with_document_policy {
+    ($operation:expr, |$policy:ident| $body:expr) => {
+        match $operation {
+            $crate::ffi::policy::OperationPolicy::Verify($policy) => $body,
+            $crate::ffi::policy::OperationPolicy::Sign($policy) => $body,
+        }
+    };
+}
+pub(crate) use with_document_policy;
 
 /// What one operation has spent of the policy's per-operation budgets,
 /// carried from one transform run it drives to the next, as the core
@@ -70,6 +126,21 @@ pub(crate) struct KeyCandidates {
     /// A search was refused for the allowance; the read fails rather than
     /// taking the refusal for a missing key.
     pub(crate) exhausted: bool,
+}
+
+impl KeyCandidates {
+    /// Charges one more candidate within `max`; refused, marked exhausted and
+    /// reported for `object` at `here` once the allowance is spent.
+    pub(crate) fn charge(&mut self, max: usize, here: Here, object: *const c_char) -> bool {
+        if self.inspected >= max {
+            self.exhausted = true;
+            errors::limit_exceeded(here, object, "max_key_candidates", max);
+            return false;
+        }
+        // Below `max`, so the count cannot overflow.
+        self.inspected += 1;
+        true
+    }
 }
 
 /// What a context's reserved slot holds during an operation: its policy

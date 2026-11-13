@@ -734,9 +734,7 @@ fn container_error(error: KeyStoreError, path: &Path) -> KeyMaterialError {
 fn terminal_import_error(error: KeyStoreError) -> Result<KeyMaterialError, KeyStoreError> {
     match error {
         KeyStoreError::ProtectedContainer => Ok(KeyMaterialError::ProtectedContainer),
-        KeyStoreError::Selection(reason) if reason.contains("safety limit") => {
-            Ok(KeyMaterialError::PrivateKeyComponents(error))
-        }
+        error if error.is_component_limit() => Ok(KeyMaterialError::PrivateKeyComponents(error)),
         error => Err(error),
     }
 }

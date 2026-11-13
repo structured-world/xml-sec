@@ -22,7 +22,7 @@ use super::super::list::{
 };
 use super::super::{contain, free, malloc, policy};
 use super::builtin::klass;
-use super::ctx::{Limit, charge, run_budget, run_policy};
+use super::ctx::{Limit, charge, run_budget, run_scope};
 use super::{
     DATA_BIN, Global, MODE_POP, MODE_PUSH, WithContext, XmlSecTransform, XmlSecTransformCtx,
     XmlSecTransformKlass, context_or, valid, xmlSecTransformDefaultGetDataType,
@@ -467,10 +467,10 @@ unsafe extern "C" fn input_uri_pop_bin(
         return 0;
     };
     // SAFETY: an initialized context.
-    let Some(pinned) = (unsafe { run_policy(ctx, here) }) else {
+    let Some((pinned, served)) = (unsafe { run_scope(ctx, here) }) else {
         return -1;
     };
-    let resources = &pinned.verification.resources;
+    let resources = pinned.of(served).resources();
     // SAFETY: the context's run budget.
     let budget = unsafe { run_budget(ctx) };
     let per_resource = Limit {

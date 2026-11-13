@@ -4,7 +4,7 @@
 
 use std::ffi::{CStr, c_int, c_uint, c_void};
 
-use xml_sec_libxml2::ffi::tree::{xsGetProp, xsSetProp};
+use xml_sec_libxml2::ffi::tree::{xsFreeNode, xsGetProp, xsSetProp, xsUnlinkNode};
 
 use super::super::errors::{self, Here, check, here};
 use super::super::tree::{XmlNode, c_text, nodes, xmlStrEqual};
@@ -462,6 +462,12 @@ pub(crate) unsafe extern "C" fn xmlSecQName2IntegerNodeWrite(
                 free(qname.cast());
                 return -1;
             }
+            // The entry exists: the name was made from it above.
+            let entry = xmlSecQName2IntegerGetInfo(info, int_value);
+            if !bound_alike(node, cur, qname, (*entry).href, here) {
+                free(qname.cast());
+                return -1;
+            }
             let set = set_reported(cur, content, here);
             free(qname.cast());
             if !set {
@@ -470,6 +476,61 @@ pub(crate) unsafe extern "C" fn xmlSecQName2IntegerNodeWrite(
         }
         0
     })
+}
+
+/// Whether the prefix of `qname` (none: the default namespace) is bound to
+/// `href` (null or empty: no namespace) in the scope of `node`.
+///
+/// # Safety
+/// `node` is a live node; `qname` NUL-terminated; `href` null or
+/// NUL-terminated.
+unsafe fn names_href(node: *mut XmlNode, qname: *const u8, href: *const u8) -> bool {
+    // SAFETY: by the caller's contract.
+    let (Some(qname), wanted) = (unsafe { c_text(qname) }, unsafe { c_text(href) }) else {
+        return false;
+    };
+    let prefix = qname.split_once(':').map(|(prefix, _)| prefix);
+    nodes::in_scope(node, prefix).as_deref().unwrap_or("") == wanted.unwrap_or("")
+}
+
+/// Whether the name `qname`, made in `parent` for an entry in `href`, keeps
+/// that namespace in `child`; otherwise reported at `here` and `child` taken
+/// back. The child's own namespace can rebind the prefix the name uses (a
+/// default namespace for an unprefixed name), and a name read in another
+/// namespace is not the value written. A name `parent` already reads in
+/// another namespace is libxmlsec1's own (`xmlSecGetQName` writes the bare
+/// local part for an entry in no namespace) and is written as libxmlsec1
+/// writes it.
+///
+/// # Safety
+/// `parent` and `child` are live nodes; `qname` is NUL-terminated; `href`
+/// null or NUL-terminated.
+unsafe fn bound_alike(
+    parent: *mut XmlNode,
+    child: *mut XmlNode,
+    qname: *const u8,
+    href: *const u8,
+    here: Here,
+) -> bool {
+    // SAFETY: by the caller's contract.
+    if unsafe { !names_href(parent, qname, href) || names_href(child, qname, href) } {
+        return true;
+    }
+    errors::other(
+        here,
+        errors::R_INVALID_DATA,
+        std::ptr::null(),
+        Some(&format!(
+            "qname={} reads as another name in the child",
+            text(qname)
+        )),
+    );
+    // SAFETY: by the caller's contract.
+    unsafe {
+        xsUnlinkNode(child);
+        xsFreeNode(child);
+    }
+    false
 }
 
 /// The qualified name `qname` as the text `xmlNodeSetContent` stores; a
@@ -1069,6 +1130,10 @@ pub(crate) unsafe extern "C" fn xmlSecQName2BitMaskNodesWrite(
                         c"xmlSecAddChild",
                         &format!("node={}", text(node_name_)),
                     );
+                    free(qname.cast());
+                    return -1;
+                }
+                if !bound_alike(node, cur, qname, entry.href, here) {
                     free(qname.cast());
                     return -1;
                 }
