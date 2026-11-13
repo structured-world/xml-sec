@@ -364,14 +364,12 @@ cbc = { version = "0.2.1", features = ["zeroize"], optional = true }
 des = { version = "0.9", features = ["zeroize"], optional = true }
 md-5 = { version = "0.11", features = ["oid", "zeroize"], optional = true }
 ripemd = { version = "0.2.0", default-features = false, features = ["oid", "zeroize"], optional = true }
-pkcs12 = { version = "0.2.0-rc.0", default-features = false, features = ["kdf"], optional = true }
-pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"], optional = true }
 
 # X.509 certificates, and the seeded hashing of every table keyed by document content
 structured-asn1 = { version = "0.22", default-features = false, features = ["alloc"] }
 structured-pkix = { version = "0.22", default-features = false, features = ["alloc"], optional = true }
-# PKCS#12 container framing (this crate keeps the password, KDF and cipher
-# work) and the incremental HMAC of the HMAC signature methods.
+# PKCS#12 containers and their password engine, OpenSSL traditional private
+# keys, and the incremental HMAC of the HMAC signature methods.
 structured-cms = { version = "0.22", default-features = false, features = ["alloc"], optional = true }
 tinyvec = { version = "1.13", optional = true }
 # `pem` is RFC 7468 decoding of caller key and certificate text.
@@ -420,6 +418,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 time = "0.3.55"
 tempfile = "3"
+# Independent PKCS#12 and PBES2 encryption of test containers.
+pkcs12 = { version = "0.2.0-rc.0", default-features = false, features = ["kdf"] }
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
 
 [features]
 # Measurement hooks only; no checks are bypassed and no timers run in production.
@@ -515,13 +516,11 @@ xmldsig-sign = [
     # Signing randomness and the signature writer need the host.
     "std",
     "dep:getrandom",
-    "dep:pkcs12",
     "dep:structured-cms",
-    # OpenSSL traditional private keys and the password engine of PKCS#12 and
-    # encrypted PKCS#8 are the shared primitives'.
+    # OpenSSL traditional private keys and the password engine of PKCS#12
+    # are the shared primitives'.
     "structured-cms/openssl",
     "structured-cms/password-protection",
-    "dep:pbkdf2",
     "dep:aes",
     "dep:cbc",
     "dep:des",

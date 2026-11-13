@@ -56,12 +56,21 @@ fn inventory_merge_preserves_import_work() {
     assert_eq!(inventory.key_import_kdf_work(), 5, "failed merge is atomic");
 }
 
+/// The KDF work one import of `bytes` with `password` spends under the
+/// default policy, kept even when the password is wrong.
+fn pkcs12_kdf_work(bytes: &[u8], password: &str) -> usize {
+    let mut probe = KeyInventory::default();
+    let _imported = probe.add_pkcs12("probe".into(), bytes, password, &ResourcePolicy::default());
+    probe.key_import_kdf_work()
+}
+
 #[test]
 fn repeated_pkcs12_imports_share_kdf_work() {
     // Each bundle fits by itself, but a session may not reset password work.
     let bytes = include_bytes!("../../tests/fixtures/xmlenc/01-phaos-xmlenc-3/rsa-priv-key.p12");
+    let one = pkcs12_kdf_work(bytes, "secret");
     let resources = ResourcePolicy {
-        max_key_import_kdf_work: 10_000,
+        max_key_import_kdf_work: one * 2 - 1,
         ..ResourcePolicy::default()
     };
     let mut single = KeyInventory::default();
@@ -165,8 +174,10 @@ fn pkcs12_mac_rejects_altered_safe_before_decryption() {
         .position(|v| v == [2, 2, 8, 0])
         .expect("PBKDF2 iterations");
     bytes[offset + 3] = 1;
+    // Room for the MAC alone, as a wrong password spends it: a decryption
+    // before the MAC would exceed it.
     let resources = ResourcePolicy {
-        max_key_import_kdf_work: 2048,
+        max_key_import_kdf_work: pkcs12_kdf_work(&bytes, "wrong"),
         ..ResourcePolicy::default()
     };
     let result = KeyInventory::default().add_pkcs12_with_password_callback(
@@ -209,20 +220,22 @@ fn pkcs12_content_count_denial_is_not_a_password_error() {
 
 #[test]
 fn pkcs12_aggregate_kdf_work_preserves_policy_error() {
-    // Individual counts fit, but MAC plus PBES2 exceeds one shared budget.
+    // Each step fits, but the MAC plus the decryptions exceed one shared
+    // budget a unit short of their sum.
+    let bytes = include_bytes!("../../tests/fixtures/xmlenc/01-phaos-xmlenc-3/rsa-priv-key.p12");
+    let limit = pkcs12_kdf_work(bytes, "secret") - 1;
     let resources = ResourcePolicy {
-        max_key_import_kdf_work: 3000,
+        max_key_import_kdf_work: limit,
         ..ResourcePolicy::default()
     };
-    let bytes = include_bytes!("../../tests/fixtures/xmlenc/01-phaos-xmlenc-3/rsa-priv-key.p12");
     assert!(matches!(
         KeyInventory::default().add_pkcs12("limited".into(), bytes, "secret", &resources),
         Err(KeyStoreError::Policy(
             crate::policy::PolicyViolation::ResourceLimitExceeded {
                 resource: crate::policy::resource_name::KEY_IMPORT_KDF_WORK,
-                maximum: 3000,
+                maximum,
             }
-        ))
+        )) if maximum == limit
     ));
 }
 

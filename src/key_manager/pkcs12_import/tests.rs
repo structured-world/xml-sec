@@ -1,5 +1,8 @@
 use super::*;
-use aes::cipher::BlockModeEncrypt as _;
+use aes::cipher::{BlockModeEncrypt as _, KeyIvInit as _, block_padding::Pkcs7};
+use der::asn1::ObjectIdentifier as Oid;
+use hmac::{Hmac, KeyInit as _, Mac as _};
+use pkcs12::kdf::{Pkcs12KeyType, derive_key};
 use std::cell::Cell;
 
 const DATA: Oid = Oid::new_unwrap("1.2.840.113549.1.7.1");
@@ -708,10 +711,13 @@ fn legacy_shrouded_key_and_hidden_limits() {
             }
         ))
     ));
-    // The outer safe needs 2 rounds x 3 blocks; the hidden key needs as much.
+    // A budget one unit short of both decryptions admits the outer safe and
+    // refuses the hidden key: the hidden step does not start a new budget.
+    let mut total = 0;
+    run_counted(&bytes, &limits(64), &mut total, password).expect("the whole bundle");
     let tight = Limits {
         resources: ResourcePolicy {
-            max_key_import_kdf_work: 6,
+            max_key_import_kdf_work: total - 1,
             ..ResourcePolicy::default()
         },
         ..limits(64)
@@ -719,16 +725,33 @@ fn legacy_shrouded_key_and_hidden_limits() {
     let mut work = 0;
     let (result, calls) = import_counting(&bytes, &tight, &mut work, password);
     assert_eq!(calls, 1, "the visible outer KDF fits");
-    assert!(matches!(
-        result,
-        Err(KeyStoreError::Policy(
-            PolicyViolation::ResourceLimitExceeded {
-                resource: resource_name::KEY_IMPORT_KDF_WORK,
-                maximum: 6
-            }
-        ))
-    ));
-    assert_eq!(work, 6, "work spent after the password is not refunded");
+    assert!(
+        matches!(
+            result,
+            Err(KeyStoreError::Policy(
+                PolicyViolation::ResourceLimitExceeded {
+                    resource: resource_name::KEY_IMPORT_KDF_WORK,
+                    maximum,
+                }
+            )) if maximum == total - 1
+        ),
+        "{:?}",
+        result.as_ref().err()
+    );
+    assert!(
+        work > 0 && work < total,
+        "the outer step's work is kept, not refunded"
+    );
+}
+
+/// Imports with `password`, adding the KDF work spent to `work`.
+fn run_counted(
+    bytes: &[u8],
+    limits: &Limits,
+    work: &mut usize,
+    password: &str,
+) -> Result<Contents> {
+    import(bytes, limits, work, || Some(password))
 }
 
 #[test]
@@ -918,26 +941,22 @@ fn kdf_integer_classification_preserves_ber_errors() {
         );
         assert_eq!(calls, 0);
     }
-    // 128 rounds pass the iteration check; 3DES's three blocks exceed 128.
-    let (result, calls) = import_counting(&shrouded(encoded(2, &[0, 128])), &limits, &mut 0, "x");
-    assert!(matches!(
-        result,
-        Err(KeyStoreError::Policy(
-            PolicyViolation::ResourceLimitExceeded {
-                resource: resource_name::KEY_IMPORT_KDF_WORK,
-                ..
-            }
-        ))
-    ));
-    assert_eq!(calls, 0);
-    let (result, calls) = import_counting(&shrouded(encoded(2, &[0, 129])), &limits, &mut 0, "x");
-    assert!(matches!(
-        result,
-        Err(KeyStoreError::Policy(
-            PolicyViolation::KdfIterationsOutsideLimit { maximum: 128 }
-        ))
-    ));
-    assert_eq!(calls, 0);
+    // Well-formed counts whose single step exceeds the whole KDF limit are
+    // policy refusals, decided before the password.
+    for rounds in [&[0, 128][..], &[0, 129][..]] {
+        let (result, calls) = import_counting(&shrouded(encoded(2, rounds)), &limits, &mut 0, "x");
+        assert!(
+            matches!(
+                result,
+                Err(KeyStoreError::Policy(
+                    PolicyViolation::KdfIterationsOutsideLimit { maximum: 128 }
+                ))
+            ),
+            "{rounds:?}: {:?}",
+            result.as_ref().err()
+        );
+        assert_eq!(calls, 0);
+    }
 }
 
 #[test]
@@ -1001,29 +1020,38 @@ fn oversized_kdf_integers_are_policy_failures() {
 
 #[test]
 fn pbes2_password_shares_work_and_live_memory_budget() {
-    // A no-MAC PFX still hashes its UTF-8 password before PBKDF2: 2 rounds
-    // of one block plus 256 / 64 password blocks is 6 units of work.
+    // A no-MAC PFX still hashes its UTF-8 password before PBKDF2: each 64
+    // password octets are one more unit of work, admitted after the
+    // password-independent cost.
+    let shrouded = |password: &str| {
+        let ciphertext =
+            aes128_pbes2_ciphertext(password.as_bytes(), b"salt", [7; 16], &private_key());
+        pfx(&[data(&sequence(&[bag(
+            pkcs12::PKCS_12_PKCS8_KEY_BAG_OID,
+            &sequence(&[
+                pbes2_aes128(b"salt", integer(2), encoded(4, &[7; 16])),
+                encoded(4, &ciphertext),
+            ]),
+        )]))])
+    };
     let password = "p".repeat(256);
     let private = private_key();
-    let iv = [7; 16];
-    let ciphertext = aes128_pbes2_ciphertext(password.as_bytes(), b"salt", iv, &private);
-    let bytes = pfx(&[data(&sequence(&[bag(
-        pkcs12::PKCS_12_PKCS8_KEY_BAG_OID,
-        &sequence(&[
-            pbes2_aes128(b"salt", integer(2), encoded(4, &iv)),
-            encoded(4, &ciphertext),
-        ]),
-    )]))]);
+    let bytes = shrouded(&password);
+    let mut needed = 0;
+    run_counted(&bytes, &limits(64), &mut needed, &password).expect("the default admits it");
+    let mut one_block = 0;
+    run_counted(&shrouded("p"), &limits(64), &mut one_block, "p").expect("a one-block password");
+    assert_eq!(needed - one_block, 3, "256 password octets are four blocks");
     let mut short = limits(64);
-    short.resources.max_key_import_kdf_work = 5;
+    short.resources.max_key_import_kdf_work = needed - 1;
     assert!(matches!(
         run(&bytes, &short, &password),
         Err(KeyStoreError::Policy(
             PolicyViolation::ResourceLimitExceeded {
                 resource: resource_name::KEY_IMPORT_KDF_WORK,
-                maximum: 5
+                maximum,
             }
-        ))
+        )) if maximum == needed - 1
     ));
     let mut narrow = limits(64);
     narrow.resources.max_external_resource_bytes = 255;
@@ -1037,7 +1065,7 @@ fn pbes2_password_shares_work_and_live_memory_budget() {
         ))
     ));
     let mut exact = limits(64);
-    exact.resources.max_key_import_kdf_work = 6;
+    exact.resources.max_key_import_kdf_work = needed;
     let contents = run(&bytes, &exact, &password).expect("exact work");
     assert_eq!(imported_key(&contents), private);
     // A callback's spare capacity is live memory for the whole import.
@@ -1071,49 +1099,60 @@ fn pbes2_cipher_prf_matrix_accepts_utf8_passwords_without_legacy_kdf() {
     // RFC 8018 PBES2 does not impose RFC 7292's legacy BMP password
     // conversion. Test every supported AES width and HMAC PRF with a
     // non-BMP UTF-8 password, including the default SHA-1 PRF.
+    type Kdf = fn(&[u8], &[u8], u32, &mut [u8]);
     let password = "secret\u{1f512}";
     let private = private_key();
     let salt = b"salt beyond the old fixed thirty-two byte representation";
     let iv = [7_u8; 16];
-    for (cipher, cipher_oid) in [
-        (Cipher::Aes128, pkcs8::pkcs5::pbes2::AES_128_CBC_OID),
-        (Cipher::Aes192, pkcs8::pkcs5::pbes2::AES_192_CBC_OID),
-        (Cipher::Aes256, pkcs8::pkcs5::pbes2::AES_256_CBC_OID),
+    let prfs: [(Option<Oid>, Kdf); 5] = [
+        // The DEFAULT PRF, written by omission.
+        (None, pbkdf2::pbkdf2_hmac::<sha1::Sha1>),
+        (
+            Some(Oid::new_unwrap("1.2.840.113549.2.8")),
+            pbkdf2::pbkdf2_hmac::<sha2::Sha224>,
+        ),
+        (
+            Some(Oid::new_unwrap("1.2.840.113549.2.9")),
+            pbkdf2::pbkdf2_hmac::<sha2::Sha256>,
+        ),
+        (
+            Some(Oid::new_unwrap("1.2.840.113549.2.10")),
+            pbkdf2::pbkdf2_hmac::<sha2::Sha384>,
+        ),
+        (
+            Some(Oid::new_unwrap("1.2.840.113549.2.11")),
+            pbkdf2::pbkdf2_hmac::<sha2::Sha512>,
+        ),
+    ];
+    for (key_len, cipher_oid) in [
+        (16, pkcs8::pkcs5::pbes2::AES_128_CBC_OID),
+        (24, pkcs8::pkcs5::pbes2::AES_192_CBC_OID),
+        (32, pkcs8::pkcs5::pbes2::AES_256_CBC_OID),
     ] {
-        for (hash, prf_oid) in Hash::ALL.into_iter().zip(Hash::HMACS) {
+        for (prf_oid, kdf) in prfs {
             let mut key = Zeroizing::new([0_u8; 32]);
-            with_hash!(
-                hash,
-                D,
-                pbkdf2::pbkdf2_hmac::<D>(
-                    password.as_bytes(),
-                    salt,
-                    2,
-                    &mut key[..cipher.key_len()]
-                )
-            );
+            kdf(password.as_bytes(), salt, 2, &mut key[..key_len]);
             let mut output = vec![0; private.len() + 16];
             macro_rules! encrypt {
                 ($cipher:ty) => {
-                    cbc::Encryptor::<$cipher>::new_from_slices(&key[..cipher.key_len()], &iv)
+                    cbc::Encryptor::<$cipher>::new_from_slices(&key[..key_len], &iv)
                         .expect("cipher")
                         .encrypt_padded_b2b::<Pkcs7>(&private, &mut output)
                         .expect("padding")
                         .to_vec()
                 };
             }
-            let ciphertext = match cipher {
-                Cipher::Aes128 => encrypt!(aes::Aes128Enc),
-                Cipher::Aes192 => encrypt!(aes::Aes192Enc),
-                Cipher::Aes256 => encrypt!(aes::Aes256Enc),
-                _ => unreachable!(),
+            let ciphertext = match key_len {
+                16 => encrypt!(aes::Aes128Enc),
+                24 => encrypt!(aes::Aes192Enc),
+                _ => encrypt!(aes::Aes256Enc),
             };
             let mut params = vec![
                 encoded(4, salt),
                 integer(2),
-                integer(u16::try_from(cipher.key_len()).expect("fixed cipher key width")),
+                integer(u16::try_from(key_len).expect("fixed cipher key width")),
             ];
-            if !matches!(hash, Hash::Sha1) {
+            if let Some(prf_oid) = prf_oid {
                 params.push(sequence(&[oid(prf_oid), encoded(5, &[])]));
             }
             let algorithm = sequence(&[

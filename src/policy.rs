@@ -595,8 +595,11 @@ pub struct ResourcePolicy {
     /// Maximum live allocation capacity retained by the shared certificate
     /// mechanism, including path search, Name processing and CRL evaluation.
     pub max_x509_workspace_bytes: usize,
-    /// Maximum aggregate PBKDF2/PKCS#12 hash rounds or conservative scrypt work
-    /// during key import, including PKCS#8 password-hashing work units.
+    /// Maximum aggregate key-derivation work during key import: for PKCS#12,
+    /// the work the shared password engine states for each step (hash rounds
+    /// with the input they read); for encrypted PKCS#8, PBKDF2 hash rounds or
+    /// conservative scrypt work, including password-hashing work units. A
+    /// single step over the whole limit is an iteration count outside it.
     pub max_key_import_kdf_work: usize,
     /// Maximum estimated scrypt or PKCS#12 KDF workspace bytes during key import.
     pub max_key_import_kdf_memory_bytes: usize,
