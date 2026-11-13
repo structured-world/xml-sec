@@ -31,7 +31,7 @@ use super::{DsigError, SignatureAlgorithm, VerificationScope, VerifyingKey};
 /// let secret = [0x42; 32];
 /// let mut mac = IncrementalHmac::begin(SignatureAlgorithm::HmacSha256, &secret)?;
 /// mac.update(b"signed bytes");
-/// let value = mac.finish();
+/// let value = mac.finish().as_bytes().to_vec();
 /// let key = HmacVerificationKey::new(secret.to_vec())?;
 /// let policy = VerificationPolicy::default();
 /// let provider = xml_sec::provider::default_provider();

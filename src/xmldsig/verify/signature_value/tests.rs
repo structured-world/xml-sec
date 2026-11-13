@@ -69,7 +69,7 @@ mod selected_provider {
         let mut mac = IncrementalHmac::begin(SignatureAlgorithm::HmacSha256, &SECRET)
             .expect("a 256-bit HMAC key");
         mac.update(DATA);
-        mac.finish()
+        mac.finish().as_bytes().to_vec()
     }
 
     /// Offers every capability of the default provider and refuses to verify.

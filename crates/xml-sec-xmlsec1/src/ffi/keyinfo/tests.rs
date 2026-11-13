@@ -17,7 +17,8 @@ use crate::ffi::keysdata::{
 };
 use crate::ffi::keysmngr::{
     xmlSecKeyStoreCreate, xmlSecKeysMngrAdoptKeysStore, xmlSecKeysMngrCreate,
-    xmlSecKeysMngrDestroy, xmlSecSimpleKeysStoreAdoptKey, xmlSecSimpleKeysStoreGetKlass,
+    xmlSecKeysMngrDestroy, xmlSecKeysMngrGetKey, xmlSecSimpleKeysStoreAdoptKey,
+    xmlSecSimpleKeysStoreGetKlass,
 };
 use crate::ffi::list::xmlSecPtrListAdd;
 use crate::ffi::policy;
@@ -28,6 +29,9 @@ use crate::ffi::{asymkeys, symkeys};
 
 /// `XMLSEC_KEYINFO_FLAGS_KEYNAME_STOP_ON_UNKNOWN`.
 const KEYNAME_STOP_ON_UNKNOWN: u32 = 0x0000_0004;
+
+/// `XMLSEC_KEYINFO_FLAGS_LAX_KEY_SEARCH`.
+const LAX_KEY_SEARCH: u32 = 0x0000_8000;
 
 fn parse(xml: &str) -> *mut XmlDoc {
     // SAFETY: the bytes and their length.
@@ -271,6 +275,48 @@ fn key_store_searches_of_one_read_share_the_candidate_budget() {
         );
         assert_eq!(read, -1, "the second search finds the allowance spent");
         assert_eq!(reasons.first(), Some(&errors::R_INVALID_SIZE));
+        xmlSecKeyInfoCtxDestroy(ctx);
+        xmlSecKeysMngrDestroy(mngr);
+    }
+}
+
+#[test]
+fn a_lax_key_search_spends_the_candidates_of_its_lookup() {
+    // `xmlSecKeysMngrGetKey` is one operation: an unknown name that used the
+    // whole allowance leaves nothing for the lax search that follows, which
+    // would otherwise start a fresh tally and return a fourth candidate.
+    own_process();
+    // SAFETY: objects created and destroyed here.
+    unsafe {
+        assert_eq!(xmlSecKeyDataIdsInit(), 0);
+        policy::republish(
+            |verification| verification.resources.max_key_candidates = 3,
+            |_| {},
+        )
+        .expect("the library policy compiles");
+        let mngr = xmlSecKeysMngrCreate();
+        let store = xmlSecKeyStoreCreate(xmlSecSimpleKeysStoreGetKlass());
+        assert_eq!(xmlSecKeysMngrAdoptKeysStore(mngr, store), 0);
+        for name in [c"k1", c"k2", c"k3"] {
+            let key = xmlSecKeyCreate();
+            let data = xmlSecKeyDataCreate(symkeys::hmac());
+            assert_eq!(
+                xmlSecKeyDataBinaryValueSetBuffer(data, b"secret".as_ptr(), 6),
+                0
+            );
+            assert_eq!(xmlSecKeySetValue(key, data), 0);
+            assert_eq!(xmlSecKeySetName(key, name.as_ptr().cast()), 0);
+            assert_eq!(xmlSecSimpleKeysStoreAdoptKey(store, key), 0);
+        }
+        let ctx = xmlSecKeyInfoCtxCreate(mngr);
+        (*ctx).flags = LAX_KEY_SEARCH;
+        let doc = parse(
+            "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\">\
+             <KeyName>unknown</KeyName></KeyInfo>",
+        );
+        let key = xmlSecKeysMngrGetKey(xsDocGetRootElement(doc), ctx);
+        assert!(key.is_null(), "the lax search finds the allowance spent");
+        xsFreeDoc(doc);
         xmlSecKeyInfoCtxDestroy(ctx);
         xmlSecKeysMngrDestroy(mngr);
     }

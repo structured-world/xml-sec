@@ -468,7 +468,7 @@ impl OwnedTree {
         // A further carrier that still holds the value is a carrier too: with
         // the registered one gone, claiming the value again would give the
         // lookup two.
-        let shadowed_holder = self.ids.shadowed(value).iter().any(|carrier| {
+        let shadowed_holder = self.ids.shadowed(value).any(|carrier| {
             carrier.element != source.element
                 && self
                     .attribute(carrier.element, &carrier.name, carrier.namespace.as_deref())
@@ -1711,7 +1711,7 @@ impl OwnedTree {
         };
         is_xml_id(&attribute.name, attribute.namespace.as_deref())
             || self.ids.get(value).is_some_and(this)
-            || self.ids.shadowed(value).iter().any(this)
+            || self.ids.shadowed(value).any(this)
     }
 
     /// Build the fragment's nodes unlinked, in order.

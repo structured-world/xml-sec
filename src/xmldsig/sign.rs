@@ -8,7 +8,6 @@
 use crate::rsa_encoding::{RsaPrivateKeyEncoding as _, RsaPublicKeyEncoding as _};
 use crate::xml::dom::{Document, Node, NodeId};
 use base64::Engine;
-use hmac::{KeyInit, Mac};
 use p256::ecdsa::{
     Signature as P256Signature, SigningKey as P256SigningKey, VerifyingKey as P256VerifyingKey,
 };
@@ -998,30 +997,9 @@ impl SigningKey for HmacSigningKey {
         algorithm: SignatureAlgorithm,
         canonical_signed_info: &[u8],
     ) -> Result<Vec<u8>, SigningKeyError> {
-        macro_rules! sign_hmac {
-            ($digest:ty) => {{
-                let mut mac = hmac::Hmac::<$digest>::new_from_slice(&self.secret)
-                    .map_err(|_| SigningKeyError::InvalidKeyDer)?;
-                mac.update(canonical_signed_info);
-                mac.finalize().into_bytes().to_vec()
-            }};
-        }
-        Ok(match algorithm {
-            #[cfg(feature = "legacy-algorithms")]
-            SignatureAlgorithm::HmacMd5 => sign_hmac!(md5::Md5),
-            #[cfg(feature = "legacy-algorithms")]
-            SignatureAlgorithm::HmacRipemd160 => sign_hmac!(ripemd::Ripemd160),
-            SignatureAlgorithm::HmacSha1 => sign_hmac!(sha1::Sha1),
-            SignatureAlgorithm::HmacSha224 => sign_hmac!(sha2::Sha224),
-            SignatureAlgorithm::HmacSha256 => sign_hmac!(sha2::Sha256),
-            SignatureAlgorithm::HmacSha384 => sign_hmac!(sha2::Sha384),
-            SignatureAlgorithm::HmacSha512 => sign_hmac!(sha2::Sha512),
-            _ => {
-                return Err(SigningKeyError::UnsupportedAlgorithm {
-                    uri: algorithm.uri().to_owned(),
-                });
-            }
-        })
+        let mut mac = super::IncrementalHmac::begin(algorithm, &self.secret)?;
+        mac.update(canonical_signed_info);
+        Ok(mac.finish().as_bytes().to_vec())
     }
 
     fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {

@@ -10,7 +10,7 @@
 
 use std::ffi::{c_char, c_int, c_uint, c_void};
 
-use xml_sec::xmldsig::{IncrementalHmac, SignatureAlgorithm, constant_time_eq};
+use xml_sec::xmldsig::{HmacTag, IncrementalHmac, SignatureAlgorithm};
 
 use super::super::buffer::{
     xmlSecBufferAppend, xmlSecBufferGetData, xmlSecBufferGetSize, xmlSecBufferRemoveHead,
@@ -66,7 +66,7 @@ struct Hmac {
     /// The revision the method was read under, which admits the key.
     pinned: Option<policy::Pinned>,
     /// The full MAC once finished.
-    result: Vec<u8>,
+    result: Option<HmacTag>,
 }
 
 /// An HMAC klass of `name` and `href`.
@@ -193,7 +193,7 @@ unsafe extern "C" fn initialize(transform: *mut XmlSecTransform) -> c_int {
                 secret_len: 0,
                 keyed: false,
                 pinned: None,
-                result: Vec::new(),
+                result: None,
             });
         }
         0
@@ -476,13 +476,10 @@ fn admit(
     }
 }
 
-/// The selected output length of `hmac` in bytes, with the mask of its
-/// last byte.
-fn selected(hmac: &Hmac) -> (usize, u8) {
-    (
-        hmac.output_bits.div_ceil(8),
-        LAST_BYTE_MASKS[hmac.output_bits % 8],
-    )
+/// The selected output length of `bits` in bytes, with the mask of its last
+/// byte.
+fn selected(bits: usize) -> (usize, u8) {
+    (bits.div_ceil(8), LAST_BYTE_MASKS[bits % 8])
 }
 
 /// `verify`: the truncated MAC against `size` bytes at `data`, in constant
@@ -521,7 +518,7 @@ unsafe extern "C" fn verify(
             errors::assertion(helper, c"dataSize > 0");
             return -1;
         }
-        let (length, mask) = selected(hmac);
+        let (length, _) = selected(hmac.output_bits);
         if size != length {
             errors::report(
                 helper,
@@ -537,12 +534,11 @@ unsafe extern "C" fn verify(
         }
         // SAFETY: the caller's `size` bytes.
         let expected = unsafe { std::slice::from_raw_parts(data, size) };
-        let last = (hmac.result[length - 1] ^ expected[length - 1]) & mask;
-        // Both parts are computed before either decides, so the time does
-        // not depend on where the values differ.
-        let body = constant_time_eq(&hmac.result[..length - 1], &expected[..length - 1]);
-        let tail = last == 0;
-        if body && tail {
+        let Some(tag) = hmac.result.as_ref() else {
+            errors::assertion(here, c"transform->status == xmlSecTransformStatusFinished");
+            return -1;
+        };
+        if tag.matches_truncated(expected, hmac.output_bits) {
             object.status = STATUS_OK;
         } else {
             errors::other(
@@ -588,12 +584,12 @@ fn absorb(object: &mut XmlSecTransform, hmac: &mut Hmac, last: bool, here: Here)
     let Some(mac) = hmac.mac.take() else {
         return -1;
     };
-    hmac.result = mac.finish();
-    let full = hmac.result.len();
+    let tag = hmac.result.insert(mac.finish());
+    let full = tag.as_bytes().len();
     if hmac.output_bits == 0 {
         hmac.output_bits = full * 8;
     }
-    let (length, mask) = selected(hmac);
+    let (length, mask) = selected(hmac.output_bits);
     if length > full {
         errors::report(
             here,
@@ -607,7 +603,7 @@ fn absorb(object: &mut XmlSecTransform, hmac: &mut Hmac, last: bool, here: Here)
         return -1;
     }
     if object.operation == OPERATION_SIGN {
-        let mut output = hmac.result[..length].to_vec();
+        let mut output = tag.as_bytes()[..length].to_vec();
         output[length - 1] &= mask;
         // SAFETY: the transform's own output buffer.
         if unsafe { xmlSecBufferAppend(&raw mut object.out_buf, output.as_ptr(), length) } < 0 {

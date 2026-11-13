@@ -32,7 +32,9 @@ impl IdSource {
 pub(super) struct IdTable {
     by_value: BTreeMap<String, IdSource>,
     by_source: BTreeMap<IdSource, String>,
-    shadowed: BTreeMap<String, Vec<IdSource>>,
+    /// Ordered sets, so forgetting one carrier of a value many attributes
+    /// repeat costs no scan of the others.
+    shadowed: BTreeMap<String, BTreeSet<IdSource>>,
     /// The same further carriers ordered by attribute, so a copy finds the
     /// ones of an element.
     shadowed_sources: BTreeSet<(IdSource, String)>,
@@ -65,7 +67,7 @@ impl IdTable {
             .shadowed_sources
             .insert((source.clone(), value.clone()))
         {
-            self.shadowed.entry(value).or_default().push(source);
+            self.shadowed.entry(value).or_default().insert(source);
         }
     }
 
@@ -91,7 +93,7 @@ impl IdTable {
             self.shadowed_sources
                 .remove(&(source.clone(), value.clone()));
             if let Some(carriers) = self.shadowed.get_mut(&value) {
-                carriers.retain(|carrier| carrier != source);
+                carriers.remove(source);
                 if carriers.is_empty() {
                     self.shadowed.remove(&value);
                 }
@@ -121,8 +123,8 @@ impl IdTable {
 
     /// The further carriers recorded for `value`; some may no longer carry
     /// it or no longer be live.
-    pub(super) fn shadowed(&self, value: &str) -> &[IdSource] {
-        self.shadowed.get(value).map_or(&[], Vec::as_slice)
+    pub(super) fn shadowed(&self, value: &str) -> impl Iterator<Item = &IdSource> {
+        self.shadowed.get(value).into_iter().flatten()
     }
 
     /// The attributes of `element` that carry an ID, with their values.

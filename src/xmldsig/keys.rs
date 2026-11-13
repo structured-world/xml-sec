@@ -10,7 +10,7 @@ mod key_value_tests;
 use super::parse::parse_x509_certificate;
 #[cfg(feature = "rustcrypto")]
 use dsa::pkcs8::EncodePublicKey as DsaEncodePublicKey;
-#[cfg(feature = "rustcrypto")]
+#[cfg(all(test, feature = "rustcrypto"))]
 use hmac::{KeyInit, Mac};
 #[cfg(test)]
 use x509_parser::prelude::FromDer;
@@ -191,28 +191,20 @@ impl HmacVerificationKey {
         signed_data: &[u8],
         signature_value: &[u8],
     ) -> Result<bool, DsigError> {
-        macro_rules! verify_hmac {
-            ($digest:ty) => {{
-                let mut mac = hmac::Hmac::<$digest>::new_from_slice(&self.secret)
-                    .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
-                mac.update(signed_data);
-                let expected = mac.finalize().into_bytes();
-                subtle::ConstantTimeEq::ct_eq(&expected[..signature_value.len()], signature_value)
-                    .into()
-            }};
-        }
-        Ok(match algorithm {
-            #[cfg(feature = "legacy-algorithms")]
-            SignatureAlgorithm::HmacMd5 => verify_hmac!(md5::Md5),
-            #[cfg(feature = "legacy-algorithms")]
-            SignatureAlgorithm::HmacRipemd160 => verify_hmac!(ripemd::Ripemd160),
-            SignatureAlgorithm::HmacSha1 => verify_hmac!(sha1::Sha1),
-            SignatureAlgorithm::HmacSha224 => verify_hmac!(sha2::Sha224),
-            SignatureAlgorithm::HmacSha256 => verify_hmac!(sha2::Sha256),
-            SignatureAlgorithm::HmacSha384 => verify_hmac!(sha2::Sha384),
-            SignatureAlgorithm::HmacSha512 => verify_hmac!(sha2::Sha512),
-            _ => return Err(KeyResolutionError::AlgorithmMismatch.into()),
-        })
+        let mut mac =
+            super::IncrementalHmac::begin(algorithm, &self.secret).map_err(
+                |error| match error {
+                    super::SigningKeyError::UnsupportedAlgorithm { .. } => {
+                        KeyResolutionError::AlgorithmMismatch
+                    }
+                    _ => KeyResolutionError::InvalidPublicKey,
+                },
+            )?;
+        mac.update(signed_data);
+        Ok(signature_value
+            .len()
+            .checked_mul(8)
+            .is_some_and(|bits| mac.finish().matches_truncated(signature_value, bits)))
     }
 }
 

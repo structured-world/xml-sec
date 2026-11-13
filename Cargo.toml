@@ -370,8 +370,9 @@ pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"], opti
 # X.509 certificates, and the seeded hashing of every table keyed by document content
 structured-asn1 = { version = "0.21.0", default-features = false, features = ["alloc"] }
 structured-pkix = { version = "0.21.0", default-features = false, features = ["alloc"], optional = true }
-# PKCS#12 container framing; this crate keeps the password, KDF and cipher work.
-structured-cms = { version = "0.21.0", default-features = false, features = ["alloc"], optional = true }
+# PKCS#12 container framing (this crate keeps the password, KDF and cipher
+# work) and the incremental HMAC of the HMAC signature methods.
+structured-cms = { version = "0.21.5", default-features = false, features = ["alloc"], optional = true }
 tinyvec = { version = "1.13", optional = true }
 # `pem` is RFC 7468 decoding of caller key and certificate text.
 der = { version = "0.8", default-features = false, features = ["alloc", "pem"], optional = true }
@@ -424,7 +425,7 @@ tempfile = "3"
 # Measurement hooks only; no checks are bypassed and no timers run in production.
 benchmark-internals = ["xmldsig", "rustcrypto", "xmlenc", "c14n", "xml-backends-all"]
 benchmark-alloc = ["benchmark-internals"]
-legacy-algorithms = ["dep:ripemd", "dep:md-5", "dep:des"]
+legacy-algorithms = ["dep:ripemd", "dep:md-5", "dep:des", "structured-cms?/legacy-hmac"]
 default = ["std", "xmldsig", "rustcrypto", "xmldsig-sign", "xmlenc", "c14n", "xml-backend-xmloxide"]
 std = [
     "thiserror/std",
@@ -490,6 +491,9 @@ rustcrypto = [
     "dep:ed448-goldilocks",
     "dep:hmac",
     "dep:md-5",
+    # The HMAC signature methods run on the shared incremental HMAC.
+    "dep:structured-cms",
+    "structured-cms/hmac",
     "dep:p256",
     "dep:p384",
     "dep:p521",

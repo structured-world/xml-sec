@@ -411,6 +411,11 @@ pub(crate) unsafe extern "C" fn xmlSecKeysMngrGetKey(
         let here = here!("xmlSecKeysMngrGetKey");
         // SAFETY: a context; a key not returned is released.
         unsafe {
+            // One lookup is one operation: the node read and the lax search
+            // after it share a policy revision and one candidate allowance.
+            let Some(_pin) = super::policy::SlotPin::hold(&raw mut (*ctx).reserved0, here) else {
+                return std::ptr::null_mut();
+            };
             let key = xmlSecKeyCreate();
             if key.is_null() {
                 errors::internal(here, std::ptr::null(), c"xmlSecKeyCreate");

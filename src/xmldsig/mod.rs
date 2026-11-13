@@ -115,7 +115,7 @@ pub use keys::{
     KeyResolutionError, KeyResolverConfig, VerificationKey,
 };
 #[cfg(feature = "rustcrypto")]
-pub use mac::IncrementalHmac;
+pub use mac::{HmacTag, IncrementalHmac};
 #[cfg(feature = "xmldsig-sign")]
 pub use modern::EdDsaSigningKey;
 pub use parse::{
