@@ -117,9 +117,7 @@ pub(crate) fn template(
         key_info.push_str(&STANDARD.encode(der(name)?));
         key_info.push_str("</ds:X509Certificate>");
     }
-    let target = target
-        .map(|target| format!(r#" Target="{target}""#))
-        .unwrap_or_default();
+    let target = target.map_or_default(|target| format!(r#" Target="{target}""#));
     Ok(format!(
         r##"<r><Data Id="payload">x</Data><ds:Signature xmlns:ds="{DS}" Id="sig"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="{EXC}"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference Id="sig-data" URI="#payload"><ds:Transforms><ds:Transform Algorithm="{EXC}"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference><ds:Reference Type="http://uri.etsi.org/01903#SignedProperties" URI="#sp"><ds:Transforms><ds:Transform Algorithm="{EXC}"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/><ds:KeyInfo><ds:X509Data>{key_info}</ds:X509Data></ds:KeyInfo><ds:Object><x:QualifyingProperties xmlns:x="{SP}"{target}><x:SignedProperties Id="sp"><x:SignedSignatureProperties><x:SigningTime>2026-10-18T12:00:00Z</x:SigningTime><x:SigningCertificateV2>{references}</x:SigningCertificateV2></x:SignedSignatureProperties><x:SignedDataObjectProperties><x:DataObjectFormat ObjectReference="#sig-data"><x:MimeType>text/xml</x:MimeType></x:DataObjectFormat></x:SignedDataObjectProperties></x:SignedProperties></x:QualifyingProperties></ds:Object></ds:Signature></r>"##
     ))
@@ -144,8 +142,7 @@ pub(crate) fn binding_facts(path: &Path) -> Result<Map<String, Value>, String> {
 fn capture_native_octets(directory: &Path) -> Result<(), String> {
     let name = directory
         .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .map_or_default(|name| name.to_string_lossy().into_owned());
     let stdout = read(&directory.join("libxmlsec.stdout"))?;
     let blocks = super::corpus::after_each(&stdout, b"= REFERENCE VERIFICATION CONTEXT\n");
     require(

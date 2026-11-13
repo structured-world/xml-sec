@@ -10,9 +10,12 @@ use crate::ffi::tests::own_process;
 use super::{UriTypeSet, admits, xmlSecIOInit, xmlSecIORegisterCallbacks, xmlSecIOShutdown};
 use crate::ffi::buffer::xmlSecBufferGetSize;
 use crate::ffi::policy;
+use crate::ffi::transforms::OPERATION_SIGN;
 use crate::ffi::transforms::ctx::{
-    xmlSecTransformCtxCreate, xmlSecTransformCtxDestroy, xmlSecTransformCtxUriExecute,
+    xmlSecTransformCtxCreate, xmlSecTransformCtxCreateAndAppend, xmlSecTransformCtxDestroy,
+    xmlSecTransformCtxUriExecute,
 };
+use crate::ffi::transforms::digests::sha256;
 use std::ffi::{c_char, c_int, c_void};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -90,6 +93,32 @@ fn library_policy_admits_external_references_only() {
     assert_eq!(policy.uris.references, UriTypeSet::ALL);
     assert_eq!(policy.uris.retrieval_methods, UriTypeSet::SAME_DOCUMENT);
     assert_eq!(policy.uris.key_info_references, UriTypeSet::SAME_DOCUMENT);
+}
+
+/// The signing snapshot admits the same external references: a chain whose
+/// digest signs reads the resource through the caller's callbacks, as a
+/// detached reference is digested when it is signed.
+#[test]
+fn a_signing_chain_reads_an_external_reference() {
+    own_process();
+    LEFT.store(16, Ordering::Relaxed);
+    // SAFETY: the callback list and the context are used by this test alone.
+    unsafe {
+        assert_eq!(xmlSecIOInit(), 0);
+        let registered =
+            xmlSecIORegisterCallbacks(Some(matches), Some(open), Some(read), Some(close));
+        assert_eq!(registered, 0);
+        let ctx = xmlSecTransformCtxCreate();
+        let digest = xmlSecTransformCtxCreateAndAppend(ctx, sha256());
+        (*digest).operation = OPERATION_SIGN;
+        assert_eq!(
+            xmlSecTransformCtxUriExecute(ctx, c"test:resource".as_ptr().cast()),
+            0
+        );
+        assert_eq!(xmlSecBufferGetSize((*ctx).result), 32);
+        xmlSecTransformCtxDestroy(ctx);
+        xmlSecIOShutdown();
+    }
 }
 
 /// An endless resource stops the run at the per-resource limit instead of

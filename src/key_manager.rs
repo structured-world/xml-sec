@@ -28,9 +28,13 @@ use dsa::{
 };
 // Private-key and protected-container import compile only with signing.
 #[cfg(feature = "xmldsig-sign")]
+mod openssl;
+#[cfg(feature = "xmldsig-sign")]
 mod pkcs12_import;
 #[cfg(feature = "xmldsig-sign")]
 use crate::rsa_encoding::RsaPrivateKeyEncoding as _;
+#[cfg(feature = "xmldsig-sign")]
+pub use openssl::PrivateKeyContainer;
 #[cfg(feature = "xmldsig-sign")]
 use pkcs8::{DecodePrivateKey as _, EncryptedPrivateKeyInfoRef, PrivateKeyInfoRef};
 #[cfg(feature = "xmldsig-sign")]
@@ -417,6 +421,15 @@ impl StoredPrivateKey {
     #[must_use]
     pub fn pkcs8_der(&self) -> &[u8] {
         &self.pkcs8_der
+    }
+
+    /// The DER `SubjectPublicKeyInfo` of this private key's public key.
+    ///
+    /// # Errors
+    /// Returns [`KeyStoreError::Selection`] for private material whose public
+    /// key cannot be derived or encoded.
+    pub fn public_key_spki_der(&self) -> Result<Vec<u8>, KeyStoreError> {
+        PrivateKeyIdentity::decode(&self.pkcs8_der)?.spki_der()
     }
 
     /// Import an explicitly selected recipient into the operation's crypto engine.
@@ -1945,7 +1958,7 @@ impl KeyInventory {
                     components.modulus.as_bytes(),
                     components.public_exponent.as_bytes(),
                 )
-                .map_err(|_| KeyStoreError::Selection("RSA public key exceeds safety limit"))?;
+                .map_err(|_| KeyStoreError::Selection(RSA_PUBLIC_KEY_LIMIT))?;
                 // Wrap borrowed PKCS#1 bytes directly; the final SPKI importer
                 // performs native RSA validation once, without an intermediate key.
                 let spki = pkcs8::SubjectPublicKeyInfoRef {
@@ -2037,9 +2050,7 @@ impl KeyInventory {
         }
         let identity = PrivateKeyIdentity::decode(&der)?;
         if usages.allows(KeyUsage::Decrypt) && !identity.can_decrypt() {
-            return Err(KeyStoreError::Selection(
-                "private key cannot recover encryption keys",
-            ));
+            return Err(KeyStoreError::Selection(CANNOT_DECRYPT));
         }
         #[cfg(feature = "experimental-pq")]
         identity.validate_usages(usages)?;
@@ -2228,8 +2239,9 @@ impl KeyInventory {
         )
     }
 
-    /// Import one PEM private key, including encrypted PKCS#8. Traditional
-    /// OpenSSL PEM encryption is handled at the CLI compatibility boundary.
+    /// Import one PEM private key, including encrypted PKCS#8. Keys in the
+    /// traditional OpenSSL envelope are read by the explicit compatibility
+    /// importer [`KeyInventory::add_openssl_private_key`].
     ///
     /// # Errors
     /// Returns malformed/unsupported PEM or private material, name/resource or
@@ -3094,6 +3106,33 @@ fn find_named_entry<'a, T>(
     Ok(None)
 }
 
+/// The refusal of a private key imported to decrypt whose family cannot
+/// recover encryption keys: a usage mismatch, distinct from a container the
+/// password failed to open.
+/// The selection refusal of a private key imported for decryption whose
+/// algorithm cannot recover encryption keys.
+#[cfg(feature = "xmldsig-sign")]
+pub(crate) const CANNOT_DECRYPT: &str = "private key cannot recover encryption keys";
+
+/// The selection refusals of an RSA key whose components pass the
+/// implementation's safety ceiling.
+const RSA_PUBLIC_KEY_LIMIT: &str = "RSA public key exceeds safety limit";
+const RSA_MODULUS_LIMIT: &str = "RSA modulus exceeds safety limit";
+const RSA_COMPONENT_LIMIT: &str = "RSA component exceeds safety limit";
+
+impl KeyStoreError {
+    /// Whether this is the refusal of a key whose components pass the
+    /// implementation's safety ceiling: the key's own failure, which no other
+    /// password or importer can turn into success.
+    #[must_use]
+    pub fn is_component_limit(&self) -> bool {
+        matches!(
+            self,
+            Self::Selection(RSA_PUBLIC_KEY_LIMIT | RSA_MODULUS_LIMIT | RSA_COMPONENT_LIMIT)
+        )
+    }
+}
+
 fn named_material_length(
     name: &str,
     payload: usize,
@@ -3269,6 +3308,61 @@ impl<'a> PrivateKeyIdentity<'a> {
         Err(KeyStoreError::Selection("unsupported PKCS#12 private key"))
     }
 
+    /// The DER `SubjectPublicKeyInfo` (RFC 5280 section 4.1.2.7) of the
+    /// public key, under the private key's own algorithm identifier.
+    fn spki_der(&self) -> Result<Vec<u8>, KeyStoreError> {
+        use der::Encode as _;
+        let invalid = |_| KeyStoreError::Selection("invalid private key identity");
+        let spki = |algorithm: pkcs8::AlgorithmIdentifierRef<'_>, key: &[u8]| {
+            pkcs8::SubjectPublicKeyInfoRef {
+                algorithm,
+                subject_public_key: der::asn1::BitStringRef::new(0, key).map_err(invalid)?,
+            }
+            .to_der()
+            .map_err(invalid)
+        };
+        match self {
+            Self::Rsa(key) => {
+                let public = pkcs1::RsaPublicKeyRef {
+                    modulus: key.modulus,
+                    public_exponent: key.public_exponent,
+                }
+                .to_der()
+                .map_err(invalid)?;
+                spki(pkcs1::ALGORITHM_ID, &public)
+            }
+            Self::Dsa { key, .. } => {
+                use dsa::pkcs8::EncodePublicKey as _;
+                key.verifying_key()
+                    .to_public_key_der()
+                    .map(|der| der.as_bytes().to_vec())
+                    .map_err(|_| KeyStoreError::Selection("invalid private key identity"))
+            }
+            Self::Ec {
+                algorithm,
+                point,
+                length,
+            } => spki(*algorithm, &point[..*length]),
+            Self::EdDsa {
+                algorithm,
+                public,
+                length,
+            } => spki(*algorithm, &public[..*length]),
+            #[cfg(feature = "experimental-pq")]
+            Self::Encapsulation {
+                algorithm,
+                public,
+                length,
+            } => spki(*algorithm, &public[..*length]),
+            #[cfg(feature = "experimental-pq")]
+            Self::PostQuantum {
+                algorithm,
+                public,
+                length,
+            } => spki(*algorithm, &public[..*length]),
+        }
+    }
+
     fn matches_spki(&self, der: &[u8]) -> bool {
         let Ok(spki) = pkcs8::SubjectPublicKeyInfoRef::from_der(der) else {
             return false;
@@ -3349,7 +3443,7 @@ pub fn preflight_rsa_pkcs1_components(der: &[u8]) -> Result<(), KeyStoreError> {
             .first()
             .is_some_and(|first| modulus.len() * 8 - first.leading_zeros() as usize > maximum)
     {
-        return Err(KeyStoreError::Selection("RSA modulus exceeds safety limit"));
+        return Err(KeyStoreError::Selection(RSA_MODULUS_LIMIT));
     }
     if [
         key.public_exponent,
@@ -3370,9 +3464,7 @@ pub fn preflight_rsa_pkcs1_components(der: &[u8]) -> Result<(), KeyStoreError> {
             })
         })
     {
-        return Err(KeyStoreError::Selection(
-            "RSA component exceeds safety limit",
-        ));
+        return Err(KeyStoreError::Selection(RSA_COMPONENT_LIMIT));
     }
     Ok(())
 }
@@ -3387,6 +3479,15 @@ fn preflight_dsa_pkcs8_components(info: &PrivateKeyInfoRef<'_>) -> Result<(), Ke
 // DER buffer. No normalized Base64 string or owned label/header copies are needed.
 struct BorrowedPem<'a> {
     label: &'a str,
+    /// The RFC 1421 header lines before the blank line, empty without them.
+    #[cfg_attr(
+        not(feature = "xmldsig-sign"),
+        expect(
+            dead_code,
+            reason = "only the OpenSSL container importer, built with signing, reads the headers"
+        )
+    )]
+    headers: &'a str,
     data: &'a str,
     decoded_len: usize,
 }
@@ -3418,16 +3519,16 @@ impl<'a> BorrowedPem<'a> {
         }
         // Preserve the existing importer's optional header and whitespace
         // acceptance without allocating header strings or a stripped body.
-        let data = if let Some((headers, data)) = payload
+        let (headers, data) = if let Some((headers, data)) = payload
             .split_once("\n\n")
             .or_else(|| payload.split_once("\r\n\r\n"))
         {
             if headers.lines().any(|line| !line.contains(':')) {
                 return Err(invalid());
             }
-            data
+            (headers, data)
         } else {
-            payload
+            ("", payload)
         };
         let mut characters = 0_usize;
         let mut padding = 0_usize;
@@ -3451,6 +3552,7 @@ impl<'a> BorrowedPem<'a> {
             .ok_or_else(invalid)?;
         Ok(Self {
             label,
+            headers,
             data,
             decoded_len,
         })
@@ -4009,3 +4111,6 @@ fn parse_xmlsec_dsa_key_value(
 // The inventory tests import private keys and select signers.
 #[cfg(all(test, feature = "xmldsig-sign"))]
 mod tests;
+
+#[cfg(all(test, feature = "xmldsig-sign"))]
+mod public_key_tests;

@@ -2,7 +2,7 @@
 //! the attribute that carries it, so an edit of that attribute finds and
 //! updates its entry, as libxml2 ties an ID to its attribute.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 
 use super::TreeNode;
@@ -23,11 +23,19 @@ impl IdSource {
     }
 }
 
-/// ID values and the attributes that carry them, indexed both ways.
+/// ID values and the attributes that carry them, indexed both ways, with the
+/// further attributes that carried a value another one already held when
+/// they arrived (a repeated `xml:id` in a parse, a copy, a replacement).
+/// Those stay unregistered, as libxml2 leaves them, but a lookup sees them,
+/// so a value two linked elements carry names neither.
 #[derive(Default)]
 pub(super) struct IdTable {
     by_value: BTreeMap<String, IdSource>,
     by_source: BTreeMap<IdSource, String>,
+    shadowed: BTreeMap<String, Vec<IdSource>>,
+    /// The same further carriers ordered by attribute, so a copy finds the
+    /// ones of an element.
+    shadowed_sources: BTreeSet<(IdSource, String)>,
 }
 
 impl IdTable {
@@ -48,6 +56,88 @@ impl IdTable {
         previous
     }
 
+    /// Records `source` as a further carrier of `value`, which another
+    /// attribute holds.
+    pub(super) fn shadow(&mut self, value: String, source: IdSource) {
+        // The ordered index answers whether the pair is recorded, so many
+        // carriers of one value cost no scan of the earlier ones.
+        if self
+            .shadowed_sources
+            .insert((source.clone(), value.clone()))
+        {
+            self.shadowed.entry(value).or_default().push(source);
+        }
+    }
+
+    /// Whether `source` is recorded as a further carrier of some value.
+    pub(super) fn is_shadowed(&self, source: &IdSource) -> bool {
+        let first = (source.clone(), String::new());
+        self.shadowed_sources
+            .range(first..)
+            .next()
+            .is_some_and(|(recorded, _)| recorded == source)
+    }
+
+    /// Forget `source` as a further carrier of any value.
+    pub(super) fn unshadow(&mut self, source: &IdSource) {
+        let first = (source.clone(), String::new());
+        let values: alloc::vec::Vec<String> = self
+            .shadowed_sources
+            .range(first..)
+            .take_while(|(recorded, _)| recorded == source)
+            .map(|(_, value)| value.clone())
+            .collect();
+        for value in values {
+            self.shadowed_sources
+                .remove(&(source.clone(), value.clone()));
+            if let Some(carriers) = self.shadowed.get_mut(&value) {
+                carriers.retain(|carrier| carrier != source);
+                if carriers.is_empty() {
+                    self.shadowed.remove(&value);
+                }
+            }
+        }
+    }
+
+    /// The further carriers recorded on attributes of `element`, with their
+    /// values; some may no longer carry them.
+    pub(super) fn shadowed_of_element(
+        &self,
+        element: TreeNode,
+    ) -> impl Iterator<Item = (&IdSource, &str)> {
+        let first = (
+            IdSource {
+                element,
+                name: String::new(),
+                namespace: None,
+            },
+            String::new(),
+        );
+        self.shadowed_sources
+            .range(first..)
+            .take_while(move |(source, _)| source.element == element)
+            .map(|(source, value)| (source, value.as_str()))
+    }
+
+    /// The further carriers recorded for `value`; some may no longer carry
+    /// it or no longer be live.
+    pub(super) fn shadowed(&self, value: &str) -> &[IdSource] {
+        self.shadowed.get(value).map_or(&[], Vec::as_slice)
+    }
+
+    /// The attributes of `element` that carry an ID, with their values.
+    pub(super) fn of_element(&self, element: TreeNode) -> impl Iterator<Item = (&IdSource, &str)> {
+        let first = IdSource {
+            element,
+            name: String::new(),
+            namespace: None,
+        };
+        self.by_source
+            .range(first..)
+            .take_while(move |(source, _)| source.element == element)
+            .map(|(source, value)| (source, value.as_str()))
+    }
+
     /// Whether `source` carries an ID.
     pub(super) fn carries(&self, source: &IdSource) -> bool {
         self.by_source.contains_key(source)
@@ -57,6 +147,34 @@ impl IdTable {
     pub(super) fn remove(&mut self, value: &str) {
         if let Some(source) = self.by_value.remove(value) {
             self.by_source.remove(&source);
+        }
+    }
+
+    /// How many entries all the indexes hold.
+    #[cfg(test)]
+    pub(super) fn recorded(&self) -> usize {
+        self.by_value.len()
+            + self.by_source.len()
+            + self.shadowed.len()
+            + self.shadowed_sources.len()
+    }
+
+    /// Forget every ID the attributes of `element` carry, registered or
+    /// shadowed, as libxml2 drops an attribute's ID when it frees it.
+    pub(super) fn forget_element(&mut self, element: TreeNode) {
+        let registered: alloc::vec::Vec<IdSource> = self
+            .of_element(element)
+            .map(|(source, _)| source.clone())
+            .collect();
+        for source in registered {
+            self.remove_source(&source);
+        }
+        let shadowed: alloc::vec::Vec<IdSource> = self
+            .shadowed_of_element(element)
+            .map(|(source, _)| source.clone())
+            .collect();
+        for source in shadowed {
+            self.unshadow(&source);
         }
     }
 

@@ -19,6 +19,13 @@ xml-sec-libxml2 = { path = "../xml-sec-libxml2" }
 libc = "0.2"
 # The resumable Base64 codec behind `xmlSecBase64Ctx`.
 structured-base64 = "0.21"
+# Private keys held by key data are wiped when released.
+zeroize = "1"
+
+[features]
+# The MD5 and RIPEMD-160 digest, HMAC and signature klasses, which libxmlsec1
+# builds only when configured with --enable-md5 and --enable-ripemd160.
+legacy-algorithms = ["xml-sec/legacy-algorithms"]
 
 [dev-dependencies]
 tempfile = "3"

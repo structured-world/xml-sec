@@ -6,7 +6,6 @@ rust-version = "1.92"
 license = "Apache-2.0 AND MIT"
 description = "Pure Rust XML Security: XMLDSig, XMLEnc, C14N with explicit policy and providers."
 repository = "https://github.com/structured-world/xml-sec"
-homepage = "https://github.com/structured-world/xml-sec"
 documentation = "https://docs.rs/xml-sec"
 keywords = ["xml", "xmldsig", "xmlenc", "c14n", "saml"]
 categories = ["cryptography", "web-programming", "authentication"]
@@ -357,11 +356,12 @@ signature = { version = "3", optional = true }
 subtle = { version = "2", default-features = false, optional = true }
 getrandom = { version = "0.4", features = ["sys_rng"], optional = true }
 zeroize = { version = "1", optional = true }
-aes = { version = "0.9.2", optional = true }
-aes-gcm = { version = "0.11.1", optional = true }
-aes-kw = { version = "0.3.1", optional = true }
-cbc = { version = "0.2.1", optional = true }
-des = { version = "0.9", optional = true }
+# Each cipher wipes the key schedule it expands from a key when dropped.
+aes = { version = "0.9.2", features = ["zeroize"], optional = true }
+aes-gcm = { version = "0.11.1", features = ["zeroize"], optional = true }
+aes-kw = { version = "0.3.1", features = ["zeroize"], optional = true }
+cbc = { version = "0.2.1", features = ["zeroize"], optional = true }
+des = { version = "0.9", features = ["zeroize"], optional = true }
 md-5 = { version = "0.11", features = ["oid", "zeroize"], optional = true }
 ripemd = { version = "0.2.0", default-features = false, features = ["oid", "zeroize"], optional = true }
 pkcs12 = { version = "0.2.0-rc.0", default-features = false, features = ["kdf"], optional = true }

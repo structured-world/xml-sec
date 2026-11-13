@@ -2291,16 +2291,49 @@ pub(crate) fn parse_key_value_dispatch(node: Node) -> Result<KeyValueInfo, Parse
         ));
     }
 
-    match (
-        first_child.tag_name().namespace(),
-        first_child.tag_name().name(),
-    ) {
-        (Some(XMLDSIG_NS), "RSAKeyValue") => parse_rsa_key_value(first_child),
-        (Some(XMLDSIG_NS), "DSAKeyValue") => parse_dsa_key_value(first_child),
-        (Some(XMLDSIG11_NS), "ECKeyValue") => parse_ec_key_value(first_child),
-        (Some("http://www.w3.org/2001/04/xmlenc#"), "DHKeyValue") => {
-            parse_dh_key_value(first_child)
-        }
+    parse_key_value_child(first_child)
+}
+
+/// Parse one key-value element, the child of a `<KeyValue>`:
+/// `RSAKeyValue`, `DSAKeyValue`, `dsig11:ECKeyValue` or `xenc:DHKeyValue`.
+///
+/// An element of another name is [`KeyValueInfo::Unsupported`], so a
+/// caller can offer it to its own readers; an EC key on a curve this build
+/// cannot use is [`KeyValueInfo::InvalidEcKeyValue`].
+///
+/// # Errors
+/// Returns [`ParseError`] for a node that is no element, or a supported
+/// element whose structure or `CryptoBinary` content is malformed.
+///
+/// # Examples
+///
+/// ```
+/// use xml_sec::xmldsig::{KeyValueInfo, parse_key_value_child};
+///
+/// let xml = r#"<RSAKeyValue xmlns="http://www.w3.org/2000/09/xmldsig#">
+///     <Modulus>AQID</Modulus><Exponent>AQAB</Exponent>
+/// </RSAKeyValue>"#;
+/// let doc = xml_sec::Document::parse(xml)?;
+/// let info = parse_key_value_child(doc.root_element())?;
+/// assert_eq!(
+///     info,
+///     KeyValueInfo::Rsa { modulus: vec![1, 2, 3], exponent: vec![1, 0, 1] }
+/// );
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn parse_key_value_child(node: Node) -> Result<KeyValueInfo, ParseError> {
+    // Only an element names a key value; any other node has an empty name
+    // that would read as an unsupported one.
+    if !node.is_element() {
+        return Err(ParseError::InvalidStructure(
+            "a key value must be an element".into(),
+        ));
+    }
+    match (node.tag_name().namespace(), node.tag_name().name()) {
+        (Some(XMLDSIG_NS), "RSAKeyValue") => parse_rsa_key_value(node),
+        (Some(XMLDSIG_NS), "DSAKeyValue") => parse_dsa_key_value(node),
+        (Some(XMLDSIG11_NS), "ECKeyValue") => parse_ec_key_value(node),
+        (Some("http://www.w3.org/2001/04/xmlenc#"), "DHKeyValue") => parse_dh_key_value(node),
         (namespace, child_name) => Ok(KeyValueInfo::Unsupported {
             namespace: namespace.map(str::to_string),
             local_name: child_name.to_string(),

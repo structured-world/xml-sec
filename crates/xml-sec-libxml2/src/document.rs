@@ -4,7 +4,7 @@
 use xml_sec::XmlDocument;
 use xml_sec::XmlDocumentError;
 use xml_sec::document::XmlDocumentPolicy;
-use xml_sec::document::owned_tree::OwnedTree;
+use xml_sec::document::owned_tree::{OwnedTree, TreeError, TreeNodeKind};
 
 use crate::handles::{self, HandleError};
 use crate::nodes::handle_of;
@@ -61,16 +61,38 @@ pub fn parse(bytes: &[u8]) -> Result<usize, DocumentError> {
 /// # Errors
 /// As for [`parse`].
 pub fn parse_parts(parts: &[&[u8]]) -> Result<usize, DocumentError> {
-    let parsed = parse_tree(parts);
+    let policy = crate::policy::library().ok_or(DocumentError::Policy);
+    let parsed = policy.and_then(|policy| parse_tree(parts, &*policy));
     if let Err(error) = &parsed {
-        let message = error.to_string();
-        LAST_ERROR.with_borrow_mut(|last| *last = Some(message));
+        record_error(error);
     }
     parsed
 }
 
-fn parse_tree(parts: &[&[u8]]) -> Result<usize, DocumentError> {
-    let policy = crate::policy::library().ok_or(DocumentError::Policy)?;
+/// [`parse_parts`] under `policy`, the revision an operation pinned, rather
+/// than the current one.
+///
+/// # Errors
+/// The core's refusal, an encoding error among them.
+pub fn parse_parts_under(
+    parts: &[&[u8]],
+    policy: &impl XmlDocumentPolicy,
+) -> Result<usize, DocumentError> {
+    let parsed = parse_tree(parts, policy);
+    if let Err(error) = &parsed {
+        record_error(error);
+    }
+    parsed
+}
+
+/// Make `error` this thread's [`last_error`], as libxml2 records each
+/// parser failure.
+pub(crate) fn record_error(error: &impl std::fmt::Display) {
+    let message = error.to_string();
+    LAST_ERROR.with_borrow_mut(|last| *last = Some(message));
+}
+
+fn parse_tree(parts: &[&[u8]], policy: &impl XmlDocumentPolicy) -> Result<usize, DocumentError> {
     let tree = OwnedTree::parse_parts_with_policy(parts, policy)?;
     Ok(handles::register(tree)?)
 }
@@ -101,6 +123,32 @@ pub fn snapshot<T>(
         XmlDocument::snapshot_of_external_tree(tree, policy)
     })??;
     Ok((document, slot))
+}
+
+/// The element `node` and its subtree as a document of its own, read under
+/// `policy`: the element is copied, declaring the bindings it inherited, so
+/// it reads as it does in place while only its subtree is projected.
+///
+/// # Errors
+/// A handle that names no live element or a lent document, or the core's
+/// refusal of the copy under `policy`.
+pub fn subtree<T>(
+    node: *const T,
+    policy: &impl XmlDocumentPolicy,
+) -> Result<XmlDocument, DocumentError> {
+    let (slot, element) = handles::node(handle_of(node))?;
+    let staged = handles::read_document(slot, |tree| {
+        if tree.kind(element)? != TreeNodeKind::Element {
+            return Err(TreeError::NotAnElement);
+        }
+        let mut staged = OwnedTree::new();
+        let copy = staged.copy_from(tree, element)?;
+        let root = staged.document_node();
+        staged.append_child(root, copy)?;
+        Ok(staged)
+    })?
+    .map_err(HandleError::from)?;
+    XmlDocument::from_owned_tree(staged, policy).map_err(|refused| refused.0.into())
 }
 
 /// Run `work` over the document `node` belongs to, read under `policy`,

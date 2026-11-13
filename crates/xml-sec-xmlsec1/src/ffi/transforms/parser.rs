@@ -9,11 +9,11 @@ use xml_sec_libxml2::ffi::io::{input_content, input_free, input_read};
 
 use super::super::errors::{self, check, here};
 use super::super::nodeset::{TREE, XmlSecNodeSet, xmlSecNodeSetCreate, xmlSecNodeSetDocDestroy};
-use super::super::parser::parse;
+use super::super::parser::parse_under;
 use super::super::policy;
 use super::super::tree::XmlDoc;
 use super::builtin::klass;
-use super::ctx::{Limit, charge};
+use super::ctx::{Limit, charge, run_scope};
 use super::io::bounded_input_buffer;
 use super::{
     STATUS_FINISHED, STATUS_NONE, STATUS_WORKING, USAGE_DSIG_TRANSFORM, WithContext,
@@ -99,10 +99,10 @@ fn name() -> *const c_char {
 }
 
 /// The limit on the octets of one document.
-fn document_limit(policy: &xml_sec::policy::VerificationPolicy) -> Limit {
+fn document_limit(resources: &xml_sec::policy::ResourcePolicy) -> Limit {
     Limit {
         name: "max_xml_document_bytes",
-        max: policy.resources.max_xml_document_bytes,
+        max: resources.max_xml_document_bytes,
     }
 }
 
@@ -147,12 +147,14 @@ unsafe extern "C" fn push_bin(
             errors::assertion(here, c"ctx->parserCtx != NULL");
             return -1;
         };
+        let Some((pinned, served)) = run_scope(ctx, here) else {
+            return -1;
+        };
+        let operation = pinned.of(served);
         if !data.is_null() && size > 0 {
-            let Some(policy) = policy::verification_at(here) else {
-                return -1;
-            };
             let mut count = pushed.len();
-            if charge(&mut count, size, document_limit(policy), here, name()).is_none() {
+            let limit = document_limit(operation.resources());
+            if charge(&mut count, size, limit, here, name()).is_none() {
                 return -1;
             }
             pushed.extend_from_slice(std::slice::from_raw_parts(data, size));
@@ -160,7 +162,8 @@ unsafe extern "C" fn push_bin(
         if last == 0 {
             return 0;
         }
-        let doc = parse(pushed, here);
+        let doc =
+            policy::with_document_policy!(operation, |policy| parse_under(pushed, here, policy));
         if doc.is_null() {
             return -1;
         }
@@ -208,9 +211,10 @@ unsafe extern "C" fn pop_xml(
                 return -1;
             }
         }
-        let Some(policy) = policy::verification_at(here) else {
+        let Some((pinned, side)) = run_scope(ctx, here) else {
             return -1;
         };
+        let operation = pinned.of(side);
         if object.prev.is_null() {
             errors::report(
                 here,
@@ -225,7 +229,7 @@ unsafe extern "C" fn pop_xml(
         let input = bounded_input_buffer(
             object.prev,
             ctx,
-            document_limit(policy),
+            document_limit(operation.resources()),
             here!("xmlSecTransformCreateInputBuffer"),
         );
         if input.is_null() {
@@ -244,7 +248,8 @@ unsafe extern "C" fn pop_xml(
             errors::xml_failed(here, name(), c"xmlParserInputBufferRead");
             return -1;
         };
-        let doc = parse(&bytes, here);
+        let doc =
+            policy::with_document_policy!(operation, |policy| parse_under(&bytes, here, policy));
         if doc.is_null() {
             return -1;
         }
