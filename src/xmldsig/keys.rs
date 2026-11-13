@@ -3101,9 +3101,10 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let source = original.read(&path.leaf)?;
         let root_source = original.read(&path.root)?;
-        let standing = structured_pkix::path::WorkingKey::standing(source.tbs().public_key());
-        let inherited = structured_pkix::path::WorkingKey::standing(root_source.tbs().public_key())
-            .subject(&source, original.memory())?;
+        let standing = structured_pkix::path::EffectiveKey::standing(source.tbs().public_key());
+        let inherited =
+            structured_pkix::path::EffectiveKey::standing(root_source.tbs().public_key())
+                .subject(&source, original.memory())?;
         let verification_key = VerificationKey {
             algorithm: SignatureAlgorithm::DsaSha256,
             public_key_bytes: effective.to_vec(),

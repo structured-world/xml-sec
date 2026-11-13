@@ -3749,7 +3749,7 @@ pub(crate) fn certificate_metadata(
         // shared reader distinguishes it from implicit and specified curves.
         // https://www.rfc-editor.org/rfc/rfc5480#section-2.1.1
         let curve = match structured_pkix::key::ec::read(
-            structured_pkix::path::WorkingKey::standing(spki),
+            structured_pkix::path::EffectiveKey::standing(spki),
             session.memory(),
         ) {
             Ok(key) => match key.curve() {

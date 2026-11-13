@@ -18,7 +18,7 @@ xml-sec-libxml2 = { path = "../xml-sec-libxml2" }
 # C `fputs` for debug dumps to a caller's `FILE*`.
 libc = "0.2"
 # The resumable Base64 codec behind `xmlSecBase64Ctx`.
-structured-base64 = "0.21"
+structured-base64 = "0.22"
 # Private keys held by key data are wiped when released.
 zeroize = "1"
 

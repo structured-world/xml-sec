@@ -1171,12 +1171,12 @@ pub(crate) fn shared_certificate_signature_outcome(
     allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
     session: &super::pkix::CertificateSession,
 ) -> Result<structured_pkix::path::Verified, X509ChainError> {
-    use structured_pkix::path::{Verify as _, WorkingKey};
+    use structured_pkix::path::{EffectiveKey, Verify as _};
     let verifier = super::pkix::ProviderVerifier { provider, allowed };
     verifier
         .verify(
             &certificate.tbs().signature(),
-            WorkingKey::standing(issuer.tbs().public_key()),
+            EffectiveKey::standing(issuer.tbs().public_key()),
             certificate.signed_bytes(),
             certificate.signature_value(),
             session.memory(),
@@ -1769,7 +1769,7 @@ mod tests {
             let outcome = crl
                 .authenticate(
                     &issuer,
-                    structured_pkix::path::WorkingKey::standing(issuer.tbs().public_key()),
+                    structured_pkix::path::EffectiveKey::standing(issuer.tbs().public_key()),
                     &FormatOnly,
                     session.memory(),
                 )
@@ -3379,7 +3379,7 @@ mod tests {
         fn verify(
             &self,
             _: &structured_pkix::algorithm::AlgorithmIdentifier<'_>,
-            _: structured_pkix::path::WorkingKey<'_>,
+            _: structured_pkix::path::EffectiveKey<'_>,
             _: &[u8],
             _: structured_pkix::signature::SignatureValue<'_>,
             _: &structured_asn1::memory::Memory,
@@ -3456,7 +3456,7 @@ mod tests {
             let proof = crl
                 .authenticate(
                     &issuer,
-                    structured_pkix::path::WorkingKey::standing(issuer.tbs().public_key()),
+                    structured_pkix::path::EffectiveKey::standing(issuer.tbs().public_key()),
                     &FormatOnly,
                     memory,
                 )

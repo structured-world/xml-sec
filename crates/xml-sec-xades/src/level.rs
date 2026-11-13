@@ -30,7 +30,7 @@ use structured_pkix::crl::CertificateList;
 #[cfg(feature = "produce")]
 use structured_pkix::ocsp::ResponseBytes;
 use structured_pkix::ocsp::{BasicResponse, Response};
-use structured_pkix::path::{Anchor, Interval, WorkingKey};
+use structured_pkix::path::{Anchor, EffectiveKey, Interval};
 use structured_pkix::temporal::{Instant, LeapTable};
 use structured_xades::Xades;
 use structured_xades::baseline::{self, Assessment, Evidence};
@@ -420,7 +420,7 @@ fn token_actors<'p, 't, W: Work>(
         let context = CheckContext {
             certificate,
             certificate_parent: parent,
-            key: WorkingKey::standing(certificate.tbs().public_key()),
+            key: EffectiveKey::standing(certificate.tbs().public_key()),
             // An incorporated token is archived evidence: this instant only
             // refuses one generated after the time being validated at.
             requested: None,
