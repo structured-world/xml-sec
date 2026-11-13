@@ -1,7 +1,9 @@
 use std::fmt::Write as _;
 
-use aes::cipher::BlockModeEncrypt as _;
+use aes::cipher::{BlockModeEncrypt as _, KeyIvInit as _, block_padding::Pkcs7};
 use base64::Engine as _;
+use der::{Decode as _, Encode as _, asn1::UintRef};
+use md5::{Digest as _, Md5};
 use p256::pkcs8::DecodePrivateKey as _;
 
 /// The error of bytes outside the selected container, as a pattern.
@@ -42,10 +44,28 @@ fn import(
     Ok(inventory)
 }
 
+/// OpenSSL `EVP_BytesToKey` with MD5 and one iteration for a 32-byte key,
+/// as the fixtures below are encrypted.
+fn envelope_key(password: &[u8], salt: &[u8]) -> [u8; 32] {
+    let first = Md5::new()
+        .chain_update(password)
+        .chain_update(salt)
+        .finalize();
+    let second = Md5::new()
+        .chain_update(first)
+        .chain_update(password)
+        .chain_update(salt)
+        .finalize();
+    let mut key = [0; 32];
+    key[..16].copy_from_slice(&first);
+    key[16..].copy_from_slice(&second);
+    key
+}
+
 /// `der` under `tag` in the traditional envelope with AES-256-CBC.
 fn encrypted_pem(tag: &str, der: &[u8], password: &[u8]) -> String {
     let iv = [0x39; 16];
-    let key = envelope_key(password, &iv[..8], 32);
+    let key = envelope_key(password, &iv[..8]);
     let mut ciphertext = vec![0_u8; der.len() + 16];
     ciphertext[..der.len()].copy_from_slice(der);
     let length = cbc::Encryptor::<aes::Aes256>::new_from_slices(&key, &iv)
@@ -222,8 +242,12 @@ fn the_single_resource_limit_holds_one_normalized_dsa_document() {
     )
     .expect("the fixture password decrypts the DSA key");
     let der = traditional.der.as_slice();
+    let (memory, _) = work_account(&ResourcePolicy::default());
+    let document = Key::read(der, Some(KeyFamily::Dsa), usize::MAX, &memory)
+        .expect("the fixture is a DSA key")
+        .encoded_len();
     let resources = ResourcePolicy {
-        max_external_resource_bytes: der.len() + PKCS8_DSA_FRAMING,
+        max_external_resource_bytes: der.len().max(document),
         ..ResourcePolicy::default()
     };
     import(der, PrivateKeyContainer::Der, None, &resources)
@@ -353,34 +377,37 @@ fn pkcs8_containers_accept_nothing_else() {
     ));
 }
 
+/// The OpenSSL DSA private key structure, to build variants of the fixture.
+#[derive(der::Sequence)]
+struct TraditionalDsaPrivateKey<'a> {
+    version: u8,
+    p: UintRef<'a>,
+    q: UintRef<'a>,
+    g: UintRef<'a>,
+    y: UintRef<'a>,
+    x: UintRef<'a>,
+}
+
 /// The traditional DER of the DSA fixture.
 fn dsa_der() -> Zeroizing<Vec<u8>> {
-    let block = pem::parse(DSA_ENCRYPTED).expect("the DSA fixture");
-    let (cipher, iv) = block
-        .headers()
-        .get("DEK-Info")
-        .and_then(|value| value.split_once(','))
-        .expect("the envelope header");
-    Cipher::named(cipher)
-        .expect("a known cipher")
-        .decrypt(
-            &decode_hex(iv).expect("a hex IV"),
-            Zeroizing::new(block.into_contents()),
-            b"legacy-dsa-password",
-        )
-        .expect("the fixture password decrypts the key")
+    let block = BorrowedPem::parse(DSA_ENCRYPTED, usize::MAX).expect("the fixture PEM");
+    decode_pem(
+        &block,
+        Some(b"legacy-dsa-password"),
+        DSA_ENCRYPTED.len(),
+        &ResourcePolicy::default(),
+    )
+    .expect("the fixture password decrypts the DSA key")
+    .der
 }
 
 #[test]
 fn a_dsa_generator_shorter_than_the_modulus_is_refused() {
-    // A generator encoded in fewer octets than p reaches the g^x check at
-    // p's precision; it does not match the stored public key and is refused
-    // as an error, not a panic.
+    // A generator encoded in fewer octets than p does not match the stored
+    // public key and is refused as an error, not a panic.
     let resources = ResourcePolicy::default();
     let der = dsa_der();
-    normalize_dsa(&der, &resources, 0)
-        .expect("the fixture normalizes")
-        .expect("the fixture is a DSA key");
+    normalize(&der, Some(KeyFamily::Dsa), &resources, 0).expect("the fixture normalizes");
     let key = TraditionalDsaPrivateKey::from_der(&der).expect("a DSA key");
     let short = TraditionalDsaPrivateKey {
         g: UintRef::new(&[2]).expect("a positive integer"),
@@ -389,7 +416,7 @@ fn a_dsa_generator_shorter_than_the_modulus_is_refused() {
     .to_der()
     .expect("the key encodes");
     assert!(matches!(
-        normalize_dsa(&short, &resources, 0),
+        normalize(&short, Some(KeyFamily::Dsa), &resources, 0),
         unsupported!()
     ));
 }

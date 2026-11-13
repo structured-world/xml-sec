@@ -517,6 +517,10 @@ xmldsig-sign = [
     "dep:getrandom",
     "dep:pkcs12",
     "dep:structured-cms",
+    # OpenSSL traditional private keys and the password engine of PKCS#12 and
+    # encrypted PKCS#8 are the shared primitives'.
+    "structured-cms/openssl",
+    "structured-cms/password-protection",
     "dep:pbkdf2",
     "dep:aes",
     "dep:cbc",
