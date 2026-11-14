@@ -13,7 +13,7 @@ use alloc::{string::String, sync::Arc, vec, vec::Vec};
 
 use pkcs8::{EncryptedPrivateKeyInfoRef, PrivateKeyInfoRef};
 use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
-use structured_cms::openssl::{Envelope, Error as OpenSslError, Key, KeyFamily};
+use structured_cms::openssl::{Envelope, Error as OpenSslError, KdfCost, Key, KeyFamily};
 use zeroize::Zeroizing;
 
 use super::{
@@ -144,7 +144,8 @@ impl KeyInventory {
                     .retained_with_name(&name, resources)?
                     .checked_add(bytes.len())
                     .ok_or_else(|| aggregate_limit(resources))?;
-                let traditional = decode_pem(&block, password, source, resources)?;
+                let traditional =
+                    decode_pem(&block, password, source, resources, &mut self.kdf_work)?;
                 // Besides the decoded DER, the encoded input, the password
                 // and the DER buffer's unused capacity stay live while the
                 // key is normalized and imported.
@@ -323,12 +324,14 @@ fn reserve(resources: &ResourcePolicy, live: usize, output: usize) -> Result<(),
 }
 
 /// The DER of the traditional PEM `block`, decrypted with `password` when
-/// its headers declare the OpenSSL envelope.
+/// its headers declare the OpenSSL envelope; the key derivation is admitted
+/// against, and spent from, the inventory's `kdf_work`.
 fn decode_pem(
     block: &BorrowedPem<'_>,
     password: Option<&[u8]>,
     source_len: usize,
     resources: &ResourcePolicy,
+    kdf_work: &mut usize,
 ) -> Result<Traditional, KeyStoreError> {
     let (memory, work) = work_account(resources);
     let envelope = Envelope::read(block.headers, &memory).map_err(|error| match error {
@@ -354,6 +357,9 @@ fn decode_pem(
     let source_len = source_len
         .checked_add(password_len)
         .ok_or_else(|| aggregate_limit(resources))?;
+    if let Some(envelope) = &envelope {
+        admit_derivation(envelope.kdf_cost(), password_len, resources, kdf_work)?;
+    }
     reserve(resources, source_len, block.decoded_len)?;
     let mut der = Zeroizing::new(vec![0; block.decoded_len]);
     block.decode_into(&mut der).map_err(|error| {
@@ -377,6 +383,44 @@ fn decode_pem(
         encrypted: envelope.is_some(),
         password_len,
     })
+}
+
+/// Admit an `EVP_BytesToKey` derivation of `cost` with a password of
+/// `password_len` bytes against the inventory's remaining KDF work, and
+/// spend it before the attempt, as encrypted PKCS#8 does: rounds times
+/// blocks, plus the password hashed once per block in 64-byte units. The
+/// password-independent part is refused first.
+fn admit_derivation(
+    cost: KdfCost,
+    password_len: usize,
+    resources: &ResourcePolicy,
+    kdf_work: &mut usize,
+) -> Result<(), KeyStoreError> {
+    let maximum = resources.max_key_import_kdf_work;
+    let refused = |actual: Option<usize>| {
+        super::kdf_policy_violation(
+            resource_name::KEY_IMPORT_KDF_WORK,
+            maximum,
+            actual.map(|actual| actual as u64),
+        )
+    };
+    let structural = cost.blocks.checked_mul(cost.rounds as usize);
+    let before = structural.and_then(|work| kdf_work.checked_add(work));
+    if before.is_none_or(|total| total > maximum) {
+        return Err(refused(before));
+    }
+    let total = cost
+        .blocks
+        .checked_mul(password_len.div_ceil(64))
+        .zip(before)
+        .and_then(|(password, before)| before.checked_add(password));
+    match total {
+        Some(total) if total <= maximum => {
+            *kdf_work = total;
+            Ok(())
+        }
+        total => Err(refused(total)),
+    }
 }
 
 /// The traditional key `der` of `family`, or of the family it decodes as,

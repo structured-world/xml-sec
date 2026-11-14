@@ -370,7 +370,7 @@ structured-asn1 = { version = "0.22", default-features = false, features = ["all
 structured-pkix = { version = "0.22", default-features = false, features = ["alloc"], optional = true }
 # PKCS#12 containers and their password engine, OpenSSL traditional private
 # keys, and the incremental HMAC of the HMAC signature methods.
-structured-cms = { version = "0.22", default-features = false, features = ["alloc"], optional = true }
+structured-cms = { version = "0.22.2", default-features = false, features = ["alloc"], optional = true }
 tinyvec = { version = "1.13", optional = true }
 # `pem` is RFC 7468 decoding of caller key and certificate text.
 der = { version = "0.8", default-features = false, features = ["alloc", "pem"], optional = true }

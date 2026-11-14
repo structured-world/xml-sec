@@ -239,6 +239,7 @@ fn the_single_resource_limit_holds_one_normalized_dsa_document() {
         Some(b"legacy-dsa-password"),
         DSA_ENCRYPTED.len(),
         &ResourcePolicy::default(),
+        &mut 0,
     )
     .expect("the fixture password decrypts the DSA key");
     let der = traditional.der.as_slice();
@@ -393,6 +394,56 @@ fn an_envelope_password_counts_against_the_resource_budgets() {
 }
 
 #[test]
+fn an_envelope_derivation_spends_the_inventory_kdf_work() {
+    // EVP_BytesToKey for AES-256 runs one MD5 round for each of two key
+    // blocks and hashes the password in each: four units of the inventory's
+    // KDF work, refused before decryption once the remainder is smaller.
+    let key = p256::SecretKey::from_slice(&[0x11; 32]).expect("a scalar below the order");
+    let der = key.to_sec1_der().expect("SEC1 encoding");
+    let pem = encrypted_pem("EC PRIVATE KEY", &der, b"secret").into_bytes();
+    let import_with = |inventory: &mut KeyInventory, name: &str, work: usize| {
+        inventory.add_openssl_private_key(
+            name.to_owned(),
+            &pem,
+            PrivateKeyContainer::Pem,
+            Some(b"secret"),
+            KeyUsages::SIGN,
+            &ResourcePolicy {
+                max_key_import_kdf_work: work,
+                ..ResourcePolicy::default()
+            },
+        )
+    };
+    let mut inventory = KeyInventory::default();
+    import_with(&mut inventory, "first", 4).expect("four units admit the derivation");
+    assert_eq!(inventory.key_import_kdf_work(), 4);
+    for (limit, actual) in [(1, 2), (7, 8)] {
+        assert!(
+            matches!(
+                import_with(&mut inventory, "second", limit),
+                Err(KeyStoreError::Policy(
+                    crate::policy::PolicyViolation::ResourceLimit {
+                        resource: resource_name::KEY_IMPORT_KDF_WORK,
+                        ..
+                    } | crate::policy::PolicyViolation::ResourceLimitExceeded {
+                        resource: resource_name::KEY_IMPORT_KDF_WORK,
+                        ..
+                    }
+                ))
+            ),
+            "limit {limit} cannot admit {actual} more units"
+        );
+    }
+    assert_eq!(
+        inventory.key_import_kdf_work(),
+        4,
+        "a refusal spends nothing"
+    );
+    import_with(&mut inventory, "second", 8).expect("eight units admit two derivations");
+    assert_eq!(inventory.key_import_kdf_work(), 8);
+}
+
+#[test]
 fn pkcs8_containers_accept_nothing_else() {
     // The PKCS#8 forms refuse traditional keys; the generic forms read both,
     // and an RSA label never carries PKCS#8.
@@ -444,6 +495,7 @@ fn dsa_der() -> Zeroizing<Vec<u8>> {
         Some(b"legacy-dsa-password"),
         DSA_ENCRYPTED.len(),
         &ResourcePolicy::default(),
+        &mut 0,
     )
     .expect("the fixture password decrypts the DSA key")
     .der
