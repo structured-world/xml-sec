@@ -40,10 +40,12 @@ pub enum PrivateKeyContainer {
 /// The error of bytes that are not a key of the selected container.
 const UNSUPPORTED: KeyStoreError = KeyStoreError::Selection("unsupported private key container");
 
-/// A traditional key's DER and whether a password envelope protected it.
+/// A traditional key's DER, whether a password envelope protected it, and
+/// the bytes of the password that opened it, live until the import ends.
 struct Traditional {
     der: Zeroizing<Vec<u8>>,
     encrypted: bool,
+    password_len: usize,
 }
 
 /// A traditional key family by its PEM label.
@@ -143,12 +145,15 @@ impl KeyInventory {
                     .checked_add(bytes.len())
                     .ok_or_else(|| aggregate_limit(resources))?;
                 let traditional = decode_pem(&block, password, source, resources)?;
-                // Besides the decoded DER, the encoded input and the DER
-                // buffer's unused capacity stay live while the key is
-                // normalized and imported.
+                // Besides the decoded DER, the encoded input, the password
+                // and the DER buffer's unused capacity stay live while the
+                // key is normalized and imported.
                 let outside = bytes
                     .len()
-                    .checked_add(traditional.der.capacity() - traditional.der.len())
+                    .checked_add(traditional.password_len)
+                    .and_then(|live| {
+                        live.checked_add(traditional.der.capacity() - traditional.der.len())
+                    })
                     .ok_or_else(|| aggregate_limit(resources))?;
                 self.add_traditional(
                     name,
@@ -335,6 +340,20 @@ fn decode_pem(
     if envelope.is_some() && password.is_none() {
         return Err(KeyStoreError::ProtectedContainer);
     }
+    // The password the envelope uses is external material, bounded as one
+    // resource and live beside everything the import holds.
+    let password_len = password
+        .filter(|_| envelope.is_some())
+        .map_or(0, <[u8]>::len);
+    if password_len > resources.max_external_resource_bytes {
+        return Err(import_resource_limit(
+            resource_name::EXTERNAL_RESOURCE_BYTES,
+            resources.max_external_resource_bytes,
+        ));
+    }
+    let source_len = source_len
+        .checked_add(password_len)
+        .ok_or_else(|| aggregate_limit(resources))?;
     reserve(resources, source_len, block.decoded_len)?;
     let mut der = Zeroizing::new(vec![0; block.decoded_len]);
     block.decode_into(&mut der).map_err(|error| {
@@ -356,6 +375,7 @@ fn decode_pem(
     Ok(Traditional {
         der,
         encrypted: envelope.is_some(),
+        password_len,
     })
 }
 
