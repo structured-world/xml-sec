@@ -27,9 +27,12 @@ use super::{contain, free, malloc, write_stream};
 
 pub(crate) mod builtin;
 pub(crate) mod ctx;
+pub(crate) mod digests;
+pub(crate) mod hmac;
 pub(crate) mod io;
 pub(crate) mod parser;
 pub(crate) mod relationship;
+pub(crate) mod signatures;
 pub(crate) mod xpath;
 
 #[cfg(test)]
@@ -43,6 +46,10 @@ pub(crate) const STATUS_NONE: c_int = 0;
 pub(crate) const STATUS_WORKING: c_int = 1;
 /// `xmlSecTransformStatusFinished`.
 pub(crate) const STATUS_FINISHED: c_int = 2;
+/// `xmlSecTransformStatusOk`.
+pub(crate) const STATUS_OK: c_int = 3;
+/// `xmlSecTransformStatusFail`.
+pub(crate) const STATUS_FAIL: c_int = 4;
 
 /// `xmlSecTransformModePush`.
 pub(crate) const MODE_PUSH: c_int = 1;
@@ -53,6 +60,10 @@ pub(crate) const MODE_POP: c_int = 2;
 pub(crate) const OPERATION_ENCODE: c_int = 1;
 /// `xmlSecTransformOperationDecode`.
 pub(crate) const OPERATION_DECODE: c_int = 2;
+/// `xmlSecTransformOperationSign`.
+pub(crate) const OPERATION_SIGN: c_int = 3;
+/// `xmlSecTransformOperationVerify`.
+pub(crate) const OPERATION_VERIFY: c_int = 4;
 
 /// `xmlSecTransformDataTypeUnknown`.
 pub(crate) const DATA_UNKNOWN: u8 = 0;
@@ -65,6 +76,10 @@ pub(crate) const DATA_XML: u8 = 2;
 pub(crate) const USAGE_DSIG_TRANSFORM: c_uint = 0x0001;
 /// `xmlSecTransformUsageC14NMethod`.
 pub(crate) const USAGE_C14N_METHOD: c_uint = 0x0002;
+/// `xmlSecTransformUsageDigestMethod`.
+pub(crate) const USAGE_DIGEST_METHOD: c_uint = 0x0004;
+/// `xmlSecTransformUsageSignatureMethod`.
+pub(crate) const USAGE_SIGNATURE_METHOD: c_uint = 0x0008;
 
 /// `XMLSEC_TRANSFORM_FLAGS_USER_SPECIFIED`.
 pub(crate) const FLAGS_USER_SPECIFIED: usize = 0x0001;

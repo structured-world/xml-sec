@@ -26,6 +26,8 @@ use super::list::{
     xmlSecPtrListInitialize, xmlSecPtrListRemove,
 };
 use super::transforms::{Global, XmlSecTransformKlass, xmlSecTransformIdsRegister, zero_list};
+use super::transforms::{digests, hmac, signatures};
+use super::{app, asymkeys, symkeys};
 
 /// An opaque `xmlSecKeysMngrPtr`, `xmlSecKeyPtr` or `xmlSecKeyInfoCtxPtr`.
 type Opaque = *mut c_void;
@@ -183,7 +185,73 @@ functions_table! {
 static BUILTIN: Global<XmlSecCryptoDLFunctions> = Global::new(XmlSecCryptoDLFunctions {
     crypto_init: Some(builtin_crypto_init),
     crypto_shutdown: Some(builtin_crypto_shutdown),
+    key_data_aes: Some(symkeys::aes),
+    key_data_camellia: Some(symkeys::camellia),
+    key_data_chacha20: Some(symkeys::chacha20),
+    key_data_concat_kdf: Some(symkeys::concat_kdf),
+    key_data_des: Some(symkeys::des),
+    key_data_der_encoded_key_value: Some(asymkeys::der_encoded_key_value),
+    key_data_dsa: Some(asymkeys::dsa),
+    key_data_ec: Some(asymkeys::ec),
+    key_data_rsa: Some(asymkeys::rsa),
+    #[cfg(feature = "legacy-algorithms")]
+    transform_hmac_md5: Some(hmac::hmac_md5),
+    #[cfg(feature = "legacy-algorithms")]
+    transform_hmac_ripemd160: Some(hmac::hmac_ripemd160),
+    transform_hmac_sha1: Some(hmac::hmac_sha1),
+    transform_hmac_sha224: Some(hmac::hmac_sha224),
+    transform_hmac_sha256: Some(hmac::hmac_sha256),
+    transform_hmac_sha384: Some(hmac::hmac_sha384),
+    transform_hmac_sha512: Some(hmac::hmac_sha512),
+    transform_dsa_sha1: Some(signatures::dsa_sha1),
+    transform_dsa_sha256: Some(signatures::dsa_sha256),
+    #[cfg(feature = "legacy-algorithms")]
+    transform_ecdsa_ripemd160: Some(signatures::ecdsa_ripemd160),
+    transform_ecdsa_sha1: Some(signatures::ecdsa_sha1),
+    transform_ecdsa_sha224: Some(signatures::ecdsa_sha224),
+    transform_ecdsa_sha256: Some(signatures::ecdsa_sha256),
+    transform_ecdsa_sha384: Some(signatures::ecdsa_sha384),
+    transform_ecdsa_sha512: Some(signatures::ecdsa_sha512),
+    transform_ecdsa_sha3_224: Some(signatures::ecdsa_sha3_224),
+    transform_ecdsa_sha3_256: Some(signatures::ecdsa_sha3_256),
+    transform_ecdsa_sha3_384: Some(signatures::ecdsa_sha3_384),
+    transform_ecdsa_sha3_512: Some(signatures::ecdsa_sha3_512),
+    #[cfg(feature = "legacy-algorithms")]
+    transform_rsa_md5: Some(signatures::rsa_md5),
+    #[cfg(feature = "legacy-algorithms")]
+    transform_rsa_ripemd160: Some(signatures::rsa_ripemd160),
+    transform_rsa_sha1: Some(signatures::rsa_sha1),
+    transform_rsa_sha224: Some(signatures::rsa_sha224),
+    transform_rsa_sha256: Some(signatures::rsa_sha256),
+    transform_rsa_sha384: Some(signatures::rsa_sha384),
+    transform_rsa_sha512: Some(signatures::rsa_sha512),
+    transform_rsa_pss_sha1: Some(signatures::rsa_pss_sha1),
+    transform_rsa_pss_sha224: Some(signatures::rsa_pss_sha224),
+    transform_rsa_pss_sha256: Some(signatures::rsa_pss_sha256),
+    transform_rsa_pss_sha384: Some(signatures::rsa_pss_sha384),
+    transform_rsa_pss_sha512: Some(signatures::rsa_pss_sha512),
+    transform_rsa_pss_sha3_224: Some(signatures::rsa_pss_sha3_224),
+    transform_rsa_pss_sha3_256: Some(signatures::rsa_pss_sha3_256),
+    transform_rsa_pss_sha3_384: Some(signatures::rsa_pss_sha3_384),
+    transform_rsa_pss_sha3_512: Some(signatures::rsa_pss_sha3_512),
+    #[cfg(feature = "legacy-algorithms")]
+    transform_md5: Some(digests::md5),
+    #[cfg(feature = "legacy-algorithms")]
+    transform_ripemd160: Some(digests::ripemd160),
+    transform_sha1: Some(digests::sha1),
+    transform_sha224: Some(digests::sha224),
+    transform_sha256: Some(digests::sha256),
+    transform_sha384: Some(digests::sha384),
+    transform_sha512: Some(digests::sha512),
+    transform_sha3_224: Some(digests::sha3_224),
+    transform_sha3_256: Some(digests::sha3_256),
+    transform_sha3_384: Some(digests::sha3_384),
+    transform_sha3_512: Some(digests::sha3_512),
+    key_data_hkdf: Some(symkeys::hkdf),
+    key_data_hmac: Some(symkeys::hmac),
+    key_data_pbkdf2: Some(symkeys::pbkdf2),
     crypto_app_init: Some(builtin_crypto_app_init),
+    crypto_app_key_load_memory: Some(app::key_load_memory),
     crypto_app_shutdown: Some(builtin_crypto_app_shutdown),
     ..XmlSecCryptoDLFunctions::empty()
 });

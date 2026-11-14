@@ -52,11 +52,33 @@ pub(crate) fn parse(bytes: &[u8], here: errors::Here) -> *mut XmlDoc {
     parse_parts(&[bytes], here)
 }
 
+/// The document in `bytes`, as [`parse`], under `policy`, the revision of
+/// the operation that parses it.
+pub(crate) fn parse_under(
+    bytes: &[u8],
+    here: errors::Here,
+    policy: &impl xml_sec::document::XmlDocumentPolicy,
+) -> *mut XmlDoc {
+    parsed(
+        &xml_sec_libxml2::document::parse_parts_under(&[bytes], policy),
+        here,
+    )
+}
+
 /// The document of `parts` in sequence, as [`parse`]; parts too large
 /// together are refused before they are joined.
 fn parse_parts(parts: &[&[u8]], here: errors::Here) -> *mut XmlDoc {
-    if let Ok(doc) = xml_sec_libxml2::document::parse_parts(parts) {
-        xml_sec_libxml2::nodes::pointer_of(doc)
+    parsed(&xml_sec_libxml2::document::parse_parts(parts), here)
+}
+
+/// The document a parse returned, or null with the failure reported from
+/// the entry point at `here`.
+fn parsed(
+    result: &Result<usize, xml_sec_libxml2::document::DocumentError>,
+    here: errors::Here,
+) -> *mut XmlDoc {
+    if let Ok(doc) = result {
+        xml_sec_libxml2::nodes::pointer_of(*doc)
     } else {
         // The reason is the tree layer's last error, which the report reads.
         errors::xml_failed(here, std::ptr::null(), c"xmlReadMemory");

@@ -24,6 +24,7 @@ use super::super::nodeset::{
     xmlSecNodeSetAdd, xmlSecNodeSetCreate, xmlSecNodeSetDestroy, xmlSecNodeSetGetChildren,
     xmlSecNodeSetWalk,
 };
+use super::super::policy;
 use super::super::strings::{
     xmlSecAttrFilter, xmlSecDSigNs, xmlSecNameXPath, xmlSecNameXPath2, xmlSecNameXPointer,
     xmlSecNodeXPath, xmlSecNodeXPath2, xmlSecNodeXPointer, xmlSecXPath2FilterIntersect,
@@ -32,8 +33,9 @@ use super::super::strings::{
 };
 use super::super::tree::{XmlDoc, XmlNode, XmlNodeSet, c_text, nodes, same_text};
 use super::super::xmltree::{next_element, xmlSecCheckNodeName};
-use super::super::{contain, free, malloc, policy};
+use super::super::{contain, free, malloc};
 use super::builtin::klass;
+use super::ctx::run_scope;
 use super::{
     USAGE_DSIG_TRANSFORM, WithContext, XmlSecTransform, XmlSecTransformCtx, XmlSecTransformKlass,
     context, context_or, klass_text, valid, xmlSecTransformDefaultPopXml,
@@ -708,8 +710,14 @@ unsafe extern "C" fn execute(
         c"doc != NULL",
         -1
     );
+    // SAFETY: an initialized context.
+    let Some((pinned, side)) = (unsafe { run_scope(ctx, here) }) else {
+        return -1;
+    };
     // SAFETY: an expression transform read from a live element.
-    let Some(output) = (unsafe { evaluate_list(expressions, object.in_nodes, doc) }) else {
+    let Some(output) = policy::with_document_policy!(pinned.of(side), |policy| unsafe {
+        evaluate_list(expressions, object.in_nodes, doc, policy)
+    }) else {
         // SAFETY: a valid transform.
         let name = unsafe { name_of(transform) };
         errors::internal(here, name, c"xmlSecXPathDataListExecute");
@@ -720,7 +728,8 @@ unsafe extern "C" fn execute(
 }
 
 /// The node set the expressions of `list` make from `input` over `doc`
-/// (libxmlsec1's `xmlSecXPathDataListExecute`, whose failures it reports).
+/// under `policy` (libxmlsec1's `xmlSecXPathDataListExecute`, whose failures
+/// it reports).
 ///
 /// # Safety
 /// `list` is a data list; `input` is null or a live node set over the live
@@ -729,9 +738,9 @@ unsafe fn evaluate_list(
     list: &mut XmlSecPtrList,
     input: *mut XmlSecNodeSet,
     doc: *mut XmlDoc,
+    policy: &impl xml_sec::document::XmlDocumentPolicy,
 ) -> Option<*mut XmlSecNodeSet> {
     let here = here!("xmlSecXPathDataListExecute");
-    let policy = policy::verification_at(here)?;
     // The core evaluates over a snapshot of the tree in place of libxml2's
     // evaluation context.
     let failed = |error: &str| {
@@ -753,7 +762,7 @@ unsafe fn evaluate_list(
     // One selector for the whole transform: its expressions charge the same
     // budgets, each with its own here().
     document.with_view(|view| {
-        let mut selector = match Selector::new(view, None, &[], &policy.resources) {
+        let mut selector = match Selector::new(view, None, &[], policy.resource_policy()) {
             Ok(selector) => selector,
             Err(error) => {
                 failed(&error.to_string());
