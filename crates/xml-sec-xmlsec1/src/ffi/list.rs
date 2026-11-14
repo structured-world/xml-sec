@@ -309,6 +309,9 @@ pub(crate) unsafe extern "C" fn xmlSecPtrListCopy(
     src: *mut XmlSecPtrList,
 ) -> c_int {
     contain(-1, || {
+        // The lists are borrowed apart below, and a list copied onto itself
+        // would grow while it is read.
+        check!(dst != src, "xmlSecPtrListCopy", c"dst != src", -1);
         // SAFETY: the caller passes null or lists.
         let (dst, src) = unsafe { (valid(dst), valid(src)) };
         check!(

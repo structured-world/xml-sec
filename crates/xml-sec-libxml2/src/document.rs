@@ -62,7 +62,7 @@ pub fn parse(bytes: &[u8]) -> Result<usize, DocumentError> {
 /// As for [`parse`].
 pub fn parse_parts(parts: &[&[u8]]) -> Result<usize, DocumentError> {
     let policy = crate::policy::library().ok_or(DocumentError::Policy);
-    let parsed = policy.and_then(|policy| parse_tree(parts, policy));
+    let parsed = policy.and_then(|policy| parse_tree(parts, &*policy));
     if let Err(error) = &parsed {
         record_error(error);
     }
