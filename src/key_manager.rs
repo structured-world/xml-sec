@@ -2132,8 +2132,21 @@ impl KeyInventory {
             let password = password.ok_or(KeyStoreError::ProtectedContainer)?;
             let work = enforce_pkcs8_password_policy(&shape, password, &remaining, kdf_live_bytes)?;
             self.kdf_work += work;
-            // The engine decrypts into one zeroizing output allocation.
-            let plain = pkcs8_import::decrypt(bytes, password, &remaining)?;
+            // The engine decrypts into one zeroizing output allocation; its
+            // full scratch, the password's share included, is live beside the
+            // password and that output.
+            let live_with_output = kdf_live_bytes
+                .checked_add(password.len())
+                .and_then(|live| live.checked_add(shape.output))
+                .ok_or_else(|| {
+                    import_resource_limit(
+                        crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                        resources.max_external_resource_total_bytes,
+                    )
+                })?;
+            let plain = pkcs8_import::decrypt(bytes, password, &remaining, |scratch| {
+                admit_kdf_scratch(scratch, &remaining, live_with_output)
+            })?;
             PrivateKeyInfoRef::try_from(plain.as_slice())
                 .map_err(|_| KeyStoreError::ProtectedContainer)?;
             plain
@@ -3642,25 +3655,59 @@ fn enforce_pkcs8_kdf_policy(
                 .expect("admitted KDF work fits the usize policy bound"),
         )
     };
-    match encrypted.kdf {
+    let (work, workspace) = match encrypted.kdf {
         KdfCost::Pbkdf2 {
             iterations, blocks, ..
-        } => rounds(iterations, blocks),
+        } => (rounds(iterations, blocks)?, 0),
         KdfCost::Pkcs12 {
             iterations,
             key_blocks,
             iv_blocks,
             ..
-        } => rounds(iterations, key_blocks + iv_blocks),
+        } => (rounds(iterations, key_blocks + iv_blocks)?, 0),
         KdfCost::Scrypt {
             n,
             r,
             p,
             workspace_bytes,
             ..
-        } => enforce_scrypt_kdf_limits(n, r, p, workspace_bytes, resources, live_with_output),
-        _ => Err(KeyStoreError::ProtectedContainer),
+        } => (scrypt_work(n, r, p, resources)?, workspace_bytes),
+        _ => return Err(KeyStoreError::ProtectedContainer),
+    };
+    // The engine's scratch holds the scrypt B, V and T blocks it states.
+    admit_kdf_scratch(
+        encrypted.scratch.max(workspace),
+        resources,
+        live_with_output,
+    )?;
+    Ok(work)
+}
+
+/// Admit `scratch` bytes of key-derivation workspace, live beside
+/// `live_with_output` bytes of inventory, input and plaintext buffer.
+#[cfg(feature = "xmldsig-sign")]
+fn admit_kdf_scratch(
+    scratch: usize,
+    resources: &ResourcePolicy,
+    live_with_output: usize,
+) -> Result<(), KeyStoreError> {
+    if scratch > resources.max_key_import_kdf_memory_bytes {
+        return Err(kdf_policy_violation(
+            crate::policy::resource_name::KEY_IMPORT_KDF_MEMORY,
+            resources.max_key_import_kdf_memory_bytes,
+            Some(scratch as u64),
+        ));
     }
+    // An independent KDF ceiling cannot waive the aggregate peak.
+    let total = scratch.checked_add(live_with_output);
+    if total.is_none_or(|total| total > resources.max_external_resource_total_bytes) {
+        return Err(kdf_policy_violation(
+            crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+            resources.max_external_resource_total_bytes,
+            total.map(|total| total as u64),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "xmldsig-sign")]
@@ -3716,15 +3763,9 @@ fn enforce_pkcs8_password_policy(
         })
 }
 
+/// The scrypt work N·r·p, within the remaining key-import KDF work.
 #[cfg(feature = "xmldsig-sign")]
-fn enforce_scrypt_kdf_limits(
-    n: u64,
-    r: u64,
-    p: u64,
-    workspace_bytes: usize,
-    resources: &ResourcePolicy,
-    retained_with_input: usize,
-) -> Result<usize, KeyStoreError> {
+fn scrypt_work(n: u64, r: u64, p: u64, resources: &ResourcePolicy) -> Result<usize, KeyStoreError> {
     if n == 0 || r == 0 || p == 0 {
         return Err(KeyStoreError::ProtectedContainer);
     }
@@ -3734,25 +3775,6 @@ fn enforce_scrypt_kdf_limits(
             crate::policy::resource_name::KEY_IMPORT_KDF_WORK,
             resources.max_key_import_kdf_work,
             work,
-        ));
-    }
-    // The B, V and T blocks the shared engine states it derives in.
-    let memory = Some(workspace_bytes as u64);
-    if memory.is_none_or(|value| value > resources.max_key_import_kdf_memory_bytes as u64) {
-        return Err(kdf_policy_violation(
-            crate::policy::resource_name::KEY_IMPORT_KDF_MEMORY,
-            resources.max_key_import_kdf_memory_bytes,
-            memory,
-        ));
-    }
-    // The workspace is live alongside the existing inventory, name and
-    // imported container. An independent KDF ceiling cannot waive that peak.
-    let total = memory.and_then(|memory| memory.checked_add(retained_with_input as u64));
-    if total.is_none_or(|total| total > resources.max_external_resource_total_bytes as u64) {
-        return Err(kdf_policy_violation(
-            crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
-            resources.max_external_resource_total_bytes,
-            total,
         ));
     }
     // The work check above proves this value exists and fits the usize ceiling.
