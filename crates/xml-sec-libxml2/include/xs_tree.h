@@ -105,7 +105,9 @@ xmlNsPtr xsNsGetNext(const xmlNs *ns);
 xmlChar *xsNsGetHref(const xmlNs *ns);
 xmlChar *xsNsGetPrefix(const xmlNs *ns);
 
-/* Building and linking. */
+/* Building and linking. A node is created in a document and stays in it:
+ * a NULL doc returns NULL where libxml2 creates a free node, so the
+ * libxmlsec1 template constructors need the document they build in. */
 xmlNodePtr xsNewDocNode(xmlDocPtr doc, xmlNsPtr ns, const xmlChar *name, const xmlChar *content);
 xmlNodePtr xsNewDocText(xmlDocPtr doc, const xmlChar *content);
 xmlNodePtr xsNewDocComment(xmlDocPtr doc, const xmlChar *content);
@@ -114,7 +116,17 @@ xmlNodePtr xsAddNextSibling(xmlNodePtr current, xmlNodePtr node);
 xmlNodePtr xsAddPrevSibling(xmlNodePtr current, xmlNodePtr node);
 void xsUnlinkNode(xmlNodePtr node);
 void xsFreeNode(xmlNodePtr node);
+/* Unlike libxml2's: a node of a linked list is unlinked before it is freed. */
+void xsFreeNodeList(xmlNodePtr node);
+/* Unlike libxml2's: only extended == 1, the recursive copy, is made; other
+ * values return NULL. */
+xmlNodePtr xsDocCopyNode(const xmlNode *node, xmlDocPtr doc, int extended);
 xmlNodePtr xsReplaceNode(xmlNodePtr old, xmlNodePtr current);
+/* data is UTF-8. Unlike libxml2's, a refusal returns 1 (bad context or
+ * encoding) or 5 (content not well-formed or refused by the policy) rather
+ * than the parser's specific code. */
+int xsParseInNodeContext(xmlNodePtr node, const char *data, int size, int options,
+                         xmlNodePtr *list);
 
 /* Content and attributes. */
 xmlChar *xsNodeGetContent(const xmlNode *node);

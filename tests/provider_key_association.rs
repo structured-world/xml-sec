@@ -6,7 +6,7 @@ use structured_asn1::{
     Encoding, Limits, Parser,
     memory::{Memory, MemoryAccount},
 };
-use structured_pkix::{key::PublicKeyInfo, path::WorkingKey};
+use structured_pkix::{key::PublicKeyInfo, path::EffectiveKey};
 use xml_sec::provider::{CryptoProvider, KeyAssociation, RustCryptoProvider};
 
 #[path = "support/provider_candidate_limits.rs"]
@@ -22,7 +22,7 @@ fn associate(actual: &[u8], expected: &[u8]) -> KeyAssociation {
     let element = reader.next_element().unwrap().unwrap();
     let expected = PublicKeyInfo::read_element(&reader, &element, "expected SPKI").unwrap();
     RustCryptoProvider
-        .associate_verification_key(actual, WorkingKey::standing(expected), &|_| Ok(()))
+        .associate_verification_key(actual, EffectiveKey::standing(expected), &|_| Ok(()))
         .unwrap()
 }
 
@@ -152,7 +152,7 @@ fn rsa_components_are_compared_across_rsa_and_pss_identifiers() {
         assert_eq!(associate(left, right), expected);
     }
     // PSS absence is unrestricted; a written NULL is not that representation,
-    // even though generic WorkingKey parameter projection reports None.
+    // even though generic EffectiveKey parameter projection reports None.
     let pss_info = pkcs8::SubjectPublicKeyInfoRef::from_der(&first_pss).unwrap();
     let pss_null = pkcs8::SubjectPublicKeyInfoRef {
         algorithm: pkcs8::AlgorithmIdentifierRef {
@@ -231,7 +231,7 @@ fn fixed_format_pq_keys_distinguish_mismatch_and_malformed() {
 
 #[test]
 fn edwards_original_null_parameters_are_not_hidden_by_effective_projection() {
-    // WorkingKey intentionally projects NULL as no effective parameters;
+    // EffectiveKey intentionally projects NULL as no effective parameters;
     // RFC 8410 still forbids writing it in either original Edwards SPKI.
     for (oid, bits) in [
         (

@@ -12,6 +12,6 @@ crate-type = ["cdylib"]
 [dependencies]
 xml-sec = { path = "../..", default-features = false, features = ["c14n", "cms", "rustcrypto", "xml-backend-roxmltree"] }
 xml-sec-xades = { path = "../../crates/xml-sec-xades", default-features = false, features = ["xml-backend-roxmltree"] }
-structured-asn1 = { version = "0.21.0", default-features = false, features = ["alloc"] }
-structured-cms = { version = "0.21.0", default-features = false, features = ["alloc"] }
-structured-pkix = { version = "0.21.0", default-features = false, features = ["alloc"] }
+structured-asn1 = { version = "0.22", default-features = false, features = ["alloc"] }
+structured-cms = { version = "0.22", default-features = false, features = ["alloc"] }
+structured-pkix = { version = "0.22", default-features = false, features = ["alloc"] }

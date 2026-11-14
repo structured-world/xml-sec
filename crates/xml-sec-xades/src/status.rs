@@ -25,7 +25,9 @@ use structured_pkix::ocsp::{
     self, AuthorityBinding, BasicResponse, BoundEvidence, Delegation, Request, ResponderRevocation,
     SignatureAuthentication, SignatureError, SignedResponse, check_delegate,
 };
-use structured_pkix::path::{Anchor, BuildError, Interval, Policy, ValidationContext, WorkingKey};
+use structured_pkix::path::{
+    Anchor, BuildError, EffectiveKey, Interval, Policy, ValidationContext,
+};
 use structured_pkix::temporal::{Instant, LeapTable, Reading};
 use xml_sec::xmldsig::VerifiedSession;
 use xml_sec::xmldsig::X509ChainError;
@@ -177,7 +179,7 @@ fn authenticated_lists<'x, W: Work>(
             {
                 continue;
             }
-            let key = WorkingKey::standing(candidate.tbs().public_key());
+            let key = EffectiveKey::standing(candidate.tbs().public_key());
             let answer = list
                 .authenticate(candidate, key, &verifier, memory)
                 .map_err(|error| match error {
@@ -223,7 +225,7 @@ fn signed_responses<'x, W: Work>(
             .chain(authorities.anchors.iter())
             .chain(authorities.pool.iter().copied())
         {
-            let key = WorkingKey::standing(candidate.tbs().public_key());
+            let key = EffectiveKey::standing(candidate.tbs().public_key());
             let answer = response
                 .authenticate_signature(candidate, key, &verifier, cms, memory)
                 .map_err(|error| match error {
@@ -329,7 +331,7 @@ impl<'e, 'x, W: Work> Engine<'e, 'x, '_, '_, '_, W> {
         &self,
         target: &'x Certificate<'x>,
         issuer: &'x Certificate<'x>,
-        issuing: WorkingKey<'x>,
+        issuing: EffectiveKey<'x>,
         roots: usize,
         extra: &mut OwnedVec<CheckedPath<'x>, structured_asn1::memory::Memory>,
     ) -> Result<Selection<'e, 'x>, StatusError> {
@@ -582,7 +584,7 @@ pub(crate) fn with_statuses<'x, W: Work, R>(
                 let member = &path_at(roots, &extra, cursor).members()[index];
                 (Some(member.certificate()), member.key())
             } else {
-                (anchor.certificate(), WorkingKey::standing(anchor.key()))
+                (anchor.certificate(), EffectiveKey::standing(anchor.key()))
             };
             // A listed entry decides whatever another source omits (RFC 5280
             // §6.3.3(i)), so a good OCSP answer cannot hide it from the report.

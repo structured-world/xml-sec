@@ -56,12 +56,21 @@ fn inventory_merge_preserves_import_work() {
     assert_eq!(inventory.key_import_kdf_work(), 5, "failed merge is atomic");
 }
 
+/// The KDF work one import of `bytes` with `password` spends under the
+/// default policy, kept even when the password is wrong.
+fn pkcs12_kdf_work(bytes: &[u8], password: &str) -> usize {
+    let mut probe = KeyInventory::default();
+    let _imported = probe.add_pkcs12("probe".into(), bytes, password, &ResourcePolicy::default());
+    probe.key_import_kdf_work()
+}
+
 #[test]
 fn repeated_pkcs12_imports_share_kdf_work() {
     // Each bundle fits by itself, but a session may not reset password work.
     let bytes = include_bytes!("../../tests/fixtures/xmlenc/01-phaos-xmlenc-3/rsa-priv-key.p12");
+    let one = pkcs12_kdf_work(bytes, "secret");
     let resources = ResourcePolicy {
-        max_key_import_kdf_work: 10_000,
+        max_key_import_kdf_work: one * 2 - 1,
         ..ResourcePolicy::default()
     };
     let mut single = KeyInventory::default();
@@ -165,8 +174,10 @@ fn pkcs12_mac_rejects_altered_safe_before_decryption() {
         .position(|v| v == [2, 2, 8, 0])
         .expect("PBKDF2 iterations");
     bytes[offset + 3] = 1;
+    // Room for the MAC alone, as a wrong password spends it: a decryption
+    // before the MAC would exceed it.
     let resources = ResourcePolicy {
-        max_key_import_kdf_work: 2048,
+        max_key_import_kdf_work: pkcs12_kdf_work(&bytes, "wrong"),
         ..ResourcePolicy::default()
     };
     let result = KeyInventory::default().add_pkcs12_with_password_callback(
@@ -209,20 +220,22 @@ fn pkcs12_content_count_denial_is_not_a_password_error() {
 
 #[test]
 fn pkcs12_aggregate_kdf_work_preserves_policy_error() {
-    // Individual counts fit, but MAC plus PBES2 exceeds one shared budget.
+    // Each step fits, but the MAC plus the decryptions exceed one shared
+    // budget a unit short of their sum.
+    let bytes = include_bytes!("../../tests/fixtures/xmlenc/01-phaos-xmlenc-3/rsa-priv-key.p12");
+    let limit = pkcs12_kdf_work(bytes, "secret") - 1;
     let resources = ResourcePolicy {
-        max_key_import_kdf_work: 3000,
+        max_key_import_kdf_work: limit,
         ..ResourcePolicy::default()
     };
-    let bytes = include_bytes!("../../tests/fixtures/xmlenc/01-phaos-xmlenc-3/rsa-priv-key.p12");
     assert!(matches!(
         KeyInventory::default().add_pkcs12("limited".into(), bytes, "secret", &resources),
         Err(KeyStoreError::Policy(
             crate::policy::PolicyViolation::ResourceLimitExceeded {
                 resource: crate::policy::resource_name::KEY_IMPORT_KDF_WORK,
-                maximum: 3000,
+                maximum,
             }
-        ))
+        )) if maximum == limit
     ));
 }
 
@@ -1803,6 +1816,13 @@ fn certificate_and_crl_capacity_precedes_der_parsing() {
     ));
 }
 
+/// The KDF shape the password engine reads from `envelope`.
+fn shape_of(envelope: &EncryptedPrivateKeyInfoRef<'_>) -> super::pkcs8_import::Shape {
+    use der::Encode as _;
+    let bytes = envelope.to_der().expect("encrypted envelope");
+    super::pkcs8_import::shape(&bytes, &ResourcePolicy::default()).expect("a supported scheme")
+}
+
 #[test]
 fn pkcs8_pbkdf2_output_blocks_are_checked_before_password() {
     use der::Encode as _;
@@ -1852,7 +1872,7 @@ fn pkcs8_pbkdf2_output_blocks_are_checked_before_password() {
         max_key_import_kdf_work: 6,
         ..resources
     };
-    assert!(enforce_pkcs8_kdf_policy(&encrypted, &exact, 0).is_ok());
+    assert!(enforce_pkcs8_kdf_policy(&shape_of(&encrypted), &exact, 0).is_ok());
     // Cover each PRF width and CBC key width, including single-block
     // cases so the fix cannot unconditionally double iteration charges.
     for (prf, hash_len) in [
@@ -1881,18 +1901,73 @@ fn pkcs8_pbkdf2_output_blocks_are_checked_before_password() {
                 max_key_import_kdf_work: work,
                 ..ResourcePolicy::default()
             };
-            assert!(enforce_pkcs8_kdf_policy(&envelope, &exact, 0).is_ok());
+            let shape = shape_of(&envelope);
+            assert!(enforce_pkcs8_kdf_policy(&shape, &exact, 0).is_ok());
             let tight = ResourcePolicy {
                 max_key_import_kdf_work: work - 1,
                 ..exact
             };
-            assert!(matches!(enforce_pkcs8_kdf_policy(&envelope, &tight, 0),
+            assert!(matches!(enforce_pkcs8_kdf_policy(&shape, &tight, 0),
                     Err(KeyStoreError::Policy(crate::policy::PolicyViolation::ResourceLimit {
                         resource: crate::policy::resource_name::KEY_IMPORT_KDF_WORK,
                         actual, ..
                     })) if actual == work));
         }
     }
+}
+
+#[test]
+fn pkcs8_decryption_admits_its_full_scratch_before_allocating_it() {
+    // The scratch decryption allocates, the password's share included, is
+    // handed to the policy first; a refusal there ends the import before
+    // the buffer exists or the KDF runs.
+    use der::Encode as _;
+    use pkcs8::pkcs5::{EncryptionScheme, pbes2};
+    let envelope = EncryptedPrivateKeyInfoRef {
+        encryption_algorithm: EncryptionScheme::Pbes2(pbes2::Parameters {
+            kdf: pbes2::Kdf::Scrypt(pbes2::ScryptParams {
+                salt: pbes2::Salt::new(b"12345678").expect("salt"),
+                cost_parameter: 2,
+                block_size: 1,
+                parallelization: 4,
+                key_length: None,
+            }),
+            encryption: pbes2::EncryptionScheme::Aes256Cbc { iv: [0; 16] },
+        }),
+        encrypted_data: der::asn1::OctetStringRef::new(&[0; 16]).expect("ciphertext"),
+    };
+    let shape = shape_of(&envelope);
+    let bytes = envelope.to_der().expect("encrypted envelope");
+    let admitted = std::cell::Cell::new(None);
+    let refused =
+        super::pkcs8_import::decrypt(&bytes, b"password", &ResourcePolicy::default(), |scratch| {
+            admitted.set(Some(scratch));
+            Err(KeyStoreError::Selection("refused by the test"))
+        });
+    assert!(matches!(
+        refused,
+        Err(KeyStoreError::Selection("refused by the test"))
+    ));
+    // An octet password adds no scratch: the full total is the shape's.
+    assert_eq!(admitted.get(), Some(shape.scratch));
+    let scratch_limited = ResourcePolicy {
+        max_key_import_kdf_memory_bytes: shape.scratch - 1,
+        ..ResourcePolicy::default()
+    };
+    assert!(matches!(
+        KeyInventory::default().add_private_der(
+            "key".into(),
+            &bytes,
+            Some(b"password"),
+            KeyUsages::SIGN,
+            &scratch_limited,
+        ),
+        Err(KeyStoreError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+            resource: crate::policy::resource_name::KEY_IMPORT_KDF_MEMORY,
+            actual,
+            ..
+        })) if actual == shape.scratch
+    ));
 }
 
 #[test]
@@ -2697,24 +2772,51 @@ fn configured_x509_fallback_does_not_reinspect_prefix() {
 
 #[test]
 fn scrypt_parallel_buffers_are_checked_before_derivation() {
-    // N*r fits a tiny limit, but p independent B/V/T workspaces do not.
+    // N*r fits a tiny limit, but B for p lanes does not: the workspace the
+    // engine states (B, V and T of RFC 7914 section 5) is checked before any
+    // derivation.
+    use pkcs8::pkcs5::{EncryptionScheme, pbes2};
+    let envelope = EncryptedPrivateKeyInfoRef {
+        encryption_algorithm: EncryptionScheme::Pbes2(pbes2::Parameters {
+            kdf: pbes2::Kdf::Scrypt(pbes2::ScryptParams {
+                salt: pbes2::Salt::new(b"12345678").expect("salt"),
+                cost_parameter: 2,
+                block_size: 1,
+                parallelization: 1_000,
+                key_length: None,
+            }),
+            encryption: pbes2::EncryptionScheme::Aes256Cbc { iv: [0; 16] },
+        }),
+        encrypted_data: der::asn1::OctetStringRef::new(&[0; 16]).expect("ciphertext"),
+    };
+    let shape = shape_of(&envelope);
+    let structured_cms::personal::password::KdfCost::Scrypt {
+        workspace_bytes, ..
+    } = shape.kdf
+    else {
+        panic!("a scrypt shape");
+    };
+    // B = 128 r p, V = 128 r N and T = 128 r; with a contiguous salt the
+    // decryption scratch is exactly that workspace.
+    assert_eq!(workspace_bytes, 128 * 1_000 + 128 * 2 + 128);
+    assert_eq!(shape.scratch, workspace_bytes);
     let mut resources = ResourcePolicy {
         max_key_import_kdf_work: 10_000,
         max_key_import_kdf_memory_bytes: 4_096,
         ..ResourcePolicy::default()
     };
     assert!(matches!(
-        enforce_scrypt_kdf_limits(2, 1, 1_000, &resources, 0),
+        enforce_pkcs8_kdf_policy(&shape, &resources, 0),
         Err(KeyStoreError::Policy(
             crate::policy::PolicyViolation::ResourceLimit {
                 resource: crate::policy::resource_name::KEY_IMPORT_KDF_MEMORY,
                 maximum: 4_096,
-                actual: 512_000,
+                actual,
             }
-        ))
+        )) if actual == workspace_bytes
     ));
-    resources.max_key_import_kdf_memory_bytes = 512_000;
-    assert!(enforce_scrypt_kdf_limits(2, 1, 1_000, &resources, 0).is_ok());
+    resources.max_key_import_kdf_memory_bytes = workspace_bytes;
+    assert!(enforce_pkcs8_kdf_policy(&shape, &resources, 0).is_ok());
 }
 
 #[test]

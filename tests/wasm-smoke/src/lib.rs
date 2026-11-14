@@ -8,7 +8,7 @@ use structured_asn1::memory::{Memory, MemoryAccount};
 use structured_cms::provider::SignatureAnswer;
 use structured_cms::timestamp::{CheckContext, ImprintAgreement, Token, TokenSignature};
 use structured_pkix::Certificate;
-use structured_pkix::path::WorkingKey;
+use structured_pkix::path::EffectiveKey;
 use structured_pkix::temporal::{Instant, LeapTable};
 use xml_sec::XmlDocument;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize_xml};
@@ -142,7 +142,7 @@ fn check_token(token: &[u8]) -> Option<SignatureAnswer> {
     let context = CheckContext {
         certificate: &certificate,
         certificate_parent: &certificate_parent,
-        key: WorkingKey::standing(certificate.tbs().public_key()),
+        key: EffectiveKey::standing(certificate.tbs().public_key()),
         requested: None,
         utc: &utc,
         reference: Some(Instant::new(1_800_000_000, 0)?),

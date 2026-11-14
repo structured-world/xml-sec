@@ -5,7 +5,7 @@ use structured_asn1::{
     Encoding, Limits, Parser,
     memory::{Memory, MemoryAccount, Work},
 };
-use structured_pkix::{key::PublicKeyInfo, path::WorkingKey};
+use structured_pkix::{key::PublicKeyInfo, path::EffectiveKey};
 use xml_sec::{
     XmlDocument,
     c14n::{C14nAlgorithm, C14nMode},
@@ -180,13 +180,13 @@ fn public_key(pem: &str) -> VerificationKey {
     }
 }
 
-fn with_expected<R>(bytes: &[u8], visitor: impl FnOnce(WorkingKey<'_>) -> R) -> R {
+fn with_expected<R>(bytes: &[u8], visitor: impl FnOnce(EffectiveKey<'_>) -> R) -> R {
     let parser = Parser::new(Encoding::Der, Limits::default(), account());
     let mut reader = parser.read(bytes, 0).unwrap();
     let element = reader.next_element().unwrap().unwrap();
     let key = PublicKeyInfo::read_element(&reader, &element, "test expected SPKI").unwrap();
     assert!(reader.is_empty());
-    visitor(WorkingKey::standing(key))
+    visitor(EffectiveKey::standing(key))
 }
 
 fn signed() -> XmlDocument {
