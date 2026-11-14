@@ -1593,6 +1593,12 @@ impl OwnedTree {
             return Ok(());
         }
         self.document.detach(id);
+        // An element leaving a linked place leaves its context too: held
+        // alone, its next link reconciles it with where it then stands. Its
+        // names carry their namespaces, so nothing is declared until then.
+        if matches!(self.document.node(id).kind, NodeKind::Element { .. }) {
+            self.hold(&[id]);
+        }
         Ok(())
     }
 
