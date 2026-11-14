@@ -52,11 +52,53 @@ pub(crate) fn parse(bytes: &[u8], here: errors::Here) -> *mut XmlDoc {
     parse_parts(&[bytes], here)
 }
 
+/// The document in `bytes`, as [`parse`], under `policy`, the revision of
+/// the operation that parses it, which has `spent` of the policy's
+/// `max_xml_parse_work_bytes`: the work the core charges (decoding and the
+/// decoded text the parser reads) is added to `spent`, a failed parse's
+/// too. A policy limit the document passes, the exhausted allowance among
+/// them, is reported as that limit, for `object` at `here`.
+pub(crate) fn parse_within(
+    bytes: &[u8],
+    here: errors::Here,
+    object: *const std::ffi::c_char,
+    policy: &impl xml_sec::document::XmlDocumentPolicy,
+    spent: &mut usize,
+) -> *mut XmlDoc {
+    use xml_sec::policy::PolicyViolation;
+    match xml_sec_libxml2::document::parse_parts_within(&[bytes], policy, spent) {
+        Ok(doc) => xml_sec_libxml2::nodes::pointer_of(doc),
+        Err(xml_sec_libxml2::document::DocumentError::Document(
+            xml_sec::document::XmlDocumentError::Policy(PolicyViolation::ResourceLimit {
+                resource,
+                maximum,
+                ..
+            }),
+        )) => {
+            errors::limit_exceeded(here, object, resource, maximum);
+            std::ptr::null_mut()
+        }
+        Err(_) => {
+            errors::xml_failed(here, object, c"xmlReadMemory");
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// The document of `parts` in sequence, as [`parse`]; parts too large
 /// together are refused before they are joined.
 fn parse_parts(parts: &[&[u8]], here: errors::Here) -> *mut XmlDoc {
-    if let Ok(doc) = xml_sec_libxml2::document::parse_parts(parts) {
-        xml_sec_libxml2::nodes::pointer_of(doc)
+    parsed(&xml_sec_libxml2::document::parse_parts(parts), here)
+}
+
+/// The document a parse returned, or null with the failure reported from
+/// the entry point at `here`.
+fn parsed(
+    result: &Result<usize, xml_sec_libxml2::document::DocumentError>,
+    here: errors::Here,
+) -> *mut XmlDoc {
+    if let Ok(doc) = result {
+        xml_sec_libxml2::nodes::pointer_of(*doc)
     } else {
         // The reason is the tree layer's last error, which the report reads.
         errors::xml_failed(here, std::ptr::null(), c"xmlReadMemory");

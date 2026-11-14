@@ -18,11 +18,10 @@ use super::super::buffer::{XmlSecBuffer, xmlSecBufferAppend};
 use super::super::errors::{self, check, here};
 use super::super::list::{
     XmlSecPtrList, XmlSecPtrListKlass, xmlSecPtrListAdd, xmlSecPtrListEmpty, xmlSecPtrListFinalize,
-    xmlSecPtrListInitialize,
 };
 use super::super::{contain, free, malloc, policy};
 use super::builtin::klass;
-use super::ctx::{Limit, charge, run_budget};
+use super::ctx::{Limit, charge, run_budget, run_scope};
 use super::{
     DATA_BIN, Global, MODE_POP, MODE_PUSH, WithContext, XmlSecTransform, XmlSecTransformCtx,
     XmlSecTransformKlass, context_or, valid, xmlSecTransformDefaultGetDataType,
@@ -78,7 +77,10 @@ pub(crate) unsafe extern "C" fn xmlSecIOInit() -> c_int {
     contain(-1, || {
         let here = here!("xmlSecIOInit");
         // SAFETY: the list has a fixed address and is not in use.
-        if unsafe { xmlSecPtrListInitialize(IO_CALLBACKS.get(), &raw const IO_CALLBACK_LIST) } < 0 {
+        if unsafe {
+            crate::ffi::list::initialize_registry(IO_CALLBACKS.get(), &raw const IO_CALLBACK_LIST)
+        } < 0
+        {
             errors::internal(here, std::ptr::null(), c"xmlSecPtrListInitialize");
             return -1;
         }
@@ -293,6 +295,21 @@ pub(crate) unsafe extern "C" fn xmlSecTransformInputURIOpen(
     transform: *mut XmlSecTransform,
     uri: *const u8,
 ) -> c_int {
+    // SAFETY: by the caller's contract.
+    unsafe { open(transform, uri, None) }
+}
+
+/// [`xmlSecTransformInputURIOpen`] admitting the URI classes `classes` the
+/// run that opens it grants, or the current policy's reference classes for a
+/// caller outside a run.
+///
+/// # Safety
+/// As for [`xmlSecTransformInputURIOpen`].
+pub(crate) unsafe fn open(
+    transform: *mut XmlSecTransform,
+    uri: *const u8,
+    classes: Option<UriTypeSet>,
+) -> c_int {
     contain(-1, || {
         let state = input_uri_or!(transform, "xmlSecTransformInputURIOpen", -1);
         check!(
@@ -316,10 +333,12 @@ pub(crate) unsafe extern "C" fn xmlSecTransformInputURIOpen(
         // SAFETY: `uri` is NUL-terminated.
         let text = unsafe { CStr::from_ptr(uri.cast()) }.to_bytes();
         let here = here!("xmlSecTransformInputURIOpen");
-        let Some(policy) = policy::verification_at(here) else {
+        let Some(classes) =
+            classes.or_else(|| policy::verification_at(here).map(|policy| policy.uris.references))
+        else {
             return -1;
         };
-        if !admits(policy.uris.references, text) {
+        if !admits(classes, text) {
             errors::uri_refused(here, c"input-uri".as_ptr(), text);
             return -1;
         }
@@ -449,10 +468,11 @@ unsafe extern "C" fn input_uri_pop_bin(
         unsafe { size.write(0) };
         return 0;
     };
-    let Some(policy) = policy::verification_at(here) else {
+    // SAFETY: an initialized context.
+    let Some((pinned, served)) = (unsafe { run_scope(ctx, here) }) else {
         return -1;
     };
-    let resources = &policy.resources;
+    let resources = pinned.of(served).resources();
     // SAFETY: the context's run budget.
     let budget = unsafe { run_budget(ctx) };
     let per_resource = Limit {

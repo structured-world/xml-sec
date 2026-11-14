@@ -602,7 +602,8 @@ pub struct ResourcePolicy {
     pub max_key_import_kdf_work: usize,
     /// Maximum estimated scrypt or PKCS#12 KDF workspace bytes during key import.
     pub max_key_import_kdf_memory_bytes: usize,
-    /// Maximum nested `KeyInfoReference` dereference depth.
+    /// Maximum nesting of the key references one `KeyInfo` read dereferences:
+    /// `KeyInfoReference`, and `RetrievalMethod` where a reader follows it.
     pub max_key_info_reference_depth: usize,
     /// Maximum bytes accepted by Base64 transforms before decoding.
     pub max_base64_transform_input_bytes: usize,
@@ -1016,7 +1017,8 @@ impl ResourcePolicy {
         Ok(())
     }
 
-    /// Reject `KeyInfoReference` traversal beyond this policy snapshot.
+    /// Reject key-reference nesting (`KeyInfoReference`, `RetrievalMethod`)
+    /// beyond this policy snapshot.
     ///
     /// # Errors
     /// Returns a `ResourceLimit` when traversal exceeds `max_key_info_reference_depth`.

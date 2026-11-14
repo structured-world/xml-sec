@@ -220,7 +220,9 @@ impl OwnedTree {
         xml: &str,
         policy: &impl XmlDocumentPolicy,
     ) -> Result<Self, XmlDocumentError> {
-        Self::under_policy(policy, |settings| Self::parse_with_settings(xml, settings))
+        Self::under_policy(policy, |settings| {
+            Self::parse_with_settings(xml, settings, None)
+        })
     }
 
     /// Parse `bytes` as [`Self::parse_with_policy`] parses text, after
@@ -249,6 +251,48 @@ impl OwnedTree {
         parts: &[&[u8]],
         policy: &impl XmlDocumentPolicy,
     ) -> Result<Self, XmlDocumentError> {
+        Self::parse_parts_metered(parts, policy, None)
+    }
+
+    /// [`Self::parse_parts_with_policy`] as one parse of an operation that
+    /// has `spent` octets of `policy`'s `max_xml_parse_work_bytes`: the
+    /// encoded octets decoded and the decoded text each pass reads are
+    /// charged before the pass, the unit every parse of an operation is
+    /// counted in, and added to `spent` whether the parse succeeds or not.
+    ///
+    /// # Errors
+    /// As for [`Self::parse_parts_with_policy`], or the policy's
+    /// `max_xml_parse_work_bytes` violation when the operation's work would
+    /// pass it.
+    #[cfg(feature = "xmldsig")]
+    pub fn parse_parts_within(
+        parts: &[&[u8]],
+        policy: &impl XmlDocumentPolicy,
+        spent: &mut usize,
+    ) -> Result<Self, XmlDocumentError> {
+        let maximum = policy.resource_policy().max_xml_parse_work_bytes;
+        let Some(remaining) = maximum.checked_sub(*spent) else {
+            return Err(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_PARSE_WORK_BYTES,
+                maximum,
+                actual: *spent,
+            }
+            .into());
+        };
+        let budget = super::XmlParseWorkBudget::within(maximum, remaining);
+        let before = budget.consumed();
+        let parsed = Self::parse_parts_metered(parts, policy, Some(&budget));
+        // Within `remaining`, so the total stays within the maximum.
+        *spent += budget.consumed() - before;
+        parsed
+    }
+
+    /// Parses `parts` under `policy`, charging `budget` for each pass.
+    fn parse_parts_metered(
+        parts: &[&[u8]],
+        policy: &impl XmlDocumentPolicy,
+        budget: Option<&super::XmlParseWorkBudget>,
+    ) -> Result<Self, XmlDocumentError> {
         Self::under_policy(policy, |settings| {
             let maximum = settings.max_bytes;
             match parts
@@ -271,8 +315,14 @@ impl OwnedTree {
                 joined = parts.concat();
                 &joined
             };
-            let xml = super::decode_xml_with_budget(bytes, maximum, None)?;
-            Self::parse_with_settings(&xml, settings)
+            let xml = super::decode_xml_with_budget(bytes, maximum, budget)?;
+            // The parser reads the decoded text once; a document type
+            // declaration has it scanned a second time first.
+            super::charge_parse_work(budget, xml.len())?;
+            if crate::xml::dom::declares_document_type(&xml) {
+                super::charge_parse_work(budget, xml.len())?;
+            }
+            Self::parse_with_settings(&xml, settings, budget)
         })
     }
 
@@ -293,17 +343,20 @@ impl OwnedTree {
         })
     }
 
+    /// Parses `xml` under `settings`; the text its entities expand to is
+    /// charged to `budget`, the source passes are the caller's to charge.
     fn parse_with_settings(
         xml: &str,
         settings: DocumentParseSettings,
+        budget: Option<&super::XmlParseWorkBudget>,
     ) -> Result<Self, XmlDocumentError> {
         super::check_document_size(xml, settings)?;
         // A document type declaration brings declarations and entity
         // expansion: the lexical scan every other parse runs refuses one the
         // policy does not allow before its internal subset is read, and
-        // bounds the entities it expands.
+        // bounds the entities it expands, their text charged as parse work.
         if crate::xml::dom::declares_document_type(xml) {
-            let mut pass = super::LimitPass::new(settings, None, super::NativeXmlStorage)?;
+            let mut pass = super::LimitPass::new(settings, budget, super::NativeXmlStorage)?;
             crate::xml::dom::scan_declared_document(xml, settings.allow_dtd, &mut pass)
                 .map_err(|error| pass.refusal_or(XmlDocumentError::Parse(error)))?;
         }

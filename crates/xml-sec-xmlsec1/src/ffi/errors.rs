@@ -34,8 +34,12 @@ pub(crate) const R_XMLSEC_FAILED: c_int = 1;
 pub(crate) const R_MALLOC_FAILED: c_int = 2;
 /// `XMLSEC_ERRORS_R_STRDUP_FAILED`.
 pub(crate) const R_STRDUP_FAILED: c_int = 3;
+/// `XMLSEC_ERRORS_R_CRYPTO_FAILED`.
+pub(crate) const R_CRYPTO_FAILED: c_int = 4;
 /// `XMLSEC_ERRORS_R_XML_FAILED`.
 pub(crate) const R_XML_FAILED: c_int = 5;
+/// `XMLSEC_ERRORS_R_IO_FAILED`.
+pub(crate) const R_IO_FAILED: c_int = 7;
 /// `XMLSEC_ERRORS_R_NOT_IMPLEMENTED`.
 pub(crate) const R_NOT_IMPLEMENTED: c_int = 9;
 /// `XMLSEC_ERRORS_R_INVALID_CONFIG`.
@@ -50,6 +54,10 @@ pub(crate) const R_INVALID_TYPE: c_int = 14;
 pub(crate) const R_INVALID_OPERATION: c_int = 15;
 /// `XMLSEC_ERRORS_R_INVALID_STATUS`.
 pub(crate) const R_INVALID_STATUS: c_int = 16;
+/// `XMLSEC_ERRORS_R_INVALID_FORMAT`.
+pub(crate) const R_INVALID_FORMAT: c_int = 17;
+/// `XMLSEC_ERRORS_R_DATA_NOT_MATCH`.
+pub(crate) const R_DATA_NOT_MATCH: c_int = 18;
 /// `XMLSEC_ERRORS_R_INVALID_VERSION`.
 pub(crate) const R_INVALID_VERSION: c_int = 19;
 /// `XMLSEC_ERRORS_R_INVALID_NODE`.
@@ -58,6 +66,8 @@ pub(crate) const R_INVALID_NODE: c_int = 21;
 pub(crate) const R_INVALID_NODE_CONTENT: c_int = 22;
 /// `XMLSEC_ERRORS_R_INVALID_NODE_ATTRIBUTE`.
 pub(crate) const R_INVALID_NODE_ATTRIBUTE: c_int = 23;
+/// `XMLSEC_ERRORS_R_NODE_ALREADY_PRESENT`.
+pub(crate) const R_NODE_ALREADY_PRESENT: c_int = 26;
 /// `XMLSEC_ERRORS_R_UNEXPECTED_NODE`.
 pub(crate) const R_UNEXPECTED_NODE: c_int = 27;
 /// `XMLSEC_ERRORS_R_NODE_NOT_FOUND`.
@@ -70,8 +80,16 @@ pub(crate) const R_INVALID_URI_TYPE: c_int = 33;
 pub(crate) const R_TRANSFORM_DISABLED: c_int = 35;
 /// `XMLSEC_ERRORS_R_TRANSFORM_SAME_DOCUMENT_REQUIRED`.
 pub(crate) const R_TRANSFORM_SAME_DOCUMENT_REQUIRED: c_int = 34;
+/// `XMLSEC_ERRORS_R_INVALID_KEY_DATA`.
+pub(crate) const R_INVALID_KEY_DATA: c_int = 41;
+/// `XMLSEC_ERRORS_R_KEY_DATA_ALREADY_EXIST`.
+pub(crate) const R_KEY_DATA_ALREADY_EXIST: c_int = 43;
 /// `XMLSEC_ERRORS_R_INVALID_KEY_DATA_SIZE`.
 pub(crate) const R_INVALID_KEY_DATA_SIZE: c_int = 44;
+/// `XMLSEC_ERRORS_R_KEY_NOT_FOUND`.
+pub(crate) const R_KEY_NOT_FOUND: c_int = 45;
+/// `XMLSEC_ERRORS_R_KEYDATA_DISABLED`.
+pub(crate) const R_KEYDATA_DISABLED: c_int = 46;
 /// `XMLSEC_ERRORS_R_ASSERTION`.
 pub(crate) const R_ASSERTION: c_int = 100;
 /// `XMLSEC_ERROR_R_CAST_IMPOSSIBLE`.
@@ -471,6 +489,28 @@ pub(crate) unsafe fn invalid_node_content(
     );
 }
 
+/// libxmlsec1's `xmlSecNodeAlreadyPresentError`: `parent` already has a
+/// child `node`.
+///
+/// # Safety
+/// Callable with any pointer; `unsafe` keeps the reporting helpers' shape.
+pub(crate) unsafe fn node_already_present(
+    here: Here,
+    parent: *const XmlNode,
+    node: &CStr,
+    object: *const c_char,
+) {
+    // SAFETY: by the caller's contract.
+    let name = unsafe { node_name(parent) };
+    report(
+        here,
+        object,
+        std::ptr::null(),
+        R_NODE_ALREADY_PRESENT,
+        &format!("parent={name}; node={}", node.to_string_lossy()),
+    );
+}
+
 /// libxmlsec1's `xmlSecInvalidNodeError`: `node` is not the expected one.
 ///
 /// # Safety
@@ -620,6 +660,25 @@ pub(crate) unsafe fn unexpected_node(here: Here, node: *const XmlNode, object: *
 /// libxmlsec1's `xmlSecInvalidDataError`.
 pub(crate) fn invalid_data(here: Here, object: *const c_char, message: &str) {
     report(here, object, std::ptr::null(), R_INVALID_DATA, message);
+}
+
+/// libxmlsec1's `xmlSecInvalidStringDataError`: `name` is `actual` where
+/// `expected` was expected.
+pub(crate) fn invalid_string_data(
+    here: Here,
+    object: *const c_char,
+    name: &str,
+    actual: &[u8],
+    expected: &str,
+) {
+    invalid_data(
+        here,
+        object,
+        &format!(
+            "invalid data for '{name}': actual='{}' and expected {expected}",
+            String::from_utf8_lossy(actual)
+        ),
+    );
 }
 
 /// libxmlsec1's `xmlSecAssert2`: when `$condition` does not hold, reports the
