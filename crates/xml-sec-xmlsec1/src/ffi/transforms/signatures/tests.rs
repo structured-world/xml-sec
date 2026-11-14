@@ -331,6 +331,50 @@ fn a_key_set_while_signing_leaves_the_run_its_key() {
 }
 
 #[test]
+fn a_key_set_while_verifying_leaves_the_run_its_key() {
+    // A verifying run checks the value with the key it started with, as
+    // libxmlsec1 binds it to its verification context: a key set between
+    // two chunks, or after the last one, changes nothing the run accepts.
+    let input = [0x41_u8; 16];
+    let value = run(OPERATION_SIGN, private_key(), &input, &[]).expect("the message signs");
+    let (first, other, late) = (
+        public_key(),
+        key(include_bytes!(
+            "../../../../../../tests/fixtures/keys/rsa/rsa-4096-pubkey.pem"
+        )),
+        key(include_bytes!(
+            "../../../../../../tests/fixtures/keys/rsa/rsa-4096-pubkey.pem"
+        )),
+    );
+    // SAFETY: every object is created and released here.
+    unsafe {
+        let ctx = xmlSecTransformCtxCreate();
+        let transform = xmlSecTransformCtxCreateAndAppend(ctx, rsa_sha256());
+        (*transform).operation = OPERATION_VERIFY;
+        assert_eq!(xmlSecTransformSetKey(transform, first.cast()), 0);
+        assert_eq!(
+            xmlSecTransformPushBin(transform, input.as_ptr(), 8, 0, ctx),
+            0
+        );
+        assert_eq!(xmlSecTransformSetKey(transform, other.cast()), 0);
+        assert_eq!(
+            xmlSecTransformPushBin(transform, input[8..].as_ptr(), 8, 1, ctx),
+            0
+        );
+        assert_eq!(xmlSecTransformSetKey(transform, late.cast()), 0);
+        assert_eq!(
+            xmlSecTransformVerify(transform, value.as_ptr(), value.len(), ctx),
+            0
+        );
+        assert_eq!((*transform).status, STATUS_OK, "the run's own key verifies");
+        xmlSecTransformCtxDestroy(ctx);
+        for key in [first, other, late] {
+            xmlSecKeyDestroy(key);
+        }
+    }
+}
+
+#[test]
 fn an_ecdsa_value_follows_the_signing_policy_encoding() {
     // The transform writes the representation the signing policy selects, as
     // document signing does: fixed-width r || s by default, an ASN.1 DER

@@ -33,6 +33,35 @@ fn an_ecdsa_value_follows_the_policy_encoding() {
 }
 
 #[test]
+fn a_policy_that_admits_no_key_candidate_signs_nothing() {
+    // The supplied key is one key candidate, as in document signing: a
+    // policy whose candidate allowance is zero refuses it before the key is
+    // asked anything.
+    let key = EcdsaP256SigningKey::from_pkcs8_pem(include_str!(
+        "../../../../tests/fixtures/keys/ec/ec-prime256v1-key.pem"
+    ))
+    .expect("P-256 fixture must parse");
+    let mut policy = SigningPolicy::default();
+    policy.resources.max_key_candidates = 0;
+    assert!(matches!(
+        sign_signature_value(
+            &policy,
+            crate::provider::default_provider(),
+            &key,
+            SignatureAlgorithm::EcdsaSha256,
+            &SignatureContext::default(),
+            b"signed bytes",
+        ),
+        Err(crate::xmldsig::SigningError::Policy(
+            crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::KEY_CANDIDATES,
+                ..
+            }
+        ))
+    ));
+}
+
+#[test]
 fn a_method_the_policy_excludes_is_refused() {
     let key = EcdsaP256SigningKey::from_pkcs8_pem(include_str!(
         "../../../../tests/fixtures/keys/ec/ec-prime256v1-key.pem"

@@ -183,6 +183,61 @@ fn retrieval_method_depth_is_bounded_by_policy_whatever_the_context_says() {
 }
 
 #[test]
+fn key_reference_depth_counts_both_kinds_of_reference() {
+    // The policy bounds the nesting of key references of either kind
+    // together: inside a KeyInfoReference, a RetrievalMethod is the second
+    // level, and the other way round, so a depth of one refuses both before
+    // any dereference.
+    own_process();
+    policy::republish(
+        |verification| verification.resources.max_key_info_reference_depth = 1,
+        |_| {},
+    )
+    .expect("the library policy compiles");
+    let cases = [
+        (
+            "<RetrievalMethod xmlns=\"http://www.w3.org/2000/09/xmldsig#\" URI=\"#absent\" \
+             Type=\"http://www.w3.org/2000/09/xmldsig#RSAKeyValue\"/>",
+            crate::ffi::keysdata::xmlSecKeyDataRetrievalMethodGetKlass(),
+            (0, 1),
+        ),
+        (
+            "<KeyInfoReference xmlns=\"http://www.w3.org/2009/xmldsig11#\" URI=\"#absent\"/>",
+            crate::ffi::keysdata::xmlSecKeyDataKeyInfoReferenceGetKlass(),
+            (1, 0),
+        ),
+    ];
+    for (xml, klass, (retrievals, references)) in cases {
+        let doc = parse(xml);
+        // SAFETY: objects created and destroyed here.
+        unsafe {
+            assert_eq!(xmlSecKeyDataIdsInit(), 0);
+            let ctx = xmlSecKeyInfoCtxCreate(std::ptr::null_mut());
+            // The level of the other kind is taken, as inside its document.
+            (*ctx).cur_retrieval_method_level = retrievals;
+            (*ctx).cur_key_info_reference_level = references;
+            REASONS.lock().expect("reasons").clear();
+            errors::xmlSecErrorsSetCallback(Some(record as errors::ErrorsCallback));
+            let key = xmlSecKeyCreate();
+            let read = xmlSecKeyDataXmlRead(
+                klass,
+                key.cast(),
+                xsDocGetRootElement(doc).cast(),
+                ctx.cast(),
+            );
+            let reasons = REASONS.lock().expect("reasons").clone();
+            assert_eq!(read, -1);
+            assert_eq!(reasons.first(), Some(&errors::R_INVALID_SIZE), "{xml}");
+            (*ctx).cur_retrieval_method_level = 0;
+            (*ctx).cur_key_info_reference_level = 0;
+            xmlSecKeyDestroy(key);
+            xmlSecKeyInfoCtxDestroy(ctx);
+            xsFreeDoc(doc);
+        }
+    }
+}
+
+#[test]
 fn an_unknown_key_name_stops_the_read_when_the_flag_asks() {
     // keyinfo.h: XMLSEC_KEYINFO_FLAGS_KEYNAME_STOP_ON_UNKNOWN aborts on a
     // name the keys manager does not know, rather than reading on.

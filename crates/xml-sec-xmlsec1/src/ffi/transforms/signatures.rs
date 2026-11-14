@@ -330,9 +330,6 @@ unsafe extern "C" fn set_key(transform: *mut XmlSecTransform, key: *mut c_void) 
             return -1;
         }
         let name = name_of(object);
-        // The next run admits the key set now; a run already started keeps
-        // the signer it was admitted with, as libxmlsec1 binds the key to its
-        // signing context when a run starts.
         // SAFETY: a key whose value is null or key data.
         unsafe {
             let value = xmlSecKeyGetValue(key);
@@ -352,23 +349,30 @@ unsafe extern "C" fn set_key(transform: *mut XmlSecTransform, key: *mut c_void) 
                 errors::internal(here, name, c"KeyValueInfo::to_spki_der");
                 return -1;
             };
-            if object.operation == OPERATION_SIGN {
-                let Some(private) = material.private.clone() else {
-                    errors::report(
-                        here,
-                        name,
-                        std::ptr::null(),
-                        errors::R_INVALID_KEY_DATA,
-                        "the key holds no private key",
-                    );
-                    return -1;
-                };
-                signature.private = Some(private);
-            } else {
-                // The last key set is the transform's key: a private key from
-                // an earlier one must not sign after a switch of operation.
-                signature.private = None;
+            if object.operation == OPERATION_SIGN && material.private.is_none() {
+                errors::report(
+                    here,
+                    name,
+                    std::ptr::null(),
+                    errors::R_INVALID_KEY_DATA,
+                    "the key holds no private key",
+                );
+                return -1;
             }
+            // A run that has started signs or verifies with the key it started
+            // with, as libxmlsec1 binds the key to its signing or verification
+            // context then; a transform runs once, so a later key is checked
+            // and otherwise unused.
+            if object.status != STATUS_NONE {
+                return 0;
+            }
+            // The last key set is the transform's key: a private key from an
+            // earlier one must not sign after a switch of operation.
+            signature.private = if object.operation == OPERATION_SIGN {
+                material.private.clone()
+            } else {
+                None
+            };
             signature.key = Some(VerificationKey {
                 algorithm,
                 public_key_bytes: spki,

@@ -11,7 +11,8 @@ use super::{
 /// must be permitted and offered by the provider, the output must have the
 /// length the key and method determine, and an ECDSA value is written in the
 /// policy's [`ecdsa_signature_value_encoding`]. For a caller that has the
-/// signed bytes itself, such as a transform chain. `context` is the context
+/// signed bytes itself, such as a transform chain. The key counts as one of
+/// the policy's key candidates. `context` is the context
 /// string of a method that takes one (Ed25519ctx, Ed448, ML-DSA); empty for
 /// the others. The counterpart of
 /// [`verify_signature_value`](crate::xmldsig::verify::verify_signature_value).
@@ -50,6 +51,8 @@ pub fn sign_signature_value(
     signed_data: &[u8],
 ) -> Result<Vec<u8>, SigningError> {
     policy.validate()?;
+    // The supplied key is one key candidate, as in document signing.
+    policy.resources.validate_key_candidates(1)?;
     policy.check_signature_algorithm(algorithm)?;
     let expected = expected_signature_output_len(key, algorithm, policy, None)?;
     provider
