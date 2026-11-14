@@ -114,7 +114,8 @@ fn beside(target: &Path, purpose: &str) -> Result<PathBuf, String> {
     let parent = target.parent().ok_or("a fixture target has a parent")?;
     let name = target
         .file_name()
-        .map_or_default(|name| name.to_string_lossy().into_owned());
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let mut candidate = None;
     for attempt in 0..1000_u32 {
         let path = parent.join(format!(

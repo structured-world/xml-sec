@@ -403,7 +403,9 @@ pub(crate) fn capture(command: &mut Command, keep_stdout: bool, limit: Duration)
         }
     };
     let join = |handle: Option<std::thread::JoinHandle<String>>| {
-        handle.map_or_default(|handle| handle.join().unwrap_or_default())
+        handle
+            .map(|handle| handle.join().unwrap_or_default())
+            .unwrap_or_default()
     };
     #[cfg(unix)]
     let signal = status.and_then(|status| std::os::unix::process::ExitStatusExt::signal(&status));

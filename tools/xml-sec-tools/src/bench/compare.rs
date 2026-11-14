@@ -494,7 +494,7 @@ fn measurement_env(target: &Path, prefix: &Path, built: &Built) -> Vec<(String, 
         ),
         (
             "LIBRARY_LIBXMLSEC1_PROFILE_BIN".to_owned(),
-            built.native_profile.clone().map_or_default(path),
+            built.native_profile.clone().map(path).unwrap_or_default(),
         ),
     ];
     let library_path = |name: &str| {
@@ -637,7 +637,8 @@ fn record(
     let variable = |name: &str| {
         env.iter()
             .find(|(key, _)| key == name)
-            .map_or_default(|(_, value)| PathBuf::from(value))
+            .map(|(_, value)| PathBuf::from(value))
+            .unwrap_or_default()
     };
     let binaries = [variable("XMLSEC1_BIN"), variable("LIBRARY_LIBXMLSEC1_BIN")];
     write(

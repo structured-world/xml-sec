@@ -20,10 +20,12 @@ type Result<T> = core::result::Result<T, KeyStoreError>;
 const UNSUPPORTED: &str = "unsupported PKCS#8 encryption algorithm";
 
 /// What admission needs of an encrypted key before its password: the KDF's
-/// parameters and the plaintext buffer the decryption fills.
+/// parameters, the plaintext buffer the decryption fills and the scratch
+/// every password needs.
 pub(super) struct Shape {
     pub(super) kdf: KdfCost,
     pub(super) output: usize,
+    pub(super) scratch: usize,
 }
 
 /// The shape of the encrypted key `bytes`.
@@ -36,16 +38,20 @@ pub(super) fn shape(bytes: &[u8], resources: &ResourcePolicy) -> Result<Shape> {
         Ok(Shape {
             kdf,
             output: cost.output,
+            scratch: cost.scratch,
         })
     })
 }
 
 /// The `PrivateKeyInfo` the encrypted key `bytes` holds, decrypted with
-/// `password` into one wiping buffer. The caller has admitted its cost.
+/// `password` into one wiping buffer. The caller has admitted the KDF;
+/// `admit_scratch` admits the full scratch, which grows with the password
+/// for a legacy one, before it is allocated.
 pub(super) fn decrypt(
     bytes: &[u8],
     password: &[u8],
     resources: &ResourcePolicy,
+    admit_scratch: impl FnOnce(usize) -> Result<()>,
 ) -> Result<Zeroizing<Vec<u8>>> {
     with_plan(bytes, resources, |plan, query, ceilings| {
         let engine = |error| ceilings.engine(error, UNSUPPORTED);
@@ -61,8 +67,13 @@ pub(super) fn decrypt(
         };
         let cost = plan.cost().map_err(engine)?;
         let extra = plan.password_cost(input).map_err(engine)?;
+        let scratch = cost
+            .scratch
+            .checked_add(extra.scratch)
+            .ok_or(KeyStoreError::ProtectedContainer)?;
+        admit_scratch(scratch)?;
         let mut output = Zeroizing::new(vec![0; cost.output]);
-        let mut scratch = Zeroizing::new(vec![0; cost.scratch + extra.scratch]);
+        let mut scratch = Zeroizing::new(vec![0; scratch]);
         let length = plan
             .decrypt(input, &mut output, &mut scratch, query)
             .map_err(engine)?;

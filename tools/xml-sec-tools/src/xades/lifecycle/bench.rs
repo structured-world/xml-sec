@@ -585,7 +585,8 @@ impl Bench<'_> {
             return Err(format!(
                 "{} failed: {}\n{}",
                 args.first()
-                    .map_or_default(|program| program.to_string_lossy().into_owned()),
+                    .map(|program| program.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
                 captured.failure(),
                 captured.stderr
             ));
@@ -776,7 +777,8 @@ impl Bench<'_> {
 
 fn detached_option(run: &Run<'_>, case: Case) -> Vec<OsString> {
     run.detached(case)
-        .map_or_default(|detached| line(&[&"--detached", &detached]))
+        .map(|detached| line(&[&"--detached", &detached]))
+        .unwrap_or_default()
 }
 
 /// The packaging and signer of a measured case, as `PACKAGING-ALGORITHM`.

@@ -402,8 +402,9 @@ impl Run {
         let (template, plain) = (path(&files.template), path(&files.plain));
         let signed = input.clone().unwrap_or_else(|| path(&files.signed));
         let encrypted = input.unwrap_or_else(|| path(&files.encrypted));
-        let destination =
-            destination.map_or_default(|destination| destination.display().to_string());
+        let destination = destination
+            .map(|destination| destination.display().to_string())
+            .unwrap_or_default();
         let files = Files {
             template: &template,
             signed: &signed,

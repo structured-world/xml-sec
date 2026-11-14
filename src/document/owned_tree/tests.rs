@@ -565,6 +565,35 @@ fn a_fragment_in_no_namespace_unlinked_and_linked_under_a_default_one_undeclares
 }
 
 #[test]
+fn a_linked_element_unlinked_and_linked_under_a_default_namespace_undeclares_it() {
+    // An element that leaves a linked place leaves its context as one
+    // leaving a run does: `x`, in no namespace, linked under a default
+    // namespace undeclares it, whether it was parsed in place or linked
+    // from a fragment first, or the document would read `x` in `urn:b`.
+    let mut tree = parsed(r#"<r><a><y/></a><b xmlns="urn:b"/></r>"#);
+    let root = tree.root_element().expect("a document element");
+    let [a, b] = children(&tree, root)[..] else {
+        panic!("two children");
+    };
+    let x = tree
+        .parse_in_context(a, "<x/>", &VerificationPolicy::default())
+        .expect("the fragment parses")
+        .expect("the fragment has nodes");
+    tree.append_child(a, x).expect("an unlinked node links");
+    tree.unlink(x).expect("a live node");
+    tree.append_child(b, x).expect("an unlinked node links");
+    let [y] = children(&tree, a)[..] else {
+        panic!("one child left");
+    };
+    tree.unlink(y).expect("a live node");
+    tree.append_child(b, y).expect("an unlinked node links");
+    assert_eq!(
+        tree.serialize(),
+        "<?xml version=\"1.0\"?>\n<r><a/><b xmlns=\"urn:b\"><x xmlns=\"\"/><y xmlns=\"\"/></b></r>\n"
+    );
+}
+
+#[test]
 fn only_an_element_or_the_document_takes_children() {
     // A child under a text node would vanish from the serialization, which
     // writes a text node's payload alone.
