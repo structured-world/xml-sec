@@ -379,11 +379,7 @@ pub(crate) fn compile_step(
     let cpp = source
         .extension()
         .is_some_and(|extension| extension == "cpp");
-    let mut args: Vec<String> = compiler
-        .args()
-        .iter()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
+    let mut args = host_args(compiler);
     args.push(source.display().to_string());
     if compiler.is_like_msvc() {
         let import = library
@@ -435,6 +431,20 @@ pub(crate) fn compile_step(
     Ok(compiler_step(compiler, source, args))
 }
 
+/// The arguments `cc` resolved for `compiler`, without the target it names.
+/// The programs run on the host, so the compiler builds for its own default
+/// target; `cc` names Rust's triple instead, and a compiler whose triple
+/// differs (Fedora's clang is `x86_64-redhat-linux-gnu`) then looks for its
+/// sanitizer runtime in a directory it does not install.
+fn host_args(compiler: &cc::Tool) -> Vec<String> {
+    compiler
+        .args()
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .filter(|arg| !arg.starts_with("--target="))
+        .collect()
+}
+
 /// Runs `compiler` with `args`, in the environment `cc` resolved for it.
 fn compiler_step(compiler: &cc::Tool, source: &Path, args: Vec<String>) -> Step {
     let mut step = Step {
@@ -454,11 +464,7 @@ fn compiler_step(compiler: &cc::Tool, source: &Path, args: Vec<String>) -> Step 
 /// The compiler invocation that builds the C `program` against the oracle,
 /// whose compiler and linker flags `program.flags` carries.
 pub(crate) fn oracle_compile_step(compiler: &cc::Tool, program: &Program<'_>) -> Step {
-    let mut args: Vec<String> = compiler
-        .args()
-        .iter()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
+    let mut args = host_args(compiler);
     args.extend([
         program.source.display().to_string(),
         "-std=c99".to_owned(),
