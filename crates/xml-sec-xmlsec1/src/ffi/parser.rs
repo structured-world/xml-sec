@@ -53,16 +53,36 @@ pub(crate) fn parse(bytes: &[u8], here: errors::Here) -> *mut XmlDoc {
 }
 
 /// The document in `bytes`, as [`parse`], under `policy`, the revision of
-/// the operation that parses it.
-pub(crate) fn parse_under(
+/// the operation that parses it, which has `spent` of the policy's
+/// `max_xml_parse_work_bytes`: the work the core charges (decoding and the
+/// decoded text the parser reads) is added to `spent`, a failed parse's
+/// too. A policy limit the document passes, the exhausted allowance among
+/// them, is reported as that limit, for `object` at `here`.
+pub(crate) fn parse_within(
     bytes: &[u8],
     here: errors::Here,
+    object: *const std::ffi::c_char,
     policy: &impl xml_sec::document::XmlDocumentPolicy,
+    spent: &mut usize,
 ) -> *mut XmlDoc {
-    parsed(
-        &xml_sec_libxml2::document::parse_parts_under(&[bytes], policy),
-        here,
-    )
+    use xml_sec::policy::PolicyViolation;
+    match xml_sec_libxml2::document::parse_parts_within(&[bytes], policy, spent) {
+        Ok(doc) => xml_sec_libxml2::nodes::pointer_of(doc),
+        Err(xml_sec_libxml2::document::DocumentError::Document(
+            xml_sec::document::XmlDocumentError::Policy(PolicyViolation::ResourceLimit {
+                resource,
+                maximum,
+                ..
+            }),
+        )) => {
+            errors::limit_exceeded(here, object, resource, maximum);
+            std::ptr::null_mut()
+        }
+        Err(_) => {
+            errors::xml_failed(here, object, c"xmlReadMemory");
+            std::ptr::null_mut()
+        }
+    }
 }
 
 /// The document of `parts` in sequence, as [`parse`]; parts too large

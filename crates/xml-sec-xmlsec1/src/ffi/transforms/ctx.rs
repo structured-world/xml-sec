@@ -219,17 +219,6 @@ pub(crate) struct Limit {
     pub(crate) max: usize,
 }
 
-/// The operation's XML parse-work allowance: every octet handed to the
-/// parser is charged before it parses, as the core charges one parse-work
-/// budget across a whole operation, retrieved and reparsed documents
-/// included.
-pub(crate) fn parse_work(resources: &xml_sec::policy::ResourcePolicy) -> Limit {
-    Limit {
-        name: "max_xml_parse_work_bytes",
-        max: resources.max_xml_parse_work_bytes,
-    }
-}
-
 /// Charges `amount` to `spent` within `limit`; refused, and reported for
 /// `object` at `here`, once the total would pass it.
 pub(crate) fn charge(

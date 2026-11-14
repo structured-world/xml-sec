@@ -69,16 +69,22 @@ pub fn parse_parts(parts: &[&[u8]]) -> Result<usize, DocumentError> {
     parsed
 }
 
-/// [`parse_parts`] under `policy`, the revision an operation pinned, rather
-/// than the current one.
+/// [`parse_parts`] under `policy`, the revision an operation pinned rather
+/// than the current one, as one parse of an operation that has `spent` of
+/// its parse work: the work the parse charges (decoding and the decoded text
+/// the parser read) is added to `spent`, whether it succeeds or not.
 ///
 /// # Errors
-/// The core's refusal, an encoding error among them.
-pub fn parse_parts_under(
+/// The core's refusal, an encoding error and the work allowance's violation
+/// among them.
+pub fn parse_parts_within(
     parts: &[&[u8]],
     policy: &impl XmlDocumentPolicy,
+    spent: &mut usize,
 ) -> Result<usize, DocumentError> {
-    let parsed = parse_tree(parts, policy);
+    let parsed = OwnedTree::parse_parts_within(parts, policy, spent)
+        .map_err(DocumentError::from)
+        .and_then(|tree| Ok(handles::register(tree)?));
     if let Err(error) = &parsed {
         record_error(error);
     }

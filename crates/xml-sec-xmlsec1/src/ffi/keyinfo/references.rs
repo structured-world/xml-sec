@@ -24,8 +24,8 @@ use super::super::strings::{
 };
 use super::super::transforms::XmlSecTransformCtx;
 use super::super::transforms::ctx::{
-    charge, parse_work, run_spent, seed_run, xmlSecTransformCtxExecute,
-    xmlSecTransformCtxNodesListRead, xmlSecTransformCtxReset, xmlSecTransformCtxSetUri,
+    run_spent, seed_run, xmlSecTransformCtxExecute, xmlSecTransformCtxNodesListRead,
+    xmlSecTransformCtxReset, xmlSecTransformCtxSetUri,
 };
 use super::super::tree::{XmlDoc, XmlNode, nodes};
 use super::super::xmltree::{xmlSecCheckNodeName, xmlSecGetNextElementNode};
@@ -209,9 +209,9 @@ unsafe fn dereference(
 }
 
 /// The document `context`'s result parses into, recovering as libxmlsec1
-/// parses it; null after a report. Its octets are charged to the read's
-/// parse work first, so references reparsing the same target, siblings
-/// included, cannot parse past the operation's allowance.
+/// parses it; null after a report. The parse runs within what the read has
+/// left of its parse work and charges it, so references reparsing the same
+/// target, siblings included, cannot parse past the operation's allowance.
 ///
 /// # Safety
 /// `context` holds a result.
@@ -234,24 +234,21 @@ unsafe fn result_document(
             errors::size_to_int_impossible(here, size);
             return std::ptr::null_mut();
         }
-        let mut total = spent.map_or_default(Cell::get);
-        let limit = parse_work(&pinned.verification.resources);
-        if charge(&mut total.xml_parse, size, limit, here, object).is_none() {
-            return std::ptr::null_mut();
-        }
-        if let Some(spent) = spent {
-            spent.set(total);
-        }
         // libxmlsec1 parses with its options and XML_PARSE_RECOVER; the
         // parser recovers from nothing, so malformed retrieved XML is
         // refused. It parses under the read's revision.
-        let doc: *mut XmlDoc = xml_sec_libxml2::document::parse_parts_under(
-            &[std::slice::from_raw_parts(data, size)],
+        let mut total = spent.map_or_default(Cell::get);
+        let doc = crate::ffi::parser::parse_within(
+            std::slice::from_raw_parts(data, size),
+            here,
+            object,
             &*pinned.verification,
-        )
-        .map_or(std::ptr::null_mut(), xml_sec_libxml2::nodes::pointer_of);
+            &mut total.xml_parse,
+        );
+        if let Some(spent) = spent {
+            spent.set(total);
+        }
         if doc.is_null() {
-            errors::xml_failed(here, object, c"xmlReadMemory");
             return std::ptr::null_mut();
         }
         if xsDocGetRootElement(doc).is_null() {

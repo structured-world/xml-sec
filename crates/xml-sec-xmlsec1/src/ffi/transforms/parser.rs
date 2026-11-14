@@ -9,11 +9,11 @@ use xml_sec_libxml2::ffi::io::{input_content, input_free, input_read};
 
 use super::super::errors::{self, check, here};
 use super::super::nodeset::{TREE, XmlSecNodeSet, xmlSecNodeSetCreate, xmlSecNodeSetDocDestroy};
-use super::super::parser::parse_under;
+use super::super::parser::parse_within;
 use super::super::policy;
 use super::super::tree::XmlDoc;
 use super::builtin::klass;
-use super::ctx::{Limit, charge, parse_work, run_budget, run_scope};
+use super::ctx::{Limit, charge, run_budget, run_scope};
 use super::io::bounded_input_buffer;
 use super::{
     STATUS_FINISHED, STATUS_NONE, STATUS_WORKING, USAGE_DSIG_TRANSFORM, WithContext,
@@ -163,19 +163,13 @@ unsafe extern "C" fn push_bin(
             return 0;
         }
         let spent = &mut run_budget(ctx).xml_parse;
-        if charge(
-            spent,
-            pushed.len(),
-            parse_work(operation.resources()),
+        let doc = policy::with_document_policy!(operation, |policy| parse_within(
+            pushed,
             here,
             name(),
-        )
-        .is_none()
-        {
-            return -1;
-        }
-        let doc =
-            policy::with_document_policy!(operation, |policy| parse_under(pushed, here, policy));
+            policy,
+            spent
+        ));
         if doc.is_null() {
             return -1;
         }
@@ -261,19 +255,13 @@ unsafe extern "C" fn pop_xml(
             return -1;
         };
         let spent = &mut run_budget(ctx).xml_parse;
-        if charge(
-            spent,
-            bytes.len(),
-            parse_work(operation.resources()),
+        let doc = policy::with_document_policy!(operation, |policy| parse_within(
+            &bytes,
             here,
             name(),
-        )
-        .is_none()
-        {
-            return -1;
-        }
-        let doc =
-            policy::with_document_policy!(operation, |policy| parse_under(&bytes, here, policy));
+            policy,
+            spent
+        ));
         if doc.is_null() {
             return -1;
         }
