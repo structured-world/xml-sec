@@ -246,6 +246,41 @@ fn a_symmetric_value_past_the_resource_limit_is_refused_before_decoding() {
 }
 
 #[test]
+fn binary_key_bytes_past_the_resource_limit_are_refused() {
+    // Raw key bytes handed to a binary reader are external material as the
+    // XML form of the same key is: past the per-resource limit they are
+    // refused before they are copied, and read at exactly the limit.
+    own_process();
+    let secret = [0x41_u8; 32];
+    let read = |limit: usize| {
+        policy::republish(
+            |verification| verification.resources.max_external_resource_bytes = limit,
+            |_| {},
+        )
+        .expect("the library policy compiles");
+        // SAFETY: objects created and destroyed here.
+        unsafe {
+            assert_eq!(xmlSecKeyDataIdsInit(), 0);
+            let ctx = xmlSecKeyInfoCtxCreate(std::ptr::null_mut());
+            let key = xmlSecKeyCreate();
+            let read = crate::ffi::keysdata::xmlSecKeyDataBinRead(
+                symkeys::hmac(),
+                key.cast(),
+                secret.as_ptr(),
+                secret.len(),
+                ctx.cast(),
+            );
+            let installed = !xmlSecKeyGetValue(key).is_null();
+            xmlSecKeyDestroy(key);
+            xmlSecKeyInfoCtxDestroy(ctx);
+            (read, installed)
+        }
+    };
+    assert_eq!(read(16), (-1, false), "16 octets admit no 32-octet key");
+    assert_eq!(read(32), (0, true), "a key of exactly the limit is read");
+}
+
+#[test]
 fn an_rsa_key_value_past_the_resource_limit_is_refused() {
     // The components of an RSAKeyValue are external material too: a modulus
     // and exponent decoding past the per-resource limit are refused, as a

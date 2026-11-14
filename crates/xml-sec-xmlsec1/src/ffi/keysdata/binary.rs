@@ -447,17 +447,22 @@ pub(crate) unsafe extern "C" fn value_bin_read(
             c"keyInfoCtx != NULL",
             -1
         );
-        // SAFETY: a klass, a key, the caller's bytes and a context.
-        unsafe {
-            adopt_value(
-                here!("xmlSecKeyDataBinaryValueBinRead"),
-                id,
-                key,
-                buf,
-                size,
-                &raw mut (*ctx).key_req,
-            )
+        let here = here!("xmlSecKeyDataBinaryValueBinRead");
+        // The bytes are external key material, bounded as the XML reader
+        // bounds the same value before anything is copied.
+        // SAFETY: a context, checked above.
+        let Some(pinned) = (unsafe { crate::ffi::keyinfo::read_policy(ctx, here) }) else {
+            return -1;
+        };
+        let max = pinned.verification.resources.max_external_resource_bytes;
+        if size > max {
+            // SAFETY: a klass of this module.
+            let object = unsafe { klass_name(id) };
+            errors::limit_exceeded(here, object, "max_external_resource_bytes", max);
+            return -1;
         }
+        // SAFETY: a klass, a key, the caller's bytes and a context.
+        unsafe { adopt_value(here, id, key, buf, size, &raw mut (*ctx).key_req) }
     })
 }
 
