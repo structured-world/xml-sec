@@ -281,7 +281,7 @@ pub(crate) fn verify_crls<'a>(
     provider: &dyn crate::provider::CryptoProvider,
     session: &'a CertificateSession,
 ) -> Result<(), X509ChainError> {
-    use structured_pkix::path::WorkingKey;
+    use structured_pkix::path::EffectiveKey;
 
     if embedded.is_empty() && additional.is_empty() {
         return Ok(());
@@ -296,7 +296,7 @@ pub(crate) fn verify_crls<'a>(
         allowed: options.certificate_signature_algorithms,
     };
     let now = options.verification_time.into();
-    let mut issuer_key = WorkingKey::standing(anchor.tbs().public_key());
+    let mut issuer_key = EffectiveKey::standing(anchor.tbs().public_key());
     // RFC 5280 §6.1.4: project effective parameters once from the validated
     // anchor toward its subjects. Original SPKI/TBS bytes are never rewritten.
     // https://www.rfc-editor.org/rfc/rfc5280#section-6.1.4
@@ -363,7 +363,7 @@ struct AuthenticatedCrl<'r, 'a> {
 fn authenticated_crls<'r, 'a>(
     crls: &'r [structured_pkix::crl::CertificateList<'a>],
     issuer: &'r Certificate<'a>,
-    issuer_key: structured_pkix::path::WorkingKey<'a>,
+    issuer_key: structured_pkix::path::EffectiveKey<'a>,
     position: usize,
     verifier: &ProviderVerifier<'_>,
     session: &'r CertificateSession,
@@ -961,7 +961,7 @@ fn critical_extension_text(
 pub(crate) const ID_DSA: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x38, 0x04, 0x01];
 
 fn materialize_effective_spki<W: Work>(
-    key: structured_pkix::path::WorkingKey<'_>,
+    key: structured_pkix::path::EffectiveKey<'_>,
     execution: &W,
 ) -> Result<OwnedVec<u8>, X509ChainError> {
     use structured_pkix::key::effective::{EffectiveSpki, VisitError};
@@ -1027,7 +1027,7 @@ fn materialize_effective_spki<W: Work>(
 }
 
 pub(crate) fn with_effective_spki<T, W: Work>(
-    key: structured_pkix::path::WorkingKey<'_>,
+    key: structured_pkix::path::EffectiveKey<'_>,
     execution: &W,
     verify: impl FnOnce(&[u8]) -> Result<T, X509ChainError>,
 ) -> Result<T, X509ChainError> {
@@ -1047,7 +1047,7 @@ pub(crate) struct ValidatedX509Key {
 }
 
 pub(crate) fn effective_target_spki(
-    key: structured_pkix::path::WorkingKey<'_>,
+    key: structured_pkix::path::EffectiveKey<'_>,
     execution: &Memory,
 ) -> Result<ValidatedX509Key, X509ChainError> {
     let original = key.key();
@@ -1079,7 +1079,7 @@ impl<W: Work> structured_pkix::path::Verify<W> for ProviderVerifier<'_> {
     fn verify(
         &self,
         algorithm: &structured_pkix::algorithm::AlgorithmIdentifier<'_>,
-        key: structured_pkix::path::WorkingKey<'_>,
+        key: structured_pkix::path::EffectiveKey<'_>,
         signed: &[u8],
         signature: structured_pkix::signature::SignatureValue<'_>,
         execution: &W,
@@ -1092,7 +1092,7 @@ impl ProviderVerifier<'_> {
     fn verify_with_key_check<W: Work>(
         &self,
         algorithm: &structured_pkix::algorithm::AlgorithmIdentifier<'_>,
-        key: structured_pkix::path::WorkingKey<'_>,
+        key: structured_pkix::path::EffectiveKey<'_>,
         signed: &[u8],
         signature: structured_pkix::signature::SignatureValue<'_>,
         execution: &W,
@@ -1390,7 +1390,7 @@ impl<W: Work> structured_pkix::path::Verify<W> for CertificatePathVerifier<'_, '
     fn verify(
         &self,
         algorithm: &structured_pkix::algorithm::AlgorithmIdentifier<'_>,
-        key: structured_pkix::path::WorkingKey<'_>,
+        key: structured_pkix::path::EffectiveKey<'_>,
         signed: &[u8],
         signature: structured_pkix::signature::SignatureValue<'_>,
         execution: &W,
@@ -1472,7 +1472,7 @@ impl<W: Work> structured_pkix::path::Verify<W> for RevocationVerifier<'_> {
     fn verify(
         &self,
         algorithm: &structured_pkix::algorithm::AlgorithmIdentifier<'_>,
-        key: structured_pkix::path::WorkingKey<'_>,
+        key: structured_pkix::path::EffectiveKey<'_>,
         signed: &[u8],
         signature: structured_pkix::signature::SignatureValue<'_>,
         execution: &W,
@@ -1604,8 +1604,11 @@ impl CertificateSession {
         self.with_public_key_info(spki, |info, execution| {
             // Each reader repeats the algorithm check, paid; this only dispatches.
             if info.algorithm().algorithm() == structured_pkix::oid::EC_PUBLIC_KEY {
-                ec::read(structured_pkix::path::WorkingKey::standing(info), execution)
-                    .map(PublicKey::Ec)
+                ec::read(
+                    structured_pkix::path::EffectiveKey::standing(info),
+                    execution,
+                )
+                .map(PublicKey::Ec)
             } else {
                 rsa::read(info, execution).map(PublicKey::Rsa)
             }
@@ -1618,7 +1621,7 @@ impl CertificateSession {
     ) -> Result<structured_pkix::key::dsa::PublicKey<'a>, structured_pkix::Error> {
         self.with_public_key_info(spki, |info, execution| {
             structured_pkix::key::dsa::read(
-                structured_pkix::path::WorkingKey::standing(info),
+                structured_pkix::path::EffectiveKey::standing(info),
                 execution,
             )
         })
@@ -1879,7 +1882,7 @@ fn refused_as_none<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use structured_pkix::path::{Verified, Verify as _, WorkingKey};
+    use structured_pkix::path::{EffectiveKey, Verified, Verify as _};
 
     fn dsa_projection_sources(written: Option<der::asn1::AnyRef<'_>>) -> (Vec<u8>, Vec<u8>) {
         use der::{Decode as _, Encode as _};
@@ -1898,7 +1901,7 @@ mod tests {
             .expect("test DSA SPKI encoding")
         };
         // A small structural certificate, not an authenticated path. Projecting
-        // its WorkingKey tests framing/provenance, never signature acceptance.
+        // its EffectiveKey tests framing/provenance, never signature acceptance.
         let algorithm = [0x30, 9, 6, 7, 0x2a, 0x86, 0x48, 0xce, 0x38, 4, 3];
         let mut tbs = vec![2, 1, 1];
         tbs.extend_from_slice(&algorithm);
@@ -1926,10 +1929,10 @@ mod tests {
         session: &'a CertificateSession,
         issuer: &'a [u8],
         subject: &'a Certificate<'a>,
-    ) -> WorkingKey<'a> {
+    ) -> EffectiveKey<'a> {
         session
             .with_public_key_info(issuer, |info, work| {
-                WorkingKey::standing(info).subject(subject, work)
+                EffectiveKey::standing(info).subject(subject, work)
             })
             .expect("project original inherited DSA parameters")
     }
@@ -2288,7 +2291,7 @@ mod tests {
         let current = Memory::new(Arc::new(MemoryAccount::new(0, 0)));
         session
             .with_public_key_info(&key, |info, _| {
-                with_effective_spki(WorkingKey::standing(info), &current, |effective| {
+                with_effective_spki(EffectiveKey::standing(info), &current, |effective| {
                     assert_eq!(effective.as_ptr(), key.as_ptr());
                     assert_eq!(effective.len(), key.len());
                     Ok(())
@@ -2555,7 +2558,7 @@ mod tests {
             verifier
                 .verify(
                     &parsed.tbs().signature(),
-                    WorkingKey::standing(parsed.tbs().public_key()),
+                    EffectiveKey::standing(parsed.tbs().public_key()),
                     parsed.signed_bytes(),
                     parsed.signature_value(),
                     session.memory()
@@ -2569,7 +2572,7 @@ mod tests {
             verifier
                 .verify(
                     &parsed.tbs().signature(),
-                    WorkingKey::standing(parsed.tbs().public_key()),
+                    EffectiveKey::standing(parsed.tbs().public_key()),
                     &altered,
                     parsed.signature_value(),
                     session.memory()
@@ -2609,7 +2612,7 @@ mod tests {
             let reader = operation.read(&[], 0).expect("create current execution");
             let result = verifier.verify(
                 &certificate.tbs().signature(),
-                WorkingKey::standing(certificate.tbs().public_key()),
+                EffectiveKey::standing(certificate.tbs().public_key()),
                 certificate.signed_bytes(),
                 certificate.signature_value(),
                 &reader.execution(),
@@ -2685,7 +2688,7 @@ mod tests {
         let result = structured_pkix::path::Verify::verify(
             &verifier,
             &parsed.tbs().signature(),
-            WorkingKey::standing(parsed.tbs().public_key()),
+            EffectiveKey::standing(parsed.tbs().public_key()),
             parsed.signed_bytes(),
             parsed.signature_value(),
             session.memory(),
@@ -2712,7 +2715,7 @@ mod tests {
         let checked = core::cell::Cell::new(false);
         let result = verifier.verify_with_key_check(
             &parsed.tbs().signature(),
-            WorkingKey::standing(parsed.tbs().public_key()),
+            EffectiveKey::standing(parsed.tbs().public_key()),
             parsed.signed_bytes(),
             parsed.signature_value(),
             session.memory(),

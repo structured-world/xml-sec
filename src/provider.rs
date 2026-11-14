@@ -1316,7 +1316,7 @@ pub trait CryptoProvider: Send + Sync {
     fn associate_verification_key(
         &self,
         _actual: &[u8],
-        _expected: structured_pkix::path::WorkingKey<'_>,
+        _expected: structured_pkix::path::EffectiveKey<'_>,
         _charge: &dyn Fn(u64) -> Result<(), structured_asn1::memory::MemoryError>,
     ) -> Result<KeyAssociation, crate::xmldsig::DsigError> {
         Ok(KeyAssociation::Unproven)
@@ -1906,7 +1906,7 @@ impl CryptoProvider for RustCryptoProvider {
     fn associate_verification_key(
         &self,
         actual: &[u8],
-        expected: structured_pkix::path::WorkingKey<'_>,
+        expected: structured_pkix::path::EffectiveKey<'_>,
         charge: &dyn Fn(u64) -> Result<(), structured_asn1::memory::MemoryError>,
     ) -> Result<KeyAssociation, crate::xmldsig::DsigError> {
         key_association::compare_rustcrypto(actual, expected, charge)

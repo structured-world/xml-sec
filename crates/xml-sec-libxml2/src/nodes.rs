@@ -700,6 +700,121 @@ pub fn add_content(node: *mut Node, content: &str) -> Result<(), HandleError> {
     })
 }
 
+/// Put the unlinked run of siblings that starts at `first`, as
+/// [`parse_in_context`] returns one, in the place of `old`, which is
+/// unlinked; the IDs `old` held pass to the run (see
+/// [`OwnedTree::replace_with_run`]). Whether it was done: nothing moves when
+/// the nodes name nothing live, belong to different documents or cannot be
+/// linked there.
+#[must_use]
+pub fn replace_with_run(old: *mut Node, first: *mut Node) -> bool {
+    let (Some((document, old)), Some((other, first))) = (tree_node(old), tree_node(first)) else {
+        return false;
+    };
+    document == other
+        && handles::edit_document(document, |tree| tree.replace_with_run(old, first)).is_ok()
+}
+
+/// Unlink every child of `node` and return the first, as libxmlsec1 takes an
+/// element's content away by clearing `node->children` and `node->last`:
+/// the children stay live and linked to each other as siblings, each
+/// without a parent. Null for a node without children or naming nothing
+/// live.
+#[must_use]
+pub fn unlink_children(node: *mut Node) -> *mut Node {
+    let Some((document, parent)) = tree_node(node) else {
+        return std::ptr::null_mut();
+    };
+    match handles::edit_document(document, |tree| tree.unlink_children(parent)) {
+        Ok(Some(first)) => node_pointer(document, first),
+        _ => std::ptr::null_mut(),
+    }
+}
+
+/// Why a fragment could not be parsed in the context of an element.
+#[derive(Debug, thiserror::Error)]
+pub enum FragmentError {
+    /// The context names nothing live, or its document is lent.
+    #[error(transparent)]
+    Handle(#[from] HandleError),
+    /// The library policy could not be compiled.
+    #[error("the library policy is unavailable")]
+    Policy,
+    /// The bytes are not UTF-8.
+    #[error("the fragment is not UTF-8")]
+    Encoding,
+    /// The core refused the fragment.
+    #[error(transparent)]
+    Document(#[from] xml_sec::XmlDocumentError),
+}
+
+/// `xmlParseInNodeContext`: parse `bytes` as content of `node`, an element
+/// or the document node, under the library policy, seeing the namespace
+/// bindings in scope there, and return the first parsed node; the nodes come
+/// back unlinked as one run of siblings. Null for a fragment without nodes.
+///
+/// # Errors
+/// A context naming nothing live or neither an element nor the document
+/// node, bytes that are not
+/// UTF-8, an unavailable policy, or the core's refusal of the fragment,
+/// which is also this thread's [`crate::document::last_error`].
+pub fn parse_in_context(node: *const Node, bytes: &[u8]) -> Result<*mut Node, FragmentError> {
+    parse_fragment(node, bytes).inspect_err(crate::document::record_error)
+}
+
+fn parse_fragment(node: *const Node, bytes: &[u8]) -> Result<*mut Node, FragmentError> {
+    let (document, context) = handles::node(handle_of(node))?;
+    let fragment = std::str::from_utf8(bytes).map_err(|_| FragmentError::Encoding)?;
+    let policy = crate::policy::library().ok_or(FragmentError::Policy)?;
+    let first = handles::update_document(document, |tree| {
+        tree.parse_in_context(context, fragment, &*policy)
+    })??;
+    Ok(first.map_or(std::ptr::null_mut(), |first| node_pointer(document, first)))
+}
+
+/// `xmlDocCopyNode` with a recursive copy: `node` and its subtree copied
+/// into `doc`, unlinked; null when either names nothing live or `node` is a
+/// document. The copy is staged outside both documents, so no two document
+/// locks are ever held together.
+#[must_use]
+pub fn copy_node(node: *const Node, doc: *const Doc) -> *mut Node {
+    let (Some((source_document, source)), Some(target)) = (tree_node(node), document_of(doc))
+    else {
+        return std::ptr::null_mut();
+    };
+    let staged = handles::read_document(source_document, |tree| {
+        let mut staged = OwnedTree::new();
+        staged.copy_from(tree, source).map(|top| (staged, top))
+    });
+    let Ok(Ok((staged, top))) = staged else {
+        return std::ptr::null_mut();
+    };
+    handles::edit_document(target, |tree| tree.copy_from(&staged, top))
+        .map_or(std::ptr::null_mut(), |copy| node_pointer(target, copy))
+}
+
+/// `xmlFreeNodeList`: free `node` and every sibling after it, each with its
+/// subtree; a value naming nothing live is ignored. Unlike libxml2's, which
+/// leaves a linked list's parent pointing at freed memory, each node is
+/// unlinked first.
+pub fn free_list(node: *mut Node) {
+    let Some((document, first)) = tree_node(node) else {
+        return;
+    };
+    if handles::edit_document(document, |tree| {
+        let mut current = Some(first);
+        while let Some(node) = current {
+            current = tree.next_sibling(node)?;
+            tree.free(node)?;
+        }
+        Ok(())
+    })
+    .is_err()
+    {
+        // libxml2's function returns nothing; there is no one to tell.
+    }
+}
+
 /// The ancestors of `node` from the document node down to `node`.
 fn path(tree: &OwnedTree, node: TreeNode) -> Vec<TreeNode> {
     let mut path = vec![node];

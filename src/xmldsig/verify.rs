@@ -70,7 +70,9 @@ mod session;
 pub use session::*;
 mod capture;
 pub use capture::SelectedSignatureMethod;
+mod signature_value;
 use capture::{CapturedOperation, ScopedCapture, VerificationCapture};
+pub use signature_value::verify_signature_value;
 
 const MAX_SIGNATURE_VALUE_LEN: usize = 8192;
 const MAX_RETRIEVAL_METHOD_COUNT: usize = 64;

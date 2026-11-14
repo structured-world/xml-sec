@@ -28,9 +28,15 @@ use dsa::{
 };
 // Private-key and protected-container import compile only with signing.
 #[cfg(feature = "xmldsig-sign")]
+mod openssl;
+#[cfg(feature = "xmldsig-sign")]
 mod pkcs12_import;
 #[cfg(feature = "xmldsig-sign")]
+mod pkcs8_import;
+#[cfg(feature = "xmldsig-sign")]
 use crate::rsa_encoding::RsaPrivateKeyEncoding as _;
+#[cfg(feature = "xmldsig-sign")]
+pub use openssl::PrivateKeyContainer;
 #[cfg(feature = "xmldsig-sign")]
 use pkcs8::{DecodePrivateKey as _, EncryptedPrivateKeyInfoRef, PrivateKeyInfoRef};
 #[cfg(feature = "xmldsig-sign")]
@@ -417,6 +423,15 @@ impl StoredPrivateKey {
     #[must_use]
     pub fn pkcs8_der(&self) -> &[u8] {
         &self.pkcs8_der
+    }
+
+    /// The DER `SubjectPublicKeyInfo` of this private key's public key.
+    ///
+    /// # Errors
+    /// Returns [`KeyStoreError::Selection`] for private material whose public
+    /// key cannot be derived or encoded.
+    pub fn public_key_spki_der(&self) -> Result<Vec<u8>, KeyStoreError> {
+        PrivateKeyIdentity::decode(&self.pkcs8_der)?.spki_der()
     }
 
     /// Import an explicitly selected recipient into the operation's crypto engine.
@@ -1945,7 +1960,7 @@ impl KeyInventory {
                     components.modulus.as_bytes(),
                     components.public_exponent.as_bytes(),
                 )
-                .map_err(|_| KeyStoreError::Selection("RSA public key exceeds safety limit"))?;
+                .map_err(|_| KeyStoreError::Selection(RSA_PUBLIC_KEY_LIMIT))?;
                 // Wrap borrowed PKCS#1 bytes directly; the final SPKI importer
                 // performs native RSA validation once, without an intermediate key.
                 let spki = pkcs8::SubjectPublicKeyInfoRef {
@@ -2037,9 +2052,7 @@ impl KeyInventory {
         }
         let identity = PrivateKeyIdentity::decode(&der)?;
         if usages.allows(KeyUsage::Decrypt) && !identity.can_decrypt() {
-            return Err(KeyStoreError::Selection(
-                "private key cannot recover encryption keys",
-            ));
+            return Err(KeyStoreError::Selection(CANNOT_DECRYPT));
         }
         #[cfg(feature = "experimental-pq")]
         identity.validate_usages(usages)?;
@@ -2102,7 +2115,7 @@ impl KeyInventory {
         let der = if PrivateKeyInfoRef::try_from(bytes).is_ok() {
             check_plain_output(bytes.len())?;
             Zeroizing::new(bytes.to_vec())
-        } else if let Ok(encrypted) = EncryptedPrivateKeyInfoRef::try_from(bytes) {
+        } else if EncryptedPrivateKeyInfoRef::try_from(bytes).is_ok() {
             // PEM decoding does not end the caller's encoded buffer lifetime.
             // Its bytes coexist with DER and the KDF workspace, not replace DER.
             let kdf_live_bytes = retained_with_input
@@ -2114,20 +2127,13 @@ impl KeyInventory {
                     )
                 })?;
             let remaining = self.remaining_kdf_resources(resources)?;
-            enforce_pkcs8_kdf_policy(&encrypted, &remaining, kdf_live_bytes)?;
+            let shape = pkcs8_import::shape(bytes, &remaining)?;
+            enforce_pkcs8_kdf_policy(&shape, &remaining, kdf_live_bytes)?;
             let password = password.ok_or(KeyStoreError::ProtectedContainer)?;
-            let work =
-                enforce_pkcs8_password_policy(&encrypted, password, &remaining, kdf_live_bytes)?;
+            let work = enforce_pkcs8_password_policy(&shape, password, &remaining, kdf_live_bytes)?;
             self.kdf_work += work;
-            // Decrypt in the one preflighted, zeroizing output allocation;
-            // SecretDocument followed by to_vec would retain two plaintext copies.
-            let mut plain = Zeroizing::new(encrypted.encrypted_data.as_bytes().to_vec());
-            let plaintext_len = encrypted
-                .encryption_algorithm
-                .decrypt_in_place(password, &mut plain)
-                .map_err(|_| KeyStoreError::ProtectedContainer)?;
-            let plaintext_len = plaintext_len.len();
-            plain.truncate(plaintext_len);
+            // The engine decrypts into one zeroizing output allocation.
+            let plain = pkcs8_import::decrypt(bytes, password, &remaining)?;
             PrivateKeyInfoRef::try_from(plain.as_slice())
                 .map_err(|_| KeyStoreError::ProtectedContainer)?;
             plain
@@ -2184,7 +2190,14 @@ impl KeyInventory {
         }
         let retained_with_input =
             self.check_material_capacity(named_material_length(&name, bytes.len(), 1)?, resources)?;
-        let encrypted = EncryptedPrivateKeyInfoRef::try_from(bytes).ok();
+        let encrypted = if EncryptedPrivateKeyInfoRef::try_from(bytes).is_ok() {
+            Some(pkcs8_import::shape(
+                bytes,
+                &self.remaining_kdf_resources(resources)?,
+            )?)
+        } else {
+            None
+        };
         let secret = if let Some(encrypted) = &encrypted {
             let remaining = self.remaining_kdf_resources(resources)?;
             // Secret acquisition is observable work: use the same remaining
@@ -2228,8 +2241,9 @@ impl KeyInventory {
         )
     }
 
-    /// Import one PEM private key, including encrypted PKCS#8. Traditional
-    /// OpenSSL PEM encryption is handled at the CLI compatibility boundary.
+    /// Import one PEM private key, including encrypted PKCS#8. Keys in the
+    /// traditional OpenSSL envelope are read by the explicit compatibility
+    /// importer [`KeyInventory::add_openssl_private_key`].
     ///
     /// # Errors
     /// Returns malformed/unsupported PEM or private material, name/resource or
@@ -3094,6 +3108,33 @@ fn find_named_entry<'a, T>(
     Ok(None)
 }
 
+/// The refusal of a private key imported to decrypt whose family cannot
+/// recover encryption keys: a usage mismatch, distinct from a container the
+/// password failed to open.
+/// The selection refusal of a private key imported for decryption whose
+/// algorithm cannot recover encryption keys.
+#[cfg(feature = "xmldsig-sign")]
+pub(crate) const CANNOT_DECRYPT: &str = "private key cannot recover encryption keys";
+
+/// The selection refusals of an RSA key whose components pass the
+/// implementation's safety ceiling.
+const RSA_PUBLIC_KEY_LIMIT: &str = "RSA public key exceeds safety limit";
+const RSA_MODULUS_LIMIT: &str = "RSA modulus exceeds safety limit";
+const RSA_COMPONENT_LIMIT: &str = "RSA component exceeds safety limit";
+
+impl KeyStoreError {
+    /// Whether this is the refusal of a key whose components pass the
+    /// implementation's safety ceiling: the key's own failure, which no other
+    /// password or importer can turn into success.
+    #[must_use]
+    pub fn is_component_limit(&self) -> bool {
+        matches!(
+            self,
+            Self::Selection(RSA_PUBLIC_KEY_LIMIT | RSA_MODULUS_LIMIT | RSA_COMPONENT_LIMIT)
+        )
+    }
+}
+
 fn named_material_length(
     name: &str,
     payload: usize,
@@ -3269,6 +3310,61 @@ impl<'a> PrivateKeyIdentity<'a> {
         Err(KeyStoreError::Selection("unsupported PKCS#12 private key"))
     }
 
+    /// The DER `SubjectPublicKeyInfo` (RFC 5280 section 4.1.2.7) of the
+    /// public key, under the private key's own algorithm identifier.
+    fn spki_der(&self) -> Result<Vec<u8>, KeyStoreError> {
+        use der::Encode as _;
+        let invalid = |_| KeyStoreError::Selection("invalid private key identity");
+        let spki = |algorithm: pkcs8::AlgorithmIdentifierRef<'_>, key: &[u8]| {
+            pkcs8::SubjectPublicKeyInfoRef {
+                algorithm,
+                subject_public_key: der::asn1::BitStringRef::new(0, key).map_err(invalid)?,
+            }
+            .to_der()
+            .map_err(invalid)
+        };
+        match self {
+            Self::Rsa(key) => {
+                let public = pkcs1::RsaPublicKeyRef {
+                    modulus: key.modulus,
+                    public_exponent: key.public_exponent,
+                }
+                .to_der()
+                .map_err(invalid)?;
+                spki(pkcs1::ALGORITHM_ID, &public)
+            }
+            Self::Dsa { key, .. } => {
+                use dsa::pkcs8::EncodePublicKey as _;
+                key.verifying_key()
+                    .to_public_key_der()
+                    .map(|der| der.as_bytes().to_vec())
+                    .map_err(|_| KeyStoreError::Selection("invalid private key identity"))
+            }
+            Self::Ec {
+                algorithm,
+                point,
+                length,
+            } => spki(*algorithm, &point[..*length]),
+            Self::EdDsa {
+                algorithm,
+                public,
+                length,
+            } => spki(*algorithm, &public[..*length]),
+            #[cfg(feature = "experimental-pq")]
+            Self::Encapsulation {
+                algorithm,
+                public,
+                length,
+            } => spki(*algorithm, &public[..*length]),
+            #[cfg(feature = "experimental-pq")]
+            Self::PostQuantum {
+                algorithm,
+                public,
+                length,
+            } => spki(*algorithm, &public[..*length]),
+        }
+    }
+
     fn matches_spki(&self, der: &[u8]) -> bool {
         let Ok(spki) = pkcs8::SubjectPublicKeyInfoRef::from_der(der) else {
             return false;
@@ -3349,7 +3445,7 @@ pub fn preflight_rsa_pkcs1_components(der: &[u8]) -> Result<(), KeyStoreError> {
             .first()
             .is_some_and(|first| modulus.len() * 8 - first.leading_zeros() as usize > maximum)
     {
-        return Err(KeyStoreError::Selection("RSA modulus exceeds safety limit"));
+        return Err(KeyStoreError::Selection(RSA_MODULUS_LIMIT));
     }
     if [
         key.public_exponent,
@@ -3370,9 +3466,7 @@ pub fn preflight_rsa_pkcs1_components(der: &[u8]) -> Result<(), KeyStoreError> {
             })
         })
     {
-        return Err(KeyStoreError::Selection(
-            "RSA component exceeds safety limit",
-        ));
+        return Err(KeyStoreError::Selection(RSA_COMPONENT_LIMIT));
     }
     Ok(())
 }
@@ -3387,6 +3481,15 @@ fn preflight_dsa_pkcs8_components(info: &PrivateKeyInfoRef<'_>) -> Result<(), Ke
 // DER buffer. No normalized Base64 string or owned label/header copies are needed.
 struct BorrowedPem<'a> {
     label: &'a str,
+    /// The RFC 1421 header lines before the blank line, empty without them.
+    #[cfg_attr(
+        not(feature = "xmldsig-sign"),
+        expect(
+            dead_code,
+            reason = "only the OpenSSL container importer, built with signing, reads the headers"
+        )
+    )]
+    headers: &'a str,
     data: &'a str,
     decoded_len: usize,
 }
@@ -3418,16 +3521,16 @@ impl<'a> BorrowedPem<'a> {
         }
         // Preserve the existing importer's optional header and whitespace
         // acceptance without allocating header strings or a stripped body.
-        let data = if let Some((headers, data)) = payload
+        let (headers, data) = if let Some((headers, data)) = payload
             .split_once("\n\n")
             .or_else(|| payload.split_once("\r\n\r\n"))
         {
             if headers.lines().any(|line| !line.contains(':')) {
                 return Err(invalid());
             }
-            data
+            (headers, data)
         } else {
-            payload
+            ("", payload)
         };
         let mut characters = 0_usize;
         let mut padding = 0_usize;
@@ -3451,6 +3554,7 @@ impl<'a> BorrowedPem<'a> {
             .ok_or_else(invalid)?;
         Ok(Self {
             label,
+            headers,
             data,
             decoded_len,
         })
@@ -3500,25 +3604,18 @@ fn single_pem_block(bytes: &[u8], maximum: usize) -> Result<pem::Pem, KeyStoreEr
 
 #[cfg(feature = "xmldsig-sign")]
 fn enforce_pkcs8_kdf_policy(
-    encrypted: &EncryptedPrivateKeyInfoRef<'_>,
+    encrypted: &pkcs8_import::Shape,
     resources: &ResourcePolicy,
     retained_with_input: usize,
 ) -> Result<usize, KeyStoreError> {
-    use pkcs8::pkcs5::{
-        EncryptionScheme,
-        pbes2::{Kdf, Pbkdf2Prf},
-    };
+    use structured_cms::personal::password::KdfCost;
     // RFC 8018 §6.2 leaves KDF iteration policy to the application. Reject
     // excessive work before decrypting attacker-supplied containers.
     // https://www.rfc-editor.org/rfc/rfc8018#section-6.2
-    let EncryptionScheme::Pbes2(params) = &encrypted.encryption_algorithm else {
-        return Err(KeyStoreError::ProtectedContainer);
-    };
-    // PBES2 decryption mutates a ciphertext-sized output buffer while the
-    // encoded input remains live. Include that capacity before any password
-    // callback or KDF, including failed padding/DER decoding.
-    let live_with_output =
-        retained_with_input.checked_add(encrypted.encrypted_data.as_bytes().len());
+    // Decryption fills a ciphertext-sized output buffer while the encoded
+    // input remains live. Include that capacity before any password callback
+    // or KDF, including failed padding/DER decoding.
+    let live_with_output = retained_with_input.checked_add(encrypted.output);
     if live_with_output.is_none_or(|total| total > resources.max_external_resource_total_bytes) {
         return Err(kdf_policy_violation(
             crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
@@ -3527,49 +3624,46 @@ fn enforce_pkcs8_kdf_policy(
         ));
     }
     let live_with_output = live_with_output.ok_or(KeyStoreError::ProtectedContainer)?;
-    let work = match &params.kdf {
-        Kdf::Pbkdf2(kdf) => {
-            if kdf.iteration_count == 0 {
-                return Err(KeyStoreError::ProtectedContainer);
-            }
-            let hash_len = match kdf.prf {
-                Pbkdf2Prf::HmacWithSha1 => 20,
-                Pbkdf2Prf::HmacWithSha224 => 28,
-                Pbkdf2Prf::HmacWithSha256 => 32,
-                Pbkdf2Prf::HmacWithSha384 => 48,
-                Pbkdf2Prf::HmacWithSha512 => 64,
-                _ => return Err(KeyStoreError::ProtectedContainer),
-            };
-            // RFC 8018 5.2 steps 2-3: every ceil(dkLen/hLen) block runs c
-            // PRFs. The cipher determines dkLen, not a caller's KDF hint.
-            // https://www.rfc-editor.org/rfc/rfc8018#section-5.2
-            let blocks = params.encryption.key_size().div_ceil(hash_len) as u64;
-            let work = u64::from(kdf.iteration_count).checked_mul(blocks);
-            if work.is_none_or(|work| work > resources.max_key_import_kdf_work as u64) {
-                return Err(kdf_policy_violation(
-                    crate::policy::resource_name::KEY_IMPORT_KDF_WORK,
-                    resources.max_key_import_kdf_work,
-                    work,
-                ));
-            }
-            usize::try_from(work.ok_or(KeyStoreError::ProtectedContainer)?)
-                .expect("admitted PBKDF2 work fits the usize policy bound")
+    // RFC 8018 5.2 steps 2-3 and RFC 7292 B.2: every output block runs c
+    // hash rounds; the cipher determines the output length.
+    let rounds = |iterations: u32, blocks: usize| {
+        let work = u64::from(iterations).checked_mul(blocks as u64);
+        if work.is_none_or(|work| work > resources.max_key_import_kdf_work as u64) {
+            return Err(kdf_policy_violation(
+                crate::policy::resource_name::KEY_IMPORT_KDF_WORK,
+                resources.max_key_import_kdf_work,
+                work,
+            ));
         }
-        Kdf::Scrypt(kdf) => enforce_scrypt_kdf_limits(
-            kdf.cost_parameter,
-            u64::from(kdf.block_size),
-            u64::from(kdf.parallelization),
-            resources,
-            live_with_output,
-        )?,
-        _ => return Err(KeyStoreError::ProtectedContainer),
+        Ok(
+            usize::try_from(work.ok_or(KeyStoreError::ProtectedContainer)?)
+                .expect("admitted KDF work fits the usize policy bound"),
+        )
     };
-    Ok(work)
+    match encrypted.kdf {
+        KdfCost::Pbkdf2 {
+            iterations, blocks, ..
+        } => rounds(iterations, blocks),
+        KdfCost::Pkcs12 {
+            iterations,
+            key_blocks,
+            iv_blocks,
+            ..
+        } => rounds(iterations, key_blocks + iv_blocks),
+        KdfCost::Scrypt {
+            n,
+            r,
+            p,
+            workspace_bytes,
+            ..
+        } => enforce_scrypt_kdf_limits(n, r, p, workspace_bytes, resources, live_with_output),
+        _ => Err(KeyStoreError::ProtectedContainer),
+    }
 }
 
 #[cfg(feature = "xmldsig-sign")]
 fn enforce_pkcs8_password_policy(
-    encrypted: &EncryptedPrivateKeyInfoRef<'_>,
+    encrypted: &pkcs8_import::Shape,
     password: &[u8],
     resources: &ResourcePolicy,
     live_bytes: usize,
@@ -3589,12 +3683,8 @@ fn enforce_pkcs8_password_policy(
     })?;
     // Product work accounting: one unit per 64 input bytes conservatively
     // covers password hashing for the supported SHA PRFs, in addition to rounds.
-    let hashing_passes = match &encrypted.encryption_algorithm {
-        pkcs8::pkcs5::EncryptionScheme::Pbes2(params)
-            if matches!(&params.kdf, pkcs8::pkcs5::pbes2::Kdf::Scrypt(_)) =>
-        {
-            2
-        }
+    let hashing_passes = match encrypted.kdf {
+        structured_cms::personal::password::KdfCost::Scrypt { .. } => 2,
         _ => 1,
     };
     // Scrypt initializes password-keyed HMAC both before and after ROMix.
@@ -3629,6 +3719,7 @@ fn enforce_scrypt_kdf_limits(
     n: u64,
     r: u64,
     p: u64,
+    workspace_bytes: usize,
     resources: &ResourcePolicy,
     retained_with_input: usize,
 ) -> Result<usize, KeyStoreError> {
@@ -3643,13 +3734,8 @@ fn enforce_scrypt_kdf_limits(
             work,
         ));
     }
-    // RustCrypto scrypt retains B[p*r] plus V[N*r] and T[r] per parallel
-    // worker when its `parallel` feature is unified in a downstream build.
-    let memory = n
-        .checked_add(2)
-        .and_then(|blocks| blocks.checked_mul(p))
-        .and_then(|blocks| blocks.checked_mul(r))
-        .and_then(|blocks| blocks.checked_mul(128));
+    // The B, V and T blocks the shared engine states it derives in.
+    let memory = Some(workspace_bytes as u64);
     if memory.is_none_or(|value| value > resources.max_key_import_kdf_memory_bytes as u64) {
         return Err(kdf_policy_violation(
             crate::policy::resource_name::KEY_IMPORT_KDF_MEMORY,
@@ -4009,3 +4095,6 @@ fn parse_xmlsec_dsa_key_value(
 // The inventory tests import private keys and select signers.
 #[cfg(all(test, feature = "xmldsig-sign"))]
 mod tests;
+
+#[cfg(all(test, feature = "xmldsig-sign"))]
+mod public_key_tests;

@@ -1084,7 +1084,7 @@ leaf of a composite key, not the first key or certificate advertised by a resolv
 Only public key material is retained, under the current execution account. HMAC
 secrets and private/token key attributes are never copied into receipts.
 
-`associate_key` accepts that receipt and the caller's published PKIX `WorkingKey`,
+`associate_key` accepts that receipt and the caller's published PKIX `EffectiveKey`,
 including its effective parameters. It rejects another operation, Signature,
 document generation or provider before comparison/callbacks. Results are `Same`,
 `Mismatch`, or `Unproven`; none establishes certificate authorization or trust.
@@ -1112,7 +1112,7 @@ the fixed-format ML-DSA and supported SLH-DSA public encodings. Both must have
 their parameter-set width and absent original/effective parameters; identical
 malformed encodings remain Unproven. Borrowed backend encoded-key types validate
 the raw format without copies, matrix expansion or another signature check.
-The original parameter field is checked even when `WorkingKey`'s generic effective
+The original parameter field is checked even when `EffectiveKey`'s generic effective
 projection treats an explicitly written NULL as absent; this also applies to `EdDSA`.
 `RustCrypto` can compare compressed/uncompressed forms on the supported NIST
 curves through its own point decoder. The official AWS safe API cannot establish

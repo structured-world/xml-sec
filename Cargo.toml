@@ -6,7 +6,6 @@ rust-version = "1.92"
 license = "Apache-2.0 AND MIT"
 description = "Pure Rust XML Security: XMLDSig, XMLEnc, C14N with explicit policy and providers."
 repository = "https://github.com/structured-world/xml-sec"
-homepage = "https://github.com/structured-world/xml-sec"
 documentation = "https://docs.rs/xml-sec"
 keywords = ["xml", "xmldsig", "xmlenc", "c14n", "saml"]
 categories = ["cryptography", "web-programming", "authentication"]
@@ -311,7 +310,7 @@ winnow ={ version = "1.0.4", default-features = false, features = ["parser"], op
 snafu = { version = "0.9", default-features = false, features = ["rust_1_81"], optional = true }
 
 # Crypto
-structured-dstu4145 = { version = "0.21.0", default-features = false, features = ["alloc"], optional = true }
+structured-dstu4145 = { version = "0.22", default-features = false, features = ["alloc"], optional = true }
 # Holds the prepared GOST substitution tables that digest states borrow.
 once_cell = { version = "1", default-features = false, features = ["alloc", "race"], optional = true }
 cryptoki = { version = "0.12.1", optional = true }
@@ -357,21 +356,21 @@ signature = { version = "3", optional = true }
 subtle = { version = "2", default-features = false, optional = true }
 getrandom = { version = "0.4", features = ["sys_rng"], optional = true }
 zeroize = { version = "1", optional = true }
-aes = { version = "0.9.2", optional = true }
-aes-gcm = { version = "0.11.1", optional = true }
-aes-kw = { version = "0.3.1", optional = true }
-cbc = { version = "0.2.1", optional = true }
-des = { version = "0.9", optional = true }
+# Each cipher wipes the key schedule it expands from a key when dropped.
+aes = { version = "0.9.2", features = ["zeroize"], optional = true }
+aes-gcm = { version = "0.11.1", features = ["zeroize"], optional = true }
+aes-kw = { version = "0.3.1", features = ["zeroize"], optional = true }
+cbc = { version = "0.2.1", features = ["zeroize"], optional = true }
+des = { version = "0.9", features = ["zeroize"], optional = true }
 md-5 = { version = "0.11", features = ["oid", "zeroize"], optional = true }
 ripemd = { version = "0.2.0", default-features = false, features = ["oid", "zeroize"], optional = true }
-pkcs12 = { version = "0.2.0-rc.0", default-features = false, features = ["kdf"], optional = true }
-pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"], optional = true }
 
 # X.509 certificates, and the seeded hashing of every table keyed by document content
-structured-asn1 = { version = "0.21.0", default-features = false, features = ["alloc"] }
-structured-pkix = { version = "0.21.0", default-features = false, features = ["alloc"], optional = true }
-# PKCS#12 container framing; this crate keeps the password, KDF and cipher work.
-structured-cms = { version = "0.21.0", default-features = false, features = ["alloc"], optional = true }
+structured-asn1 = { version = "0.22", default-features = false, features = ["alloc"] }
+structured-pkix = { version = "0.22", default-features = false, features = ["alloc"], optional = true }
+# PKCS#12 containers and their password engine, OpenSSL traditional private
+# keys, and the incremental HMAC of the HMAC signature methods.
+structured-cms = { version = "0.22", default-features = false, features = ["alloc"], optional = true }
 tinyvec = { version = "1.13", optional = true }
 # `pem` is RFC 7468 decoding of caller key and certificate text.
 der = { version = "0.8", default-features = false, features = ["alloc", "pem"], optional = true }
@@ -419,12 +418,15 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 time = "0.3.55"
 tempfile = "3"
+# Independent PKCS#12 and PBES2 encryption of test containers.
+pkcs12 = { version = "0.2.0-rc.0", default-features = false, features = ["kdf"] }
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
 
 [features]
 # Measurement hooks only; no checks are bypassed and no timers run in production.
 benchmark-internals = ["xmldsig", "rustcrypto", "xmlenc", "c14n", "xml-backends-all"]
 benchmark-alloc = ["benchmark-internals"]
-legacy-algorithms = ["dep:ripemd", "dep:md-5", "dep:des"]
+legacy-algorithms = ["dep:ripemd", "dep:md-5", "dep:des", "structured-cms?/legacy-hmac"]
 default = ["std", "xmldsig", "rustcrypto", "xmldsig-sign", "xmlenc", "c14n", "xml-backend-xmloxide"]
 std = [
     "thiserror/std",
@@ -490,6 +492,9 @@ rustcrypto = [
     "dep:ed448-goldilocks",
     "dep:hmac",
     "dep:md-5",
+    # The HMAC signature methods run on the shared incremental HMAC.
+    "dep:structured-cms",
+    "structured-cms/hmac",
     "dep:p256",
     "dep:p384",
     "dep:p521",
@@ -511,9 +516,11 @@ xmldsig-sign = [
     # Signing randomness and the signature writer need the host.
     "std",
     "dep:getrandom",
-    "dep:pkcs12",
     "dep:structured-cms",
-    "dep:pbkdf2",
+    # OpenSSL traditional private keys and the password engine of PKCS#12
+    # are the shared primitives'.
+    "structured-cms/openssl",
+    "structured-cms/password-protection",
     "dep:aes",
     "dep:cbc",
     "dep:des",
