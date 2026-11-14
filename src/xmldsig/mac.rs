@@ -1,9 +1,9 @@
 //! The `XMLDSig` HMAC signature methods over the shared incremental HMAC
-//! (RFC 2104) of `structured-cms`.
+//! (RFC 2104) of `structured-asn1`.
 
 use alloc::borrow::ToOwned;
 
-use structured_cms::hmac::{Algorithm, Mac, Tag};
+use structured_asn1::hmac::{Algorithm, Mac, Tag};
 
 use super::{SignatureAlgorithm, SigningKeyError};
 

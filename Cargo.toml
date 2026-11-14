@@ -310,7 +310,7 @@ winnow ={ version = "1.0.4", default-features = false, features = ["parser"], op
 snafu = { version = "0.9", default-features = false, features = ["rust_1_81"], optional = true }
 
 # Crypto
-structured-dstu4145 = { version = "0.22", default-features = false, features = ["alloc"], optional = true }
+structured-dstu4145 = { version = "0.23", default-features = false, features = ["alloc"], optional = true }
 # Holds the prepared GOST substitution tables that digest states borrow.
 once_cell = { version = "1", default-features = false, features = ["alloc", "race"], optional = true }
 cryptoki = { version = "0.12.1", optional = true }
@@ -365,12 +365,12 @@ des = { version = "0.9", features = ["zeroize"], optional = true }
 md-5 = { version = "0.11", features = ["oid", "zeroize"], optional = true }
 ripemd = { version = "0.2.0", default-features = false, features = ["oid", "zeroize"], optional = true }
 
-# X.509 certificates, and the seeded hashing of every table keyed by document content
-structured-asn1 = { version = "0.22", default-features = false, features = ["alloc"] }
-structured-pkix = { version = "0.22", default-features = false, features = ["alloc"], optional = true }
-# PKCS#12 containers and their password engine, OpenSSL traditional private
-# keys, and the incremental HMAC of the HMAC signature methods.
-structured-cms = { version = "0.22.2", default-features = false, features = ["alloc"], optional = true }
+# X.509 certificates, the seeded hashing of every table keyed by document
+# content, and the incremental HMAC of the HMAC signature methods.
+structured-asn1 = { version = "0.23", default-features = false, features = ["alloc"] }
+structured-pkix = { version = "0.23", default-features = false, features = ["alloc"], optional = true }
+# PKCS#12 containers and their password engine, OpenSSL traditional private keys.
+structured-cms = { version = "0.23", default-features = false, features = ["alloc"], optional = true }
 tinyvec = { version = "1.13", optional = true }
 # `pem` is RFC 7468 decoding of caller key and certificate text.
 der = { version = "0.8", default-features = false, features = ["alloc", "pem"], optional = true }
@@ -426,7 +426,7 @@ pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
 # Measurement hooks only; no checks are bypassed and no timers run in production.
 benchmark-internals = ["xmldsig", "rustcrypto", "xmlenc", "c14n", "xml-backends-all"]
 benchmark-alloc = ["benchmark-internals"]
-legacy-algorithms = ["dep:ripemd", "dep:md-5", "dep:des", "structured-cms?/legacy-hmac"]
+legacy-algorithms = ["dep:ripemd", "dep:md-5", "dep:des", "structured-asn1/legacy-hmac"]
 default = ["std", "xmldsig", "rustcrypto", "xmldsig-sign", "xmlenc", "c14n", "xml-backend-xmloxide"]
 std = [
     "thiserror/std",
@@ -493,8 +493,7 @@ rustcrypto = [
     "dep:hmac",
     "dep:md-5",
     # The HMAC signature methods run on the shared incremental HMAC.
-    "dep:structured-cms",
-    "structured-cms/hmac",
+    "structured-asn1/hmac",
     "dep:p256",
     "dep:p384",
     "dep:p521",
