@@ -141,8 +141,67 @@ fn a_node_that_is_no_element_is_no_key_value() {
     let text = doc.root_element().first_child().expect("a text node");
     for node in [text, doc.root()] {
         assert!(matches!(
-            crate::xmldsig::parse_key_value_child(node),
+            crate::xmldsig::parse_key_value_child(node, &ResourcePolicy::default()),
             Err(crate::xmldsig::ParseError::InvalidStructure(_))
         ));
+    }
+}
+
+#[test]
+fn key_value_components_past_the_resource_limit_are_refused() {
+    // The components of a key value are one embedded resource: an RSA, DSA or
+    // EC key whose components decode past the per-resource limit is refused
+    // by the policy before it is decoded, not read as a key; at the limit it
+    // is read.
+    const DS: &str = "http://www.w3.org/2000/09/xmldsig#";
+    const DSIG11: &str = "http://www.w3.org/2009/xmldsig11#";
+    // An uncompressed P-256 point: 0x04 and 64 coordinate octets.
+    let point = format!("BA{}=", "A".repeat(85));
+    let cases = [
+        (
+            format!(
+                "<RSAKeyValue xmlns=\"{DS}\"><Modulus>{}</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>",
+                "AQID".repeat(8)
+            ),
+            24 + 3,
+        ),
+        (
+            format!(
+                "<DSAKeyValue xmlns=\"{DS}\"><P>AQID</P><Q>AQID</Q><G>AQID</G><Y>{}</Y></DSAKeyValue>",
+                "AQID".repeat(4)
+            ),
+            9 + 12,
+        ),
+        (
+            format!(
+                "<ECKeyValue xmlns=\"{DSIG11}\"><NamedCurve URI=\"urn:oid:1.2.840.10045.3.1.7\"/><PublicKey>{point}</PublicKey></ECKeyValue>"
+            ),
+            65,
+        ),
+    ];
+    for (xml, decoded) in cases {
+        let doc = crate::Document::parse(&xml).expect("a key value");
+        let mut resources = ResourcePolicy {
+            max_external_resource_bytes: decoded - 1,
+            ..ResourcePolicy::default()
+        };
+        assert!(
+            matches!(
+                crate::xmldsig::parse_key_value_child(doc.root_element(), &resources),
+                Err(crate::xmldsig::ParseError::Policy(
+                    crate::policy::PolicyViolation::ResourceLimitExceeded { resource, .. }
+                )) if resource == crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES
+            ),
+            "{xml}"
+        );
+        resources.max_external_resource_bytes = decoded;
+        let read = crate::xmldsig::parse_key_value_child(doc.root_element(), &resources);
+        assert!(
+            matches!(
+                read,
+                Ok(KeyValueInfo::Rsa { .. } | KeyValueInfo::Dsa { .. } | KeyValueInfo::Ec { .. })
+            ),
+            "{xml}: {read:?}"
+        );
     }
 }
