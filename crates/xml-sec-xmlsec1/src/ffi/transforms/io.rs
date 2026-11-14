@@ -18,7 +18,6 @@ use super::super::buffer::{XmlSecBuffer, xmlSecBufferAppend};
 use super::super::errors::{self, check, here};
 use super::super::list::{
     XmlSecPtrList, XmlSecPtrListKlass, xmlSecPtrListAdd, xmlSecPtrListEmpty, xmlSecPtrListFinalize,
-    xmlSecPtrListInitialize,
 };
 use super::super::{contain, free, malloc, policy};
 use super::builtin::klass;
@@ -78,7 +77,10 @@ pub(crate) unsafe extern "C" fn xmlSecIOInit() -> c_int {
     contain(-1, || {
         let here = here!("xmlSecIOInit");
         // SAFETY: the list has a fixed address and is not in use.
-        if unsafe { xmlSecPtrListInitialize(IO_CALLBACKS.get(), &raw const IO_CALLBACK_LIST) } < 0 {
+        if unsafe {
+            crate::ffi::list::initialize_registry(IO_CALLBACKS.get(), &raw const IO_CALLBACK_LIST)
+        } < 0
+        {
             errors::internal(here, std::ptr::null(), c"xmlSecPtrListInitialize");
             return -1;
         }

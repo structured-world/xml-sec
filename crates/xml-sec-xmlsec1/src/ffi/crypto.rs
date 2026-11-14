@@ -22,8 +22,7 @@ use super::keysdata::{
 };
 use super::library::xmlSecGetDefaultCrypto;
 use super::list::{
-    XmlSecPtrList, XmlSecPtrListKlass, xmlSecPtrListAdd, xmlSecPtrListFinalize,
-    xmlSecPtrListInitialize, xmlSecPtrListRemove,
+    XmlSecPtrList, XmlSecPtrListKlass, xmlSecPtrListAdd, xmlSecPtrListFinalize, xmlSecPtrListRemove,
 };
 use super::transforms::{Global, XmlSecTransformKlass, xmlSecTransformIdsRegister, zero_list};
 use super::transforms::{digests, hmac, signatures};
@@ -385,7 +384,8 @@ fn find_library(name: &[u8]) -> Option<usize> {
 pub(crate) unsafe extern "C" fn xmlSecCryptoDLInit() -> c_int {
     contain(-1, || {
         // SAFETY: the list has a fixed address and is not in use.
-        if unsafe { xmlSecPtrListInitialize(LIBRARIES.get(), &raw const LIBRARY_LIST) } < 0 {
+        if unsafe { super::list::initialize_registry(LIBRARIES.get(), &raw const LIBRARY_LIST) } < 0
+        {
             errors::internal(
                 here!("xmlSecCryptoDLInit"),
                 c"xmlSecCryptoDLLibrariesListGetKlass".as_ptr(),

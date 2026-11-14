@@ -15,10 +15,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use super::buffer::XmlSecBuffer;
 use super::errors::{self, check, here};
 use super::keys::TYPE_UNKNOWN;
-use super::list::{
-    XmlSecPtrList, XmlSecPtrListKlass, xmlSecPtrListAdd, xmlSecPtrListFinalize,
-    xmlSecPtrListInitialize,
-};
+use super::list::{XmlSecPtrList, XmlSecPtrListKlass, xmlSecPtrListAdd, xmlSecPtrListFinalize};
 use super::strings::{
     xmlSecDSig11Ns, xmlSecDSigNs, xmlSecEnc11Ns, xmlSecEncNs, xmlSecExperimental202512Ns,
     xmlSecHrefAgreementMethod, xmlSecHrefDerivedKey, xmlSecHrefEncapsulationMechanism,
@@ -228,7 +225,7 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataIdsInit() -> c_int {
         // SAFETY: the registries have fixed addresses and are not in use.
         unsafe {
             for registry in [xmlSecKeyDataIdsGet(), xmlSecKeyDataIdsGetEnabled()] {
-                if xmlSecPtrListInitialize(registry, xmlSecKeyDataIdListGetKlass()) < 0 {
+                if super::list::initialize_registry(registry, xmlSecKeyDataIdListGetKlass()) < 0 {
                     errors::internal(
                         here,
                         std::ptr::null(),

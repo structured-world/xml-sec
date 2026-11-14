@@ -161,6 +161,29 @@ pub(crate) unsafe extern "C" fn xmlSecPtrListInitialize(
     })
 }
 
+/// Makes the global registry `list` an empty list of klass `id`, first
+/// releasing what an earlier initialization left in it. libxmlsec1 writes
+/// over the old list and loses its storage, so its init functions leak when
+/// called again without their shutdown; a registry here is only ever
+/// replaced whole.
+///
+/// # Safety
+/// `list` is a registry, zeroed or a list, that nothing else reads while it
+/// is replaced; `id` is a klass that outlives it.
+pub(crate) unsafe fn initialize_registry(
+    list: *mut XmlSecPtrList,
+    id: *const XmlSecPtrListKlass,
+) -> c_int {
+    // SAFETY: by the caller's contract; a zeroed registry has no klass and
+    // nothing to release.
+    unsafe {
+        if valid(list).is_some() {
+            xmlSecPtrListFinalize(list);
+        }
+        xmlSecPtrListInitialize(list, id)
+    }
+}
+
 /// `xmlSecPtrListFinalize`: destroys the items and releases the storage,
 /// leaving the list zeroed (without a klass).
 ///

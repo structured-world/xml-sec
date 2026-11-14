@@ -19,7 +19,7 @@ use super::buffer::{
 use super::errors::{self, check, here};
 use super::list::{
     XmlSecPtrList, XmlSecPtrListKlass, xmlSecPtrListAdd, xmlSecPtrListFinalize,
-    xmlSecPtrListGetItem, xmlSecPtrListInitialize,
+    xmlSecPtrListGetItem,
 };
 use super::nodeset::{XmlSecNodeSet, xmlSecNodeSetDestroy};
 use super::tree::xmlStrEqual;
@@ -614,7 +614,10 @@ pub(crate) unsafe extern "C" fn xmlSecTransformIdsInit() -> c_int {
         let here = here!("xmlSecTransformIdsInit");
         // SAFETY: the registry has a fixed address and is not in use.
         unsafe {
-            if xmlSecPtrListInitialize(xmlSecTransformIdsGet(), xmlSecTransformIdListGetKlass()) < 0
+            if super::list::initialize_registry(
+                xmlSecTransformIdsGet(),
+                xmlSecTransformIdListGetKlass(),
+            ) < 0
             {
                 errors::internal(
                     here,
