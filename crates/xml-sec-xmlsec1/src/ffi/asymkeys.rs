@@ -776,32 +776,7 @@ unsafe fn der_adopt(
     req: *mut XmlSecKeyReq,
 ) -> c_int {
     let object_name = xmlSecNameDEREncodedKeyValue.as_ptr().cast::<c_char>();
-    // The key is external material: what its Base64 text decodes to is
-    // bounded before the reader allocates for it. Whitespace decodes to
-    // nothing; every four other characters decode to at most three octets,
-    // less one for each trailing pad (RFC 4648 section 4). The reader still
-    // validates the text.
-    let max = resources.max_external_resource_bytes;
-    let (encoded, padding) = nodes::content(node).map_or((0, 0), |text| {
-        let mut significant = text.bytes().filter(|byte| !byte.is_ascii_whitespace());
-        let encoded = significant.clone().count();
-        let padding = significant
-            .by_ref()
-            .rev()
-            .take(2)
-            .take_while(|&byte| byte == b'=')
-            .count();
-        (encoded, padding)
-    });
-    let decoded = encoded.div_ceil(4).checked_mul(3).map(|bound| {
-        if encoded % 4 == 0 {
-            bound - padding
-        } else {
-            bound
-        }
-    });
-    if decoded.is_none_or(|decoded| decoded > max) {
-        errors::limit_exceeded(here, object_name, "max_external_resource_bytes", max);
+    if !super::keyinfo::key_value_within(here, object_name, node, resources) {
         return -1;
     }
     // SAFETY: by the caller's contract.

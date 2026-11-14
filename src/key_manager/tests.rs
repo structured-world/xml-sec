@@ -1816,6 +1816,13 @@ fn certificate_and_crl_capacity_precedes_der_parsing() {
     ));
 }
 
+/// The KDF shape the password engine reads from `envelope`.
+fn shape_of(envelope: &EncryptedPrivateKeyInfoRef<'_>) -> super::pkcs8_import::Shape {
+    use der::Encode as _;
+    let bytes = envelope.to_der().expect("encrypted envelope");
+    super::pkcs8_import::shape(&bytes, &ResourcePolicy::default()).expect("a supported scheme")
+}
+
 #[test]
 fn pkcs8_pbkdf2_output_blocks_are_checked_before_password() {
     use der::Encode as _;
@@ -1865,7 +1872,7 @@ fn pkcs8_pbkdf2_output_blocks_are_checked_before_password() {
         max_key_import_kdf_work: 6,
         ..resources
     };
-    assert!(enforce_pkcs8_kdf_policy(&encrypted, &exact, 0).is_ok());
+    assert!(enforce_pkcs8_kdf_policy(&shape_of(&encrypted), &exact, 0).is_ok());
     // Cover each PRF width and CBC key width, including single-block
     // cases so the fix cannot unconditionally double iteration charges.
     for (prf, hash_len) in [
@@ -1894,12 +1901,13 @@ fn pkcs8_pbkdf2_output_blocks_are_checked_before_password() {
                 max_key_import_kdf_work: work,
                 ..ResourcePolicy::default()
             };
-            assert!(enforce_pkcs8_kdf_policy(&envelope, &exact, 0).is_ok());
+            let shape = shape_of(&envelope);
+            assert!(enforce_pkcs8_kdf_policy(&shape, &exact, 0).is_ok());
             let tight = ResourcePolicy {
                 max_key_import_kdf_work: work - 1,
                 ..exact
             };
-            assert!(matches!(enforce_pkcs8_kdf_policy(&envelope, &tight, 0),
+            assert!(matches!(enforce_pkcs8_kdf_policy(&shape, &tight, 0),
                     Err(KeyStoreError::Policy(crate::policy::PolicyViolation::ResourceLimit {
                         resource: crate::policy::resource_name::KEY_IMPORT_KDF_WORK,
                         actual, ..
@@ -2710,24 +2718,49 @@ fn configured_x509_fallback_does_not_reinspect_prefix() {
 
 #[test]
 fn scrypt_parallel_buffers_are_checked_before_derivation() {
-    // N*r fits a tiny limit, but p independent B/V/T workspaces do not.
+    // N*r fits a tiny limit, but B for p lanes does not: the workspace the
+    // engine states (B, V and T of RFC 7914 section 5) is checked before any
+    // derivation.
+    use pkcs8::pkcs5::{EncryptionScheme, pbes2};
+    let envelope = EncryptedPrivateKeyInfoRef {
+        encryption_algorithm: EncryptionScheme::Pbes2(pbes2::Parameters {
+            kdf: pbes2::Kdf::Scrypt(pbes2::ScryptParams {
+                salt: pbes2::Salt::new(b"12345678").expect("salt"),
+                cost_parameter: 2,
+                block_size: 1,
+                parallelization: 1_000,
+                key_length: None,
+            }),
+            encryption: pbes2::EncryptionScheme::Aes256Cbc { iv: [0; 16] },
+        }),
+        encrypted_data: der::asn1::OctetStringRef::new(&[0; 16]).expect("ciphertext"),
+    };
+    let shape = shape_of(&envelope);
+    let structured_cms::personal::password::KdfCost::Scrypt {
+        workspace_bytes, ..
+    } = shape.kdf
+    else {
+        panic!("a scrypt shape");
+    };
+    // B = 128 r p, V = 128 r N and T = 128 r.
+    assert_eq!(workspace_bytes, 128 * 1_000 + 128 * 2 + 128);
     let mut resources = ResourcePolicy {
         max_key_import_kdf_work: 10_000,
         max_key_import_kdf_memory_bytes: 4_096,
         ..ResourcePolicy::default()
     };
     assert!(matches!(
-        enforce_scrypt_kdf_limits(2, 1, 1_000, &resources, 0),
+        enforce_pkcs8_kdf_policy(&shape, &resources, 0),
         Err(KeyStoreError::Policy(
             crate::policy::PolicyViolation::ResourceLimit {
                 resource: crate::policy::resource_name::KEY_IMPORT_KDF_MEMORY,
                 maximum: 4_096,
-                actual: 512_000,
+                actual,
             }
-        ))
+        )) if actual == workspace_bytes
     ));
-    resources.max_key_import_kdf_memory_bytes = 512_000;
-    assert!(enforce_scrypt_kdf_limits(2, 1, 1_000, &resources, 0).is_ok());
+    resources.max_key_import_kdf_memory_bytes = workspace_bytes;
+    assert!(enforce_pkcs8_kdf_policy(&shape, &resources, 0).is_ok());
 }
 
 #[test]

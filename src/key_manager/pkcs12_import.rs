@@ -14,7 +14,7 @@ use structured_asn1::memory::{Memory, MemoryAccount, MemoryError, MemoryReservat
 use structured_asn1::{Encoding, Limit, Parser, Reader, Tag};
 use structured_cms::Octets;
 use structured_cms::personal::password::{
-    self as engine, Authentication, Cost, Decryption, Password as Input,
+    self as engine, Authentication, Cost, Decryption, KdfCost, Password as Input,
 };
 use structured_cms::personal::{
     self, Backend, Bag, BagValue, Cause, Decision, Failure, Integrity, Pfx, Plaintext, PrivateKey,
@@ -95,12 +95,12 @@ pub(super) fn import<S: Secret, F: FnOnce() -> Option<S>>(
             max_element_length: u64::MAX,
             max_work: ceilings.work as u64,
         },
-        // The password engine charges its KDF work to this account as well;
-        // the policy admits that work against its own KDF budget, so the
-        // account holds both. Past the address space it holds everything.
+        // The password engine charges its own execution work to this session
+        // too; the policy's KDF budget is admitted separately, in its own
+        // units, from the parameters the engine states.
         Memory::new(Arc::new(MemoryAccount::new(
             limits.memory_available,
-            ceilings.work.saturating_add(maximum),
+            ceilings.work,
         ))),
     );
     let mut reader = parser.read(bytes, 0).map_err(|e| ceilings.refuse(&e))?;
@@ -149,7 +149,7 @@ fn remaining(memory: &Memory) -> usize {
 }
 
 /// A shared-reader refusal: its reader code and whether it is a resource limit.
-trait Refusal {
+pub(super) trait Refusal {
     fn reader_code(&self) -> Option<structured_asn1::ErrorCode>;
     fn is_resource(&self) -> bool;
 }
@@ -198,7 +198,7 @@ pub(super) struct Ceilings {
 }
 
 impl Ceilings {
-    fn refuse(self, error: &impl Refusal) -> KeyStoreError {
+    pub(super) fn refuse(self, error: &impl Refusal) -> KeyStoreError {
         use structured_asn1::ErrorCode as Code;
         let code = error.reader_code();
         // Excess nesting describes the encoding, not an exhausted allowance.
@@ -280,47 +280,42 @@ impl Ceilings {
     }
 }
 
-/// Admits a password-engine `cost` against the policy: its work against the
-/// operation's key-import KDF work, of which `spent` is used, its scratch
-/// against the KDF memory limit, and scratch and output against the bytes
-/// `memory` still holds. The work admitted is added to `spent`. A step that
-/// alone exceeds the whole KDF limit is an iteration count outside it.
-pub(super) fn admit_cost(
-    cost: Cost,
-    resources: &ResourcePolicy,
-    spent: &mut usize,
-    available: usize,
-    ceilings: Ceilings,
-) -> Result<()> {
-    let maximum = resources.max_key_import_kdf_work;
-    let work = usize::try_from(cost.work)
-        .ok()
-        .filter(|work| *work <= maximum)
-        .ok_or(KeyStoreError::from(
-            PolicyViolation::KdfIterationsOutsideLimit { maximum },
-        ))?;
-    if work > maximum - *spent {
-        return Err(denial(resource_name::KEY_IMPORT_KDF_WORK, maximum));
+/// The policy's work for the key derivation `kdf`: hash rounds times output
+/// blocks (RFC 8018 5.2, RFC 7292 B.2) or scrypt's N·r·p, with the rounds
+/// whose count alone the policy bounds. `None` for a derivation it lacks.
+fn kdf_work(kdf: KdfCost) -> Option<(Option<u64>, Option<u32>)> {
+    Some(match kdf {
+        KdfCost::Pbkdf2 {
+            iterations, blocks, ..
+        } => (
+            u64::from(iterations).checked_mul(blocks as u64),
+            Some(iterations),
+        ),
+        KdfCost::Pkcs12 {
+            iterations,
+            key_blocks,
+            iv_blocks,
+            ..
+        } => (
+            u64::from(iterations).checked_mul((key_blocks + iv_blocks) as u64),
+            Some(iterations),
+        ),
+        KdfCost::Scrypt { n, r, p, .. } => {
+            (n.checked_mul(r).and_then(|nr| nr.checked_mul(p)), None)
+        }
+        _ => return None,
+    })
+}
+
+/// Hash rounds over the password the policy counts, one per 64 octets for
+/// each password-keyed HMAC set-up: once for PBKDF2, before and after `ROMix`
+/// for scrypt. RFC 7292 B.2 hashes the password within its counted rounds.
+fn password_work(kdf: KdfCost, password: usize) -> usize {
+    match kdf {
+        KdfCost::Pbkdf2 { .. } => password.div_ceil(64),
+        KdfCost::Scrypt { .. } => 2 * password.div_ceil(64),
+        _ => 0,
     }
-    let scratch_maximum = resources.max_key_import_kdf_memory_bytes;
-    if cost.scratch > scratch_maximum {
-        return Err(denial(
-            resource_name::KEY_IMPORT_KDF_MEMORY,
-            scratch_maximum,
-        ));
-    }
-    if cost
-        .scratch
-        .checked_add(cost.output)
-        .is_none_or(|live| live > available)
-    {
-        return Err(denial(
-            resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
-            ceilings.memory,
-        ));
-    }
-    *spent += work;
-    Ok(())
 }
 
 /// Bag count and KDF work of one pass over the container.
@@ -352,14 +347,64 @@ impl<'l> Charges<'l> {
         Ok(())
     }
 
-    fn admit(&mut self, cost: Cost, memory: &Memory) -> Result<()> {
-        admit_cost(
-            cost,
-            &self.limits.resources,
-            &mut self.work,
-            remaining(memory),
-            self.ceilings,
-        )
+    /// Admits `work` more KDF work.
+    fn work(&mut self, work: Option<u64>) -> Result<()> {
+        let maximum = self.limits.resources.max_key_import_kdf_work;
+        let work = work
+            .and_then(|work| usize::try_from(work).ok())
+            .filter(|work| *work <= maximum - self.work)
+            .ok_or_else(|| denial(resource_name::KEY_IMPORT_KDF_WORK, maximum))?;
+        self.work += work;
+        Ok(())
+    }
+
+    /// Admits a step's key derivation `kdf` before the password: its rounds,
+    /// its work against the KDF budget, and the engine's `cost` scratch and
+    /// output against the KDF memory limit and the bytes `memory` still holds.
+    /// A count of rounds over the whole budget is outside the KDF limit.
+    fn admit(&mut self, kdf: KdfCost, cost: Cost, memory: &Memory) -> Result<()> {
+        let maximum = self.limits.resources.max_key_import_kdf_work;
+        let (work, rounds) = kdf_work(kdf).ok_or(KeyStoreError::Selection(
+            "unsupported PKCS#12 key derivation",
+        ))?;
+        if rounds.is_some_and(|rounds| rounds as usize > maximum) {
+            return Err(PolicyViolation::KdfIterationsOutsideLimit { maximum }.into());
+        }
+        self.work(work)?;
+        self.live(cost.scratch, cost.output, memory)
+    }
+
+    /// Admits the password's hashing and the scratch it adds, `scratch` in
+    /// all, after the password is known.
+    fn admit_password(
+        &mut self,
+        kdf: KdfCost,
+        password: usize,
+        scratch: usize,
+        output: usize,
+        memory: &Memory,
+    ) -> Result<()> {
+        self.work(Some(password_work(kdf, password) as u64))?;
+        self.live(scratch, output, memory)
+    }
+
+    /// Refuses KDF scratch over the KDF memory limit, or scratch and output
+    /// over the bytes `memory` still holds.
+    fn live(&self, scratch: usize, output: usize, memory: &Memory) -> Result<()> {
+        let maximum = self.limits.resources.max_key_import_kdf_memory_bytes;
+        if scratch > maximum {
+            return Err(denial(resource_name::KEY_IMPORT_KDF_MEMORY, maximum));
+        }
+        if scratch
+            .checked_add(output)
+            .is_none_or(|live| live > remaining(memory))
+        {
+            return Err(denial(
+                resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                self.ceilings.memory,
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -601,18 +646,35 @@ impl<S: Secret, F: FnOnce() -> Option<S>> Adapter<'_, F, S> {
         let plan = plan.map_err(|e| ceilings.plan(e, UNSUPPORTED, kdf))?;
         // KDF work, scratch and the plaintext are admitted before the password
         // is requested, so a refused step never prompts for one.
+        let derivation = plan
+            .kdf_cost()
+            .map_err(|e| ceilings.plan(e, UNSUPPORTED, kdf))?;
         let cost = plan
             .cost()
             .map_err(|e| ceilings.plan(e, UNSUPPORTED, kdf))?;
-        self.charges.admit(cost, query.memory())?;
+        self.charges.admit(derivation, cost, query.memory())?;
         let password = input!(self, plan, query);
         let extra = plan
             .password_cost(password)
             .map_err(|e| ceilings.plan(e, UNSUPPORTED, kdf))?;
-        self.charges.admit(extra, query.memory())?;
-        let (mut scratch, _reservation) = scratch(cost.scratch + extra.scratch, query, ceilings)?;
+        let all = cost.scratch + extra.scratch;
+        self.charges.admit_password(
+            derivation,
+            input_len(password),
+            all,
+            cost.output,
+            query.memory(),
+        )?;
+        let (mut scratch, _reservation) = scratch(all, query, ceilings)?;
         plan.decrypt_owned(password, &mut scratch, query)
             .map_err(|e| ceilings.engine(e, UNSUPPORTED))
+    }
+}
+
+/// The octets of a password input.
+fn input_len(input: Input<'_>) -> usize {
+    match input {
+        Input::Octets(bytes) | Input::Legacy(bytes) => bytes.len(),
     }
 }
 
@@ -662,16 +724,26 @@ impl<S: Secret, F: FnOnce() -> Option<S>> Backend for Adapter<'_, F, S> {
             }
             Err(error) => return Err(ceilings.plan(error, UNSUPPORTED, kdf)),
         };
+        let derivation = plan
+            .kdf_cost()
+            .map_err(|e| ceilings.plan(e, UNSUPPORTED, kdf))?;
         let cost = plan
             .cost()
             .map_err(|e| ceilings.plan(e, UNSUPPORTED, kdf))?;
-        self.charges.admit(cost, query.memory())?;
+        self.charges.admit(derivation, cost, query.memory())?;
         let password = input!(self, plan, query);
         let extra = plan
             .password_cost(password)
             .map_err(|e| ceilings.plan(e, UNSUPPORTED, kdf))?;
-        self.charges.admit(extra, query.memory())?;
-        let (mut scratch, _reservation) = scratch(cost.scratch + extra.scratch, query, ceilings)?;
+        let all = cost.scratch + extra.scratch;
+        self.charges.admit_password(
+            derivation,
+            input_len(password),
+            all,
+            cost.output,
+            query.memory(),
+        )?;
+        let (mut scratch, _reservation) = scratch(all, query, ceilings)?;
         match plan.verify(password, &mut scratch, query) {
             Ok(()) => Ok(Decision::Accept),
             Err(engine::Error::Rejected) => Ok(Decision::Reject),

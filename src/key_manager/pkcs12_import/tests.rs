@@ -711,13 +711,10 @@ fn legacy_shrouded_key_and_hidden_limits() {
             }
         ))
     ));
-    // A budget one unit short of both decryptions admits the outer safe and
-    // refuses the hidden key: the hidden step does not start a new budget.
-    let mut total = 0;
-    run_counted(&bytes, &limits(64), &mut total, password).expect("the whole bundle");
+    // The outer safe needs 2 rounds x 3 blocks; the hidden key needs as much.
     let tight = Limits {
         resources: ResourcePolicy {
-            max_key_import_kdf_work: total - 1,
+            max_key_import_kdf_work: 6,
             ..ResourcePolicy::default()
         },
         ..limits(64)
@@ -725,23 +722,16 @@ fn legacy_shrouded_key_and_hidden_limits() {
     let mut work = 0;
     let (result, calls) = import_counting(&bytes, &tight, &mut work, password);
     assert_eq!(calls, 1, "the visible outer KDF fits");
-    assert!(
-        matches!(
-            result,
-            Err(KeyStoreError::Policy(
-                PolicyViolation::ResourceLimitExceeded {
-                    resource: resource_name::KEY_IMPORT_KDF_WORK,
-                    maximum,
-                }
-            )) if maximum == total - 1
-        ),
-        "{:?}",
-        result.as_ref().err()
-    );
-    assert!(
-        work > 0 && work < total,
-        "the outer step's work is kept, not refunded"
-    );
+    assert!(matches!(
+        result,
+        Err(KeyStoreError::Policy(
+            PolicyViolation::ResourceLimitExceeded {
+                resource: resource_name::KEY_IMPORT_KDF_WORK,
+                maximum: 6
+            }
+        ))
+    ));
+    assert_eq!(work, 6, "work spent after the password is not refunded");
 }
 
 /// Imports with `password`, adding the KDF work spent to `work`.
@@ -941,22 +931,26 @@ fn kdf_integer_classification_preserves_ber_errors() {
         );
         assert_eq!(calls, 0);
     }
-    // Well-formed counts whose single step exceeds the whole KDF limit are
-    // policy refusals, decided before the password.
-    for rounds in [&[0, 128][..], &[0, 129][..]] {
-        let (result, calls) = import_counting(&shrouded(encoded(2, rounds)), &limits, &mut 0, "x");
-        assert!(
-            matches!(
-                result,
-                Err(KeyStoreError::Policy(
-                    PolicyViolation::KdfIterationsOutsideLimit { maximum: 128 }
-                ))
-            ),
-            "{rounds:?}: {:?}",
-            result.as_ref().err()
-        );
-        assert_eq!(calls, 0);
-    }
+    // 128 rounds pass the iteration check; 3DES's three blocks exceed 128.
+    let (result, calls) = import_counting(&shrouded(encoded(2, &[0, 128])), &limits, &mut 0, "x");
+    assert!(matches!(
+        result,
+        Err(KeyStoreError::Policy(
+            PolicyViolation::ResourceLimitExceeded {
+                resource: resource_name::KEY_IMPORT_KDF_WORK,
+                ..
+            }
+        ))
+    ));
+    assert_eq!(calls, 0);
+    let (result, calls) = import_counting(&shrouded(encoded(2, &[0, 129])), &limits, &mut 0, "x");
+    assert!(matches!(
+        result,
+        Err(KeyStoreError::Policy(
+            PolicyViolation::KdfIterationsOutsideLimit { maximum: 128 }
+        ))
+    ));
+    assert_eq!(calls, 0);
 }
 
 #[test]

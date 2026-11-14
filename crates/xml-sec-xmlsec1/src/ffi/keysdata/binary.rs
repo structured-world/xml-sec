@@ -279,6 +279,19 @@ pub(crate) unsafe extern "C" fn value_xml_read(
         // decoded in place and freed here.
         unsafe {
             let object = klass_name(id);
+            // The secret is external material, bounded as a
+            // DEREncodedKeyValue is before anything is decoded.
+            let Some(pinned) = crate::ffi::keyinfo::read_policy(ctx, here) else {
+                return -1;
+            };
+            if !crate::ffi::keyinfo::key_value_within(
+                here,
+                object,
+                node,
+                &pinned.verification.resources,
+            ) {
+                return -1;
+            }
             let text = xmlSecGetNodeContentAndTrim(node);
             if text.is_null() {
                 errors::invalid_node_content(here, node, object, "empty");

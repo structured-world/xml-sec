@@ -32,6 +32,8 @@ mod openssl;
 #[cfg(feature = "xmldsig-sign")]
 mod pkcs12_import;
 #[cfg(feature = "xmldsig-sign")]
+mod pkcs8_import;
+#[cfg(feature = "xmldsig-sign")]
 use crate::rsa_encoding::RsaPrivateKeyEncoding as _;
 #[cfg(feature = "xmldsig-sign")]
 pub use openssl::PrivateKeyContainer;
@@ -2113,7 +2115,7 @@ impl KeyInventory {
         let der = if PrivateKeyInfoRef::try_from(bytes).is_ok() {
             check_plain_output(bytes.len())?;
             Zeroizing::new(bytes.to_vec())
-        } else if let Ok(encrypted) = EncryptedPrivateKeyInfoRef::try_from(bytes) {
+        } else if EncryptedPrivateKeyInfoRef::try_from(bytes).is_ok() {
             // PEM decoding does not end the caller's encoded buffer lifetime.
             // Its bytes coexist with DER and the KDF workspace, not replace DER.
             let kdf_live_bytes = retained_with_input
@@ -2125,20 +2127,13 @@ impl KeyInventory {
                     )
                 })?;
             let remaining = self.remaining_kdf_resources(resources)?;
-            enforce_pkcs8_kdf_policy(&encrypted, &remaining, kdf_live_bytes)?;
+            let shape = pkcs8_import::shape(bytes, &remaining)?;
+            enforce_pkcs8_kdf_policy(&shape, &remaining, kdf_live_bytes)?;
             let password = password.ok_or(KeyStoreError::ProtectedContainer)?;
-            let work =
-                enforce_pkcs8_password_policy(&encrypted, password, &remaining, kdf_live_bytes)?;
+            let work = enforce_pkcs8_password_policy(&shape, password, &remaining, kdf_live_bytes)?;
             self.kdf_work += work;
-            // Decrypt in the one preflighted, zeroizing output allocation;
-            // SecretDocument followed by to_vec would retain two plaintext copies.
-            let mut plain = Zeroizing::new(encrypted.encrypted_data.as_bytes().to_vec());
-            let plaintext_len = encrypted
-                .encryption_algorithm
-                .decrypt_in_place(password, &mut plain)
-                .map_err(|_| KeyStoreError::ProtectedContainer)?;
-            let plaintext_len = plaintext_len.len();
-            plain.truncate(plaintext_len);
+            // The engine decrypts into one zeroizing output allocation.
+            let plain = pkcs8_import::decrypt(bytes, password, &remaining)?;
             PrivateKeyInfoRef::try_from(plain.as_slice())
                 .map_err(|_| KeyStoreError::ProtectedContainer)?;
             plain
@@ -2195,7 +2190,14 @@ impl KeyInventory {
         }
         let retained_with_input =
             self.check_material_capacity(named_material_length(&name, bytes.len(), 1)?, resources)?;
-        let encrypted = EncryptedPrivateKeyInfoRef::try_from(bytes).ok();
+        let encrypted = if EncryptedPrivateKeyInfoRef::try_from(bytes).is_ok() {
+            Some(pkcs8_import::shape(
+                bytes,
+                &self.remaining_kdf_resources(resources)?,
+            )?)
+        } else {
+            None
+        };
         let secret = if let Some(encrypted) = &encrypted {
             let remaining = self.remaining_kdf_resources(resources)?;
             // Secret acquisition is observable work: use the same remaining
@@ -3602,25 +3604,18 @@ fn single_pem_block(bytes: &[u8], maximum: usize) -> Result<pem::Pem, KeyStoreEr
 
 #[cfg(feature = "xmldsig-sign")]
 fn enforce_pkcs8_kdf_policy(
-    encrypted: &EncryptedPrivateKeyInfoRef<'_>,
+    encrypted: &pkcs8_import::Shape,
     resources: &ResourcePolicy,
     retained_with_input: usize,
 ) -> Result<usize, KeyStoreError> {
-    use pkcs8::pkcs5::{
-        EncryptionScheme,
-        pbes2::{Kdf, Pbkdf2Prf},
-    };
+    use structured_cms::personal::password::KdfCost;
     // RFC 8018 §6.2 leaves KDF iteration policy to the application. Reject
     // excessive work before decrypting attacker-supplied containers.
     // https://www.rfc-editor.org/rfc/rfc8018#section-6.2
-    let EncryptionScheme::Pbes2(params) = &encrypted.encryption_algorithm else {
-        return Err(KeyStoreError::ProtectedContainer);
-    };
-    // PBES2 decryption mutates a ciphertext-sized output buffer while the
-    // encoded input remains live. Include that capacity before any password
-    // callback or KDF, including failed padding/DER decoding.
-    let live_with_output =
-        retained_with_input.checked_add(encrypted.encrypted_data.as_bytes().len());
+    // Decryption fills a ciphertext-sized output buffer while the encoded
+    // input remains live. Include that capacity before any password callback
+    // or KDF, including failed padding/DER decoding.
+    let live_with_output = retained_with_input.checked_add(encrypted.output);
     if live_with_output.is_none_or(|total| total > resources.max_external_resource_total_bytes) {
         return Err(kdf_policy_violation(
             crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
@@ -3629,49 +3624,46 @@ fn enforce_pkcs8_kdf_policy(
         ));
     }
     let live_with_output = live_with_output.ok_or(KeyStoreError::ProtectedContainer)?;
-    let work = match &params.kdf {
-        Kdf::Pbkdf2(kdf) => {
-            if kdf.iteration_count == 0 {
-                return Err(KeyStoreError::ProtectedContainer);
-            }
-            let hash_len = match kdf.prf {
-                Pbkdf2Prf::HmacWithSha1 => 20,
-                Pbkdf2Prf::HmacWithSha224 => 28,
-                Pbkdf2Prf::HmacWithSha256 => 32,
-                Pbkdf2Prf::HmacWithSha384 => 48,
-                Pbkdf2Prf::HmacWithSha512 => 64,
-                _ => return Err(KeyStoreError::ProtectedContainer),
-            };
-            // RFC 8018 5.2 steps 2-3: every ceil(dkLen/hLen) block runs c
-            // PRFs. The cipher determines dkLen, not a caller's KDF hint.
-            // https://www.rfc-editor.org/rfc/rfc8018#section-5.2
-            let blocks = params.encryption.key_size().div_ceil(hash_len) as u64;
-            let work = u64::from(kdf.iteration_count).checked_mul(blocks);
-            if work.is_none_or(|work| work > resources.max_key_import_kdf_work as u64) {
-                return Err(kdf_policy_violation(
-                    crate::policy::resource_name::KEY_IMPORT_KDF_WORK,
-                    resources.max_key_import_kdf_work,
-                    work,
-                ));
-            }
-            usize::try_from(work.ok_or(KeyStoreError::ProtectedContainer)?)
-                .expect("admitted PBKDF2 work fits the usize policy bound")
+    // RFC 8018 5.2 steps 2-3 and RFC 7292 B.2: every output block runs c
+    // hash rounds; the cipher determines the output length.
+    let rounds = |iterations: u32, blocks: usize| {
+        let work = u64::from(iterations).checked_mul(blocks as u64);
+        if work.is_none_or(|work| work > resources.max_key_import_kdf_work as u64) {
+            return Err(kdf_policy_violation(
+                crate::policy::resource_name::KEY_IMPORT_KDF_WORK,
+                resources.max_key_import_kdf_work,
+                work,
+            ));
         }
-        Kdf::Scrypt(kdf) => enforce_scrypt_kdf_limits(
-            kdf.cost_parameter,
-            u64::from(kdf.block_size),
-            u64::from(kdf.parallelization),
-            resources,
-            live_with_output,
-        )?,
-        _ => return Err(KeyStoreError::ProtectedContainer),
+        Ok(
+            usize::try_from(work.ok_or(KeyStoreError::ProtectedContainer)?)
+                .expect("admitted KDF work fits the usize policy bound"),
+        )
     };
-    Ok(work)
+    match encrypted.kdf {
+        KdfCost::Pbkdf2 {
+            iterations, blocks, ..
+        } => rounds(iterations, blocks),
+        KdfCost::Pkcs12 {
+            iterations,
+            key_blocks,
+            iv_blocks,
+            ..
+        } => rounds(iterations, key_blocks + iv_blocks),
+        KdfCost::Scrypt {
+            n,
+            r,
+            p,
+            workspace_bytes,
+            ..
+        } => enforce_scrypt_kdf_limits(n, r, p, workspace_bytes, resources, live_with_output),
+        _ => Err(KeyStoreError::ProtectedContainer),
+    }
 }
 
 #[cfg(feature = "xmldsig-sign")]
 fn enforce_pkcs8_password_policy(
-    encrypted: &EncryptedPrivateKeyInfoRef<'_>,
+    encrypted: &pkcs8_import::Shape,
     password: &[u8],
     resources: &ResourcePolicy,
     live_bytes: usize,
@@ -3691,12 +3683,8 @@ fn enforce_pkcs8_password_policy(
     })?;
     // Product work accounting: one unit per 64 input bytes conservatively
     // covers password hashing for the supported SHA PRFs, in addition to rounds.
-    let hashing_passes = match &encrypted.encryption_algorithm {
-        pkcs8::pkcs5::EncryptionScheme::Pbes2(params)
-            if matches!(&params.kdf, pkcs8::pkcs5::pbes2::Kdf::Scrypt(_)) =>
-        {
-            2
-        }
+    let hashing_passes = match encrypted.kdf {
+        structured_cms::personal::password::KdfCost::Scrypt { .. } => 2,
         _ => 1,
     };
     // Scrypt initializes password-keyed HMAC both before and after ROMix.
@@ -3731,6 +3719,7 @@ fn enforce_scrypt_kdf_limits(
     n: u64,
     r: u64,
     p: u64,
+    workspace_bytes: usize,
     resources: &ResourcePolicy,
     retained_with_input: usize,
 ) -> Result<usize, KeyStoreError> {
@@ -3745,13 +3734,8 @@ fn enforce_scrypt_kdf_limits(
             work,
         ));
     }
-    // RustCrypto scrypt retains B[p*r] plus V[N*r] and T[r] per parallel
-    // worker when its `parallel` feature is unified in a downstream build.
-    let memory = n
-        .checked_add(2)
-        .and_then(|blocks| blocks.checked_mul(p))
-        .and_then(|blocks| blocks.checked_mul(r))
-        .and_then(|blocks| blocks.checked_mul(128));
+    // The B, V and T blocks the shared engine states it derives in.
+    let memory = Some(workspace_bytes as u64);
     if memory.is_none_or(|value| value > resources.max_key_import_kdf_memory_bytes as u64) {
         return Err(kdf_policy_violation(
             crate::policy::resource_name::KEY_IMPORT_KDF_MEMORY,

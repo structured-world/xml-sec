@@ -68,6 +68,44 @@ pub(crate) unsafe fn read_policy(
     }
 }
 
+/// Whether the Base64 content of `node`, external key material, decodes to
+/// at most the policy's per-resource octets, checked before the reader
+/// allocates for it; reported for the klass `object` at `here` otherwise.
+/// Whitespace decodes to nothing; every four other characters decode to at
+/// most three octets, less one for each trailing pad (RFC 4648 section 4).
+/// The reader still validates the text.
+pub(crate) fn key_value_within(
+    here: errors::Here,
+    object: *const std::ffi::c_char,
+    node: *mut XmlNode,
+    resources: &xml_sec::policy::ResourcePolicy,
+) -> bool {
+    let max = resources.max_external_resource_bytes;
+    let (encoded, padding) = nodes::content(node).map_or((0, 0), |text| {
+        let mut significant = text.bytes().filter(|byte| !byte.is_ascii_whitespace());
+        let encoded = significant.clone().count();
+        let padding = significant
+            .by_ref()
+            .rev()
+            .take(2)
+            .take_while(|&byte| byte == b'=')
+            .count();
+        (encoded, padding)
+    });
+    let decoded = encoded.div_ceil(4).checked_mul(3).map(|bound| {
+        if encoded % 4 == 0 {
+            bound - padding
+        } else {
+            bound
+        }
+    });
+    if decoded.is_none_or(|decoded| decoded > max) {
+        errors::limit_exceeded(here, object, "max_external_resource_bytes", max);
+        return false;
+    }
+    true
+}
+
 /// Whether a key-store search of the read with `ctx` was refused for the
 /// read's candidate allowance: a policy failure, not an unknown name.
 ///

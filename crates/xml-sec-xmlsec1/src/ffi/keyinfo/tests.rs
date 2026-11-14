@@ -208,6 +208,44 @@ fn a_binary_value_is_written_only_by_its_own_klass() {
 }
 
 #[test]
+fn a_symmetric_value_past_the_resource_limit_is_refused_before_decoding() {
+    // A document-supplied secret is external material: one decoding to more
+    // octets than the policy's per-resource limit is refused, as a
+    // DEREncodedKeyValue is, and a key of exactly the limit is read.
+    own_process();
+    let secret = "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE="; // 32 octets
+    let read = |limit: usize| {
+        policy::republish(
+            |verification| verification.resources.max_external_resource_bytes = limit,
+            |_| {},
+        )
+        .expect("the library policy compiles");
+        let doc = parse(&format!(
+            "<HMACKeyValue xmlns=\"http://www.aleksey.com/xmlsec/2002\">{secret}</HMACKeyValue>"
+        ));
+        // SAFETY: objects created and destroyed here.
+        unsafe {
+            assert_eq!(xmlSecKeyDataIdsInit(), 0);
+            let ctx = xmlSecKeyInfoCtxCreate(std::ptr::null_mut());
+            let key = xmlSecKeyCreate();
+            let read = xmlSecKeyDataXmlRead(
+                symkeys::hmac(),
+                key.cast(),
+                xsDocGetRootElement(doc).cast(),
+                ctx.cast(),
+            );
+            let installed = !xmlSecKeyGetValue(key).is_null();
+            xmlSecKeyDestroy(key);
+            xmlSecKeyInfoCtxDestroy(ctx);
+            xsFreeDoc(doc);
+            (read, installed)
+        }
+    };
+    assert_eq!(read(16), (-1, false), "16 octets admit no 32-octet secret");
+    assert_eq!(read(32), (0, true), "a secret of exactly the limit is read");
+}
+
+#[test]
 fn a_copy_onto_itself_is_refused() {
     // Copying a context or a list onto itself would alias the destination
     // with the source; the call is refused and leaves both as they were.

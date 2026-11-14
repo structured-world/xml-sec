@@ -358,7 +358,12 @@ fn temporary_pkcs12_imports_keep_aggregate_work() {
     // Room for one import of the bundle, not two.
     let mut probe = KeyInventory::default();
     probe
-        .add_pkcs12("key".into(), bytes, "secret", &Default::default())
+        .add_pkcs12(
+            "key".into(),
+            bytes,
+            "secret",
+            &xml_sec::policy::ResourcePolicy::default(),
+        )
         .unwrap();
     let resources = xml_sec::policy::ResourcePolicy {
         max_key_import_kdf_work: probe.key_import_kdf_work() * 2 - 1,
