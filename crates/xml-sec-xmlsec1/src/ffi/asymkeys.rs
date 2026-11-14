@@ -342,7 +342,11 @@ unsafe fn read_value(
     let document = xml_sec_libxml2::document::subtree(node, &*pinned.verification)
         .map_err(|error| error.to_string())?;
     document.with_view(|view| {
-        parse_key_value_child(view.document().root_element()).map_err(|error| error.to_string())
+        parse_key_value_child(
+            view.document().root_element(),
+            &pinned.verification.resources,
+        )
+        .map_err(|error| error.to_string())
     })
 }
 

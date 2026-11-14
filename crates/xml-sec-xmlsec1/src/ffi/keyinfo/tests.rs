@@ -246,6 +246,45 @@ fn a_symmetric_value_past_the_resource_limit_is_refused_before_decoding() {
 }
 
 #[test]
+fn an_rsa_key_value_past_the_resource_limit_is_refused() {
+    // The components of an RSAKeyValue are external material too: a modulus
+    // and exponent decoding past the per-resource limit are refused, as a
+    // DEREncodedKeyValue is, and are read under a limit they fit.
+    own_process();
+    let modulus = "AQID".repeat(8); // 24 octets
+    let read = |limit: usize| {
+        policy::republish(
+            |verification| verification.resources.max_external_resource_bytes = limit,
+            |_| {},
+        )
+        .expect("the library policy compiles");
+        let doc = parse(&format!(
+            "<RSAKeyValue xmlns=\"http://www.w3.org/2000/09/xmldsig#\">\
+             <Modulus>{modulus}</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>"
+        ));
+        // SAFETY: objects created and destroyed here.
+        unsafe {
+            assert_eq!(xmlSecKeyDataIdsInit(), 0);
+            let ctx = xmlSecKeyInfoCtxCreate(std::ptr::null_mut());
+            let key = xmlSecKeyCreate();
+            let read = xmlSecKeyDataXmlRead(
+                asymkeys::rsa(),
+                key.cast(),
+                xsDocGetRootElement(doc).cast(),
+                ctx.cast(),
+            );
+            let installed = !xmlSecKeyGetValue(key).is_null();
+            xmlSecKeyDestroy(key);
+            xmlSecKeyInfoCtxDestroy(ctx);
+            xsFreeDoc(doc);
+            (read, installed)
+        }
+    };
+    assert_eq!(read(16), (-1, false), "16 octets admit no 24-octet modulus");
+    assert_eq!(read(27), (0, true), "modulus and exponent fit 27 octets");
+}
+
+#[test]
 fn a_copy_onto_itself_is_refused() {
     // Copying a context or a list onto itself would alias the destination
     // with the source; the call is refused and leaves both as they were.
