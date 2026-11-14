@@ -490,7 +490,8 @@ impl OwnedTree {
         let Ok(mut top) = self.live(element) else {
             return false;
         };
-        while let Some(parent) = self.document.parent(top) {
+        // The top of the subtree, not the holder an unlinked one waits in.
+        while let Some(parent) = self.linked_parent(top) {
             top = parent;
         }
         !released.contains(&top)
@@ -1300,6 +1301,12 @@ impl OwnedTree {
             let mut next = String::from(value);
             if xml_id {
                 normalize_id_value(&mut next);
+            }
+            // The value this attribute already holds stays its own: nothing
+            // moves, so no other carrier of it is asked about.
+            if self.ids.get(&next) == Some(&source) {
+                self.put_attribute(id, local_name, prefix, namespace, &next);
+                return Ok(());
             }
             self.check_claim(&next, &source, &[])?;
         }
