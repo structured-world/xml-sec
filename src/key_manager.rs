@@ -2664,6 +2664,7 @@ impl KeyInventory {
     fn read_xml_store_entry(
         info: Node<'_, '_>,
         material_budget: &mut XmlImportMaterialBudget,
+        resources: &crate::policy::ResourcePolicy,
     ) -> Result<(String, ParsedMaterial), KeyStoreError> {
         let mut name = None;
         let mut value = None;
@@ -2711,7 +2712,7 @@ impl KeyInventory {
                     || key.has_tag_name((XMLDSIG11_NS, "ECKeyValue"))
                 {
                     ParsedMaterial::Public(
-                        crate::xmldsig::parse::parse_key_value_dispatch(child)
+                        crate::xmldsig::parse::parse_key_value_dispatch(child, resources)
                             .map_err(|error| KeyStoreError::Invalid(error.to_string()))?,
                     )
                 } else {
@@ -2903,7 +2904,8 @@ impl KeyInventory {
             *inspected += 1;
             entry_count += 1;
             preflight_xml_material(info, &mut material_budget)?;
-            let (name, material) = Self::read_xml_store_entry(info, &mut material_budget)?;
+            let (name, material) =
+                Self::read_xml_store_entry(info, &mut material_budget, resources)?;
             if !names.insert(name.clone()) {
                 return Err(KeyStoreError::Invalid("duplicate key name".into()));
             }

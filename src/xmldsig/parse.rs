@@ -1958,7 +1958,7 @@ fn parse_key_info_contents_in_session(
             }
             (Some(XMLDSIG_NS), "KeyValue") => {
                 charge_embedded_key_candidate(&mut usage.embedded_candidates, resources)?;
-                KeyInfoSource::KeyValue(parse_key_value_dispatch(child)?)
+                KeyInfoSource::KeyValue(parse_key_value_dispatch(child, resources)?)
             }
             (Some(XMLDSIG_NS), "X509Data") => KeyInfoSource::X509Data(parse_x509_data_in_session(
                 child,
@@ -2275,7 +2275,10 @@ pub(crate) fn parse_replay_canonicalization_method<'a, 's, S: transforms::ParseS
     Ok((algorithm, prefixes))
 }
 
-pub(crate) fn parse_key_value_dispatch(node: Node) -> Result<KeyValueInfo, ParseError> {
+pub(crate) fn parse_key_value_dispatch(
+    node: Node,
+    resources: &crate::policy::ResourcePolicy,
+) -> Result<KeyValueInfo, ParseError> {
     verify_ds_element(node, "KeyValue")?;
     ensure_no_non_whitespace_text(node, "KeyValue")?;
 
@@ -2291,7 +2294,35 @@ pub(crate) fn parse_key_value_dispatch(node: Node) -> Result<KeyValueInfo, Parse
         ));
     }
 
-    parse_key_value_child(first_child)
+    parse_key_value_child(first_child, resources)
+}
+
+/// The octets one key value may still decode: its components together are
+/// one embedded resource, bounded by the policy before any is decoded.
+struct KeyValueBytes {
+    remaining: usize,
+    maximum: usize,
+}
+
+impl KeyValueBytes {
+    fn new(resources: &crate::policy::ResourcePolicy) -> Self {
+        Self {
+            remaining: resources.max_external_resource_bytes,
+            maximum: resources.max_external_resource_bytes,
+        }
+    }
+
+    fn admit(&mut self, decoded_len: usize) -> Result<(), ParseError> {
+        if decoded_len > self.remaining {
+            return Err(crate::policy::PolicyViolation::ResourceLimitExceeded {
+                resource: crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
+                maximum: self.maximum,
+            }
+            .into());
+        }
+        self.remaining -= decoded_len;
+        Ok(())
+    }
 }
 
 /// Parse one key-value element, the child of a `<KeyValue>`:
@@ -2299,29 +2330,36 @@ pub(crate) fn parse_key_value_dispatch(node: Node) -> Result<KeyValueInfo, Parse
 ///
 /// An element of another name is [`KeyValueInfo::Unsupported`], so a
 /// caller can offer it to its own readers; an EC key on a curve this build
-/// cannot use is [`KeyValueInfo::InvalidEcKeyValue`].
+/// cannot use is [`KeyValueInfo::InvalidEcKeyValue`]. The components of the
+/// key value decode to at most `resources.max_external_resource_bytes`
+/// octets together, checked before each is decoded.
 ///
 /// # Errors
-/// Returns [`ParseError`] for a node that is no element, or a supported
-/// element whose structure or `CryptoBinary` content is malformed.
+/// Returns [`ParseError`] for a node that is no element, a supported
+/// element whose structure or `CryptoBinary` content is malformed, or
+/// components past the per-resource limit.
 ///
 /// # Examples
 ///
 /// ```
+/// use xml_sec::policy::ResourcePolicy;
 /// use xml_sec::xmldsig::{KeyValueInfo, parse_key_value_child};
 ///
 /// let xml = r#"<RSAKeyValue xmlns="http://www.w3.org/2000/09/xmldsig#">
 ///     <Modulus>AQID</Modulus><Exponent>AQAB</Exponent>
 /// </RSAKeyValue>"#;
 /// let doc = xml_sec::Document::parse(xml)?;
-/// let info = parse_key_value_child(doc.root_element())?;
+/// let info = parse_key_value_child(doc.root_element(), &ResourcePolicy::default())?;
 /// assert_eq!(
 ///     info,
 ///     KeyValueInfo::Rsa { modulus: vec![1, 2, 3], exponent: vec![1, 0, 1] }
 /// );
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-pub fn parse_key_value_child(node: Node) -> Result<KeyValueInfo, ParseError> {
+pub fn parse_key_value_child(
+    node: Node,
+    resources: &crate::policy::ResourcePolicy,
+) -> Result<KeyValueInfo, ParseError> {
     // Only an element names a key value; any other node has an empty name
     // that would read as an unsupported one.
     if !node.is_element() {
@@ -2329,11 +2367,14 @@ pub fn parse_key_value_child(node: Node) -> Result<KeyValueInfo, ParseError> {
             "a key value must be an element".into(),
         ));
     }
+    let bytes = &mut KeyValueBytes::new(resources);
     match (node.tag_name().namespace(), node.tag_name().name()) {
-        (Some(XMLDSIG_NS), "RSAKeyValue") => parse_rsa_key_value(node),
-        (Some(XMLDSIG_NS), "DSAKeyValue") => parse_dsa_key_value(node),
-        (Some(XMLDSIG11_NS), "ECKeyValue") => parse_ec_key_value(node),
-        (Some("http://www.w3.org/2001/04/xmlenc#"), "DHKeyValue") => parse_dh_key_value(node),
+        (Some(XMLDSIG_NS), "RSAKeyValue") => parse_rsa_key_value(node, bytes),
+        (Some(XMLDSIG_NS), "DSAKeyValue") => parse_dsa_key_value(node, bytes),
+        (Some(XMLDSIG11_NS), "ECKeyValue") => parse_ec_key_value(node, bytes),
+        (Some("http://www.w3.org/2001/04/xmlenc#"), "DHKeyValue") => {
+            parse_dh_key_value(node, bytes)
+        }
         (namespace, child_name) => Ok(KeyValueInfo::Unsupported {
             namespace: namespace.map(str::to_string),
             local_name: child_name.to_string(),
@@ -2346,24 +2387,28 @@ pub(crate) fn validate_key_info_container(node: Node) -> Result<(), ParseError> 
     ensure_no_non_whitespace_text(node, "KeyInfo")
 }
 
-fn parse_dsa_key_value(node: Node<'_, '_>) -> Result<KeyValueInfo, ParseError> {
+fn parse_dsa_key_value(
+    node: Node<'_, '_>,
+    bytes: &mut KeyValueBytes,
+) -> Result<KeyValueInfo, ParseError> {
     verify_ds_element(node, "DSAKeyValue")?;
     ensure_no_non_whitespace_text(node, "DSAKeyValue")?;
     let children = element_children(node).collect::<Vec<_>>();
     let mut index = 0;
-    let p = take_dsa_crypto_binary(&children, &mut index, "P")?;
-    let q = take_dsa_crypto_binary(&children, &mut index, "Q")?;
+    let mut take = |name| take_dsa_crypto_binary(&children, &mut index, name, bytes);
+    let p = take("P")?;
+    let q = take("Q")?;
     if p.is_some() != q.is_some() {
         return Err(ParseError::InvalidStructure(
             "DSAKeyValue P and Q must be present together".into(),
         ));
     }
-    let g = take_dsa_crypto_binary(&children, &mut index, "G")?;
-    let y = take_dsa_crypto_binary(&children, &mut index, "Y")?
-        .ok_or_else(|| ParseError::InvalidStructure("DSAKeyValue requires Y".into()))?;
-    let _j = take_dsa_crypto_binary(&children, &mut index, "J")?;
-    let seed = take_dsa_crypto_binary(&children, &mut index, "Seed")?;
-    let counter = take_dsa_crypto_binary(&children, &mut index, "PgenCounter")?;
+    let g = take("G")?;
+    let y =
+        take("Y")?.ok_or_else(|| ParseError::InvalidStructure("DSAKeyValue requires Y".into()))?;
+    let _j = take("J")?;
+    let seed = take("Seed")?;
+    let counter = take("PgenCounter")?;
     if seed.is_some() != counter.is_some() {
         return Err(ParseError::InvalidStructure(
             "DSAKeyValue Seed and PgenCounter must be present together".into(),
@@ -2377,7 +2422,10 @@ fn parse_dsa_key_value(node: Node<'_, '_>) -> Result<KeyValueInfo, ParseError> {
     Ok(KeyValueInfo::Dsa { p, q, g, y })
 }
 
-fn parse_dh_key_value(node: Node<'_, '_>) -> Result<KeyValueInfo, ParseError> {
+fn parse_dh_key_value(
+    node: Node<'_, '_>,
+    bytes: &mut KeyValueBytes,
+) -> Result<KeyValueInfo, ParseError> {
     const NS: &str = "http://www.w3.org/2001/04/xmlenc#";
     ensure_no_non_whitespace_text(node, "DHKeyValue")?;
     let mut children = element_children(node).peekable();
@@ -2394,6 +2442,7 @@ fn parse_dh_key_value(node: Node<'_, '_>) -> Result<KeyValueInfo, ParseError> {
             child,
             name,
             crate::hard_limits::DH_MODULUS_BIT_CEILING.div_ceil(8),
+            bytes,
         )
         .map(Some)
     };
@@ -2431,6 +2480,7 @@ fn take_dsa_crypto_binary(
     children: &[Node<'_, '_>],
     index: &mut usize,
     name: &'static str,
+    bytes: &mut KeyValueBytes,
 ) -> Result<Option<Vec<u8>>, ParseError> {
     let Some(&child) = children.get(*index) else {
         return Ok(None);
@@ -2440,14 +2490,17 @@ fn take_dsa_crypto_binary(
     }
     *index += 1;
     ensure_no_element_children(child, name)?;
-    decode_crypto_binary(child, name, MAX_RSA_MODULUS_LEN).map(Some)
+    decode_crypto_binary(child, name, MAX_RSA_MODULUS_LEN, bytes).map(Some)
 }
 
 fn is_ds_element(node: Node<'_, '_>, name: &str) -> bool {
     node.tag_name().namespace() == Some(XMLDSIG_NS) && node.tag_name().name() == name
 }
 
-fn parse_ec_key_value(node: Node<'_, '_>) -> Result<KeyValueInfo, ParseError> {
+fn parse_ec_key_value(
+    node: Node<'_, '_>,
+    bytes: &mut KeyValueBytes,
+) -> Result<KeyValueInfo, ParseError> {
     verify_dsig11_element(node, "ECKeyValue")?;
     ensure_no_non_whitespace_text(node, "ECKeyValue")?;
 
@@ -2495,10 +2548,14 @@ fn parse_ec_key_value(node: Node<'_, '_>) -> Result<KeyValueInfo, ParseError> {
         return Ok(KeyValueInfo::InvalidEcKeyValue);
     }
 
-    let Ok(public_key) = decode_crypto_binary(public_key_node, "PublicKey", MAX_EC_PUBLIC_KEY_LEN)
-    else {
-        return Ok(KeyValueInfo::InvalidEcKeyValue);
-    };
+    // A malformed point is an invalid key value; the policy's refusal stays
+    // a refusal.
+    let public_key =
+        match decode_crypto_binary(public_key_node, "PublicKey", MAX_EC_PUBLIC_KEY_LEN, bytes) {
+            Ok(public_key) => public_key,
+            Err(refused @ ParseError::Policy(_)) => return Err(refused),
+            Err(_) => return Ok(KeyValueInfo::InvalidEcKeyValue),
+        };
     if validate_ec_public_key_point(&public_key, expected_public_key_len).is_err() {
         return Ok(KeyValueInfo::InvalidEcKeyValue);
     }
@@ -2548,7 +2605,10 @@ fn validate_ec_public_key_point(public_key: &[u8], expected_len: usize) -> Resul
     Ok(())
 }
 
-fn parse_rsa_key_value(node: Node<'_, '_>) -> Result<KeyValueInfo, ParseError> {
+fn parse_rsa_key_value(
+    node: Node<'_, '_>,
+    bytes: &mut KeyValueBytes,
+) -> Result<KeyValueInfo, ParseError> {
     verify_ds_element(node, "RSAKeyValue")?;
     ensure_no_non_whitespace_text(node, "RSAKeyValue")?;
 
@@ -2571,15 +2631,18 @@ fn parse_rsa_key_value(node: Node<'_, '_>) -> Result<KeyValueInfo, ParseError> {
     }
 
     Ok(KeyValueInfo::Rsa {
-        modulus: decode_crypto_binary(modulus_node, "Modulus", MAX_RSA_MODULUS_LEN)?,
-        exponent: decode_crypto_binary(exponent_node, "Exponent", MAX_RSA_EXPONENT_LEN)?,
+        modulus: decode_crypto_binary(modulus_node, "Modulus", MAX_RSA_MODULUS_LEN, bytes)?,
+        exponent: decode_crypto_binary(exponent_node, "Exponent", MAX_RSA_EXPONENT_LEN, bytes)?,
     })
 }
 
+/// The `CryptoBinary` content of `node`, at most `max_decoded_len` octets
+/// and admitted against the key value's `bytes` before it is decoded.
 fn decode_crypto_binary(
     node: Node<'_, '_>,
     element_name: &'static str,
     max_decoded_len: usize,
+    bytes: &mut KeyValueBytes,
 ) -> Result<Vec<u8>, ParseError> {
     let max_base64_len = max_decoded_len.div_ceil(3) * 4;
     let payload = super::whitespace::XmlBase64Payload::bounded(node, usize::MAX, max_base64_len)
@@ -2599,6 +2662,7 @@ fn decode_crypto_binary(
             "{element_name} exceeds maximum allowed binary length"
         )));
     }
+    bytes.admit(payload.decoded_len)?;
     payload
         .decode()
         .map_err(|reason| ParseError::Base64(format!("{element_name}: {reason}")))
