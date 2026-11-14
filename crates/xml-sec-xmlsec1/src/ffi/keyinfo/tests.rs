@@ -138,6 +138,51 @@ fn key_info_reference_depth_is_bounded_by_policy_whatever_the_context_says() {
 }
 
 #[test]
+fn retrieval_method_depth_is_bounded_by_policy_whatever_the_context_says() {
+    // A RetrievalMethod nested in a retrieved document is a key reference as
+    // a KeyInfoReference is: the policy's depth bounds it, not the far higher
+    // level the caller set, and the refusal comes before any dereference.
+    own_process();
+    policy::republish(
+        |verification| verification.resources.max_key_info_reference_depth = 1,
+        |_| {},
+    )
+    .expect("the library policy compiles");
+    let doc = parse(
+        "<RetrievalMethod xmlns=\"http://www.w3.org/2000/09/xmldsig#\" URI=\"#absent\" \
+         Type=\"http://www.w3.org/2000/09/xmldsig#RSAKeyValue\"/>",
+    );
+    // SAFETY: objects created and destroyed here.
+    unsafe {
+        assert_eq!(xmlSecKeyDataIdsInit(), 0);
+        let ctx = xmlSecKeyInfoCtxCreate(std::ptr::null_mut());
+        (*ctx).max_retrieval_method_level = 1000;
+        // One level is already taken, as inside a retrieved document.
+        (*ctx).cur_retrieval_method_level = 1;
+        REASONS.lock().expect("reasons").clear();
+        errors::xmlSecErrorsSetCallback(Some(record as errors::ErrorsCallback));
+        let key = xmlSecKeyCreate();
+        let read = xmlSecKeyDataXmlRead(
+            crate::ffi::keysdata::xmlSecKeyDataRetrievalMethodGetKlass(),
+            key.cast(),
+            xsDocGetRootElement(doc).cast(),
+            ctx.cast(),
+        );
+        let reasons = REASONS.lock().expect("reasons").clone();
+        assert_eq!(read, -1);
+        assert_eq!(
+            reasons.first(),
+            Some(&errors::R_INVALID_SIZE),
+            "{reasons:?}"
+        );
+        (*ctx).cur_retrieval_method_level = 0;
+        xmlSecKeyDestroy(key);
+        xmlSecKeyInfoCtxDestroy(ctx);
+        xsFreeDoc(doc);
+    }
+}
+
+#[test]
 fn an_unknown_key_name_stops_the_read_when_the_flag_asks() {
     // keyinfo.h: XMLSEC_KEYINFO_FLAGS_KEYNAME_STOP_ON_UNKNOWN aborts on a
     // name the keys manager does not know, rather than reading on.

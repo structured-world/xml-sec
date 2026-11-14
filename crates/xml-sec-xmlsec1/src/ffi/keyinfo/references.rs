@@ -309,6 +309,23 @@ pub(crate) unsafe extern "C" fn retrieval_xml_read(
                 );
                 return -1;
             }
+            // A retrieved document may hold another RetrievalMethod: the
+            // library policy bounds that nesting as it bounds key references,
+            // whatever level the caller set on the context.
+            let Some(pinned) = read_policy(ctx, here) else {
+                return -1;
+            };
+            let resources = &pinned.verification.resources;
+            let depth = usize::try_from(current).map_or(usize::MAX, |depth| depth + 1);
+            if resources.validate_key_info_reference_depth(depth).is_err() {
+                errors::limit_exceeded(
+                    here,
+                    object,
+                    "RetrievalMethod depth",
+                    resources.max_key_info_reference_depth,
+                );
+                return -1;
+            }
             (*ctx).cur_retrieval_method_level += 1;
             let result = retrieve(here, object, key, node, ctx);
             (*ctx).cur_retrieval_method_level -= 1;

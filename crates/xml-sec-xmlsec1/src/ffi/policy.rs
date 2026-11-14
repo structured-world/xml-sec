@@ -118,6 +118,8 @@ pub(crate) struct Spent {
     pub(crate) external_resources: usize,
     /// Octets handed to the XML parser, of `max_xml_parse_work_bytes`.
     pub(crate) xml_parse: usize,
+    /// `XPath` expressions evaluated, of `max_xpath_expressions`.
+    pub(crate) xpath_expressions: usize,
 }
 
 /// The key candidates one `KeyInfo` read has inspected of the policy's

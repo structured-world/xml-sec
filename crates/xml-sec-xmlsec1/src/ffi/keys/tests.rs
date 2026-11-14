@@ -76,6 +76,31 @@ fn key_bytes_over_the_resource_limit_are_refused_before_any_copy() {
 }
 
 #[test]
+fn data_adopted_into_the_list_and_then_set_as_value_has_one_owner() {
+    // Data the key holds in its list moves to its value: the list gives it
+    // up, so destroying the key releases the allocation once, not twice.
+    // SAFETY: objects created here; the key owns the data.
+    unsafe {
+        let key = xmlSecKeyCreate();
+        let data = xmlSecKeyDataCreate(symkeys::hmac());
+        assert_eq!(
+            xmlSecKeyDataBinaryValueSetBuffer(data, b"secret".as_ptr(), 6),
+            0
+        );
+        assert_eq!(xmlSecKeyAdoptData(key, data), 0);
+        assert_eq!(xmlSecPtrListGetSize((*key).data_list), 1);
+        assert_eq!(xmlSecKeySetValue(key, data), 0);
+        assert!(std::ptr::eq(xmlSecKeyGetValue(key), data));
+        assert_eq!(
+            xmlSecPtrListGetSize((*key).data_list),
+            0,
+            "the list no longer owns the value"
+        );
+        xmlSecKeyDestroy(key);
+    }
+}
+
+#[test]
 fn a_use_with_record_copied_onto_itself_keeps_its_strings() {
     // The setter frees the strings it is given before reading them.
     // SAFETY: a record created and destroyed here.

@@ -79,6 +79,8 @@ pub(crate) struct RunBudget {
     pub(crate) external_resources: usize,
     /// Octets handed to the XML parser, of `max_xml_parse_work_bytes`.
     pub(crate) xml_parse: usize,
+    /// `XPath` expressions evaluated, of `max_xpath_expressions`.
+    pub(crate) xpath_expressions: usize,
     /// The policy revision of the run, pinned at its first read or handed
     /// down by the `KeyInfo` read that runs the chain.
     policy: Option<policy::Pinned>,
@@ -174,6 +176,7 @@ pub(crate) unsafe fn seed_run(
     run.base64_output = spent.base64_output;
     run.external_resources = spent.external_resources;
     run.xml_parse = spent.xml_parse;
+    run.xpath_expressions = spent.xpath_expressions;
 }
 
 /// What the run of `ctx` has spent; nothing when no run has started.
@@ -188,6 +191,7 @@ pub(crate) unsafe fn run_spent(ctx: *mut XmlSecTransformCtx) -> policy::Spent {
             base64_output: run.base64_output,
             external_resources: run.external_resources,
             xml_parse: run.xml_parse,
+            xpath_expressions: run.xpath_expressions,
         },
         None => policy::Spent::default(),
     }

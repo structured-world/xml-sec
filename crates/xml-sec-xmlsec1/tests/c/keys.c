@@ -26,6 +26,12 @@ static void record(const char *file, int line, const char *func, const char *obj
            msg != NULL ? msg : "(null)");
 }
 
+/* A name to print with %s, which a null pointer must not reach (C11
+ * 7.21.6.1p8: the argument is a pointer to a string). */
+static const char *shown(const xmlChar *name) {
+    return name != NULL ? (const char *)name : "(null)";
+}
+
 typedef struct { xmlSecKeyData base; xmlSecBuffer value; } BinaryData;
 
 static int binary_initialize(xmlSecKeyDataPtr data) {
@@ -142,12 +148,12 @@ static void use_with(void) {
     xmlSecKeyUseWithDebugDump(a, stdout);
     xmlSecKeyUseWithDebugXmlDump(a, stdout);
     b = xmlSecKeyUseWithDuplicate(a);
-    printf("  duplicate: %s %s\n", (const char *)b->application, (const char *)b->identifier);
+    printf("  duplicate: %s %s\n", shown(b->application), shown(b->identifier));
     printf("  set: %d\n", xmlSecKeyUseWithSet(b, NULL, BAD_CAST "only"));
     xmlSecKeyUseWithDebugDump(b, stdout);
     xmlSecKeyUseWithInitialize(&c);
     ret = xmlSecKeyUseWithCopy(&c, a);
-    printf("  copy: %d %s\n", ret, (const char *)c.application);
+    printf("  copy: %d %s\n", ret, shown(c.application));
     xmlSecKeyUseWithReset(&c);
     printf("  reset: %p %p\n", (void *)c.application, (void *)c.identifier);
     xmlSecKeyUseWithFinalize(&c);
@@ -156,7 +162,7 @@ static void use_with(void) {
     xmlSecPtrListAdd(&list, b);
     xmlSecPtrListDebugDump(&list, stdout);
     xmlSecPtrListDebugXmlDump(&list, stdout);
-    printf("  list name: %s\n", (const char *)xmlSecPtrListGetName(&list));
+    printf("  list name: %s\n", shown(xmlSecPtrListGetName(&list)));
     xmlSecPtrListFinalize(&list);
     printf("  null: %d\n", xmlSecKeyUseWithSet(NULL, NULL, NULL));
 }
@@ -215,9 +221,9 @@ static void keys(void) {
     printf("  created: usage=0x%08x type=%u size=%d value=%p\n", key->usage, xmlSecKeyGetType(key),
            (int)xmlSecKeyGetSize(key), (void *)xmlSecKeyGetValue(key));
     ret = xmlSecKeySetName(key, BAD_CAST "first");
-    printf("  set name: %d %s\n", ret, (const char *)xmlSecKeyGetName(key));
+    printf("  set name: %d %s\n", ret, shown(xmlSecKeyGetName(key)));
     ret = xmlSecKeySetNameEx(key, BAD_CAST "second-and-more", 6);
-    printf("  set name ex: %d %s\n", ret, (const char *)xmlSecKeyGetName(key));
+    printf("  set name ex: %d %s\n", ret, shown(xmlSecKeyGetName(key)));
     ret = xmlSecKeySetNameEx(key, BAD_CAST "x", 0);
     printf("  set name ex empty: %d %p\n", ret, (void *)xmlSecKeyGetName(key));
     xmlSecKeySetName(key, BAD_CAST "named");
@@ -246,16 +252,16 @@ static void keys(void) {
     xmlSecKeyDebugXmlDump(key, stdout);
 
     copy = xmlSecKeyDuplicate(key);
-    printf("  duplicate: %s usage=%u valid=%ld..%ld data=%d value=%d\n", (const char *)copy->name, copy->usage,
+    printf("  duplicate: %s usage=%u valid=%ld..%ld data=%d value=%d\n", shown(copy->name), copy->usage,
            (long)copy->notValidBefore, (long)copy->notValidAfter, (int)xmlSecPtrListGetSize(copy->dataList),
            copy->value != key->value && xmlSecKeyGetSize(copy) == 192);
     ret = xmlSecKeySwap(copy, other);
-    printf("  swap: %d %s/%s\n", ret, (const char *)xmlSecKeyGetName(copy), (const char *)xmlSecKeyGetName(other));
+    printf("  swap: %d %s/%s\n", ret, shown(xmlSecKeyGetName(copy)), shown(xmlSecKeyGetName(other)));
     xmlSecKeyReqInitialize(&req);
     printf("  match name: %d other name: %d any: %d\n", xmlSecKeyMatch(key, BAD_CAST "named", &req),
            xmlSecKeyMatch(key, BAD_CAST "nope", &req), xmlSecKeyMatch(key, NULL, &req));
     ret = xmlSecKeyCopy(copy, key);
-    printf("  copy into: %d %s\n", ret, (const char *)copy->name);
+    printf("  copy into: %d %s\n", ret, shown(copy->name));
     xmlSecKeyEmpty(copy);
     printf("  emptied: usage=%u name=%p value=%p list=%p\n", copy->usage, (void *)copy->name, (void *)copy->value,
            (void *)copy->dataList);
@@ -263,7 +269,7 @@ static void keys(void) {
 
     xmlSecPtrListInitialize(&list, xmlSecKeyPtrListId);
     xmlSecPtrListAdd(&list, xmlSecKeyDuplicate(key));
-    printf("  list: %s %d\n", (const char *)xmlSecPtrListGetName(&list), (int)xmlSecPtrListGetSize(&list));
+    printf("  list: %s %d\n", shown(xmlSecPtrListGetName(&list)), (int)xmlSecPtrListGetSize(&list));
     xmlSecPtrListDebugDump(&list, stdout);
     xmlSecPtrListFinalize(&list);
 

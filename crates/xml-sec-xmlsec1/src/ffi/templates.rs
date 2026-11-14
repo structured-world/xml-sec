@@ -2179,7 +2179,10 @@ pub(crate) unsafe extern "C" fn xmlSecTmplTransformAddC14NInclNamespaces(
                 );
                 return -1;
             }
-            xsSetProp(cur, name(&xmlSecAttrPrefixList), prefix_list);
+            if !optional(cur, &xmlSecAttrPrefixList, prefix_list, here) {
+                discard(cur);
+                return -1;
+            }
         }
         0
     })
@@ -2344,7 +2347,10 @@ pub(crate) unsafe extern "C" fn xmlSecTmplTransformAddXPath2(
             if node.is_null() {
                 return -1;
             }
-            xsSetProp(node, name(&xmlSecAttrFilter), kind);
+            if !optional(node, &xmlSecAttrFilter, kind, here) {
+                discard(node);
+                return -1;
+            }
             fill_expression(node, expression, ns_list, here)
         }
     })

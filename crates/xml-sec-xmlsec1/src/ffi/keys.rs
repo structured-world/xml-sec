@@ -1113,6 +1113,15 @@ pub(crate) unsafe extern "C" fn xmlSecKeySetValue(
             if std::ptr::eq(owned.value, value) {
                 return 0;
             }
+            // Data the key already holds in its list moves to the value: the
+            // list gives it up, so the allocation keeps one owner.
+            if !value.is_null()
+                && let Some(pos) = find_data(key, (*value).id).filter(|&pos| {
+                    std::ptr::eq(xmlSecPtrListGetItem(owned.data_list, pos), value.cast())
+                })
+            {
+                super::list::xmlSecPtrListRemoveAndReturn(owned.data_list, pos);
+            }
             if !owned.value.is_null() {
                 xmlSecKeyDataDestroy(owned.value);
             }

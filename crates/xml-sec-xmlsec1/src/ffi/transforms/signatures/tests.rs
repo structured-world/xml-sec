@@ -259,6 +259,78 @@ fn a_verification_key_drops_the_private_key_set_before() {
 }
 
 #[test]
+fn a_signing_key_the_policy_refuses_takes_no_input() {
+    // The key is admitted under the run's policy before the first chunk: an
+    // RSA-2048 key under a 4096-bit minimum is refused there, not after the
+    // input was collected.
+    own_process();
+    policy::republish(
+        |_| {},
+        |signing| signing.rsa_keys.minimum_modulus_bits = 4096,
+    )
+    .expect("the library policy compiles");
+    let key = private_key();
+    // SAFETY: every object is created and released here.
+    unsafe {
+        let ctx = xmlSecTransformCtxCreate();
+        let transform = xmlSecTransformCtxCreateAndAppend(ctx, rsa_sha256());
+        (*transform).operation = OPERATION_SIGN;
+        assert_eq!(xmlSecTransformSetKey(transform, key.cast()), 0);
+        let chunk = [0x41_u8; 8];
+        assert_eq!(
+            xmlSecTransformPushBin(transform, chunk.as_ptr(), chunk.len(), 0, ctx),
+            -1
+        );
+        xmlSecTransformCtxDestroy(ctx);
+        xmlSecKeyDestroy(key);
+    }
+}
+
+#[test]
+fn an_ecdsa_value_follows_the_signing_policy_encoding() {
+    // The transform writes the representation the signing policy selects, as
+    // document signing does: fixed-width r || s by default, an ASN.1 DER
+    // SEQUENCE when the policy asks for it.
+    own_process();
+    let sign = || {
+        let key = key(include_bytes!(
+            "../../../../../../tests/fixtures/keys/ec/ec-prime256v1-key.pem"
+        ));
+        // SAFETY: every object is created and released here.
+        unsafe {
+            let ctx = xmlSecTransformCtxCreate();
+            let transform = xmlSecTransformCtxCreateAndAppend(ctx, super::ecdsa_sha256());
+            (*transform).operation = OPERATION_SIGN;
+            assert_eq!(xmlSecTransformSetKey(transform, key.cast()), 0);
+            let input = [0x41_u8; 16];
+            assert_eq!(
+                xmlSecTransformCtxBinaryExecute(ctx, input.as_ptr(), input.len()),
+                0
+            );
+            let output = (*ctx).result;
+            let value = std::slice::from_raw_parts(
+                xmlSecBufferGetData(output),
+                xmlSecBufferGetSize(output),
+            )
+            .to_vec();
+            xmlSecTransformCtxDestroy(ctx);
+            xmlSecKeyDestroy(key);
+            value
+        }
+    };
+    assert_eq!(sign().len(), 64, "r || s of P-256");
+    policy::republish(
+        |_| {},
+        |signing| {
+            signing.ecdsa_signature_value_encoding =
+                xml_sec::policy::EcdsaSignatureValueEncoding::XmlSecAsn1Der;
+        },
+    )
+    .expect("the library policy compiles");
+    assert_eq!(sign().first(), Some(&0x30), "a DER SEQUENCE");
+}
+
+#[test]
 fn a_signature_over_the_empty_message_verifies() {
     // The empty message is signed and its signature verifies, as libxmlsec1
     // accepts it.

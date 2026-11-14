@@ -13,8 +13,9 @@ use std::sync::Arc;
 
 use xml_sec::key_manager::{KeyInventory, KeyUsages};
 use xml_sec::policy::{PolicyViolation, SigningPolicy, VerificationPolicy};
+use xml_sec::xmldsig::sign::sign_signature_value;
 use xml_sec::xmldsig::verify::verify_signature_value;
-use xml_sec::xmldsig::{SignatureAlgorithm, VerificationKey};
+use xml_sec::xmldsig::{SignatureAlgorithm, SignatureContext, SigningKey, VerificationKey};
 use zeroize::Zeroizing;
 
 use super::super::asymkeys::{self, material_of};
@@ -66,6 +67,9 @@ struct Signature {
     key: Option<VerificationKey>,
     /// The PKCS#8 DER of the signing key, from `setKey` when signing.
     private: Option<Zeroizing<Vec<u8>>>,
+    /// The signing key admitted under the run's policy before its first
+    /// chunk, which signs the collected bytes.
+    signer: Option<Box<dyn SigningKey + Send + Sync>>,
     /// The signed bytes collected so far.
     data: Vec<u8>,
     /// The library policy the run started under: taken at the first
@@ -255,6 +259,7 @@ unsafe extern "C" fn initialize(transform: *mut XmlSecTransform) -> c_int {
             (&raw mut (*transform.cast::<WithContext<Signature>>()).context).write(Signature {
                 key: None,
                 private: None,
+                signer: None,
                 data: Vec::new(),
                 policy: None,
             });
@@ -325,6 +330,8 @@ unsafe extern "C" fn set_key(transform: *mut XmlSecTransform, key: *mut c_void) 
             return -1;
         }
         let name = name_of(object);
+        // The next run admits the key set now.
+        signature.signer = None;
         // SAFETY: a key whose value is null or key data.
         unsafe {
             let value = xmlSecKeyGetValue(key);
@@ -499,7 +506,7 @@ fn collect(
     }
     if object.operation == OPERATION_SIGN {
         let algorithm = method(object.id).map(|(algorithm, _)| algorithm);
-        let (Some(algorithm), Some(private)) = (algorithm, signature.private.as_ref()) else {
+        let (Some(algorithm), Some(signer)) = (algorithm, signature.signer.as_deref()) else {
             errors::assertion(here, c"ctx->pKey != NULL");
             return -1;
         };
@@ -507,10 +514,19 @@ fn collect(
             errors::assertion(here, c"ctx->policy != NULL");
             return -1;
         };
-        let value = match sign(policy, algorithm, private, &signature.data) {
+        // The value document signing writes, ECDSA in the policy's encoding;
+        // libxmlsec1's signature klasses carry no context string.
+        let value = match sign_signature_value(
+            policy,
+            xml_sec::provider::default_provider(),
+            signer,
+            algorithm,
+            &SignatureContext::default(),
+            &signature.data,
+        ) {
             Ok(value) => value,
             Err(error) => {
-                errors::internal_with(here, name, c"SigningKey::sign", &error);
+                errors::internal_with(here, name, c"SigningKey::sign", &error.to_string());
                 return -1;
             }
         };
@@ -531,14 +547,13 @@ fn collect(
     0
 }
 
-/// The signature value of `data` by the PKCS#8 key `private` under the
-/// run's signing `policy`, which admits the method and the key.
-fn sign(
+/// The signing key of the PKCS#8 key `private` for `algorithm`, admitted
+/// under the run's signing `policy`: its family, strength and usage.
+fn signing_key(
     policy: &SigningPolicy,
     algorithm: SignatureAlgorithm,
     private: &[u8],
-    data: &[u8],
-) -> Result<Vec<u8>, String> {
+) -> Result<Box<dyn SigningKey + Send + Sync>, String> {
     let mut inventory = KeyInventory::default();
     inventory
         .add_private_der(
@@ -549,10 +564,8 @@ fn sign(
             &policy.resources,
         )
         .map_err(|error| error.to_string())?;
-    let key = inventory
+    inventory
         .signing_key("key", algorithm, policy)
-        .map_err(|error| error.to_string())?;
-    key.sign_with_provider(xml_sec::provider::default_provider(), algorithm, data)
         .map_err(|error| error.to_string())
 }
 
@@ -598,6 +611,21 @@ unsafe extern "C" fn execute(
                         &violation.to_string(),
                     );
                     return -1;
+                }
+            }
+            // A signing key the run's policy refuses (family, strength,
+            // usage) ends the run before it takes any input. A key admitted
+            // for an earlier run never signs this one.
+            signature.signer = None;
+            if let (Some(RunPolicy::Signing(policy)), Some(private)) =
+                (signature.policy.as_ref(), signature.private.as_ref())
+            {
+                match signing_key(policy, algorithm, private) {
+                    Ok(signer) => signature.signer = Some(signer),
+                    Err(error) => {
+                        errors::internal_with(here, name_of(object), c"signing_key", &error);
+                        return -1;
+                    }
                 }
             }
             object.status = STATUS_WORKING;

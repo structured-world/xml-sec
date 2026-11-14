@@ -714,8 +714,27 @@ unsafe extern "C" fn execute(
     let Some((pinned, side)) = (unsafe { run_scope(ctx, here) }) else {
         return -1;
     };
+    // Every expression the operation evaluates counts against the policy of
+    // the side it serves, before any is evaluated.
+    let operation = pinned.of(side);
+    let limit = super::ctx::Limit {
+        name: "max_xpath_expressions",
+        max: operation.resources().max_xpath_expressions,
+    };
+    // SAFETY: an initialized context, the transform's expression list and a
+    // valid transform.
+    let (spent, count, name) = unsafe {
+        (
+            &mut super::ctx::run_budget(ctx).xpath_expressions,
+            xmlSecPtrListGetSize(expressions),
+            name_of(transform),
+        )
+    };
+    if super::ctx::charge(spent, count, limit, here, name).is_none() {
+        return -1;
+    }
     // SAFETY: an expression transform read from a live element.
-    let Some(output) = policy::with_document_policy!(pinned.of(side), |policy| unsafe {
+    let Some(output) = policy::with_document_policy!(operation, |policy| unsafe {
         evaluate_list(expressions, object.in_nodes, doc, policy)
     }) else {
         // SAFETY: a valid transform.

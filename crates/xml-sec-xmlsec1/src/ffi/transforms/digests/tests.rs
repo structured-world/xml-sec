@@ -52,6 +52,26 @@ fn a_digest_the_policy_excludes_is_refused() {
 }
 
 #[test]
+fn each_operation_admits_its_digest_under_its_own_policy() {
+    // Signing reads the signing policy and verifying the verification one:
+    // a method only one side admits runs on that side and is refused on the
+    // other, whichever side it is.
+    own_process();
+    let only_sha512 = || Some(BTreeSet::from([DigestAlgorithm::Sha512]));
+    policy::republish(|_| {}, |signing| signing.digest_algorithms = only_sha512())
+        .expect("the library policy compiles");
+    assert_eq!(run(OPERATION_SIGN), -1, "signing excludes SHA-256");
+    assert_eq!(run(OPERATION_VERIFY), 0, "verification admits it");
+    policy::republish(
+        |verification| verification.digest_algorithms = only_sha512(),
+        |signing| signing.digest_algorithms = None,
+    )
+    .expect("the library policy compiles");
+    assert_eq!(run(OPERATION_SIGN), 0, "signing admits SHA-256");
+    assert_eq!(run(OPERATION_VERIFY), -1, "verification excludes it");
+}
+
+#[test]
 fn a_digest_under_an_expired_policy_is_refused() {
     // A snapshot whose authorized lifetime has ended admits nothing, as a
     // core operation checks the lifetime at entry.
