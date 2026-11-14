@@ -896,6 +896,24 @@ fn a_replaced_node_linked_again_makes_its_id_ambiguous() {
 }
 
 #[test]
+fn a_replacement_owns_the_id_of_the_node_it_replaced() {
+    // The replaced node is kept, unlinked, but releases its ID to the
+    // replacement: setting the replacement's `xml:id` to the value it
+    // already carries is no duplicate.
+    let mut tree = parsed(r#"<r><old xml:id="x"/></r>"#);
+    let root = tree.root_element().expect("a root");
+    let old = children(&tree, root)[0];
+    let first = tree
+        .parse_in_context(root, r#"<new xml:id="x"/>"#, &VerificationPolicy::default())
+        .expect("the fragment parses")
+        .expect("the fragment has nodes");
+    tree.replace_with_run(old, first).expect("the run links");
+    tree.set_attribute(first, "id", Some("xml"), Some(XML_NAMESPACE), "x")
+        .expect("the replacement owns its ID");
+    assert_eq!(tree.element_by_id("x"), Some(first));
+}
+
+#[test]
 fn a_copy_keeps_the_ids_a_caller_registered() {
     // An ID registered on an attribute of the copied subtree carries over
     // with the attribute, as libxml2's copy re-adds a copied ID attribute.
