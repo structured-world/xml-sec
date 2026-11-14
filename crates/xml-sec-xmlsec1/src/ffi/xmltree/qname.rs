@@ -831,6 +831,10 @@ pub(crate) unsafe extern "C" fn xmlSecQName2BitMaskGetInfo(
 /// `xmlSecQName2BitMaskGetBitMask`: the mask of the name `qname_local_part`
 /// in namespace `qname_href`; -1 when the table has none.
 ///
+/// The href comes first, as in the libxmlsec1 snapshot the differential
+/// oracle is built from, though the header declares the local part first;
+/// the order moves to the header's together with the oracle (#457).
+///
 /// # Safety
 /// `info` is null or a table; the names null or NUL-terminated; `mask` null
 /// or writable.
