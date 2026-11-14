@@ -2072,6 +2072,8 @@ impl KeyInventory {
         Ok(())
     }
 
+    /// `live_outside` bytes the caller holds (encoded PEM text, a password
+    /// buffer's spare capacity) stay live for the whole import.
     fn add_private_der_inner(
         &mut self,
         name: String,
@@ -2079,7 +2081,7 @@ impl KeyInventory {
         password: Option<&[u8]>,
         usages: KeyUsages,
         resources: &ResourcePolicy,
-        live_encoded_bytes: usize,
+        live_outside: usize,
     ) -> Result<(), KeyStoreError> {
         self.check_new_name(&name, resources)?;
         if bytes.len() > resources.max_external_resource_bytes {
@@ -2102,7 +2104,7 @@ impl KeyInventory {
             }
             let live = bytes
                 .len()
-                .checked_add(live_encoded_bytes)
+                .checked_add(live_outside)
                 .and_then(|live| live.checked_add(output))
                 .ok_or_else(|| {
                     import_resource_limit(
@@ -2116,16 +2118,17 @@ impl KeyInventory {
             check_plain_output(bytes.len())?;
             Zeroizing::new(bytes.to_vec())
         } else if pkcs8_import::is_encrypted(bytes) {
-            // PEM decoding does not end the caller's encoded buffer lifetime.
-            // Its bytes coexist with DER and the KDF workspace, not replace DER.
-            let kdf_live_bytes = retained_with_input
-                .checked_add(live_encoded_bytes)
-                .ok_or_else(|| {
-                    import_resource_limit(
-                        crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
-                        resources.max_external_resource_total_bytes,
-                    )
-                })?;
+            // The caller's encoded PEM text or password buffer coexists with
+            // DER and the KDF workspace, not replaces DER.
+            let kdf_live_bytes =
+                retained_with_input
+                    .checked_add(live_outside)
+                    .ok_or_else(|| {
+                        import_resource_limit(
+                            crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                            resources.max_external_resource_total_bytes,
+                        )
+                    })?;
             let remaining = self.remaining_kdf_resources(resources)?;
             let shape = pkcs8_import::shape(bytes, &remaining)?;
             enforce_pkcs8_kdf_policy(&shape, &remaining, kdf_live_bytes)?;
@@ -2247,12 +2250,18 @@ impl KeyInventory {
                 retained_with_input + secret.capacity() - secret.len(),
             )?;
         }
-        self.add_private_der(
+        // The callback's buffer stays live at its whole capacity until the
+        // import returns, beside the decryption's form, scratch and output.
+        let spare = secret
+            .as_ref()
+            .map_or(0, |secret| secret.capacity() - secret.len());
+        self.add_private_der_inner(
             name,
             bytes,
             secret.as_deref().map(Vec::as_slice),
             usages,
             resources,
+            spare,
         )
     }
 

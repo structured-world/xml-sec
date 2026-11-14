@@ -2029,6 +2029,42 @@ fn pkcs8_legacy_password_form_counts_against_the_aggregate_budget() {
         import(without_form + form),
         Err(KeyStoreError::ProtectedContainer)
     ));
+    // A callback's password buffer stays live at its whole capacity while the
+    // key is decrypted, so its spare capacity counts beside the form and the
+    // scratch as well.
+    let spare = 128;
+    let with_callback = |total| {
+        let mut secret = Vec::with_capacity(password.len() + spare);
+        secret.extend_from_slice(&password);
+        assert_eq!(secret.capacity() - secret.len(), spare);
+        KeyInventory::default().add_private_der_with_password_callback(
+            "key".into(),
+            &bytes,
+            || Some(Zeroizing::new(secret)),
+            KeyUsages::SIGN,
+            &ResourcePolicy {
+                max_external_resource_total_bytes: total,
+                ..ResourcePolicy::default()
+            },
+        )
+    };
+    let short = with_callback(without_form + form + spare - 1);
+    assert!(
+        matches!(
+            short,
+            Err(KeyStoreError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                    ..
+                }
+            ))
+        ),
+        "{short:?}"
+    );
+    assert!(matches!(
+        with_callback(without_form + form + spare),
+        Err(KeyStoreError::ProtectedContainer)
+    ));
 }
 
 #[test]
