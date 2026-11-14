@@ -1,5 +1,7 @@
 use crate::rsa_encoding::RsaPublicKeyEncoding as _;
 use pkcs8::EncodePublicKey as _;
+#[cfg(feature = "xmldsig-sign")]
+use pkcs8::EncryptedPrivateKeyInfoRef;
 use rand_chacha::{ChaCha8Rng, rand_core::SeedableRng as _};
 use rsa::RsaPublicKey;
 
@@ -1971,6 +1973,131 @@ fn pkcs8_decryption_admits_its_full_scratch_before_allocating_it() {
 }
 
 #[test]
+fn pkcs8_legacy_password_form_counts_against_the_aggregate_budget() {
+    // RFC 7292 B.1: a PKCS#12 PBE scheme hashes the password's BMPString
+    // form, a second buffer of two bytes per character plus a terminator that
+    // is live beside the caller's password during decryption. The aggregate
+    // budget refuses the import when only that form exceeds it.
+    let salt = [0x5a_u8; 8];
+    let mut bytes = vec![0x30, 0x2f, 0x30, 0x1b];
+    // pbeWithSHAAnd3-KeyTripleDES-CBC (RFC 7292 C), PBEParameter { salt, 2 }.
+    bytes.extend_from_slice(&[
+        0x06, 0x0a, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x0c, 0x01, 0x03, 0x30, 0x0d, 0x04,
+        0x08,
+    ]);
+    bytes.extend_from_slice(&salt);
+    bytes.extend_from_slice(&[0x02, 0x01, 0x02, 0x04, 0x10]);
+    bytes.extend_from_slice(&[0; 16]);
+    let shape = super::pkcs8_import::shape(&bytes, &ResourcePolicy::default())
+        .expect("a supported legacy scheme");
+    let password = [b'p'; 40];
+    let scratch = std::cell::Cell::new(0);
+    let _ = super::pkcs8_import::decrypt(&bytes, &password, &ResourcePolicy::default(), |all| {
+        scratch.set(all);
+        Err(KeyStoreError::Selection("measured"))
+    });
+    let form = 2 * (password.len() + 1);
+    let without_form = "key".len() + bytes.len() + password.len() + shape.output + scratch.get();
+    let import = |total| {
+        KeyInventory::default().add_private_der(
+            "key".into(),
+            &bytes,
+            Some(&password),
+            KeyUsages::SIGN,
+            &ResourcePolicy {
+                max_external_resource_total_bytes: total,
+                ..ResourcePolicy::default()
+            },
+        )
+    };
+    let short = import(without_form + form - 1);
+    assert!(
+        matches!(
+            short,
+            Err(KeyStoreError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                    ..
+                }
+            ))
+        ),
+        "{short:?}"
+    );
+    // With the form admitted the import reaches decryption, which the zero
+    // ciphertext fails.
+    assert!(matches!(
+        import(without_form + form),
+        Err(KeyStoreError::ProtectedContainer)
+    ));
+}
+
+#[test]
+fn pkcs8_under_a_pkcs12_pbe_scheme_imports() {
+    // `openssl pkcs8 -topk8 -v1 PBE-SHA1-3DES` (RFC 7292 appendix C): the
+    // import recognizes the RFC 5958 structure, not one decoder's scheme
+    // list, so the key reaches the password engine instead of being read as
+    // PKCS#1.
+    use cbc::cipher::{BlockModeEncrypt as _, KeyIvInit as _, block_padding::Pkcs7};
+    use pkcs8::EncodePrivateKey as _;
+    use pkcs12::kdf::{Pkcs12KeyType, derive_key_utf8};
+    let tlv = |tag: u8, content: &[u8]| {
+        let length = u8::try_from(content.len()).expect("short-form length");
+        assert!(length < 0x80);
+        let mut out = vec![tag, length];
+        out.extend_from_slice(content);
+        out
+    };
+    let plain = ed25519_dalek::SigningKey::from_bytes(&[7; 32])
+        .to_pkcs8_der()
+        .expect("PKCS#8");
+    let salt = b"12345678";
+    let derive = |kind, length| {
+        derive_key_utf8::<sha1::Sha1>("secret", salt, kind, 2, length).expect("two KDF rounds")
+    };
+    let (key, iv) = (
+        derive(Pkcs12KeyType::EncryptionKey, 24),
+        derive(Pkcs12KeyType::Iv, 8),
+    );
+    let mut ciphertext = vec![0; plain.as_bytes().len() + 8];
+    let ciphertext = cbc::Encryptor::<des::TdesEde3>::new_from_slices(&key, &iv)
+        .expect("cipher")
+        .encrypt_padded_b2b::<Pkcs7>(plain.as_bytes(), &mut ciphertext)
+        .expect("padding")
+        .to_vec();
+    let mut parameters = tlv(0x04, salt);
+    parameters.extend_from_slice(&tlv(0x02, &[2]));
+    let mut algorithm = tlv(
+        0x06,
+        &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x0c, 0x01, 0x03],
+    );
+    algorithm.extend_from_slice(&tlv(0x30, &parameters));
+    let mut info = tlv(0x30, &algorithm);
+    info.extend_from_slice(&tlv(0x04, &ciphertext));
+    let bytes = tlv(0x30, &info);
+    let mut inventory = KeyInventory::default();
+    assert!(matches!(
+        inventory.add_private_der(
+            "wrong".into(),
+            &bytes,
+            Some(b"other"),
+            KeyUsages::SIGN,
+            &ResourcePolicy::default(),
+        ),
+        Err(KeyStoreError::ProtectedContainer)
+    ));
+    inventory
+        .add_private_der(
+            "key".into(),
+            &bytes,
+            Some(b"secret"),
+            KeyUsages::SIGN,
+            &ResourcePolicy::default(),
+        )
+        .expect("PBE-SHA1-3DES import");
+    assert_eq!(inventory.private_keys().len(), 1);
+}
+
+#[test]
 fn protected_password_consumes_live_byte_and_work_budgets() {
     use der::Encode as _;
     use pkcs8::pkcs5::{EncryptionScheme, pbes2};
@@ -2006,16 +2133,17 @@ fn protected_password_consumes_live_byte_and_work_budgets() {
         },
     ] {
         let mut inventory = KeyInventory::default();
-        assert!(matches!(
-            inventory.add_private_der(
-                "new".into(),
-                &envelope,
-                Some(&[0; 256]),
-                KeyUsages::SIGN,
-                &resources
-            ),
-            Err(KeyStoreError::Policy(_))
-        ));
+        let result = inventory.add_private_der(
+            "new".into(),
+            &envelope,
+            Some(&[0; 256]),
+            KeyUsages::SIGN,
+            &resources,
+        );
+        assert!(
+            matches!(result, Err(KeyStoreError::Policy(_))),
+            "{resources:?}: {result:?}"
+        );
         assert!(inventory.private_keys().is_empty());
     }
     let resources = ResourcePolicy {

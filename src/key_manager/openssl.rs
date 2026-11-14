@@ -11,7 +11,7 @@
 
 use alloc::{string::String, sync::Arc, vec, vec::Vec};
 
-use pkcs8::{EncryptedPrivateKeyInfoRef, PrivateKeyInfoRef};
+use pkcs8::PrivateKeyInfoRef;
 use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
 use structured_cms::openssl::{Envelope, Error as OpenSslError, KdfCost, Key, KeyFamily};
 use zeroize::Zeroizing;
@@ -272,8 +272,7 @@ fn declares_envelope(bytes: &[u8]) -> bool {
 }
 
 fn is_pkcs8(bytes: &[u8]) -> bool {
-    PrivateKeyInfoRef::try_from(bytes).is_ok()
-        || EncryptedPrivateKeyInfoRef::try_from(bytes).is_ok()
+    PrivateKeyInfoRef::try_from(bytes).is_ok() || super::pkcs8_import::is_encrypted(bytes)
 }
 
 fn aggregate_limit(resources: &ResourcePolicy) -> KeyStoreError {

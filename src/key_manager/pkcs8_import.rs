@@ -26,6 +26,44 @@ pub(super) struct Shape {
     pub(super) kdf: KdfCost,
     pub(super) output: usize,
     pub(super) scratch: usize,
+    /// The scheme hashes the RFC 7292 B.1 form of the password.
+    pub(super) legacy_password: bool,
+}
+
+impl Shape {
+    /// The bytes of the RFC 7292 B.1 `BMPString` form the scheme hashes in
+    /// place of `password`, live beside it while the key is decrypted: two
+    /// per character and a two-byte terminator. Zero when the scheme hashes
+    /// the password octets themselves.
+    pub(super) fn password_form_len(&self, password: &[u8]) -> Result<usize> {
+        if !self.legacy_password {
+            return Ok(0);
+        }
+        core::str::from_utf8(password)
+            .map_err(|_| KeyStoreError::ProtectedContainer)?
+            .chars()
+            .count()
+            .checked_add(1)
+            .and_then(|characters| characters.checked_mul(2))
+            .ok_or(KeyStoreError::ProtectedContainer)
+    }
+}
+
+/// Whether `bytes` is one DER RFC 5958 section 3 `EncryptedPrivateKeyInfo`,
+/// whatever scheme its `AlgorithmIdentifier` names: the engine decrypts more
+/// schemes (PBES1, PBES2 and those of RFC 7292 appendix C) than one decoder's
+/// list holds, and reads the scheme under the import's budgets afterwards.
+pub(super) fn is_encrypted(bytes: &[u8]) -> bool {
+    use der::{Decode as _, Reader as _, asn1::OctetStringRef};
+    let Ok(mut reader) = der::SliceReader::new(bytes) else {
+        return false;
+    };
+    let whole = reader.sequence(|inner| {
+        pkcs8::spki::AlgorithmIdentifierRef::decode(inner)?;
+        <&OctetStringRef>::decode(inner)?;
+        Ok::<_, der::Error>(inner.is_finished())
+    });
+    matches!(whole, Ok(true)) && reader.is_finished()
 }
 
 /// The shape of the encrypted key `bytes`.
@@ -39,12 +77,14 @@ pub(super) fn shape(bytes: &[u8], resources: &ResourcePolicy) -> Result<Shape> {
             kdf,
             output: cost.output,
             scratch: cost.scratch,
+            legacy_password: plan.uses_legacy_password(),
         })
     })
 }
 
 /// The `PrivateKeyInfo` the encrypted key `bytes` holds, decrypted with
-/// `password` into one wiping buffer. The caller has admitted the KDF;
+/// `password` into one wiping buffer. The caller has admitted the KDF and
+/// the password's converted form ([`Shape::password_form_len`]);
 /// `admit_scratch` admits the full scratch, which grows with the password
 /// for a legacy one, before it is allocated.
 pub(super) fn decrypt(

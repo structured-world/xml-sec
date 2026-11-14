@@ -38,7 +38,7 @@ use crate::rsa_encoding::RsaPrivateKeyEncoding as _;
 #[cfg(feature = "xmldsig-sign")]
 pub use openssl::PrivateKeyContainer;
 #[cfg(feature = "xmldsig-sign")]
-use pkcs8::{DecodePrivateKey as _, EncryptedPrivateKeyInfoRef, PrivateKeyInfoRef};
+use pkcs8::{DecodePrivateKey as _, PrivateKeyInfoRef};
 #[cfg(feature = "xmldsig-sign")]
 use pkcs12_import::Limits as Pkcs12Limits;
 #[cfg(feature = "xmldsig-sign")]
@@ -2115,7 +2115,7 @@ impl KeyInventory {
         let der = if PrivateKeyInfoRef::try_from(bytes).is_ok() {
             check_plain_output(bytes.len())?;
             Zeroizing::new(bytes.to_vec())
-        } else if EncryptedPrivateKeyInfoRef::try_from(bytes).is_ok() {
+        } else if pkcs8_import::is_encrypted(bytes) {
             // PEM decoding does not end the caller's encoded buffer lifetime.
             // Its bytes coexist with DER and the KDF workspace, not replace DER.
             let kdf_live_bytes = retained_with_input
@@ -2134,9 +2134,11 @@ impl KeyInventory {
             self.kdf_work += work;
             // The engine decrypts into one zeroizing output allocation; its
             // full scratch, the password's share included, is live beside the
-            // password and that output.
+            // password, its converted form and that output.
+            let form = shape.password_form_len(password)?;
             let live_with_output = kdf_live_bytes
                 .checked_add(password.len())
+                .and_then(|live| live.checked_add(form))
                 .and_then(|live| live.checked_add(shape.output))
                 .ok_or_else(|| {
                     import_resource_limit(
@@ -2203,7 +2205,7 @@ impl KeyInventory {
         }
         let retained_with_input =
             self.check_material_capacity(named_material_length(&name, bytes.len(), 1)?, resources)?;
-        let encrypted = if EncryptedPrivateKeyInfoRef::try_from(bytes).is_ok() {
+        let encrypted = if pkcs8_import::is_encrypted(bytes) {
             Some(pkcs8_import::shape(
                 bytes,
                 &self.remaining_kdf_resources(resources)?,
@@ -2305,8 +2307,9 @@ impl KeyInventory {
         // https://www.rfc-editor.org/rfc/rfc7468#section-2
         match payload {
             Payload::Encrypted => {
-                EncryptedPrivateKeyInfoRef::try_from(der.as_slice())
-                    .map_err(|_| KeyStoreError::ProtectedContainer)?;
+                if !pkcs8_import::is_encrypted(&der) {
+                    return Err(KeyStoreError::ProtectedContainer);
+                }
             }
             Payload::Plain => {
                 PrivateKeyInfoRef::try_from(der.as_slice())
@@ -3724,12 +3727,23 @@ fn enforce_pkcs8_password_policy(
             Some(password.len() as u64),
         ));
     }
-    let live = live_bytes.checked_add(password.len()).ok_or_else(|| {
-        import_resource_limit(
-            crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
-            resources.max_external_resource_total_bytes,
-        )
-    })?;
+    // A scheme of RFC 7292 appendix C hashes the password's converted form,
+    // which is live beside the password itself.
+    let form = encrypted.password_form_len(password)?;
+    let live = live_bytes
+        .checked_add(password.len())
+        .and_then(|live| live.checked_add(form))
+        .ok_or_else(|| {
+            import_resource_limit(
+                crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                resources.max_external_resource_total_bytes,
+            )
+        })?;
+    let hashed = if encrypted.legacy_password {
+        form
+    } else {
+        password.len()
+    };
     // Product work accounting: one unit per 64 input bytes conservatively
     // covers password hashing for the supported SHA PRFs, in addition to rounds.
     let hashing_passes = match encrypted.kdf {
@@ -3737,7 +3751,7 @@ fn enforce_pkcs8_password_policy(
         _ => 1,
     };
     // Scrypt initializes password-keyed HMAC both before and after ROMix.
-    let password_work = password.len().div_ceil(64) * hashing_passes;
+    let password_work = hashed.div_ceil(64) * hashing_passes;
     if password_work > resources.max_key_import_kdf_work {
         return Err(kdf_policy_violation(
             crate::policy::resource_name::KEY_IMPORT_KDF_WORK,
