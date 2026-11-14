@@ -345,6 +345,54 @@ fn sec1_keys_import_from_pem_der_and_the_envelope() {
 }
 
 #[test]
+fn an_envelope_password_counts_against_the_resource_budgets() {
+    // The password of a traditional envelope is external material as an
+    // encrypted PKCS#8 one is: past the per-resource limit it is refused
+    // before decryption, and it stays live in the aggregate budget.
+    let key = p256::SecretKey::from_slice(&[0x11; 32]).expect("a scalar below the order");
+    let der = key.to_sec1_der().expect("SEC1 encoding");
+    let password = vec![b'p'; 600];
+    let pem = encrypted_pem("EC PRIVATE KEY", &der, &password).into_bytes();
+    let per_resource = ResourcePolicy {
+        max_external_resource_bytes: 599,
+        ..ResourcePolicy::default()
+    };
+    assert!(matches!(
+        import(
+            &pem,
+            PrivateKeyContainer::Pem,
+            Some(&password),
+            &per_resource
+        ),
+        Err(KeyStoreError::Policy(
+            crate::policy::PolicyViolation::ResourceLimitExceeded {
+                resource: resource_name::EXTERNAL_RESOURCE_BYTES,
+                ..
+            }
+        ))
+    ));
+    // The smallest aggregate that admits the import with a one-byte
+    // password, then the same with the long one: the 599 extra bytes of
+    // password must not fit.
+    let fits = |total: usize, password: &[u8]| {
+        let pem = encrypted_pem("EC PRIVATE KEY", &der, password).into_bytes();
+        let resources = ResourcePolicy {
+            max_external_resource_total_bytes: total,
+            ..ResourcePolicy::default()
+        };
+        import(&pem, PrivateKeyContainer::Pem, Some(password), &resources).is_ok()
+    };
+    let minimum = (1..=1 << 16)
+        .find(|&total| fits(total, b"p"))
+        .expect("the key imports under some aggregate");
+    assert!(
+        !fits(minimum + 598, &password),
+        "the long password is live beside the key"
+    );
+    assert!(fits(minimum + 599, &password));
+}
+
+#[test]
 fn pkcs8_containers_accept_nothing_else() {
     // The PKCS#8 forms refuse traditional keys; the generic forms read both,
     // and an RSA label never carries PKCS#8.
