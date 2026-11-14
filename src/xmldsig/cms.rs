@@ -21,7 +21,7 @@ use structured_cms::Octets;
 use structured_cms::provider::{Prehash, SignatureAnswer, SignatureMode, SignatureProvider};
 use structured_pkix::AlgorithmIdentifier;
 use structured_pkix::algorithm::digest::{Algorithm, AsnDigest};
-use structured_pkix::path::WorkingKey;
+use structured_pkix::path::EffectiveKey;
 
 pub use super::DigestOutput;
 use super::pkix::CertificateSession;
@@ -184,7 +184,7 @@ impl AsnDigest<'_> for CmsProvider<'_> {
 /// Raw signature input admitted against the operation's memory.
 pub struct RawSignature<'a> {
     algorithm: X509SignatureAlgorithm,
-    key: WorkingKey<'a>,
+    key: EffectiveKey<'a>,
     signature: &'a Octets<'a>,
     signed: OwnedVec<u8>,
 }
@@ -262,7 +262,7 @@ impl<'a> SignatureProvider<'a> for CmsProvider<'_> {
         &'a self,
         identifier: AlgorithmIdentifier<'a>,
         digest: &DigestAlgorithm,
-        key: WorkingKey<'a>,
+        key: EffectiveKey<'a>,
         _encoding: Encoding,
         parent: &Reader<'a>,
     ) -> Result<Resolution<SignatureMode<X509SignatureAlgorithm>>, CmsProviderError> {
@@ -311,7 +311,7 @@ impl<'a> SignatureProvider<'a> for CmsProvider<'_> {
     fn start_raw<W: Work>(
         &'a self,
         identity: &X509SignatureAlgorithm,
-        key: WorkingKey<'a>,
+        key: EffectiveKey<'a>,
         signature: &'a Octets<'a>,
         execution: &W,
     ) -> Result<RawSignature<'a>, CmsProviderError> {
@@ -375,7 +375,7 @@ impl<'a> SignatureProvider<'a> for CmsProvider<'_> {
     fn verify_prehashed<W: Work>(
         &'a self,
         _identity: &X509SignatureAlgorithm,
-        _key: WorkingKey<'a>,
+        _key: EffectiveKey<'a>,
         _signature: &Octets<'a>,
         _digest: Prehash<'_, '_, Self, DigestAlgorithm>,
         _execution: &W,

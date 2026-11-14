@@ -5,8 +5,8 @@ use structured_asn1::Parser;
 use structured_asn1::memory::{HashWork, Memory, MemoryError, OwnedVec, Work};
 use structured_ltv::pki::{CheckedPath, PathOutcome};
 use structured_pkix::path::{
-    Anchor, Bounds, BuildError, Context as PathContext, Interval, Policy, Truncation,
-    ValidationContext, Verified, Verify as PathVerify, WorkingKey,
+    Anchor, Bounds, BuildError, Context as PathContext, EffectiveKey, Interval, Policy, Truncation,
+    ValidationContext, Verified, Verify as PathVerify,
 };
 use structured_pkix::signature::SignatureValue;
 use structured_pkix::temporal::Instant;
@@ -381,7 +381,7 @@ impl PathVerify for Unverified {
     fn verify(
         &self,
         _algorithm: &AlgorithmIdentifier<'_>,
-        _key: WorkingKey<'_>,
+        _key: EffectiveKey<'_>,
         _signed: &[u8],
         _signature: SignatureValue<'_>,
         _execution: &Memory,

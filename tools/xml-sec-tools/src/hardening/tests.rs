@@ -114,6 +114,19 @@ fn the_runner_preserves_every_source_and_delegates_the_85_percent_gate_to_llvm()
             < index(calls, "cargo llvm-cov show-env")
     );
     assert!(index(calls, "mkdir /evidence") < index(calls, "rustup"));
+    // The libxmlsec1-compatible library is exercised by its C programs, which
+    // run against the instrumented build before the report merges profiles.
+    let capi = index(
+        calls,
+        "cargo run --quiet -p xml-sec-tools -- capi --xmlsec1",
+    );
+    assert!(index(calls, "tokens /test/module --workspace --all-features") < capi);
+    assert!(
+        capi < index(
+            calls,
+            "cargo llvm-cov report --package * --fail-under-lines"
+        )
+    );
     assert!(
         index(
             calls,

@@ -313,7 +313,7 @@ fn assert_token_key_receipt(provider: &Pkcs11Provider, public: &Pkcs11RsaKey, si
     let parser = Parser::new(Encoding::Der, Limits::default(), work.clone());
     let mut reader = parser.read(bytes, 0).unwrap();
     let element = reader.next_element().unwrap().unwrap();
-    let expected = structured_pkix::path::WorkingKey::standing(
+    let expected = structured_pkix::path::EffectiveKey::standing(
         structured_pkix::key::PublicKeyInfo::read_element(&reader, &element, "token expected key")
             .unwrap(),
     );

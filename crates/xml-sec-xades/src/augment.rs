@@ -41,7 +41,7 @@ use structured_cms::timestamp::{
 };
 use structured_pkix::Certificate;
 use structured_pkix::algorithm::digest::{self, AsnDigest};
-use structured_pkix::path::WorkingKey;
+use structured_pkix::path::EffectiveKey;
 use structured_xades::baseline::{self, Evidence};
 use structured_xades::produce::{
     self, Augmentation, Event, PreparationError, ResponseCheck, ResponseError, TimestampKind,
@@ -1045,7 +1045,7 @@ fn timestamped<W: Work>(
     let context = CheckContext {
         certificate,
         certificate_parent,
-        key: WorkingKey::standing(certificate.tbs().public_key()),
+        key: EffectiveKey::standing(certificate.tbs().public_key()),
         requested: Some(Requested {
             request: &request,
             parent: &asked,

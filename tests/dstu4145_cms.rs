@@ -13,7 +13,7 @@ use structured_cms::provider::SignatureAnswer;
 use structured_cms::signed::SignedData;
 use structured_cms::timestamp::{CheckContext, Token, TokenSignature};
 use structured_cms::verify::{self, ContentAgreement};
-use structured_pkix::path::WorkingKey;
+use structured_pkix::path::EffectiveKey;
 use structured_pkix::temporal::{Instant, LeapTable};
 use xml_sec::policy::{CertificateSignatureAlgorithms, VerificationPolicy};
 use xml_sec::provider::{
@@ -65,7 +65,7 @@ fn answer(
     let context = CheckContext {
         certificate,
         certificate_parent: &parent,
-        key: WorkingKey::standing(certificate.tbs().public_key()),
+        key: EffectiveKey::standing(certificate.tbs().public_key()),
         requested: None,
         utc: &utc,
         reference: Some(Instant::new(1_717_200_000, 0).expect("instant")),
@@ -114,7 +114,7 @@ fn detached(sample: &[u8], content: &[u8]) -> Detached {
     let preparation = prepare::resolve(
         &cms,
         &message.signers()[0],
-        WorkingKey::standing(certificate.tbs().public_key()),
+        EffectiveKey::standing(certificate.tbs().public_key()),
         &parent,
         Scope::Content(message.content().kind()),
     )

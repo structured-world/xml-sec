@@ -62,13 +62,15 @@ compile_error!("select either `no-unsafe` or `raw-pointer-backend`");
 #[cfg(not(feature = "embedded"))]
 #[macro_use]
 extern crate peresil;
-#[cfg(not(feature = "embedded"))]
+#[cfg(all(feature = "no-unsafe", not(feature = "embedded")))]
 extern crate alloc;
 
 // The standalone crate always has std; embedded, the tables follow xml-sec's build.
 #[cfg(not(feature = "embedded"))]
 mod collections {
-    pub(crate) use std::collections::{HashMap as Map, HashSet as Set, hash_map as map};
+    #[cfg(feature = "no-unsafe")]
+    pub(crate) use std::collections::HashSet as Set;
+    pub(crate) use std::collections::{HashMap as Map, hash_map as map};
 
     pub(crate) trait Key: core::hash::Hash + Eq {}
     impl<T: core::hash::Hash + Eq + ?Sized> Key for T {}
@@ -76,6 +78,7 @@ mod collections {
 
 #[cfg(feature = "embedded")]
 use alloc::borrow::ToOwned;
+#[cfg(any(feature = "no-unsafe", feature = "embedded"))]
 use alloc::string::String;
 use core::{
     fmt,

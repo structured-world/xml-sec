@@ -138,7 +138,7 @@ impl CryptoProvider for AwsLcFipsProvider {
     fn associate_verification_key(
         &self,
         actual: &[u8],
-        expected: structured_pkix::path::WorkingKey<'_>,
+        expected: structured_pkix::path::EffectiveKey<'_>,
         charge: &dyn Fn(u64) -> Result<(), structured_asn1::memory::MemoryError>,
     ) -> Result<super::KeyAssociation, DsigError> {
         // The official safe AWS API does not expose general parsed-point

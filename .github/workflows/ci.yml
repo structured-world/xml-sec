@@ -82,7 +82,7 @@ jobs:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-llvm-cov@0.8.5
+          tool: cargo-llvm-cov
       - uses: ./.github/actions/nextest
       - uses: ./.github/actions/rust-build-cache
         with:

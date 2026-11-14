@@ -1171,12 +1171,12 @@ pub(crate) fn shared_certificate_signature_outcome(
     allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
     session: &super::pkix::CertificateSession,
 ) -> Result<structured_pkix::path::Verified, X509ChainError> {
-    use structured_pkix::path::{Verify as _, WorkingKey};
+    use structured_pkix::path::{EffectiveKey, Verify as _};
     let verifier = super::pkix::ProviderVerifier { provider, allowed };
     verifier
         .verify(
             &certificate.tbs().signature(),
-            WorkingKey::standing(issuer.tbs().public_key()),
+            EffectiveKey::standing(issuer.tbs().public_key()),
             certificate.signed_bytes(),
             certificate.signature_value(),
             session.memory(),
@@ -1496,27 +1496,22 @@ fn dns_name_has_valid_syntax(value: &str, allow_leading_dot: bool) -> bool {
     } else {
         value
     };
-    if domain.is_empty()
-        || domain.len() > 253
-        || domain.split('.').any(|label| {
-            label.is_empty()
-                || label.len() > 63
-                || !label
+    !domain.is_empty()
+        && domain.len() <= 253
+        && domain.split('.').all(|label| {
+            label.len() <= 63
+                && label
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-                || !label
+                && label
                     .as_bytes()
                     .first()
                     .is_some_and(u8::is_ascii_alphanumeric)
-                || !label
+                && label
                     .as_bytes()
                     .last()
                     .is_some_and(u8::is_ascii_alphanumeric)
         })
-    {
-        return false;
-    }
-    true
 }
 
 #[cfg(test)]
@@ -1774,7 +1769,7 @@ mod tests {
             let outcome = crl
                 .authenticate(
                     &issuer,
-                    structured_pkix::path::WorkingKey::standing(issuer.tbs().public_key()),
+                    structured_pkix::path::EffectiveKey::standing(issuer.tbs().public_key()),
                     &FormatOnly,
                     session.memory(),
                 )
@@ -3384,7 +3379,7 @@ mod tests {
         fn verify(
             &self,
             _: &structured_pkix::algorithm::AlgorithmIdentifier<'_>,
-            _: structured_pkix::path::WorkingKey<'_>,
+            _: structured_pkix::path::EffectiveKey<'_>,
             _: &[u8],
             _: structured_pkix::signature::SignatureValue<'_>,
             _: &structured_asn1::memory::Memory,
@@ -3461,7 +3456,7 @@ mod tests {
             let proof = crl
                 .authenticate(
                     &issuer,
-                    structured_pkix::path::WorkingKey::standing(issuer.tbs().public_key()),
+                    structured_pkix::path::EffectiveKey::standing(issuer.tbs().public_key()),
                     &FormatOnly,
                     memory,
                 )

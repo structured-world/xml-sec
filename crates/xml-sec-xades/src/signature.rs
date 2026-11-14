@@ -4,7 +4,7 @@ use crate::{Document, Error, Snapshot};
 use structured_asn1::memory::Work;
 use structured_cms::stream::Receiver;
 use structured_pkix::Certificate;
-use structured_pkix::path::WorkingKey;
+use structured_pkix::path::EffectiveKey;
 use structured_xades::binding::{Coverage, Reference, SignatureXml, Status, Target};
 use structured_xades::certificate::{CertificateXml, KeyAssociation};
 use structured_xades::hashes::{
@@ -357,7 +357,7 @@ impl<W: Work> CertificateXml for Document<'_, '_, '_, '_, W> {
         snapshot: Snapshot,
         signature: NodeIdentity,
         _certificate: &Certificate<'_>,
-        key: WorkingKey<'_>,
+        key: EffectiveKey<'_>,
         execution: &Q,
     ) -> Result<KeyAssociation, Error> {
         self.check(snapshot)?;

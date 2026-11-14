@@ -3,7 +3,7 @@
 use crate::xmldsig::{DsigError, SignatureAlgorithm, SignatureContext, VerifyingKey};
 use structured_asn1::memory::MemoryError;
 #[cfg(feature = "rustcrypto")]
-use structured_pkix::path::WorkingKey;
+use structured_pkix::path::EffectiveKey;
 
 /// Public-key association established by the originally selected provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,7 +165,7 @@ where
 #[cfg(any(feature = "aws-lc-fips", feature = "pkcs11"))]
 pub(super) fn compare(
     actual: &[u8],
-    expected: WorkingKey<'_>,
+    expected: EffectiveKey<'_>,
     charge: &dyn Fn(u64) -> Result<(), MemoryError>,
 ) -> Result<KeyAssociation, DsigError> {
     compare_with_points(actual, expected, charge, false)
@@ -174,7 +174,7 @@ pub(super) fn compare(
 #[cfg(feature = "rustcrypto")]
 pub(super) fn compare_rustcrypto(
     actual: &[u8],
-    expected: WorkingKey<'_>,
+    expected: EffectiveKey<'_>,
     charge: &dyn Fn(u64) -> Result<(), MemoryError>,
 ) -> Result<KeyAssociation, DsigError> {
     compare_with_points(actual, expected, charge, true)
@@ -183,7 +183,7 @@ pub(super) fn compare_rustcrypto(
 #[cfg(feature = "rustcrypto")]
 fn compare_with_points(
     actual: &[u8],
-    expected: WorkingKey<'_>,
+    expected: EffectiveKey<'_>,
     charge: &dyn Fn(u64) -> Result<(), MemoryError>,
     rustcrypto_points: bool,
 ) -> Result<KeyAssociation, DsigError> {
@@ -218,7 +218,7 @@ fn compare_with_points(
 #[cfg(feature = "rustcrypto")]
 fn associate(
     actual: structured_pkix::PublicKeyInfo<'_>,
-    expected: WorkingKey<'_>,
+    expected: EffectiveKey<'_>,
     execution: &structured_asn1::memory::Execution<'_>,
     charge: &dyn Fn(u64) -> Result<(), MemoryError>,
     rustcrypto_points: bool,
@@ -234,7 +234,7 @@ fn associate(
     let expected_oid = algorithm.algorithm();
     // RFC 4055 §3.1: PSS parameters are absent or RSASSA-PSS-params, never
     // NULL. PSS does not inherit parameters; retain the original field rather
-    // than the generic WorkingKey projection which treats NULL as absent.
+    // than the generic EffectiveKey projection which treats NULL as absent.
     // https://www.rfc-editor.org/rfc/rfc4055#section-3.1
     let parameters = if expected_oid == RSASSA_PSS {
         algorithm.parameters()
@@ -283,7 +283,7 @@ fn associate(
         // only inside the selected RustCrypto provider, never as native fallback.
         // https://www.rfc-editor.org/rfc/rfc8410#section-4
         // https://www.rfc-editor.org/rfc/rfc8032#section-5.1.3
-        // WorkingKey's generic effective projection treats NULL as absent;
+        // EffectiveKey's generic effective projection treats NULL as absent;
         // the original encoding is still governed by RFC 8410 §3.
         // https://www.rfc-editor.org/rfc/rfc8410#section-3
         if actual_algorithm.parameters().is_some()
@@ -353,7 +353,7 @@ fn associate(
 #[inline]
 fn compare_rsa_material(
     actual: structured_pkix::PublicKeyInfo<'_>,
-    expected: WorkingKey<'_>,
+    expected: EffectiveKey<'_>,
     parameters: Option<&[u8]>,
     execution: &structured_asn1::memory::Execution<'_>,
 ) -> KeyAssociation {
@@ -407,7 +407,7 @@ fn compare_rsa_material(
 #[inline]
 fn compare_dsa_material(
     actual: structured_pkix::PublicKeyInfo<'_>,
-    expected: WorkingKey<'_>,
+    expected: EffectiveKey<'_>,
     execution: &structured_asn1::memory::Execution<'_>,
 ) -> KeyAssociation {
     use structured_pkix::key::dsa;
@@ -415,7 +415,7 @@ fn compare_dsa_material(
     // may come from the checked path rather than the subject's SPKI.
     // https://www.rfc-editor.org/rfc/rfc3279#section-2.3.2
     let (Ok(actual), Ok(expected)) = (
-        dsa::read(WorkingKey::standing(actual), execution),
+        dsa::read(EffectiveKey::standing(actual), execution),
         dsa::read(expected, execution),
     ) else {
         return KeyAssociation::Unproven;

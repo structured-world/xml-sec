@@ -1,81 +1,42 @@
 use std::fs;
 
-use aes::cipher::BlockModeEncrypt as _;
+use aes::cipher::{BlockModeEncrypt as _, KeyIvInit as _, block_padding::Pkcs7};
 use base64::Engine as _;
+use der::{Decode as _, Encode as _, asn1::UintRef};
+use dsa::{Components as DsaComponents, SigningKey as NativeDsaSigningKey};
 use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng as _};
 
 use super::*;
 
 #[test]
-fn traditional_pem_rejects_invalid_protection_before_workspace() {
-    // Malformed protection metadata must be refused before DER allocation.
-    let encrypted =
-        include_str!("../../../../tests/fixtures/keys/rsa/rsa-2048-key-traditional-encrypted.pem");
-    for malformed in [
-        encrypted.replace("AES-256-CBC", "RC2-CBC"),
-        encrypted.replace(
-            "C98DDAE6A971742BF435D3FF6CD60028",
-            "C98DDAE6A971742BF435D3FF6CD6002Z",
-        ),
-    ] {
-        let allocations = std::cell::Cell::new(0);
-        assert!(
-            decode_traditional_pem(
-                malformed.as_bytes(),
-                "RSA PRIVATE KEY",
-                Some(b"legacy-rsa-password"),
-                Path::new("key"),
-                |_, _| {
-                    allocations.set(allocations.get() + 1);
-                    Ok(())
-                }
-            )
-            .is_err()
-        );
-        assert_eq!(allocations.get(), 0);
-    }
-}
-
-#[test]
-fn traditional_pem_workspace_limit_precedes_decoding() {
-    // Exact source + decoded capacity is accepted; one byte less fails
-    // before the streaming decoder allocates its output.
-    let pem = pem::encode(&pem::Pem::new("RSA PRIVATE KEY", vec![1, 2, 3]));
-    let mut resources = ResourcePolicy {
-        max_external_resource_total_bytes: pem.len() + 3,
-        ..ResourcePolicy::default()
+fn a_signing_key_decodes_only_within_the_remaining_budget() {
+    // The source and the DER it decodes to coexist: a remaining allowance of
+    // twice the source admits a PKCS#8 key, one octet less refuses it before
+    // the decoder allocates.
+    let pem = include_bytes!("../../../../tests/fixtures/keys/ec/ec-prime256v1-key.pem");
+    let decode = |total: usize| {
+        let resources = ResourcePolicy {
+            max_external_resource_total_bytes: total,
+            ..ResourcePolicy::default()
+        };
+        decode_signing_key(
+            Path::new("key.pem"),
+            pem,
+            PrivateKeyFormat::Pem,
+            SignatureAlgorithm::EcdsaSha256,
+            None,
+            &resources,
+        )
     };
-    assert_eq!(
-        decode_bounded_traditional_pem(pem.as_bytes(), None, Path::new("key"), &resources)
-            .unwrap()
-            .der
-            .as_slice(),
-        &[1, 2, 3]
-    );
-    resources.max_external_resource_total_bytes -= 1;
+    assert!(decode(pem.len() * 2).is_ok());
+    let refused = decode(pem.len() * 2 - 1);
     assert!(matches!(
-        decode_bounded_traditional_pem(pem.as_bytes(), None, Path::new("key"), &resources),
-        Err(KeyMaterialError::Policy(_))
+        refused,
+        Err(KeyMaterialError::KeyMaterialTooLarge { .. })
     ));
-}
-
-#[test]
-fn damaged_protected_pem_is_terminal() {
-    // A recognized protected envelope cannot become a skippable candidate
-    // just because its encrypted payload is not valid base64.
-    let encrypted =
-        include_str!("../../../../tests/fixtures/keys/rsa/rsa-2048-key-traditional-encrypted.pem");
-    let (headers, _) = encrypted.split_once("\n\n").unwrap();
-    let damaged = format!("{headers}\n\n!!!!\n-----END RSA PRIVATE KEY-----\n");
-    assert!(matches!(
-        decode_bounded_traditional_pem(
-            damaged.as_bytes(),
-            Some(b"legacy-rsa-password"),
-            Path::new("key"),
-            &ResourcePolicy::default()
-        ),
-        Err(KeyMaterialError::ProtectedContainer)
-    ));
+    // The refusal holds for the invocation: lax key search stops at it
+    // instead of signing with a later candidate.
+    assert!(!refused.err().expect("refused").is_candidate_miss());
 }
 
 #[test]
@@ -163,6 +124,40 @@ fn rsa_pkcs8_pem_keeps_label_and_protected_failure_contracts() {
 }
 
 #[test]
+fn both_private_key_import_paths_stop_lax_search_alike() {
+    // A policy refusal is terminal whichever importer reports it, and a
+    // store error wrapping one is classified the same.
+    let invalid_policy = ResourcePolicy {
+        max_external_resource_bytes: usize::MAX,
+        ..ResourcePolicy::default()
+    };
+    let pem = include_bytes!("../../../../tests/fixtures/keys/rsa/rsa-2048-key.pem");
+    let mut inventory = xml_sec::key_manager::KeyInventory::default();
+    let imported = import_private_key(
+        &mut inventory,
+        pem,
+        &PrivateKeyImport {
+            path: Path::new("key.pem"),
+            name: "key",
+            format: PrivateKeyFormat::Pem,
+            password: None,
+            usages: xml_sec::key_manager::KeyUsages::SIGN,
+            resources: &invalid_policy,
+        },
+    );
+    let error = imported.expect_err("an invalid policy refuses the import");
+    assert!(!error.is_candidate_miss(), "{error:?}");
+    for wrapped in [
+        xml_sec::key_manager::KeyStoreError::ProtectedContainer,
+        xml_sec::key_manager::KeyStoreError::Policy(
+            xml_sec::policy::PolicyViolation::AuthorizationExpired,
+        ),
+    ] {
+        assert!(!KeyMaterialError::KeyStore(wrapped).is_candidate_miss());
+    }
+}
+
+#[test]
 fn protected_rsa_container_failure_is_not_a_lax_candidate_miss() {
     // A wrong or missing password must stop lax search before a later
     // unprotected candidate can silently replace the requested key.
@@ -210,21 +205,19 @@ fn encrypted_traditional_dsa_and_ec_reject_valid_padding_invalid_der() {
     // protected envelope containing invalid DER remains terminal for lax search.
     for tag in ["DSA PRIVATE KEY", "EC PRIVATE KEY"] {
         let text = encrypted_traditional_pem(tag, b"not ASN.1", b"secret");
-        let result = if tag == "DSA PRIVATE KEY" {
-            decode_dsa_signing_key(
-                Path::new("key.pem"),
-                text.as_bytes(),
-                PrivateKeyFormat::Pem,
-                Some(b"secret"),
-            )
+        let algorithm = if tag == "DSA PRIVATE KEY" {
+            SignatureAlgorithm::DsaSha256
         } else {
-            decode_ecdsa_signing_key(
-                Path::new("key.pem"),
-                text.as_bytes(),
-                PrivateKeyFormat::Pem,
-                Some(b"secret"),
-            )
+            SignatureAlgorithm::EcdsaSha256
         };
+        let result = decode_signing_key(
+            Path::new("key.pem"),
+            text.as_bytes(),
+            PrivateKeyFormat::Pem,
+            algorithm,
+            Some(b"secret"),
+            &ResourcePolicy::default(),
+        );
         assert!(
             matches!(result, Err(KeyMaterialError::ProtectedContainer)),
             "{tag}"
@@ -258,7 +251,43 @@ fn load_signing_key(
 ) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
     let path = path.as_ref();
     let bytes = read(path)?;
-    decode_signing_key(path, &bytes, format, SignatureAlgorithm::RsaSha256, None)
+    decode_signing_key(
+        path,
+        &bytes,
+        format,
+        SignatureAlgorithm::RsaSha256,
+        None,
+        &ResourcePolicy::default(),
+    )
+}
+
+/// OpenSSL's traditional DSA private key structure.
+#[derive(der::Sequence)]
+struct TraditionalDsaPrivateKey<'a> {
+    version: u8,
+    p: UintRef<'a>,
+    q: UintRef<'a>,
+    g: UintRef<'a>,
+    y: UintRef<'a>,
+    x: UintRef<'a>,
+}
+
+/// OpenSSL `EVP_BytesToKey` with MD5 and one iteration, as the traditional
+/// envelope derives its key; an oracle independent of the importer.
+fn envelope_key(password: &[u8], salt: &[u8], key_len: usize) -> Vec<u8> {
+    use md5::Digest as _;
+    let mut key = Vec::new();
+    let mut previous = Vec::new();
+    while key.len() < key_len {
+        let mut digest = md5::Md5::new();
+        digest.update(&previous);
+        digest.update(password);
+        digest.update(salt);
+        previous = digest.finalize().to_vec();
+        key.extend_from_slice(&previous);
+    }
+    key.truncate(key_len);
+    key
 }
 
 /// OpenSSL's traditional DSA structure for `key`, with a caller-chosen
@@ -285,7 +314,7 @@ fn traditional_dsa_der(key: &NativeDsaSigningKey, version: u8, public: &[u8]) ->
 fn encrypted_traditional_pem(tag: &str, der: &[u8], password: &[u8]) -> String {
     use std::fmt::Write as _;
     let iv = [0x39; 16];
-    let key = openssl_legacy_key(password, &iv[..8], 32);
+    let key = envelope_key(password, &iv[..8], 32);
     let mut ciphertext = vec![0_u8; der.len() + 16];
     ciphertext[..der.len()].copy_from_slice(der);
     let ciphertext_len = cbc::Encryptor::<aes::Aes256>::new_from_slices(&key, &iv)
@@ -327,12 +356,14 @@ fn traditional_dsa_decoder_rejects_ambiguous_or_inconsistent_containers() {
     let y = key.verifying_key().y().to_be_bytes_trimmed_vartime();
     let valid = traditional_dsa_der(&key, 0, y.as_ref());
     let path = Path::new("traditional-dsa.der");
+    let resources = ResourcePolicy::default();
     decode_signing_key(
         path,
         &valid,
         PrivateKeyFormat::Der,
         SignatureAlgorithm::DsaSha256,
         None,
+        &resources,
     )
     .expect("valid traditional DSA DER must decode");
 
@@ -345,6 +376,7 @@ fn traditional_dsa_decoder_rejects_ambiguous_or_inconsistent_containers() {
         PrivateKeyFormat::Pem,
         SignatureAlgorithm::DsaSha256,
         Some(password),
+        &resources,
     )
     .expect("the correct password must decrypt traditional DSA PEM");
     for rejected_password in [None, Some(b"wrong-password".as_slice())] {
@@ -355,6 +387,7 @@ fn traditional_dsa_decoder_rejects_ambiguous_or_inconsistent_containers() {
                 PrivateKeyFormat::Pem,
                 SignatureAlgorithm::DsaSha256,
                 rejected_password,
+                &resources,
             )
             .is_err(),
             "missing or incorrect passwords must fail closed"
@@ -368,6 +401,7 @@ fn traditional_dsa_decoder_rejects_ambiguous_or_inconsistent_containers() {
             PrivateKeyFormat::Pem,
             SignatureAlgorithm::DsaSha256,
             Some(password),
+            &resources,
         )
         .is_err(),
         "encrypted DSA PEM must occupy the complete input"
@@ -390,7 +424,15 @@ fn traditional_dsa_decoder_rejects_ambiguous_or_inconsistent_containers() {
         (valid, PrivateKeyFormat::Pkcs8Der),
     ] {
         assert!(
-            decode_signing_key(path, &bytes, format, SignatureAlgorithm::DsaSha256, None,).is_err(),
+            decode_signing_key(
+                path,
+                &bytes,
+                format,
+                SignatureAlgorithm::DsaSha256,
+                None,
+                &resources,
+            )
+            .is_err(),
             "malformed or misclassified traditional DSA must be rejected"
         );
     }
@@ -598,6 +640,7 @@ fn decrypts_traditional_encrypted_rsa_pem() {
         PrivateKeyFormat::Pem,
         SignatureAlgorithm::RsaSha256,
         Some(b"legacy-rsa-password"),
+        &ResourcePolicy::default(),
     )
     .expect("the correct password must decrypt traditional RSA PEM");
 
@@ -609,6 +652,7 @@ fn decrypts_traditional_encrypted_rsa_pem() {
                 PrivateKeyFormat::Pem,
                 SignatureAlgorithm::RsaSha256,
                 password,
+                &ResourcePolicy::default(),
             )
             .is_err(),
             "missing or incorrect passwords must fail closed"
@@ -657,6 +701,7 @@ fn decrypts_traditional_encrypted_sec1_pem_for_every_curve() {
             PrivateKeyFormat::Pem,
             algorithm,
             Some(password),
+            &ResourcePolicy::default(),
         )
         .expect("the correct password must decrypt traditional SEC1 PEM");
 
@@ -668,6 +713,7 @@ fn decrypts_traditional_encrypted_sec1_pem_for_every_curve() {
                     PrivateKeyFormat::Pem,
                     algorithm,
                     rejected_password,
+                    &ResourcePolicy::default(),
                 )
                 .is_err(),
                 "missing or incorrect passwords must fail closed"
@@ -682,6 +728,7 @@ fn decrypts_traditional_encrypted_sec1_pem_for_every_curve() {
                 PrivateKeyFormat::Pem,
                 algorithm,
                 Some(password),
+                &ResourcePolicy::default(),
             )
             .is_err(),
             "encrypted SEC1 PEM must occupy the complete input"
@@ -715,6 +762,7 @@ fn rejects_malformed_traditional_encrypted_rsa_pem() {
                 PrivateKeyFormat::Pem,
                 SignatureAlgorithm::RsaSha256,
                 Some(b"legacy-rsa-password"),
+                &ResourcePolicy::default(),
             )
             .is_err(),
             "malformed legacy PEM envelopes must fail closed"

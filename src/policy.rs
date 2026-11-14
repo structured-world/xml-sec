@@ -311,7 +311,12 @@ impl HmacPolicy {
         Ok(())
     }
 
-    pub(crate) fn validate_key_bytes(self, key_bytes: usize) -> Result<(), PolicyViolation> {
+    /// Check an HMAC secret of `key_bytes` bytes against the configured
+    /// minimum key length.
+    ///
+    /// # Errors
+    /// [`PolicyViolation::InvalidKeyMaterial`] for a shorter secret.
+    pub fn validate_key_bytes(self, key_bytes: usize) -> Result<(), PolicyViolation> {
         self.validate_key_bits(key_bytes.saturating_mul(8))
     }
 
@@ -326,7 +331,14 @@ impl HmacPolicy {
         Ok(())
     }
 
-    pub(crate) fn validate_output(
+    /// Check a selected HMAC output length of `algorithm` against this policy
+    /// and the `XMLDSig` floor: at least the configured minimum, 80 bits and
+    /// half the digest width, and at most the digest width.
+    ///
+    /// # Errors
+    /// [`PolicyViolation::Algorithm`] for a method that is no HMAC,
+    /// [`PolicyViolation::HmacOutputLength`] for a length out of range.
+    pub fn validate_output(
         self,
         algorithm: SignatureAlgorithm,
         selected_bits: usize,
@@ -583,8 +595,10 @@ pub struct ResourcePolicy {
     /// Maximum live allocation capacity retained by the shared certificate
     /// mechanism, including path search, Name processing and CRL evaluation.
     pub max_x509_workspace_bytes: usize,
-    /// Maximum aggregate PBKDF2/PKCS#12 hash rounds or conservative scrypt work
-    /// during key import, including PKCS#8 password-hashing work units.
+    /// Maximum aggregate key-derivation work during key import: hash rounds
+    /// times output blocks for PBKDF2 and the PKCS#12 KDF, N·r·p for scrypt,
+    /// and password-hashing work units, from the parameters the shared
+    /// password engine states before any password is used.
     pub max_key_import_kdf_work: usize,
     /// Maximum estimated scrypt or PKCS#12 KDF workspace bytes during key import.
     pub max_key_import_kdf_memory_bytes: usize,
@@ -1431,7 +1445,11 @@ pub struct VerificationPolicy {
 
 #[cfg(feature = "xmldsig")]
 impl VerificationPolicy {
-    pub(crate) fn check_digest_algorithm(
+    /// Whether verification admits the digest method `algorithm`.
+    ///
+    /// # Errors
+    /// [`PolicyViolation::Algorithm`] for a method the policy excludes.
+    pub fn check_digest_algorithm(
         &self,
         algorithm: DigestAlgorithm,
     ) -> Result<(), PolicyViolation> {
@@ -1470,6 +1488,31 @@ impl VerificationPolicy {
         self.key_establishment.validate()?;
         self.key_trust.validate()?;
         self.hmac.validate()
+    }
+
+    /// Admit an operation that verifies a signature value with a key the
+    /// caller resolved, without expected targets: the snapshot itself, a
+    /// signature profile (which needs targets the operation cannot check),
+    /// the method, and the pre-resolved key source. Every such operation
+    /// applies this one admission, so none of them bypasses a part of it.
+    ///
+    /// # Errors
+    /// The snapshot's own violation, a profile that requires expected
+    /// targets, a method the policy excludes, or
+    /// [`PolicyViolation::KeyTrust`] when pre-resolved keys are disabled.
+    pub fn check_supplied_key_verification(
+        &self,
+        algorithm: SignatureAlgorithm,
+    ) -> Result<(), PolicyViolation> {
+        self.validate()?;
+        self.signature_constraints.require_targets(false)?;
+        self.check_signature_algorithm(algorithm)?;
+        if !self.key_sources.contains(KeySourceKind::PresetKey) {
+            return Err(PolicyViolation::KeyTrust {
+                reason: "pre-resolved verification keys are disabled",
+            });
+        }
+        Ok(())
     }
 
     /// Enforce the signature algorithm after key resolution.
@@ -1583,7 +1626,14 @@ impl SigningPolicy {
         self.hmac.validate()
     }
 
-    pub(crate) fn check_signature_algorithm(
+    /// Whether this policy admits signing with `algorithm`: the explicit
+    /// method list or the parameterized RSA-PSS permission, and the
+    /// method's own signing permission.
+    ///
+    /// # Errors
+    /// [`PolicyViolation::Algorithm`] for a method the policy does not
+    /// admit for signing.
+    pub fn check_signature_algorithm(
         &self,
         algorithm: SignatureAlgorithm,
     ) -> Result<(), PolicyViolation> {
@@ -1598,7 +1648,11 @@ impl SigningPolicy {
         )
     }
 
-    pub(crate) fn check_digest_algorithm(
+    /// Whether signing admits the digest method `algorithm`.
+    ///
+    /// # Errors
+    /// [`PolicyViolation::Algorithm`] for a method the policy excludes.
+    pub fn check_digest_algorithm(
         &self,
         algorithm: DigestAlgorithm,
     ) -> Result<(), PolicyViolation> {

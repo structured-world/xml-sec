@@ -355,8 +355,18 @@ fn temporary_pkcs12_imports_keep_aggregate_work() {
     // Lax candidates use temporary inventories without resetting operation work.
     let bytes =
         include_bytes!("../../../../tests/fixtures/xmlenc/01-phaos-xmlenc-3/rsa-priv-key.p12");
+    // Room for one import of the bundle, not two.
+    let mut probe = KeyInventory::default();
+    probe
+        .add_pkcs12(
+            "key".into(),
+            bytes,
+            "secret",
+            &xml_sec::policy::ResourcePolicy::default(),
+        )
+        .unwrap();
     let resources = xml_sec::policy::ResourcePolicy {
-        max_key_import_kdf_work: 10_000,
+        max_key_import_kdf_work: probe.key_import_kdf_work() * 2 - 1,
         ..Default::default()
     };
     let mut budget = ExternalMaterialBudget::new(resources.max_external_resource_total_bytes);

@@ -2,7 +2,8 @@
 //!
 //! Serializes a `Document` tree into a well-formed XML string.
 
-use crate::parser_xmloxide::tree::{Document, NodeId, NodeKind};
+use crate::parser_xmloxide::parser::input;
+use crate::parser_xmloxide::tree::{Attribute, Document, NodeId, NodeKind};
 use alloc::string::{String, ToString};
 
 /// Options controlling XML serialization output.
@@ -287,7 +288,16 @@ fn serialize_element_node(
         out.push(':');
     }
     out.push_str(name);
-    for attr in attributes {
+    // Only an unprefixed `xmlns` and the `xmlns:` prefix declare a namespace
+    // (Namespaces in XML 1.0 section 3); `p:xmlns` is an ordinary attribute.
+    let is_ns_decl = |attr: &&Attribute| {
+        (attr.prefix.is_none() && attr.name == "xmlns") || attr.prefix.as_deref() == Some("xmlns")
+    };
+    // libxml2 writes an element's namespace declarations before its
+    // attributes, each group in its own order.
+    let declarations = attributes.iter().filter(is_ns_decl);
+    let others = attributes.iter().filter(|attr| !is_ns_decl(attr));
+    for attr in declarations.chain(others) {
         out.push(' ');
         if let Some(pfx) = &attr.prefix {
             out.push_str(pfx);
@@ -295,7 +305,7 @@ fn serialize_element_node(
         }
         out.push_str(&attr.name);
         out.push_str("=\"");
-        let is_ns_decl = attr.name == "xmlns" || attr.prefix.as_deref() == Some("xmlns");
+        let is_ns_decl = is_ns_decl(&attr);
         if let Some(raw) = attr.raw_value.as_ref().filter(|_| !is_ns_decl) {
             write_escaped_attr_preserve_refs(out, raw, reencode_non_ascii);
         } else {
@@ -357,9 +367,9 @@ fn write_hex_char_ref(out: &mut String, ch: char) {
 
 /// Escapes text content for XML output.
 ///
-/// Follows libxml2's `xmlEscapeEntities` behavior:
+/// Follows current libxml2's text escaping:
 /// - `<`, `>`, `&` are escaped with named entity references
-/// - `\r` is encoded as `&#13;`
+/// - `\r` is encoded as `&#xD;`, as `xmlDocDumpMemory` writes it
 /// - `\t` and `\n` are passed through
 /// - Control characters below 0x20 (other than `\t`, `\n`, `\r`) are hex-encoded
 /// - Non-ASCII characters are passed through as raw UTF-8
@@ -369,7 +379,7 @@ fn write_escaped_text(out: &mut String, text: &str, reencode_non_ascii: bool) {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
-            '\r' => out.push_str("&#13;"),
+            '\r' => out.push_str("&#xD;"),
             '\t' | '\n' => out.push(ch),
             c if (c as u32) < 0x20 => write_hex_char_ref(out, c),
             c if reencode_non_ascii && (c as u32) >= 0x80 => write_hex_char_ref(out, c),
@@ -394,7 +404,7 @@ fn write_escaped_attr_preserve_refs(out: &mut String, text: &str, reencode_non_a
         let b = bytes[i];
         if b == b'&' {
             // Check if this starts a valid reference
-            if let Some(ref_end) = find_attr_reference_end(bytes, i) {
+            if let Some(ref_end) = find_attr_reference_end(text, i) {
                 let ref_str = &text[i..=ref_end];
                 if ref_str.starts_with("&#") {
                     // Character reference — decode to char, then escape normally
@@ -490,7 +500,8 @@ fn write_escaped_attr_char(out: &mut String, ch: char, reencode_non_ascii: bool)
 }
 
 /// Finds the end of an entity/character reference in attribute raw value.
-fn find_attr_reference_end(bytes: &[u8], start: usize) -> Option<usize> {
+fn find_attr_reference_end(text: &str, start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
     if start >= bytes.len() || bytes[start] != b'&' {
         return None;
     }
@@ -523,23 +534,20 @@ fn find_attr_reference_end(bytes: &[u8], start: usize) -> Option<usize> {
         }
         Some(i)
     } else {
-        if !bytes[i].is_ascii_alphabetic() && bytes[i] != b'_' && bytes[i] != b':' {
-            return None;
-        }
-        i += 1;
-        while i < bytes.len()
-            && (bytes[i].is_ascii_alphanumeric()
-                || bytes[i] == b'_'
-                || bytes[i] == b':'
-                || bytes[i] == b'-'
-                || bytes[i] == b'.')
+        // An entity name is an XML Name, not only ASCII (XML 1.0 section
+        // 2.3 [4], [4a]).
+        // https://www.w3.org/TR/xml/#NT-Name
+        // `i` follows the ASCII `&`, a character boundary.
+        let name = &text[i..];
+        let mut chars = name.char_indices();
+        if !chars
+            .next()
+            .is_some_and(|(_, c)| input::is_name_start_char(c))
         {
-            i += 1;
-        }
-        if i >= bytes.len() || bytes[i] != b';' {
             return None;
         }
-        Some(i)
+        let (end, _) = chars.find(|&(_, c)| !input::is_name_char(c))?;
+        (name.as_bytes()[end] == b';').then_some(i + end)
     }
 }
 
@@ -817,5 +825,20 @@ mod tests {
         let xml1 = serialize(&doc);
         let xml2 = serialize_with_options(&doc, &SerializeOptions::default());
         assert_eq!(xml1, xml2);
+    }
+
+    #[test]
+    fn a_reference_to_an_entity_with_a_unicode_name_is_kept() {
+        // XML names are not ASCII-only (XML 1.0 section 2.3 [4], [4a]): a
+        // reference to `β` in an attribute, `p:xmlns` among them, is written
+        // back as the reference, not as an escaped `&amp;` that would read
+        // as literal text.
+        let source = "<!DOCTYPE r [<!ENTITY β \"ok\"><!ENTITY xβ· \"ok\">]>\
+                      <r xmlns:p=\"urn:p\" a=\"&β;\" p:xmlns=\"&β;\" b=\"&xβ·;\"/>";
+        let xml = serialize(&Document::parse_str(source).unwrap());
+        assert!(xml.contains(" a=\"&β;\""), "{xml}");
+        assert!(xml.contains(" p:xmlns=\"&β;\""), "{xml}");
+        assert!(xml.contains(" b=\"&xβ·;\""), "{xml}");
+        assert!(!xml.contains("&amp;"), "{xml}");
     }
 }

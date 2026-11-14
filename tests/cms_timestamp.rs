@@ -18,7 +18,7 @@ use structured_cms::timestamp::{
     TokenSignature,
 };
 use structured_pkix::Certificate;
-use structured_pkix::path::WorkingKey;
+use structured_pkix::path::EffectiveKey;
 use structured_pkix::temporal::{Instant, LeapTable};
 use xml_sec::policy::{CertificateSignatureAlgorithms, VerificationPolicy};
 #[cfg(not(feature = "xmlenc"))]
@@ -129,7 +129,7 @@ fn check(
         let context = CheckContext {
             certificate: &certificate,
             certificate_parent: &certificate_parent,
-            key: WorkingKey::standing(certificate.tbs().public_key()),
+            key: EffectiveKey::standing(certificate.tbs().public_key()),
             requested: None,
             utc: &utc,
             reference: Some(Instant::new(1_800_000_000, 0).expect("instant")),
@@ -365,7 +365,7 @@ fn an_identifier_that_names_no_signature_algorithm_is_unsupported() {
         cms.resolve_signature(
             key.algorithm(),
             &DigestAlgorithm::Sha256,
-            WorkingKey::standing(key),
+            EffectiveKey::standing(key),
             Encoding::Der,
             &parent,
         ),
@@ -440,7 +440,7 @@ fn an_algorithm_the_provider_lacks_is_unsupported_after_policy_permits_it() {
         cms.resolve_signature(
             certificate.signature_algorithm(),
             &DigestAlgorithm::Sha512,
-            WorkingKey::standing(certificate.tbs().public_key()),
+            EffectiveKey::standing(certificate.tbs().public_key()),
             Encoding::Der,
             &parent,
         ),
@@ -465,7 +465,7 @@ fn resolve_own_signature(
     cms.resolve_signature(
         certificate.signature_algorithm(),
         &digest,
-        WorkingKey::standing(certificate.tbs().public_key()),
+        EffectiveKey::standing(certificate.tbs().public_key()),
         Encoding::Der,
         &parent,
     )
@@ -534,7 +534,7 @@ fn one_provider_charges_every_signer_to_one_certificate_account() {
                 .resolve_signature(
                     certificate.signature_algorithm(),
                     &DigestAlgorithm::Sha256,
-                    WorkingKey::standing(key),
+                    EffectiveKey::standing(key),
                     Encoding::Der,
                     &parent,
                 )
@@ -548,7 +548,7 @@ fn one_provider_charges_every_signer_to_one_certificate_account() {
         cms.resolve_signature(
             certificate.signature_algorithm(),
             &DigestAlgorithm::Sha256,
-            WorkingKey::standing(key),
+            EffectiveKey::standing(key),
             Encoding::Der,
             &parent,
         )
@@ -571,7 +571,7 @@ fn ecdsa_must_name_the_signer_digest_and_rsa_encryption_takes_it() {
 
     let ecdsa_bytes = fixture("ecdsa-p256.der");
     let ecdsa = Certificate::read(&parser, &ecdsa_bytes, 0).expect("certificate");
-    let key = WorkingKey::standing(ecdsa.tbs().public_key());
+    let key = EffectiveKey::standing(ecdsa.tbs().public_key());
     let resolve = |digest| {
         cms.resolve_signature(
             ecdsa.signature_algorithm(),
@@ -599,7 +599,7 @@ fn ecdsa_must_name_the_signer_digest_and_rsa_encryption_takes_it() {
         cms.resolve_signature(
             rsa_key.algorithm(),
             &DigestAlgorithm::Sha384,
-            WorkingKey::standing(rsa_key),
+            EffectiveKey::standing(rsa_key),
             Encoding::Der,
             &parent,
         ),

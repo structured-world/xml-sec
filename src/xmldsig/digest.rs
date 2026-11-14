@@ -243,6 +243,67 @@ pub(crate) fn begin_digest<'p>(
     provider.begin_digest(algorithm, memory)
 }
 
+/// An incremental digest of a selected provider, the streaming counterpart of
+/// [`compute_digest_with_provider`] for a caller that bounds its own input.
+///
+/// # Examples
+///
+/// ```
+/// # #[cfg(feature = "rustcrypto")]
+/// # {
+/// use xml_sec::xmldsig::{DigestAlgorithm, IncrementalDigest, compute_digest};
+///
+/// let provider = xml_sec::provider::default_provider();
+/// let mut digest = IncrementalDigest::begin(provider, DigestAlgorithm::Sha256)?;
+/// digest.update(b"chunked ")?;
+/// digest.update(b"input")?;
+/// assert_eq!(&*digest.finish()?, compute_digest(DigestAlgorithm::Sha256, b"chunked input"));
+/// # }
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub struct IncrementalDigest<'p> {
+    algorithm: DigestAlgorithm,
+    state: Box<dyn crate::provider::DigestState + 'p>,
+}
+
+impl<'p> IncrementalDigest<'p> {
+    /// Start `algorithm` on `provider`.
+    ///
+    /// # Errors
+    /// Returns the provider's missing capability or state-creation failure.
+    pub fn begin(
+        provider: &'p dyn crate::provider::CryptoProvider,
+        algorithm: DigestAlgorithm,
+    ) -> Result<Self, crate::provider::ProviderError> {
+        Ok(Self {
+            algorithm,
+            state: begin_digest(provider, algorithm, &digest_memory())?,
+        })
+    }
+
+    /// The algorithm this digest computes.
+    #[must_use]
+    pub fn algorithm(&self) -> DigestAlgorithm {
+        self.algorithm
+    }
+
+    /// Absorb the next input bytes.
+    ///
+    /// # Errors
+    /// Returns the provider's update failure.
+    pub fn update(&mut self, data: &[u8]) -> Result<(), crate::provider::ProviderError> {
+        self.state.update(data)
+    }
+
+    /// The digest of all absorbed bytes.
+    ///
+    /// # Errors
+    /// Returns the provider's finalization failure or a wrong output width.
+    pub fn finish(mut self) -> Result<DigestOutput, crate::provider::ProviderError> {
+        finish_digest(self.algorithm, &mut *self.state)
+    }
+}
+
 /// The longest digest any `XMLDSig` algorithm produces, in bytes.
 pub const MAX_DIGEST_OUTPUT: usize = 64;
 

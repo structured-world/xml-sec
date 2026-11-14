@@ -16,7 +16,7 @@ use structured_asn1::Parser;
 use structured_asn1::memory::{Memory, MemoryAccount};
 use structured_pkix::PublicKeyInfo;
 use structured_pkix::key::{dsa, ec, rsa};
-use structured_pkix::path::WorkingKey;
+use structured_pkix::path::EffectiveKey;
 use xml_sec::policy::{VerificationPolicy, VerificationTrustMode};
 use xml_sec::provider::{
     CryptoProvider, DigestState, KdfParameters, ProviderCapability, ProviderError,
@@ -342,7 +342,7 @@ fn a_dsa_key_value_reaches_the_provider_as_its_canonical_spki() {
     // Dss-Parms of RFC 3279 section 2.3.2, byte for byte the fixture's DER;
     // its 256-bit q fixes the 64-octet DSA-SHA256 value.
     let (p, q, g, y) = with_key(&spki(DSA_PUBLIC_KEY), |info, memory| {
-        let key = dsa::read(WorkingKey::standing(info), memory).expect("a DSA key");
+        let key = dsa::read(EffectiveKey::standing(info), memory).expect("a DSA key");
         let parameters = key.parameters().expect("written parameters");
         (
             parameters.p().as_bytes().to_vec(),
@@ -379,7 +379,7 @@ fn an_ec_key_value_reaches_the_provider_as_its_canonical_spki() {
     // ECKeyValue with a named curve (XMLDSig 1.1 section 4.5.2.3) becomes the
     // id-ecPublicKey SPKI of RFC 5480 section 2, byte for byte the fixture's.
     let point = with_key(&spki(EC_PUBLIC_KEY), |info, memory| {
-        ec::read(WorkingKey::standing(info), memory)
+        ec::read(EffectiveKey::standing(info), memory)
             .expect("an EC key")
             .as_bytes()
             .to_vec()

@@ -6,7 +6,7 @@ dependency/safety and coverage jobs. A green subset is not complete qualificatio
 
 ## Coverage
 
-Install cargo-llvm-cov 0.8.5, cargo-nextest and the Rust toolchain's
+Install the current cargo-llvm-cov, cargo-nextest and the Rust toolchain's
 `llvm-tools-preview` component. Provision the [isolated SoftHSM harness](crypto-providers.md)
 and pinned [XML security](features.md) and [XSLT oracles](xslt-conformance.md), then run:
 

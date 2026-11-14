@@ -1354,7 +1354,17 @@ fn prepare_signing_key_candidate_inner(
         )?;
         inventory.signing_key_with_provider(name, algorithm, policy, provider)?
     } else {
-        key_material::decode_signing_key(Path::new(path), &key_bytes, format, algorithm, password)?
+        // Earlier candidates stay charged: decoding may use only what the
+        // operation has left.
+        let remaining = remaining_workspace(resources, material_budget, key_bytes.len())?;
+        key_material::decode_signing_key(
+            Path::new(path),
+            &key_bytes,
+            format,
+            algorithm,
+            password,
+            &remaining,
+        )?
     };
     validate_signing_key(key.as_ref(), algorithm, policy)
         .map_err(|error| CommandError::Signature(error.to_string()))?;
@@ -2213,17 +2223,8 @@ fn import_explicit_private_key(
     import: &key_material::PrivateKeyImport<'_>,
     budget: &ExternalMaterialBudget,
 ) -> Result<(), CommandError> {
-    // Container normalization is provider-independent. Already charged material
-    // stays live; the importer may use only the remaining operation workspace.
-    debug_assert!(budget.total_bytes >= bytes.len());
-    let mut remaining = import.resources.clone();
-    remaining.max_external_resource_total_bytes = remaining
-        .max_external_resource_total_bytes
-        .min(budget.maximum_bytes)
-        .checked_sub(budget.total_bytes - bytes.len())
-        .ok_or(CommandError::ExternalMaterialTooLarge {
-            maximum: budget.maximum_bytes,
-        })?;
+    // Container normalization is provider-independent.
+    let remaining = remaining_workspace(import.resources, budget, bytes.len())?;
     key_material::import_private_key(
         inventory,
         bytes,
@@ -2237,6 +2238,26 @@ fn import_explicit_private_key(
         error => CommandError::Key(error),
     })?;
     Ok(())
+}
+
+/// `resources` with the aggregate allowance cut to what the operation has
+/// left: material already charged to `budget` stays live, except the
+/// `source` bytes being decoded, which the importer counts itself.
+fn remaining_workspace(
+    resources: &ResourcePolicy,
+    budget: &ExternalMaterialBudget,
+    source: usize,
+) -> Result<ResourcePolicy, CommandError> {
+    debug_assert!(budget.total_bytes >= source);
+    let mut remaining = resources.clone();
+    remaining.max_external_resource_total_bytes = remaining
+        .max_external_resource_total_bytes
+        .min(budget.maximum_bytes)
+        .checked_sub(budget.total_bytes - source)
+        .ok_or(CommandError::ExternalMaterialTooLarge {
+            maximum: budget.maximum_bytes,
+        })?;
+    Ok(remaining)
 }
 
 fn read_key_material_with_budget(
@@ -2265,20 +2286,15 @@ fn read_key_material_with_budget(
 fn lax_candidate_error_is_recoverable(error: &CommandError) -> bool {
     // Lax lookup may skip an unusable candidate, not an invocation-wide
     // resource failure or a failed protected-container authentication.
-    !matches!(
-        error,
+    match error {
         CommandError::Policy(_)
-            | CommandError::ExternalMaterialTooLarge { .. }
-            | CommandError::KeyStore(
-                key_manager::KeyStoreError::ProtectedContainer
-                    | key_manager::KeyStoreError::Policy(_)
-            )
-            | CommandError::Key(
-                key_material::KeyMaterialError::ProtectedContainer
-                    | key_material::KeyMaterialError::PrivateKeyComponents(_)
-                    | key_material::KeyMaterialError::Policy(_)
-            )
-    )
+        | CommandError::ExternalMaterialTooLarge { .. }
+        | CommandError::KeyStore(
+            key_manager::KeyStoreError::ProtectedContainer | key_manager::KeyStoreError::Policy(_),
+        ) => false,
+        CommandError::Key(error) => error.is_candidate_miss(),
+        _ => true,
+    }
 }
 
 fn push_configured_certificate(certificates: &mut Vec<Vec<u8>>, certificate: Vec<u8>) {
@@ -5038,12 +5054,15 @@ fn load_recipient_private_key(
             parsing,
         );
     }
+    // Earlier recipient keys stay charged: normalization may use only what
+    // the operation has left.
+    let remaining = remaining_workspace(resources, budget, bytes.len())?;
     let private_key = key_material::decode_rsa_private_with_inventory(
         Path::new(path),
         &bytes,
         private_key_format(option),
         command.invocation.password_bytes(),
-        resources,
+        &remaining,
         inventory,
     )?;
     if !certificate_paths.is_empty() {

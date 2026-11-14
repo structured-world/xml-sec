@@ -55,7 +55,7 @@ impl<W: Work> VerifiedSession<'_, '_, '_, W> {
     pub fn with_key_association_in<Q: Work, R, E>(
         &self,
         signature: NodeIdentity,
-        expected: structured_pkix::path::WorkingKey<'_>,
+        expected: structured_pkix::path::EffectiveKey<'_>,
         work: &Q,
         visitor: impl FnOnce(KeyAssociation) -> Result<R, E>,
     ) -> Result<R, CatalogueError<E>> {
@@ -96,7 +96,7 @@ impl<W: Work> VerifiedSession<'_, '_, '_, W> {
         &self,
         index: usize,
         receipt: &SelectedKeyReceipt<'_>,
-        expected: structured_pkix::path::WorkingKey<'_>,
+        expected: structured_pkix::path::EffectiveKey<'_>,
         work: &Q,
     ) -> Result<KeyAssociation, DsigError> {
         work.charge_work(1)?;
@@ -162,7 +162,7 @@ impl<W: Work, Q: Work> SelectedSignature<'_, '_, '_, '_, W, Q> {
     pub fn associate_key<R, E>(
         &self,
         receipt: &SelectedKeyReceipt<'_>,
-        expected: structured_pkix::path::WorkingKey<'_>,
+        expected: structured_pkix::path::EffectiveKey<'_>,
         visitor: impl FnOnce(KeyAssociation) -> Result<R, E>,
     ) -> Result<R, CatalogueError<E>> {
         self.signature_method()
