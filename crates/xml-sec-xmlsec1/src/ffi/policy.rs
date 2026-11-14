@@ -116,6 +116,8 @@ pub(crate) struct Spent {
     pub(crate) base64_output: usize,
     /// Octets read from external resources through the input callbacks.
     pub(crate) external_resources: usize,
+    /// Octets handed to the XML parser, of `max_xml_parse_work_bytes`.
+    pub(crate) xml_parse: usize,
 }
 
 /// The key candidates one `KeyInfo` read has inspected of the policy's

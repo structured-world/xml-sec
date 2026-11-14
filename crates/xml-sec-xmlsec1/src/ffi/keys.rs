@@ -1528,41 +1528,57 @@ pub(crate) unsafe extern "C" fn xmlSecKeyReadBuffer(
             c"buffer != NULL",
             std::ptr::null_mut()
         );
-        let here = here!("xmlSecKeyReadBuffer");
-        // SAFETY: a klass and a buffer; the key and context are released on
-        // every failure.
+        // SAFETY: a klass and a buffer holding its size in bytes.
         unsafe {
-            let name = klass_name(data_id).cast();
-            let key = xmlSecKeyCreate();
-            if key.is_null() {
-                errors::internal(here, name, c"xmlSecKeyCreate");
-                return key;
-            }
-            let mut ctx = std::mem::MaybeUninit::<super::keyinfo::XmlSecKeyInfoCtx>::uninit();
-            let ctx = ctx.as_mut_ptr();
-            if super::keyinfo::xmlSecKeyInfoCtxInitialize(ctx, std::ptr::null_mut()) < 0 {
-                errors::internal(here, name, c"xmlSecKeyInfoCtxInitialize");
-                xmlSecKeyDestroy(key);
-                return std::ptr::null_mut();
-            }
-            // xmlSecKeyDataTypeAny.
-            (*ctx).key_req.key_type = 0xFFFF;
-            let read = super::keysdata::xmlSecKeyDataBinRead(
+            read_bytes(
                 data_id,
-                key.cast(),
                 super::buffer::xmlSecBufferGetData(buffer),
                 super::buffer::xmlSecBufferGetSize(buffer),
-                ctx.cast(),
-            );
-            super::keyinfo::xmlSecKeyInfoCtxFinalize(ctx);
-            if read < 0 {
-                errors::internal(here, name, c"xmlSecKeyDataBinRead");
-                xmlSecKeyDestroy(key);
-                return std::ptr::null_mut();
-            }
-            key
+            )
         }
     })
+}
+
+/// [`xmlSecKeyReadBuffer`] of `size` bytes at `data`, reporting as it does.
+/// The klass bounds `size` by the policy before it reads a byte, so the
+/// caller's bytes are handed over in place, never copied first.
+///
+/// # Safety
+/// `data_id` is a klass; `data` holds `size` bytes.
+unsafe fn read_bytes(
+    data_id: *const XmlSecKeyDataKlass,
+    data: *const u8,
+    size: usize,
+) -> *mut XmlSecKey {
+    let here = here!("xmlSecKeyReadBuffer");
+    // SAFETY: a klass and `size` bytes; the key and context are released on
+    // every failure.
+    unsafe {
+        let name = klass_name(data_id).cast();
+        let key = xmlSecKeyCreate();
+        if key.is_null() {
+            errors::internal(here, name, c"xmlSecKeyCreate");
+            return key;
+        }
+        let mut ctx = std::mem::MaybeUninit::<super::keyinfo::XmlSecKeyInfoCtx>::uninit();
+        let ctx = ctx.as_mut_ptr();
+        if super::keyinfo::xmlSecKeyInfoCtxInitialize(ctx, std::ptr::null_mut()) < 0 {
+            errors::internal(here, name, c"xmlSecKeyInfoCtxInitialize");
+            xmlSecKeyDestroy(key);
+            return std::ptr::null_mut();
+        }
+        // xmlSecKeyDataTypeAny.
+        (*ctx).key_req.key_type = 0xFFFF;
+        let read =
+            super::keysdata::xmlSecKeyDataBinRead(data_id, key.cast(), data, size, ctx.cast());
+        super::keyinfo::xmlSecKeyInfoCtxFinalize(ctx);
+        if read < 0 {
+            errors::internal(here, name, c"xmlSecKeyDataBinRead");
+            xmlSecKeyDestroy(key);
+            return std::ptr::null_mut();
+        }
+        key
+    }
 }
 
 /// `xmlSecKeyReadMemory`: [`xmlSecKeyReadBuffer`] of `data_size` bytes of
@@ -1595,27 +1611,19 @@ pub(crate) unsafe extern "C" fn xmlSecKeyReadMemory(
             c"dataSize > 0",
             std::ptr::null_mut()
         );
-        let here = here!("xmlSecKeyReadMemory");
-        // SAFETY: a klass and `data_size` bytes; the buffer is finalized on
-        // every path.
+        // libxmlsec1 copies the bytes into a buffer first; reading them in
+        // place lets the policy refuse an oversized input before anything
+        // is allocated for it. The reports are libxmlsec1's.
+        // SAFETY: a klass and `data_size` bytes.
         unsafe {
-            let name = klass_name(data_id).cast();
-            let mut buffer = std::mem::MaybeUninit::<super::buffer::XmlSecBuffer>::uninit();
-            let buffer = buffer.as_mut_ptr();
-            if super::buffer::xmlSecBufferInitialize(buffer, 0) < 0 {
-                errors::internal(here, name, c"xmlSecBufferInitialize");
-                return std::ptr::null_mut();
-            }
-            if super::buffer::xmlSecBufferAppend(buffer, data, data_size) < 0 {
-                errors::internal(here, name, c"xmlSecBufferAppend");
-                super::buffer::xmlSecBufferFinalize(buffer);
-                return std::ptr::null_mut();
-            }
-            let key = xmlSecKeyReadBuffer(data_id, buffer);
+            let key = read_bytes(data_id, data, data_size);
             if key.is_null() {
-                errors::internal(here, name, c"xmlSecKeyReadBuffer");
+                errors::internal(
+                    here!("xmlSecKeyReadMemory"),
+                    klass_name(data_id).cast(),
+                    c"xmlSecKeyReadBuffer",
+                );
             }
-            super::buffer::xmlSecBufferFinalize(buffer);
             key
         }
     })

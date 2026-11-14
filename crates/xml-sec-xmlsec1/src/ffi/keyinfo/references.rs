@@ -24,8 +24,8 @@ use super::super::strings::{
 };
 use super::super::transforms::XmlSecTransformCtx;
 use super::super::transforms::ctx::{
-    run_spent, seed_run, xmlSecTransformCtxExecute, xmlSecTransformCtxNodesListRead,
-    xmlSecTransformCtxReset, xmlSecTransformCtxSetUri,
+    charge, parse_work, run_spent, seed_run, xmlSecTransformCtxExecute,
+    xmlSecTransformCtxNodesListRead, xmlSecTransformCtxReset, xmlSecTransformCtxSetUri,
 };
 use super::super::tree::{XmlDoc, XmlNode, nodes};
 use super::super::xmltree::{xmlSecCheckNodeName, xmlSecGetNextElementNode};
@@ -209,7 +209,9 @@ unsafe fn dereference(
 }
 
 /// The document `context`'s result parses into, recovering as libxmlsec1
-/// parses it; null after a report.
+/// parses it; null after a report. Its octets are charged to the read's
+/// parse work first, so references reparsing the same target, siblings
+/// included, cannot parse past the operation's allowance.
 ///
 /// # Safety
 /// `context` holds a result.
@@ -218,6 +220,7 @@ unsafe fn result_document(
     object: *const std::ffi::c_char,
     context: *mut XmlSecTransformCtx,
     pinned: &policy::Pinned,
+    spent: Option<&Cell<policy::Spent>>,
 ) -> *mut XmlDoc {
     // SAFETY: by the caller's contract.
     unsafe {
@@ -230,6 +233,14 @@ unsafe fn result_document(
         if c_int::try_from(size).is_err() {
             errors::size_to_int_impossible(here, size);
             return std::ptr::null_mut();
+        }
+        let mut total = spent.map_or_default(Cell::get);
+        let limit = parse_work(&pinned.verification.resources);
+        if charge(&mut total.xml_parse, size, limit, here, object).is_none() {
+            return std::ptr::null_mut();
+        }
+        if let Some(spent) = spent {
+            spent.set(total);
         }
         // libxmlsec1 parses with its options and XML_PARSE_RECOVER; the
         // parser recovers from nothing, so malformed retrieved XML is
@@ -406,7 +417,13 @@ unsafe fn read_retrieved_xml(
     // SAFETY: by the caller's contract; the document is freed here.
     unsafe {
         let object = klass_name(type_id);
-        let doc = result_document(here, object, context, pinned);
+        let doc = result_document(
+            here,
+            object,
+            context,
+            pinned,
+            policy::spent((*ctx).reserved0),
+        );
         if doc.is_null() {
             return -1;
         }
@@ -586,7 +603,13 @@ unsafe fn dereference_key_info(
         // XMLDSig 1.1 4.5.10: the result is a KeyInfo element or a document
         // with a KeyInfo root. The unknown type is reported as a null object.
         let inner = here!("xmlSecKeyDataKeyInfoReferenceReadXmlResult");
-        let doc = result_document(inner, std::ptr::null(), context, pinned);
+        let doc = result_document(
+            inner,
+            std::ptr::null(),
+            context,
+            pinned,
+            policy::spent((*ctx).reserved0),
+        );
         let result =
             if doc.is_null() {
                 -1

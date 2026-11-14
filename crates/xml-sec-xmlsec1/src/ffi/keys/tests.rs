@@ -32,6 +32,49 @@ unsafe fn hmac_key(name: &CStr) -> *mut super::XmlSecKey {
     }
 }
 
+/// The reasons of the reports received, in order.
+static REASONS: std::sync::Mutex<Vec<std::ffi::c_int>> = std::sync::Mutex::new(Vec::new());
+
+unsafe extern "C" fn record(
+    _file: *const std::ffi::c_char,
+    _line: std::ffi::c_int,
+    _func: *const std::ffi::c_char,
+    _object: *const std::ffi::c_char,
+    _subject: *const std::ffi::c_char,
+    reason: std::ffi::c_int,
+    _message: *const std::ffi::c_char,
+) {
+    REASONS.lock().expect("reasons").push(reason);
+}
+
+#[test]
+fn key_bytes_over_the_resource_limit_are_refused_before_any_copy() {
+    crate::ffi::tests::own_process();
+    // The size the caller states is checked against the policy before its
+    // bytes are touched: a length no allocation could hold is refused for
+    // the limit, not after an attempt to copy it into a buffer.
+    let byte = [0x5a_u8];
+    // SAFETY: the callback has the callback's signature; the size check
+    // precedes any read of the one real byte.
+    unsafe {
+        crate::ffi::errors::xmlSecErrorsSetCallback(Some(
+            record as crate::ffi::errors::ErrorsCallback,
+        ));
+        REASONS.lock().expect("reasons").clear();
+        let key = super::xmlSecKeyReadMemory(symkeys::hmac(), byte.as_ptr(), 1 << 60);
+        assert!(key.is_null());
+    }
+    let reasons = REASONS.lock().expect("reasons").clone();
+    assert!(
+        reasons.contains(&crate::ffi::errors::R_INVALID_SIZE),
+        "{reasons:?}"
+    );
+    assert!(
+        !reasons.contains(&crate::ffi::errors::R_MALLOC_FAILED),
+        "{reasons:?}"
+    );
+}
+
 #[test]
 fn a_use_with_record_copied_onto_itself_keeps_its_strings() {
     // The setter frees the strings it is given before reading them.

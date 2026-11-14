@@ -13,7 +13,7 @@ use super::super::parser::parse_under;
 use super::super::policy;
 use super::super::tree::XmlDoc;
 use super::builtin::klass;
-use super::ctx::{Limit, charge, run_scope};
+use super::ctx::{Limit, charge, parse_work, run_budget, run_scope};
 use super::io::bounded_input_buffer;
 use super::{
     STATUS_FINISHED, STATUS_NONE, STATUS_WORKING, USAGE_DSIG_TRANSFORM, WithContext,
@@ -162,6 +162,18 @@ unsafe extern "C" fn push_bin(
         if last == 0 {
             return 0;
         }
+        let spent = &mut run_budget(ctx).xml_parse;
+        if charge(
+            spent,
+            pushed.len(),
+            parse_work(operation.resources()),
+            here,
+            name(),
+        )
+        .is_none()
+        {
+            return -1;
+        }
         let doc =
             policy::with_document_policy!(operation, |policy| parse_under(pushed, here, policy));
         if doc.is_null() {
@@ -248,6 +260,18 @@ unsafe extern "C" fn pop_xml(
             errors::xml_failed(here, name(), c"xmlParserInputBufferRead");
             return -1;
         };
+        let spent = &mut run_budget(ctx).xml_parse;
+        if charge(
+            spent,
+            bytes.len(),
+            parse_work(operation.resources()),
+            here,
+            name(),
+        )
+        .is_none()
+        {
+            return -1;
+        }
         let doc =
             policy::with_document_policy!(operation, |policy| parse_under(&bytes, here, policy));
         if doc.is_null() {

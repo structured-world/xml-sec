@@ -77,6 +77,8 @@ pub(crate) struct RunBudget {
     pub(crate) base64_output: usize,
     /// Octets read from external resources through the input callbacks.
     pub(crate) external_resources: usize,
+    /// Octets handed to the XML parser, of `max_xml_parse_work_bytes`.
+    pub(crate) xml_parse: usize,
     /// The policy revision of the run, pinned at its first read or handed
     /// down by the `KeyInfo` read that runs the chain.
     policy: Option<policy::Pinned>,
@@ -171,6 +173,7 @@ pub(crate) unsafe fn seed_run(
     run.base64_input = spent.base64_input;
     run.base64_output = spent.base64_output;
     run.external_resources = spent.external_resources;
+    run.xml_parse = spent.xml_parse;
 }
 
 /// What the run of `ctx` has spent; nothing when no run has started.
@@ -184,6 +187,7 @@ pub(crate) unsafe fn run_spent(ctx: *mut XmlSecTransformCtx) -> policy::Spent {
             base64_input: run.base64_input,
             base64_output: run.base64_output,
             external_resources: run.external_resources,
+            xml_parse: run.xml_parse,
         },
         None => policy::Spent::default(),
     }
@@ -209,6 +213,17 @@ pub(crate) unsafe fn run_budget<'a>(ctx: *mut XmlSecTransformCtx) -> &'a mut Run
 pub(crate) struct Limit {
     pub(crate) name: &'static str,
     pub(crate) max: usize,
+}
+
+/// The operation's XML parse-work allowance: every octet handed to the
+/// parser is charged before it parses, as the core charges one parse-work
+/// budget across a whole operation, retrieved and reparsed documents
+/// included.
+pub(crate) fn parse_work(resources: &xml_sec::policy::ResourcePolicy) -> Limit {
+    Limit {
+        name: "max_xml_parse_work_bytes",
+        max: resources.max_xml_parse_work_bytes,
+    }
 }
 
 /// Charges `amount` to `spent` within `limit`; refused, and reported for

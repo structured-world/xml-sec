@@ -29,7 +29,7 @@ use super::keys::{
 use super::keysdata::{
     USAGE_KEY_INFO_NODE, USAGE_KEY_VALUE_NODE, USAGE_READ_FROM_FILE,
     USAGE_RETRIEVAL_METHOD_NODE_XML, XmlSecKeyData, XmlSecKeyDataKlass, check_id, data_valid,
-    xmlSecKeyDataCreate, xmlSecKeyDataDestroy, xmlSecKeyDataGetSize,
+    xmlSecKeyDataCreate, xmlSecKeyDataDestroy, xmlSecKeyDataGetSize, xmlSecKeyDataGetType,
 };
 use super::strings::{
     xmlSecAttrURI, xmlSecDSig11Ns, xmlSecDSigNs, xmlSecHrefDSAKeyValue, xmlSecHrefECKeyValue,
@@ -818,11 +818,13 @@ unsafe fn der_adopt(
     }
 }
 
-/// Makes `data` the value of `key` when it meets `req`; a value the
-/// requirements refuse is released and the key keeps none, so a later
-/// candidate of the same `KeyInfo` can still supply it. libxmlsec1 installs
-/// the first value whatever it is and then fails the next reader with "key
-/// already has a value".
+/// Makes `data` the value of `key` when it meets `req`: its klass, size and
+/// key type (a public value is no answer to a request for a private key). A
+/// value the requirements refuse is released and the key keeps none, so a
+/// later candidate of the same `KeyInfo`, a `KeyName` naming a stored
+/// private key included, can still supply it. libxmlsec1 installs the first
+/// value whatever it is and then fails the next reader with "key already
+/// has a value".
 ///
 /// # Safety
 /// `key` is a key without a value, `data` key data it may adopt, `req`
@@ -836,7 +838,9 @@ unsafe fn install_value(
 ) -> c_int {
     // SAFETY: by the caller's contract.
     unsafe {
-        if xmlSecKeyReqMatchKeyValue(req, data) != 1 {
+        let wanted = (*req).key_type;
+        let typed = wanted == TYPE_UNKNOWN || xmlSecKeyDataGetType(data) & wanted != 0;
+        if !typed || xmlSecKeyReqMatchKeyValue(req, data) != 1 {
             xmlSecKeyDataDestroy(data);
             return 0;
         }

@@ -657,6 +657,41 @@ fn the_references_of_one_read_share_its_resource_budget() {
 }
 
 #[test]
+fn the_references_of_one_read_share_its_parse_work_budget() {
+    // Every same-document KeyInfoReference reparses its keyless target; each
+    // parse fits the parse-work limit, but one read may not parse past it
+    // across all of them, however many sibling references it holds.
+    own_process();
+    policy::republish(
+        |verification| verification.resources.max_xml_parse_work_bytes = 1024,
+        |_| {},
+    )
+    .expect("the library policy compiles");
+    let read = |references: usize| {
+        let xml = format!(
+            "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\" \
+             xmlns:dsig11=\"http://www.w3.org/2009/xmldsig11#\">\
+             <KeyInfo xml:id=\"t\"/>{}</KeyInfo>",
+            "<dsig11:KeyInfoReference URI=\"#t\"/>".repeat(references)
+        );
+        // SAFETY: a context created and destroyed here.
+        unsafe {
+            let ctx = xmlSecKeyInfoCtxCreate(std::ptr::null_mut());
+            let result = read_reported(&xml, ctx);
+            xmlSecKeyInfoCtxDestroy(ctx);
+            result
+        }
+    };
+    // SAFETY: the built-in klasses are registered once.
+    unsafe { assert_eq!(xmlSecKeyDataIdsInit(), 0) };
+    assert_eq!(read(1).0, 0, "one reparse fits the limit");
+    let (result, reasons) = read(50);
+    assert_eq!(result, -1, "fifty reparses pass the limit");
+    assert!(reasons.contains(&errors::R_INVALID_SIZE), "{reasons:?}");
+    assert_eq!(read(1).0, 0, "a new read starts afresh");
+}
+
+#[test]
 fn a_key_reference_opens_its_uri_under_the_key_reference_classes() {
     // A policy admitting external key references while keeping a
     // signature's references in the document still reads the key
@@ -733,6 +768,40 @@ fn a_key_value_the_requirements_refuse_leaves_the_key_for_a_later_one() {
         xmlSecKeyInfoCtxDestroy(ctx);
         xsFreeDoc(ec);
         xsFreeDoc(rsa);
+    }
+}
+
+#[test]
+fn a_public_value_is_not_installed_when_a_private_key_is_required() {
+    // Signing asks for a private key: a public KeyValue does not become the
+    // key's value, so a KeyName after it can still fetch the private key the
+    // manager holds instead of finding the key already filled.
+    const RSA: &str = include_str!("../../../../../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    let body: String = RSA
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect();
+    let doc = parse(&format!(
+        "<DEREncodedKeyValue xmlns=\"http://www.w3.org/2009/xmldsig11#\">{body}</DEREncodedKeyValue>"
+    ));
+    // SAFETY: objects created and destroyed here.
+    unsafe {
+        assert_eq!(xmlSecKeyDataIdsInit(), 0);
+        let ctx = xmlSecKeyInfoCtxCreate(std::ptr::null_mut());
+        (*ctx).key_req.key_id = asymkeys::rsa().cast();
+        (*ctx).key_req.key_type = crate::ffi::keys::TYPE_PRIVATE;
+        let key = xmlSecKeyCreate();
+        let read = xmlSecKeyDataXmlRead(
+            asymkeys::der_encoded_key_value(),
+            key.cast(),
+            xsDocGetRootElement(doc).cast(),
+            ctx.cast(),
+        );
+        assert_eq!(read, 0);
+        assert!(xmlSecKeyGetValue(key).is_null());
+        xmlSecKeyDestroy(key);
+        xmlSecKeyInfoCtxDestroy(ctx);
+        xsFreeDoc(doc);
     }
 }
 
