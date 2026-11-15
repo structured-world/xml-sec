@@ -161,39 +161,44 @@ const MESSAGE_CAPACITY: usize = 1024;
 /// The message a format that cannot be expanded reports instead.
 const FATAL: &CStr = c"Can not format error message";
 
-/// A callback slot: whether it was set, and the callback set (null disables
-/// reporting). Unset, the system slot holds the default callback.
+/// The address that marks a slot as never set; no callback has it.
+static UNSET: u8 = 0;
+
+/// A callback slot in one atomic word, so a store and a clear from different
+/// threads each replace the whole setting: never set ([`UNSET`]'s address),
+/// set to null (reporting disabled), or set to a callback. Unset, the system
+/// slot holds the default callback.
 struct Slot {
-    set: AtomicBool,
-    callback: AtomicPtr<c_void>,
+    setting: AtomicPtr<c_void>,
 }
 
 impl Slot {
     const fn new() -> Self {
         Self {
-            set: AtomicBool::new(false),
-            callback: AtomicPtr::new(std::ptr::null_mut()),
+            setting: AtomicPtr::new(Self::unset()),
         }
+    }
+
+    const fn unset() -> *mut c_void {
+        (&raw const UNSET).cast::<c_void>().cast_mut()
     }
 
     fn store(&self, callback: Option<ErrorsCallback>) {
         let pointer = callback.map_or(std::ptr::null_mut(), |callback| callback as *mut c_void);
-        self.callback.store(pointer, Ordering::Relaxed);
-        self.set.store(true, Ordering::Release);
+        self.setting.store(pointer, Ordering::Release);
     }
 
     /// Returns the slot to never set.
     fn clear(&self) {
-        self.set.store(false, Ordering::Release);
-        self.callback.store(std::ptr::null_mut(), Ordering::Relaxed);
+        self.setting.store(Self::unset(), Ordering::Release);
     }
 
     /// What the slot holds.
     fn load(&self) -> Setting {
-        if !self.set.load(Ordering::Acquire) {
+        let pointer = self.setting.load(Ordering::Acquire);
+        if pointer == Self::unset() {
             return Setting::Unset;
         }
-        let pointer = self.callback.load(Ordering::Relaxed);
         if pointer.is_null() {
             return Setting::Set(None);
         }

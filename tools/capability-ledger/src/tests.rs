@@ -1,5 +1,18 @@
 use super::*;
 
+#[test]
+fn sanitized_code_keeps_every_line_of_a_continued_literal() {
+    // Export detection indexes the sanitized text by physical line, so a
+    // string literal continued with a backslash-newline keeps its newline
+    // and the export after it stays on its own line.
+    let header = "#define XMLSEC_TEXT \"first\\\nsecond\"\nXMLSEC_EXPORT int xmlSecAfter(void);\n";
+    let code = sanitize_c(header);
+    let lines: Vec<_> = code.lines().collect();
+    assert_eq!(lines.len(), header.lines().count());
+    assert!(lines[2].contains("XMLSEC_EXPORT"), "{lines:?}");
+    assert!(!lines[1].contains("XMLSEC_EXPORT"), "{lines:?}");
+}
+
 fn evidence() -> BTreeMap<String, Evidence> {
     BTreeMap::from([(
         "test".into(),

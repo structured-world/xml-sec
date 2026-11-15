@@ -7,7 +7,7 @@ use std::ffi::c_int;
 use crate::ffi::tests::own_process;
 
 use super::super::super::app::key_load_memory;
-use super::super::super::buffer::{xmlSecBufferGetData, xmlSecBufferGetSize};
+use super::super::super::buffer::{xmlSecBufferAppend, xmlSecBufferGetData, xmlSecBufferGetSize};
 use super::super::super::keys::{XmlSecKey, xmlSecKeyDestroy};
 use super::super::super::policy;
 use super::super::ctx::{
@@ -15,8 +15,8 @@ use super::super::ctx::{
     xmlSecTransformCtxDestroy,
 };
 use super::super::{
-    OPERATION_SIGN, OPERATION_VERIFY, STATUS_OK, xmlSecTransformPushBin, xmlSecTransformSetKey,
-    xmlSecTransformVerify,
+    OPERATION_SIGN, OPERATION_VERIFY, STATUS_OK, xmlSecTransformExecute, xmlSecTransformPushBin,
+    xmlSecTransformSetKey, xmlSecTransformVerify,
 };
 use super::rsa_sha256;
 use xml_sec::policy::{Instant, PolicyValidity};
@@ -444,4 +444,42 @@ fn the_empty_message_is_signed_only_when_the_context_allows_it() {
         run_with_flags(allow, OPERATION_VERIFY, public_key(), &[], &value),
         Err(STATUS_OK)
     );
+}
+
+#[test]
+fn input_a_caller_buffered_itself_is_not_empty() {
+    // Bytes appended to the transform's input buffer and executed as the
+    // last chunk are input like pushed bytes: they are signed, not refused
+    // as empty, and give the signature pushing them gives.
+    let message = b"buffered by the caller";
+    let pushed = run(OPERATION_SIGN, private_key(), message, &[]).expect("pushed bytes sign");
+    // SAFETY: every object is created and released here.
+    let buffered = unsafe {
+        let ctx = xmlSecTransformCtxCreate();
+        let transform = xmlSecTransformCtxCreateAndAppend(ctx, rsa_sha256());
+        (*transform).operation = OPERATION_SIGN;
+        let key = private_key();
+        assert_eq!(xmlSecTransformSetKey(transform, key.cast()), 0);
+        assert_eq!(
+            xmlSecBufferAppend(
+                &raw mut (*transform).in_buf,
+                message.as_ptr(),
+                message.len()
+            ),
+            0
+        );
+        let executed = xmlSecTransformExecute(transform, 1, ctx);
+        let output = &raw mut (*transform).out_buf;
+        let signature = if executed == 0 {
+            std::slice::from_raw_parts(xmlSecBufferGetData(output), xmlSecBufferGetSize(output))
+                .to_vec()
+        } else {
+            Vec::new()
+        };
+        xmlSecTransformCtxDestroy(ctx);
+        xmlSecKeyDestroy(key);
+        assert_eq!(executed, 0, "buffered input is not empty");
+        signature
+    };
+    assert_eq!(buffered, pushed);
 }

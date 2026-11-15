@@ -1724,7 +1724,9 @@ fn sanitize_c(value: &str) -> String {
                 output.push(' ');
             }
         } else if let Some(delimiter) = quote {
-            output.push(' ');
+            // A literal continued with a backslash-newline keeps its line
+            // break, so the output stays line for line with the input.
+            output.push(if ch == '\n' { '\n' } else { ' ' });
             if escaped {
                 escaped = false;
             } else if ch == '\\' {
