@@ -476,6 +476,18 @@ pub(crate) unsafe extern "C" fn xmlSecReplaceContent(
     unsafe { xmlSecReplaceContentAndReturn(node, new_node, std::ptr::null_mut()) }
 }
 
+/// Whether `ancestor` is a proper ancestor of `node`.
+fn is_descendant(node: *const XmlNode, ancestor: *const XmlNode) -> bool {
+    let mut current = nodes::parent(node);
+    while !current.is_null() {
+        if std::ptr::eq(current, ancestor) {
+            return true;
+        }
+        current = nodes::parent(current);
+    }
+    false
+}
+
 /// `xmlSecReplaceContentAndReturn`: makes `new_node` the content of `node`;
 /// the previous children go to `replaced` as an unlinked sibling list, which
 /// the caller frees with `xmlFreeNodeList`, or are freed when it is null.
@@ -501,12 +513,36 @@ pub(crate) unsafe extern "C" fn xmlSecReplaceContentAndReturn(
             c"newNode != NULL",
             -1
         );
+        check!(
+            !std::ptr::eq(node, new_node),
+            "xmlSecReplaceContentAndReturn",
+            c"node != newNode",
+            -1
+        );
+        // Neither node may be a descendant of the other: `new_node` above
+        // `node` would move `node` out of its place, and a child of `node`
+        // would be freed with the content it is meant to replace.
+        if is_descendant(node, new_node) {
+            errors::invalid_data(
+                here!("xmlSecReplaceContentAndReturn"),
+                std::ptr::null(),
+                "node is a descendant of newNode",
+            );
+            return -1;
+        }
+        if is_descendant(new_node, node) {
+            errors::invalid_data(
+                here!("xmlSecReplaceContentAndReturn"),
+                std::ptr::null(),
+                "newNode is a descendant of node",
+            );
+            return -1;
+        }
         // The link must be possible before anything moves: only an element
         // or the document holds children the serialization writes; a node of
-        // another document, an attribute, namespace or document node, `node`
-        // itself or an ancestor of it could not become the content, and
-        // unlinking it first would lose the old content or move `node` out
-        // of its place.
+        // another document or an attribute, namespace or document node could
+        // not become the content, and unlinking it first would lose the old
+        // content.
         let destination = nodes::kind(node);
         let linkable = (destination == XML_ELEMENT_NODE || destination == XML_DOCUMENT_NODE)
             && nodes::tree_node(new_node).is_some()
@@ -519,17 +555,6 @@ pub(crate) unsafe extern "C" fn xmlSecReplaceContentAndReturn(
             );
             return -1;
         }
-        let mut ancestor = node;
-        while !ancestor.is_null() {
-            if std::ptr::eq(ancestor, new_node) {
-                errors::assertion(
-                    here!("xmlSecReplaceContentAndReturn"),
-                    c"newNode is not node or an ancestor of it",
-                );
-                return -1;
-            }
-            ancestor = nodes::parent(ancestor);
-        }
         if !std::ptr::eq(nodes::doc(new_node), nodes::doc(node)) {
             errors::xml_failed(
                 here!("xmlSecReplaceContentAndReturn"),
@@ -541,8 +566,7 @@ pub(crate) unsafe extern "C" fn xmlSecReplaceContentAndReturn(
         // SAFETY: handles are validated by each call; `replaced` is writable
         // by the caller's contract.
         unsafe {
-            // libxmlsec1 links `new_node` alone. It is unlinked first: it may
-            // be one of the children about to be freed.
+            // libxmlsec1 links `new_node` alone, out of wherever it was.
             xsUnlinkNode(new_node);
             let former = nodes::unlink_children(node);
             if replaced.is_null() {

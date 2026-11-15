@@ -151,6 +151,9 @@ static void replacing(void) {
     xsFreeNodeList(replaced);
     printf("  content freed: %d\n", xmlSecReplaceContent(xsNodeGetNext(xsNodeGetChildren(root)),
                                                          xsNewDocText(doc, BAD_CAST "plain")));
+    /* neither node may be a descendant of the other */
+    printf("  own child: %d\n", xmlSecReplaceContent(root, xsNodeGetChildren(root)));
+    printf("  own ancestor: %d\n", xmlSecReplaceContent(xsNodeGetChildren(root), root));
     printf("  buffer: %d\n", xmlSecReplaceNodeBuffer(xsNodeGetLast(root), BAD_CAST "<p>1</p><q/>", 12));
     printf("  bad buffer: %d\n", xmlSecReplaceNodeBuffer(xsNodeGetLast(root), BAD_CAST "<p>", 3));
     replaced = NULL;

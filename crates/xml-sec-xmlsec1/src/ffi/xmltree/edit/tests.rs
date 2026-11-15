@@ -76,23 +76,26 @@ fn replaced_content_comes_back_as_an_unlinked_run_of_siblings() {
 }
 
 #[test]
-fn a_child_can_become_the_whole_content_of_its_parent() {
-    // The new node may be one of the children it replaces: it is taken out
-    // before the others are freed, and stays as the only content.
-    let xml = "<r><a/><n>kept</n><b/></r>";
+fn a_descendant_cannot_become_the_content_of_its_ancestor() {
+    // A child or a deeper descendant of the element would be freed with the
+    // content it is meant to replace: the call fails and the element keeps
+    // its content.
+    let xml = "<r><a/><n>kept<g/></n><b/></r>";
     // SAFETY: handles are validated by each call; the document is freed once.
     unsafe {
         let doc = xmlSecParseMemory(xml.as_ptr(), xml.len(), 1);
         assert!(!doc.is_null(), "the document parses");
         let root = xsDocGetRootElement(doc);
         let child = nodes::next(nodes::first_child(root));
-        assert_eq!(
-            xmlSecReplaceContentAndReturn(root, child, std::ptr::null_mut()),
-            0
-        );
-        assert_eq!(nodes::first_child(root), child);
-        assert!(nodes::next(child).is_null());
-        assert_eq!(nodes::content(root).as_deref(), Some("kept"));
+        let grandchild = nodes::last_child(child);
+        for descendant in [child, grandchild] {
+            assert_eq!(
+                xmlSecReplaceContentAndReturn(root, descendant, std::ptr::null_mut()),
+                -1
+            );
+            assert_eq!(nodes::content(root).as_deref(), Some("kept"));
+            assert_eq!(nodes::parent(child), root);
+        }
         xsFreeDoc(doc);
     }
 }
