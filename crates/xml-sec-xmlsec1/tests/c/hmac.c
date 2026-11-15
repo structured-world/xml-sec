@@ -2,7 +2,7 @@
  * caller uses them: their identities, the key requirements, signing with an
  * HMAC key in full and truncated by HMACOutputLength (whole and partial last
  * byte), verifying a match, a wrong size and a wrong value, and the library's
- * minimum output length. Built against the pinned libxmlsec1 with its
+ * minimum output length. Built against the libxmlsec1 oracle with its
  * default crypto library and against this crate, both must print the same.
  * Refusals whose reports name the implementation's own checks print their
  * result only. */

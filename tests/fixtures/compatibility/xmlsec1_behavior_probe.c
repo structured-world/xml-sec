@@ -6,6 +6,7 @@
 #include <libxml/tree.h>
 
 #include <xmlsec/crypto.h>
+#include <xmlsec/dl.h>
 #include <xmlsec/xmldsig.h>
 #include <xmlsec/xmlsec.h>
 #include <xmlsec/xmltree.h>

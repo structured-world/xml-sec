@@ -2,8 +2,8 @@
  * uses them: the KeyInfo context, reading a KeyInfo element through the
  * KeyName and KeyValue klasses and a key-data klass of the program's own,
  * writing a template, the keys manager with the simple keys store, a store
- * klass of the program's own and data stores. Built against the pinned
- * libxmlsec1 and against this crate, both must print the same keys, trees
+ * klass of the program's own and data stores. Built against the libxmlsec1
+ * oracle and against this crate, both must print the same keys, trees
  * and reports. */
 
 #include <stdio.h>

@@ -4,7 +4,7 @@
  * formats a key cannot be read in, and signing with a loaded private key
  * through a transform context, verified with the loaded public key. The
  * program reads the key files and passes their bytes. Built against the
- * pinned libxmlsec1 with its default crypto library and against this crate,
+ * libxmlsec1 oracle with its default crypto library and against this crate,
  * both must print the same; the reports of failures whose wording belongs
  * to each implementation are hidden. */
 

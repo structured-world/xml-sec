@@ -1,5 +1,5 @@
-/* The Base64 codec as a libxmlsec1 caller sees it. Built against the pinned
- * libxmlsec1 and against this crate, both must print the same encodings,
+/* The Base64 codec as a libxmlsec1 caller sees it. Built against the
+ * libxmlsec1 oracle and against this crate, both must print the same encodings,
  * decodings, chunked streaming results and refusals. */
 
 #include <stdio.h>

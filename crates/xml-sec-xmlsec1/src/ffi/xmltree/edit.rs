@@ -155,7 +155,7 @@ pub(crate) unsafe extern "C" fn xmlSecAddChild(
             if !ns.is_null() {
                 let declared = namespace_for(cur, ns);
                 if declared.is_null() {
-                    // libxmlsec1 1.3.13 takes the element back.
+                    // libxmlsec1 takes the element back.
                     errors::xml_failed(here, std::ptr::null(), c"xmlNewNs");
                     xsUnlinkNode(cur);
                     xsFreeNode(cur);
@@ -223,7 +223,7 @@ enum Side {
 /// `xmlSecAddNextSibling` and `xmlSecAddPrevSibling`: a new element beside
 /// `node` with a line feed between them. A namespace declaration that
 /// cannot be created fails the call and takes the element back, as in
-/// libxmlsec1 1.3.13.
+/// libxmlsec1.
 ///
 /// # Safety
 /// `name` is NUL-terminated and `ns` null or NUL-terminated.
@@ -262,7 +262,7 @@ unsafe fn add_sibling(
         if !ns.is_null() {
             let declared = namespace_for(cur, ns);
             if declared.is_null() {
-                // libxmlsec1 1.3.13 takes the element back.
+                // libxmlsec1 takes the element back.
                 errors::xml_failed(here, std::ptr::null(), c"xmlNewNs");
                 xsUnlinkNode(cur);
                 xsFreeNode(cur);

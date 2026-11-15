@@ -202,14 +202,21 @@ fn ordinary_jobs_have_one_matrix_writer_and_separate_instrumented_domains() {
 
 #[test]
 fn cached_native_oracles_still_pass_installer_provenance_and_capability_validation() {
-    // A cache hit must not bypass validation or share modern and earlier profiles.
+    // A cache hit must not bypass validation or share profiles, and an entry
+    // belongs to the source commit it was built from, so a moved upstream
+    // commit gets a new entry instead of a rebuild on every run.
     let workflow = read(".github/workflows/ci.yml");
     assert_eq!(count(&workflow, "profile: modern"), 4);
-    assert_eq!(count(&workflow, "profile: legacy"), 0);
     assert!(!pattern(r"if:.*cache-hit").is_match(&workflow));
-    assert!(read(".github/actions/xmlsec-oracle-cache/action.yml").contains(
-        "hashFiles('tools/xml-sec-tools/src/install_xmlsec1.rs', 'compatibility/libxmlsec1-1.3.13-donor-commit.txt')"
+    let action = read(".github/actions/xmlsec-oracle-cache/action.yml");
+    assert!(action.contains("path: ${{ inputs.prefix }}"));
+    assert!(action.contains(
+        "${{ inputs.profile }}-${{ inputs.commit }}-${{ hashFiles('tools/xml-sec-tools/src/install_xmlsec1.rs') }}"
     ));
+    let uses = pattern(
+        r"uses: \./\.github/actions/xmlsec-oracle-cache\n\s+with:\n\s+profile: modern\n\s+commit: \$\{\{ steps\.[a-z-]+\.outputs[^\n]+\}\}\n\s+prefix: [^\n]+\n",
+    );
+    assert_eq!(uses.find_iter(&workflow).count(), 4);
     assert_eq!(count(&workflow, "xml-sec-tools -- install-xmlsec1\n"), 4);
 }
 

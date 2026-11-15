@@ -1,7 +1,7 @@
 use super::{
     FIPS_ONLY, HEADER, Library, Mode, Target, build_step, declared, declared_with,
-    first_difference, host, layout_program, library, symbol_mismatch, targets, template_defines,
-    test_step,
+    first_difference, host, layout_program, library, oracle_program_step, symbol_mismatch, targets,
+    template_defines, test_step,
 };
 use crate::test_support::read;
 use std::collections::BTreeSet;
@@ -9,6 +9,39 @@ use std::path::PathBuf;
 
 fn names(list: &[&str]) -> BTreeSet<String> {
     list.iter().map(|&name| name.to_owned()).collect()
+}
+
+/// An oracle program loads the libraries of its own installation first and
+/// its crypto library from there, whatever loader path the job exports for
+/// another installation.
+#[test]
+fn an_oracle_program_loads_its_own_installation() {
+    let library = Library {
+        shared: PathBuf::from("/t/debug/libxml_sec_xmlsec1.so"),
+        import: None,
+    };
+    let step = oracle_program_step(
+        &PathBuf::from("/s/app-oracle"),
+        &PathBuf::from("/o/master"),
+        &library,
+    );
+    let value = |name: &str| {
+        let (_, value) = step
+            .env
+            .iter()
+            .find(|(key, _)| key == name)
+            .unwrap_or_else(|| panic!("{name} is set"));
+        value.clone()
+    };
+    assert_eq!(value("LTDL_LIBRARY_PATH"), "/o/master/lib");
+    for variable in ["LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"] {
+        let path = value(variable);
+        assert_eq!(
+            std::env::split_paths(&path).next(),
+            Some(PathBuf::from("/o/master/lib")),
+            "{variable}={path}"
+        );
+    }
 }
 
 #[test]

@@ -1,5 +1,5 @@
 /* Input callbacks as a libxmlsec1 caller sees them. The program is built
- * against the pinned libxmlsec1 and against this crate, and both must print
+ * against the libxmlsec1 oracle and against this crate, and both must print
  * the same: which registered set reads a URI, the URI each callback
  * receives, the bytes a chain reads through them, and the outcome and
  * reports of a set that cannot open or read. Each library's own default

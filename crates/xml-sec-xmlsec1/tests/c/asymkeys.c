@@ -2,7 +2,7 @@
  * libxmlsec1 caller uses them: the klasses' identities, reading a public key
  * from its KeyValue child, the key's size, type and dumps, refusing a second
  * value, duplicating, and writing the key back under the key requirements.
- * Built against the pinned libxmlsec1 with its default crypto library and
+ * Built against the libxmlsec1 oracle with its default crypto library and
  * against this crate, both must print the same. Failures whose reports name
  * the implementation's own reader print their result only. */
 

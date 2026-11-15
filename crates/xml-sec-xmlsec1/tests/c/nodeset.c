@@ -1,5 +1,5 @@
 /* Node sets over a document tree as a libxmlsec1 caller sees them. Built
- * against the pinned libxmlsec1 and against this crate, both must print the
+ * against the libxmlsec1 oracle and against this crate, both must print the
  * same membership for every node, attribute and namespace node, under every
  * set type and operation, and the same walks and dumps. */
 

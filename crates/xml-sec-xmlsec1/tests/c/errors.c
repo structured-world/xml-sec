@@ -1,5 +1,5 @@
 /* Error reporting as a libxmlsec1 caller sees it. The program is built
- * against the pinned libxmlsec1 and against this crate, and both must print
+ * against the libxmlsec1 oracle and against this crate, and both must print
  * the same: the reason table, the fields and formatted message a
  * callback receives, the callback priority, the default callback's line
  * (after its location fields, which name each library's own code), and the
