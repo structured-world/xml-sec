@@ -997,10 +997,21 @@ fn a_policy_refusing_empty_digest_input_refuses_a_reference_that_selects_nothing
     let refused = VerifyContext::new()
         .key(&AcceptingKey)
         .policy(policy)
-        .verify(&xml);
+        .verify(&xml)
+        .expect("a refused Reference is a verdict, not an error");
+    let violation = DsigStatus::Invalid(FailureReason::ReferencePolicyViolation { ref_index: 0 });
+    assert_eq!(refused.status, violation);
+    assert_eq!(refused.signed_info_references.len(), 1);
+    assert_eq!(refused.signed_info_references[0].status, violation);
     assert!(
-        format!("{refused:?}").contains("EmptyDigestInput"),
-        "{refused:?}"
+        refused.policy.decisions.iter().any(|decision| matches!(
+            decision,
+            crate::policy::PolicyDecision::Rejected(
+                crate::policy::PolicyViolation::EmptyDigestInput
+            )
+        )),
+        "{:?}",
+        refused.policy.decisions
     );
 }
 
