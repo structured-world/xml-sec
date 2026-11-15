@@ -63,8 +63,8 @@ pub(crate) fn admit(run: &mut impl Run, xmlsec: &Path, pinned: &str) -> Result<(
         .parent()
         .and_then(Path::parent)
         .ok_or("XMLSEC1_BIN must name an installed oracle binary")?;
-    let marker = std::fs::read_to_string(prefix.join(".xmlsec-source-commit")).ok();
-    if marker.as_deref().map(str::trim) != Some(pinned) {
+    let recorded = crate::install_xmlsec1::installed(prefix);
+    if recorded.as_ref().map(|source| source.commit.as_str()) != Some(pinned) {
         return Err("Oracle source provenance must match the pinned installer revision".into());
     }
     let binary = xmlsec.display().to_string();

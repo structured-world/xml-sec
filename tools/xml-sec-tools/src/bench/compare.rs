@@ -1,7 +1,8 @@
-//! `bench-compare NEW_OUTPUT_DIR [SAMPLES] [--heap]`: builds every engine at
-//! its pinned revision, runs the command-line and library comparisons and
-//! records the evidence a regression report needs. The competitor is measured
-//! at its current default-branch commit, which the evidence records.
+//! `bench-compare NEW_OUTPUT_DIR [SAMPLES] [--heap]`: builds every engine,
+//! runs the command-line and library comparisons and records the evidence a
+//! regression report needs. Bergshamra and libxmlsec1 are measured at their
+//! current upstream commits, which the evidence records: libxmlsec1's as its
+//! installation records the source it was built from.
 
 use super::identity::build_identity;
 use crate::repo::{Failure, Step, TOOL, root, spawn};
@@ -11,7 +12,7 @@ use std::process::{Command, Stdio};
 #[cfg(test)]
 mod tests;
 
-const SOURCE_PATHS: [&str; 14] = [
+const SOURCE_PATHS: [&str; 13] = [
     "Cargo.toml",
     "rust-toolchain.toml",
     "src",
@@ -21,7 +22,6 @@ const SOURCE_PATHS: [&str; 14] = [
     "examples",
     "tools",
     "benchmarks",
-    "compatibility/libxmlsec1-1.3.13-donor-commit.txt",
     "tests/fixtures/keys/rsa",
     "tests/fixtures/keys/cacert.pem",
     "tests/fixtures/keys/ca2cert.pem",
@@ -240,11 +240,12 @@ fn competitor(root: &Path, revision: &str) -> Result<PathBuf, Failure> {
     Ok(source)
 }
 
-fn pinned(root: &Path, file: &str) -> Result<String, Failure> {
-    Ok(std::fs::read_to_string(root.join(file))
-        .map_err(|error| format!("{file}: {error}"))?
-        .trim()
-        .to_owned())
+/// The upstream commit the libxmlsec1 installation under `prefix` was built
+/// from, as the installer records it: the identity the measurements carry.
+fn installed_commit(prefix: &Path) -> Result<String, Failure> {
+    crate::install_xmlsec1::installed(prefix)
+        .map(|source| source.commit)
+        .ok_or_else(|| format!("{} records no libxmlsec1 source commit", prefix.display()).into())
 }
 
 fn words(text: &str) -> Vec<String> {
@@ -526,23 +527,15 @@ fn execute(request: &Request) -> Result<(), Failure> {
     } else {
         root.join(target)
     };
-    let donor = pinned(&root, "compatibility/libxmlsec1-1.3.13-donor-commit.txt")?;
     let prefix = std::env::var("XMLSEC1_PREFIX")
         .ok()
         .filter(|prefix| !prefix.is_empty())
-        .map_or_else(
-            || {
-                root.join(format!(
-                    ".tools/xmlsec1-1.3.13-{}",
-                    donor.get(..12).unwrap_or(&donor)
-                ))
-            },
-            PathBuf::from,
-        );
+        .map_or_else(|| root.join(".tools/xmlsec1-master"), PathBuf::from);
     tool_step(
         &["install-xmlsec1"],
         &[("XMLSEC1_PREFIX".into(), prefix.display().to_string())],
     )?;
+    let donor = installed_commit(&prefix)?;
     align_competitor_library(&root, &revision)?;
     let before = source_identity(&root)?;
     let built = build_engines(&root, &target, &competitor, &prefix)?;

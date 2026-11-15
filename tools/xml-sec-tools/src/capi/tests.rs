@@ -33,7 +33,10 @@ fn an_oracle_program_loads_its_own_installation() {
             .unwrap_or_else(|| panic!("{name} is set"));
         value.clone()
     };
-    assert_eq!(value("LTDL_LIBRARY_PATH"), "/o/master/lib");
+    assert_eq!(
+        PathBuf::from(value("LTDL_LIBRARY_PATH")),
+        PathBuf::from("/o/master/lib")
+    );
     for variable in ["LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"] {
         let path = value(variable);
         assert_eq!(

@@ -1,4 +1,5 @@
 use super::{SLICING, execute};
+use crate::install_xmlsec1::{MARKER, Source};
 use crate::repo::{Failure, Run, Step, root};
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::Path;
@@ -53,14 +54,15 @@ impl Run for Recorder {
     }
 }
 
-/// An installed oracle whose provenance marker names `commit`.
+/// An installed oracle whose provenance marker, as the installer writes it,
+/// names `commit`.
 fn oracle(directory: &Path, commit: &str) -> String {
     std::fs::create_dir_all(directory.join("bin")).unwrap();
-    std::fs::write(
-        directory.join(".xmlsec-source-commit"),
-        format!("{commit}\n"),
-    )
-    .unwrap();
+    let source = Source {
+        commit: commit.to_owned(),
+        version: "1.3.13".to_owned(),
+    };
+    std::fs::write(directory.join(MARKER), source.marker()).unwrap();
     directory.join("bin/xmlsec1").display().to_string()
 }
 
@@ -137,7 +139,7 @@ fn an_unqualified_oracle_fails_before_any_suite() {
     let qualified = oracle(&directory.path().join("qualified"), &pinned());
     let foreign = oracle(
         &directory.path().join("foreign"),
-        "different-source-revision",
+        "90b3d51a25c734c667d5d37896586d3d60b862ff",
     );
     let mut older = Recorder::new();
     older.version = "xmlsec1 1.3.12 (openssl)\n";

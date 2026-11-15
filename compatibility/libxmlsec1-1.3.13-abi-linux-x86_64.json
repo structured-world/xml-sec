@@ -18,7 +18,6 @@
     },
     "crypto": "openssl",
     "defines": [
-      "-DWITH_GZFILEOP",
       "-DXMLSEC_CRYPTO_DYNAMIC_LOADING=1",
       "-DXMLSEC_DL_LIBLTDL=1",
       "-DXMLSEC_NO_FTP=1",

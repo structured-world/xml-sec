@@ -15,7 +15,7 @@ const REPOSITORY: &str = "https://github.com/lsh123/xmlsec.git";
 /// The upstream branch the oracle follows.
 const BRANCH: &str = "refs/heads/master";
 /// The file in the prefix naming the source commit and version installed.
-const MARKER: &str = ".xmlsec-source";
+pub(crate) const MARKER: &str = ".xmlsec-source";
 /// libxmlsec1 enables `EdDSA` only with the OpenSSL 3.5 API. This isolated
 /// test-oracle dependency never replaces the host OpenSSL or enters the Rust runtime.
 const OPENSSL_VERSION: &str = "3.5.9";
@@ -95,7 +95,7 @@ pub(crate) struct Source {
 
 impl Source {
     /// The marker's text: the commit, then the version, one per line.
-    fn marker(&self) -> String {
+    pub(crate) fn marker(&self) -> String {
         format!("{}\n{}\n", self.commit, self.version)
     }
 
@@ -112,6 +112,14 @@ impl Source {
     fn short(&self) -> &str {
         &self.commit[..12]
     }
+}
+
+/// The source the installation under `prefix` records it was built from;
+/// `None` without a well-formed marker.
+pub(crate) fn installed(prefix: &Path) -> Option<Source> {
+    std::fs::read_to_string(prefix.join(MARKER))
+        .ok()
+        .and_then(|text| Source::from_marker(&text))
 }
 
 /// Whether `text` is a full Git object id.
@@ -662,11 +670,7 @@ fn accept(
 
 pub(crate) fn execute(run: &mut impl Run, install: &Install) -> Result<(), String> {
     let commit = resolve(run, install)?;
-    let marker = install.prefix.join(MARKER);
-    let recorded = std::fs::read_to_string(&marker)
-        .ok()
-        .and_then(|text| Source::from_marker(&text))
-        .filter(|recorded| recorded.commit == commit);
+    let recorded = installed(&install.prefix).filter(|recorded| recorded.commit == commit);
     if let Some(recorded) = recorded.filter(|_| executable(&install.oracle())) {
         if let Some(version) = validated(run, install, &recorded.version)? {
             println!("{version}");
@@ -697,7 +701,7 @@ pub(crate) fn execute(run: &mut impl Run, install: &Install) -> Result<(), Strin
     };
     // Any failure here, including a query that cannot start, restores the
     // previous installation; dropping `work` would otherwise delete its backup.
-    let version = match accept(run, install, &source, &marker) {
+    let version = match accept(run, install, &source, &install.prefix.join(MARKER)) {
         Ok(version) => version,
         Err(refusal) => return Err(promotion.abandon(refusal).report(work)),
     };
