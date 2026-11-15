@@ -42,6 +42,7 @@ pub(crate) type ReadCallback =
 pub(crate) type CloseCallback = Option<unsafe extern "C" fn(*mut c_void) -> c_int>;
 
 /// One registered set of input callbacks.
+#[derive(Clone, Copy)]
 struct IoCallbacks {
     matches: unsafe extern "C" fn(*const c_char) -> c_int,
     open: OpenCallback,
@@ -87,30 +88,53 @@ pub(crate) unsafe extern "C" fn xmlSecIOInit() -> c_int {
         // SAFETY: registering during initialization.
         if unsafe { xmlSecIORegisterDefaultCallbacks() } < 0 {
             errors::internal(here, std::ptr::null(), c"xmlSecIORegisterDefaultCallbacks");
+            // Leaves nothing half initialized.
+            // SAFETY: still during initialization.
+            unsafe { xmlSecIOShutdown() };
             return -1;
         }
         0
     })
 }
 
-/// `xmlSecIOShutdown`: releases every registered set.
+/// Whether the callback list is initialized and not shut down.
+fn callbacks_live() -> bool {
+    // SAFETY: the list has a fixed address; its klass pointer is plain data.
+    std::ptr::eq(
+        unsafe { (*IO_CALLBACKS.get()).id },
+        &raw const IO_CALLBACK_LIST,
+    )
+}
+
+/// `xmlSecIOShutdown`: releases every registered set; nothing to release
+/// before initialization or after a shutdown.
 ///
 /// # Safety
 /// Called during shutdown, while nothing reads the list.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecIOShutdown() {
-    // SAFETY: the list has a fixed address and is not in use.
-    contain((), || unsafe { xmlSecPtrListFinalize(IO_CALLBACKS.get()) });
+    contain((), || {
+        if callbacks_live() {
+            // SAFETY: the list has a fixed address and is not in use.
+            unsafe { xmlSecPtrListFinalize(IO_CALLBACKS.get()) };
+        }
+    });
 }
 
-/// `xmlSecIOCleanupCallbacks`: removes every registered set.
+/// `xmlSecIOCleanupCallbacks`: removes every registered set, when the list
+/// is live.
 ///
 /// # Safety
-/// As for [`xmlSecIOShutdown`].
+/// As for [`xmlSecIOShutdown`]; an open input-URI transform keeps its own
+/// copy of the set it opened with.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecIOCleanupCallbacks() {
-    // SAFETY: the list has a fixed address and is not in use.
-    contain((), || unsafe { xmlSecPtrListEmpty(IO_CALLBACKS.get()) });
+    contain((), || {
+        if callbacks_live() {
+            // SAFETY: the list has a fixed address and is not in use.
+            unsafe { xmlSecPtrListEmpty(IO_CALLBACKS.get()) };
+        }
+    });
 }
 
 /// `xmlSecIORegisterDefaultCallbacks`: libxmlsec1 registers file, HTTP and
@@ -198,34 +222,9 @@ unsafe fn find_callbacks(uri: *const c_char) -> *mut IoCallbacks {
     std::ptr::null_mut()
 }
 
-/// `uri` with `%XX` escapes decoded, as libxml2's `xmlURIUnescapeString`
-/// decodes them: a `%` followed by two hexadecimal digits is one octet; any
-/// other byte is kept.
-fn unescape(uri: &[u8]) -> Vec<u8> {
-    let hex = |byte: u8| char::from(byte).to_digit(16);
-    let mut out = Vec::with_capacity(uri.len());
-    let mut position = 0;
-    while position < uri.len() {
-        let byte = uri[position];
-        if byte == b'%'
-            && let (Some(high), Some(low)) = (
-                uri.get(position + 1).copied().and_then(hex),
-                uri.get(position + 2).copied().and_then(hex),
-            )
-        {
-            // Two hexadecimal digits make one octet.
-            out.push(u8::try_from(high * 16 + low).expect("two hexadecimal digits fit an octet"));
-            position += 3;
-        } else {
-            out.push(byte);
-            position += 1;
-        }
-    }
-    out
-}
-
-/// The state of an input-URI transform: the callbacks reading its resource,
-/// their context, and the octets read from it so far.
+/// The state of an input-URI transform: its own copy of the callbacks
+/// reading its resource (the registered set may be removed while it is
+/// open), their context, and the octets read from it so far.
 #[repr(C)]
 struct InputUri {
     callbacks: *mut IoCallbacks,
@@ -282,10 +281,11 @@ fn admits(references: UriTypeSet, uri: &[u8]) -> bool {
     references.allows(&String::from_utf8_lossy(uri))
 }
 
-/// `xmlSecTransformInputURIOpen`: opens `uri` through the most recently
-/// registered callbacks that match it, trying the unescaped URI first and
-/// the URI as given when no set matches that. The policy's reference URI
-/// permission decides first whether the URI's class may be read at all.
+/// `xmlSecTransformInputURIOpen`: opens `uri`, as given, through the most
+/// recently registered callbacks that match it; the open callback interprets
+/// any escapes. The policy's reference URI permission decides first whether
+/// the URI's class may be read at all. A failed open leaves the transform
+/// unopened.
 ///
 /// # Safety
 /// `transform` is null or a valid transform; `uri` is null or
@@ -342,39 +342,47 @@ pub(crate) unsafe fn open(
             errors::uri_refused(here, c"input-uri".as_ptr(), text);
             return -1;
         }
-        // The unescaped URI has no NUL unless an escape decodes one, which
-        // ends the C string as it ends libxml2's.
-        let mut unescaped = unescape(text);
-        unescaped.push(0);
-        for candidate in [unescaped.as_ptr().cast::<c_char>(), uri.cast()] {
-            if !state.callbacks.is_null() {
-                break;
-            }
-            // SAFETY: both candidates are NUL-terminated; a found set is a
-            // registered one, whose open callback takes the URI.
-            unsafe {
-                state.callbacks = find_callbacks(candidate);
-                if let Some(open) = state.callbacks.as_ref().and_then(|set| set.open) {
-                    state.context = open(candidate);
-                }
-            }
-        }
-        if state.callbacks.is_null() || state.context.is_null() {
+        let shown = String::from_utf8_lossy(text);
+        let io_failed = |message: String| {
+            errors::report(
+                here,
+                c"input-uri".as_ptr(),
+                std::ptr::null(),
+                errors::R_IO_FAILED,
+                &message,
+            );
+        };
+        // SAFETY: `uri` is NUL-terminated; a found set is a registered one.
+        let Some(found) = (unsafe { find_callbacks(uri.cast()).as_ref() }) else {
+            io_failed(format!("no matching handler for URI='{shown}'"));
+            return -1;
+        };
+        let Some(open) = found.open else {
+            io_failed(format!("no open callback for URI='{shown}'"));
+            return -1;
+        };
+        let callbacks = *found;
+        // SAFETY: the caller's open callback, given the NUL-terminated URI.
+        let context = unsafe { open(uri.cast()) };
+        if context.is_null() {
             errors::internal_with(
                 here,
                 c"input-uri".as_ptr(),
-                c"ctx->clbks->opencallback",
-                &format!("uri={}", String::from_utf8_lossy(text)),
+                c"open callback",
+                &format!("uri={shown}"),
             );
             return -1;
         }
+        state.callbacks = Box::into_raw(Box::new(callbacks));
+        state.context = context;
         state.read = 0;
         0
     })
 }
 
 /// `xmlSecTransformInputURIClose`: closes the resource, when it is open and
-/// its callbacks can close it.
+/// its callbacks can close it, and resets the transform to unopened; -1 when
+/// the close callback fails, the resource then being the caller's to release.
 ///
 /// # Safety
 /// `transform` is null or a valid transform.
@@ -384,18 +392,31 @@ pub(crate) unsafe extern "C" fn xmlSecTransformInputURIClose(
 ) -> c_int {
     contain(-1, || {
         let state = input_uri_or!(transform, "xmlSecTransformInputURIClose", -1);
-        // SAFETY: the set the transform opened with, while registered.
+        let mut result = 0;
+        // SAFETY: the transform's own copy of the set it opened with.
         let close = unsafe { state.callbacks.as_ref() }.and_then(|set| set.close);
         if let Some(close) = close
             && !state.context.is_null()
-        {
-            // libxmlsec1 ignores the close callback's result.
             // SAFETY: the context the open callback returned.
-            unsafe { close(state.context) };
-            state.context = std::ptr::null_mut();
+            && unsafe { close(state.context) } != 0
+        {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            errors::report(
+                here!("xmlSecTransformInputURIClose"),
+                std::ptr::null(),
+                c"ctx->clbks->closecallback".as_ptr(),
+                errors::R_IO_FAILED,
+                &format!("name=\"input-uri\"; errno={errno}"),
+            );
+            result = -1;
+        }
+        state.context = std::ptr::null_mut();
+        if !state.callbacks.is_null() {
+            // SAFETY: the copy `open` leaked.
+            drop(unsafe { Box::from_raw(state.callbacks) });
             state.callbacks = std::ptr::null_mut();
         }
-        0
+        result
     })
 }
 
@@ -414,13 +435,14 @@ unsafe extern "C" fn input_uri_finalize(transform: *mut XmlSecTransform) {
     // SAFETY: an input-URI transform being destroyed.
     let closed = unsafe { xmlSecTransformInputURIClose(transform) };
     if closed < 0 {
-        // libxmlsec1 reports the failure and goes on finalizing.
+        // The resource stays the caller's to release.
         errors::internal_with(
             here!("xmlSecTransformInputURIFinalize"),
             c"input-uri".as_ptr(),
             c"xmlSecTransformInputURIClose",
             &format!("ret={closed}"),
         );
+        return;
     }
     *state = InputUri {
         callbacks: std::ptr::null_mut(),

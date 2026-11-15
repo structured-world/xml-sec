@@ -101,7 +101,6 @@ functions_table! {
         transform_dh_es,
         transform_dsa_sha1, transform_dsa_sha256,
         transform_ecdh,
-        transform_x448, transform_x25519,
         transform_ecdsa_ripemd160, transform_ecdsa_sha1, transform_ecdsa_sha224,
         transform_ecdsa_sha256, transform_ecdsa_sha384, transform_ecdsa_sha512,
         transform_ecdsa_sha3_224, transform_ecdsa_sha3_256, transform_ecdsa_sha3_384,
@@ -131,6 +130,7 @@ functions_table! {
         transform_sha1,
         transform_sha224, transform_sha256, transform_sha384, transform_sha512,
         transform_sha3_224, transform_sha3_256, transform_sha3_384, transform_sha3_512,
+        transform_x25519, transform_x448,
     }
     app {
         crypto_app_init: Option<unsafe extern "C" fn(*const c_char) -> c_int>,
@@ -188,7 +188,6 @@ static BUILTIN: Global<XmlSecCryptoDLFunctions> = Global::new(XmlSecCryptoDLFunc
     key_data_camellia: Some(symkeys::camellia),
     key_data_chacha20: Some(symkeys::chacha20),
     key_data_concat_kdf: Some(symkeys::concat_kdf),
-    key_data_des: Some(symkeys::des),
     key_data_der_encoded_key_value: Some(asymkeys::der_encoded_key_value),
     key_data_dsa: Some(asymkeys::dsa),
     key_data_ec: Some(asymkeys::ec),
@@ -695,13 +694,11 @@ impl XmlSecCryptoDLFunctions {
         ]
     }
 
-    /// The first transform getters in libxmlsec1's registration order;
-    /// AES-192-CBC comes twice, as libxmlsec1 registers it.
-    fn transforms_in_registration_order(&self) -> [TransformGetter; 50] {
+    /// The first transform getters in libxmlsec1's registration order.
+    fn transforms_in_registration_order(&self) -> [TransformGetter; 49] {
         let table = self;
         [
             table.transform_aes128_cbc,
-            table.transform_aes192_cbc,
             table.transform_aes192_cbc,
             table.transform_aes256_cbc,
             table.transform_aes128_gcm,
@@ -840,7 +837,9 @@ fn missing_method(here: errors::Here, name: &str) {
         std::ptr::null(),
         std::ptr::null(),
         errors::R_NOT_IMPLEMENTED,
-        &format!("Method is missing in the dynamically loaded library: {name}"),
+        &format!(
+            "Crypto library was not loaded or the method is missing in the dynamically loaded library: {name}"
+        ),
     );
 }
 

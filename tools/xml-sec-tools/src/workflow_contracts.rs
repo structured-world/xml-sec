@@ -203,10 +203,10 @@ fn ordinary_jobs_have_one_matrix_writer_and_separate_instrumented_domains() {
 #[test]
 fn cached_native_oracles_still_pass_installer_provenance_and_capability_validation() {
     // A cache hit must not bypass validation or share profiles, and an entry
-    // belongs to the source commit it was built from, so a moved upstream
-    // commit gets a new entry instead of a rebuild on every run.
+    // belongs to the source commit it was built from: a commit upstream
+    // master moves to gets a new entry instead of a rebuild on every run.
     let workflow = read(".github/workflows/ci.yml");
-    assert_eq!(count(&workflow, "profile: modern"), 4);
+    assert_eq!(count(&workflow, "profile: modern"), 5);
     assert!(!pattern(r"if:.*cache-hit").is_match(&workflow));
     let action = read(".github/actions/xmlsec-oracle-cache/action.yml");
     assert!(action.contains("path: ${{ inputs.prefix }}"));
@@ -216,8 +216,8 @@ fn cached_native_oracles_still_pass_installer_provenance_and_capability_validati
     let uses = pattern(
         r"uses: \./\.github/actions/xmlsec-oracle-cache\n\s+with:\n\s+profile: modern\n\s+commit: \$\{\{ steps\.[a-z-]+\.outputs[^\n]+\}\}\n\s+prefix: [^\n]+\n",
     );
-    assert_eq!(uses.find_iter(&workflow).count(), 4);
-    assert_eq!(count(&workflow, "xml-sec-tools -- install-xmlsec1\n"), 4);
+    assert_eq!(uses.find_iter(&workflow).count(), 5);
+    assert_eq!(count(&workflow, "xml-sec-tools -- install-xmlsec1\n"), 5);
 }
 
 /// Runs the runner-image action's script with `image` as `ImageOS`.

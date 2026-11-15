@@ -1,7 +1,7 @@
 /* Prints, one per line, the layout of the xmlsec1 structures this crate
  * creates or reads, as its own headers define them. The crate's tests compile
  * and run it and compare the output with the Rust declarations; the headers
- * themselves are compared with the pinned libxmlsec1 by the header check and
+ * themselves are compared with the libxmlsec1 oracle by the header check and
  * with its binary baseline by the C layout test. */
 
 #include <stddef.h>
@@ -17,6 +17,7 @@ static const size_t layout[] = {
     offsetof(xmlSecBuffer, size),
     offsetof(xmlSecBuffer, maxSize),
     offsetof(xmlSecBuffer, allocMode),
+    offsetof(xmlSecBuffer, flags),
     sizeof(xmlSecAllocMode),
     xmlSecAllocModeExact,
     xmlSecAllocModeDouble,

@@ -267,8 +267,7 @@ pub(crate) unsafe extern "C" fn xmlSecKeysMngrAdoptKeysStore(
             -1
         );
         // SAFETY: a manager owning its store. The store it already owns is
-        // kept, as libxmlsec1 1.3.13 does: releasing it would leave the
-        // manager a freed store.
+        // kept: releasing it would leave the manager a freed store.
         unsafe {
             if std::ptr::eq((*mngr).keys_store, store) {
                 return 0;
@@ -434,7 +433,7 @@ pub(crate) unsafe extern "C" fn xmlSecKeysMngrGetKey(
                     return std::ptr::null_mut();
                 }
                 if !(*key).value.is_null()
-                    && xmlSecKeyMatch(key, std::ptr::null(), &raw mut (*ctx).key_req) != 0
+                    && xmlSecKeyMatch(key, std::ptr::null(), &raw mut (*ctx).key_req) == 1
                 {
                     return key;
                 }
@@ -454,15 +453,14 @@ unsafe fn lax_search(ctx: *mut XmlSecKeyInfoCtx) -> *mut XmlSecKey {
     // SAFETY: by the caller's contract.
     unsafe {
         if (*ctx).flags & FLAGS_LAX_KEY_SEARCH != 0 && !(*ctx).keys_mngr.is_null() {
+            // No key found ends in the not-found report below.
             let key = xmlSecKeysMngrFindKey((*ctx).keys_mngr, std::ptr::null(), ctx);
-            if key.is_null() {
-                errors::internal(here, std::ptr::null(), c"xmlSecKeysMngrFindKey");
-                return key;
+            if !key.is_null() {
+                if !(*key).value.is_null() {
+                    return key;
+                }
+                xmlSecKeyDestroy(key);
             }
-            if !(*key).value.is_null() {
-                return key;
-            }
-            xmlSecKeyDestroy(key);
         }
     }
     errors::other(here, errors::R_KEY_NOT_FOUND, std::ptr::null(), None);

@@ -5,13 +5,13 @@
  *
  * Copyright (C) 2002-2026 Aleksey Sanin <aleksey@aleksey.com>. All Rights Reserved.
  */
-#ifndef __XMLSEC_TEMPLATES_H__
-#define __XMLSEC_TEMPLATES_H__
+#ifndef XMLSEC_TEMPLATES_H
+#define XMLSEC_TEMPLATES_H
 
 /**
  * @defgroup xmlsec_core_templates XML Templates
  * @ingroup xmlsec_core
- * @brief Functions for creating XMLDSig and XMLEnc XML template documents.
+ * @brief Functions for creating XMLDSig and XMLEnc XML template elements/nodes.
  * @{
  */
 
@@ -29,16 +29,16 @@ extern "C" {
  *
  * &lt;dsig:Signature/&gt; node
  *
-  *****************************************************************************/
+ *****************************************************************************/
 XMLSEC_EXPORT xmlNodePtr xmlSecTmplSignatureCreate              (xmlDocPtr doc,
                                                                  xmlSecTransformId c14nMethodId,
                                                                  xmlSecTransformId signMethodId,
                                                                  const xmlChar *id);
-XMLSEC_EXPORT xmlNodePtr xmlSecTmplSignatureCreateNsPref       (xmlDocPtr doc,
-                                                                xmlSecTransformId c14nMethodId,
-                                                                xmlSecTransformId signMethodId,
-                                                                const xmlChar *id,
-                                                                const xmlChar *nsPrefix);
+XMLSEC_EXPORT xmlNodePtr xmlSecTmplSignatureCreateNsPref        (xmlDocPtr doc,
+                                                                 xmlSecTransformId c14nMethodId,
+                                                                 xmlSecTransformId signMethodId,
+                                                                 const xmlChar *id,
+                                                                 const xmlChar *nsPrefix);
 XMLSEC_EXPORT xmlNodePtr xmlSecTmplSignatureEnsureKeyInfo       (xmlNodePtr signNode,
                                                                  const xmlChar *id);
 XMLSEC_EXPORT xmlNodePtr xmlSecTmplSignatureAddReference        (xmlNodePtr signNode,
@@ -70,7 +70,7 @@ XMLSEC_EXPORT xmlNodePtr xmlSecTmplManifestAddReference         (xmlNodePtr mani
  *
  * &lt;enc:EncryptedData/&gt; node
  *
-  *****************************************************************************/
+ *****************************************************************************/
 XMLSEC_EXPORT xmlNodePtr xmlSecTmplEncDataCreate                (xmlDocPtr doc,
                                                                  xmlSecTransformId encMethodId,
                                                                  const xmlChar *id,
@@ -95,7 +95,7 @@ XMLSEC_EXPORT xmlNodePtr xmlSecTmplCipherReferenceAddTransform  (xmlNodePtr ciph
  *
  * &lt;enc:EncryptedKey/&gt; node
  *
-  *****************************************************************************/
+ *****************************************************************************/
 XMLSEC_EXPORT xmlNodePtr xmlSecTmplReferenceListAddDataReference(xmlNodePtr encNode,
                                                                  const xmlChar *uri);
 XMLSEC_EXPORT xmlNodePtr xmlSecTmplReferenceListAddKeyReference (xmlNodePtr encNode,
@@ -105,9 +105,9 @@ XMLSEC_EXPORT xmlNodePtr xmlSecTmplReferenceListAddKeyReference (xmlNodePtr encN
  *
  * &lt;dsig:KeyInfo/&gt; node
  *
-  *****************************************************************************/
+ *****************************************************************************/
 XMLSEC_EXPORT xmlNodePtr xmlSecTmplKeyInfoAddKeyName            (xmlNodePtr keyInfoNode,
-                                                                 const xmlChar* name);
+                                                                 const xmlChar *name);
 XMLSEC_EXPORT xmlNodePtr xmlSecTmplKeyInfoAddKeyValue           (xmlNodePtr keyInfoNode);
 XMLSEC_EXPORT xmlNodePtr xmlSecTmplKeyInfoAddX509Data           (xmlNodePtr keyInfoNode);
 XMLSEC_EXPORT xmlNodePtr xmlSecTmplKeyInfoAddRetrievalMethod    (xmlNodePtr keyInfoNode,
@@ -125,13 +125,13 @@ XMLSEC_EXPORT xmlNodePtr xmlSecTmplKeyInfoAddEncryptedKey       (xmlNodePtr keyI
  *
  * &lt;dsig:X509Data/&gt; node
  *
-  *****************************************************************************/
+ *****************************************************************************/
 XMLSEC_EXPORT xmlNodePtr xmlSecTmplX509DataAddIssuerSerial      (xmlNodePtr x509DataNode);
-XMLSEC_EXPORT xmlNodePtr xmlSecTmplX509IssuerSerialAddIssuerName(xmlNodePtr x509IssuerSerialNode, const xmlChar* issuerName);
-XMLSEC_EXPORT xmlNodePtr xmlSecTmplX509IssuerSerialAddSerialNumber(xmlNodePtr x509IssuerSerialNode, const xmlChar* serial);
+XMLSEC_EXPORT xmlNodePtr xmlSecTmplX509IssuerSerialAddIssuerName(xmlNodePtr x509IssuerSerialNode, const xmlChar *issuerName);
+XMLSEC_EXPORT xmlNodePtr xmlSecTmplX509IssuerSerialAddSerialNumber (xmlNodePtr x509IssuerSerialNode, const xmlChar *serial);
 XMLSEC_EXPORT xmlNodePtr xmlSecTmplX509DataAddSubjectName       (xmlNodePtr x509DataNode);
 XMLSEC_EXPORT xmlNodePtr xmlSecTmplX509DataAddSKI               (xmlNodePtr x509DataNode);
-XMLSEC_EXPORT xmlNodePtr xmlSecTmplX509DataAddDigest            (xmlNodePtr x509DataNode, const xmlChar* digestAlgorithm);
+XMLSEC_EXPORT xmlNodePtr xmlSecTmplX509DataAddDigest            (xmlNodePtr x509DataNode, const xmlChar *digestAlgorithm);
 XMLSEC_EXPORT xmlNodePtr xmlSecTmplX509DataAddCertificate       (xmlNodePtr x509DataNode);
 XMLSEC_EXPORT xmlNodePtr xmlSecTmplX509DataAddCRL               (xmlNodePtr x509DataNode);
 
@@ -139,16 +139,16 @@ XMLSEC_EXPORT xmlNodePtr xmlSecTmplX509DataAddCRL               (xmlNodePtr x509
  *
  * &lt;dsig:Transform/&gt; node
  *
-  *****************************************************************************/
+ *****************************************************************************/
 XMLSEC_EXPORT int       xmlSecTmplTransformAddHmacOutputLength  (xmlNodePtr transformNode,
                                                                  xmlSecSize bitsLen);
 XMLSEC_EXPORT int       xmlSecTmplTransformAddRsaOaepParam      (xmlNodePtr transformNode,
                                                                  const xmlSecByte *buf,
                                                                  xmlSecSize size);
 XMLSEC_EXPORT int       xmlSecTmplTransformAddRsaMgf            (xmlNodePtr transformNode,
-                                                                 const xmlChar* algorithm);
+                                                                 const xmlChar *algorithm);
 XMLSEC_EXPORT int       xmlSecTmplTransformAddRsaDigest         (xmlNodePtr transformNode,
-                                                                 const xmlChar* algorithm);
+                                                                 const xmlChar *algorithm);
 XMLSEC_EXPORT int       xmlSecTmplTransformAddXsltStylesheet    (xmlNodePtr transformNode,
                                                                  const xmlChar *xslt);
 XMLSEC_EXPORT int       xmlSecTmplTransformAddC14NInclNamespaces(xmlNodePtr transformNode,
@@ -157,7 +157,7 @@ XMLSEC_EXPORT int       xmlSecTmplTransformAddXPath             (xmlNodePtr tran
                                                                  const xmlChar *expression,
                                                                  const xmlChar **nsList);
 XMLSEC_EXPORT int       xmlSecTmplTransformAddXPath2            (xmlNodePtr transformNode,
-                                                                 const xmlChar* type,
+                                                                 const xmlChar *type,
                                                                  const xmlChar *expression,
                                                                  const xmlChar **nsList);
 XMLSEC_EXPORT int       xmlSecTmplTransformAddXPointer          (xmlNodePtr transformNode,
@@ -168,6 +168,6 @@ XMLSEC_EXPORT int       xmlSecTmplTransformAddXPointer          (xmlNodePtr tran
 }
 #endif /* __cplusplus */
 
-/** @} */ /** xmlsec_core_templates */
+/** @} */ /* xmlsec_core_templates */
 
-#endif /* __XMLSEC_TEMPLATES_H__ */
+#endif /* XMLSEC_TEMPLATES_H */

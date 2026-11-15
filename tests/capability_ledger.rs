@@ -11,8 +11,7 @@ mod cli_src {
 #[cfg(all(feature = "xmldsig", feature = "xmlenc", feature = "c14n"))]
 use cli_src::args as cli_args;
 
-const LEDGER_JSON: &str = include_str!("../compatibility/libxmlsec1-1.3.13.json");
-const DONOR_COMMIT: &str = include_str!("../compatibility/libxmlsec1-1.3.13-donor-commit.txt");
+const LEDGER_JSON: &str = include_str!("../compatibility/libxmlsec1.json");
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -27,10 +26,10 @@ struct Ledger {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Upstream {
     project: String,
     version: String,
-    commit: String,
     repository: String,
 }
 
@@ -165,15 +164,13 @@ fn complete_surface_categories_are_stable() {
     let ledger = ledger();
     assert_eq!(ledger.schema_version, 2);
     assert_eq!(ledger.upstream.project, "libxmlsec1");
-    assert_eq!(ledger.upstream.version, "1.3.13");
-    assert_eq!(ledger.upstream.commit, DONOR_COMMIT.trim());
     assert_eq!(
         ledger.upstream.repository,
         "https://github.com/lsh123/xmlsec"
     );
     assert_eq!(ledger.generated_by, "xml-sec-capability-ledger/2");
     assert_eq!(ledger.classifications.len(), 25);
-    assert_eq!(ledger.availability.len(), 449);
+    assert_eq!(ledger.availability.len(), 497);
 
     let counts = ledger
         .items
@@ -185,26 +182,26 @@ fn complete_surface_categories_are_stable() {
     assert_eq!(
         counts,
         BTreeMap::from([
-            ("algorithm-uri", 141),
-            ("backend-api", 847),
+            ("algorithm-uri", 136),
+            ("backend-api", 856),
             ("build-define", 50),
-            ("callback", 64),
-            ("class-id", 1_078),
+            ("callback", 65),
+            ("class-id", 1_128),
             ("cli-command", 24),
             ("cli-exit-status", 3),
-            ("cli-option", 74),
-            ("deprecated-api", 13),
+            ("cli-option", 77),
+            ("deprecated-api", 14),
             ("enum", 15),
-            ("export-function", 609),
-            ("export-variable", 435),
+            ("export-function", 625),
+            ("export-variable", 431),
             ("header", 59),
-            ("internal-export", 78),
+            ("internal-export", 70),
             ("key-format", 11),
-            ("macro", 1_499),
+            ("macro", 1_663),
             ("registry", 15),
             ("struct-layout", 25),
-            ("test-family", 20),
-            ("typedef", 70),
+            ("test-family", 29),
+            ("typedef", 66),
         ])
     );
 }
@@ -815,7 +812,7 @@ fn donor_declarations_are_extracted_without_truncation() {
                 .any(|item| item.kind == "typedef" && item.name == alias)
         );
     }
-    for enum_name in ["xmlSecDSigReferenceOrigin", "xmlEncCtxMode"] {
+    for enum_name in ["xmlSecDSigReferenceOrigin", "xmlSecEncCtxMode"] {
         assert!(
             ledger
                 .items
@@ -837,7 +834,7 @@ fn donor_declarations_are_extracted_without_truncation() {
     );
 
     for define in [
-        "XMLSEC_CUSTOM_CRYPT32",
+        "XMLSEC_CRYPTO_DYNAMIC_LOADING",
         "XMLSEC_DL_LIBLTDL",
         "XMLSEC_OPENSSL3_ENGINES",
         "XMLSEC_STATIC",
@@ -881,7 +878,7 @@ fn conditional_macro_variants_and_class_ids_are_complete() {
         .iter()
         .filter(|item| item.kind == "macro" && item.name == "XMLSEC_EXPORT")
         .collect();
-    assert_eq!(export_variants.len(), 5);
+    assert_eq!(export_variants.len(), 6);
     assert!(
         export_variants
             .iter()
@@ -941,7 +938,8 @@ fn registry_inventory_covers_complete_id_families() {
 
 #[test]
 fn configured_header_contains_installed_version_values() {
-    // The ledger represents configured version.h values rather than Autoconf placeholders.
+    // The ledger represents configured version.h values rather than Autoconf
+    // placeholders, and they are the version the ledger was generated from.
     let ledger = ledger();
     let macros: BTreeMap<_, _> = ledger
         .items
@@ -949,11 +947,20 @@ fn configured_header_contains_installed_version_values() {
         .filter(|item| item.kind == "macro" && item.source == "include/xmlsec/version.h.in")
         .map(|item| (item.name.as_str(), item.detail.as_str()))
         .collect();
-    assert!(macros["XMLSEC_VERSION"].contains("\"1.3.13\""));
-    assert!(macros["XMLSEC_VERSION_MAJOR"].ends_with('1'));
-    assert!(macros["XMLSEC_VERSION_MINOR"].ends_with('3'));
-    assert!(macros["XMLSEC_VERSION_SUBMINOR"].ends_with("13"));
-    assert!(macros["XMLSEC_VERSION_INFO"].contains("\"10313:0:0\""));
+    let version = ledger.upstream.version.as_str();
+    let parts: Vec<u32> = version
+        .split('.')
+        .map(|part| part.parse().expect("numeric version part"))
+        .collect();
+    let [major, minor, subminor] = parts[..] else {
+        panic!("three-part version {version}");
+    };
+    assert!(macros["XMLSEC_VERSION"].ends_with(&format!(" \"{version}\"")));
+    assert!(macros["XMLSEC_VERSION_MAJOR"].ends_with(&format!(" {major}")));
+    assert!(macros["XMLSEC_VERSION_MINOR"].ends_with(&format!(" {minor}")));
+    assert!(macros["XMLSEC_VERSION_SUBMINOR"].ends_with(&format!(" {subminor}")));
+    let info = major * 10_000 + minor * 100 + subminor;
+    assert!(macros["XMLSEC_VERSION_INFO"].ends_with(&format!(" \"{info}:0:0\"")));
     assert!(macros.values().all(|detail| !detail.contains('@')));
 }
 
@@ -1069,7 +1076,7 @@ fn assert_cli_exit_statuses_match(ledger: &Ledger) {
     for (status, outcome, code) in [
         ("success", "behavior-compatible", 0),
         ("failure", "behavior-compatible", 1),
-        ("unknown-command", "planned", 0),
+        ("unknown-command", "planned", 1),
     ] {
         let item = ledger
             .items

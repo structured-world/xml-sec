@@ -6,10 +6,10 @@ use super::{
     xmlSecPtrListDestroy, xmlSecPtrListDuplicate, xmlSecPtrListEmpty, xmlSecPtrListFinalize,
     xmlSecPtrListGetItem, xmlSecPtrListGetSize, xmlSecPtrListInitialize, xmlSecPtrListInsert,
     xmlSecPtrListPopLast, xmlSecPtrListRemove, xmlSecPtrListRemoveAndReturn, xmlSecPtrListSet,
-    xmlSecStringListGetKlass,
+    xmlSecPtrListSort, xmlSecStringListGetKlass,
 };
 use std::cell::Cell;
-use std::ffi::{CStr, c_char, c_void};
+use std::ffi::{CStr, c_char, c_int, c_void};
 use std::mem::MaybeUninit;
 
 thread_local! {
@@ -133,22 +133,126 @@ fn string_lists_duplicate_their_items() {
     }
 }
 
-/// Lists of different klasses are not copied into each other, and a klass
-/// without a duplicate method copies the pointers.
+/// A klass that neither duplicates nor destroys: its lists share pointers.
+static BORROWING: XmlSecPtrListKlass = XmlSecPtrListKlass {
+    name: c"borrowing".as_ptr().cast(),
+    duplicate_item: None,
+    destroy_item: None,
+    debug_dump_item: None,
+    debug_xml_dump_item: None,
+};
+
+/// Lists of different klasses are not copied into each other; a klass that
+/// destroys items it cannot duplicate is not copyable, since both lists would
+/// destroy each item; a klass with neither method copies the pointers, and a
+/// list copied to itself is unchanged.
 #[test]
 fn copy_checks_the_klass() {
-    // SAFETY: both klasses are static and the lists are used while live.
+    // SAFETY: the klasses are static and the lists are used while live.
     unsafe {
         let counting = xmlSecPtrListCreate(&raw const COUNTING);
         let strings = xmlSecPtrListCreate(xmlSecStringListGetKlass());
         xmlSecPtrListAdd(counting, item(4));
         assert_eq!(xmlSecPtrListCopy(strings, counting), -1);
         let other = xmlSecPtrListCreate(&raw const COUNTING);
-        assert_eq!(xmlSecPtrListCopy(other, counting), 0);
-        assert_eq!(items(other), [4]);
-        xmlSecPtrListDestroy(other);
-        xmlSecPtrListDestroy(counting);
-        xmlSecPtrListDestroy(strings);
+        assert_eq!(xmlSecPtrListCopy(other, counting), -1);
+        assert_eq!(items(other), Vec::<usize>::new());
+        let shared = xmlSecPtrListCreate(&raw const BORROWING);
+        let copy = xmlSecPtrListCreate(&raw const BORROWING);
+        xmlSecPtrListAdd(shared, item(7));
+        assert_eq!(xmlSecPtrListCopy(copy, shared), 0);
+        assert_eq!(items(copy), [7]);
+        assert_eq!(xmlSecPtrListCopy(shared, shared), 0);
+        assert_eq!(items(shared), [7]);
+        for list in [other, counting, strings, shared, copy] {
+            xmlSecPtrListDestroy(list);
+        }
+    }
+}
+
+thread_local! {
+    /// Duplications [`FAILING`] still makes before it fails.
+    static DUPLICATES_LEFT: Cell<usize> = const { Cell::new(0) };
+}
+
+unsafe extern "C" fn failing_duplicate(item: *mut c_void) -> *mut c_void {
+    DUPLICATES_LEFT.with(|left| match left.get() {
+        0 => std::ptr::null_mut(),
+        n => {
+            left.set(n - 1);
+            item
+        }
+    })
+}
+
+/// A klass whose duplication fails after a set number of items.
+static FAILING: XmlSecPtrListKlass = XmlSecPtrListKlass {
+    name: c"failing".as_ptr().cast(),
+    duplicate_item: Some(failing_duplicate),
+    destroy_item: Some(count_destroy),
+    debug_dump_item: None,
+    debug_xml_dump_item: None,
+};
+
+/// A copy that fails partway destroys the copies it made and leaves the
+/// destination with the items it had.
+#[test]
+fn a_failed_copy_leaves_the_destination_as_it_was() {
+    // SAFETY: the klass is static and the lists are used while live.
+    unsafe {
+        let source = xmlSecPtrListCreate(&raw const FAILING);
+        let target = xmlSecPtrListCreate(&raw const FAILING);
+        for value in [1, 2, 3] {
+            xmlSecPtrListAdd(source, item(value));
+        }
+        xmlSecPtrListAdd(target, item(9));
+        DUPLICATES_LEFT.with(|left| left.set(2));
+        assert_eq!(xmlSecPtrListCopy(target, source), -1);
+        assert_eq!(items(target), [9]);
+        assert_eq!(destroyed(), 2, "the two copies made are destroyed");
+        xmlSecPtrListDestroy(source);
+        xmlSecPtrListDestroy(target);
+    }
+}
+
+unsafe extern "C" fn by_value(left: *mut c_void, right: *mut c_void) -> c_int {
+    match left.addr().cmp(&right.addr()) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
+/// Sorting orders the items by the comparison; lists of zero and one items
+/// need none, and a missing comparison is refused.
+#[test]
+fn sort_orders_the_items() {
+    // SAFETY: the klass is static and the list is used while live.
+    unsafe {
+        let list = xmlSecPtrListCreate(&raw const BORROWING);
+        assert_eq!(xmlSecPtrListSort(list, Some(by_value)), 0);
+        xmlSecPtrListAdd(list, item(5));
+        assert_eq!(xmlSecPtrListSort(list, Some(by_value)), 0);
+        for value in [3, 9, 1, 7, 3, 8] {
+            xmlSecPtrListAdd(list, item(value));
+        }
+        assert_eq!(xmlSecPtrListSort(list, None), -1);
+        assert_eq!(xmlSecPtrListSort(list, Some(by_value)), 0);
+        assert_eq!(items(list), [1, 3, 3, 5, 7, 8, 9]);
+        xmlSecPtrListDestroy(list);
+    }
+}
+
+/// Reading past the end answers null without a report.
+#[test]
+fn reading_past_the_end_is_null() {
+    // SAFETY: the klass is static and the list is used while live.
+    unsafe {
+        let list = xmlSecPtrListCreate(&raw const BORROWING);
+        assert!(xmlSecPtrListGetItem(list, 0).is_null());
+        xmlSecPtrListAdd(list, item(1));
+        assert!(xmlSecPtrListGetItem(list, 1).is_null());
+        xmlSecPtrListDestroy(list);
     }
 }
 

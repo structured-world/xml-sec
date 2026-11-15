@@ -5,8 +5,8 @@
  *
  * Copyright (C) 2002-2026 Aleksey Sanin <aleksey@aleksey.com>. All Rights Reserved.
  */
-#ifndef __XMLSEC_BUFFER_H__
-#define __XMLSEC_BUFFER_H__
+#ifndef XMLSEC_BUFFER_H
+#define XMLSEC_BUFFER_H
 
 /**
  * @defgroup xmlsec_core_buffer Dynamic Buffer
@@ -15,6 +15,8 @@
  * @{
  */
 
+#include <stddef.h>
+#include <stdio.h>
 #include <xs_tree.h>
 
 #include <xmlsec/exports.h>
@@ -30,18 +32,18 @@ typedef struct _xmlSecBuffer                                    xmlSecBuffer,
 
 /**
  * @brief The memory allocation mode.
- * @details The memory allocation mode (used by xmlSecBuffer and xmlSecList).
+ * @details The memory allocation mode (used by xmlSecBuffer and xmlSecPtrList).
  */
 typedef enum {
-    xmlSecAllocModeExact = 0,  /**< the memory allocation mode that minimizes total allocated memory size. */
-    xmlSecAllocModeDouble  /**< the memory allocation mode that tries to minimize the number of malloc calls. */
+    xmlSecAllocModeExact = 0,   /**< the memory allocation mode that minimizes total allocated memory size. */
+    xmlSecAllocModeDouble       /**< the memory allocation mode that tries to minimize the number of malloc calls. */
 } xmlSecAllocMode;
 
 /******************************************************************************
  *
  * xmlSecBuffer
  *
-  *****************************************************************************/
+ *****************************************************************************/
 
 /**
  * @brief Binary data buffer.
@@ -50,7 +52,8 @@ struct _xmlSecBuffer {
     xmlSecByte*         data;  /**< the pointer to buffer data. */
     xmlSecSize          size;  /**< the current data size. */
     xmlSecSize          maxSize;  /**< the max data size (allocated buffer size). */
-    xmlSecAllocMode     allocMode;  /**< the buffer memory allocation mode. */
+    xmlSecAllocMode     allocMode;  /**< the memory allocation mode. */
+    int                 flags;  /**< the buffer behavior flags. */
 };
 
 XMLSEC_EXPORT void              xmlSecBufferSetDefaultAllocMode (xmlSecAllocMode defAllocMode,
@@ -61,6 +64,8 @@ XMLSEC_EXPORT void              xmlSecBufferDestroy             (xmlSecBufferPtr
 XMLSEC_EXPORT int               xmlSecBufferInitialize          (xmlSecBufferPtr buf,
                                                                  xmlSecSize size);
 XMLSEC_EXPORT void              xmlSecBufferFinalize            (xmlSecBufferPtr buf);
+XMLSEC_EXPORT void              xmlSecBufferMakeSecure          (xmlSecBufferPtr buf);
+XMLSEC_EXPORT int               xmlSecBufferIsSecure            (xmlSecBufferPtr buf);
 XMLSEC_EXPORT int               xmlSecBufferIsEmpty             (xmlSecBufferPtr buf);
 XMLSEC_EXPORT xmlSecByte*       xmlSecBufferGetData             (xmlSecBufferPtr buf);
 XMLSEC_EXPORT int               xmlSecBufferSetData             (xmlSecBufferPtr buf,
@@ -105,13 +110,15 @@ XMLSEC_EXPORT xmlOutputBufferPtr xmlSecBufferCreateOutputBuffer (xmlSecBufferPtr
  * Helpers
  */
 XMLSEC_EXPORT int               xmlSecMemEqual                  (const xmlSecByte* buf1,
-																 const xmlSecByte* buf2,
-																 xmlSecSize size);
+                                                                 const xmlSecByte* buf2,
+                                                                 xmlSecSize size);
+
+XMLSEC_EXPORT void              xmlSecMemCleanse                (void* data, xmlSecSize size);
 
 #ifdef __cplusplus
 }
 #endif /* __cplusplus */
 
-/** @} */ /** xmlsec_core_buffer */
+/** @} */ /* xmlsec_core_buffer */
 
-#endif /* __XMLSEC_BUFFER_H__ */
+#endif /* XMLSEC_BUFFER_H */

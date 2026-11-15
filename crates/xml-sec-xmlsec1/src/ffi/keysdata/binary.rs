@@ -17,7 +17,7 @@ use super::{
 use crate::ffi::base64::{xmlSecBase64DecodeInPlace, xmlSecBase64Encode};
 use crate::ffi::buffer::{
     XmlSecBuffer, xmlSecBufferFinalize, xmlSecBufferGetData, xmlSecBufferGetSize,
-    xmlSecBufferInitialize, xmlSecBufferSetData, xmlSecMemEqual,
+    xmlSecBufferInitialize, xmlSecBufferMakeSecure, xmlSecBufferSetData,
 };
 use crate::ffi::errors::{self, Here, check, here};
 use crate::ffi::keyinfo::XmlSecKeyInfoCtx;
@@ -92,6 +92,9 @@ pub(crate) unsafe extern "C" fn value_initialize(data: *mut XmlSecKeyData) -> c_
             );
             return -1;
         }
+        // The value is a key: its buffer is a secure one.
+        // SAFETY: an initialized buffer.
+        unsafe { xmlSecBufferMakeSecure(buffer) };
         0
     })
 }
@@ -149,14 +152,13 @@ macro_rules! method_arguments {
     };
 }
 
-/// Makes `size` bytes at `bytes` the value of `key` as a new object of
-/// klass `id`, as libxmlsec1's binary readers do: an existing value of the
-/// same klass must hold exactly these bytes, any other value refuses them,
-/// and the new value must satisfy `key_req`.
+/// Makes `size` bytes at `bytes` the value of `key`, which has none, as a
+/// new object of klass `id`, as libxmlsec1's binary readers do; the new
+/// value must satisfy `key_req`.
 ///
 /// # Safety
-/// `id` is a klass with the binary layout; `key` is a key; `bytes` holds
-/// `size` bytes; `key_req` is initialized requirements.
+/// `id` is a klass with the binary layout; `key` is a key without a value;
+/// `bytes` holds `size` bytes; `key_req` is initialized requirements.
 unsafe fn adopt_value(
     here: Here,
     id: *const XmlSecKeyDataKlass,
@@ -168,51 +170,6 @@ unsafe fn adopt_value(
     // SAFETY: by the caller's contract.
     unsafe {
         let object = klass_name(id);
-        let existing = xmlSecKeyGetValue(key);
-        if !existing.is_null() {
-            let existing_name = data_name(existing);
-            // libxmlsec1's formatted `xmlSecOtherError2/3` print the text
-            // alone, without the `details=` of `xmlSecOtherError`.
-            if !check_id(existing, id) {
-                errors::report(
-                    here,
-                    existing_name,
-                    std::ptr::null(),
-                    errors::R_KEY_DATA_ALREADY_EXIST,
-                    &format!("id={}", klass_text(object.cast())),
-                );
-                return -1;
-            }
-            let buffer = xmlSecKeyDataBinaryValueGetBuffer(existing);
-            if !buffer.is_null() {
-                let current = xmlSecBufferGetSize(buffer);
-                if current != size {
-                    errors::report(
-                        here,
-                        existing_name,
-                        std::ptr::null(),
-                        errors::R_KEY_DATA_ALREADY_EXIST,
-                        &format!("cur-data-size={current}; new-data-size={size}"),
-                    );
-                    return -1;
-                }
-                let equal = xmlSecMemEqual(xmlSecBufferGetData(buffer), bytes, size);
-                if equal < 0 {
-                    errors::internal(here, existing_name, c"xmlSecMemEqual");
-                    return -1;
-                }
-                if equal == 0 {
-                    errors::other(
-                        here,
-                        errors::R_KEY_DATA_ALREADY_EXIST,
-                        existing_name,
-                        Some("key already has a different value"),
-                    );
-                    return -1;
-                }
-                return 0;
-            }
-        }
         let data = xmlSecKeyDataCreate(id);
         if data.is_null() {
             errors::internal(here, object, c"xmlSecKeyDataCreate");
@@ -244,7 +201,7 @@ unsafe fn adopt_value(
 }
 
 /// `xmlSecKeyDataBinaryValueXmlRead`: the Base64 content of `node` as the
-/// value of `key`.
+/// value of `key`, which must have none yet.
 ///
 /// # Safety
 /// `id` is null or a klass with the binary layout; `key` is null or a key;
@@ -262,6 +219,17 @@ pub(crate) unsafe extern "C" fn value_xml_read(
     );
     contain(-1, || {
         method_arguments!("xmlSecKeyDataBinaryValueXmlRead", id, key);
+        // SAFETY: a key.
+        if !unsafe { xmlSecKeyGetValue(key) }.is_null() {
+            errors::other(
+                here!("xmlSecKeyDataBinaryValueXmlRead"),
+                errors::R_INVALID_KEY_DATA,
+                // SAFETY: a klass.
+                unsafe { klass_name(id) },
+                Some("key already has a value"),
+            );
+            return -1;
+        }
         check!(
             !node.is_null(),
             "xmlSecKeyDataBinaryValueXmlRead",
@@ -294,15 +262,18 @@ pub(crate) unsafe extern "C" fn value_xml_read(
             }
             let text = xmlSecGetNodeContentAndTrim(node);
             if text.is_null() {
-                errors::invalid_node_content(here, node, object, "empty");
+                errors::internal(here, object, c"xmlSecGetNodeContentAndTrim");
                 return -1;
             }
             // The text and the bytes decoded over it are the secret: the
             // whole string is wiped before the allocation is released.
             let length = std::ffi::CStr::from_ptr(text.cast()).count_bytes();
             let mut size = 0;
-            let result = if xmlSecBase64DecodeInPlace(text, &raw mut size) < 0 {
-                errors::internal(here, object, c"xmlSecBase64Decode_ex");
+            let result = if length == 0 {
+                errors::invalid_node_content(here, node, object, "empty");
+                -1
+            } else if xmlSecBase64DecodeInPlace(text, &raw mut size) < 0 {
+                errors::internal(here, object, c"xmlSecBase64DecodeInPlace");
                 -1
             } else {
                 adopt_value(here, id, key, text, size, &raw mut (*ctx).key_req)
@@ -314,8 +285,57 @@ pub(crate) unsafe extern "C" fn value_xml_read(
     })
 }
 
+/// The value buffer of `key` a binary writer of klass `id` exports, after
+/// libxmlsec1's checks inside the entry point `func`: the key has a value,
+/// valid and of klass `id`; `None` after the report.
+///
+/// # Safety
+/// `id` is a klass; `key` is a key.
+unsafe fn written_value(
+    id: *const XmlSecKeyDataKlass,
+    key: *mut XmlSecKey,
+    here: Here,
+) -> Option<*mut XmlSecBuffer> {
+    // SAFETY: by the caller's contract.
+    unsafe {
+        let value = xmlSecKeyGetValue(key);
+        if value.is_null() {
+            errors::other(
+                here,
+                errors::R_INVALID_KEY_DATA,
+                klass_name(id),
+                Some("key has no value"),
+            );
+            return None;
+        }
+        if !data_valid(value) {
+            errors::assertion(here, c"xmlSecKeyDataIsValid(value)");
+            return None;
+        }
+        // A writer called with another klass would write one key type's
+        // bytes as another's.
+        if !check_id(value, id) {
+            errors::report(
+                here,
+                klass_name(id),
+                std::ptr::null(),
+                errors::R_INVALID_TYPE,
+                "key value is not of the expected binary key data type",
+            );
+            return None;
+        }
+        let buffer = xmlSecKeyDataBinaryValueGetBuffer(value);
+        if buffer.is_null() {
+            errors::assertion(here, c"buffer != NULL");
+            return None;
+        }
+        Some(buffer)
+    }
+}
+
 /// `xmlSecKeyDataBinaryValueXmlWrite`: the value of `key` as the Base64
-/// content of `node`, when the context asks for a symmetric key.
+/// content of `node`, when the context asks for a symmetric key; an empty
+/// value is refused.
 ///
 /// # Safety
 /// As for [`value_xml_read`]; the key's value is binary
@@ -349,37 +369,24 @@ pub(crate) unsafe extern "C" fn value_xml_write(
         if unsafe { (*ctx).key_req.key_type } & TYPE_SYMMETRIC == 0 {
             return 0;
         }
-        // SAFETY: a key.
-        let value = unsafe { xmlSecKeyGetValue(key) };
-        // SAFETY: null or the key's key data.
-        let valid_value = unsafe { data_valid(value) };
-        check!(
-            valid_value,
-            "xmlSecKeyDataBinaryValueXmlWrite",
-            c"xmlSecKeyDataIsValid(value)",
-            -1
-        );
-        // A writer called directly with another klass would write one key
-        // type's bytes as another's.
-        // SAFETY: valid key data and a klass.
-        let own = unsafe { check_id(value, id) };
-        check!(
-            own,
-            "xmlSecKeyDataBinaryValueXmlWrite",
-            c"xmlSecKeyDataCheckId(value, id)",
-            -1
-        );
-        // SAFETY: valid key data.
-        let buffer = unsafe { xmlSecKeyDataBinaryValueGetBuffer(value) };
-        check!(
-            !buffer.is_null(),
-            "xmlSecKeyDataBinaryValueXmlWrite",
-            c"buffer != NULL",
-            -1
-        );
+        let here = here!("xmlSecKeyDataBinaryValueXmlWrite");
+        // SAFETY: a klass and a key.
+        let Some(buffer) = (unsafe { written_value(id, key, here) }) else {
+            return -1;
+        };
         // SAFETY: the value buffer, a context and a live node; the text is
         // freed here.
         unsafe {
+            if xmlSecBufferGetSize(buffer) == 0 {
+                errors::report(
+                    here,
+                    klass_name(id),
+                    std::ptr::null(),
+                    errors::R_INVALID_KEY_DATA_SIZE,
+                    "invalid zero key data size",
+                );
+                return -1;
+            }
             let text = xmlSecBase64Encode(
                 xmlSecBufferGetData(buffer),
                 xmlSecBufferGetSize(buffer),
@@ -414,7 +421,8 @@ pub(crate) unsafe extern "C" fn value_xml_write(
     })
 }
 
-/// `xmlSecKeyDataBinaryValueBinRead`: `size` bytes as the value of `key`.
+/// `xmlSecKeyDataBinaryValueBinRead`: `size` bytes as the value of `key`,
+/// which must have none yet.
 ///
 /// # Safety
 /// `id` is null or a klass with the binary layout; `key` is null or a key;
@@ -429,6 +437,13 @@ pub(crate) unsafe extern "C" fn value_bin_read(
     let (key, ctx) = (key.cast::<XmlSecKey>(), ctx.cast::<XmlSecKeyInfoCtx>());
     contain(-1, || {
         method_arguments!("xmlSecKeyDataBinaryValueBinRead", id, key);
+        check!(
+            // SAFETY: a key.
+            unsafe { xmlSecKeyGetValue(key) }.is_null(),
+            "xmlSecKeyDataBinaryValueBinRead",
+            c"xmlSecKeyGetValue(key) == NULL",
+            -1
+        );
         check!(
             !buf.is_null(),
             "xmlSecKeyDataBinaryValueBinRead",
@@ -505,38 +520,21 @@ pub(crate) unsafe extern "C" fn value_bin_write(
         if unsafe { (*ctx).key_req.key_type } & TYPE_SYMMETRIC == 0 {
             return 0;
         }
-        // SAFETY: a key.
-        let value = unsafe { xmlSecKeyGetValue(key) };
-        // SAFETY: null or the key's key data.
-        let valid_value = unsafe { data_valid(value) };
-        check!(
-            valid_value,
-            "xmlSecKeyDataBinaryValueBinWrite",
-            c"xmlSecKeyDataIsValid(value)",
-            -1
-        );
-        // As for the XML writer: only the value's own klass exports it.
-        // SAFETY: valid key data and a klass.
-        let own = unsafe { check_id(value, id) };
-        check!(
-            own,
-            "xmlSecKeyDataBinaryValueBinWrite",
-            c"xmlSecKeyDataCheckId(value, id)",
-            -1
-        );
-        // SAFETY: valid key data.
-        let buffer = unsafe { xmlSecKeyDataBinaryValueGetBuffer(value) };
-        check!(
-            !buffer.is_null(),
-            "xmlSecKeyDataBinaryValueBinWrite",
-            c"buffer != NULL",
-            -1
-        );
+        let here = here!("xmlSecKeyDataBinaryValueBinWrite");
+        // SAFETY: a klass and a key.
+        let Some(buffer) = (unsafe { written_value(id, key, here) }) else {
+            return -1;
+        };
         // SAFETY: the value buffer holds `length` bytes; the copy is the
         // caller's, in libxml2's memory.
         unsafe {
             let length = xmlSecBufferGetSize(buffer);
             *size = length;
+            // An empty value is written as nothing: no block to allocate.
+            if length == 0 {
+                *buf = std::ptr::null_mut();
+                return 0;
+            }
             let copy = malloc(length).cast::<u8>();
             *buf = copy;
             if copy.is_null() {
@@ -547,26 +545,32 @@ pub(crate) unsafe extern "C" fn value_bin_write(
                 );
                 return -1;
             }
-            // An empty value may have no data pointer, which a copy, even of
-            // nothing, must not read.
-            if length > 0 {
-                copy.copy_from_nonoverlapping(xmlSecBufferGetData(buffer), length);
-            }
+            copy.copy_from_nonoverlapping(xmlSecBufferGetData(buffer), length);
         }
         0
     })
 }
 
 /// The element name of the binary value `$data` for a debug dump to
-/// `$output`, after libxmlsec1's assertions inside the entry point `$func`.
-/// Only the name and size are printed: the key bytes are secret.
+/// `$output`, or its klass name for a klass without an element, after
+/// libxmlsec1's assertions inside the entry point `$func`. Only the name
+/// and size are printed: the key bytes are secret.
 macro_rules! dump_name_or {
     ($data:expr, $output:expr, $func:literal) => {{
-        let node = binary_klass_or!($data, $func).data_node_name;
-        check!(!node.is_null(), $func, c"data->id->dataNodeName != NULL");
+        let klass = binary_klass_or!($data, $func);
         check!(!$output.is_null(), $func, c"output != NULL");
-        // SAFETY: the klass's NUL-terminated element name.
-        unsafe { klass_text(node) }
+        let name = if klass.data_node_name.is_null() {
+            klass.name
+        } else {
+            klass.data_node_name
+        };
+        // A missing name prints as libxmlsec1's safe string does.
+        if name.is_null() {
+            "NULL".to_owned()
+        } else {
+            // SAFETY: the klass's NUL-terminated name.
+            unsafe { klass_text(name) }
+        }
     }};
 }
 
@@ -612,10 +616,19 @@ pub(crate) unsafe extern "C" fn value_debug_xml_dump(
 pub(crate) unsafe extern "C" fn xmlSecKeyDataBinaryValueGetSize(data: *mut XmlSecKeyData) -> usize {
     contain(0, || {
         let buffer = binary_buffer_or!(data, "xmlSecKeyDataBinaryValueGetSize", 0);
-        // libxmlsec1 computes `8 * size` in `xmlSecSize`, which wraps for a
-        // value of more than `SIZE_MAX / 8` bytes; the same number here.
         // SAFETY: the object's value buffer.
-        unsafe { xmlSecBufferGetSize(buffer) }.wrapping_mul(8)
+        let size = unsafe { xmlSecBufferGetSize(buffer) };
+        let Some(bits) = size.checked_mul(8) else {
+            errors::size_more_than(
+                here!("xmlSecKeyDataBinaryValueGetSize"),
+                std::ptr::null(),
+                "size",
+                size,
+                usize::MAX / 8,
+            );
+            return 0;
+        };
+        bits
     })
 }
 

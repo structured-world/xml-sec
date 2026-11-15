@@ -5,8 +5,8 @@
  *
  * Copyright (C) 2002-2026 Aleksey Sanin <aleksey@aleksey.com>. All Rights Reserved.
  */
-#ifndef __XMLSEC_KEYSDATA_H__
-#define __XMLSEC_KEYSDATA_H__
+#ifndef XMLSEC_KEYSDATA_H
+#define XMLSEC_KEYSDATA_H
 
 /**
  * @defgroup xmlsec_core_keysdata Key Data
@@ -15,12 +15,15 @@
  * @{
  */
 
+#include <stdio.h>
+
 #include <xs_tree.h>
 
 #include <xmlsec/exports.h>
 #include <xmlsec/xmlsec.h>
 #include <xmlsec/buffer.h>
 #include <xmlsec/list.h>
+#include <xmlsec/x509.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -30,7 +33,7 @@ extern "C" {
  *
  * Forward declarations
  *
-  *****************************************************************************/
+ *****************************************************************************/
 /**
  * @brief The key data klass.
  */
@@ -47,106 +50,88 @@ typedef const struct _xmlSecKeyDataStoreKlass           xmlSecKeyDataStoreKlass;
  * @brief Pointer to #xmlSecKeyDataStoreKlass.
  */
 typedef const struct _xmlSecKeyDataStoreKlass           *xmlSecKeyDataStoreId;
-/**
- * @brief The key data list.
- */
-typedef struct _xmlSecKeyDataList                       xmlSecKeyDataList;
-/**
- * @brief Pointer to #xmlSecKeyDataList.
- */
-typedef struct _xmlSecKeyDataList                       *xmlSecKeyDataListPtr;
-
-/**
- * @brief The X.509 key data value.
- */
-typedef struct _xmlSecKeyX509DataValue                  xmlSecKeyX509DataValue;
-
-/**
- * @brief Pointer to xmlSecKeyX509DataValue.
- */
-typedef struct _xmlSecKeyX509DataValue                  *xmlSecKeyX509DataValuePtr;
 
 /******************************************************************************
  *
  * xmlSecKeyDataUsage
  *
-  *****************************************************************************/
+ *****************************************************************************/
 /**
  * @brief The key data usage bitmask.
- * @details The bits mask that determines possible keys data usage.
+ * @details The bitmask that determines possible key data usage.
  */
 typedef unsigned int                                    xmlSecKeyDataUsage;
 
 /**
  * @brief The key data usage is unknown.
  */
-#define xmlSecKeyDataUsageUnknown                       0x00000
+#define xmlSecKeyDataUsageUnknown                       0x0000
 
 /**
  * @brief The key data can be read from a KeyInfo child.
  * @details The key data could be read from a &lt;dsig:KeyInfo/&gt; child.
  */
-#define xmlSecKeyDataUsageKeyInfoNodeRead               0x00001
+#define xmlSecKeyDataUsageKeyInfoNodeRead               0x0001
 
 /**
  * @brief The key data can be written to a KeyInfo child.
- * @details The key data could be written to a <dsig:KeyInfo /> child.
+ * @details The key data could be written to a &lt;dsig:KeyInfo/&gt; child.
  */
-#define xmlSecKeyDataUsageKeyInfoNodeWrite              0x00002
+#define xmlSecKeyDataUsageKeyInfoNodeWrite              0x0002
 
 /**
  * @brief The key data can be read from a KeyValue child.
- * @details The key data could be read from a <dsig:KeyValue /> child.
+ * @details The key data could be read from a &lt;dsig:KeyValue/&gt; child.
  */
-#define xmlSecKeyDataUsageKeyValueNodeRead              0x00004
+#define xmlSecKeyDataUsageKeyValueNodeRead              0x0004
 
 /**
  * @brief The key data can be written to a KeyValue child.
- * @details The key data could be written to a <dsig:KeyValue /> child.
+ * @details The key data could be written to a &lt;dsig:KeyValue/&gt; child.
  */
-#define xmlSecKeyDataUsageKeyValueNodeWrite             0x00008
+#define xmlSecKeyDataUsageKeyValueNodeWrite             0x0008
 
 /**
  * @brief The key data can be retrieved via RetrievalMethod in XML format.
- * @details The key data could be retrieved using <dsig:RetrievalMethod /> node
+ * @details The key data could be retrieved using &lt;dsig:RetrievalMethod/&gt; node
  * in XML format.
  */
-#define xmlSecKeyDataUsageRetrievalMethodNodeXml        0x00010
+#define xmlSecKeyDataUsageRetrievalMethodNodeXml        0x0010
 
 /**
  * @brief The key data can be retrieved via RetrievalMethod in binary format.
- * @details The key data could be retrieved using <dsig:RetrievalMethod /> node
+ * @details The key data could be retrieved using &lt;dsig:RetrievalMethod/&gt; node
  * in binary format.
  */
-#define xmlSecKeyDataUsageRetrievalMethodNodeBin        0x00020
+#define xmlSecKeyDataUsageRetrievalMethodNodeBin        0x0020
 
 /**
  * @brief The key data could be read from a file.
  */
-#define xmlSecKeyDataUsageReadFromFile                   0x00040
+#define xmlSecKeyDataUsageReadFromFile                  0x0040
 
 /**
  * @brief Any key data usage.
  */
-#define xmlSecKeyDataUsageAny                            0xFFFFF
+#define xmlSecKeyDataUsageAny                           0xFFFF
 
 /**
  * @brief The key data can be read and written from/to a KeyInfo child.
- * @details The key data could be read and written from/to a <dsig:KeyInfo /> child.
+ * @details The key data could be read and written from/to a &lt;dsig:KeyInfo/&gt; child.
  */
 #define xmlSecKeyDataUsageKeyInfoNode                   \
         (xmlSecKeyDataUsageKeyInfoNodeRead | xmlSecKeyDataUsageKeyInfoNodeWrite)
 
 /**
  * @brief The key data can be read and written from/to a KeyValue child.
- * @details The key data could be read and written from/to a <dsig:KeyValue /> child.
+ * @details The key data could be read and written from/to a &lt;dsig:KeyValue/&gt; child.
  */
 #define xmlSecKeyDataUsageKeyValueNode                  \
         (xmlSecKeyDataUsageKeyValueNodeRead | xmlSecKeyDataUsageKeyValueNodeWrite)
 
 /**
  * @brief The key data can be retrieved via RetrievalMethod in any format.
- * @details The key data could be retrieved using <dsig:RetrievalMethod /> node
+ * @details The key data could be retrieved using &lt;dsig:RetrievalMethod/&gt; node
  * in any format.
  */
 #define xmlSecKeyDataUsageRetrievalMethodNode           \
@@ -156,7 +141,7 @@ typedef unsigned int                                    xmlSecKeyDataUsage;
  *
  * xmlSecKeyDataType
  *
-  *****************************************************************************/
+ *****************************************************************************/
 /**
  * @brief The key data type.
  * @details The key data type (public/private, session/permanent, etc.).
@@ -170,35 +155,35 @@ typedef unsigned int                            xmlSecKeyDataType;
 #define xmlSecKeyDataTypeUnknown                        0x0000
 
 /**
- * @brief The key data type is unknown (same as unknown).
- * @details The key data type is unknown (same as #xmlSecKeyDataTypeUnknown).
+ * @brief The key data type is none (same as unknown).
+ * @details The key data type is none (same as #xmlSecKeyDataTypeUnknown).
  */
 #define xmlSecKeyDataTypeNone                           xmlSecKeyDataTypeUnknown
 
 /**
- * @brief The key data contain a public key.
+ * @brief The key data contains a public key.
  */
 #define xmlSecKeyDataTypePublic                         0x0001
 
 /**
- * @brief The key data contain a private key.
+ * @brief The key data contains a private key.
  */
 #define xmlSecKeyDataTypePrivate                        0x0002
 
 /**
- * @brief The key data contain a symmetric key.
+ * @brief The key data contains a symmetric key.
  */
 #define xmlSecKeyDataTypeSymmetric                      0x0004
 
 /**
  * @brief The key data contains a session (one-time) key.
- * @details The key data contain session key (one time key, not stored in keys manager).
+ * @details The key data contains a session key (one-time key, not stored in keys manager).
  */
 #define xmlSecKeyDataTypeSession                        0x0008
 
 /**
  * @brief The key data contains a permanent key.
- * @details The key data contain permanent key (stored in keys manager).
+ * @details The key data contains a permanent key (stored in keys manager).
  */
 #define xmlSecKeyDataTypePermanent                      0x0010
 
@@ -216,9 +201,9 @@ typedef unsigned int                            xmlSecKeyDataType;
  *
  * xmlSecKeyDataFormat
  *
-  *****************************************************************************/
+ *****************************************************************************/
 /**
- * @brief The key data format (binary, der, pem, etc.).
+ * @brief The key data format (binary, DER, PEM, etc.).
  */
 typedef enum {
     xmlSecKeyDataFormatUnknown = 0,  /**< the key data format is unknown. */
@@ -227,7 +212,7 @@ typedef enum {
     xmlSecKeyDataFormatDer,  /**< the DER key data (cert or public/private key). */
     xmlSecKeyDataFormatPkcs8Pem,  /**< the PKCS8 PEM private key. */
     xmlSecKeyDataFormatPkcs8Der,  /**< the PKCS8 DER private key. */
-    xmlSecKeyDataFormatPkcs12,  /**< the PKCS12 format (bag of keys and certs) */
+    xmlSecKeyDataFormatPkcs12,  /**< the PKCS12 format (bag of keys and certs). */
     xmlSecKeyDataFormatCertPem,  /**< the PEM cert. */
     xmlSecKeyDataFormatCertDer,  /**< the DER cert. */
     xmlSecKeyDataFormatEngine,  /**< the crypto engine (e.g. OpenSSL ENGINE). */
@@ -238,7 +223,7 @@ typedef enum {
  *
  * Global xmlSecKeyDataIds methods
  *
-  *****************************************************************************/
+ *****************************************************************************/
 XMLSEC_EXPORT xmlSecPtrListPtr  xmlSecKeyDataIdsGet             (void);
 XMLSEC_EXPORT xmlSecPtrListPtr  xmlSecKeyDataIdsGetEnabled      (void);
 XMLSEC_EXPORT int               xmlSecKeyDataIdsInit            (void);
@@ -251,10 +236,10 @@ XMLSEC_EXPORT int               xmlSecKeyDataIdsRegisterDisabled(xmlSecKeyDataId
  *
  * xmlSecKeyData
  *
-  *****************************************************************************/
+ *****************************************************************************/
 /**
- * @brief The key data (key value, x509 data, pgp data, etc.).
- * @details The key data: key value (crypto material), x509 data, pgp data, etc.
+ * @brief The key data (key value, x509 data, etc.).
+ * @details The key data: key value (crypto material), x509 data, etc.
  */
 struct _xmlSecKeyData {
     xmlSecKeyDataId                     id;  /**< the data id (#xmlSecKeyDataId). */
@@ -272,9 +257,9 @@ XMLSEC_EXPORT xmlSecKeyDataType xmlSecKeyDataGetType            (xmlSecKeyDataPt
 XMLSEC_EXPORT xmlSecSize        xmlSecKeyDataGetSize            (xmlSecKeyDataPtr data);
 
 XMLSEC_EXPORT void              xmlSecKeyDataDebugDump          (xmlSecKeyDataPtr data,
-                                                                 FILE *output);
+                                                                  FILE* output);
 XMLSEC_EXPORT void              xmlSecKeyDataDebugXmlDump       (xmlSecKeyDataPtr data,
-                                                                 FILE *output);
+                                                                  FILE* output);
 
 XMLSEC_EXPORT int               xmlSecKeyDataXmlRead            (xmlSecKeyDataId id,
                                                                  xmlSecKeyPtr key,
@@ -290,12 +275,12 @@ XMLSEC_EXPORT int               xmlSecKeyDataBinRead            (xmlSecKeyDataId
                                                                  const xmlSecByte* buf,
                                                                  xmlSecSize bufSize,
                                                                  xmlSecKeyInfoCtxPtr keyInfoCtx);
+
 XMLSEC_EXPORT int               xmlSecKeyDataBinWrite           (xmlSecKeyDataId id,
                                                                  xmlSecKeyPtr key,
                                                                  xmlSecByte** buf,
                                                                  xmlSecSize* bufSize,
                                                                  xmlSecKeyInfoCtxPtr keyInfoCtx);
-
 
 /**
  * @brief Macro. Returns the key data name.
@@ -307,8 +292,10 @@ XMLSEC_EXPORT int               xmlSecKeyDataBinWrite           (xmlSecKeyDataId
 
 /**
  * @brief Macro. Returns 1 if @p data is valid.
- * @details Macro. Returns 1 if @p data is not NULL and @p data->id is not NULL
- * or 0 otherwise.
+ * @details Macro. Returns 1 if @p data is not NULL, @p data->id is not NULL,
+ * @p data->id->klassSize is at least sizeof(xmlSecKeyDataKlass),
+ * @p data->id->objSize is at least sizeof(xmlSecKeyData) and @p data->id->name
+ * is not NULL, or 0 otherwise.
  * @param data the pointer to data.
  */
 #define xmlSecKeyDataIsValid(data) \
@@ -346,13 +333,13 @@ XMLSEC_EXPORT int               xmlSecKeyDataBinWrite           (xmlSecKeyDataId
  */
 #define xmlSecKeyDataCheckSize(data, size) \
         (xmlSecKeyDataIsValid(( data )) && \
-         (( data )->id->objSize >= size))
+         (( data )->id->objSize >= ( size )))
 
 /******************************************************************************
  *
  * xmlSecKeyDataKlass
  *
-  *****************************************************************************/
+ *****************************************************************************/
 /**
  * @brief The "unknown" id.
  */
@@ -423,10 +410,12 @@ typedef int                     (*xmlSecKeyDataBinReadMethod)   (xmlSecKeyDataId
                                                                  xmlSecKeyInfoCtxPtr keyInfoCtx);
 /**
  * @brief Key data specific method to write a binary buffer.
- * @details Key data specific method for reading binary buffer.
+ * @details Key data specific method for writing binary buffer.
+ * On success, the method allocates the output buffer @p buf and the caller
+ * is responsible for freeing it.
  * @param id the data id.
  * @param key the key.
- * @param buf the output buffer.
+ * @param buf the output buffer (allocated by the method; the caller must free it).
  * @param bufSize the buffer size.
  * @param keyInfoCtx the &lt;dsig:KeyInfo/&gt; node processing context.
  * @return 0 on success or a negative value if an error occurs.
@@ -494,7 +483,7 @@ struct _xmlSecKeyDataKlass {
     /* get info */
     xmlSecKeyDataGetTypeMethod          getType;  /**< the method to access data's type information. */
     xmlSecKeyDataGetSizeMethod          getSize;  /**< the method to access data's size. */
-    void*                               deprecated0;  /**< DEPRECAED: the method to access data's string identifier. */
+    void*                               deprecated0;  /**< DEPRECATED: the method to access data's string identifier. */
 
     /* read/write */
     xmlSecKeyDataXmlReadMethod          xmlRead;  /**< the method for reading data from XML node. */
@@ -513,7 +502,7 @@ struct _xmlSecKeyDataKlass {
 
 /**
  * @brief Macro. Returns data klass name.
- * @param klass the data klass.
+ * @param klass the pointer to data klass.
  */
 #define xmlSecKeyDataKlassGetName(klass) \
         (((klass)) ? ((klass)->name) : NULL)
@@ -524,7 +513,7 @@ struct _xmlSecKeyDataKlass {
  *
  * Helper functions for binary key data (HMAC, AES, DES, ...).
  *
-  *****************************************************************************/
+ *****************************************************************************/
 XMLSEC_EXPORT xmlSecSize        xmlSecKeyDataBinaryValueGetSize         (xmlSecKeyDataPtr data);
 XMLSEC_EXPORT xmlSecBufferPtr   xmlSecKeyDataBinaryValueGetBuffer       (xmlSecKeyDataPtr data);
 XMLSEC_EXPORT int               xmlSecKeyDataBinaryValueSetBuffer       (xmlSecKeyDataPtr data,
@@ -535,9 +524,9 @@ XMLSEC_EXPORT int               xmlSecKeyDataBinaryValueSetBuffer       (xmlSecK
  *
  * Key Data list
  *
-  *****************************************************************************/
+ *****************************************************************************/
 /**
- * @brief The key data klasses list klass id.
+ * @brief The key data list klass id.
  */
 #define xmlSecKeyDataListId     xmlSecKeyDataListGetKlass()
 XMLSEC_EXPORT xmlSecPtrListId   xmlSecKeyDataListGetKlass       (void);
@@ -546,9 +535,9 @@ XMLSEC_EXPORT xmlSecPtrListId   xmlSecKeyDataListGetKlass       (void);
  *
  * Key Data Ids list
  *
-  *****************************************************************************/
+ *****************************************************************************/
 /**
- * @brief The key data list klass id.
+ * @brief The key data ids list klass id.
  */
 #define xmlSecKeyDataIdListId   xmlSecKeyDataIdListGetKlass()
 XMLSEC_EXPORT xmlSecPtrListId   xmlSecKeyDataIdListGetKlass     (void);
@@ -574,11 +563,11 @@ XMLSEC_EXPORT void              xmlSecKeyDataIdListDebugXmlDump (xmlSecPtrListPt
  *
  * xmlSecKeyDataStore
  *
-  *****************************************************************************/
+ *****************************************************************************/
 /**
  * @brief The key data store (holds common data for key processing).
  * @details The key data store. Key data store holds common key data specific information
- * required for key data processing. For example, X509 data store may hold
+ * required for key data processing. For example, an X509 data store may hold
  * information about trusted (root) certificates.
  */
 struct _xmlSecKeyDataStore {
@@ -602,12 +591,18 @@ XMLSEC_EXPORT void              xmlSecKeyDataStoreDestroy       (xmlSecKeyDataSt
 
 /**
  * @brief Macro. Returns 1 if @p store is valid.
- * @details Macro. Returns 1 if @p store is not NULL and @p store->id is not NULL
- * or 0 otherwise.
+ * @details Macro. Returns 1 if @p store is not NULL, @p store->id is not NULL,
+ * @p store->id->klassSize is at least sizeof(xmlSecKeyDataStoreKlass),
+ * @p store->id->objSize is at least sizeof(xmlSecKeyDataStore) and
+ * @p store->id->name is not NULL, or 0 otherwise.
  * @param store the pointer to store.
  */
 #define xmlSecKeyDataStoreIsValid(store) \
-        ((( store ) != NULL) && ((( store )->id) != NULL))
+        ((( store ) != NULL) && \
+         (( store )->id != NULL) && \
+         (( store )->id->klassSize >= sizeof(xmlSecKeyDataStoreKlass)) && \
+         (( store )->id->objSize >= sizeof(xmlSecKeyDataStore)) && \
+         (( store )->id->name != NULL))
 /**
  * @brief Macro. Returns 1 if @p store's id equals @p storeId.
  * @details Macro. Returns 1 if @p store is valid and @p store's id is equal to @p storeId.
@@ -620,24 +615,24 @@ XMLSEC_EXPORT void              xmlSecKeyDataStoreDestroy       (xmlSecKeyDataSt
 
 /**
  * @brief Macro. Returns 1 if @p store's object has at least @p size bytes.
- * @details Macro. Returns 1 if @p data is valid and @p stores's object has at least @p size bytes.
+ * @details Macro. Returns 1 if @p store is valid and @p store's object has at least @p size bytes.
  * @param store the pointer to store.
  * @param size the expected size.
  */
 #define xmlSecKeyDataStoreCheckSize(store, size) \
         (xmlSecKeyDataStoreIsValid(( store )) && \
-         (( store )->id->objSize >= size))
+         (( store )->id->objSize >= ( size )))
 
 
 /******************************************************************************
  *
  * xmlSecKeyDataStoreKlass
  *
-  *****************************************************************************/
+ *****************************************************************************/
 /**
  * @brief The "unknown" id.
  */
-#define xmlSecKeyDataStoreIdUnknown                     NULL
+#define xmlSecKeyDataStoreIdUnknown                     ((xmlSecKeyDataStoreId)NULL)
 
 /**
  * @brief Key data store specific initialization method.
@@ -683,22 +678,27 @@ struct _xmlSecKeyDataStoreKlass {
  *
  * Key Data Store list
  *
-  *****************************************************************************/
+ *****************************************************************************/
 /**
- * @brief The data store list id (klass).
+ * @brief The key data store list id (klass).
  */
 #define xmlSecKeyDataStorePtrListId     xmlSecKeyDataStorePtrListGetKlass()
 XMLSEC_EXPORT xmlSecPtrListId   xmlSecKeyDataStorePtrListGetKlass       (void);
 
-XMLSEC_EXPORT void xmlSecImportSetPersistKey                            (void);
-XMLSEC_EXPORT int xmlSecImportGetPersistKey                             (void);
+/******************************************************************************
+ *
+ * Key import
+ *
+ *****************************************************************************/
+XMLSEC_EXPORT void              xmlSecImportSetPersistKey               (void);
+XMLSEC_EXPORT int               xmlSecImportGetPersistKey               (void);
 
 
 /******************************************************************************
  *
  * DEPRECATED
  *
-  *****************************************************************************/
+ *****************************************************************************/
 XMLSEC_EXPORT XMLSEC_DEPRECATED const xmlChar*    xmlSecKeyDataGetIdentifier      (xmlSecKeyDataPtr data);
 
 
@@ -706,6 +706,6 @@ XMLSEC_EXPORT XMLSEC_DEPRECATED const xmlChar*    xmlSecKeyDataGetIdentifier    
 }
 #endif /* __cplusplus */
 
-/** @} */ /** xmlsec_core_keysdata */
+/** @} */ /* xmlsec_core_keysdata */
 
-#endif /* __XMLSEC_KEYSDATA_H__ */
+#endif /* XMLSEC_KEYSDATA_H */

@@ -16,7 +16,7 @@ use super::builtin::klass;
 use super::ctx::{Limit, charge, run_budget, run_scope};
 use super::io::bounded_input_buffer;
 use super::{
-    STATUS_FINISHED, STATUS_NONE, STATUS_WORKING, USAGE_DSIG_TRANSFORM, WithContext,
+    STATUS_FAIL, STATUS_FINISHED, STATUS_NONE, STATUS_WORKING, USAGE_DSIG_TRANSFORM, WithContext,
     XmlSecTransform, XmlSecTransformCtx, XmlSecTransformKlass, context_or, xmlSecTransformPushXml,
 };
 
@@ -137,12 +137,53 @@ unsafe extern "C" fn push_bin(
                 object.status = STATUS_WORKING;
             }
             STATUS_WORKING => {}
-            STATUS_FINISHED => return 0,
+            STATUS_FINISHED if data.is_null() || size == 0 => return 0,
+            STATUS_FINISHED => {
+                status_refused(here, "data pushed after transform finished");
+                return -1;
+            }
             status => {
                 errors::invalid_status(here, name(), status);
                 return -1;
             }
         }
+        // Any failure from here on fails the transform.
+        let pushed_ok = push_working(object, slot, data, size, last, ctx, here);
+        if pushed_ok < 0 {
+            object.status = STATUS_FAIL;
+        }
+        pushed_ok
+    }
+}
+
+/// libxmlsec1's `xmlSecInvalidTransformStatusError2` for the XML parser,
+/// whose status is finished whenever it reports one.
+fn status_refused(here: errors::Here, message: &str) {
+    errors::report(
+        here,
+        name(),
+        std::ptr::null(),
+        errors::R_INVALID_STATUS,
+        &format!("transformStatus={STATUS_FINISHED}; msg={message}"),
+    );
+}
+
+/// The working part of [`push_bin`]: collects the octets and on the last
+/// push parses and pushes the document on.
+///
+/// # Safety
+/// As for [`push_bin`], with the transform working.
+unsafe fn push_working(
+    object: &mut XmlSecTransform,
+    slot: &mut *mut Pushed,
+    data: *const u8,
+    size: usize,
+    last: c_int,
+    ctx: *mut XmlSecTransformCtx,
+    here: errors::Here,
+) -> c_int {
+    // SAFETY: by the caller's contract.
+    unsafe {
         let Some(pushed) = slot.as_mut() else {
             errors::assertion(here, c"ctx->parserCtx != NULL");
             return -1;
@@ -205,32 +246,33 @@ unsafe extern "C" fn pop_xml(
     // SAFETY: an XML parser transform in a live chain; `nodes` is writable.
     unsafe {
         let object = &mut *transform;
+        let original = object.status;
         match object.status {
             STATUS_NONE => object.status = STATUS_WORKING,
             STATUS_WORKING => {}
             STATUS_FINISHED => {
-                nodes.write(std::ptr::null_mut());
-                return 0;
+                status_refused(here, "data popped after transform finished");
+                return -1;
             }
             status => {
                 errors::invalid_status(here, name(), status);
                 return -1;
             }
         }
-        let Some((pinned, side)) = run_scope(ctx, here) else {
-            return -1;
-        };
-        let operation = pinned.of(side);
         if object.prev.is_null() {
             errors::report(
                 here,
                 name(),
                 std::ptr::null(),
                 errors::R_INVALID_TRANSFORM,
-                "prev transform=\"NULL\"",
+                &format!("transform has no previous transform: status={original}"),
             );
             return -1;
         }
+        let Some((pinned, side)) = run_scope(ctx, here) else {
+            return -1;
+        };
+        let operation = pinned.of(side);
         // Reads past the document limit fail inside the buffer.
         let input = bounded_input_buffer(
             object.prev,

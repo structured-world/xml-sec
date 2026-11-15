@@ -5,8 +5,8 @@
  *
  * Copyright (C) 2002-2026 Aleksey Sanin <aleksey@aleksey.com>. All Rights Reserved.
  */
-#ifndef __XMLSEC_IO_H__
-#define __XMLSEC_IO_H__
+#ifndef XMLSEC_IO_H
+#define XMLSEC_IO_H
 
 /**
  * @defgroup xmlsec_core_io I/O
@@ -38,7 +38,7 @@ XMLSEC_EXPORT int       xmlSecIORegisterCallbacks               (xmlInputMatchCa
  *
  * Input URI transform
  *
-  *****************************************************************************/
+ *****************************************************************************/
 /**
  * @brief The Input URI transform id.
  */
@@ -53,6 +53,6 @@ XMLSEC_EXPORT int       xmlSecTransformInputURIClose            (xmlSecTransform
 }
 #endif /* __cplusplus */
 
-/** @} */ /** xmlsec_core_io */
+/** @} */ /* xmlsec_core_io */
 
-#endif /* __XMLSEC_IO_H__ */
+#endif /* XMLSEC_IO_H */

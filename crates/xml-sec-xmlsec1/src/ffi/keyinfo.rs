@@ -216,11 +216,11 @@ pub(crate) const MODE_WRITE: c_int = 1;
 /// `XMLSEC_KEYINFO_FLAGS_DONT_STOP_ON_KEY_FOUND`.
 pub(crate) const FLAGS_DONT_STOP_ON_KEY_FOUND: c_uint = 0x0000_0001;
 /// `XMLSEC_KEYINFO_FLAGS_STOP_ON_UNKNOWN_CHILD`.
-const FLAGS_STOP_ON_UNKNOWN_CHILD: c_uint = 0x0000_0002;
-/// `XMLSEC_KEYINFO_FLAGS_KEYNAME_STOP_ON_UNKNOWN`.
-const FLAGS_KEYNAME_STOP_ON_UNKNOWN: c_uint = 0x0000_0004;
+pub(crate) const FLAGS_STOP_ON_UNKNOWN_CHILD: c_uint = 0x0000_0002;
 /// `XMLSEC_KEYINFO_FLAGS_KEYVALUE_STOP_ON_UNKNOWN_CHILD`.
 const FLAGS_KEYVALUE_STOP_ON_UNKNOWN_CHILD: c_uint = 0x0000_0008;
+/// `XMLSEC_KEYINFO_FLAGS_STOP_ON_EMPTY_NODE`.
+const FLAGS_STOP_ON_EMPTY_NODE: c_uint = 0x0000_2000;
 
 /// `xmlSecKeyDataUsageKeyInfoNodeRead`.
 const USAGE_KEY_INFO_NODE_READ: c_uint = 0x00001;
@@ -350,11 +350,19 @@ pub(crate) unsafe extern "C" fn xmlSecKeyInfoNodeRead(
                 return -1;
             };
             let mut cur = xmlSecGetNextElementNode(nodes::first_child(key_info_node));
-            while !cur.is_null()
-                && ((*ctx).flags & FLAGS_DONT_STOP_ON_KEY_FOUND != 0
-                    || !key_valid(key)
-                    || xmlSecKeyMatch(key, std::ptr::null(), &raw mut (*ctx).key_req) == 0)
-            {
+            while !cur.is_null() {
+                // A key already meeting the requirements ends the read, unless
+                // the caller asked for every child.
+                if (*ctx).flags & FLAGS_DONT_STOP_ON_KEY_FOUND == 0 && key_valid(key) {
+                    let matched = xmlSecKeyMatch(key, std::ptr::null(), &raw mut (*ctx).key_req);
+                    if matched < 0 {
+                        errors::internal(here, klass_name((*(*key).value).id), c"xmlSecKeyMatch");
+                        return -1;
+                    }
+                    if matched != 0 {
+                        break;
+                    }
+                }
                 let data_id = child_klass(ctx, cur, USAGE_KEY_INFO_NODE_READ);
                 if data_id.is_null() {
                     errors::unexpected_node(here, cur, std::ptr::null());
@@ -634,14 +642,10 @@ pub(crate) unsafe extern "C" fn xmlSecKeyInfoCtxCopyUserPref(
             c"src != NULL",
             -1
         );
-        // The contexts are borrowed apart below; one context as both would
-        // alias them.
-        check!(
-            dst != src,
-            "xmlSecKeyInfoCtxCopyUserPref",
-            c"dst != src",
-            -1
-        );
+        // A context copied onto itself already holds its preferences.
+        if dst == src {
+            return 0;
+        }
         let here = here!("xmlSecKeyInfoCtxCopyUserPref");
         // SAFETY: initialized contexts.
         unsafe {
@@ -664,7 +668,7 @@ pub(crate) unsafe extern "C" fn xmlSecKeyInfoCtxCopyUserPref(
                 errors::internal(
                     here,
                     std::ptr::null(),
-                    c"xmlSecTransformCtxCopyUserPref(enabledKeyData)",
+                    c"xmlSecTransformCtxCopyUserPref(retrievalMethodCtx)",
                 );
                 return -1;
             }
@@ -677,7 +681,7 @@ pub(crate) unsafe extern "C" fn xmlSecKeyInfoCtxCopyUserPref(
                 errors::internal(
                     here,
                     std::ptr::null(),
-                    c"xmlSecTransformCtxCopyUserPref(enabledKeyData)",
+                    c"xmlSecTransformCtxCopyUserPref(keyInfoReferenceCtx)",
                 );
                 return -1;
             }
@@ -801,16 +805,39 @@ pub(crate) unsafe extern "C" fn xmlSecKeyInfoCtxDebugXmlDump(
             } else {
                 write_stream(output, "<EnabledKeyData>all</EnabledKeyData>\n");
             }
-            // libxmlsec1 prints the EncryptedKey levels for all three.
-            let levels = format!(
-                "cur=\"{}\" max=\"{}\"",
-                context.cur_encrypted_key_level, context.max_encrypted_key_level
+            let levels = |cur: c_int, max: c_int| format!("cur=\"{cur}\" max=\"{max}\"");
+            write_stream(
+                output,
+                &format!(
+                    "<RetrievalMethodLevel {} />\n",
+                    levels(
+                        context.cur_retrieval_method_level,
+                        context.max_retrieval_method_level
+                    )
+                ),
             );
-            write_stream(output, &format!("<RetrievalMethodLevel {levels} />\n"));
             xmlSecTransformCtxDebugXmlDump(&raw mut context.retrieval_method_ctx, output);
-            write_stream(output, &format!("<KeyInfoReferenceLevel {levels} />\n"));
+            write_stream(
+                output,
+                &format!(
+                    "<KeyInfoReferenceLevel {} />\n",
+                    levels(
+                        context.cur_key_info_reference_level,
+                        context.max_key_info_reference_level
+                    )
+                ),
+            );
             xmlSecTransformCtxDebugXmlDump(&raw mut context.key_info_reference_ctx, output);
-            write_stream(output, &format!("<EncryptedKeyLevel {levels} />\n"));
+            write_stream(
+                output,
+                &format!(
+                    "<EncryptedKeyLevel {} />\n",
+                    levels(
+                        context.cur_encrypted_key_level,
+                        context.max_encrypted_key_level
+                    )
+                ),
+            );
             xmlSecKeyReqDebugXmlDump(&raw mut context.key_req, output);
             match context.mode {
                 MODE_READ => write_stream(output, "</KeyInfoReadContext>\n"),
@@ -824,8 +851,9 @@ pub(crate) unsafe extern "C" fn xmlSecKeyInfoCtxDebugXmlDump(
 // ----------------------------------------------------------------------------
 // <dsig:KeyName/>
 
-/// `xmlRead` of the `KeyName` klass: names the key, or with a keys manager
-/// and no value yet, takes the manager's key of that name.
+/// `xmlRead` of the `KeyName` klass: with a keys manager and no value yet,
+/// takes the manager's key of that name; otherwise names the key, or checks
+/// the name it already has.
 pub(crate) unsafe extern "C" fn name_xml_read(
     id: *const XmlSecKeyDataKlass,
     key: *mut c_void,
@@ -875,54 +903,38 @@ pub(crate) unsafe extern "C" fn name_xml_read(
         unsafe {
             let object = klass_name(id);
             let new_name = xmlSecGetNodeContentAndTrim(node);
-            if new_name.is_null() {
+            if new_name.is_null() || *new_name == 0 {
                 errors::invalid_node_content(here, node, object, "empty");
+                if !new_name.is_null() {
+                    free(new_name.cast());
+                }
                 return -1;
             }
-            let result = if (*key).value.is_null() && !(*ctx).keys_mngr.is_null() {
-                let found = xmlSecKeysMngrFindKey((*ctx).keys_mngr, new_name, ctx);
+            let mut found = std::ptr::null_mut();
+            if (*key).value.is_null() && !(*ctx).keys_mngr.is_null() {
+                found = xmlSecKeysMngrFindKey((*ctx).keys_mngr, new_name, ctx);
                 if found.is_null() && candidates_exhausted(ctx) {
                     free(new_name.cast());
                     return -1;
                 }
-                if found.is_null() {
-                    // keyinfo.h documents this flag as stopping on a name the
-                    // manager does not know; libxmlsec1 1.3.13 defines it
-                    // without reading it.
-                    if (*ctx).flags & FLAGS_KEYNAME_STOP_ON_UNKNOWN != 0 {
-                        let shown = std::ffi::CStr::from_ptr(new_name.cast()).to_string_lossy();
-                        errors::other(
-                            here,
-                            errors::R_KEY_NOT_FOUND,
-                            object,
-                            Some(&format!("name={shown}")),
-                        );
-                        free(new_name.cast());
-                        return -1;
-                    }
-                    0
+            }
+            let result = if !found.is_null() {
+                xmlSecKeyEmpty(key);
+                let copied = xmlSecKeyCopy(key, found);
+                xmlSecKeyDestroy(found);
+                if copied < 0 {
+                    errors::internal(here, object, c"xmlSecKeyCopy");
+                    -1
+                } else if xmlSecKeySetName(key, new_name) < 0 {
+                    errors::internal(here, object, c"xmlSecKeySetName");
+                    -1
                 } else {
-                    xmlSecKeyEmpty(key);
-                    let copied = xmlSecKeyCopy(key, found);
-                    xmlSecKeyDestroy(found);
-                    if copied < 0 {
-                        errors::internal(here, object, c"xmlSecKeyCopy");
-                        -1
-                    } else if xmlSecKeySetName(key, new_name) < 0 {
-                        errors::internal(here, object, c"xmlSecKeySetName");
-                        -1
-                    } else {
-                        0
-                    }
+                    0
                 }
             } else if !(*key).name.is_null() {
+                // A name the manager does not know still names the key.
                 if xmlStrEqual((*key).name, new_name) == 0 {
-                    errors::other(
-                        here,
-                        R_INVALID_KEY_DATA,
-                        object,
-                        Some("key name is already specified"),
-                    );
+                    errors::other(here, R_INVALID_KEY_DATA, object, Some("key name mismatch"));
                     -1
                 } else {
                     0
@@ -940,7 +952,7 @@ pub(crate) unsafe extern "C" fn name_xml_read(
 }
 
 /// `xmlWrite` of the `KeyName` klass: writes the key's name into an empty
-/// element; 8 when the key has no name, as libxmlsec1 returns.
+/// element; nothing for a key without a name.
 pub(crate) unsafe extern "C" fn name_xml_write(
     id: *const XmlSecKeyDataKlass,
     key: *mut c_void,
@@ -989,7 +1001,7 @@ pub(crate) unsafe extern "C" fn name_xml_write(
         unsafe {
             let name = (*key).name;
             if name.is_null() {
-                return 8;
+                return 0;
             }
             // libxmlsec1 treats the error result -1 as not empty too.
             if xmlSecIsEmptyNode(node) == 0 {
@@ -1063,6 +1075,10 @@ pub(crate) unsafe extern "C" fn value_xml_read(
             let object = klass_name(id);
             let cur = xmlSecGetNextElementNode(nodes::first_child(node));
             if cur.is_null() {
+                if (*ctx).flags & FLAGS_STOP_ON_EMPTY_NODE != 0 {
+                    errors::invalid_node_content(here, node, object, "empty");
+                    return -1;
+                }
                 return 0;
             }
             let data_id = child_klass(ctx, cur, USAGE_KEY_VALUE_NODE_READ);
@@ -1145,19 +1161,22 @@ pub(crate) unsafe extern "C" fn value_xml_write(
             if !data_valid(value) || (*(*value).id).usage & USAGE_KEY_VALUE_NODE_WRITE == 0 {
                 return 0;
             }
-            // An enabled list admits the KeyValue element and, as when it is
-            // read (`child_klass`), the value klass inside it: a klass the
-            // list leaves out is never written, so a key requirement that
-            // admits symmetric keys cannot export a disabled secret.
-            // libxmlsec1 checks the KeyValue klass alone.
+            // An enabled list admits the value klass inside the element, as
+            // when it is read (`child_klass`): a klass the list leaves out is
+            // never written, so a key requirement that admits symmetric keys
+            // cannot export a disabled secret.
             let enabled = &raw mut (*ctx).enabled_key_data;
             if xmlSecPtrListGetSize(enabled) > 0
-                && (xmlSecKeyDataIdListFind(enabled, id) != 1
-                    || xmlSecKeyDataIdListFind(enabled, (*value).id) != 1)
+                && xmlSecKeyDataIdListFind(enabled, (*value).id) != 1
             {
                 return 0;
             }
-            if xmlSecKeyReqMatchKey(&raw mut (*ctx).key_req, key) != 1 {
+            let matched = xmlSecKeyReqMatchKey(&raw mut (*ctx).key_req, key);
+            if matched < 0 {
+                errors::internal(here, object, c"xmlSecKeyReqMatchKey");
+                return -1;
+            }
+            if matched == 0 {
                 return 0;
             }
             let klass = &*(*value).id;
@@ -1167,9 +1186,10 @@ pub(crate) unsafe extern "C" fn value_xml_write(
                 c"nodeName != NULL",
                 -1
             );
-            // xmlNodeSetContent(node, NULL), whose outcome libxmlsec1 ignores.
+            // xmlNodeSetContent(node, NULL): the old value goes first.
             if nodes::set_content(node, "").is_err() {
-                // libxml2's setter returns nothing libxmlsec1 reads.
+                errors::xml_failed(here, std::ptr::null(), c"xmlNodeSetContent");
+                return -1;
             }
             let cur = xmlSecAddChild(node, klass.data_node_name, klass.data_node_ns);
             if cur.is_null() {

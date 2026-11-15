@@ -2,9 +2,10 @@
  * binary key-data value they are made of, as a libxmlsec1 caller uses them:
  * the klasses' identities, generating a key, reading and writing a KeyValue
  * child and raw bytes, the checks against a value the key already has and
- * against the key requirements, duplicating, and the debug dumps. Built
- * against the pinned libxmlsec1 with its default crypto library and against
- * this crate, both must print the same. */
+ * against the key requirements, duplicating, and the debug dumps. DES is off
+ * in the default build, so its klass is only looked up. Built against the
+ * libxmlsec1 oracle with its default crypto library and against this crate,
+ * both must print the same. */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -141,7 +142,7 @@ int main(void) {
     key = xmlSecKeyGenerate(xmlSecKeyDataHmacId, 12, xmlSecKeyDataTypeSymmetric);
     show_key("generate 12", key);
     xmlSecKeyDestroy(key);
-    data = xmlSecKeyDataCreate(xmlSecKeyDataDesId);
+    data = xmlSecKeyDataCreate(xmlSecKeyDataHmacId);
     printf("empty: size=%d type=0x%x\n", (int)xmlSecKeyDataGetSize(data),
            xmlSecKeyDataGetType(data));
     printf("empty dump:\n");
@@ -161,7 +162,7 @@ int main(void) {
     printf("same again: %d\n", read_value(xmlSecKeyDataAesId, key, ctx, "AAECAwQFBgcICQoLDA0ODw=="));
     printf("other bytes: %d\n", read_value(xmlSecKeyDataAesId, key, ctx, "DwECAwQFBgcICQoLDA0ODw=="));
     printf("other size: %d\n", read_value(xmlSecKeyDataAesId, key, ctx, "AAECAw=="));
-    printf("other klass: %d\n", read_value(xmlSecKeyDataDesId, key, ctx, "AAECAwQFBgcICQoLDA0ODw=="));
+    printf("other klass: %d\n", read_value(xmlSecKeyDataHmacId, key, ctx, "AAECAwQFBgcICQoLDA0ODw=="));
 
     /* Duplicating copies the value. */
     copy = xmlSecKeyDuplicate(key);
@@ -189,7 +190,7 @@ int main(void) {
 
     /* The key requirements decide what is accepted. */
     xmlSecKeyInfoCtxReset(ctx);
-    ctx->keyReq.keyId = xmlSecKeyDataDesId;
+    ctx->keyReq.keyId = xmlSecKeyDataAesId;
     printf("wrong required klass: %d\n", read_value(xmlSecKeyDataHmacId, key, ctx, "AAECAw=="));
     ctx->keyReq.keyId = xmlSecKeyDataHmacId;
     ctx->keyReq.keyBitsSize = 64;

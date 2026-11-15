@@ -68,9 +68,14 @@ fn racing_init_and_shutdown_leave_consistent_registries() {
     unsafe {
         assert_eq!(xmlSecShutdown(), 0);
         assert_eq!(xmlSecInit(), 0);
-        assert_eq!(xmlSecPtrListGetSize(xmlSecTransformIdsGet()), 12);
+        assert_eq!(xmlSecPtrListGetSize(xmlSecTransformIdsGet()), defaults());
         assert_eq!(xmlSecShutdown(), 0);
     }
+}
+
+/// How many klasses libxmlsec1 registers by default.
+fn defaults() -> usize {
+    crate::ffi::transforms::builtin::defaults().len()
 }
 
 /// A second initialization without a shutdown in between leaves the
@@ -83,24 +88,27 @@ fn repeated_init_releases_the_previous_registries() {
     unsafe {
         assert_eq!(xmlSecInit(), 0);
         assert_eq!(xmlSecInit(), 0);
-        assert_eq!(xmlSecPtrListGetSize(xmlSecTransformIdsGet()), 12);
+        assert_eq!(xmlSecPtrListGetSize(xmlSecTransformIdsGet()), defaults());
         assert_eq!(xmlSecShutdown(), 0);
     }
 }
 
 /// The version check accepts this release exactly and any older minor or
-/// subminor as ABI compatible, and refuses another major.
+/// subminor as ABI compatible, and refuses a newer one, another major and an
+/// unknown mode.
 #[test]
 fn version_check_follows_libxmlsec1() {
+    let (major, minor, subminor) = crate::ffi::version::VERSION;
     // SAFETY: the version check takes any numbers.
     unsafe {
-        assert_eq!(xmlSecCheckVersionExt(1, 3, 13, 0), 1);
-        assert_eq!(xmlSecCheckVersionExt(1, 3, 12, 0), 0);
-        assert_eq!(xmlSecCheckVersionExt(1, 3, 12, 1), 1);
-        assert_eq!(xmlSecCheckVersionExt(1, 2, 40, 1), 1);
-        assert_eq!(xmlSecCheckVersionExt(1, 3, 14, 1), 0);
-        assert_eq!(xmlSecCheckVersionExt(1, 4, 0, 1), 0);
-        assert_eq!(xmlSecCheckVersionExt(2, 3, 13, 1), 0);
+        assert_eq!(xmlSecCheckVersionExt(major, minor, subminor, 0), 1);
+        assert_eq!(xmlSecCheckVersionExt(major, minor, subminor - 1, 0), 0);
+        assert_eq!(xmlSecCheckVersionExt(major, minor, subminor - 1, 1), 1);
+        assert_eq!(xmlSecCheckVersionExt(major, minor - 1, 40, 1), 1);
+        assert_eq!(xmlSecCheckVersionExt(major, minor, subminor + 1, 1), 0);
+        assert_eq!(xmlSecCheckVersionExt(major, minor + 1, 0, 1), 0);
+        assert_eq!(xmlSecCheckVersionExt(major + 1, minor, subminor, 1), 0);
+        assert_eq!(xmlSecCheckVersionExt(major, minor, subminor, 7), 0);
     }
 }
 

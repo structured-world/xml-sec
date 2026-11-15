@@ -192,7 +192,17 @@ pub(crate) struct XmlSecTransform {
     pub(crate) out_nodes: *mut XmlSecNodeSet,
     pub(crate) expected_output_size: usize,
     pub(crate) flags: usize,
+    /// The binary input received so far, saturating at `usize::MAX`.
+    pub(crate) in_total_size: usize,
     pub(crate) reserved0: *mut c_void,
+}
+
+impl XmlSecTransform {
+    /// Counts `size` more bytes of binary input. libxmlsec1 saturates the
+    /// count: it only tells empty input from non-empty.
+    fn received(&mut self, size: usize) {
+        self.in_total_size = self.in_total_size.saturating_add(size);
+    }
 }
 
 /// A transform object with its klass's context in the tail, as libxmlsec1's
@@ -1141,7 +1151,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformExecute(
     ctx: *mut XmlSecTransformCtx,
 ) -> c_int {
     contain(-1, || {
-        let (_, klass) = valid_or!(transform, "xmlSecTransformExecute", -1);
+        let (object, klass) = valid_or!(transform, "xmlSecTransformExecute", -1);
         let execute = method!(
             klass.execute,
             "xmlSecTransformExecute",
@@ -1153,6 +1163,19 @@ pub(crate) unsafe extern "C" fn xmlSecTransformExecute(
             c"transformCtx != NULL",
             -1
         );
+        // Digests and signatures refuse to finish over empty input unless
+        // the context allows it.
+        let digest_or_signature = klass.usage & (USAGE_DIGEST_METHOD | USAGE_SIGNATURE_METHOD) != 0;
+        // SAFETY: a non-null context by the caller's contract.
+        let allowed = unsafe { (*ctx).flags } & ctx::FLAGS_ALLOW_EMPTY_INPUT != 0;
+        if last != 0 && digest_or_signature && !allowed && object.in_total_size == 0 {
+            errors::invalid_data(
+                here!("xmlSecTransformExecute"),
+                klass.name.cast(),
+                "empty (0-length) input is not allowed for digest and signature transforms",
+            );
+            return -1;
+        }
         // SAFETY: the klass method keeps libxmlsec1's contract.
         unsafe { execute(transform, last, ctx) }
     })
@@ -1518,6 +1541,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformDefaultPushBin(
                         );
                         return -1;
                     }
+                    object.received(part);
                     remaining -= part;
                     data = data.add(part);
                 }
@@ -1527,7 +1551,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformDefaultPushBin(
                         here,
                         name,
                         c"xmlSecTransformExecute",
-                        &format!("final={is_final}"),
+                        &format!("finalData={final_data}"),
                     );
                     return -1;
                 }
@@ -1573,6 +1597,67 @@ pub(crate) unsafe extern "C" fn xmlSecTransformDefaultPushBin(
             }
         }
     })
+}
+
+/// Pops up to one `chunk` from the transform before `object` into its input
+/// buffer, counting it as received; the bytes popped, 0 at the end of the
+/// input, `None` after a report at `here` for the transform `name` names.
+///
+/// # Safety
+/// `object` is a valid transform with a previous one; `ctx` is a context.
+unsafe fn pull_chunk(
+    object: &mut XmlSecTransform,
+    chunk: usize,
+    ctx: *mut XmlSecTransformCtx,
+    (here, name): (errors::Here, *const std::ffi::c_char),
+) -> Option<usize> {
+    // SAFETY: by the caller's contract; the previous transform writes at
+    // most one chunk into the space reserved for it.
+    unsafe {
+        let in_size = xmlSecBufferGetSize(&raw mut object.in_buf);
+        let Some(room) = in_size.checked_add(chunk) else {
+            errors::size_more_than(
+                here,
+                std::ptr::null(),
+                "inSize",
+                in_size,
+                usize::MAX - chunk,
+            );
+            return None;
+        };
+        if xmlSecBufferSetMaxSize(&raw mut object.in_buf, room) < 0 {
+            errors::internal_with(
+                here,
+                name,
+                c"xmlSecBufferSetMaxSize",
+                &format!("size={room}"),
+            );
+            return None;
+        }
+        let mut got = chunk;
+        let target = xmlSecBufferGetData(&raw mut object.in_buf).add(in_size);
+        if xmlSecTransformPopBin(object.prev, target, chunk, &raw mut got, ctx) < 0 {
+            errors::internal(
+                here,
+                valid(object.prev).map_or(std::ptr::null(), |(_, prev)| prev.name.cast()),
+                c"xmlSecTransformPopBin",
+            );
+            return None;
+        }
+        if got > 0 {
+            if xmlSecBufferSetSize(&raw mut object.in_buf, in_size + got) < 0 {
+                errors::internal_with(
+                    here,
+                    name,
+                    c"xmlSecBufferSetSize",
+                    &format!("size={}", in_size + got),
+                );
+                return None;
+            }
+            object.received(got);
+        }
+        Some(got)
+    }
 }
 
 /// `xmlSecTransformDefaultPopBin`: pulls chunks from the previous transform
@@ -1623,45 +1708,10 @@ pub(crate) unsafe extern "C" fn xmlSecTransformDefaultPopBin(
                     // Without a previous transform the input never grows.
                     is_final = true;
                 } else {
-                    let in_size = xmlSecBufferGetSize(&raw mut object.in_buf);
-                    // A room past the address space is an allocation
-                    // libxmlsec1 could not make either.
-                    let room = in_size
-                        .checked_add(chunk)
-                        .filter(|room| xmlSecBufferSetMaxSize(&raw mut object.in_buf, *room) >= 0);
-                    if room.is_none() {
-                        errors::internal_with(
-                            here,
-                            name,
-                            c"xmlSecBufferSetMaxSize",
-                            &format!("size={}", in_size.wrapping_add(chunk)),
-                        );
+                    let Some(got) = pull_chunk(object, chunk, ctx, (here, name)) else {
                         return -1;
-                    }
-                    let mut got = chunk;
-                    let target = xmlSecBufferGetData(&raw mut object.in_buf).add(in_size);
-                    if xmlSecTransformPopBin(object.prev, target, chunk, &raw mut got, ctx) < 0 {
-                        errors::internal(
-                            here,
-                            valid(object.prev)
-                                .map_or(std::ptr::null(), |(_, prev)| prev.name.cast()),
-                            c"xmlSecTransformPopBin",
-                        );
-                        return -1;
-                    }
-                    if got > 0 {
-                        if xmlSecBufferSetSize(&raw mut object.in_buf, in_size + got) < 0 {
-                            errors::internal_with(
-                                here,
-                                name,
-                                c"xmlSecBufferSetSize",
-                                &format!("size={}", in_size + got),
-                            );
-                            return -1;
-                        }
-                    } else {
-                        is_final = true;
-                    }
+                    };
+                    is_final = got == 0;
                 }
                 if xmlSecTransformExecute(transform, c_int::from(is_final), ctx) < 0 {
                     errors::internal(here, name, c"xmlSecTransformExecute");

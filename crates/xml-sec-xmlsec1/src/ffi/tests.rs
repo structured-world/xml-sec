@@ -1,7 +1,7 @@
 use super::buffer::XmlSecBuffer;
 use super::list::{XmlSecPtrList, XmlSecPtrListKlass};
 use super::nodeset::{self, XmlSecNodeSet};
-use super::{ALLOC_MODE_DOUBLE, ALLOC_MODE_EXACT, grown};
+use super::{ALLOC_MODE_DOUBLE, ALLOC_MODE_EXACT, GrowthRefused, grown};
 use std::ffi::c_int;
 use std::mem::{offset_of, size_of};
 use std::path::Path;
@@ -65,6 +65,7 @@ fn rust_layouts_match_the_headers() {
         offset_of!(XmlSecBuffer, size),
         offset_of!(XmlSecBuffer, max_size),
         offset_of!(XmlSecBuffer, alloc_mode),
+        offset_of!(XmlSecBuffer, flags),
         size_of::<c_int>(),
         usize::try_from(ALLOC_MODE_EXACT).expect("non-negative"),
         usize::try_from(ALLOC_MODE_DOUBLE).expect("non-negative"),
@@ -97,16 +98,28 @@ fn rust_layouts_match_the_headers() {
 }
 
 /// libxmlsec1's growth rule: exact mode adds 8, double mode doubles and adds
-/// 32, neither goes below the initial size, and an overflowing request fails
-/// instead of wrapping to a small allocation.
+/// 32, neither goes below the initial size; a request whose grown size would
+/// overflow is refused with the largest size the mode grows, and an unknown
+/// mode is refused rather than clamped to the initial size.
 #[test]
 fn allocation_growth_follows_libxmlsec1() {
-    assert_eq!(grown(ALLOC_MODE_EXACT, 2000, 1024), Some(2008));
-    assert_eq!(grown(ALLOC_MODE_DOUBLE, 2000, 1024), Some(4032));
-    assert_eq!(grown(ALLOC_MODE_DOUBLE, 10, 1024), Some(1024));
-    assert_eq!(grown(7, 10, 64), Some(64));
-    assert_eq!(grown(ALLOC_MODE_DOUBLE, usize::MAX / 2, 0), None);
-    assert_eq!(grown(ALLOC_MODE_EXACT, usize::MAX - 7, 0), None);
+    assert_eq!(grown(ALLOC_MODE_EXACT, 2000, 1024), Ok(2008));
+    assert_eq!(grown(ALLOC_MODE_DOUBLE, 2000, 1024), Ok(4032));
+    assert_eq!(grown(ALLOC_MODE_DOUBLE, 10, 1024), Ok(1024));
+    assert_eq!(grown(7, 10, 64), Err(GrowthRefused::UnknownMode));
+    let double = (usize::MAX - 32) / 2;
+    assert_eq!(grown(ALLOC_MODE_DOUBLE, double, 0), Ok(usize::MAX - 1));
+    assert_eq!(
+        grown(ALLOC_MODE_DOUBLE, double + 1, 0),
+        Err(GrowthRefused::TooLarge { limit: double })
+    );
+    assert_eq!(grown(ALLOC_MODE_EXACT, usize::MAX - 8, 0), Ok(usize::MAX));
+    assert_eq!(
+        grown(ALLOC_MODE_EXACT, usize::MAX - 7, 0),
+        Err(GrowthRefused::TooLarge {
+            limit: usize::MAX - 8
+        })
+    );
 }
 
 /// Asserts that the calling test runs in a process of its own, as cargo

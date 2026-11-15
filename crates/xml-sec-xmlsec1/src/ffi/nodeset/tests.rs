@@ -34,8 +34,9 @@ fn listing(listed: &[*mut XmlNode]) -> *mut crate::ffi::tree::XmlNodeSet {
     set
 }
 
-/// Each member combines with the result of those before it: intersection
-/// and subtraction can only remove, union can only add back.
+/// The first member is the base set, whatever its operation; each later one
+/// combines with the result of those before it: intersection and
+/// subtraction can only remove, union can only add back.
 #[test]
 fn operations_combine_in_list_order() {
     let doc = parse(b"<r/>");
@@ -44,6 +45,9 @@ fn operations_combine_in_list_order() {
     unsafe {
         let all = set(NORMAL);
         assert_eq!(xmlSecNodeSetContains(all, element, std::ptr::null_mut()), 1);
+        // The base set's own operation is not applied.
+        (*all).op = SUBTRACTION;
+        assert_eq!(xmlSecNodeSetContains(all, element, std::ptr::null_mut()), 1);
         let combined = xmlSecNodeSetAdd(all, set(INVERT), INTERSECTION);
         assert_eq!(combined, all);
         assert_eq!(xmlSecNodeSetContains(all, element, std::ptr::null_mut()), 0);
@@ -51,12 +55,12 @@ fn operations_combine_in_list_order() {
         assert_eq!(xmlSecNodeSetContains(all, element, std::ptr::null_mut()), 1);
         xmlSecNodeSetAdd(all, set(NORMAL), SUBTRACTION);
         assert_eq!(xmlSecNodeSetContains(all, element, std::ptr::null_mut()), 0);
-        // An unknown operation fails the check rather than guessing.
-        (*all).op = 9;
-        assert_eq!(
-            xmlSecNodeSetContains(all, element, std::ptr::null_mut()),
-            -1
-        );
+        // An unknown operation of a later member answers no rather than
+        // guessing.
+        xmlSecNodeSetAdd(all, set(NORMAL), UNION);
+        assert_eq!(xmlSecNodeSetContains(all, element, std::ptr::null_mut()), 1);
+        (*(*all).prev).op = 9;
+        assert_eq!(xmlSecNodeSetContains(all, element, std::ptr::null_mut()), 0);
         xmlSecNodeSetDestroy(all);
     }
     xml_sec_libxml2::document::free(doc);
@@ -169,19 +173,19 @@ fn walk_visits_each_member_node_once() {
     xml_sec_libxml2::document::free(doc);
 }
 
-/// The walk is in document order whatever order a caller listed the nodes
-/// in, and a lone member whose operation is not intersection is walked as
-/// the set it stands for: a union holds every node, a subtraction every node
-/// outside its list.
+/// A lone set, whatever its operation (the first member is the base set),
+/// and a list of intersections are walked from their listed nodes in list
+/// order; any other combination is walked over the whole document, in
+/// document order.
 #[test]
-fn walk_follows_document_order_and_the_member_operation() {
+fn walk_follows_the_list_or_the_document() {
     let doc = parse(b"<r><a>x</a><b>y</b></r>");
     let a = nodes::first_child(nodes::root_element(doc));
     let b = nodes::next(a);
     // SAFETY: as above.
     unsafe {
         let reversed = xmlSecNodeSetCreate(doc, listing(&[b, a]), TREE);
-        assert_eq!(walk(reversed), ["a", "x", "b", "y"]);
+        assert_eq!(walk(reversed), ["b", "y", "a", "x"]);
         xmlSecNodeSetDestroy(reversed);
 
         let union = xmlSecNodeSetAdd(
@@ -189,7 +193,7 @@ fn walk_follows_document_order_and_the_member_operation() {
             xmlSecNodeSetCreate(doc, listing(&[b, a]), TREE),
             UNION,
         );
-        assert_eq!(walk(union), ["r", "a", "x", "b", "y"]);
+        assert_eq!(walk(union), ["b", "y", "a", "x"]);
         xmlSecNodeSetDestroy(union);
 
         let subtraction = xmlSecNodeSetAdd(
@@ -197,8 +201,14 @@ fn walk_follows_document_order_and_the_member_operation() {
             xmlSecNodeSetCreate(doc, listing(&[a]), TREE),
             SUBTRACTION,
         );
-        assert_eq!(walk(subtraction), ["r", "b", "y"]);
+        assert_eq!(walk(subtraction), ["a", "x"]);
         xmlSecNodeSetDestroy(subtraction);
+
+        let left = xmlSecNodeSetCreate(doc, listing(&[b]), TREE);
+        let right = xmlSecNodeSetCreate(doc, listing(&[a]), TREE);
+        let joined = xmlSecNodeSetAdd(left, right, UNION);
+        assert_eq!(walk(joined), ["a", "x", "b", "y"]);
+        xmlSecNodeSetDestroy(joined);
     }
     xml_sec_libxml2::document::free(doc);
 }

@@ -34,10 +34,8 @@ impl Drop for ProbeDirectory {
 }
 
 fn ledger() -> Value {
-    serde_json::from_str(include_str!(
-        "../compatibility/libxmlsec1-1.3.13-behavior.json"
-    ))
-    .expect("generated behavioral ledger must be valid JSON")
+    serde_json::from_str(include_str!("../compatibility/libxmlsec1-behavior.json"))
+        .expect("generated behavioral ledger must be valid JSON")
 }
 
 fn c_boundary_behaviors(value: &Value) -> Vec<&Value> {

@@ -5,15 +5,17 @@
  *
  * Copyright (C) 2002-2026 Aleksey Sanin <aleksey@aleksey.com>. All Rights Reserved.
  */
-#ifndef __XMLSEC_LIST_H__
-#define __XMLSEC_LIST_H__
+#ifndef XMLSEC_LIST_H
+#define XMLSEC_LIST_H
 
 /**
  * @defgroup xmlsec_core_list Generic List
  * @ingroup xmlsec_core
- * @brief Generic doubly-linked list implementation.
+ * @brief Generic dynamic array (vector) of pointers.
  * @{
  */
+
+#include <stdio.h>
 
 #include <xmlsec/exports.h>
 #include <xmlsec/xmlsec.h>
@@ -35,10 +37,22 @@ typedef struct _xmlSecPtrList                                   xmlSecPtrList,
                                                                 *xmlSecPtrListPtr;
 
 /**
- * @brief The pointers list.
+ * @brief Compares two list items.
+ * @details A comparison function used by #xmlSecPtrListSort.
+ * @param item1 the first list item.
+ * @param item2 the second list item.
+ * @return a value less than zero, zero, or greater than zero depending on
+ * whether @p item1 should sort before, is equal to, or should sort after
+ * @p item2, respectively.
+ */
+typedef int                     (*xmlSecPtrListCompareMethod) (xmlSecPtr item1,
+                                                               xmlSecPtr item2);
+
+/**
+ * @brief The pointer list.
  */
 struct _xmlSecPtrList {
-    xmlSecPtrListId             id;  /**< the list items description. */
+    xmlSecPtrListId             id;  /**< the list klass. */
 
     xmlSecPtr*                  data;  /**< the list data. */
     xmlSecSize                  use;  /**< the current list size. */
@@ -77,62 +91,68 @@ XMLSEC_EXPORT int               xmlSecPtrListRemove             (xmlSecPtrListPt
 XMLSEC_EXPORT xmlSecPtr         xmlSecPtrListRemoveAndReturn    (xmlSecPtrListPtr list,
                                                                  xmlSecSize pos);
 XMLSEC_EXPORT xmlSecPtr         xmlSecPtrListPopLast            (xmlSecPtrListPtr list);
+XMLSEC_EXPORT int               xmlSecPtrListSort               (xmlSecPtrListPtr list,
+                                                                 xmlSecPtrListCompareMethod compare);
 XMLSEC_EXPORT void              xmlSecPtrListDebugDump          (xmlSecPtrListPtr list,
                                                                  FILE* output);
 XMLSEC_EXPORT void              xmlSecPtrListDebugXmlDump       (xmlSecPtrListPtr list,
                                                                  FILE* output);
 
 /**
- * @brief Macro. Returns lists's name.
- * @param list the ponter to list.
+ * @brief Macro. Returns list's name.
+ * @param list the pointer to list.
  */
 #define xmlSecPtrListGetName(list) \
         (((list) != NULL) ? xmlSecPtrListKlassGetName((list)->id) : NULL)
 
 /**
- * @brief Macro. Returns 1 if list is not NULL and list->id is not NULL.
- * @details Macro. Returns 1 if @p list is not NULL and @p list->id is not NULL or 0 otherwise.
+ * @brief Macro. Returns 1 if @p list is valid.
+ * @details Macro. Returns 1 if @p list is not NULL and @p list->id is not NULL,
+ * or 0 otherwise.
  * @param list the pointer to list.
  */
 #define xmlSecPtrListIsValid(list) \
         ((( list ) != NULL) && ((( list )->id) != NULL))
 /**
- * @brief Macro. Returns 1 if list is valid and list's id matches dataId.
- * @details Macro. Returns 1 if @p list is valid and @p list's id is equal to @p dataId.
+ * @brief Macro. Returns 1 if @p list's id equals @p listId.
+ * @details Macro. Returns 1 if @p list is valid and @p list's id is equal to @p listId.
  * @param list the pointer to list.
- * @param dataId the list Id.
+ * @param listId the list Id.
  */
-#define xmlSecPtrListCheckId(list, dataId) \
+#define xmlSecPtrListCheckId(list, listId) \
         (xmlSecPtrListIsValid(( list )) && \
-        ((( list )->id) == ( dataId )))
+        ((( list )->id) == ( listId )))
 
 
 /******************************************************************************
  *
  * List klass
  *
-  *****************************************************************************/
+ *****************************************************************************/
 /**
  * @brief The "unknown" id.
  */
-#define xmlSecPtrListIdUnknown                  NULL
+#define xmlSecPtrListIdUnknown                  ((xmlSecPtrListId)NULL)
 
 /**
  * @brief Duplicates item @p ptr.
- * @param ptr the poinetr to list item.
+ * @details If this method is not NULL then the list klass must also provide
+ * #xmlSecPtrDestroyItemMethod to release items duplicated by this method,
+ * including partial copies rolled back after an error.
+ * @param ptr the pointer to list item.
  * @return pointer to new item copy or NULL if an error occurs.
  */
 typedef xmlSecPtr               (*xmlSecPtrDuplicateItemMethod) (xmlSecPtr ptr);
 
 /**
  * @brief Destroys list item @p ptr.
- * @param ptr the poinetr to list item.
+ * @param ptr the pointer to list item.
  */
 typedef void                    (*xmlSecPtrDestroyItemMethod)   (xmlSecPtr ptr);
 
 /**
- * @brief Prints debug information about @p item to @p output.
- * @param ptr the poinetr to list item.
+ * @brief Prints debug information about @p ptr to @p output.
+ * @param ptr the pointer to list item.
  * @param output the output FILE.
  */
 typedef void                    (*xmlSecPtrDebugDumpItemMethod) (xmlSecPtr ptr,
@@ -140,13 +160,17 @@ typedef void                    (*xmlSecPtrDebugDumpItemMethod) (xmlSecPtr ptr,
 
 /**
  * @brief List klass.
+ * @details If #duplicateItem is NULL then #xmlSecPtrListCopy shares the raw item
+ * pointers between the source and the destination lists. In that case, if
+ * #destroyItem is not NULL, finalizing both lists will free each shared item
+ * twice, so #xmlSecPtrListCopy rejects such list klasses.
  */
 struct _xmlSecPtrListKlass {
     const xmlChar*                      name;  /**< the list klass name. */
-    xmlSecPtrDuplicateItemMethod        duplicateItem;  /**< the duplicate item method. */
-    xmlSecPtrDestroyItemMethod          destroyItem;  /**< the destroy item method. */
+    xmlSecPtrDuplicateItemMethod        duplicateItem;  /**< the duplicate item method; requires destroyItem when not NULL. */
+    xmlSecPtrDestroyItemMethod          destroyItem;  /**< the destroy item method for list-owned items, including duplicated items. */
     xmlSecPtrDebugDumpItemMethod        debugDumpItem;  /**< the debug dump item method. */
-    xmlSecPtrDebugDumpItemMethod        debugXmlDumpItem;  /**< the debug dump item in xml format method. */
+    xmlSecPtrDebugDumpItemMethod        debugXmlDumpItem;  /**< the method for printing debug item information in XML format. */
 };
 
 /**
@@ -160,7 +184,7 @@ struct _xmlSecPtrListKlass {
  *
  * xmlSecStringListKlass
  *
-  *****************************************************************************/
+ *****************************************************************************/
 /**
  * @brief Strings list klass.
  */
@@ -172,6 +196,6 @@ XMLSEC_EXPORT xmlSecPtrListId   xmlSecStringListGetKlass        (void);
 }
 #endif /* __cplusplus */
 
-/** @} */ /** xmlsec_core_list */
+/** @} */ /* xmlsec_core_list */
 
-#endif /* __XMLSEC_LIST_H__ */
+#endif /* XMLSEC_LIST_H */

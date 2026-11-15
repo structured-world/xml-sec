@@ -2,7 +2,7 @@
   "schema_version": 1,
   "upstream": {
     "project": "libxmlsec1",
-    "version": "1.3.13",
+    "version": "1.3.14",
     "repository": "https://github.com/lsh123/xmlsec"
   },
   "generated_by": "xml-sec-capability-ledger abi-generate",
@@ -20,13 +20,14 @@
     "defines": [
       "-DXMLSEC_CRYPTO_DYNAMIC_LOADING=1",
       "-DXMLSEC_DL_LIBLTDL=1",
+      "-DXMLSEC_FUNCTION=__func__",
+      "-DXMLSEC_NO_DES=1",
       "-DXMLSEC_NO_FTP=1",
       "-DXMLSEC_NO_GOST2012=1",
       "-DXMLSEC_NO_GOST=1",
       "-DXMLSEC_NO_HTTP=1",
       "-DXMLSEC_NO_MLDSA=1",
-      "-DXMLSEC_NO_SLHDSA=1",
-      "-D__XMLSEC_FUNCTION__=__func__"
+      "-DXMLSEC_NO_SLHDSA=1"
     ]
   },
   "libraries": [
@@ -62,6 +63,36 @@
           "name": "xmlSecAttrAlgorithm",
           "kind": "data",
           "size": 10,
+          "declaration": "export-variable"
+        },
+        {
+          "name": "xmlSecAttrConcatKDFAlgorithmID",
+          "kind": "data",
+          "size": 12,
+          "declaration": "export-variable"
+        },
+        {
+          "name": "xmlSecAttrConcatKDFPartyUInfo",
+          "kind": "data",
+          "size": 11,
+          "declaration": "export-variable"
+        },
+        {
+          "name": "xmlSecAttrConcatKDFPartyVInfo",
+          "kind": "data",
+          "size": 11,
+          "declaration": "export-variable"
+        },
+        {
+          "name": "xmlSecAttrConcatKDFSuppPrivInfo",
+          "kind": "data",
+          "size": 13,
+          "declaration": "export-variable"
+        },
+        {
+          "name": "xmlSecAttrConcatKDFSuppPubInfo",
+          "kind": "data",
+          "size": 12,
           "declaration": "export-variable"
         },
         {
@@ -254,6 +285,11 @@
           "declaration": "export-function"
         },
         {
+          "name": "xmlSecBnPrependZeroIfMsbSet",
+          "kind": "function",
+          "declaration": "export-function"
+        },
+        {
           "name": "xmlSecBnReverse",
           "kind": "function",
           "declaration": "export-function"
@@ -360,6 +396,16 @@
         },
         {
           "name": "xmlSecBufferIsEmpty",
+          "kind": "function",
+          "declaration": "export-function"
+        },
+        {
+          "name": "xmlSecBufferIsSecure",
+          "kind": "function",
+          "declaration": "export-function"
+        },
+        {
+          "name": "xmlSecBufferMakeSecure",
           "kind": "function",
           "declaration": "export-function"
         },
@@ -585,6 +631,12 @@
           "declaration": "export-variable"
         },
         {
+          "name": "xmlSecDSig2021MoreNs",
+          "kind": "data",
+          "size": 40,
+          "declaration": "export-variable"
+        },
+        {
           "name": "xmlSecDSigCtxCreate",
           "kind": "function",
           "declaration": "export-function"
@@ -706,12 +758,6 @@
           "declaration": "export-function"
         },
         {
-          "name": "xmlSecEdDSANs",
-          "kind": "data",
-          "size": 52,
-          "declaration": "export-variable"
-        },
-        {
           "name": "xmlSecEnc11Ns",
           "kind": "data",
           "size": 33,
@@ -773,12 +819,12 @@
           "declaration": "export-function"
         },
         {
-          "name": "xmlSecEncCtxEncapsulationMechanismGenerate",
+          "name": "xmlSecEncCtxEncryptedKeyXmlRead",
           "kind": "function",
           "declaration": "export-function"
         },
         {
-          "name": "xmlSecEncCtxEncapsulationMechanismXmlWrite",
+          "name": "xmlSecEncCtxEncryptedKeyXmlWrite",
           "kind": "function",
           "declaration": "export-function"
         },
@@ -796,6 +842,10 @@
           "name": "xmlSecEncCtxInitialize",
           "kind": "function",
           "declaration": "export-function"
+        },
+        {
+          "name": "xmlSecEncCtxMapOperation",
+          "kind": "function"
         },
         {
           "name": "xmlSecEncCtxReset",
@@ -825,6 +875,11 @@
         },
         {
           "name": "xmlSecError",
+          "kind": "function",
+          "declaration": "export-function"
+        },
+        {
+          "name": "xmlSecErrorsClearCallback",
           "kind": "function",
           "declaration": "export-function"
         },
@@ -877,12 +932,6 @@
           "name": "xmlSecErrorsShutdown",
           "kind": "function",
           "declaration": "export-function"
-        },
-        {
-          "name": "xmlSecExperimental202512Ns",
-          "kind": "data",
-          "size": 52,
-          "declaration": "export-variable"
         },
         {
           "name": "xmlSecFindChild",
@@ -989,7 +1038,7 @@
         {
           "name": "xmlSecHrefAgreementMethod",
           "kind": "data",
-          "size": 50,
+          "size": 49,
           "declaration": "export-variable"
         },
         {
@@ -1227,18 +1276,6 @@
           "declaration": "export-variable"
         },
         {
-          "name": "xmlSecHrefEdDSAKeyValue",
-          "kind": "data",
-          "size": 57,
-          "declaration": "export-variable"
-        },
-        {
-          "name": "xmlSecHrefEncapsulationMechanism",
-          "kind": "data",
-          "size": 74,
-          "declaration": "export-variable"
-        },
-        {
           "name": "xmlSecHrefEncryptedKey",
           "kind": "data",
           "size": 46,
@@ -1415,49 +1452,37 @@
         {
           "name": "xmlSecHrefMLDSA44",
           "kind": "data",
-          "size": 61,
+          "size": 49,
           "declaration": "export-variable"
         },
         {
           "name": "xmlSecHrefMLDSA65",
           "kind": "data",
-          "size": 61,
+          "size": 49,
           "declaration": "export-variable"
         },
         {
           "name": "xmlSecHrefMLDSA87",
           "kind": "data",
-          "size": 61,
-          "declaration": "export-variable"
-        },
-        {
-          "name": "xmlSecHrefMLDSAKeyValue",
-          "kind": "data",
-          "size": 58,
+          "size": 49,
           "declaration": "export-variable"
         },
         {
           "name": "xmlSecHrefMLKEM1024",
           "kind": "data",
-          "size": 63,
+          "size": 51,
           "declaration": "export-variable"
         },
         {
           "name": "xmlSecHrefMLKEM512",
           "kind": "data",
-          "size": 62,
+          "size": 50,
           "declaration": "export-variable"
         },
         {
           "name": "xmlSecHrefMLKEM768",
           "kind": "data",
-          "size": 62,
-          "declaration": "export-variable"
-        },
-        {
-          "name": "xmlSecHrefMLKEMKeyValue",
-          "kind": "data",
-          "size": 58,
+          "size": 50,
           "declaration": "export-variable"
         },
         {
@@ -1647,45 +1672,39 @@
           "declaration": "export-variable"
         },
         {
-          "name": "xmlSecHrefSLHDSAKeyValue",
-          "kind": "data",
-          "size": 59,
-          "declaration": "export-variable"
-        },
-        {
           "name": "xmlSecHrefSLHDSA_SHA2_128f",
           "kind": "data",
-          "size": 69,
+          "size": 57,
           "declaration": "export-variable"
         },
         {
           "name": "xmlSecHrefSLHDSA_SHA2_128s",
           "kind": "data",
-          "size": 69,
+          "size": 57,
           "declaration": "export-variable"
         },
         {
           "name": "xmlSecHrefSLHDSA_SHA2_192f",
           "kind": "data",
-          "size": 69,
+          "size": 57,
           "declaration": "export-variable"
         },
         {
           "name": "xmlSecHrefSLHDSA_SHA2_192s",
           "kind": "data",
-          "size": 69,
+          "size": 57,
           "declaration": "export-variable"
         },
         {
           "name": "xmlSecHrefSLHDSA_SHA2_256f",
           "kind": "data",
-          "size": 69,
+          "size": 57,
           "declaration": "export-variable"
         },
         {
           "name": "xmlSecHrefSLHDSA_SHA2_256s",
           "kind": "data",
-          "size": 69,
+          "size": 57,
           "declaration": "export-variable"
         },
         {
@@ -1924,6 +1943,16 @@
           "declaration": "internal-export"
         },
         {
+          "name": "xmlSecKeyDataCamelliaGetKlass",
+          "kind": "function",
+          "declaration": "export-function"
+        },
+        {
+          "name": "xmlSecKeyDataChaCha20GetKlass",
+          "kind": "function",
+          "declaration": "export-function"
+        },
+        {
           "name": "xmlSecKeyDataConcatKdfGetKlass",
           "kind": "function",
           "declaration": "export-function"
@@ -2035,11 +2064,6 @@
         },
         {
           "name": "xmlSecKeyDataEdDSAGetKlass",
-          "kind": "function",
-          "declaration": "export-function"
-        },
-        {
-          "name": "xmlSecKeyDataEncapsulationMechanismGetKlass",
           "kind": "function",
           "declaration": "export-function"
         },
@@ -2175,16 +2199,6 @@
         },
         {
           "name": "xmlSecKeyDataKEMGetKlass",
-          "kind": "function",
-          "declaration": "internal-export"
-        },
-        {
-          "name": "xmlSecKeyDataKEMGetRecipientKey",
-          "kind": "function",
-          "declaration": "internal-export"
-        },
-        {
-          "name": "xmlSecKeyDataKEMSetCiphertext",
           "kind": "function",
           "declaration": "internal-export"
         },
@@ -2624,10 +2638,9 @@
           "declaration": "export-function"
         },
         {
-          "name": "xmlSecMLDSANs",
-          "kind": "data",
-          "size": 52,
-          "declaration": "export-variable"
+          "name": "xmlSecMemCleanse",
+          "kind": "function",
+          "declaration": "export-function"
         },
         {
           "name": "xmlSecMemEqual",
@@ -2926,12 +2939,6 @@
           "name": "xmlSecNameEdDSAKeyValue",
           "kind": "data",
           "size": 6,
-          "declaration": "export-variable"
-        },
-        {
-          "name": "xmlSecNameEncapsulationMechanism",
-          "kind": "data",
-          "size": 24,
           "declaration": "export-variable"
         },
         {
@@ -3505,6 +3512,12 @@
           "declaration": "export-variable"
         },
         {
+          "name": "xmlSecNameXPointerLegacy",
+          "kind": "data",
+          "size": 16,
+          "declaration": "export-variable"
+        },
+        {
           "name": "xmlSecNameXslt",
           "kind": "data",
           "size": 5,
@@ -3583,45 +3596,10 @@
           "declaration": "export-variable"
         },
         {
-          "name": "xmlSecNodeConcatKDFAttrAlgorithmID",
-          "kind": "data",
-          "size": 12,
-          "declaration": "export-variable"
-        },
-        {
-          "name": "xmlSecNodeConcatKDFAttrPartyUInfo",
-          "kind": "data",
-          "size": 11,
-          "declaration": "export-variable"
-        },
-        {
-          "name": "xmlSecNodeConcatKDFAttrPartyVInfo",
-          "kind": "data",
-          "size": 11,
-          "declaration": "export-variable"
-        },
-        {
-          "name": "xmlSecNodeConcatKDFAttrSuppPrivInfo",
-          "kind": "data",
-          "size": 13,
-          "declaration": "export-variable"
-        },
-        {
-          "name": "xmlSecNodeConcatKDFAttrSuppPubInfo",
-          "kind": "data",
-          "size": 12,
-          "declaration": "export-variable"
-        },
-        {
           "name": "xmlSecNodeConcatKDFParams",
           "kind": "data",
           "size": 16,
           "declaration": "export-variable"
-        },
-        {
-          "name": "xmlSecNodeConcatKdfKeyValue",
-          "kind": "data",
-          "size": 18
         },
         {
           "name": "xmlSecNodeDEREncodedKeyValue",
@@ -3770,13 +3748,7 @@
         {
           "name": "xmlSecNodeEdDSAContextString",
           "kind": "data",
-          "size": 19,
-          "declaration": "export-variable"
-        },
-        {
-          "name": "xmlSecNodeEncapsulationMechanism",
-          "kind": "data",
-          "size": 23,
+          "size": 17,
           "declaration": "export-variable"
         },
         {
@@ -3857,11 +3829,6 @@
           "declaration": "export-variable"
         },
         {
-          "name": "xmlSecNodeHkdfKeyValue",
-          "kind": "data",
-          "size": 13
-        },
-        {
           "name": "xmlSecNodeHkdfPRF",
           "kind": "data",
           "size": 4,
@@ -3883,6 +3850,12 @@
           "name": "xmlSecNodeInclusiveNamespaces",
           "kind": "data",
           "size": 20,
+          "declaration": "export-variable"
+        },
+        {
+          "name": "xmlSecNodeKANonce",
+          "kind": "data",
+          "size": 9,
           "declaration": "export-variable"
         },
         {
@@ -3924,7 +3897,7 @@
         {
           "name": "xmlSecNodeMLDSAContextString",
           "kind": "data",
-          "size": 19,
+          "size": 17,
           "declaration": "export-variable"
         },
         {
@@ -3974,11 +3947,6 @@
           "kind": "data",
           "size": 10,
           "declaration": "export-variable"
-        },
-        {
-          "name": "xmlSecNodePbkdf2KeyValue",
-          "kind": "data",
-          "size": 15
         },
         {
           "name": "xmlSecNodePbkdf2PRF",
@@ -4085,7 +4053,7 @@
         {
           "name": "xmlSecNodeSLHDSAContextString",
           "kind": "data",
-          "size": 20,
+          "size": 17,
           "declaration": "export-variable"
         },
         {
@@ -4265,6 +4233,12 @@
           "declaration": "export-variable"
         },
         {
+          "name": "xmlSecNsEdDSAContextString",
+          "kind": "data",
+          "size": 40,
+          "declaration": "export-variable"
+        },
+        {
           "name": "xmlSecNsExcC14N",
           "kind": "data",
           "size": 40,
@@ -4274,6 +4248,18 @@
           "name": "xmlSecNsExcC14NWithComments",
           "kind": "data",
           "size": 52,
+          "declaration": "export-variable"
+        },
+        {
+          "name": "xmlSecNsMLDSAContextString",
+          "kind": "data",
+          "size": 40,
+          "declaration": "export-variable"
+        },
+        {
+          "name": "xmlSecNsSLHDSAContextString",
+          "kind": "data",
+          "size": 40,
           "declaration": "export-variable"
         },
         {
@@ -4398,6 +4384,11 @@
         },
         {
           "name": "xmlSecPtrListSetDefaultAllocMode",
+          "kind": "function",
+          "declaration": "export-function"
+        },
+        {
+          "name": "xmlSecPtrListSort",
           "kind": "function",
           "declaration": "export-function"
         },
@@ -4552,12 +4543,6 @@
           "declaration": "export-function"
         },
         {
-          "name": "xmlSecSLHDSANs",
-          "kind": "data",
-          "size": 52,
-          "declaration": "export-variable"
-        },
-        {
           "name": "xmlSecSetDefaultLineFeed",
           "kind": "function",
           "declaration": "export-function"
@@ -4617,6 +4602,12 @@
           "name": "xmlSecStringEmpty",
           "kind": "data",
           "size": 1,
+          "declaration": "export-variable"
+        },
+        {
+          "name": "xmlSecStringLF",
+          "kind": "data",
+          "size": 2,
           "declaration": "export-variable"
         },
         {
@@ -4890,6 +4881,26 @@
           "declaration": "export-function"
         },
         {
+          "name": "xmlSecTransformCamellia128CbcGetKlass",
+          "kind": "function",
+          "declaration": "export-function"
+        },
+        {
+          "name": "xmlSecTransformCamellia192CbcGetKlass",
+          "kind": "function",
+          "declaration": "export-function"
+        },
+        {
+          "name": "xmlSecTransformCamellia256CbcGetKlass",
+          "kind": "function",
+          "declaration": "export-function"
+        },
+        {
+          "name": "xmlSecTransformChaCha20GetKlass",
+          "kind": "function",
+          "declaration": "export-function"
+        },
+        {
           "name": "xmlSecTransformChaCha20ParamsRead",
           "kind": "function",
           "declaration": "internal-export"
@@ -4898,6 +4909,11 @@
           "name": "xmlSecTransformChaCha20ParamsWrite",
           "kind": "function",
           "declaration": "internal-export"
+        },
+        {
+          "name": "xmlSecTransformChaCha20Poly1305GetKlass",
+          "kind": "function",
+          "declaration": "export-function"
         },
         {
           "name": "xmlSecTransformChaCha20Poly1305ParamsRead",
@@ -4963,6 +4979,10 @@
           "name": "xmlSecTransformCtxBinaryExecute",
           "kind": "function",
           "declaration": "export-function"
+        },
+        {
+          "name": "xmlSecTransformCtxClearNodeRefs",
+          "kind": "function"
         },
         {
           "name": "xmlSecTransformCtxCopyUserPref",
@@ -5485,16 +5505,6 @@
           "declaration": "internal-export"
         },
         {
-          "name": "xmlSecTransformKEMRead",
-          "kind": "function",
-          "declaration": "internal-export"
-        },
-        {
-          "name": "xmlSecTransformKEMWrite",
-          "kind": "function",
-          "declaration": "internal-export"
-        },
-        {
           "name": "xmlSecTransformKWAes128GetKlass",
           "kind": "function",
           "declaration": "export-function"
@@ -5510,34 +5520,24 @@
           "declaration": "export-function"
         },
         {
-          "name": "xmlSecTransformKWDes3Execute",
+          "name": "xmlSecTransformKWCamellia128GetKlass",
           "kind": "function",
-          "declaration": "internal-export"
+          "declaration": "export-function"
         },
         {
-          "name": "xmlSecTransformKWDes3Finalize",
+          "name": "xmlSecTransformKWCamellia192GetKlass",
           "kind": "function",
-          "declaration": "internal-export"
+          "declaration": "export-function"
+        },
+        {
+          "name": "xmlSecTransformKWCamellia256GetKlass",
+          "kind": "function",
+          "declaration": "export-function"
         },
         {
           "name": "xmlSecTransformKWDes3GetKlass",
           "kind": "function",
           "declaration": "export-function"
-        },
-        {
-          "name": "xmlSecTransformKWDes3Initialize",
-          "kind": "function",
-          "declaration": "internal-export"
-        },
-        {
-          "name": "xmlSecTransformKWDes3SetKey",
-          "kind": "function",
-          "declaration": "internal-export"
-        },
-        {
-          "name": "xmlSecTransformKWDes3SetKeyReq",
-          "kind": "function",
-          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformKWRfc3394Execute",
@@ -5661,8 +5661,7 @@
         },
         {
           "name": "xmlSecTransformReadKeyInfoNode",
-          "kind": "function",
-          "declaration": "internal-export"
+          "kind": "function"
         },
         {
           "name": "xmlSecTransformRelationshipGetKlass",
@@ -5906,8 +5905,7 @@
         },
         {
           "name": "xmlSecTransformWriteKeyInfoNode",
-          "kind": "function",
-          "declaration": "internal-export"
+          "kind": "function"
         },
         {
           "name": "xmlSecTransformX25519GetKlass",
@@ -5931,6 +5929,11 @@
         },
         {
           "name": "xmlSecTransformXPointerGetKlass",
+          "kind": "function",
+          "declaration": "export-function"
+        },
+        {
+          "name": "xmlSecTransformXPointerLegacyGetKlass",
           "kind": "function",
           "declaration": "export-function"
         },
@@ -6035,15 +6038,15 @@
           "declaration": "export-variable"
         },
         {
-          "name": "xmlSecXPointerNs",
+          "name": "xmlSecXPointerLegacyNs",
           "kind": "data",
           "size": 44,
           "declaration": "export-variable"
         },
         {
-          "name": "xmlSecXmldsig2021MoreNs",
+          "name": "xmlSecXPointerNs",
           "kind": "data",
-          "size": 40,
+          "size": 44,
           "declaration": "export-variable"
         }
       ],
@@ -6216,6 +6219,10 @@
           "declaration": "backend-api"
         },
         {
+          "name": "xmlSecOpenSSLEvpGetProviderQuery",
+          "kind": "function"
+        },
+        {
           "name": "xmlSecOpenSSLEvpKeyAdopt",
           "kind": "function",
           "declaration": "backend-api"
@@ -6301,16 +6308,6 @@
         },
         {
           "name": "xmlSecOpenSSLKeyDataDEREncodedKeyValueGetKlass",
-          "kind": "function",
-          "declaration": "backend-api"
-        },
-        {
-          "name": "xmlSecOpenSSLKeyDataDesGetKlass",
-          "kind": "function",
-          "declaration": "backend-api"
-        },
-        {
-          "name": "xmlSecOpenSSLKeyDataDesSet",
           "kind": "function",
           "declaration": "backend-api"
         },
@@ -6622,11 +6619,6 @@
           "declaration": "backend-api"
         },
         {
-          "name": "xmlSecOpenSSLTransformDes3CbcGetKlass",
-          "kind": "function",
-          "declaration": "backend-api"
-        },
-        {
           "name": "xmlSecOpenSSLTransformDhEsGetKlass",
           "kind": "function",
           "declaration": "backend-api"
@@ -6788,11 +6780,6 @@
         },
         {
           "name": "xmlSecOpenSSLTransformKWCamellia256GetKlass",
-          "kind": "function",
-          "declaration": "backend-api"
-        },
-        {
-          "name": "xmlSecOpenSSLTransformKWDes3GetKlass",
           "kind": "function",
           "declaration": "backend-api"
         },
@@ -7074,10 +7061,6 @@
           "name": "xmlSecOpenSSLX509StoreVerifyKey",
           "kind": "function",
           "declaration": "backend-api"
-        },
-        {
-          "name": "xmlSecOpenSslEvpGetProviderQuery",
-          "kind": "function"
         }
       ],
       "foreign": {
@@ -7110,6 +7093,11 @@
         {
           "name": "allocMode",
           "offset": 24,
+          "size": 4
+        },
+        {
+          "name": "flags",
+          "offset": 28,
           "size": 4
         }
       ]
@@ -7375,372 +7363,372 @@
           "size": 8
         },
         {
-          "name": "transformX448GetKlass",
+          "name": "transformEcdsaRipemd160GetKlass",
           "offset": 408,
           "size": 8
         },
         {
-          "name": "transformX25519GetKlass",
+          "name": "transformEcdsaSha1GetKlass",
           "offset": 416,
           "size": 8
         },
         {
-          "name": "transformEcdsaRipemd160GetKlass",
+          "name": "transformEcdsaSha224GetKlass",
           "offset": 424,
           "size": 8
         },
         {
-          "name": "transformEcdsaSha1GetKlass",
+          "name": "transformEcdsaSha256GetKlass",
           "offset": 432,
           "size": 8
         },
         {
-          "name": "transformEcdsaSha224GetKlass",
+          "name": "transformEcdsaSha384GetKlass",
           "offset": 440,
           "size": 8
         },
         {
-          "name": "transformEcdsaSha256GetKlass",
+          "name": "transformEcdsaSha512GetKlass",
           "offset": 448,
           "size": 8
         },
         {
-          "name": "transformEcdsaSha384GetKlass",
+          "name": "transformEcdsaSha3_224GetKlass",
           "offset": 456,
           "size": 8
         },
         {
-          "name": "transformEcdsaSha512GetKlass",
+          "name": "transformEcdsaSha3_256GetKlass",
           "offset": 464,
           "size": 8
         },
         {
-          "name": "transformEcdsaSha3_224GetKlass",
+          "name": "transformEcdsaSha3_384GetKlass",
           "offset": 472,
           "size": 8
         },
         {
-          "name": "transformEcdsaSha3_256GetKlass",
+          "name": "transformEcdsaSha3_512GetKlass",
           "offset": 480,
           "size": 8
         },
         {
-          "name": "transformEcdsaSha3_384GetKlass",
+          "name": "transformGost2001GostR3411_94GetKlass",
           "offset": 488,
           "size": 8
         },
         {
-          "name": "transformEcdsaSha3_512GetKlass",
+          "name": "transformGostR3410_2012GostR3411_2012_256GetKlass",
           "offset": 496,
           "size": 8
         },
         {
-          "name": "transformGost2001GostR3411_94GetKlass",
+          "name": "transformGostR3410_2012GostR3411_2012_512GetKlass",
           "offset": 504,
           "size": 8
         },
         {
-          "name": "transformGostR3410_2012GostR3411_2012_256GetKlass",
+          "name": "transformGostR3411_94GetKlass",
           "offset": 512,
           "size": 8
         },
         {
-          "name": "transformGostR3410_2012GostR3411_2012_512GetKlass",
+          "name": "transformGostR3411_2012_256GetKlass",
           "offset": 520,
           "size": 8
         },
         {
-          "name": "transformGostR3411_94GetKlass",
+          "name": "transformGostR3411_2012_512GetKlass",
           "offset": 528,
           "size": 8
         },
         {
-          "name": "transformGostR3411_2012_256GetKlass",
+          "name": "transformHkdfGetKlass",
           "offset": 536,
           "size": 8
         },
         {
-          "name": "transformGostR3411_2012_512GetKlass",
+          "name": "transformHmacMd5GetKlass",
           "offset": 544,
           "size": 8
         },
         {
-          "name": "transformHkdfGetKlass",
+          "name": "transformHmacRipemd160GetKlass",
           "offset": 552,
           "size": 8
         },
         {
-          "name": "transformHmacMd5GetKlass",
+          "name": "transformHmacSha1GetKlass",
           "offset": 560,
           "size": 8
         },
         {
-          "name": "transformHmacRipemd160GetKlass",
+          "name": "transformHmacSha224GetKlass",
           "offset": 568,
           "size": 8
         },
         {
-          "name": "transformHmacSha1GetKlass",
+          "name": "transformHmacSha256GetKlass",
           "offset": 576,
           "size": 8
         },
         {
-          "name": "transformHmacSha224GetKlass",
+          "name": "transformHmacSha384GetKlass",
           "offset": 584,
           "size": 8
         },
         {
-          "name": "transformHmacSha256GetKlass",
+          "name": "transformHmacSha512GetKlass",
           "offset": 592,
           "size": 8
         },
         {
-          "name": "transformHmacSha384GetKlass",
+          "name": "transformMLDSA44GetKlass",
           "offset": 600,
           "size": 8
         },
         {
-          "name": "transformHmacSha512GetKlass",
+          "name": "transformMLDSA65GetKlass",
           "offset": 608,
           "size": 8
         },
         {
-          "name": "transformMLDSA44GetKlass",
+          "name": "transformMLDSA87GetKlass",
           "offset": 616,
           "size": 8
         },
         {
-          "name": "transformMLDSA65GetKlass",
+          "name": "transformMLKEM512GetKlass",
           "offset": 624,
           "size": 8
         },
         {
-          "name": "transformMLDSA87GetKlass",
+          "name": "transformMLKEM768GetKlass",
           "offset": 632,
           "size": 8
         },
         {
-          "name": "transformMLKEM512GetKlass",
+          "name": "transformMLKEM1024GetKlass",
           "offset": 640,
           "size": 8
         },
         {
-          "name": "transformMLKEM768GetKlass",
+          "name": "transformMd5GetKlass",
           "offset": 648,
           "size": 8
         },
         {
-          "name": "transformMLKEM1024GetKlass",
+          "name": "transformPbkdf2GetKlass",
           "offset": 656,
           "size": 8
         },
         {
-          "name": "transformMd5GetKlass",
+          "name": "transformRipemd160GetKlass",
           "offset": 664,
           "size": 8
         },
         {
-          "name": "transformPbkdf2GetKlass",
+          "name": "transformRsaMd5GetKlass",
           "offset": 672,
           "size": 8
         },
         {
-          "name": "transformRipemd160GetKlass",
+          "name": "transformRsaRipemd160GetKlass",
           "offset": 680,
           "size": 8
         },
         {
-          "name": "transformRsaMd5GetKlass",
+          "name": "transformRsaSha1GetKlass",
           "offset": 688,
           "size": 8
         },
         {
-          "name": "transformRsaRipemd160GetKlass",
+          "name": "transformRsaSha224GetKlass",
           "offset": 696,
           "size": 8
         },
         {
-          "name": "transformRsaSha1GetKlass",
+          "name": "transformRsaSha256GetKlass",
           "offset": 704,
           "size": 8
         },
         {
-          "name": "transformRsaSha224GetKlass",
+          "name": "transformRsaSha384GetKlass",
           "offset": 712,
           "size": 8
         },
         {
-          "name": "transformRsaSha256GetKlass",
+          "name": "transformRsaSha512GetKlass",
           "offset": 720,
           "size": 8
         },
         {
-          "name": "transformRsaSha384GetKlass",
+          "name": "transformRsaPssSha1GetKlass",
           "offset": 728,
           "size": 8
         },
         {
-          "name": "transformRsaSha512GetKlass",
+          "name": "transformRsaPssSha224GetKlass",
           "offset": 736,
           "size": 8
         },
         {
-          "name": "transformRsaPssSha1GetKlass",
+          "name": "transformRsaPssSha256GetKlass",
           "offset": 744,
           "size": 8
         },
         {
-          "name": "transformRsaPssSha224GetKlass",
+          "name": "transformRsaPssSha384GetKlass",
           "offset": 752,
           "size": 8
         },
         {
-          "name": "transformRsaPssSha256GetKlass",
+          "name": "transformRsaPssSha512GetKlass",
           "offset": 760,
           "size": 8
         },
         {
-          "name": "transformRsaPssSha384GetKlass",
+          "name": "transformRsaPssSha3_224GetKlass",
           "offset": 768,
           "size": 8
         },
         {
-          "name": "transformRsaPssSha512GetKlass",
+          "name": "transformRsaPssSha3_256GetKlass",
           "offset": 776,
           "size": 8
         },
         {
-          "name": "transformRsaPssSha3_224GetKlass",
+          "name": "transformRsaPssSha3_384GetKlass",
           "offset": 784,
           "size": 8
         },
         {
-          "name": "transformRsaPssSha3_256GetKlass",
+          "name": "transformRsaPssSha3_512GetKlass",
           "offset": 792,
           "size": 8
         },
         {
-          "name": "transformRsaPssSha3_384GetKlass",
+          "name": "transformRsaPkcs1GetKlass",
           "offset": 800,
           "size": 8
         },
         {
-          "name": "transformRsaPssSha3_512GetKlass",
+          "name": "transformRsaOaepGetKlass",
           "offset": 808,
           "size": 8
         },
         {
-          "name": "transformRsaPkcs1GetKlass",
+          "name": "transformRsaOaepEnc11GetKlass",
           "offset": 816,
           "size": 8
         },
         {
-          "name": "transformRsaOaepGetKlass",
+          "name": "transformSLHDSA_SHA2_128fGetKlass",
           "offset": 824,
           "size": 8
         },
         {
-          "name": "transformRsaOaepEnc11GetKlass",
+          "name": "transformSLHDSA_SHA2_128sGetKlass",
           "offset": 832,
           "size": 8
         },
         {
-          "name": "transformSLHDSA_SHA2_128fGetKlass",
+          "name": "transformSLHDSA_SHA2_192fGetKlass",
           "offset": 840,
           "size": 8
         },
         {
-          "name": "transformSLHDSA_SHA2_128sGetKlass",
+          "name": "transformSLHDSA_SHA2_192sGetKlass",
           "offset": 848,
           "size": 8
         },
         {
-          "name": "transformSLHDSA_SHA2_192fGetKlass",
+          "name": "transformSLHDSA_SHA2_256fGetKlass",
           "offset": 856,
           "size": 8
         },
         {
-          "name": "transformSLHDSA_SHA2_192sGetKlass",
+          "name": "transformSLHDSA_SHA2_256sGetKlass",
           "offset": 864,
           "size": 8
         },
         {
-          "name": "transformSLHDSA_SHA2_256fGetKlass",
+          "name": "transformEdDSAEd25519GetKlass",
           "offset": 872,
           "size": 8
         },
         {
-          "name": "transformSLHDSA_SHA2_256sGetKlass",
+          "name": "transformEdDSAEd25519ctxGetKlass",
           "offset": 880,
           "size": 8
         },
         {
-          "name": "transformEdDSAEd25519GetKlass",
+          "name": "transformEdDSAEd25519phGetKlass",
           "offset": 888,
           "size": 8
         },
         {
-          "name": "transformEdDSAEd25519ctxGetKlass",
+          "name": "transformEdDSAEd448GetKlass",
           "offset": 896,
           "size": 8
         },
         {
-          "name": "transformEdDSAEd25519phGetKlass",
+          "name": "transformEdDSAEd448phGetKlass",
           "offset": 904,
           "size": 8
         },
         {
-          "name": "transformEdDSAEd448GetKlass",
+          "name": "transformSha1GetKlass",
           "offset": 912,
           "size": 8
         },
         {
-          "name": "transformEdDSAEd448phGetKlass",
+          "name": "transformSha224GetKlass",
           "offset": 920,
           "size": 8
         },
         {
-          "name": "transformSha1GetKlass",
+          "name": "transformSha256GetKlass",
           "offset": 928,
           "size": 8
         },
         {
-          "name": "transformSha224GetKlass",
+          "name": "transformSha384GetKlass",
           "offset": 936,
           "size": 8
         },
         {
-          "name": "transformSha256GetKlass",
+          "name": "transformSha512GetKlass",
           "offset": 944,
           "size": 8
         },
         {
-          "name": "transformSha384GetKlass",
+          "name": "transformSha3_224GetKlass",
           "offset": 952,
           "size": 8
         },
         {
-          "name": "transformSha512GetKlass",
+          "name": "transformSha3_256GetKlass",
           "offset": 960,
           "size": 8
         },
         {
-          "name": "transformSha3_224GetKlass",
+          "name": "transformSha3_384GetKlass",
           "offset": 968,
           "size": 8
         },
         {
-          "name": "transformSha3_256GetKlass",
+          "name": "transformSha3_512GetKlass",
           "offset": 976,
           "size": 8
         },
         {
-          "name": "transformSha3_384GetKlass",
+          "name": "transformX25519GetKlass",
           "offset": 984,
           "size": 8
         },
         {
-          "name": "transformSha3_512GetKlass",
+          "name": "transformX448GetKlass",
           "offset": 992,
           "size": 8
         },
@@ -8923,7 +8911,7 @@
     },
     {
       "name": "_xmlSecTransform",
-      "size": 144,
+      "size": 152,
       "align": 8,
       "fields": [
         {
@@ -8987,8 +8975,13 @@
           "size": 8
         },
         {
-          "name": "reserved0",
+          "name": "inTotalSize",
           "offset": 136,
+          "size": 8
+        },
+        {
+          "name": "reserved0",
+          "offset": 144,
           "size": 8
         }
       ]
@@ -9190,19 +9183,6 @@
   ],
   "enums": [
     {
-      "name": "xmlEncCtxMode",
-      "values": [
-        {
-          "name": "xmlEncCtxModeEncryptedData",
-          "value": 0
-        },
-        {
-          "name": "xmlEncCtxModeEncryptedKey",
-          "value": 1
-        }
-      ]
-    },
-    {
       "name": "xmlSecAllocMode",
       "values": [
         {
@@ -9293,6 +9273,19 @@
         {
           "name": "xmlSecDSigStatusInvalid",
           "value": 2
+        }
+      ]
+    },
+    {
+      "name": "xmlSecEncCtxMode",
+      "values": [
+        {
+          "name": "xmlSecEncCtxModeEncryptedData",
+          "value": 0
+        },
+        {
+          "name": "xmlSecEncCtxModeEncryptedKey",
+          "value": 1
         }
       ]
     },
@@ -9707,6 +9700,12 @@
       }
     },
     {
+      "name": "xmlSecBnPrependZeroIfMsbSet",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
       "name": "xmlSecBnReverse",
       "returns": {
         "kind": "value"
@@ -9840,6 +9839,18 @@
     },
     {
       "name": "xmlSecBufferIsEmpty",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecBufferIsSecure",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecBufferMakeSecure",
       "returns": {
         "kind": "value"
       }
@@ -10329,14 +10340,13 @@
       }
     },
     {
-      "name": "xmlSecEncCtxEncapsulationMechanismGenerate",
+      "name": "xmlSecEncCtxEncryptedKeyXmlRead",
       "returns": {
-        "kind": "owned",
-        "release": "xmlSecKeyDestroy"
+        "kind": "value"
       }
     },
     {
-      "name": "xmlSecEncCtxEncapsulationMechanismXmlWrite",
+      "name": "xmlSecEncCtxEncryptedKeyXmlWrite",
       "returns": {
         "kind": "value"
       }
@@ -10386,6 +10396,12 @@
     },
     {
       "name": "xmlSecError",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecErrorsClearCallback",
       "returns": {
         "kind": "value"
       }
@@ -10722,6 +10738,18 @@
       }
     },
     {
+      "name": "xmlSecKeyDataCamelliaGetKlass",
+      "returns": {
+        "kind": "static"
+      }
+    },
+    {
+      "name": "xmlSecKeyDataChaCha20GetKlass",
+      "returns": {
+        "kind": "static"
+      }
+    },
+    {
       "name": "xmlSecKeyDataConcatKdfGetKlass",
       "returns": {
         "kind": "static"
@@ -10857,12 +10885,6 @@
     },
     {
       "name": "xmlSecKeyDataEdDSAGetKlass",
-      "returns": {
-        "kind": "static"
-      }
-    },
-    {
-      "name": "xmlSecKeyDataEncapsulationMechanismGetKlass",
       "returns": {
         "kind": "static"
       }
@@ -11028,19 +11050,6 @@
       "name": "xmlSecKeyDataKEMGetKlass",
       "returns": {
         "kind": "static"
-      }
-    },
-    {
-      "name": "xmlSecKeyDataKEMGetRecipientKey",
-      "returns": {
-        "kind": "borrowed",
-        "owner": "data"
-      }
-    },
-    {
-      "name": "xmlSecKeyDataKEMSetCiphertext",
-      "returns": {
-        "kind": "value"
       }
     },
     {
@@ -11598,6 +11607,12 @@
       }
     },
     {
+      "name": "xmlSecMemCleanse",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
       "name": "xmlSecMemEqual",
       "returns": {
         "kind": "value"
@@ -11983,18 +11998,6 @@
       "name": "xmlSecOpenSSLKeyDataDEREncodedKeyValueGetKlass",
       "returns": {
         "kind": "static"
-      }
-    },
-    {
-      "name": "xmlSecOpenSSLKeyDataDesGetKlass",
-      "returns": {
-        "kind": "static"
-      }
-    },
-    {
-      "name": "xmlSecOpenSSLKeyDataDesSet",
-      "returns": {
-        "kind": "value"
       }
     },
     {
@@ -12396,12 +12399,6 @@
       }
     },
     {
-      "name": "xmlSecOpenSSLTransformDes3CbcGetKlass",
-      "returns": {
-        "kind": "static"
-      }
-    },
-    {
       "name": "xmlSecOpenSSLTransformDhEsGetKlass",
       "returns": {
         "kind": "static"
@@ -12595,12 +12592,6 @@
     },
     {
       "name": "xmlSecOpenSSLTransformKWCamellia256GetKlass",
-      "returns": {
-        "kind": "static"
-      }
-    },
-    {
-      "name": "xmlSecOpenSSLTransformKWDes3GetKlass",
       "returns": {
         "kind": "static"
       }
@@ -13058,6 +13049,12 @@
     },
     {
       "name": "xmlSecPtrListSetDefaultAllocMode",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecPtrListSort",
       "returns": {
         "kind": "value"
       }
@@ -13685,6 +13682,30 @@
       }
     },
     {
+      "name": "xmlSecTransformCamellia128CbcGetKlass",
+      "returns": {
+        "kind": "static"
+      }
+    },
+    {
+      "name": "xmlSecTransformCamellia192CbcGetKlass",
+      "returns": {
+        "kind": "static"
+      }
+    },
+    {
+      "name": "xmlSecTransformCamellia256CbcGetKlass",
+      "returns": {
+        "kind": "static"
+      }
+    },
+    {
+      "name": "xmlSecTransformChaCha20GetKlass",
+      "returns": {
+        "kind": "static"
+      }
+    },
+    {
       "name": "xmlSecTransformChaCha20ParamsRead",
       "returns": {
         "kind": "value"
@@ -13694,6 +13715,12 @@
       "name": "xmlSecTransformChaCha20ParamsWrite",
       "returns": {
         "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecTransformChaCha20Poly1305GetKlass",
+      "returns": {
+        "kind": "static"
       }
     },
     {
@@ -14423,18 +14450,6 @@
       }
     },
     {
-      "name": "xmlSecTransformKEMRead",
-      "returns": {
-        "kind": "value"
-      }
-    },
-    {
-      "name": "xmlSecTransformKEMWrite",
-      "returns": {
-        "kind": "value"
-      }
-    },
-    {
       "name": "xmlSecTransformKWAes128GetKlass",
       "returns": {
         "kind": "static"
@@ -14453,39 +14468,27 @@
       }
     },
     {
-      "name": "xmlSecTransformKWDes3Execute",
+      "name": "xmlSecTransformKWCamellia128GetKlass",
       "returns": {
-        "kind": "value"
+        "kind": "static"
       }
     },
     {
-      "name": "xmlSecTransformKWDes3Finalize",
+      "name": "xmlSecTransformKWCamellia192GetKlass",
       "returns": {
-        "kind": "value"
+        "kind": "static"
+      }
+    },
+    {
+      "name": "xmlSecTransformKWCamellia256GetKlass",
+      "returns": {
+        "kind": "static"
       }
     },
     {
       "name": "xmlSecTransformKWDes3GetKlass",
       "returns": {
         "kind": "static"
-      }
-    },
-    {
-      "name": "xmlSecTransformKWDes3Initialize",
-      "returns": {
-        "kind": "value"
-      }
-    },
-    {
-      "name": "xmlSecTransformKWDes3SetKey",
-      "returns": {
-        "kind": "value"
-      }
-    },
-    {
-      "name": "xmlSecTransformKWDes3SetKeyReq",
-      "returns": {
-        "kind": "value"
       }
     },
     {
@@ -14638,13 +14641,6 @@
       "name": "xmlSecTransformPushXml",
       "returns": {
         "kind": "value"
-      }
-    },
-    {
-      "name": "xmlSecTransformReadKeyInfoNode",
-      "returns": {
-        "kind": "owned",
-        "release": "xmlSecKeyDestroy"
       }
     },
     {
@@ -14936,12 +14932,6 @@
       }
     },
     {
-      "name": "xmlSecTransformWriteKeyInfoNode",
-      "returns": {
-        "kind": "value"
-      }
-    },
-    {
       "name": "xmlSecTransformX25519GetKlass",
       "returns": {
         "kind": "static"
@@ -14967,6 +14957,12 @@
     },
     {
       "name": "xmlSecTransformXPointerGetKlass",
+      "returns": {
+        "kind": "static"
+      }
+    },
+    {
+      "name": "xmlSecTransformXPointerLegacyGetKlass",
       "returns": {
         "kind": "static"
       }

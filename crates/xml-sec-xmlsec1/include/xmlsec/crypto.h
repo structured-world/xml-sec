@@ -5,20 +5,23 @@
  *
  * Copyright (C) 2002-2026 Aleksey Sanin <aleksey@aleksey.com>. All Rights Reserved.
  */
-#ifndef __XMLSEC_CRYPTO_H__
-#define __XMLSEC_CRYPTO_H__
+#ifndef XMLSEC_CRYPTO_H
+#define XMLSEC_CRYPTO_H
 /**
+ * @defgroup xmlsec_core_crypto Crypto Back-End Selection
+ * @ingroup xmlsec_core
  * @brief Selects and includes the configured cryptographic back-end.
+ * @{
  */
 
 #include <xmlsec/xmlsec.h>
 
-/* include nothing if we compile xmlsec library itself */
+/* include nothing if we compile the xmlsec or xmlsec-crypto library itself */
 #ifndef IN_XMLSEC
 #ifndef IN_XMLSEC_CRYPTO
 
 #if defined(XMLSEC_NO_CRYPTO_DYNAMIC_LOADING) && defined(XMLSEC_CRYPTO_DYNAMIC_LOADING)
-#error Dynamic loading for xmlsec-crypto libraries is disabled during library compilation
+#error Conflicting configuration: both XMLSEC_NO_CRYPTO_DYNAMIC_LOADING and XMLSEC_CRYPTO_DYNAMIC_LOADING are defined
 #endif /* defined(XMLSEC_NO_CRYPTO_DYNAMIC_LOADING) && defined(XMLSEC_CRYPTO_DYNAMIC_LOADING) */
 
 #ifdef XMLSEC_CRYPTO_DYNAMIC_LOADING
@@ -59,7 +62,7 @@
 #include <xmlsec/gcrypt/crypto.h>
 #include <xmlsec/gcrypt/symbols.h>
 #else /* XMLSEC_CRYPTO_GCRYPT */
-#error No crypto library defined
+#error No crypto library defined (define one of the crypto back-end macros, e.g. XMLSEC_CRYPTO_OPENSSL, or XMLSEC_CRYPTO_DYNAMIC_LOADING)
 #endif /* XMLSEC_CRYPTO_GCRYPT */
 #endif /* XMLSEC_CRYPTO_GNUTLS */
 #endif /* XMLSEC_CRYPTO_NSS */
@@ -70,4 +73,7 @@
 
 #endif /* IN_XMLSEC_CRYPTO */
 #endif /* IN_XMLSEC */
-#endif /* __XMLSEC_CRYPTO_H__ */
+
+/** @} */ /* xmlsec_core_crypto */
+
+#endif /* XMLSEC_CRYPTO_H */

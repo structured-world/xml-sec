@@ -1,7 +1,7 @@
 //! The built-in provider's symmetric key-data klasses: AES, Camellia,
-//! `ChaCha20`, DES and HMAC keys in their `KeyValue` children, and the
-//! `ConcatKDF`, PBKDF2 and HKDF derivation keys, which are read only from
-//! files. Each is a binary value whose bytes the built-in provider
+//! `ChaCha20` and HMAC keys in their `KeyValue` children, and the
+//! `ConcatKDF`, PBKDF2 and HKDF derivation keys, which are read from files
+//! or retrieved, never from a `KeyValue`. Each is a binary value whose bytes the built-in provider
 //! generates; the klasses are the members of the built-in crypto table.
 
 use std::ffi::{c_int, c_uint};
@@ -19,11 +19,11 @@ use super::keysdata::{
 };
 use super::strings::{
     xmlSecHrefAESKeyValue, xmlSecHrefCamelliaKeyValue, xmlSecHrefChaCha20KeyValue,
-    xmlSecHrefConcatKdf, xmlSecHrefDESKeyValue, xmlSecHrefHMACKeyValue, xmlSecHrefHkdf,
-    xmlSecHrefPbkdf2, xmlSecNameAESKeyValue, xmlSecNameCamelliaKeyValue,
-    xmlSecNameChaCha20KeyValue, xmlSecNameConcatKdf, xmlSecNameDESKeyValue, xmlSecNameHMACKeyValue,
-    xmlSecNameHkdf, xmlSecNamePbkdf2, xmlSecNodeAESKeyValue, xmlSecNodeCamelliaKeyValue,
-    xmlSecNodeChaCha20KeyValue, xmlSecNodeDESKeyValue, xmlSecNodeHMACKeyValue, xmlSecNs,
+    xmlSecHrefConcatKdf, xmlSecHrefHMACKeyValue, xmlSecHrefHkdf, xmlSecHrefPbkdf2,
+    xmlSecNameAESKeyValue, xmlSecNameCamelliaKeyValue, xmlSecNameChaCha20KeyValue,
+    xmlSecNameConcatKdf, xmlSecNameHMACKeyValue, xmlSecNameHkdf, xmlSecNamePbkdf2,
+    xmlSecNodeAESKeyValue, xmlSecNodeCamelliaKeyValue, xmlSecNodeChaCha20KeyValue,
+    xmlSecNodeHMACKeyValue, xmlSecNs,
 };
 
 /// A symmetric klass: a binary value of the built-in provider.
@@ -75,12 +75,13 @@ const fn key_value(name: *const u8, href: *const u8, node: *const u8) -> XmlSecK
     )
 }
 
-/// A derivation-key klass, read only from files.
+/// A derivation-key klass, read from files or through a `RetrievalMethod`,
+/// never from a `KeyValue` child.
 const fn file_only(name: *const u8, href: *const u8) -> XmlSecKeyDataKlass {
     klass(
         name,
         href,
-        USAGE_READ_FROM_FILE,
+        USAGE_READ_FROM_FILE | USAGE_RETRIEVAL_METHOD_NODE_XML,
         std::ptr::null(),
         std::ptr::null(),
         None,
@@ -105,11 +106,6 @@ static CHACHA20: XmlSecKeyDataKlass = key_value(
 );
 static CONCAT_KDF: XmlSecKeyDataKlass =
     file_only(xmlSecNameConcatKdf.as_ptr(), xmlSecHrefConcatKdf.as_ptr());
-static DES: XmlSecKeyDataKlass = key_value(
-    xmlSecNameDESKeyValue.as_ptr(),
-    xmlSecHrefDESKeyValue.as_ptr(),
-    xmlSecNodeDESKeyValue.as_ptr(),
-);
 static HMAC: XmlSecKeyDataKlass = key_value(
     xmlSecNameHMACKeyValue.as_ptr(),
     xmlSecHrefHMACKeyValue.as_ptr(),
@@ -134,7 +130,6 @@ fn is_symmetric(klass: *const XmlSecKeyDataKlass) -> bool {
         &CAMELLIA,
         &CHACHA20,
         &CONCAT_KDF,
-        &DES,
         &HMAC,
         &PBKDF2,
         &HKDF,
@@ -288,7 +283,6 @@ getters! {
     camellia => CAMELLIA;
     chacha20 => CHACHA20;
     concat_kdf => CONCAT_KDF;
-    des => DES;
     hmac => HMAC;
     pbkdf2 => PBKDF2;
     hkdf => HKDF;

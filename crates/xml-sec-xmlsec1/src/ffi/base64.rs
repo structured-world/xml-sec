@@ -37,10 +37,17 @@ pub(crate) struct XmlSecBase64Ctx {
     finished: c_int,
 }
 
+/// libxmlsec1's `xmlSecBase64IsValidColumns`: no line breaks (0) or lines of
+/// at least two characters.
+pub(crate) fn valid_columns(columns: c_int) -> bool {
+    columns == 0 || columns > 1
+}
+
 impl XmlSecBase64Ctx {
-    /// A context for `encode` with `columns` per line; `None` for a
-    /// negative line size.
+    /// A context for `encode` with `columns` per line; `None` for a line
+    /// size [`valid_columns`] refuses.
     fn new(encode: c_int, columns: c_int) -> Option<Self> {
+        valid_columns(columns).then_some(())?;
         Some(Self {
             encode,
             columns: usize::try_from(columns).ok()?,
@@ -85,18 +92,8 @@ impl XmlSecBase64Ctx {
     }
 }
 
-/// The output size libxmlsec1 reserves to encode `size` bytes.
-pub(crate) fn encode_size(columns: usize, size: usize) -> Option<usize> {
-    Base64Codec::encoded_capacity(columns, size)
-}
-
-/// The output size libxmlsec1 reserves to decode `size` characters.
-pub(crate) fn decode_size(size: usize) -> Option<usize> {
-    Base64Codec::decoded_capacity(size)
-}
-
-/// Initializes `ctx` for `encode` with `columns` per line; `None` for a
-/// negative line size.
+/// Initializes `ctx` for `encode` with `columns` per line; `None` for a line
+/// size [`valid_columns`] refuses.
 pub(crate) fn initialize(ctx: &mut XmlSecBase64Ctx, encode: c_int, columns: c_int) -> Option<()> {
     *ctx = XmlSecBase64Ctx::new(encode, columns)?;
     Some(())
@@ -114,87 +111,148 @@ pub(crate) fn update(
     result
 }
 
-/// Finishes the stream; the bytes written. As libxmlsec1 does, a NUL follows
-/// the encoded characters when room remains, and the decoder writes one when
-/// more than one byte of room remains.
+/// Finishes the stream; the bytes written, and a NUL after them when room
+/// remains, as libxmlsec1 terminates its output.
 pub(crate) fn finish(ctx: &mut XmlSecBase64Ctx, output: &mut [u8]) -> Result<usize, Base64Error> {
     let mut codec = ctx.codec();
     let result = codec.finish(output);
     ctx.store(&codec);
     let written = result?;
-    let room = if codec.encode { written } else { written + 1 };
-    if room < output.len() {
+    if written < output.len() {
         output[written] = 0;
     }
     Ok(written)
 }
 
-/// The byte-level cause libxmlsec1's decoder reports when decoding `input`
-/// from the state `before` fails: the state itself, misplaced padding, or a
-/// byte that is not Base64. `None` when it reports none: the stream had
-/// already ended, or the output filled up.
+/// Why libxmlsec1's decoder stops on `input` from a state.
+enum DecodeStop {
+    /// A byte, or the state itself, is refused with this report.
+    Refused(String),
+    /// The stream ended before the input did: the rest is left unread.
+    Ended,
+    /// No byte is refused.
+    Nothing,
+}
+
+/// Where libxmlsec1's decoder stops when decoding `input` from the state
+/// `before` fails: the state itself, misplaced padding or a byte that is not
+/// Base64, or the end of the stream before the end of the input.
 ///
-/// The codec finds the failing byte itself: a copy of the state before the
+/// The codec finds the stopping byte itself: a copy of the state before the
 /// call is fed the input one byte at a time until it refuses one.
-fn decode_cause(before: Base64Codec, input: &[u8]) -> Option<String> {
+fn decode_stop(before: Base64Codec, input: &[u8]) -> DecodeStop {
     let mut codec = before;
     // One input byte decodes to at most one output byte.
     let mut room = [0u8; 1];
     if codec.update(&[], &mut room).is_err() {
-        return Some(format!(
+        return DecodeStop::Refused(format!(
             "invalid data for 'ctx->inPos': actual={} and expected 0,1,2,3",
             before.position
         ));
     }
     for &byte in input {
         // libxmlsec1 stops at the end of the stream without inspecting the
-        // byte and reports only that input was left over.
+        // byte; trailing whitespace is read past.
         if codec.finished && codec.position == 0 {
-            return None;
+            if matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
+                continue;
+            }
+            return DecodeStop::Ended;
         }
         let position = codec.position;
         match codec.update(&[byte], &mut room) {
             Ok(_) => {}
             Err(Base64Error::Invalid) if byte == b'=' => {
-                return Some(format!(
+                return DecodeStop::Refused(format!(
                     "invalid data for 'ctx->inPos': actual={position} and expected 2,3"
                 ));
             }
             Err(Base64Error::Invalid) => {
-                return Some(format!(
+                return DecodeStop::Refused(format!(
                     "invalid data for 'inByte': actual={byte} and expected base64 character"
                 ));
             }
-            Err(_) => return None,
+            Err(_) => return DecodeStop::Nothing,
         }
     }
-    None
+    DecodeStop::Nothing
 }
 
-/// Reports a failed update from the state `before` over `input` with the
-/// reports libxmlsec1's codec makes below `xmlSecBase64CtxUpdate_ex`: for a
-/// byte the decoder refuses, the byte's cause and the failed decoding step.
-fn report_update_failure(before: Base64Codec, input: &[u8], error: Base64Error) {
-    if before.encode || error != Base64Error::Invalid {
+/// Reports a failed update from the state `before` over `input` as libxmlsec1
+/// reports it at and below `xmlSecBase64CtxUpdate_ex` (`here`).
+fn report_update_failure(
+    here: errors::Here,
+    before: Base64Codec,
+    input: &[u8],
+    error: Base64Error,
+) {
+    let too_small = || {
+        errors::report(
+            here,
+            std::ptr::null(),
+            std::ptr::null(),
+            errors::R_INVALID_SIZE,
+            "invalid size: output base64 buffer size is too small",
+        );
+    };
+    if before.encode {
+        // The encoder stops at a full output and leaves the rest unread.
+        if error == Base64Error::OutputFull {
+            too_small();
+        } else {
+            errors::internal(here, std::ptr::null(), c"xmlSecBase64CtxEncode");
+        }
         return;
     }
-    if let Some(cause) = decode_cause(before, input) {
-        errors::invalid_data(here!("xmlSecBase64CtxDecodeByte"), std::ptr::null(), &cause);
-        // `xmlSecBase64StatusFailed`.
-        errors::internal_with(
-            here!("xmlSecBase64CtxDecode"),
-            std::ptr::null(),
-            c"xmlSecBase64CtxDecodeByte",
-            "status=4",
-        );
+    let decode = here!("xmlSecBase64CtxDecode");
+    match error {
+        Base64Error::OutputFull => {
+            errors::report(
+                decode,
+                std::ptr::null(),
+                std::ptr::null(),
+                errors::R_INVALID_SIZE,
+                "invalid size: output base64 buffer size is too small",
+            );
+        }
+        _ => match decode_stop(before, input) {
+            DecodeStop::Ended => {
+                errors::report(
+                    here,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    errors::R_INVALID_SIZE,
+                    "invalid size: input base64 buffer size is too large",
+                );
+                return;
+            }
+            DecodeStop::Refused(cause) => {
+                errors::invalid_data(here!("xmlSecBase64CtxDecodeByte"), std::ptr::null(), &cause);
+                // `xmlSecBase64StatusFailed`.
+                errors::internal_with(
+                    decode,
+                    std::ptr::null(),
+                    c"xmlSecBase64CtxDecodeByte",
+                    "status=4",
+                );
+            }
+            DecodeStop::Nothing => {}
+        },
     }
+    errors::internal(here, std::ptr::null(), c"xmlSecBase64CtxDecode");
 }
 
 /// Reports a failed finish with the reports libxmlsec1 makes for it: an
 /// unfinished decoder group, or an encoder whose output does not fit.
 fn report_final_failure(here: errors::Here, encode: bool, error: Base64Error, out_size: usize) {
     if !encode {
-        errors::internal(here, std::ptr::null(), c"xmlSecBase64CtxDecodeIsFinished");
+        errors::report(
+            here,
+            std::ptr::null(),
+            std::ptr::null(),
+            errors::R_INVALID_SIZE,
+            "invalid size: Base64 data is incomplete",
+        );
         return;
     }
     let encode_final = here!("xmlSecBase64CtxEncodeFinal");
@@ -255,17 +313,25 @@ pub(crate) unsafe extern "C" fn xmlSecBase64GetDefaultLineSize() -> c_int {
 }
 
 /// `xmlSecBase64SetDefaultLineSize`: the line size of Base64 transforms
-/// created from now on.
+/// created from now on; a size [`valid_columns`] refuses is refused.
 ///
 /// # Safety
 /// Callable at any time.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecBase64SetDefaultLineSize(columns: c_int) {
-    LINE_SIZE.store(columns, Ordering::Relaxed);
+    contain((), || {
+        check!(
+            valid_columns(columns),
+            "xmlSecBase64SetDefaultLineSize",
+            c"xmlSecBase64IsValidColumns(columns)",
+        );
+        LINE_SIZE.store(columns, Ordering::Relaxed);
+    });
 }
 
 /// `xmlSecBase64CtxCreate`: a new context, released with
-/// [`xmlSecBase64CtxDestroy`]; null for a negative line size.
+/// [`xmlSecBase64CtxDestroy`]; null for a line size [`valid_columns`]
+/// refuses.
 ///
 /// # Safety
 /// Callable at any time.
@@ -333,14 +399,17 @@ pub(crate) unsafe extern "C" fn xmlSecBase64CtxInitialize(
             c"ctx != NULL",
             -1
         );
-        // SAFETY: `ctx` is writable; it is zeroed before any field is read.
-        unsafe {
-            ctx.write(XmlSecBase64Ctx::empty());
-            (*ctx).encode = encode;
-            if initialize(&mut *ctx, encode, columns).is_none() {
-                errors::int_to_size_impossible(here!("xmlSecBase64CtxInitialize"), columns);
-                return -1;
-            }
+        check!(
+            valid_columns(columns),
+            "xmlSecBase64CtxInitialize",
+            c"xmlSecBase64IsValidColumns(columns)",
+            -1
+        );
+        // SAFETY: `ctx` is writable.
+        unsafe { ctx.write(XmlSecBase64Ctx::empty()) };
+        // SAFETY: as above; the line size is valid, so this cannot fail.
+        if initialize(unsafe { &mut *ctx }, encode, columns).is_none() {
+            return -1;
         }
         0
     })
@@ -383,9 +452,9 @@ pub(crate) unsafe extern "C" fn xmlSecBase64CtxUpdate_ex(
             -1
         );
         check!(
-            !input.is_null(),
+            !input.is_null() || in_size == 0,
             "xmlSecBase64CtxUpdate_ex",
-            c"in != NULL",
+            c"(in != NULL) || (inSize == 0)",
             -1
         );
         check!(
@@ -402,8 +471,11 @@ pub(crate) unsafe extern "C" fn xmlSecBase64CtxUpdate_ex(
         );
         // SAFETY: by the caller's contract.
         unsafe {
+            if in_size == 0 {
+                out_written.write(0);
+                return 0;
+            }
             let before = (*ctx).codec();
-            let encode = before.encode;
             let data = in_slice(input, in_size);
             match update(&mut *ctx, data, out_slice(out, out_size)) {
                 Ok(written) => {
@@ -411,14 +483,7 @@ pub(crate) unsafe extern "C" fn xmlSecBase64CtxUpdate_ex(
                     0
                 }
                 Err(error) => {
-                    let here = here!("xmlSecBase64CtxUpdate_ex");
-                    report_update_failure(before, data, error);
-                    let failed = if encode {
-                        c"xmlSecBase64CtxEncode"
-                    } else {
-                        c"xmlSecBase64CtxDecode"
-                    };
-                    errors::internal(here, std::ptr::null(), failed);
+                    report_update_failure(here!("xmlSecBase64CtxUpdate_ex"), before, data, error);
                     -1
                 }
             }
@@ -450,11 +515,19 @@ pub(crate) unsafe extern "C" fn xmlSecBase64CtxFinal_ex(
             c"out != NULL",
             -1
         );
-        check!(out_size > 0, "xmlSecBase64CtxFinal_ex", c"outSize > 0", -1);
         check!(
             !out_written.is_null(),
             "xmlSecBase64CtxFinal_ex",
             c"outWritten != NULL",
+            -1
+        );
+        // An encoder writes its pending group, so it needs room for it.
+        // SAFETY: a non-null context by the caller's contract.
+        let (encode, pending) = unsafe { ((*ctx).encode != 0, (*ctx).in_pos) };
+        check!(
+            !encode || pending == 0 || out_size > 0,
+            "xmlSecBase64CtxFinal_ex",
+            c"(ctx->inPos == 0) || (outSize > 0)",
             -1
         );
         // SAFETY: by the caller's contract.
@@ -487,9 +560,9 @@ pub(crate) unsafe extern "C" fn xmlSecBase64Encode(
 ) -> *mut u8 {
     contain(std::ptr::null_mut(), || {
         check!(
-            !input.is_null(),
+            !input.is_null() || in_size == 0,
             "xmlSecBase64Encode",
-            c"in != NULL",
+            c"(in != NULL) || (inSize == 0)",
             std::ptr::null_mut()
         );
         let here = here!("xmlSecBase64Encode");
@@ -499,7 +572,7 @@ pub(crate) unsafe extern "C" fn xmlSecBase64Encode(
             errors::internal(here, std::ptr::null(), c"xmlSecBase64CtxInitialize");
             return std::ptr::null_mut();
         }
-        let Some(size) = encode_size(ctx.columns, in_size) else {
+        let Some(size) = Base64Codec::encoded_capacity(ctx.columns, in_size) else {
             errors::internal(here, std::ptr::null(), c"xmlSecBase64GetEncodeSize");
             return std::ptr::null_mut();
         };

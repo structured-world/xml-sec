@@ -5,8 +5,8 @@
  *
  * Copyright (C) 2002-2026 Aleksey Sanin <aleksey@aleksey.com>. All Rights Reserved.
  */
-#ifndef __XMLSEC_MEMBUF_H__
-#define __XMLSEC_MEMBUF_H__
+#ifndef XMLSEC_MEMBUF_H
+#define XMLSEC_MEMBUF_H
 
 /**
  * @defgroup xmlsec_core_membuf Memory Buffer Transform
@@ -14,8 +14,6 @@
  * @brief In-memory buffer transform for capturing transform output.
  * @{
  */
-
-#include <xs_tree.h>
 
 #include <xmlsec/exports.h>
 #include <xmlsec/xmlsec.h>
@@ -28,9 +26,9 @@ extern "C" {
 
 /******************************************************************************
  *
- * Memory Buffer transform
+ * Memory Buffer Transform
  *
-  *****************************************************************************/
+ *****************************************************************************/
 /**
  * @brief The Memory Buffer transform klass.
  */
@@ -43,6 +41,6 @@ XMLSEC_EXPORT xmlSecBufferPtr   xmlSecTransformMemBufGetBuffer          (xmlSecT
 }
 #endif /* __cplusplus */
 
-/** @} */ /** xmlsec_core_membuf */
+/** @} */ /* xmlsec_core_membuf */
 
-#endif /* __XMLSEC_MEMBUF_H__ */
+#endif /* XMLSEC_MEMBUF_H */

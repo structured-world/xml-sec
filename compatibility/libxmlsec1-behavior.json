@@ -2,8 +2,7 @@
   "schema_version": 1,
   "upstream": {
     "project": "libxmlsec1",
-    "version": "1.3.13",
-    "commit": "5fdd47dc35753438bdc38b6e96c1a3805c67a483",
+    "version": "1.3.14",
     "repository": "https://github.com/lsh123/xmlsec"
   },
   "generated_by": "xml-sec-capability-ledger behavior-generate",
@@ -234,13 +233,13 @@
       "donor_anchors": [
         {
           "source": "src/xpath.c",
-          "line": 481,
+          "line": 522,
           "needle": "xmlSecTransformXPathNodeRead(xmlSecTransformPtr transform, xmlNodePtr node, xmlSecTransformCtxPtr transformCtx)"
         },
         {
           "source": "src/xpath.c",
-          "line": 219,
-          "needle": "xmlXPathRegisterFunc(data->ctx, (xmlChar *)\"here\", xmlSecXPathHereFunction);"
+          "line": 241,
+          "needle": "xmlXPathRegisterFunc(data->ctx, (xmlChar *)\"here\", xmlSecXPathHereFunction)"
         }
       ]
     },
@@ -258,12 +257,12 @@
       "donor_anchors": [
         {
           "source": "apps/xmlsec.c",
-          "line": 837,
+          "line": 838,
           "needle": "\"--enable-visa3d-hack\","
         },
         {
           "source": "src/xmldsig.c",
-          "line": 1252,
+          "line": 1276,
           "needle": "XMLSEC_DSIG_FLAGS_USE_VISA3D_HACK"
         }
       ]
@@ -282,17 +281,17 @@
       "donor_anchors": [
         {
           "source": "apps/xmlsec.c",
-          "line": 851,
+          "line": 852,
           "needle": "\"--enable-asn1-signatures-hack\","
         },
         {
           "source": "src/openssl/signatures.c",
-          "line": 2137,
+          "line": 2196,
           "needle": "static int\nxmlSecOpenSSLEvpSignatureEcdsa_XmlDSig2OpenSSL("
         },
         {
           "source": "src/openssl/signatures.c",
-          "line": 2243,
+          "line": 2319,
           "needle": "static int\nxmlSecOpenSSLEvpSignatureEcdsa_OpenSSL2XmlDSig("
         }
       ]
@@ -311,12 +310,12 @@
       "donor_anchors": [
         {
           "source": "src/transforms.c",
-          "line": 1924,
+          "line": 2075,
           "needle": "middleId = xmlSecTransformXmlParserId;"
         },
         {
           "source": "src/transforms.c",
-          "line": 1932,
+          "line": 2083,
           "needle": "middleId = xmlSecTransformInclC14NId;"
         }
       ]
@@ -335,12 +334,12 @@
       "donor_anchors": [
         {
           "source": "src/transforms.c",
-          "line": 969,
+          "line": 1002,
           "needle": "transform = xmlSecTransformCtxCreateAndPrepend(ctx, xmlSecTransformXPointerId);"
         },
         {
           "source": "src/transforms.c",
-          "line": 990,
+          "line": 1022,
           "needle": "transform = xmlSecTransformCtxCreateAndPrepend(ctx, xmlSecTransformVisa3DHackId);"
         }
       ]
@@ -359,12 +358,12 @@
       "donor_anchors": [
         {
           "source": "src/xmltree.c",
-          "line": 873,
+          "line": 1077,
           "needle": "xmlSecAddIDs(xmlDocPtr doc, xmlNodePtr node, const xmlChar** ids)"
         },
         {
           "source": "apps/xmlsec.c",
-          "line": 3265,
+          "line": 3367,
           "needle": "xmlSecAddIDs(data->doc, NULL, idAttr);"
         }
       ]
@@ -383,7 +382,7 @@
       "donor_anchors": [
         {
           "source": "src/xmldsig.c",
-          "line": 326,
+          "line": 336,
           "needle": "xmlSecDSigCtxVerify(xmlSecDSigCtxPtr dsigCtx, xmlNodePtr node)"
         }
       ]
@@ -402,12 +401,12 @@
       "donor_anchors": [
         {
           "source": "src/xmldsig.c",
-          "line": 932,
+          "line": 951,
           "needle": "dsigRefCtx = xmlSecDSigReferenceCtxCreate(dsigCtx, xmlSecDSigReferenceOriginManifest);"
         },
         {
           "source": "src/xmldsig.c",
-          "line": 499,
+          "line": 513,
           "needle": "if((dsigCtx->flags & XMLSEC_DSIG_FLAGS_IGNORE_MANIFESTS) == 0)"
         }
       ]
@@ -426,12 +425,12 @@
       "donor_anchors": [
         {
           "source": "src/xmldsig.c",
-          "line": 382,
+          "line": 393,
           "needle": "dsigCtx->status = xmlSecDSigStatusInvalid;"
         },
         {
           "source": "src/xmldsig.c",
-          "line": 326,
+          "line": 336,
           "needle": "xmlSecDSigCtxVerify(xmlSecDSigCtxPtr dsigCtx, xmlNodePtr node)"
         }
       ]
@@ -450,7 +449,7 @@
       "donor_anchors": [
         {
           "source": "src/xmldsig.c",
-          "line": 379,
+          "line": 390,
           "needle": "xmlSecDSigCtxMarkAsFailed(xmlSecDSigCtxPtr dsigCtx, xmlSecDSigFailureReason failureReason)"
         }
       ]
@@ -469,12 +468,12 @@
       "donor_anchors": [
         {
           "source": "src/xmldsig.c",
-          "line": 1248,
+          "line": 1272,
           "needle": "dsigRefCtx->transformCtx.preExecCallback = dsigCtx->referencePreExecuteCallback;"
         },
         {
           "source": "src/xmldsig.c",
-          "line": 1250,
+          "line": 1274,
           "needle": "dsigRefCtx->transformCtx.userData = dsigCtx->userData;"
         }
       ]
@@ -493,12 +492,12 @@
       "donor_anchors": [
         {
           "source": "src/xmldsig.c",
-          "line": 308,
+          "line": 317,
           "needle": "xmlNodeSetContentLen(dsigCtx->signValueNode, outBuf, outLen);"
         },
         {
           "source": "src/xmldsig.c",
-          "line": 1460,
+          "line": 1495,
           "needle": "xmlNodeSetContentLen(digestValueNode, outBuf, outLen);"
         }
       ]

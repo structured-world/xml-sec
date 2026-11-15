@@ -62,9 +62,21 @@ fn run(
     input: &[u8],
     value: &[u8],
 ) -> Result<Vec<u8>, c_int> {
+    run_with_flags(0, operation, key, input, value)
+}
+
+/// [`run`] in a context with the transform context flags `flags`.
+fn run_with_flags(
+    flags: std::ffi::c_uint,
+    operation: c_int,
+    key: *mut XmlSecKey,
+    input: &[u8],
+    value: &[u8],
+) -> Result<Vec<u8>, c_int> {
     // SAFETY: every object is created and released here.
     unsafe {
         let ctx = xmlSecTransformCtxCreate();
+        (*ctx).flags = flags;
         let transform = xmlSecTransformCtxCreateAndAppend(ctx, rsa_sha256());
         (*transform).operation = operation;
         let mut result = Err(-1);
@@ -419,12 +431,17 @@ fn an_ecdsa_value_follows_the_signing_policy_encoding() {
 }
 
 #[test]
-fn a_signature_over_the_empty_message_verifies() {
-    // The empty message is signed and its signature verifies, as libxmlsec1
-    // accepts it.
-    let value = run(OPERATION_SIGN, private_key(), &[], &[]).expect("the empty message signs");
+fn the_empty_message_is_signed_only_when_the_context_allows_it() {
+    // Signing or verifying nothing is refused by default; a context with
+    // XMLSEC_TRANSFORMCTX_FLAGS_ALLOW_EMPTY_INPUT signs the empty message and
+    // its signature verifies.
+    assert_eq!(run(OPERATION_SIGN, private_key(), &[], &[]), Err(-1));
+    assert_eq!(run(OPERATION_VERIFY, public_key(), &[], &[0; 256]), Err(-1));
+    let allow = crate::ffi::transforms::ctx::FLAGS_ALLOW_EMPTY_INPUT;
+    let value = run_with_flags(allow, OPERATION_SIGN, private_key(), &[], &[])
+        .expect("the empty message signs");
     assert_eq!(
-        run(OPERATION_VERIFY, public_key(), &[], &value),
+        run_with_flags(allow, OPERATION_VERIFY, public_key(), &[], &value),
         Err(STATUS_OK)
     );
 }

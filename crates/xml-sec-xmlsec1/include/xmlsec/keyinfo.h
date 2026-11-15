@@ -5,8 +5,8 @@
  *
  * Copyright (C) 2002-2026 Aleksey Sanin <aleksey@aleksey.com>. All Rights Reserved.
  */
-#ifndef __XMLSEC_KEYINFO_H__
-#define __XMLSEC_KEYINFO_H__
+#ifndef XMLSEC_KEYINFO_H
+#define XMLSEC_KEYINFO_H
 
 /**
  * @defgroup xmlsec_core_keyinfo KeyInfo Processing
@@ -15,7 +15,10 @@
  * @{
  */
 
+#include <stdio.h>
+#ifndef XMLSEC_NO_X509
 #include <time.h>
+#endif /* XMLSEC_NO_X509 */
 
 #include <xs_tree.h>
 
@@ -34,7 +37,7 @@ extern "C" {
  *
  * High-level functions
  *
-  *****************************************************************************/
+ *****************************************************************************/
 XMLSEC_EXPORT int               xmlSecKeyInfoNodeRead           (xmlNodePtr keyInfoNode,
                                                                  xmlSecKeyPtr key,
                                                                  xmlSecKeyInfoCtxPtr keyInfoCtx);
@@ -66,15 +69,15 @@ typedef enum {
 #define XMLSEC_KEYINFO_FLAGS_STOP_ON_UNKNOWN_CHILD              0x00000002
 
 /**
- * @brief Abort on unknown KeyName content.
- * @details If flags is set then we abort if an unknown key name
+ * @brief Deprecated. Abort on unknown KeyName content.
+ * @details Deprecated, do not use. If flag is set then we abort if an unknown key name
  * (content of <dsig:KeyName /> element) is found.
  */
 #define XMLSEC_KEYINFO_FLAGS_KEYNAME_STOP_ON_UNKNOWN            0x00000004
 
 /**
  * @brief Abort on unknown KeyValue child element.
- * @details If flags is set then we abort if an unknown <dsig:KeyValue />
+ * @details If flag is set then we abort if an unknown <dsig:KeyValue />
  * child is found.
  */
 #define XMLSEC_KEYINFO_FLAGS_KEYVALUE_STOP_ON_UNKNOWN_CHILD     0x00000008
@@ -88,14 +91,14 @@ typedef enum {
 
 /**
  * @brief Abort when href doesn't match actual key data type.
- * @details If flag is set then we abort if an href attribute <dsig:RetrievalMethod />
+ * @details If flag is set then we abort if an href attribute of <dsig:RetrievalMethod />
  * element does not match the real key data type.
  */
 #define XMLSEC_KEYINFO_FLAGS_RETRMETHOD_STOP_ON_MISMATCH_HREF   0x00000020
 
 /**
  * @brief Abort on unknown X509Data child element.
- * @details If flags is set then we abort if an unknown <dsig:X509Data />
+ * @details If flag is set then we abort if an unknown <dsig:X509Data />
  * child is found.
  */
 #define XMLSEC_KEYINFO_FLAGS_X509DATA_STOP_ON_UNKNOWN_CHILD     0x00000100
@@ -123,22 +126,32 @@ typedef enum {
 #define XMLSEC_KEYINFO_FLAGS_X509DATA_STOP_ON_INVALID_CERT      0x00000800
 
 /**
- * @brief Stop when EncryptedKey element processing fails.
- * @details If the flag is set then we'll stop when <enc:EncryptedKey /> element
- * processing fails.
+ * @brief Stop when key recovery, derivation, or generation fails.
+ * @details If the flag is set then we'll stop when the key cannot be recovered from an
+ * <enc:EncryptedKey /> element, or derived from an <enc11:DerivedKey /> element, or
+ * generated from an <enc:AgreementMethod /> element. Other processing errors always
+ * cause an abort regardless of this flag.
  */
-#define XMLSEC_KEYINFO_FLAGS_ENCKEY_DONT_STOP_ON_FAILED_DECRYPTION 0x00001000
+#define XMLSEC_KEYINFO_FLAGS_ENCKEY_STOP_ON_FAILED_DECRYPTION   0x00001000
+
+/**
+ * @brief Deprecated. Use XMLSEC_KEYINFO_FLAGS_ENCKEY_STOP_ON_FAILED_DECRYPTION instead.
+ * @details Deprecated, do not use. The old name ("DONT_STOP") contradicted the actual behavior (set = stop); it is
+ * kept only for source compatibility and maps to the same value.
+ */
+#define XMLSEC_KEYINFO_FLAGS_ENCKEY_DONT_STOP_ON_FAILED_DECRYPTION \
+    XMLSEC_KEYINFO_FLAGS_ENCKEY_STOP_ON_FAILED_DECRYPTION
 
 /**
  * @brief Stop when an empty node is found.
- * @details If the flag is set then we'll stop when we found an empty node.
+ * @details If the flag is set then we'll stop when we find an empty node.
  * Otherwise we just ignore it.
  */
 #define XMLSEC_KEYINFO_FLAGS_STOP_ON_EMPTY_NODE                 0x00002000
 
 /**
  * @brief Skip strict checking of certificates and CRLs.
- * @details If the flag is set then we'll skip strict checking of certs and CRLs
+ * @details If the flag is set then we'll skip strict checking of certs and CRLs.
  */
 #define XMLSEC_KEYINFO_FLAGS_X509DATA_SKIP_STRICT_CHECKS        0x00004000
 
@@ -146,14 +159,14 @@ typedef enum {
 /**
  * @brief Try any key matching requirements, not just referenced keys.
  * @details If the flag is set then we'll try to find any key that matches requirements
- * (e.g. *any* RSA public key). In the default strict key search mode, only keys
+ * (e.g. any RSA public key). In the default strict key search mode, only keys
  * referenced in &lt;dsig:KeyInfo/&gt; (e.g. by KeyName value) are used.
  */
 #define XMLSEC_KEYINFO_FLAGS_LAX_KEY_SEARCH                     0x00008000
 
 /**
  * @brief Skip time checks of certificates and CRLs.
- * @details If the flag is set then we'll skip time checks of certs and CRLs
+ * @details If the flag is set then we'll skip time checks of certs and CRLs.
  */
 #define XMLSEC_KEYINFO_FLAGS_X509DATA_SKIP_TIME_CHECKS          0x00010000
 
@@ -162,40 +175,42 @@ typedef enum {
  */
 struct _xmlSecKeyInfoCtx {
     void*                               userData;  /**< the pointer to user data (xmlsec and xmlsec-crypto never touch this). */
-    unsigned int                        flags;  /**< the bit mask for flags that control processin. */
+    unsigned int                        flags;  /**< the bit mask for flags that control processing. */
     unsigned int                        flags2;  /**< reserved for future. */
     xmlSecKeysMngrPtr                   keysMngr;  /**< the pointer to current keys manager. */
     xmlSecKeyInfoMode                   mode;  /**< do we read or write <dsig:KeyInfo /> element. */
     xmlSecPtrList                       enabledKeyData;  /**< the list of enabled #xmlSecKeyDataId (if list is empty then all data ids are enabled). */
-    int                                 base64LineSize;  /**< the max columns size for base64 encoding. */
+    int                                 base64LineSize;  /**< the maximum column size for base64 encoding. */
 
     /* RetrievalMethod */
     xmlSecTransformCtx                  retrievalMethodCtx;  /**< the transforms context for <dsig:RetrievalMethod /> element processing. */
     int                                 maxRetrievalMethodLevel;  /**< the max recursion level when processing &lt;dsig:RetrievalMethod/&gt; element; default level is 1 (see also #curRetrievalMethodLevel). */
 
     /* KeyInfoReference */
-    xmlSecTransformCtx                  keyInfoReferenceCtx;  /**< the transforms context for&lt;dsig11:KeyInfoReference/&gt; element processing. */
+    xmlSecTransformCtx                  keyInfoReferenceCtx;  /**< the transforms context for &lt;dsig11:KeyInfoReference/&gt; element processing. */
     int                                 maxKeyInfoReferenceLevel;  /**< the max recursion level when processing &lt;dsig11:KeyInfoReference/&gt; element; default level is 1 (see also #curKeyInfoReferenceLevel). */
 
 #ifndef XMLSEC_NO_XMLENC
     /* EncryptedKey or DerivedKey */
-    xmlSecEncCtxPtr                     encCtx;  /**< the encryption context for <dsig:EncryptedKey /> element processing. */
-    int                                 maxEncryptedKeyLevel;  /**< the max recursion level when processing &lt;enc:EncryptedKey/&gt; element; default level is 1 (see #curEncryptedKeyLevel). */
+    xmlSecEncCtxPtr                     encCtx;  /**< the encryption context for <enc:EncryptedKey /> element processing. */
+    int                                 maxEncryptedKeyLevel;  /**< the max recursion level when processing &lt;enc:EncryptedKey/&gt;, &lt;enc11:DerivedKey/&gt; or &lt;enc:AgreementMethod/&gt; elements; default level is 1 (see also #curEncryptedKeyLevel). */
 #endif /* XMLSEC_NO_XMLENC */
 
 #ifndef XMLSEC_NO_X509
     /* x509 certificates */
-    time_t                              certsVerificationTime;  /**< the time to use for X509 certificates verification ("not valid before" and "not valid after" checks); if #certsVerificationTime is equal to 0 (default) then we verify certificates against the system's clock "now". */
-    int                                 certsVerificationDepth;  /**< the max certifications chain length (default is 9). */
+    time_t                              certsVerificationTime;  /**< the time to use for X509 certificates verification ("not valid before" and "not valid after" checks); if equal to 0 (default) then we verify certificates against the system's clock "now". */
+    int                                 certsVerificationDepth;  /**< the max certificate chain length (default is 9). */
 #endif /* XMLSEC_NO_X509 */
 
     /* DEPRECATED: PGP */
     void*                               deprecated0;  /**< DEPRECATED: reserved for PGP. */
 
     /* internal data */
-    int                                 curRetrievalMethodLevel;  /**< the current&lt;dsig:RetrievalMethod/&gt; element processing level (see #maxRetrievalMethodLevel). */
-    int                                 curKeyInfoReferenceLevel;  /**< the current&lt;dsig11:KeyInfoReference/&gt; element processing level (see #maxKeyInfoReferenceLevel). */
-    int                                 curEncryptedKeyLevel;  /**< the current&lt;enc:EncryptedKey/&gt; or&lt;enc11:DerivedKey/&gt; element processing level (see #maxEncryptedKeyLevel). */
+    int                                 curRetrievalMethodLevel;  /**< the current &lt;dsig:RetrievalMethod/&gt; element processing level (see #maxRetrievalMethodLevel). */
+    int                                 curKeyInfoReferenceLevel;  /**< the current &lt;dsig11:KeyInfoReference/&gt; element processing level (see #maxKeyInfoReferenceLevel). */
+#ifndef XMLSEC_NO_XMLENC
+    int                                 curEncryptedKeyLevel;  /**< the current &lt;enc:EncryptedKey/&gt;, &lt;enc11:DerivedKey/&gt; or &lt;enc:AgreementMethod/&gt; element processing level (see #maxEncryptedKeyLevel). */
+#endif /* XMLSEC_NO_XMLENC */
     xmlSecTransformOperation            operation;  /**< the transform operation for this key info. */
     xmlSecKeyReq                        keyReq;  /**< the current key requirements. */
 
@@ -260,20 +275,12 @@ XMLSEC_EXPORT xmlSecKeyDataId           xmlSecKeyDataAgreementMethodGetKlass(voi
 #define xmlSecKeyDataDerivedKeyId       xmlSecKeyDataDerivedKeyGetKlass()
 XMLSEC_EXPORT xmlSecKeyDataId           xmlSecKeyDataDerivedKeyGetKlass(void);
 
- #ifndef XMLSEC_NO_MLKEM
-/**
- * @brief The as:EncapsulationMechanism processing class.
- */
-#define xmlSecKeyDataEncapsulationMechanismId   xmlSecKeyDataEncapsulationMechanismGetKlass()
-XMLSEC_EXPORT xmlSecKeyDataId           xmlSecKeyDataEncapsulationMechanismGetKlass(void);
-#endif /* XMLSEC_NO_MLKEM */
-
 #endif /* XMLSEC_NO_XMLENC */
 
 #ifdef __cplusplus
 }
 #endif /* __cplusplus */
 
-/** @} */ /** xmlsec_core_keyinfo */
+/** @} */ /* xmlsec_core_keyinfo */
 
-#endif /* __XMLSEC_KEYINFO_H__ */
+#endif /* XMLSEC_KEYINFO_H */

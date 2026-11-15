@@ -19,6 +19,7 @@ use super::errors::{self, here, xmlSecErrorsInit, xmlSecErrorsShutdown};
 use super::keysdata::{xmlSecKeyDataIdsInit, xmlSecKeyDataIdsShutdown};
 use super::transforms::io::{xmlSecIOInit, xmlSecIOShutdown};
 use super::transforms::{xmlSecTransformIdsInit, xmlSecTransformIdsShutdown};
+use super::version::VERSION;
 
 #[cfg(test)]
 mod tests;
@@ -27,9 +28,6 @@ mod tests;
 const VERSION_EXACT: c_int = 0;
 /// `xmlSecCheckVersionABICompatible`.
 const VERSION_ABI_COMPATIBLE: c_int = 1;
-/// libxmlsec1's release this library is compatible with (`XMLSEC_VERSION_*`
-/// of its headers).
-const VERSION: (c_int, c_int, c_int) = (1, 3, 13);
 
 /// Held while `xmlSecInit` or `xmlSecShutdown` runs.
 static LIFECYCLE: AtomicBool = AtomicBool::new(false);
@@ -198,12 +196,12 @@ pub(crate) unsafe extern "C" fn xmlSecCheckVersionExt(
         };
         if major != our_major {
             return refuse(format!(
-                "expected major version={our_major};real major version={major}"
+                "library major version={our_major};required major version={major}"
             ));
         }
         let detail = |name: &str| {
             format!(
-                "mode={name};expected minor version={our_minor};real minor version={minor};expected subminor version={our_subminor};real subminor version={subminor}"
+                "mode={name};library minor version={our_minor};required minor version={minor};library subminor version={our_subminor};required subminor version={subminor}"
             )
         };
         match mode {
@@ -215,7 +213,11 @@ pub(crate) unsafe extern "C" fn xmlSecCheckVersionExt(
             {
                 refuse(detail("abi compatible"))
             }
-            _ => 1,
+            VERSION_EXACT | VERSION_ABI_COMPATIBLE => 1,
+            _ => {
+                errors::unsupported_enum(here, std::ptr::null(), "mode", mode);
+                0
+            }
         }
     })
 }

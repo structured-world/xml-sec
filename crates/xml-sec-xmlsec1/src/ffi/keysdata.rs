@@ -17,13 +17,12 @@ use super::errors::{self, check, here};
 use super::keys::TYPE_UNKNOWN;
 use super::list::{XmlSecPtrList, XmlSecPtrListKlass, xmlSecPtrListAdd, xmlSecPtrListFinalize};
 use super::strings::{
-    xmlSecDSig11Ns, xmlSecDSigNs, xmlSecEnc11Ns, xmlSecEncNs, xmlSecExperimental202512Ns,
-    xmlSecHrefAgreementMethod, xmlSecHrefDerivedKey, xmlSecHrefEncapsulationMechanism,
-    xmlSecHrefEncryptedKey, xmlSecNameAgreementMethod, xmlSecNameDerivedKey,
-    xmlSecNameEncapsulationMechanism, xmlSecNameEncryptedKey, xmlSecNameKeyInfoReference,
-    xmlSecNameKeyName, xmlSecNameKeyValue, xmlSecNameRetrievalMethod, xmlSecNodeAgreementMethod,
-    xmlSecNodeDerivedKey, xmlSecNodeEncapsulationMechanism, xmlSecNodeEncryptedKey,
-    xmlSecNodeKeyInfoReference, xmlSecNodeKeyName, xmlSecNodeKeyValue, xmlSecNodeRetrievalMethod,
+    xmlSecDSig11Ns, xmlSecDSigNs, xmlSecEnc11Ns, xmlSecEncNs, xmlSecHrefAgreementMethod,
+    xmlSecHrefDerivedKey, xmlSecHrefEncryptedKey, xmlSecNameAgreementMethod, xmlSecNameDerivedKey,
+    xmlSecNameEncryptedKey, xmlSecNameKeyInfoReference, xmlSecNameKeyName, xmlSecNameKeyValue,
+    xmlSecNameRetrievalMethod, xmlSecNodeAgreementMethod, xmlSecNodeDerivedKey,
+    xmlSecNodeEncryptedKey, xmlSecNodeKeyInfoReference, xmlSecNodeKeyName, xmlSecNodeKeyValue,
+    xmlSecNodeRetrievalMethod,
 };
 use super::transforms::{Global, klass_text, xml_text, zero_list};
 use super::tree::xmlStrEqual;
@@ -320,17 +319,15 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataIdsRegisterDisabled(
 }
 
 /// `xmlSecKeyDataIdsRegisterDefault`: the `KeyInfo` child klasses in
-/// libxmlsec1's order; `KeyValue` and the experimental encapsulation
-/// mechanism are registered disabled.
+/// libxmlsec1's order; `KeyValue` is registered disabled.
 ///
 /// # Safety
 /// As [`xmlSecKeyDataIdsRegister`].
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecKeyDataIdsRegisterDefault() -> c_int {
     contain(-1, || {
-        // libxmlsec1's order, with the step each failure names; the
-        // unterminated parentheses are libxmlsec1's own text.
-        let registrations: [(*const XmlSecKeyDataKlass, bool, &CStr); 8] = [
+        // libxmlsec1's order, with the step each failure names.
+        let registrations: [(*const XmlSecKeyDataKlass, bool, &CStr); 7] = [
             (
                 &raw const NAME,
                 true,
@@ -339,12 +336,12 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataIdsRegisterDefault() -> c_int {
             (
                 &raw const RETRIEVAL_METHOD,
                 true,
-                c"xmlSecKeyDataIdsRegister(xmlSecKeyDataRetrievalMethodId",
+                c"xmlSecKeyDataIdsRegister(xmlSecKeyDataRetrievalMethodId)",
             ),
             (
                 &raw const KEY_INFO_REFERENCE,
                 true,
-                c"xmlSecKeyDataIdsRegister(xmlSecKeyDataKeyInfoReferenceId",
+                c"xmlSecKeyDataIdsRegister(xmlSecKeyDataKeyInfoReferenceId)",
             ),
             (
                 &raw const ENCRYPTED_KEY,
@@ -362,14 +359,9 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataIdsRegisterDefault() -> c_int {
                 c"xmlSecKeyDataIdsRegister(xmlSecKeyDataDerivedKeyId)",
             ),
             (
-                &raw const ENCAPSULATION_MECHANISM,
-                false,
-                c"xmlSecKeyDataIdsRegister(xmlSecKeyDataEncapsulationMechanismId)",
-            ),
-            (
                 &raw const VALUE,
                 false,
-                c"xmlSecKeyDataIdsRegister(xmlSecKeyDataValueId)",
+                c"xmlSecKeyDataIdsRegisterDisabled(xmlSecKeyDataValueId)",
             ),
         ];
         for (id, enabled, step) in registrations {
@@ -1337,14 +1329,6 @@ static AGREEMENT_METHOD: XmlSecKeyDataKlass = key_info_child(
     None,
     None,
 );
-static ENCAPSULATION_MECHANISM: XmlSecKeyDataKlass = key_info_child(
-    xmlSecNameEncapsulationMechanism.as_ptr(),
-    xmlSecHrefEncapsulationMechanism.as_ptr(),
-    xmlSecNodeEncapsulationMechanism.as_ptr(),
-    xmlSecExperimental202512Ns.as_ptr(),
-    None,
-    None,
-);
 
 macro_rules! key_data_getter {
     ($($name:ident => $klass:ident;)*) => {
@@ -1369,5 +1353,4 @@ key_data_getter! {
     xmlSecKeyDataEncryptedKeyGetKlass => ENCRYPTED_KEY;
     xmlSecKeyDataDerivedKeyGetKlass => DERIVED_KEY;
     xmlSecKeyDataAgreementMethodGetKlass => AGREEMENT_METHOD;
-    xmlSecKeyDataEncapsulationMechanismGetKlass => ENCAPSULATION_MECHANISM;
 }

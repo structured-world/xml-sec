@@ -14,9 +14,11 @@ use xml_sec::document::external::ExternalNode;
 use xml_sec::document::owned_tree::TreeNode;
 use xml_sec::{DocumentView, Node};
 
+use structured_base64::Base64Codec;
+
 use super::super::base64::{
-    self, XmlSecBase64Ctx, decode_size, encode_size, xmlSecBase64CtxFinal_ex,
-    xmlSecBase64CtxInitialize, xmlSecBase64CtxUpdate_ex,
+    self, XmlSecBase64Ctx, xmlSecBase64CtxFinal_ex, xmlSecBase64CtxInitialize,
+    xmlSecBase64CtxUpdate_ex,
 };
 use super::super::buffer::{
     XmlSecBuffer, xmlSecBufferAppend, xmlSecBufferFinalize, xmlSecBufferGetData,
@@ -89,7 +91,7 @@ pub(crate) const fn klass(
 }
 
 /// libxmlsec1's own transform klasses in its registration order.
-pub(crate) fn defaults() -> [*const XmlSecTransformKlass; 12] {
+pub(crate) fn defaults() -> [*const XmlSecTransformKlass; 13] {
     [
         base64(),
         &raw const ENVELOPED,
@@ -102,6 +104,7 @@ pub(crate) fn defaults() -> [*const XmlSecTransformKlass; 12] {
         xpath::xpath(),
         xpath::xpath2(),
         xpath::xpointer(),
+        xpath::xpointer_legacy(),
         relationship::relationship(),
     ]
 }
@@ -316,6 +319,15 @@ pub(crate) unsafe extern "C" fn xmlSecTransformBase64SetLineSize(
             "xmlSecTransformBase64SetLineSize",
             c"xmlSecTransformCheckId(transform, xmlSecTransformBase64Id)"
         );
+        let Ok(columns) = c_int::try_from(line_size) else {
+            errors::size_to_int_impossible(here!("xmlSecTransformBase64SetLineSize"), line_size);
+            return;
+        };
+        check!(
+            base64::valid_columns(columns),
+            "xmlSecTransformBase64SetLineSize",
+            c"xmlSecBase64IsValidColumns(lineSizeInt)",
+        );
         codec.columns = line_size;
     });
 }
@@ -374,7 +386,12 @@ unsafe fn codec_step(
     unsafe {
         let size = xmlSecBufferGetSize(out);
         let Some(total) = size.checked_add(reserve) else {
-            errors::internal_with(here, name, c"xmlSecBufferSetMaxSize", "size overflow");
+            errors::internal_with(
+                here,
+                name,
+                c"xmlSecBufferSetMaxSize",
+                &format!("outSize={size}; outMaxLen={reserve}"),
+            );
             return None;
         };
         if xmlSecBufferSetMaxSize(out, total) < 0 {
@@ -442,12 +459,17 @@ unsafe fn base64_step(
             };
             charge(&mut budget.base64_input, in_size, limit, here, name)?;
             let reserve = if (*codec).encode != 0 {
-                encode_size((*codec).columns, in_size)
+                Base64Codec::encoded_capacity((*codec).columns, in_size)
             } else {
-                decode_size(in_size)
+                Base64Codec::decoded_capacity(in_size)
             };
             let Some(reserve) = reserve else {
-                errors::internal_with(here, name, c"xmlSecBufferSetMaxSize", "size overflow");
+                errors::internal_with(
+                    here,
+                    name,
+                    c"xmlSecBase64Execute",
+                    &format!("inSize={in_size}"),
+                );
                 return None;
             };
             let data = xmlSecBufferGetData(input);
@@ -696,6 +718,7 @@ klass_getter! {
     xmlSecTransformXPathGetKlass => xpath::xpath();
     xmlSecTransformXPath2GetKlass => xpath::xpath2();
     xmlSecTransformXPointerGetKlass => xpath::xpointer();
+    xmlSecTransformXPointerLegacyGetKlass => xpath::xpointer_legacy();
     xmlSecTransformVisa3DHackGetKlass => xpath::visa3d_hack();
     xmlSecTransformRelationshipGetKlass => relationship::relationship();
 }

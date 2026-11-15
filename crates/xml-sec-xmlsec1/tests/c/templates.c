@@ -1,9 +1,10 @@
 /* The templates.h functions as a libxmlsec1 caller uses them: signature,
  * reference, object and manifest templates, encrypted data and keys, KeyInfo
  * and X509Data children and transform content, including the refusals of a
- * second unique child. Built against the pinned libxmlsec1 and against this
- * crate, both must print the same trees, results and reports. Algorithms
- * are klasses of the program's own: a template reads only their href. */
+ * second unique child and the repeatable X509Data children. Built against
+ * the libxmlsec1 oracle and against this crate, both must print the same
+ * trees, results and reports. Algorithms are klasses of the program's own:
+ * a template reads only their href. */
 
 #include <stdio.h>
 #include <string.h>
@@ -13,6 +14,7 @@
 #include <xmlsec/errors.h>
 #include <xmlsec/transforms.h>
 #include <xmlsec/templates.h>
+#include <xmlsec/xmltree.h>
 
 /* A parser's own diagnostic after "xml error: " (its code and wording) is
  * the parser's, not part of the contract, so only its presence is printed. */
@@ -25,6 +27,11 @@ static void record(const char *file, int line, const char *func, const char *obj
            object != NULL ? object : "(null)", subject != NULL ? subject : "(null)", reason,
            diagnostic != NULL ? (int)(diagnostic - msg) : (int)strlen(msg != NULL ? msg : "(null)"),
            msg != NULL ? msg : "(null)", diagnostic != NULL ? "xml error: <parser diagnostic>" : "");
+}
+
+/* Whether a call returned a node: its address differs between libraries. */
+static const char *made(xmlNodePtr node) {
+    return node != NULL ? "node" : "null";
 }
 
 /* Every dumped node is its document's element, so the document is dumped. */
@@ -75,8 +82,8 @@ static void signature(void) {
     printf("signature\n");
     signNode = xmlSecTmplSignatureCreateNsPref(doc, &c14n, &sign, BAD_CAST "sig1", BAD_CAST "ds");
     xsAddChild(root, signNode);
-    printf("  no c14n: %p\n", (void *)xmlSecTmplSignatureCreate(doc, NULL, &sign, NULL));
-    printf("  no href: %p\n", (void *)xmlSecTmplSignatureCreate(doc, &c14n, &nohref, NULL));
+    printf("  no c14n: %s\n", made(xmlSecTmplSignatureCreate(doc, NULL, &sign, NULL)));
+    printf("  no href: %s\n", made(xmlSecTmplSignatureCreate(doc, &c14n, &nohref, NULL)));
 
     ref = xmlSecTmplSignatureAddReference(signNode, &digest, BAD_CAST "r1", BAD_CAST "#obj", BAD_CAST "urn:type");
     transform = xmlSecTmplReferenceAddTransform(ref, &c14n);
@@ -92,14 +99,14 @@ static void signature(void) {
     printf("  hmac: %d\n", xmlSecTmplTransformAddHmacOutputLength(transform, 160));
     printf("  hmac again: %d\n", xmlSecTmplTransformAddHmacOutputLength(transform, 80));
     printf("  hmac zero: %d\n", xmlSecTmplTransformAddHmacOutputLength(transform, 0));
-    printf("  no transform href: %p\n", (void *)xmlSecTmplReferenceAddTransform(ref, &nohref));
-    printf("  ref no digest: %p\n", (void *)xmlSecTmplSignatureAddReference(signNode, NULL, NULL, NULL, NULL));
+    printf("  no transform href: %s\n", made(xmlSecTmplReferenceAddTransform(ref, &nohref)));
+    printf("  ref no digest: %s\n", made(xmlSecTmplSignatureAddReference(signNode, NULL, NULL, NULL, NULL)));
 
     obj = xmlSecTmplSignatureAddObject(signNode, BAD_CAST "obj", BAD_CAST "text/xml", BAD_CAST "utf-8");
     xmlSecTmplObjectAddSignProperties(obj, BAD_CAST "props", BAD_CAST "#sig1");
     manifest = xmlSecTmplObjectAddManifest(obj, BAD_CAST "man");
     xmlSecTmplManifestAddReference(manifest, &digest, NULL, BAD_CAST "urn:x", NULL);
-    printf("  manifest no node: %p\n", (void *)xmlSecTmplManifestAddReference(NULL, &digest, NULL, NULL, NULL));
+    printf("  manifest no node: %s\n", made(xmlSecTmplManifestAddReference(NULL, &digest, NULL, NULL, NULL)));
 
     keyInfo = xmlSecTmplSignatureEnsureKeyInfo(signNode, BAD_CAST "ki");
     printf("  ensure again: %d\n", xmlSecTmplSignatureEnsureKeyInfo(signNode, NULL) == keyInfo);
@@ -107,18 +114,18 @@ static void signature(void) {
     xmlSecTmplKeyInfoAddKeyValue(keyInfo);
     x509 = xmlSecTmplKeyInfoAddX509Data(keyInfo);
     serial = xmlSecTmplX509DataAddIssuerSerial(x509);
-    printf("  issuer serial again: %p\n", (void *)xmlSecTmplX509DataAddIssuerSerial(x509));
+    printf("  issuer serial again: %s\n", made(xmlSecTmplX509DataAddIssuerSerial(x509)));
     xmlSecTmplX509IssuerSerialAddIssuerName(serial, BAD_CAST "CN=a<b");
-    printf("  issuer name again: %p\n", (void *)xmlSecTmplX509IssuerSerialAddIssuerName(serial, NULL));
+    printf("  issuer name again: %s\n", made(xmlSecTmplX509IssuerSerialAddIssuerName(serial, NULL)));
     xmlSecTmplX509IssuerSerialAddSerialNumber(serial, BAD_CAST "42");
-    printf("  serial again: %p\n", (void *)xmlSecTmplX509IssuerSerialAddSerialNumber(serial, NULL));
+    printf("  serial again: %s\n", made(xmlSecTmplX509IssuerSerialAddSerialNumber(serial, NULL)));
     xmlSecTmplX509DataAddSubjectName(x509);
     xmlSecTmplX509DataAddSKI(x509);
     xmlSecTmplX509DataAddDigest(x509, BAD_CAST "urn:alg:digest");
-    printf("  digest again: %p\n", (void *)xmlSecTmplX509DataAddDigest(x509, BAD_CAST "urn:alg:digest"));
-    printf("  digest null: %p\n", (void *)xmlSecTmplX509DataAddDigest(x509, NULL));
+    printf("  digest again: %s\n", made(xmlSecTmplX509DataAddDigest(x509, BAD_CAST "urn:alg:digest")));
+    printf("  digest null: %s\n", made(xmlSecTmplX509DataAddDigest(x509, NULL)));
     xmlSecTmplX509DataAddCertificate(x509);
-    printf("  certificate again: %p\n", (void *)xmlSecTmplX509DataAddCertificate(x509));
+    printf("  certificate again: %s\n", made(xmlSecTmplX509DataAddCertificate(x509)));
     xmlSecTmplX509DataAddCRL(x509);
     retrieval = xmlSecTmplKeyInfoAddRetrievalMethod(keyInfo, BAD_CAST "#x509", BAD_CAST "urn:type:x509");
     xmlSecTmplRetrievalMethodAddTransform(retrieval, &c14n);
@@ -126,8 +133,8 @@ static void signature(void) {
 
     print_algorithm("  sign method", xmlSecTmplSignatureGetSignMethodNode(signNode));
     print_algorithm("  c14n method", xmlSecTmplSignatureGetC14NMethodNode(signNode));
-    printf("  method of bare node: %p\n", (void *)xmlSecTmplSignatureGetSignMethodNode(root));
-    printf("  key info of bare node: %p\n", (void *)xmlSecTmplSignatureEnsureKeyInfo(root, NULL));
+    printf("  method of bare node: %s\n", made(xmlSecTmplSignatureGetSignMethodNode(root)));
+    printf("  key info of bare node: %s\n", made(xmlSecTmplSignatureEnsureKeyInfo(root, NULL)));
     dump_node("  tree", doc, root);
     xsFreeDoc(doc);
 }
@@ -161,18 +168,22 @@ static void encryption(void) {
     keyInfo = xmlSecTmplEncDataEnsureKeyInfo(enc, BAD_CAST "eki");
     printf("  ensure again: %d\n", xmlSecTmplEncDataEnsureKeyInfo(enc, NULL) == keyInfo);
     encKey = xmlSecTmplKeyInfoAddEncryptedKey(keyInfo, &cipher, BAD_CAST "ek", NULL, BAD_CAST "bob");
+    /* ReferenceList and then EncryptionProperties go before CarriedKeyName,
+     * in EncryptedKeyType's order */
+    xmlSecAddChild(encKey, BAD_CAST "CarriedKeyName", BAD_CAST "http://www.w3.org/2001/04/xmlenc#");
     xmlSecTmplReferenceListAddDataReference(encKey, BAD_CAST "#ed");
     xmlSecTmplReferenceListAddKeyReference(encKey, BAD_CAST "#ek2");
     xmlSecTmplReferenceListAddDataReference(encKey, NULL);
+    printf("  key properties: %s\n", made(xmlSecTmplEncDataEnsureEncProperties(encKey, NULL)));
     print_algorithm("  key method", xmlSecTmplEncDataGetEncMethodNode(encKey));
     xmlSecTmplEncDataEnsureCipherValue(encKey);
-    printf("  cipher reference on value: %p\n", (void *)xmlSecTmplEncDataEnsureCipherReference(encKey, NULL));
+    printf("  cipher reference on value: %s\n", made(xmlSecTmplEncDataEnsureCipherReference(encKey, NULL)));
     xmlSecTmplEncDataAddEncProperty(enc, BAD_CAST "p1", BAD_CAST "#ed");
     xmlSecTmplEncDataAddEncProperty(enc, NULL, NULL);
     xmlSecTmplEncDataEnsureEncProperties(enc, BAD_CAST "props");
     cref = xmlSecTmplEncDataEnsureCipherReference(enc, BAD_CAST "urn:data");
     printf("  ensure again: %d\n", xmlSecTmplEncDataEnsureCipherReference(enc, NULL) == cref);
-    printf("  cipher value on reference: %p\n", (void *)xmlSecTmplEncDataEnsureCipherValue(enc));
+    printf("  cipher value on reference: %s\n", made(xmlSecTmplEncDataEnsureCipherValue(enc)));
     xmlSecTmplCipherReferenceAddTransform(cref, &c14n);
     xmlSecTmplCipherReferenceAddTransform(cref, &sign);
     transform = xmlSecTmplEncDataGetEncMethodNode(enc);
@@ -188,12 +199,12 @@ static void encryption(void) {
     doc = xsNewDoc(BAD_CAST "1.0");
     enc = xmlSecTmplEncDataCreate(doc, NULL, NULL, NULL, NULL, NULL);
     xsDocSetRootElement(doc, enc);
-    printf("  no method: %p\n", (void *)xmlSecTmplEncDataGetEncMethodNode(enc));
-    printf("  bad method: %p\n", (void *)xmlSecTmplEncDataCreate(doc, &nohref, NULL, NULL, NULL, NULL));
+    printf("  no method: %s\n", made(xmlSecTmplEncDataGetEncMethodNode(enc)));
+    printf("  bad method: %s\n", made(xmlSecTmplEncDataCreate(doc, &nohref, NULL, NULL, NULL, NULL)));
     dump_node("  bare", doc, enc);
     /* the refused node stays the caller's */
     transform = xsNewDocNode(doc, NULL, BAD_CAST "x", NULL);
-    printf("  key info of bare node: %p\n", (void *)xmlSecTmplEncDataEnsureKeyInfo(transform, NULL));
+    printf("  key info of bare node: %s\n", made(xmlSecTmplEncDataEnsureKeyInfo(transform, NULL)));
     xsFreeNode(transform);
     xsFreeDoc(doc);
 }

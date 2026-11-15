@@ -5,8 +5,8 @@
  *
  * Copyright (C) 2002-2026 Aleksey Sanin <aleksey@aleksey.com>. All Rights Reserved.
  */
-#ifndef __XMLSEC_DL_H__
-#define __XMLSEC_DL_H__
+#ifndef XMLSEC_DL_H
+#define XMLSEC_DL_H
 
 /**
  * @defgroup xmlsec_core_dl Dynamic Loading
@@ -15,11 +15,12 @@
  * @{
  */
 
+#include <xmlsec/exports.h>
+
 #ifndef XMLSEC_NO_CRYPTO_DYNAMIC_LOADING
 
 #include <xs_tree.h>
 
-#include <xmlsec/exports.h>
 #include <xmlsec/xmlsec.h>
 #include <xmlsec/keysdata.h>
 #include <xmlsec/keys.h>
@@ -32,6 +33,9 @@
 extern "C" {
 #endif /* __cplusplus */
 
+/**
+ * @brief The crypto back-end functions table.
+ */
 typedef struct _xmlSecCryptoDLFunctions         xmlSecCryptoDLFunctions,
                                                 *xmlSecCryptoDLFunctionsPtr;
 
@@ -50,14 +54,12 @@ XMLSEC_EXPORT int                               xmlSecCryptoDLFunctionsRegisterK
  *
  * Dynamic load functions
  *
-  *****************************************************************************/
+ *****************************************************************************/
 XMLSEC_EXPORT int                               xmlSecCryptoDLInit              (void);
 XMLSEC_EXPORT int                               xmlSecCryptoDLShutdown          (void);
-
 XMLSEC_EXPORT int                               xmlSecCryptoDLLoadLibrary       (const xmlChar* crypto);
 XMLSEC_EXPORT xmlSecCryptoDLFunctionsPtr        xmlSecCryptoDLGetLibraryFunctions(const xmlChar* crypto);
 XMLSEC_EXPORT int                               xmlSecCryptoDLUnloadLibrary     (const xmlChar* crypto);
-
 XMLSEC_EXPORT int                               xmlSecCryptoDLSetFunctions      (xmlSecCryptoDLFunctionsPtr functions);
 XMLSEC_EXPORT xmlSecCryptoDLFunctionsPtr        xmlSecCryptoDLGetFunctions      (void);
 
@@ -67,6 +69,6 @@ XMLSEC_EXPORT xmlSecCryptoDLFunctionsPtr        xmlSecCryptoDLGetFunctions      
 }
 #endif /* __cplusplus */
 
-/** @} */ /** xmlsec_core_dl */
+/** @} */ /* xmlsec_core_dl */
 
-#endif /* __XMLSEC_DL_H__ */
+#endif /* XMLSEC_DL_H */

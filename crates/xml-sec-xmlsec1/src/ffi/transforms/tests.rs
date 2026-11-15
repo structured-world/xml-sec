@@ -50,6 +50,7 @@ fn registry_holds_the_defaults_in_order() {
                 "xpath",
                 "xpath2",
                 "xpointer",
+                "xpointer-legacy",
                 "relationship",
             ]
         );

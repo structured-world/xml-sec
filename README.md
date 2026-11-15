@@ -234,8 +234,8 @@ invalid, and fail-closed classifications. Selected unmodified upstream XMLDSig, 
 and key-management scenarios execute against the Rust `xmlsec1` binary without network access or
 a system libxmlsec1 installation.
 
-The generated [compatibility ledger](docs/compatibility-ledger.md) tracks libxmlsec1 1.3.13 public
-surface and operation behavior with source and test evidence.
+The generated [compatibility ledger](docs/compatibility-ledger.md) tracks the libxmlsec1 public
+surface of upstream master and its operation behavior with source and test evidence.
 
 The [local XAdES interoperability corpus](interop/xades/README.md) compares exact Reference
 and SignedInfo bytes with native libxmlsec1 and checks independent EU DSS profile expectations.

@@ -2,8 +2,9 @@
 //!
 //! The library is what C programs written against libxmlsec1's generic
 //! headers compile and link against: the headers in `include/xmlsec/` are
-//! libxmlsec1 1.3.13's own with its tree header (`xs_tree.h` of
-//! `xml-sec-libxml2`) in place of libxml2's, and the exported functions keep
+//! those of upstream libxmlsec1's development line, with its tree header
+//! (`xs_tree.h` of `xml-sec-libxml2`) in place of libxml2's; the version they
+//! declare is the one `xmlSecCheckVersion` checks. The exported functions keep
 //! its structure layouts, return values and memory ownership. It uses no C
 //! library: documents are the core's trees behind opaque handles, read and
 //! changed through tree functions shaped like libxml2's; objects and strings

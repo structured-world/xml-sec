@@ -31,8 +31,8 @@ use super::super::tree::{XmlDoc, XmlNode, nodes};
 use super::super::xmltree::{xmlSecCheckNodeName, xmlSecGetNextElementNode};
 use super::super::{contain, free, policy};
 use super::{
-    FLAGS_KEYVALUE_STOP_ON_UNKNOWN_CHILD, MODE_READ, MODE_WRITE, XmlSecKeyInfoCtx, child_klass,
-    klass_name, node_name, read_policy, source_refused, xmlSecKeyInfoNodeRead,
+    FLAGS_STOP_ON_UNKNOWN_CHILD, MODE_READ, MODE_WRITE, XmlSecKeyInfoCtx, child_klass, klass_name,
+    node_name, read_policy, source_refused, xmlSecKeyInfoNodeRead,
 };
 use xml_sec::xmldsig::UriTypeSet;
 
@@ -46,11 +46,12 @@ const USAGE_RETRIEVAL_METHOD_NODE_XML: c_uint = 0x00010;
 const USAGE_RETRIEVAL_METHOD_NODE: c_uint = 0x00030;
 /// `xmlSecTransformUsageDSigTransform`.
 const USAGE_DSIG_TRANSFORM: c_uint = 0x0001;
-/// `XMLSEC_ERRORS_R_MAX_RETRIEVALS_LEVEL`, also
+/// `XMLSEC_ERRORS_R_MAX_RETRIEVALS_LEVEL`.
+const R_MAX_RETRIEVALS_LEVEL: c_int = 51;
 /// `XMLSEC_ERRORS_R_MAX_KEYINFOREFERENCE_LEVEL`.
-const R_MAX_LEVEL: c_int = 51;
-/// `XMLSEC_ERRORS_R_MAX_RETRIEVAL_TYPE_MISMATCH`.
-const R_MAX_RETRIEVAL_TYPE_MISMATCH: c_int = 52;
+const R_MAX_KEYINFOREFERENCE_LEVEL: c_int = 53;
+/// `XMLSEC_ERRORS_R_RETRIEVAL_TYPE_MISMATCH`.
+const R_RETRIEVAL_TYPE_MISMATCH: c_int = 52;
 
 /// Checks the arguments every reference read takes, reporting under `func`.
 macro_rules! read_arguments {
@@ -197,11 +198,17 @@ unsafe fn dereference(
         if let Some(spent) = spent {
             spent.set(run_spent(context));
         }
-        if executed < 0
-            || (*context).result.is_null()
-            || xmlSecBufferGetData((*context).result).is_null()
-        {
+        if executed < 0 {
             errors::internal(here, object, c"xmlSecTransformCtxExecute");
+            return false;
+        }
+        if (*context).result.is_null() || xmlSecBufferGetData((*context).result).is_null() {
+            errors::other(
+                here,
+                errors::R_INVALID_RESULT,
+                object,
+                Some("transform result is empty"),
+            );
             return false;
         }
         true
@@ -288,8 +295,9 @@ unsafe fn next_reference_depth(ctx: *const XmlSecKeyInfoCtx) -> usize {
 // <dsig:RetrievalMethod/>
 
 /// `xmlRead` of the `RetrievalMethod` klass: reads the key data of its
-/// `Type` from what its URI and transforms retrieve; an unknown or absent
-/// type is skipped unless the context stops on it.
+/// `Type` from what its URI and transforms retrieve; for an unknown or
+/// absent type, unless the context stops on it, the result is read as XML
+/// whose root element names the key data.
 pub(crate) unsafe extern "C" fn retrieval_xml_read(
     id: *const XmlSecKeyDataKlass,
     key: *mut c_void,
@@ -325,7 +333,7 @@ pub(crate) unsafe extern "C" fn retrieval_xml_read(
                     here,
                     object,
                     std::ptr::null(),
-                    R_MAX_LEVEL,
+                    R_MAX_RETRIEVALS_LEVEL,
                     &format!("cur={current};max={maximum}"),
                 );
                 return -1;
@@ -377,22 +385,17 @@ unsafe fn retrieve(
             xmlSecKeyDataIdListFindByHref(enabled(ctx), retrieval_type, USAGE_RETRIEVAL_METHOD_NODE)
         };
         free(retrieval_type.cast());
-        // Lax schema validation unless the caller stops on unknown types. An
-        // absent Type names no klass either, so the retrieval is skipped,
-        // as libxmlsec1 1.3.13's xmlSecKeyDataRetrievalMethodXmlRead does:
-        // it never guesses the result's type from the retrieved XML.
-        if data_id.is_null() {
-            if (*ctx).flags & FLAGS_RETRMETHOD_STOP_ON_UNKNOWN_HREF != 0 {
-                errors::invalid_node_attribute(
-                    here,
-                    node,
-                    c"Type",
-                    object,
-                    "retrieval type is unknown",
-                );
-                return -1;
-            }
-            return 0;
+        // Lax schema validation unless the caller stops on unknown types: an
+        // unknown or absent Type leaves the retrieved XML to name its data.
+        if data_id.is_null() && (*ctx).flags & FLAGS_RETRMETHOD_STOP_ON_UNKNOWN_HREF != 0 {
+            errors::invalid_node_attribute(
+                here,
+                node,
+                c"Type",
+                object,
+                "retrieval type is unknown",
+            );
+            return -1;
         }
         let Some(pinned) = read_policy(ctx, here) else {
             return -1;
@@ -416,7 +419,7 @@ unsafe fn retrieve(
         if !dereferenced {
             return -1;
         }
-        if (*data_id).usage & USAGE_RETRIEVAL_METHOD_NODE_XML != 0 {
+        if data_id.is_null() || (*data_id).usage & USAGE_RETRIEVAL_METHOD_NODE_XML != 0 {
             // The retrieved element is read through `xmlSecKeyDataXmlRead`,
             // which checks its key source.
             if read_retrieved_xml(data_id, key, context, ctx, &pinned) < 0 {
@@ -441,11 +444,11 @@ unsafe fn retrieve(
 }
 
 /// Reads the key data the root of the retrieved XML holds, which must be of
-/// `type_id` when the context stops on a mismatch.
+/// `type_id`, when known, if the context stops on a mismatch.
 ///
 /// # Safety
-/// `type_id` is a klass; `key` a key; `context` holds a result; `ctx` a
-/// context.
+/// `type_id` is null or a klass; `key` a key; `context` holds a result;
+/// `ctx` a context.
 unsafe fn read_retrieved_xml(
     type_id: *const XmlSecKeyDataKlass,
     key: *mut XmlSecKey,
@@ -471,13 +474,14 @@ unsafe fn read_retrieved_xml(
         let data_id = child_klass(ctx, root, USAGE_RETRIEVAL_METHOD_NODE_XML);
         let result = if data_id.is_null() {
             // Lax schema validation unless the caller stops on unknown nodes.
-            if (*ctx).flags & FLAGS_KEYVALUE_STOP_ON_UNKNOWN_CHILD != 0 {
+            if (*ctx).flags & FLAGS_STOP_ON_UNKNOWN_CHILD != 0 {
                 errors::unexpected_node(here, root, object);
                 -1
             } else {
                 0
             }
-        } else if !std::ptr::eq(type_id, data_id)
+        } else if !type_id.is_null()
+            && !std::ptr::eq(type_id, data_id)
             && (*ctx).flags & FLAGS_RETRMETHOD_STOP_ON_MISMATCH_HREF != 0
         {
             let type_name = if object.is_null() {
@@ -491,7 +495,7 @@ unsafe fn read_retrieved_xml(
                 here,
                 klass_name(data_id),
                 std::ptr::null(),
-                R_MAX_RETRIEVAL_TYPE_MISMATCH,
+                R_RETRIEVAL_TYPE_MISMATCH,
                 &format!("typeId={type_name}"),
             );
             -1
@@ -572,7 +576,7 @@ pub(crate) unsafe extern "C" fn reference_xml_read(
                     here,
                     object,
                     std::ptr::null(),
-                    R_MAX_LEVEL,
+                    R_MAX_KEYINFOREFERENCE_LEVEL,
                     &format!("cur={current};max={maximum}"),
                 );
                 return -1;
@@ -621,7 +625,7 @@ unsafe fn dereference_key_info(
     unsafe {
         let uri = xsGetProp(node, xmlSecAttrURI.as_ptr());
         if uri.is_null() {
-            errors::invalid_node_attribute(here, node, c"URI", object, "empty");
+            errors::invalid_node_attribute(here, node, c"URI", object, "missing");
             return -1;
         }
         let context = &raw mut (*ctx).key_info_reference_ctx;
@@ -643,11 +647,11 @@ unsafe fn dereference_key_info(
             return -1;
         }
         // XMLDSig 1.1 4.5.10: the result is a KeyInfo element or a document
-        // with a KeyInfo root. The unknown type is reported as a null object.
+        // with a KeyInfo root.
         let inner = here!("xmlSecKeyDataKeyInfoReferenceReadXmlResult");
         let doc = result_document(
             inner,
-            std::ptr::null(),
+            object,
             context,
             pinned,
             policy::spent((*ctx).reserved0),
@@ -661,10 +665,10 @@ unsafe fn dereference_key_info(
                     if xmlSecCheckNodeName(root, xmlSecNodeKeyInfo.as_ptr(), xmlSecDSigNs.as_ptr())
                         == 0
                     {
-                        errors::invalid_node(inner, root, "KeyInfo", std::ptr::null());
+                        errors::invalid_node(inner, root, "KeyInfo", object);
                         -1
                     } else if xmlSecKeyInfoNodeRead(root, key, ctx) < 0 {
-                        errors::internal(inner, std::ptr::null(), c"xmlSecKeyInfoNodeRead");
+                        errors::internal(inner, object, c"xmlSecKeyInfoNodeRead");
                         -1
                     } else {
                         0

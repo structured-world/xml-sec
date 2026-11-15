@@ -29,10 +29,10 @@ unsafe fn names(list: *mut crate::ffi::list::XmlSecPtrList) -> Vec<String> {
 }
 
 /// The registry holds libxmlsec1's `KeyInfo` child klasses in its order;
-/// `KeyValue` and the experimental encapsulation mechanism are registered
-/// but not enabled, so lookups in the enabled list miss them.
+/// `KeyValue` is registered but not enabled, so lookups in the enabled list
+/// miss it.
 #[test]
-fn registry_enables_all_defaults_but_key_value_and_encapsulation() {
+fn registry_enables_all_defaults_but_key_value() {
     // SAFETY: this test owns the registries for its process.
     unsafe {
         assert_eq!(xmlSecKeyDataIdsInit(), 0);
@@ -45,7 +45,6 @@ fn registry_enables_all_defaults_but_key_value_and_encapsulation() {
                 "enc-key",
                 "agreement-method",
                 "derived-key",
-                "encapsulation-mechanism",
                 "key-value",
             ]
         );

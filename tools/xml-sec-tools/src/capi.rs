@@ -50,7 +50,7 @@ pub(crate) enum Target {
 /// The libxmlsec1-compatible crate, its headers and its pkg-config template.
 const XMLSEC1_CRATE: &str = "crates/xml-sec-xmlsec1";
 /// The binary baseline of the tuple CI records.
-const ABI_BASELINE: &str = "compatibility/libxmlsec1-1.3.13-abi-linux-x86_64.json";
+const ABI_BASELINE: &str = "compatibility/libxmlsec1-abi-linux-x86_64.json";
 /// The pkg-config package of the oracle.
 const XMLSEC1: &str = "xmlsec1";
 

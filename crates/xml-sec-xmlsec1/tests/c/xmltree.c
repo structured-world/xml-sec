@@ -285,7 +285,7 @@ static void qnames(void) {
            xmlSecQName2BitMaskNodesRead(bits, &cur, BAD_CAST "m", BAD_CAST "urn:d", 1, &mask));
     printf(" -> %u next=%s\n", mask, name_of(cur));
     printf("  mask info: %s\n", (const char *)xmlSecQName2BitMaskGetInfo(bits, 4)->qnameLocalPart);
-    printf("  mask get: %d", xmlSecQName2BitMaskGetBitMask(bits, BAD_CAST "urn:a", BAD_CAST "write", &mask));
+    printf("  mask get: %d", xmlSecQName2BitMaskGetBitMask(bits, BAD_CAST "write", BAD_CAST "urn:a", &mask));
     printf(" -> %u\n", mask);
     text = xmlSecQName2BitMaskGetStringFromBitMask(bits, root, 1);
     printf("  mask string: %s\n", (const char *)text);

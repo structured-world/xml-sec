@@ -27,9 +27,9 @@ use super::super::nodeset::{
 use super::super::policy;
 use super::super::strings::{
     xmlSecAttrFilter, xmlSecDSigNs, xmlSecNameXPath, xmlSecNameXPath2, xmlSecNameXPointer,
-    xmlSecNodeXPath, xmlSecNodeXPath2, xmlSecNodeXPointer, xmlSecXPath2FilterIntersect,
-    xmlSecXPath2FilterSubtract, xmlSecXPath2FilterUnion, xmlSecXPath2Ns, xmlSecXPathNs,
-    xmlSecXPointerNs,
+    xmlSecNameXPointerLegacy, xmlSecNodeXPath, xmlSecNodeXPath2, xmlSecNodeXPointer,
+    xmlSecXPath2FilterIntersect, xmlSecXPath2FilterSubtract, xmlSecXPath2FilterUnion,
+    xmlSecXPath2Ns, xmlSecXPathNs, xmlSecXPointerLegacyNs, xmlSecXPointerNs,
 };
 use super::super::tree::{XmlDoc, XmlNode, XmlNodeSet, c_text, nodes, same_text};
 use super::super::xmltree::{next_element, xmlSecCheckNodeName};
@@ -127,6 +127,11 @@ static XPOINTER: XmlSecTransformKlass = expression_klass(
     xmlSecXPointerNs.as_ptr(),
     xpointer_read_node,
 );
+static XPOINTER_LEGACY: XmlSecTransformKlass = expression_klass(
+    xmlSecNameXPointerLegacy.as_ptr(),
+    xmlSecXPointerLegacyNs.as_ptr(),
+    xpointer_read_node,
+);
 static VISA3D_HACK: XmlSecTransformKlass = XmlSecTransformKlass {
     finalize: Some(visa3d_finalize),
     push_xml: Some(xmlSecTransformDefaultPushXml),
@@ -150,9 +155,20 @@ pub(crate) fn xpath2() -> *const XmlSecTransformKlass {
     &raw const XPATH2
 }
 
-/// The `XPointer` klass, which also selects URI fragments.
+/// The `XPointer` klass (RFC 9231), which also selects URI fragments.
 pub(crate) fn xpointer() -> *const XmlSecTransformKlass {
     &raw const XPOINTER
+}
+
+/// The `XPointer` klass under its RFC 4051 identifier, otherwise the same as
+/// [`xpointer`].
+pub(crate) fn xpointer_legacy() -> *const XmlSecTransformKlass {
+    &raw const XPOINTER_LEGACY
+}
+
+/// The two `XPointer` klasses.
+fn xpointers() -> [*const XmlSecTransformKlass; 2] {
+    [xpointer(), xpointer_legacy()]
 }
 
 /// The `Visa3D` id-lookup klass.
@@ -194,8 +210,8 @@ unsafe fn data_list<'a>(
 }
 
 /// The klasses that keep a data list.
-fn family() -> [*const XmlSecTransformKlass; 3] {
-    [xpath(), xpath2(), xpointer()]
+fn family() -> [*const XmlSecTransformKlass; 4] {
+    [xpath(), xpath2(), xpointer(), xpointer_legacy()]
 }
 
 unsafe extern "C" fn initialize(transform: *mut XmlSecTransform) -> c_int {
@@ -286,16 +302,16 @@ unsafe fn add(
     0
 }
 
-/// Reads the one expression child `expected` names (in namespace `ns`) of
-/// an `XPath` or `XPointer` transform's element as `kind`; reports from the
-/// entry point at `here`.
+/// Reads the one expression child `expected` names (in one of the namespaces
+/// `ns`) of an `XPath` or `XPointer` transform's element as `kind`; reports
+/// from the entry point at `here`.
 ///
 /// # Safety
 /// `node` is a live element; `list` is the transform's empty data list.
 unsafe fn read_single(
     list: &mut XmlSecPtrList,
     node: *mut XmlNode,
-    (kind, expected, ns): (Kind, &CStr, &CStr),
+    (kind, expected, ns): (Kind, &CStr, &[&CStr]),
     here: errors::Here,
     name: *const c_char,
 ) -> c_int {
@@ -303,7 +319,9 @@ unsafe fn read_single(
     unsafe {
         let current = next_element(nodes::first_child(node));
         if current.is_null()
-            || xmlSecCheckNodeName(current, expected.as_ptr().cast(), ns.as_ptr().cast()) == 0
+            || !ns.iter().any(|ns| {
+                xmlSecCheckNodeName(current, expected.as_ptr().cast(), ns.as_ptr().cast()) != 0
+            })
         {
             errors::invalid_node(here, current, &expected.to_string_lossy(), name);
             return -1;
@@ -371,7 +389,7 @@ unsafe extern "C" fn xpath_read_node(
         read_single(
             list,
             node,
-            (Kind::XPath, expected, ns),
+            (Kind::XPath, expected, &[ns]),
             here,
             name_of(transform),
         )
@@ -441,35 +459,57 @@ unsafe extern "C" fn xpath2_read_node(
     }
 }
 
-/// Reads the one `xptr:XPointer` child of an `XPointer` transform's
-/// element.
+/// Reads the one `XPointer` child of an `XPointer` transform's element, in
+/// the current or the RFC 4051 namespace whichever klass reads it.
 unsafe extern "C" fn xpointer_read_node(
     transform: *mut XmlSecTransform,
     node: *mut XmlNode,
     ctx: *mut XmlSecTransformCtx,
 ) -> c_int {
-    let list = reading_or!(
-        transform,
-        xpointer(),
-        node,
-        ctx,
+    let here = here!("xmlSecTransformXPointerNodeRead");
+    // SAFETY: a transform being read by its klass.
+    let Some(list) = (unsafe {
+        data_list(
+            transform,
+            &xpointers(),
+            (here, c"xmlSecTransformXPointerCheckId(transform)"),
+        )
+    }) else {
+        return -1;
+    };
+    check!(
+        !node.is_null(),
         "xmlSecTransformXPointerNodeRead",
-        c"xmlSecTransformCheckId(transform, xmlSecTransformXPointerId)"
+        c"node != NULL",
+        -1
+    );
+    check!(
+        !ctx.is_null(),
+        "xmlSecTransformXPointerNodeRead",
+        c"transformCtx != NULL",
+        -1
+    );
+    check!(
+        // SAFETY: an initialized data list.
+        unsafe { xmlSecPtrListGetSize(&raw mut *list) } == 0,
+        "xmlSecTransformXPointerNodeRead",
+        c"xmlSecPtrListGetSize(dataList) == 0",
+        -1
     );
     // SAFETY: the namespace and node name constants are NUL-terminated.
-    let (ns, expected) = unsafe {
+    let (current, legacy, expected) = unsafe {
         (
             CStr::from_ptr(xmlSecXPointerNs.as_ptr().cast()),
+            CStr::from_ptr(xmlSecXPointerLegacyNs.as_ptr().cast()),
             CStr::from_ptr(xmlSecNodeXPointer.as_ptr().cast()),
         )
     };
     // SAFETY: an `XPointer` transform and a live element of its document.
     unsafe {
-        let here = here!("xmlSecTransformXPointerNodeRead");
         read_single(
             list,
             node,
-            (Kind::XPointer, expected, ns),
+            (Kind::XPointer, expected, &[current, legacy]),
             here,
             name_of(transform),
         )
@@ -490,14 +530,14 @@ pub(crate) unsafe extern "C" fn xmlSecTransformXPointerSetExpr(
     here: *mut XmlNode,
 ) -> c_int {
     contain(-1, || {
-        let list = context_or!(
-            transform,
-            XmlSecPtrList,
-            xpointer(),
-            "xmlSecTransformXPointerSetExpr",
-            c"xmlSecTransformCheckId(transform, xmlSecTransformXPointerId)",
-            -1
+        let checked = (
+            here!("xmlSecTransformXPointerSetExpr"),
+            c"xmlSecTransformXPointerCheckId(transform)",
         );
+        // SAFETY: null or a valid transform by the caller's contract.
+        let Some(list) = (unsafe { data_list(transform, &xpointers(), checked) }) else {
+            return -1;
+        };
         // SAFETY: a valid transform.
         let object = unsafe { &mut *transform };
         check!(
@@ -518,7 +558,6 @@ pub(crate) unsafe extern "C" fn xmlSecTransformXPointerSetExpr(
             c"hereNode != NULL",
             -1
         );
-        object.here_node = here;
         check!(
             // SAFETY: an initialized data list.
             unsafe { xmlSecPtrListGetSize(&raw mut *list) } == 0,
@@ -543,8 +582,13 @@ pub(crate) unsafe extern "C" fn xmlSecTransformXPointerSetExpr(
                 op: INTERSECTION,
                 node_set_type: kind,
             };
-            add(list, data, location, name)
+            if add(list, data, location, name) < 0 {
+                return -1;
+            }
         }
+        // Set last, so a failed call leaves the transform as it was.
+        object.here_node = here;
+        0
     })
 }
 
