@@ -44,18 +44,36 @@ struct Password {
     context: *mut c_void,
 }
 
+/// A password as the key importer reads it: the caller's explicit string in
+/// place, or the bytes a callback wrote into our buffer.
+enum Secret<'a> {
+    Explicit(&'a [u8]),
+    Returned(Zeroizing<Vec<u8>>),
+}
+
+impl Secret<'_> {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Explicit(bytes) => bytes,
+            Self::Returned(buffer) => buffer,
+        }
+    }
+}
+
 impl Password {
     /// The caller's password, from the explicit string or the callback;
-    /// `None` when there is neither or the callback declines.
+    /// `None` when there is neither or the callback declines. The explicit
+    /// string is read in place, not copied, so the importer's resource
+    /// check meets it before any allocation.
     ///
     /// # Safety
-    /// `explicit` is null or NUL-terminated; `callback` is null or a
-    /// `pem_password_cb` taking `context`.
-    unsafe fn get(&self) -> Option<Zeroizing<Vec<u8>>> {
+    /// `explicit` is null or NUL-terminated and outlives the result;
+    /// `callback` is null or a `pem_password_cb` taking `context`.
+    unsafe fn get(&self) -> Option<Secret<'_>> {
         if !self.explicit.is_null() {
             // SAFETY: by the caller's contract.
             let text = unsafe { CStr::from_ptr(self.explicit) };
-            return Some(Zeroizing::new(text.to_bytes().to_vec()));
+            return Some(Secret::Explicit(text.to_bytes()));
         }
         if self.callback.is_null() {
             return None;
@@ -78,7 +96,7 @@ impl Password {
             .ok()
             .filter(|length| *length <= capacity)?;
         buffer.truncate(length);
-        Some(buffer)
+        Some(Secret::Returned(buffer))
     }
 }
 
@@ -106,7 +124,7 @@ fn private_key(
         Err(KeyStoreError::ProtectedContainer) => {
             // SAFETY: the password sources are the caller's arguments.
             let secret = unsafe { password.get() }.ok_or(KeyStoreError::ProtectedContainer)?;
-            import(Some(&secret))?
+            import(Some(secret.bytes()))?
         }
         other => other?,
     };

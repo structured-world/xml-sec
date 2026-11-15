@@ -58,10 +58,9 @@ pub fn sign_signature_value(
     provider
         .require_capability(crate::provider::ProviderCapability::Sign(algorithm))
         .map_err(SigningKeyError::from)?;
-    let mut value = provider.sign_with_context(key, algorithm, context, signed_data)?;
-    if algorithm.hmac_output_bits().is_some() {
-        value.truncate(expected);
-    }
+    // The full output is asked for, an HMAC's included, so the value is
+    // checked as the provider returned it.
+    let value = provider.sign_with_context(key, algorithm, context, signed_data)?;
     validate_signature_output(expected, &value)?;
     encode_signature_output(algorithm, value, policy.ecdsa_signature_value_encoding)
 }

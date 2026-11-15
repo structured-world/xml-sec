@@ -54,14 +54,22 @@ fn line_feed(node: *mut XmlNode, here: errors::Here) -> *mut XmlNode {
 
 /// Appends a text node holding the default line feed to `parent`, as
 /// libxmlsec1 does before and after an added child; false when it cannot be
-/// created, reported at `here`.
-fn add_line_feed(parent: *mut XmlNode, here: errors::Here) -> bool {
+/// created, or when `parent` takes no children, reported at `here` as the
+/// failure of `refused`, the libxml2 call libxmlsec1 sees fail then.
+fn add_line_feed(parent: *mut XmlNode, here: errors::Here, refused: &CStr) -> bool {
     let text = line_feed(parent, here);
     if text.is_null() {
         return false;
     }
-    // SAFETY: both are handles, validated by the call.
-    unsafe { xsAddChild(parent, text) };
+    // SAFETY: both are handles, validated by each call; a refused link
+    // leaves the new text detached and ours to free.
+    unsafe {
+        if xsAddChild(parent, text).is_null() {
+            errors::xml_failed(here, std::ptr::null(), refused);
+            xsFreeNode(text);
+            return false;
+        }
+    }
     true
 }
 
@@ -116,7 +124,9 @@ pub(crate) unsafe extern "C" fn xmlSecAddChild(
             c"name != NULL",
             std::ptr::null_mut()
         );
-        if nodes::first_child(parent).is_null() && !add_line_feed(parent, here) {
+        // A parent that takes no children refuses the line feed; libxml2
+        // merges it into a text parent and fails at `xmlNewChild` instead.
+        if nodes::first_child(parent).is_null() && !add_line_feed(parent, here, c"xmlNewChild") {
             return std::ptr::null_mut();
         }
         // SAFETY: handles are validated by each call; the names are
@@ -136,6 +146,10 @@ pub(crate) unsafe extern "C" fn xmlSecAddChild(
             };
             if cur.is_null() {
                 errors::xml_failed(here, std::ptr::null(), c"xmlNewChild");
+                // A refused link leaves the new element detached and ours.
+                if !created.is_null() {
+                    xsFreeNode(created);
+                }
                 return std::ptr::null_mut();
             }
             if !ns.is_null() {
@@ -149,7 +163,7 @@ pub(crate) unsafe extern "C" fn xmlSecAddChild(
                 }
                 xsSetNs(cur, declared);
             }
-            if !add_line_feed(parent, here) {
+            if !add_line_feed(parent, here, c"xmlAddChild") {
                 return std::ptr::null_mut();
             }
             cur
@@ -183,7 +197,7 @@ pub(crate) unsafe extern "C" fn xmlSecAddChildNode(
             c"child != NULL",
             std::ptr::null_mut()
         );
-        if nodes::first_child(parent).is_null() && !add_line_feed(parent, here) {
+        if nodes::first_child(parent).is_null() && !add_line_feed(parent, here, c"xmlAddChild") {
             return std::ptr::null_mut();
         }
         // SAFETY: handles are validated by the call.
@@ -192,7 +206,7 @@ pub(crate) unsafe extern "C" fn xmlSecAddChildNode(
             errors::xml_failed(here, std::ptr::null(), c"xmlAddChild");
             return std::ptr::null_mut();
         }
-        if !add_line_feed(parent, here) {
+        if !add_line_feed(parent, here, c"xmlAddChild") {
             return std::ptr::null_mut();
         }
         added
