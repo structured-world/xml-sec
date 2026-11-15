@@ -3,7 +3,6 @@
   "upstream": {
     "project": "libxmlsec1",
     "version": "1.3.13",
-    "commit": "5fdd47dc35753438bdc38b6e96c1a3805c67a483",
     "repository": "https://github.com/lsh123/xmlsec"
   },
   "generated_by": "xml-sec-capability-ledger abi-generate",

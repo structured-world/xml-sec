@@ -1,7 +1,7 @@
 /* Transform chains as a libxmlsec1 caller builds them, with representative
  * extension klasses: an octet transform written on the default push/pop
  * methods, one with its own push method, and a node-set transform. Built
- * against the pinned libxmlsec1 and against this crate, both must print the
+ * against the libxmlsec1 oracle and against this crate, both must print the
  * same results, statuses, adapters and callback observations. */
 
 #include <stdio.h>

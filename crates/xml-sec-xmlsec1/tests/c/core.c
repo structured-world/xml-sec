@@ -1,5 +1,5 @@
 /* Buffers and pointer lists as a libxmlsec1 caller sees them. The program is
- * built against the pinned libxmlsec1 and against this crate, and both must
+ * built against the libxmlsec1 oracle and against this crate, and both must
  * print the same: sizes, allocation sizes, the zeroed bytes past the data,
  * item order and ownership, and every refusal's return value. */
 

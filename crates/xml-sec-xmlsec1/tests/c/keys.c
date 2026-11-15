@@ -2,7 +2,7 @@
  * them: ownership of the value, name and data list, copies, swaps,
  * matching against requirements, generation through a klass and the debug
  * dumps. The key data is a binary klass of the program's own. Built against
- * the pinned libxmlsec1 and against this crate, both must print the same
+ * the libxmlsec1 oracle and against this crate, both must print the same
  * results, dumps and reports. */
 
 #include <stdio.h>

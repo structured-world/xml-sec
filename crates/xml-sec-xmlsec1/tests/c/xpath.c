@@ -1,6 +1,6 @@
 /* The XPath, XPath Filter 2.0, XPointer and Visa3D transforms as a
  * libxmlsec1 caller uses them: read from transform elements, and created by
- * a context for a same-document URI. Built against the pinned libxmlsec1
+ * a context for a same-document URI. Built against the libxmlsec1 oracle
  * and against this crate, both must print the same canonical results and
  * statuses. */
 

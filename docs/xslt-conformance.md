@@ -33,8 +33,11 @@ pre-digest output and digest mismatch instead of silently skipping it.
 
 ## Reproduce
 
-Provision the existing pinned oracle with `cargo run -p xml-sec-tools -- install-xmlsec1` and
-set its reported library path. Use a checkout of the libxslt commit recorded in
+Provision the oracle from a checkout of the libxmlsec1 commit recorded in
+`compatibility/libxmlsec1-1.3.13-donor-commit.txt` with
+`XMLSEC1_SOURCE_DIR=/path/to/that/checkout cargo run -p xml-sec-tools -- install-xmlsec1`
+(without `XMLSEC1_SOURCE_DIR` the installer builds upstream master) and set its
+reported library path. Use a checkout of the libxslt commit recorded in
 `compatibility/libxslt-1.1.45-donor-commit.txt`:
 
 ```sh

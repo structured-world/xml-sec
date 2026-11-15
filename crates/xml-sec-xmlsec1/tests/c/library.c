@@ -1,5 +1,5 @@
 /* Library state and the crypto function table as a libxmlsec1 caller sees
- * them. The program is built against the pinned libxmlsec1 and against
+ * them. The program is built against the libxmlsec1 oracle and against
  * this crate, and both must print the same: the version check and
  * its reports, the layout of xmlSecCryptoDLFunctions, and dispatch through a
  * table the caller installs itself (which loads no crypto library): its
@@ -15,6 +15,7 @@
 #include <xmlsec/xmlsec.h>
 #include <xmlsec/errors.h>
 #include <xmlsec/app.h>
+#include <xmlsec/dl.h>
 #include <xmlsec/transforms.h>
 #include <xmlsec/keysdata.h>
 #include <xmlsec/list.h>

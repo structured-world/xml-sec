@@ -8,7 +8,7 @@
 //! Linux, builds the libraries and runs the crates' tests with the address
 //! sanitizer on nightly, and builds the programs with the address (leak
 //! checking included) and undefined behavior sanitizers. `--xmlsec1`
-//! qualifies the libxmlsec1-compatible library against the pinned libxmlsec1
+//! qualifies the libxmlsec1-compatible library against the libxmlsec1 oracle
 //! installed under `XMLSEC1_PREFIX`: every program, including one generated
 //! from the binary baseline that prints every recorded structure layout, is
 //! built once against the oracle (with `XS_ORACLE`, so its tree calls are
@@ -587,6 +587,26 @@ pub(crate) fn program_step(program: &Path, args: &[PathBuf], library: &Library) 
     step
 }
 
+/// Runs an oracle `program` against the libraries of the oracle under
+/// `prefix`: an inherited loader path naming another installation would
+/// otherwise take precedence over the program's run path, and libxmlsec1
+/// loads its crypto library through ltdl from `LTDL_LIBRARY_PATH`.
+pub(crate) fn oracle_program_step(program: &Path, prefix: &Path, library: &Library) -> Step {
+    let own = prefix.join("lib");
+    let mut step = program_step(program, &[], library)
+        .with_env("LTDL_LIBRARY_PATH", own.display().to_string());
+    for variable in ["LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"] {
+        let mut dirs = vec![own.clone()];
+        if let Some(inherited) = std::env::var_os(variable) {
+            dirs.extend(std::env::split_paths(&inherited));
+        }
+        if let Ok(path) = std::env::join_paths(dirs) {
+            step = step.with_env(variable, path.to_string_lossy());
+        }
+    }
+    step
+}
+
 /// Runs `step` with its output captured, and fails with that output.
 fn checked(runner: &mut impl Run, step: &Step) -> Result<String, Failure> {
     let (status, output) = runner.combined(step)?;
@@ -899,7 +919,7 @@ fn qualify_xmlsec1(
             flags: &oracle,
         };
         checked(runner, &oracle_compile_step(&compiler, &program))?;
-        let expected = standard_output(runner, &program_step(&theirs, &[], &library))?;
+        let expected = standard_output(runner, &oracle_program_step(&theirs, prefix, &library))?;
         let actual = standard_output(runner, &program_step(&mine, &[], &library))?;
         if let Some(difference) = first_difference(&expected, &actual) {
             return Err(format!(

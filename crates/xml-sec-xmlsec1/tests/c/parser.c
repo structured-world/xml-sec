@@ -1,6 +1,6 @@
 /* The parser functions, the XML parser transform in both directions, and
  * the OPC Relationship transform, as a libxmlsec1 caller uses them. Built
- * against the pinned libxmlsec1 and against this crate, both must print the
+ * against the libxmlsec1 oracle and against this crate, both must print the
  * same documents, results and statuses. */
 
 #include <stdio.h>

@@ -1,7 +1,7 @@
 /* The xmltree.h helpers as a libxmlsec1 caller uses them: adding elements
  * and namespaces with line feeds, replacing nodes, content and buffers,
  * registering IDs, hex and size content, escaping, qualified names and the
- * QName mappings. Built against the pinned libxmlsec1 and against this
+ * QName mappings. Built against the libxmlsec1 oracle and against this
  * crate, both must print the same trees, results and reports. */
 
 #include <stdio.h>
@@ -96,15 +96,38 @@ static void adding(void) {
     xsFreeDoc(doc);
 }
 
+/* `text` with control characters spelled out, so the result does not depend
+ * on how a serializer of a given libxml2 version escapes them. */
+static void print_escaped(const xmlChar *text) {
+    for (; text != NULL && *text != '\0'; text++) {
+        if (*text == '\r') {
+            printf("\\r");
+        } else if (*text == '\n') {
+            printf("\\n");
+        } else {
+            putchar(*text);
+        }
+    }
+}
+
 static void line_feed(void) {
     xmlDocPtr doc = parse("<r/>");
     const xmlChar *saved = xmlSecGetDefaultLineFeed();
+    xmlNodePtr cur;
 
     printf("line feed: [%s]\n", (const char *)saved);
     xmlSecSetDefaultLineFeed(BAD_CAST "\r\n  ");
     xmlSecAddChild(xsDocGetRootElement(doc), BAD_CAST "c", NULL);
     xmlSecSetDefaultLineFeed(saved);
-    dump("  custom", doc);
+    printf("  custom:");
+    for (cur = xsNodeGetChildren(xsDocGetRootElement(doc)); cur != NULL; cur = xsNodeGetNext(cur)) {
+        xmlChar *content = xsNodeGetContent(cur);
+        printf(" [%s ", name_of(cur));
+        print_escaped(content);
+        printf("]");
+        xsFree(content);
+    }
+    printf("\n");
     xsFreeDoc(doc);
 }
 

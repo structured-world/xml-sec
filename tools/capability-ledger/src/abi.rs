@@ -1,4 +1,4 @@
-//! `abi-generate` / `abi-check`: the binary baseline of one installed pinned
+//! `abi-generate` / `abi-check`: the binary baseline of one installed
 //! libxmlsec1 build. Exported symbols come from the built libraries, layouts
 //! and enumerator values from a probe compiled against the installed headers,
 //! and ownership from reviewed rules over the source ledger.
@@ -28,7 +28,6 @@ struct LedgerFile {
 struct Upstream {
     project: String,
     version: String,
-    commit: String,
     repository: String,
 }
 
@@ -73,7 +72,7 @@ pub(crate) fn run(check: bool, mut args: impl Iterator<Item = String>) -> Result
         return Err(usage());
     }
     let ledger: LedgerFile = read_json(&ledger_path)?;
-    verify_oracle(&prefix, &ledger.upstream.commit)?;
+    verify_oracle(&prefix, &ledger.upstream.version)?;
     let cflags = configured_cflags(&prefix)?;
     let (libraries, binary) = symbols::read(&prefix.join("lib"), &ledger.items)?;
     let probe = layout::measure(&prefix, &cflags, &ledger.items)?;
@@ -126,24 +125,24 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
     serde_json::from_slice(&bytes).map_err(|error| format!("parse {}: {error}", path.display()))
 }
 
-/// The installation must be built from the pinned commit; the installer
-/// records it beside the build.
-fn verify_oracle(prefix: &Path, commit: &str) -> Result<(), String> {
-    if commit != super::EXPECTED_COMMIT.trim() {
-        return Err(format!(
-            "the ledger is for commit {commit}, not the pinned donor"
-        ));
-    }
-    let marker = prefix.join(".xmlsec-source-commit");
+/// The installation must be of the version the ledger describes; the
+/// installer records the commit and version it built beside the build, and
+/// the run prints the commit.
+fn verify_oracle(prefix: &Path, version: &str) -> Result<(), String> {
+    let marker = prefix.join(".xmlsec-source");
     let recorded = fs::read_to_string(&marker)
         .map_err(|error| format!("read {}: {error}", marker.display()))?;
-    if recorded.trim() != commit {
+    let mut lines = recorded.lines();
+    let (Some(commit), Some(built)) = (lines.next(), lines.next()) else {
+        return Err(format!("{} names no commit and version", marker.display()));
+    };
+    if built != version {
         return Err(format!(
-            "{} was built from {}, not the pinned {commit}",
-            prefix.display(),
-            recorded.trim()
+            "{} is xmlsec1 {built}, the ledger describes {version}",
+            prefix.display()
         ));
     }
+    eprintln!("xmlsec1 {built} built from upstream {commit}");
     Ok(())
 }
 

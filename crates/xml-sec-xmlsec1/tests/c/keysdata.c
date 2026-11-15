@@ -2,7 +2,7 @@
  * enabled subset, lookups, a custom binary key-data klass driven through
  * every dispatcher, key-data lists, a custom store klass, the binary value
  * helpers, a transform context's extra key data, and Base64 node content.
- * Built against the pinned libxmlsec1 and against this crate, both must
+ * Built against the libxmlsec1 oracle and against this crate, both must
  * print the same. */
 
 #include <stdio.h>

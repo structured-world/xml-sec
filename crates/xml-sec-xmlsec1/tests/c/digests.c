@@ -1,7 +1,7 @@
 /* The digest transform klasses of the default crypto library as a libxmlsec1
  * caller uses them: their identities, computing a digest through a transform
  * context in one chunk and in many, and verifying a digest that matches, has
- * the wrong size or the wrong value. Built against the pinned libxmlsec1
+ * the wrong size or the wrong value. Built against the libxmlsec1 oracle
  * with its default crypto library and against this crate, both must print
  * the same. */
 

@@ -3,7 +3,7 @@
  * identities, the key requirements, a key of the wrong family, and
  * verifying a valid signature and a tampered one through a transform
  * context. The signatures were made with the private keys of the fixtures
- * whose public keys the program reads. Built against the pinned libxmlsec1
+ * whose public keys the program reads. Built against the libxmlsec1 oracle
  * with its default crypto library and against this crate, both must print
  * the same. */
 

@@ -226,7 +226,10 @@ operation inside a process.
 ### Command-line process
 
 The runner builds Bergshamra's current source (RustCrypto only) and the
-existing libxmlsec1 1.3.13 oracle, independently of the product dependency graph.
+libxmlsec1 oracle from upstream master as it is when the run starts (or from
+`HEAD` of the `XMLSEC1_SOURCE_DIR` checkout when that variable is set),
+independently of the product dependency graph; the evidence records the
+commit each was built from.
 It compares both xml-sec XML backends against those CLIs: single-reference
 RSA-2048/SHA-256 sign/verify and AES-256-GCM encrypt/decrypt of identical plaintext
 octets, at three sizes for five deterministic document shapes. AES keys use the
@@ -296,8 +299,9 @@ The same corpus and keys drive one in-process harness per engine:
   code: it takes the commit its default branch points at, builds the command
   line from that commit, moves the library harness to the same commit, and
   records the commit in the evidence;
-- libxmlsec1 1.3.13 through its C API (`benchmarks/libxmlsec1-library.c`),
-  linked against the oracle build and the OpenSSL inside it.
+- libxmlsec1 through its C API (`benchmarks/libxmlsec1-library.c`), linked
+  against the oracle build of upstream master and the OpenSSL inside it; the
+  evidence records the commit the installation was built from.
 
 Each process loads keys, trust anchors and settings once, validates its first
 result, runs three warmups and then times every sample around the operation
