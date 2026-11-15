@@ -104,7 +104,6 @@ static void bin_write(const char *label, xmlSecKeyDataId id, xmlSecKeyPtr key,
 }
 
 int main(void) {
-    xmlSecCryptoDLFunctionsPtr table;
     xmlSecKeyInfoCtxPtr ctx;
     xmlSecKeyPtr key;
     xmlSecKeyPtr copy;
@@ -120,18 +119,26 @@ int main(void) {
         printf("crypto init failed\n");
         return 1;
     }
-    table = xmlSecCryptoDLGetFunctions();
-
     describe("aes", xmlSecKeyDataAesId);
     describe("des", xmlSecKeyDataDesId);
     describe("hmac", xmlSecKeyDataHmacId);
     describe("concatkdf", xmlSecKeyDataConcatKdfId);
     describe("pbkdf2", xmlSecKeyDataPbkdf2Id);
     describe("hkdf", xmlSecKeyDataHkdfId);
-    describe("camellia",
-             table->keyDataCamelliaGetKlass != NULL ? table->keyDataCamelliaGetKlass() : NULL);
-    describe("chacha20",
-             table->keyDataChaCha20GetKlass != NULL ? table->keyDataChaCha20GetKlass() : NULL);
+    describe("camellia", xmlSecKeyDataCamelliaId);
+    describe("chacha20", xmlSecKeyDataChaCha20Id);
+    /* the transform klass getters app.h declares are exported: the program
+     * links only when the library defines every one */
+    {
+        static xmlSecTransformId (*const getters[])(void) = {
+            xmlSecTransformCamellia128CbcGetKlass, xmlSecTransformCamellia192CbcGetKlass,
+            xmlSecTransformCamellia256CbcGetKlass, xmlSecTransformKWCamellia128GetKlass,
+            xmlSecTransformKWCamellia192GetKlass,  xmlSecTransformKWCamellia256GetKlass,
+            xmlSecTransformChaCha20GetKlass,       xmlSecTransformChaCha20Poly1305GetKlass,
+        };
+        printf("camellia and chacha20 transform getters: %d\n",
+               (int)(sizeof(getters) / sizeof(getters[0])));
+    }
     printf("registered aes: %d\n",
            xmlSecKeyDataIdListFind(xmlSecKeyDataIdsGet(), xmlSecKeyDataAesId));
 

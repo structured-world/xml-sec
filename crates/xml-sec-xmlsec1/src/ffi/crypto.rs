@@ -866,6 +866,8 @@ macro_rules! klass_getters {
 
 klass_getters! { XmlSecKeyDataKlass =>
     xmlSecKeyDataAesGetKlass = key_data_aes, "keyDataAesGetKlass";
+    xmlSecKeyDataCamelliaGetKlass = key_data_camellia, "keyDataCamelliaGetKlass";
+    xmlSecKeyDataChaCha20GetKlass = key_data_chacha20, "keyDataChaCha20GetKlass";
     xmlSecKeyDataConcatKdfGetKlass = key_data_concat_kdf, "keyDataConcatKdfGetKlass";
     xmlSecKeyDataDesGetKlass = key_data_des, "keyDataDesGetKlass";
     xmlSecKeyDataDhGetKlass = key_data_dh, "keyDataDhGetKlass";
@@ -903,6 +905,14 @@ klass_getters! { XmlSecTransformKlass =>
     xmlSecTransformKWAes128GetKlass = transform_kw_aes128, "transformKWAes128GetKlass";
     xmlSecTransformKWAes192GetKlass = transform_kw_aes192, "transformKWAes192GetKlass";
     xmlSecTransformKWAes256GetKlass = transform_kw_aes256, "transformKWAes256GetKlass";
+    xmlSecTransformCamellia128CbcGetKlass = transform_camellia128_cbc, "transformCamellia128CbcGetKlass";
+    xmlSecTransformCamellia192CbcGetKlass = transform_camellia192_cbc, "transformCamellia192CbcGetKlass";
+    xmlSecTransformCamellia256CbcGetKlass = transform_camellia256_cbc, "transformCamellia256CbcGetKlass";
+    xmlSecTransformKWCamellia128GetKlass = transform_kw_camellia128, "transformKWCamellia128GetKlass";
+    xmlSecTransformKWCamellia192GetKlass = transform_kw_camellia192, "transformKWCamellia192GetKlass";
+    xmlSecTransformKWCamellia256GetKlass = transform_kw_camellia256, "transformKWCamellia256GetKlass";
+    xmlSecTransformChaCha20GetKlass = transform_chacha20, "transformChaCha20GetKlass";
+    xmlSecTransformChaCha20Poly1305GetKlass = transform_chacha20_poly1305, "transformChaCha20Poly1305GetKlass";
     xmlSecTransformDes3CbcGetKlass = transform_des3_cbc, "transformDes3CbcGetKlass";
     xmlSecTransformKWDes3GetKlass = transform_kw_des3, "transformKWDes3GetKlass";
     xmlSecTransformDhEsGetKlass = transform_dh_es, "transformDhEsGetKlass";
