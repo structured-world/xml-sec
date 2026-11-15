@@ -12,7 +12,7 @@ base64 = "0.23"
 cc = "1"
 flate2 = "1"
 # Reads the C ABI library's exported symbols to compare them with its header.
-object = { version = "0.40", default-features = false, features = ["read"] }
+object = { version = "0.41", default-features = false, features = ["read"] }
 regex = "1"
 # Summaries keep the field order they are written in, and measured values
 # survive a read and rewrite unchanged.
