@@ -733,6 +733,9 @@ impl<'a> VerifyContext<'a> {
             .xpath_here_semantics(self.policy.transforms.xpath_here_semantics)
             .opc_relationship_edition(self.policy.transforms.opc_relationship_edition)
             .xslt_stylesheet_semantics(self.policy.transforms.xslt_stylesheet_semantics)
+            // Resident References apply this where their output is digested;
+            // a detached payload's completion applies the same decision to
+            // the bytes the caller streams.
             .empty_digest_input(self.policy.transforms.empty_digest_input)
     }
 
