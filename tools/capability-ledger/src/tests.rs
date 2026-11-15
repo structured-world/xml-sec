@@ -13,6 +13,20 @@ fn sanitized_code_keeps_every_line_of_a_continued_literal() {
     assert!(!lines[1].contains("XMLSEC_EXPORT"), "{lines:?}");
 }
 
+#[test]
+fn a_line_comment_continued_with_a_backslash_hides_the_next_line() {
+    // Line splicing comes before comment removal (C11 5.1.1.2, phases 2 and
+    // 3), so a `//` comment ending in a backslash also covers the next
+    // line: the declaration there is comment text, while the line count
+    // stays that of the input.
+    let header = "// Hidden declaration \\\nXMLSEC_EXPORT int xmlSecHidden(void);\nXMLSEC_EXPORT int xmlSecReal(void);\n";
+    let code = sanitize_c(header);
+    let lines: Vec<_> = code.lines().collect();
+    assert_eq!(lines.len(), header.lines().count());
+    assert!(!lines[1].contains("xmlSecHidden"), "{lines:?}");
+    assert!(lines[2].contains("xmlSecReal"), "{lines:?}");
+}
+
 fn evidence() -> BTreeMap<String, Evidence> {
     BTreeMap::from([(
         "test".into(),

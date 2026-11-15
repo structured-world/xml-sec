@@ -1706,7 +1706,13 @@ fn sanitize_c(value: &str) -> String {
     let mut escaped = false;
     while let Some(ch) = chars.next() {
         if in_line_comment {
-            if ch == '\n' {
+            if ch == '\\' && chars.peek() == Some(&'\n') {
+                // Line splicing precedes comment removal (C11 5.1.1.2), so
+                // the comment goes on; the line break stays for line numbers.
+                output.push(' ');
+                output.push('\n');
+                chars.next();
+            } else if ch == '\n' {
                 in_line_comment = false;
                 output.push(ch);
             } else {
