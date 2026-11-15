@@ -140,6 +140,7 @@ pub(crate) struct TransformOptions<'r> {
     allow_internal_dtd: bool,
     opc_relationship_edition: crate::policy::OpcRelationshipEdition,
     xslt_stylesheet_semantics: crate::policy::XsltStylesheetSemantics,
+    empty_digest_input: crate::policy::EmptyDigestInput,
     id_attributes: &'r [crate::xml::IdAttributeRegistration],
 }
 
@@ -547,6 +548,14 @@ impl<'r> TransformOptions<'r> {
     ) -> Self {
         self.xslt_stylesheet_semantics = semantics;
         self
+    }
+    pub(crate) fn empty_digest_input(mut self, decision: crate::policy::EmptyDigestInput) -> Self {
+        self.empty_digest_input = decision;
+        self
+    }
+    /// Whether a Reference with no data is digested, for its [`DigestRequest`].
+    pub(crate) fn empty_digest_decision(&self) -> crate::policy::EmptyDigestInput {
+        self.empty_digest_input
     }
     /// Select the node returned by the `XPath` `here()` extension function.
     #[must_use]
@@ -1987,6 +1996,8 @@ pub(crate) struct DigestRequest<'p> {
     pub(crate) provider: &'p dyn crate::provider::CryptoProvider,
     pub(crate) algorithm: super::DigestAlgorithm,
     pub(crate) retain_pre_digest: bool,
+    /// Whether no data at all is digested or refused.
+    pub(crate) empty_input: crate::policy::EmptyDigestInput,
 }
 
 /// Digest input is passed to the provider in blocks of this size: the
@@ -2066,6 +2077,19 @@ impl c14n::sink::ByteSink for DigestWriter<'_> {
     }
 }
 
+/// Refuses a digest over no data when the policy says so.
+fn admit_digest_input(
+    decision: crate::policy::EmptyDigestInput,
+    written: usize,
+) -> Result<(), ReferenceDigestError> {
+    if written == 0 && decision == crate::policy::EmptyDigestInput::Refuse {
+        return Err(
+            TransformError::Policy(crate::policy::PolicyViolation::EmptyDigestInput).into(),
+        );
+    }
+    Ok(())
+}
+
 /// Hashes the final transform output without collecting it: a final node set
 /// is canonicalized straight into the digest, final octets are hashed in place.
 struct DigestTerminal<'p>(DigestRequest<'p>);
@@ -2083,6 +2107,7 @@ impl TransformTerminal<Native> for DigestTerminal<'_> {
             provider,
             algorithm,
             retain_pre_digest,
+            empty_input,
         } = self.0;
         let mut sink = DigestWriter::new(
             super::digest::begin_digest(provider, algorithm, &budget.digest_memory)
@@ -2119,6 +2144,7 @@ impl TransformTerminal<Native> for DigestTerminal<'_> {
                 .charge(sink.written)
                 .map_err(TransformError::from)?;
         }
+        admit_digest_input(empty_input, sink.written)?;
         let (digest, pre_digest) = sink
             .finish(algorithm)
             .map_err(ReferenceDigestError::Provider)?;
@@ -2137,6 +2163,7 @@ impl TransformTerminal<Native> for DigestTerminal<'_> {
             provider,
             algorithm,
             retain_pre_digest,
+            empty_input,
         } = self.0;
         let mut sink = DigestWriter::new(
             super::digest::begin_digest(provider, algorithm, &budget.digest_memory)
@@ -2157,6 +2184,7 @@ impl TransformTerminal<Native> for DigestTerminal<'_> {
                 TransformError::Base64(base64::DecodeSliceError::DecodeError(failure)).into(),
             );
         }
+        admit_digest_input(empty_input, sink.written)?;
         let (digest, pre_digest) = sink
             .finish(algorithm)
             .map_err(ReferenceDigestError::Provider)?;

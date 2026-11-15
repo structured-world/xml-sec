@@ -733,6 +733,10 @@ impl<'a> VerifyContext<'a> {
             .xpath_here_semantics(self.policy.transforms.xpath_here_semantics)
             .opc_relationship_edition(self.policy.transforms.opc_relationship_edition)
             .xslt_stylesheet_semantics(self.policy.transforms.xslt_stylesheet_semantics)
+            // Resident References apply this where their output is digested;
+            // a detached payload's completion applies the same decision to
+            // the bytes the caller streams.
+            .empty_digest_input(self.policy.transforms.empty_digest_input)
     }
 
     /// Verify one `XMLDSig` signature using this context.
@@ -1729,6 +1733,7 @@ fn process_reference_with_options<C: VerificationCapture>(
             provider: execution.provider,
             algorithm: reference.digest_method,
             retain_pre_digest: execution.store_pre_digest,
+            empty_input: execution.transform_options.empty_digest_decision(),
         },
     )
     .map_err(|error| match error {

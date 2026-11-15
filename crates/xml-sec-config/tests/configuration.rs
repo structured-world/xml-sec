@@ -779,6 +779,36 @@ fn xslt_stylesheet_semantics_comes_from_the_base_profile() {
     ));
 }
 
+#[test]
+fn empty_digest_input_reaches_the_compiled_snapshots() {
+    // Refusing to digest no data reaches the compiled snapshots, accepting it
+    // is the default, and unknown names are schema errors.
+    use xml_sec::policy::EmptyDigestInput;
+    let config = |extra: &str| {
+        Configuration::from_str(
+            &format!("schema_version = 1\n[profiles.team]\nbase = 'Modern'\n{extra}"),
+            LoadLimits::default(),
+        )
+    };
+    let decision = |extra: &str| {
+        effective(&config(extra).expect("strict config"), "team")
+            .compiled()
+            .verification()
+            .unwrap()
+            .transforms
+            .empty_digest_input
+    };
+    assert_eq!(decision(""), EmptyDigestInput::Accept);
+    assert_eq!(
+        decision("[profiles.team.verification.transforms]\nempty_digest_input='Refuse'"),
+        EmptyDigestInput::Refuse
+    );
+    assert!(matches!(
+        config("[profiles.team.verification.transforms]\nempty_digest_input='Sometimes'"),
+        Err(xml_sec_config::Error::Schema(message)) if message.contains("empty_digest_input")
+    ));
+}
+
 #[cfg(feature = "xmldsig-sign")]
 #[test]
 fn configured_snapshots_enforce_real_sign_and_verify_limits() {

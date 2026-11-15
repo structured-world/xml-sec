@@ -162,6 +162,11 @@ pub enum PolicyViolation {
     #[cfg(feature = "xmldsig")]
     #[error("Manifest reference processing is disabled by policy")]
     ManifestProcessingDisabled,
+    /// The policy refuses to digest a Reference whose transforms produce no
+    /// octets ([`EmptyDigestInput::Refuse`]).
+    #[cfg(feature = "xmldsig")]
+    #[error("transform policy refuses to digest a Reference with no data")]
+    EmptyDigestInput,
     /// The policy forbids completing a detached Reference with a digest the
     /// caller attests instead of bytes this operation digests.
     #[cfg(feature = "xmldsig")]
@@ -1157,6 +1162,21 @@ pub enum EcdsaSignatureValueEncoding {
     XmlSecAsn1Der,
 }
 
+/// Whether a Reference whose transforms produce no octets is digested.
+///
+/// `XMLDSig` 1.1 section 4.4.3.2 digests whatever octets the transforms
+/// produce and is silent on an empty result, so this is a product decision:
+/// a chain that selects nothing signs nothing a relying party can see.
+#[cfg(feature = "xmldsig")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EmptyDigestInput {
+    /// Digest the empty octet string.
+    #[default]
+    Accept,
+    /// Refuse the Reference with [`PolicyViolation::EmptyDigestInput`].
+    Refuse,
+}
+
 /// `XMLDSig` transform and canonicalization decisions shared by signing and verification.
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1171,6 +1191,8 @@ pub struct TransformPolicy {
     pub opc_relationship_edition: OpcRelationshipEdition,
     /// How XSLT stylesheets are read; applies to builds with `xslt`.
     pub xslt_stylesheet_semantics: XsltStylesheetSemantics,
+    /// Whether a Reference whose transforms produce no octets is digested.
+    pub empty_digest_input: EmptyDigestInput,
 }
 
 /// URI-class decisions shared by `XMLDSig` reference and key retrieval processing.
