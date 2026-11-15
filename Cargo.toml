@@ -410,7 +410,7 @@ x509-parser = "0.18"
 pem = "4"
 # The provider-only build's test provider computes RSA itself, as a
 # downstream provider would, without the built-in backends.
-num-bigint = "0.4"
+num-bigint = "0.5"
 # The vendored ML-DSA tests draw random polynomials in every feature set.
 getrandom = { version = "0.4", features = ["sys_rng"] }
 rand_chacha = "0.10"
