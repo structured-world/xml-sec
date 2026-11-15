@@ -1370,7 +1370,8 @@ fn direction(field: &str, old: Option<&Value>, new: Option<&Value>) -> Direction
                 | "RequireAuthenticatedCipher"
                 | "ExactOnly"
                 | "Forbidden"
-                | "Declared",
+                | "Declared"
+                | "Refuse",
             ),
         )
         | (Some("AllSupported"), Some("SecureSupported")) => Restrictive,
@@ -1586,6 +1587,23 @@ mod tests {
         );
         assert_eq!(
             direction(field, Some(&classical), Some(&default)),
+            Direction::Relaxing
+        );
+    }
+
+    #[test]
+    fn refusing_empty_digest_input_is_restrictive() {
+        // Refusing to digest no data only removes a permission; accepting it
+        // again restores one.
+        let field = "verification.transforms.empty_digest_input";
+        let accept = Value::String("Accept".into());
+        let refuse = Value::String("Refuse".into());
+        assert_eq!(
+            direction(field, Some(&accept), Some(&refuse)),
+            Direction::Restrictive
+        );
+        assert_eq!(
+            direction(field, Some(&refuse), Some(&accept)),
             Direction::Relaxing
         );
     }

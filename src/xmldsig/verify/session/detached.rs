@@ -118,6 +118,8 @@ pub struct DetachedPayload<'s, 'view, 'scope, 'inputs, W: Work> {
     fingerprint: Option<sha2::Sha256>,
     base64: Option<Base64Stream>,
     streamed: usize,
+    // Bytes the Base64 chain decoded, which its digests hash.
+    decoded: usize,
     completion: DetachedCompletion,
     refused: bool,
 }
@@ -217,6 +219,7 @@ impl<'view, 'scope, 'inputs, W: Work> VerifiedSession<'view, 'scope, 'inputs, W>
             fingerprint,
             base64,
             streamed: 0,
+            decoded: 0,
             completion,
             refused: false,
         })
@@ -663,11 +666,14 @@ fn resource_refusal(error: &DsigError) -> Option<DsigError> {
 fn feed_base64_states(
     states: &mut [StreamState<'_>],
     budget: &super::TransformExecutionBudget,
+    count: &mut usize,
     decoded: &[u8],
 ) -> Result<(), DsigError> {
     budget
         .charge_base64_output(decoded.len())
         .map_err(base64_budget_error)?;
+    // Bounded by the Base64 output allowance just charged.
+    *count += decoded.len();
     for state in states {
         if state.chain == DetachedChain::Base64 {
             state
@@ -789,8 +795,9 @@ impl<W: Work> DetachedPayload<'_, '_, '_, '_, W> {
                     .map_err(base64_budget_error)?;
             }
             let states = &mut self.states;
+            let count = &mut self.decoded;
             base64.feed(chunk, &mut |decoded| {
-                feed_base64_states(states, budget, decoded)
+                feed_base64_states(states, budget, count, decoded)
             })?;
         }
         Ok(())
@@ -808,9 +815,10 @@ impl<W: Work> DetachedPayload<'_, '_, '_, '_, W> {
             mut states,
             fingerprint,
             base64,
+            streamed,
+            mut decoded,
             completion,
             refused,
-            ..
         } = self;
         if refused {
             return Err(DsigError::InvalidRequest {
@@ -822,10 +830,21 @@ impl<W: Work> DetachedPayload<'_, '_, '_, '_, W> {
         let budget = &session.budgets.transforms;
         let base64_failure = match base64 {
             Some(base64) => base64
-                .finish(&mut |decoded| feed_base64_states(&mut states, budget, decoded))?
+                .finish(&mut |bytes| feed_base64_states(&mut states, budget, &mut decoded, bytes))?
                 .is_some(),
             None => false,
         };
+        // A Reference this payload gives no data is refused as a resident
+        // Reference with no data is; the payload then has no result.
+        if session.context.policy.transforms.empty_digest_input
+            == crate::policy::EmptyDigestInput::Refuse
+            && targets.iter().any(|target| match target.chain {
+                DetachedChain::Octets => streamed == 0,
+                DetachedChain::Base64 => decoded == 0 && !base64_failure,
+            })
+        {
+            return Err(crate::policy::PolicyViolation::EmptyDigestInput.into());
+        }
         let mut digests = Vec::with_capacity(states.len());
         for mut state in states {
             session

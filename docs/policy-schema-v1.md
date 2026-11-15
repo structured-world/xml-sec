@@ -69,9 +69,7 @@ These interpretation choices are not ordered security levels. Restrictive
 composition rejects incompatible modes rather than selecting the last value.
 `empty_digest_input` is the exception: it is a restriction, so a layer that
 refuses to digest a Reference whose transforms produce no octets keeps
-refusing it whatever another layer says. The libxmlsec1-compatible library
-honours a caller's `XMLSEC_TRANSFORMCTX_FLAGS_ALLOW_EMPTY_INPUT` only while
-the policy accepts empty digest input.
+refusing it whatever another layer says.
 
 ## Key Trust And Sources
 

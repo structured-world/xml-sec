@@ -202,6 +202,49 @@ fn streamed_payload_completes_a_valid_detached_reference() {
 }
 
 #[test]
+fn a_policy_refusing_empty_digest_input_refuses_an_empty_streamed_payload() {
+    // A payload that gives a digest no data, an empty stream or Base64 that
+    // decodes to nothing, is refused under a policy that refuses empty digest
+    // input as a resident Reference with no data is: the payload has no
+    // result and its Reference stays unavailable.
+    for (payload, base64) in [(&b""[..], false), (&b" \n "[..], true)] {
+        let document = signed(
+            &[Detached {
+                uri: "payload.bin",
+                base64,
+                digest: DigestAlgorithm::Sha256,
+                payload,
+            }],
+            false,
+        );
+        let mut policy = verification_policy();
+        policy.transforms.empty_digest_input = xml_sec::policy::EmptyDigestInput::Refuse;
+        let (result, references, accepted) = session(&document, policy, |session| {
+            let reference = pending_references(session, DetachedCompletion::Complete)[0];
+            Ok(stream(
+                session,
+                &[reference],
+                payload,
+                1,
+                DetachedCompletion::Complete,
+            ))
+        });
+        assert!(
+            matches!(
+                result,
+                Err(DsigError::Policy(PolicyViolation::EmptyDigestInput))
+            ),
+            "base64 {base64}: {result:?}"
+        );
+        assert_eq!(
+            references[1].status,
+            DsigStatus::Invalid(FailureReason::ReferenceUnavailable { ref_index: 1 })
+        );
+        assert!(!accepted);
+    }
+}
+
+#[test]
 fn unstreamed_detached_reference_keeps_the_signature_unaccepted() {
     // Without bytes the Reference stays unavailable and the request is not
     // accepted; the signature itself remains verified.
