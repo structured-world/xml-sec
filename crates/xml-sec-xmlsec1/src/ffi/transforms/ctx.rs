@@ -42,6 +42,12 @@ const FLAGS_USE_VISA3D_HACK: c_uint = 0x0001;
 pub(crate) const FLAGS_ALLOW_EMPTY_INPUT: c_uint = 0x0008;
 /// `xmlSecTransformUriTypeEmpty | xmlSecTransformUriTypeSameDocument`: the
 /// URIs a context dereferences until the caller enables more.
+///
+/// This is the documented initial value of the caller-owned `enabledUris`
+/// field of the libxmlsec1 ABI (`transforms.h`), not a deployment default.
+/// It never widens the compiled policy: a dereference needs both the
+/// caller's mask and the policy's URI classes, so a program written for
+/// libxmlsec1 that leaves the mask alone keeps its opt-in for external URIs.
 const URI_TYPES_DEFAULT: c_uint = 0x0001 | 0x0002;
 /// `xmlSecNodeSetTree`.
 const TREE: c_int = 2;
