@@ -693,6 +693,8 @@ fn dss_signatures(corpus: &super::Corpus, results: &std::path::Path) -> Result<(
                 &"--fail",
                 &"--silent",
                 &"--show-error",
+                &"--retry",
+                &"5",
                 &"--output",
                 &target,
                 &url,

@@ -165,8 +165,17 @@ fn bootstrap(corpus: &Corpus, logs: &Path) -> Result<(), String> {
     let url = format!(
         "https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/{MAVEN}/apache-maven-{MAVEN}-bin.tar.gz"
     );
+    // Maven Central answers shared CI addresses with 429 under load; curl
+    // retries it, honouring Retry-After.
     let curl = |extra: &[&dyn AsRef<std::ffi::OsStr>]| {
-        let mut args = line(&[&"curl", &"--fail", &"--silent", &"--show-error"]);
+        let mut args = line(&[
+            &"curl",
+            &"--fail",
+            &"--silent",
+            &"--show-error",
+            &"--retry",
+            &"5",
+        ]);
         args.extend(line(extra));
         args
     };
