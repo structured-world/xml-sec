@@ -471,6 +471,45 @@ fn a_policy_refusing_empty_digest_input_overrides_the_contexts_permission() {
 }
 
 #[test]
+fn buffered_input_consumed_before_the_last_chunk_is_not_empty() {
+    // A caller that buffers its bytes, executes a non-final chunk that
+    // consumes them and then finishes signed a non-empty message: the last
+    // call does not refuse it as empty.
+    let message = b"buffered, then streamed";
+    let pushed = run(OPERATION_SIGN, private_key(), message, &[]).expect("pushed bytes sign");
+    // SAFETY: every object is created and released here.
+    let streamed = unsafe {
+        let ctx = xmlSecTransformCtxCreate();
+        let transform = xmlSecTransformCtxCreateAndAppend(ctx, rsa_sha256());
+        (*transform).operation = OPERATION_SIGN;
+        let key = private_key();
+        assert_eq!(xmlSecTransformSetKey(transform, key.cast()), 0);
+        assert_eq!(
+            xmlSecBufferAppend(
+                &raw mut (*transform).in_buf,
+                message.as_ptr(),
+                message.len()
+            ),
+            0
+        );
+        assert_eq!(xmlSecTransformExecute(transform, 0, ctx), 0);
+        let executed = xmlSecTransformExecute(transform, 1, ctx);
+        let output = &raw mut (*transform).out_buf;
+        let signature = if executed == 0 {
+            std::slice::from_raw_parts(xmlSecBufferGetData(output), xmlSecBufferGetSize(output))
+                .to_vec()
+        } else {
+            Vec::new()
+        };
+        xmlSecTransformCtxDestroy(ctx);
+        xmlSecKeyDestroy(key);
+        assert_eq!(executed, 0, "consumed buffered input is not empty");
+        signature
+    };
+    assert_eq!(streamed, pushed);
+}
+
+#[test]
 fn input_a_caller_buffered_itself_is_not_empty() {
     // Bytes appended to the transform's input buffer and executed as the
     // last chunk are input like pushed bytes: they are signed, not refused

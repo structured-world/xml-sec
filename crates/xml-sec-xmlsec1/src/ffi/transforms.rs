@@ -1166,12 +1166,16 @@ pub(crate) unsafe extern "C" fn xmlSecTransformExecute(
         );
         // Digests and signatures refuse to finish over empty input unless
         // the context allows it. Input is what the transform received through
-        // its push and pop methods or holds in its input buffer: libxmlsec1
-        // counts only the former, and so refuses bytes a caller appended to
-        // the buffer itself, which are input all the same.
+        // its push and pop methods and what a caller appended to its input
+        // buffer itself: libxmlsec1 counts only the former, and so refuses
+        // the latter, which is input all the same. Such bytes are counted
+        // when the transform first runs over them, so a non-final call that
+        // consumes them still leaves the input non-empty at the last one.
         let digest_or_signature = klass.usage & (USAGE_DIGEST_METHOD | USAGE_SIGNATURE_METHOD) != 0;
-        let empty = object.in_total_size == 0 && object.in_buf.size == 0;
-        if last != 0 && digest_or_signature && empty {
+        if digest_or_signature && object.in_total_size == 0 && object.in_buf.size > 0 {
+            object.received(object.in_buf.size);
+        }
+        if last != 0 && digest_or_signature && object.in_total_size == 0 {
             let here = here!("xmlSecTransformExecute");
             // SAFETY: a non-null context by the caller's contract.
             if unsafe { (*ctx).flags } & ctx::FLAGS_ALLOW_EMPTY_INPUT == 0 {
