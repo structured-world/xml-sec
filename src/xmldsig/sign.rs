@@ -2771,7 +2771,8 @@ impl<'a> SignContext<'a> {
             .allow_internal_dtd(self.policy.xml.allow_internal_dtd)
             .xpath_here_semantics(self.policy.transforms.xpath_here_semantics)
             .opc_relationship_edition(self.policy.transforms.opc_relationship_edition)
-            .xslt_stylesheet_semantics(self.policy.transforms.xslt_stylesheet_semantics);
+            .xslt_stylesheet_semantics(self.policy.transforms.xslt_stylesheet_semantics)
+            .empty_digest_input(self.policy.transforms.empty_digest_input);
         let external_resources = ExternalResourceContext::new(
             self.external_resources,
             self.policy.resources.max_external_resource_bytes,
@@ -4320,6 +4321,7 @@ fn reference_dependency_levels(
                     provider,
                     algorithm: reference.digest_method,
                     retain_pre_digest: false,
+                    empty_input: transform_options.empty_digest_decision(),
                 }),
             )
             .map_err(map_reference_digest_error)?;
@@ -4665,6 +4667,7 @@ fn compute_signing_reference_digests(
                     provider,
                     algorithm: reference.digest_method,
                     retain_pre_digest: false,
+                    empty_input: transform_options.empty_digest_decision(),
                 },
             )
             .map_err(map_reference_digest_error)?

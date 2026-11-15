@@ -974,6 +974,37 @@ fn minimal_signature_xml(reference_uri: &str, transforms_xml: &str) -> String {
 }
 
 #[test]
+fn a_policy_refusing_empty_digest_input_refuses_a_reference_that_selects_nothing() {
+    // An XPath that selects nothing leaves the Reference no data: the default
+    // policy digests the empty string and compares, a policy that refuses
+    // empty digest input rejects the Reference with its typed violation.
+    let nothing = r#"<ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>false()</ds:XPath></ds:Transform></ds:Transforms>"#;
+    let xml = minimal_signature_xml("", nothing);
+    let accepted = VerifyContext::new()
+        .key(&AcceptingKey)
+        .verify(&xml)
+        .expect("the default policy digests no data");
+    assert!(
+        matches!(
+            accepted.status,
+            DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
+        ),
+        "{:?}",
+        accepted.status
+    );
+    let mut policy = crate::policy::VerificationPolicy::default();
+    policy.transforms.empty_digest_input = crate::policy::EmptyDigestInput::Refuse;
+    let refused = VerifyContext::new()
+        .key(&AcceptingKey)
+        .policy(policy)
+        .verify(&xml);
+    assert!(
+        format!("{refused:?}").contains("EmptyDigestInput"),
+        "{refused:?}"
+    );
+}
+
+#[test]
 fn retained_verification_preserves_original_authenticated_operation() {
     // Keep the original per-Signature graph/authentication state, not a new
     // set reconstructed from detached digest-result booleans.

@@ -1,10 +1,10 @@
 use super::{PolicySet, PolicyValidity, SignatureConstraints, configuration};
 use crate::policy::{
-    CertificateSignatureAlgorithms, DetachedDigestAttestation, DsaKeyPolicy, HmacPolicy,
-    KemContentAuthentication, KeyDerivationAlgorithm, KeyEstablishmentPolicy, KeySourcePolicy,
-    KeyTrustPolicy, ManifestProcessing, PolicyViolation, ResourcePolicy, RsaKeyPolicy,
-    RsaPssPermission, SigningPolicy, TimestampTokenEncoding, TransformPolicy, UriPolicy,
-    VerificationPolicy, VerificationTrustMode, XmlInputPolicy,
+    CertificateSignatureAlgorithms, DetachedDigestAttestation, DsaKeyPolicy, EmptyDigestInput,
+    HmacPolicy, KemContentAuthentication, KeyDerivationAlgorithm, KeyEstablishmentPolicy,
+    KeySourcePolicy, KeyTrustPolicy, ManifestProcessing, PolicyViolation, ResourcePolicy,
+    RsaKeyPolicy, RsaPssPermission, SigningPolicy, TimestampTokenEncoding, TransformPolicy,
+    UriPolicy, VerificationPolicy, VerificationTrustMode, XmlInputPolicy,
 };
 #[cfg(feature = "xmlenc")]
 use crate::policy::{
@@ -263,6 +263,14 @@ fn transforms(
         )?,
         opc_relationship_edition: equal(a.opc_relationship_edition, b.opc_relationship_edition)?,
         xslt_stylesheet_semantics: equal(a.xslt_stylesheet_semantics, b.xslt_stylesheet_semantics)?,
+        // A layer that refuses empty digest input keeps refusing it.
+        empty_digest_input: if a.empty_digest_input == EmptyDigestInput::Refuse
+            || b.empty_digest_input == EmptyDigestInput::Refuse
+        {
+            EmptyDigestInput::Refuse
+        } else {
+            EmptyDigestInput::Accept
+        },
     })
 }
 fn manifests(a: ManifestProcessing, b: ManifestProcessing) -> ManifestProcessing {
@@ -700,5 +708,31 @@ mod tests {
             salt_len: 17,
         });
         assert!(composed.check_signature_algorithm(algorithm).is_ok());
+    }
+
+    #[test]
+    fn a_layer_refusing_empty_digest_input_keeps_refusing_it() {
+        // The refusal is a restriction: composing it with a layer that accepts
+        // empty digest input, in either order, refuses it.
+        let refusing = VerificationPolicy {
+            transforms: TransformPolicy {
+                empty_digest_input: EmptyDigestInput::Refuse,
+                ..TransformPolicy::default()
+            },
+            ..VerificationPolicy::default()
+        };
+        let accepting = VerificationPolicy::default();
+        for (a, b) in [(&refusing, &accepting), (&accepting, &refusing)] {
+            let composed = verification(a, b).expect("compatible policies");
+            assert_eq!(
+                composed.transforms.empty_digest_input,
+                EmptyDigestInput::Refuse
+            );
+        }
+        let composed = verification(&accepting, &accepting).expect("compatible policies");
+        assert_eq!(
+            composed.transforms.empty_digest_input,
+            EmptyDigestInput::Accept
+        );
     }
 }

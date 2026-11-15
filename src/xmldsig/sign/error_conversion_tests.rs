@@ -404,6 +404,33 @@ fn owned_signing_staged_copies_preserve_policy_errors() {
 }
 
 #[test]
+fn a_policy_refusing_empty_digest_input_refuses_to_sign_nothing() {
+    // A Reference whose XPath selects nothing gives the digest no data: the
+    // default policy signs the empty string, a policy that refuses empty
+    // digest input fails the signature with its typed violation and leaves
+    // the document as it was.
+    let xml = r##"<root><payload Id="payload">content</payload><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#payload"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>false()</ds:XPath></ds:Transform></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature></root>"##;
+    let mut accepted = XmlDocument::parse(xml).expect("fixture must parse");
+    SignContext::new(&FixedRsaSigningKey)
+        .sign_document(&mut accepted)
+        .expect("the default policy signs no data");
+    assert!(!accepted.as_xml().contains("<ds:DigestValue/>"));
+
+    let mut policy = crate::policy::SigningPolicy::default();
+    policy.transforms.empty_digest_input = crate::policy::EmptyDigestInput::Refuse;
+    let mut refused = XmlDocument::parse(xml).expect("fixture must parse");
+    let error = SignContext::new(&FixedRsaSigningKey)
+        .policy(policy)
+        .sign_document(&mut refused)
+        .expect_err("the policy refuses to sign no data");
+    assert!(
+        format!("{error:?}").contains("EmptyDigestInput"),
+        "{error:?}"
+    );
+    assert_eq!(refused.as_xml(), xml);
+}
+
+#[test]
 fn owned_signing_commits_the_validated_stage_without_reparsing() {
     // Atomic commit must adopt the already validated staged cell. Charging
     // another complete backend parse makes valid maximum-size inputs exceed

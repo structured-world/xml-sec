@@ -10,7 +10,7 @@ use xml_sec::xmlenc::{
 use xml_sec::{
     policy::{
         CertificateSignatureAlgorithms, CompiledPolicies, DetachedDigestAttestation, DsaKeyPolicy,
-        EcdsaSignatureValueEncoding, ExtendedKeyPurpose, HmacPolicy, Instant,
+        EcdsaSignatureValueEncoding, EmptyDigestInput, ExtendedKeyPurpose, HmacPolicy, Instant,
         KemContentAuthentication, KeyAgreementAlgorithm, KeyDerivationAlgorithm,
         KeyEstablishmentPolicy, KeySourceKind, KeySourcePolicy, KeyTrustPolicy, ManifestProcessing,
         OpcRelationshipEdition, PolicySet, PolicyValidity, ResourcePolicy, RsaKeyPolicy,
@@ -277,6 +277,14 @@ fn transforms(p: &mut TransformPolicy, v: &Value) -> Result<(), Error> {
                     key,
                     XsltStylesheetSemantics::Specification,
                     XsltStylesheetSemantics::Libxmlsec1
+                );
+            }
+            "empty_digest_input" => {
+                p.empty_digest_input = choice!(
+                    value,
+                    key,
+                    EmptyDigestInput::Accept,
+                    EmptyDigestInput::Refuse
                 );
             }
             _ => return Err(invalid(key)),
@@ -783,6 +791,7 @@ fn transform_snapshot(p: &TransformPolicy) -> Value {
             "xslt_stylesheet_semantics".into(),
             named(p.xslt_stylesheet_semantics),
         ),
+        ("empty_digest_input".into(), named(p.empty_digest_input)),
     ]))
 }
 fn establishment_snapshot(p: &KeyEstablishmentPolicy) -> Value {

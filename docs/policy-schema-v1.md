@@ -63,9 +63,15 @@ not create a resolver, resource map or network access.
 | `same_document_id_semantics` | `Specification`, `XmlSecBarename`, `XmlSecVisa3d` |
 | `opc_relationship_edition` | `Ecma2012`, `Ecma2021` |
 | `xslt_stylesheet_semantics` | `Specification`, `Libxmlsec1` |
+| `empty_digest_input` | `Accept`, `Refuse` |
 
 These interpretation choices are not ordered security levels. Restrictive
 composition rejects incompatible modes rather than selecting the last value.
+`empty_digest_input` is the exception: it is a restriction, so a layer that
+refuses to digest a Reference whose transforms produce no octets keeps
+refusing it whatever another layer says. The libxmlsec1-compatible library
+honours a caller's `XMLSEC_TRANSFORMCTX_FLAGS_ALLOW_EMPTY_INPUT` only while
+the policy accepts empty digest input.
 
 ## Key Trust And Sources
 
