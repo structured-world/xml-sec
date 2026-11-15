@@ -212,8 +212,7 @@ XMLSEC_EXPORT int               xmlSecKeyMatch          (xmlSecKeyPtr key,
 
 XMLSEC_EXPORT xmlSecKeyPtr      xmlSecKeyReadBuffer     (xmlSecKeyDataId dataId,
                                                          xmlSecBuffer* buffer);
-XMLSEC_EXPORT xmlSecKeyPtr      xmlSecKeyReadBinaryFile (xmlSecKeyDataId dataId,
-                                                         const char* filename);
+/* xmlSecKeyReadBinaryFile is not offered: the library reads no file; the caller passes the bytes to xmlSecKeyReadMemory. */
 XMLSEC_EXPORT xmlSecKeyPtr      xmlSecKeyReadMemory     (xmlSecKeyDataId dataId,
                                                          const xmlSecByte* data,
                                                          xmlSecSize dataSize);

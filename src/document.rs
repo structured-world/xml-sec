@@ -259,6 +259,16 @@ impl XmlParseWorkBudget {
         }
     }
 
+    /// The allowance of an operation that has `remaining` of its `maximum`
+    /// left, so a refusal reports the operation's whole consumption.
+    #[cfg(all(feature = "xmldsig", feature = "owned-tree"))]
+    pub(crate) fn within(maximum: usize, remaining: usize) -> Self {
+        Self {
+            remaining: Cell::new(remaining.min(maximum)),
+            maximum,
+        }
+    }
+
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     pub(crate) fn charge_policy(&self, bytes: usize) -> Result<(), crate::policy::PolicyViolation> {
         let consumed = self.maximum.saturating_sub(self.remaining.get());

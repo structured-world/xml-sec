@@ -258,16 +258,9 @@ typedef int                    (*xmlSecSimpleKeysStoreAdoptKeyFunc)     (xmlSecK
 XMLSEC_EXPORT xmlSecKeyStoreId          xmlSecSimpleKeysStoreGetKlass   (void);
 XMLSEC_EXPORT int                       xmlSecSimpleKeysStoreAdoptKey   (xmlSecKeyStorePtr store,
                                                                          xmlSecKeyPtr key);
-XMLSEC_EXPORT int                       xmlSecSimpleKeysStoreLoad       (xmlSecKeyStorePtr store,
-                                                                         const char *uri,
-                                                                         xmlSecKeysMngrPtr keysMngr);
-XMLSEC_EXPORT int                       xmlSecSimpleKeysStoreLoad_ex    (xmlSecKeyStorePtr store,
-                                                                         const char *uri,
-                                                                         xmlSecKeysMngrPtr keysMngr,
-                                                                         xmlSecSimpleKeysStoreAdoptKeyFunc adoptKeyFunc);
-XMLSEC_EXPORT int                       xmlSecSimpleKeysStoreSave       (xmlSecKeyStorePtr store,
-                                                                         const char *filename,
-                                                                         xmlSecKeyDataType type);
+/* xmlSecSimpleKeysStoreLoad is not offered: the library reads no file; the caller reads its keys and adopts them. */
+/* xmlSecSimpleKeysStoreLoad_ex is not offered: the library reads no file; the caller reads its keys and adopts them. */
+/* xmlSecSimpleKeysStoreSave is not offered: the library writes no file; the caller writes its keys. */
 XMLSEC_EXPORT xmlSecPtrListPtr          xmlSecSimpleKeysStoreGetKeys    (xmlSecKeyStorePtr store);
 
 

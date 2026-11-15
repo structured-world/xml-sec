@@ -74,6 +74,38 @@ impl Drop for Buffer {
     }
 }
 
+std::thread_local! {
+    /// The blocks growth released on this thread, as they were at release.
+    static RELEASED: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Records a block growth releases, called just before it is freed.
+pub(super) fn released(block: &[u8]) {
+    RELEASED.with(|blocks| blocks.borrow_mut().push(block.to_vec()));
+}
+
+/// Growth moves the contents to a new block and releases the old one wiped:
+/// a key the buffer held does not stay in freed heap memory.
+#[test]
+fn growth_wipes_the_block_it_leaves() {
+    let _defaults = defaults();
+    let buf = Buffer::new(16);
+    let secret = [0xA5_u8; 16];
+    assert_eq!(buf.append(&secret), 0);
+    let old_max = buf.max_size();
+    RELEASED.with(|blocks| blocks.borrow_mut().clear());
+    // SAFETY: the buffer is live.
+    assert_eq!(unsafe { xmlSecBufferSetMaxSize(buf.0, old_max + 1) }, 0);
+    let released = RELEASED.with(std::cell::RefCell::take);
+    assert_eq!(released.len(), 1, "one block is released");
+    assert_eq!(released[0].len(), old_max);
+    assert!(
+        released[0].iter().all(|&byte| byte == 0),
+        "the old block is wiped"
+    );
+    assert_eq!(buf.contents(), secret);
+}
+
 /// A zero-size buffer allocates nothing; any other gets at least the
 /// default 1024 bytes, all zero.
 #[test]

@@ -20,6 +20,64 @@ fn children(tree: &OwnedTree, node: TreeNode) -> Vec<TreeNode> {
 }
 
 #[test]
+#[cfg(feature = "xmldsig")]
+fn a_parse_within_an_operation_charges_decoding_and_the_decoded_text() {
+    // A UTF-16 document costs its encoded octets (decoding) plus the UTF-8
+    // text the parser reads; a parse that fails still keeps what it spent,
+    // and an operation without the work left is refused.
+    let mut xml = alloc::vec![0xff_u8, 0xfe];
+    let text = alloc::format!("<r>{}</r>", "\u{0800}".repeat(10));
+    xml.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+    let policy = VerificationPolicy::default();
+    let mut spent = 0;
+    OwnedTree::parse_parts_within(&[&xml], &policy, &mut spent).expect("the document parses");
+    assert_eq!(spent, xml.len() + text.len());
+    let broken = b"<r>";
+    let before = spent;
+    assert!(OwnedTree::parse_parts_within(&[broken], &policy, &mut spent).is_err());
+    assert_eq!(
+        spent,
+        before + 2 * broken.len(),
+        "a failed parse keeps its work"
+    );
+    let mut tight = VerificationPolicy::default();
+    tight.resources.max_xml_parse_work_bytes = xml.len() + text.len() - 1;
+    let mut spent = 0;
+    assert!(matches!(
+        OwnedTree::parse_parts_within(&[&xml], &tight, &mut spent),
+        Err(XmlDocumentError::Policy(PolicyViolation::ResourceLimit {
+            resource: resource_name::XML_PARSE_WORK_BYTES,
+            ..
+        }))
+    ));
+}
+
+#[test]
+#[cfg(feature = "xmldsig")]
+fn a_parse_within_an_operation_charges_the_entities_it_expands() {
+    // Entity expansion is parse work: an operation's allowance that covers
+    // the source passes (decoding, the declaration scan and the parse, each
+    // the length of the text) but not the expanded text refuses the document.
+    let mut policy = VerificationPolicy::default();
+    policy.xml.allow_internal_dtd = true;
+    let xml = r#"<!DOCTYPE r [<!ENTITY a "0123456789"><!ENTITY b "&a;&a;">]><r>&b;&b;</r>"#;
+    let mut spent = 0;
+    OwnedTree::parse_parts_within(&[xml.as_bytes()], &policy, &mut spent)
+        .expect("the document parses");
+    // `b` twice (6 octets each) and `a` four times (10 octets each).
+    assert_eq!(spent, 3 * xml.len() + 2 * 6 + 4 * 10);
+    policy.resources.max_xml_parse_work_bytes = 3 * xml.len();
+    let mut spent = 0;
+    assert!(matches!(
+        OwnedTree::parse_parts_within(&[xml.as_bytes()], &policy, &mut spent),
+        Err(XmlDocumentError::Policy(PolicyViolation::ResourceLimit {
+            resource: resource_name::XML_PARSE_WORK_BYTES,
+            ..
+        }))
+    ));
+}
+
+#[test]
 fn a_parse_reads_names_namespaces_attributes_and_text() {
     let tree = parsed(r#"<a:r xmlns:a="urn:a" id="1"><c>t</c><!--x--></a:r>"#);
     let root = tree.root_element().expect("a document element");

@@ -241,6 +241,35 @@ fn xml_parser_push_is_bounded_by_the_document_limit() {
     assert_eq!(run(&document_of(limit + 1)), -1);
 }
 
+/// The parse work a document costs is its decoding and the decoded text the
+/// parser reads, not its encoded length: a UTF-16 document of 2016 octets
+/// that decodes to 3007 octets of UTF-8 costs more than a 4000-octet
+/// allowance, though its encoded length fits it.
+#[test]
+fn xml_parser_charges_the_decoded_text_it_parses() {
+    crate::ffi::tests::own_process();
+    crate::ffi::policy::republish(
+        |verification| verification.resources.max_xml_parse_work_bytes = 4000,
+        |_| {},
+    )
+    .expect("the library policy compiles");
+    let mut xml = vec![0xff, 0xfe];
+    let text: String = core::iter::once("<r>")
+        .chain(core::iter::repeat_n("\u{0800}", 1000))
+        .chain(core::iter::once("</r>"))
+        .collect();
+    xml.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+    assert_eq!(xml.len(), 2016);
+    // SAFETY: the context and its transform are used while live.
+    unsafe {
+        let ctx = xmlSecTransformCtxCreate();
+        let parser = xmlSecTransformCtxCreateAndAppend(ctx, super::parser::xml_parser());
+        let status = super::xmlSecTransformPushBin(parser, xml.as_ptr(), xml.len(), 1, ctx);
+        xmlSecTransformCtxDestroy(ctx);
+        assert_eq!(status, -1);
+    }
+}
+
 /// The parser klass popping its input reads at most the policy's document
 /// size from the previous transform.
 #[test]
@@ -459,7 +488,7 @@ fn library_policy_runs_the_relationship_transform() {
             document.root(),
             TransformData::NodeSet(NodeSet::entire_document_without_comments(document)?),
             &transforms,
-            policy,
+            &*policy,
         )
     });
     let output = String::from_utf8(output.expect("relationship transform")).expect("UTF-8");

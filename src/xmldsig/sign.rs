@@ -1131,6 +1131,9 @@ pub(crate) fn decode_dsa_signing_key(
 #[cfg(test)]
 mod dsa_import_tests;
 
+mod signature_value;
+pub use signature_value::sign_signature_value;
+
 impl SigningKey for DsaSigningKey {
     fn sign(
         &self,
