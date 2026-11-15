@@ -69,6 +69,22 @@ fn registry_holds_the_defaults_in_order() {
     }
 }
 
+/// A reset drops the parent key info context with the run: it belongs to the
+/// caller that set it for one run and must not reach the next one.
+#[test]
+fn a_reset_forgets_the_parent_key_info_context() {
+    // SAFETY: the context is created and destroyed here; the parent pointer
+    // is only stored, never dereferenced.
+    unsafe {
+        let ctx = xmlSecTransformCtxCreate();
+        let mut parent = 0_u8;
+        (*ctx).parent_key_info_ctx = (&raw mut parent).cast();
+        super::ctx::xmlSecTransformCtxReset(ctx);
+        assert!((*ctx).parent_key_info_ctx.is_null());
+        xmlSecTransformCtxDestroy(ctx);
+    }
+}
+
 /// A binary chain through Base64 encoding runs through the default push
 /// methods into the memory-buffer terminal that becomes the result.
 #[test]

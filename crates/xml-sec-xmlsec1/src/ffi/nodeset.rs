@@ -389,6 +389,12 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetGetChildren(
             c"doc != NULL",
             std::ptr::null_mut()
         );
+        check!(
+            parent.is_null() || nodes::doc(parent) == doc,
+            "xmlSecNodeSetGetChildren",
+            c"(parent == NULL) || (parent->doc == doc)",
+            std::ptr::null_mut()
+        );
         let here = here!("xmlSecNodeSetGetChildren");
         let set = nodes::node_set(parent);
         if set.is_null() {

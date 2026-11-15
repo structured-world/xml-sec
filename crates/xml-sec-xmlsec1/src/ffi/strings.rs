@@ -1057,7 +1057,7 @@ pub(crate) static xmlSecNodeDHPublic: [u8; 7] = *b"Public\0";
 pub(crate) static xmlSecNodeDHQ: [u8; 2] = *b"Q\0";
 
 #[unsafe(no_mangle)]
-pub(crate) static xmlSecNodeDHSeed: [u8; 5] = *b"Seed\0";
+pub(crate) static xmlSecNodeDHSeed: [u8; 5] = *b"seed\0";
 
 #[unsafe(no_mangle)]
 pub(crate) static xmlSecNodeDSAG: [u8; 2] = *b"G\0";

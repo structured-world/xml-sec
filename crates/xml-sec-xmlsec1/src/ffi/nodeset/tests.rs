@@ -123,6 +123,24 @@ fn refusals() {
     }
 }
 
+/// The children of a node are a set over the node's own document: a parent
+/// from another document is refused rather than paired with the wrong one.
+#[test]
+fn children_of_a_node_from_another_document_are_refused() {
+    let doc = parse(b"<a><b/></a>");
+    let other = parse(b"<c><d/></c>");
+    // SAFETY: the documents and the set are used while live.
+    unsafe {
+        let root = nodes::root_element(other);
+        assert!(xmlSecNodeSetGetChildren(doc, root, 1, 0).is_null());
+        let own = xmlSecNodeSetGetChildren(other, root, 1, 0);
+        assert!(!own.is_null(), "a node of the set's document is accepted");
+        xmlSecNodeSetDestroy(own);
+        xml_sec_libxml2::ffi::tree::xsFreeDoc(doc);
+        xml_sec_libxml2::ffi::tree::xsFreeDoc(other);
+    }
+}
+
 /// Records each visited node's name, or a text node's content.
 unsafe extern "C" fn record(
     _set: *mut XmlSecNodeSet,

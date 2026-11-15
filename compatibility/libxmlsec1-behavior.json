@@ -310,12 +310,12 @@
       "donor_anchors": [
         {
           "source": "src/transforms.c",
-          "line": 2075,
+          "line": 2078,
           "needle": "middleId = xmlSecTransformXmlParserId;"
         },
         {
           "source": "src/transforms.c",
-          "line": 2083,
+          "line": 2086,
           "needle": "middleId = xmlSecTransformInclC14NId;"
         }
       ]
@@ -334,12 +334,12 @@
       "donor_anchors": [
         {
           "source": "src/transforms.c",
-          "line": 1002,
+          "line": 1005,
           "needle": "transform = xmlSecTransformCtxCreateAndPrepend(ctx, xmlSecTransformXPointerId);"
         },
         {
           "source": "src/transforms.c",
-          "line": 1022,
+          "line": 1025,
           "needle": "transform = xmlSecTransformCtxCreateAndPrepend(ctx, xmlSecTransformVisa3DHackId);"
         }
       ]
@@ -358,7 +358,7 @@
       "donor_anchors": [
         {
           "source": "src/xmltree.c",
-          "line": 1077,
+          "line": 1103,
           "needle": "xmlSecAddIDs(xmlDocPtr doc, xmlNodePtr node, const xmlChar** ids)"
         },
         {

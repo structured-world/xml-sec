@@ -570,7 +570,8 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxFinalize(ctx: *mut XmlSecTrans
 }
 
 /// `xmlSecTransformCtxReset`: destroys the chain, the URI, the extra key
-/// data and the result, keeping the user settings.
+/// data and the result and forgets the parent key info context, keeping the
+/// user settings.
 ///
 /// # Safety
 /// `ctx` is null or an initialized context.
@@ -604,6 +605,9 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxReset(ctx: *mut XmlSecTransfor
             }
             context.first = std::ptr::null_mut();
             context.last = std::ptr::null_mut();
+            // The parent key info context belongs to the caller that set it
+            // for this run.
+            context.parent_key_info_ctx = std::ptr::null_mut();
         }
     });
 }
