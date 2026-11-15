@@ -24,6 +24,7 @@ use super::list::{
 use super::nodeset::{XmlSecNodeSet, xmlSecNodeSetDestroy};
 use super::tree::xmlStrEqual;
 use super::{contain, free, malloc, write_stream};
+use xml_sec::policy::{EmptyDigestInput, PolicyViolation};
 
 pub(crate) mod builtin;
 pub(crate) mod ctx;
@@ -1169,16 +1170,38 @@ pub(crate) unsafe extern "C" fn xmlSecTransformExecute(
         // counts only the former, and so refuses bytes a caller appended to
         // the buffer itself, which are input all the same.
         let digest_or_signature = klass.usage & (USAGE_DIGEST_METHOD | USAGE_SIGNATURE_METHOD) != 0;
-        // SAFETY: a non-null context by the caller's contract.
-        let allowed = unsafe { (*ctx).flags } & ctx::FLAGS_ALLOW_EMPTY_INPUT != 0;
         let empty = object.in_total_size == 0 && object.in_buf.size == 0;
-        if last != 0 && digest_or_signature && !allowed && empty {
-            errors::invalid_data(
-                here!("xmlSecTransformExecute"),
-                klass.name.cast(),
-                "empty (0-length) input is not allowed for digest and signature transforms",
-            );
-            return -1;
+        if last != 0 && digest_or_signature && empty {
+            let here = here!("xmlSecTransformExecute");
+            // SAFETY: a non-null context by the caller's contract.
+            if unsafe { (*ctx).flags } & ctx::FLAGS_ALLOW_EMPTY_INPUT == 0 {
+                errors::invalid_data(
+                    here,
+                    klass.name.cast(),
+                    "empty (0-length) input is not allowed for digest and signature transforms",
+                );
+                return -1;
+            }
+            // The caller's flag allows what the operation's policy accepts:
+            // a policy that refuses empty digest input refuses it whatever
+            // the flag says.
+            // SAFETY: a non-null context, initialized by the caller's contract.
+            let Some(pinned) = (unsafe { ctx::run_policy(ctx, here) }) else {
+                return -1;
+            };
+            let transforms = if object.operation == OPERATION_SIGN {
+                &pinned.signing.transforms
+            } else {
+                &pinned.verification.transforms
+            };
+            if transforms.empty_digest_input == EmptyDigestInput::Refuse {
+                errors::invalid_data(
+                    here,
+                    klass.name.cast(),
+                    &PolicyViolation::EmptyDigestInput.to_string(),
+                );
+                return -1;
+            }
         }
         // SAFETY: the klass method keeps libxmlsec1's contract.
         unsafe { execute(transform, last, ctx) }

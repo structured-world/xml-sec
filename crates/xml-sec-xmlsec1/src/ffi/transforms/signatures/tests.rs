@@ -447,6 +447,30 @@ fn the_empty_message_is_signed_only_when_the_context_allows_it() {
 }
 
 #[test]
+fn a_policy_refusing_empty_digest_input_overrides_the_contexts_permission() {
+    // The context flag allows the empty message only while the operation's
+    // policy accepts empty digest input: a policy that refuses it refuses
+    // signing and verifying nothing even in a context that allows it.
+    own_process();
+    let refuse = xml_sec::policy::EmptyDigestInput::Refuse;
+    policy::republish(
+        |verification| verification.transforms.empty_digest_input = refuse,
+        |signing| signing.transforms.empty_digest_input = refuse,
+    )
+    .expect("the library policy compiles");
+    let allow = crate::ffi::transforms::ctx::FLAGS_ALLOW_EMPTY_INPUT;
+    assert_eq!(
+        run_with_flags(allow, OPERATION_SIGN, private_key(), &[], &[]),
+        Err(-1)
+    );
+    assert_eq!(
+        run_with_flags(allow, OPERATION_VERIFY, public_key(), &[], &[0; 256]),
+        Err(-1)
+    );
+    assert!(run(OPERATION_SIGN, private_key(), b"data", &[]).is_ok());
+}
+
+#[test]
 fn input_a_caller_buffered_itself_is_not_empty() {
     // Bytes appended to the transform's input buffer and executed as the
     // last chunk are input like pushed bytes: they are signed, not refused
