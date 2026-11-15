@@ -562,6 +562,11 @@ fn execute(request: &Request) -> Result<(), Failure> {
             "Dependency graph changed during measurement; discard results",
         ));
     }
+    if installed_commit(&prefix)? != donor {
+        return Err(changed(
+            "libxmlsec1 installation changed during measurement; discard results",
+        ));
+    }
     record(
         &root,
         request,
