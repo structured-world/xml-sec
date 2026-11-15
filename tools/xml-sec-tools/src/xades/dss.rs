@@ -183,11 +183,15 @@ fn bootstrap(corpus: &Corpus, logs: &Path) -> Result<(), String> {
         &curl(&[&"--output", &archive, &url]),
         &logs.join("download"),
     )?;
-    let published = corpus.require(
-        &curl(&[&format!("{url}.sha512")]),
+    // The checksum goes to a file: a retry rewrites a file from its start,
+    // where it would append to captured stdout.
+    let checksum = tools.join("maven.tar.gz.sha512");
+    corpus.require(
+        &curl(&[&"--output", &checksum, &format!("{url}.sha512")]),
         &logs.join("download-sha512"),
     )?;
-    let published = String::from_utf8_lossy(&published.stdout);
+    let published = read(&checksum)?;
+    let published = String::from_utf8_lossy(&published);
     let expected = published.split_whitespace().next().unwrap_or_default();
     if super::hex(&sha2::Sha512::digest(read(&archive)?)) != expected {
         return Err("Maven distribution SHA-512 mismatch".into());

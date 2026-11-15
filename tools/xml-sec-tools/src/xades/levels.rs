@@ -688,6 +688,9 @@ fn dss_signatures(corpus: &super::Corpus, results: &std::path::Path) -> Result<(
             let url = format!(
                 "https://raw.githubusercontent.com/esig/dss/{DSS_RELEASE}/dss-xades/src/test/resources/validation/{file}"
             );
+            // A failed fetch leaves no `target`, so the next run fetches again
+            // instead of reading a truncated file.
+            let partial = directory.join(format!("{file}.part"));
             let fetch = super::line(&[
                 &"curl",
                 &"--fail",
@@ -696,10 +699,11 @@ fn dss_signatures(corpus: &super::Corpus, results: &std::path::Path) -> Result<(
                 &"--retry",
                 &"5",
                 &"--output",
-                &target,
+                &partial,
                 &url,
             ]);
             corpus.require(&fetch, &directory.join(format!("{file}-fetch")))?;
+            std::fs::rename(&partial, &target).map_err(|error| error.to_string())?;
         }
         let mut probe = super::line(&[
             &"cargo",
