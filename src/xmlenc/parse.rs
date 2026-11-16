@@ -928,9 +928,14 @@ fn parse_key_info<'doc>(
 ) -> Result<ParsedKeyInfo, XmlEncError> {
     require_element(node, XMLDSIG_NS, "KeyInfo")?;
     policy.resources.validate_key_info_reference_depth(depth)?;
+    // Counts what `charge_recipient` counts below: an ML-KEM EncryptedKey is
+    // a KEM ciphertext bounded by the key-source budget, not a recipient.
     let recipients = node
         .children()
-        .filter(|child| child.has_tag_name((XMLENC_NS, "EncryptedKey")))
+        .filter(|child| {
+            child.has_tag_name((XMLENC_NS, "EncryptedKey"))
+                && crate::key_establishment::encapsulation_algorithm(*child).is_none()
+        })
         .count();
     if recipients > policy.resources.max_encryption_recipients {
         return Err(crate::policy::PolicyViolation::ResourceLimit {

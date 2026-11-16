@@ -6055,6 +6055,38 @@ mod tests {
 
     #[cfg(feature = "experimental-pq")]
     #[test]
+    fn kem_encrypted_keys_are_not_counted_as_wrapped_recipients() {
+        // The recipient limit counts wrapped or transported keys; an ML-KEM
+        // EncryptedKey carries a KEM ciphertext bounded by the key-source and
+        // cipher-value budgets instead. The KeyInfo pre-count must agree with
+        // the per-key checks, so a limit of zero still admits it.
+        let document = crate::XmlDomDocument::parse(include_str!(
+            "../../tests/fixtures/xmlenc/aleksey-xmlenc-01/enc-aes128gcm-kt-ml-kem-512.xml"
+        ))
+        .expect("valid donor XML");
+        let node = document
+            .descendants()
+            .find(|node| node.has_tag_name((crate::xmlenc::types::XMLENC_NS, "EncryptedData")))
+            .expect("donor EncryptedData");
+        let mut policy = crate::policy::DecryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_encryption_recipients: 0,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::DecryptionPolicy::default()
+        };
+        policy
+            .key_establishment
+            .encapsulation_algorithms
+            .insert(crate::provider::KeyEncapsulationAlgorithm::MlKem512);
+        let data = super::super::parse_encrypted_data_node_with_policy(node, &policy)
+            .expect("an ML-KEM EncryptedKey is not a wrapped recipient");
+        assert_eq!(data.encapsulation_methods.len(), 1);
+        assert!(data.encrypted_keys.is_empty());
+    }
+
+    #[cfg(feature = "experimental-pq")]
+    #[test]
     fn typed_kem_ciphertext_shares_aggregate_cipher_value_budget() {
         // Typed input must charge the same base64-projected KEM ciphertext as
         // XML input, including descriptors nested under an EncryptedKey.
