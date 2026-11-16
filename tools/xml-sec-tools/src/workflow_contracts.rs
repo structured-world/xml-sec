@@ -206,7 +206,9 @@ fn cached_native_oracles_still_pass_installer_provenance_and_capability_validati
     // belongs to the source commit it was built from: a commit upstream
     // master moves to gets a new entry instead of a rebuild on every run.
     let workflow = read(".github/workflows/ci.yml");
-    assert_eq!(count(&workflow, "profile: modern"), 5);
+    // Coverage, the test blocks, the ledger and the XML interoperability job
+    // each build one oracle.
+    assert_eq!(count(&workflow, "profile: modern"), 4);
     assert!(!pattern(r"if:.*cache-hit").is_match(&workflow));
     let action = read(".github/actions/xmlsec-oracle-cache/action.yml");
     assert!(action.contains("path: ${{ inputs.prefix }}"));
@@ -216,8 +218,8 @@ fn cached_native_oracles_still_pass_installer_provenance_and_capability_validati
     let uses = pattern(
         r"uses: \./\.github/actions/xmlsec-oracle-cache\n\s+with:\n\s+profile: modern\n\s+commit: \$\{\{ steps\.[a-z-]+\.outputs[^\n]+\}\}\n\s+prefix: [^\n]+\n",
     );
-    assert_eq!(uses.find_iter(&workflow).count(), 5);
-    assert_eq!(count(&workflow, "xml-sec-tools -- install-xmlsec1\n"), 5);
+    assert_eq!(uses.find_iter(&workflow).count(), 4);
+    assert_eq!(count(&workflow, "xml-sec-tools -- install-xmlsec1\n"), 4);
 }
 
 /// Runs the runner-image action's script with `image` as `ImageOS`.
@@ -603,18 +605,15 @@ fn coverage_checkout_references_resolve_existing_pinned_oracle_revisions() {
         .unwrap();
     assert!(status.success());
     let pins = std::fs::read_to_string(output).unwrap();
-    for donor in ["libxmlsec1-1.3.13", "libxslt-1.1.45"] {
-        let pinned = read(&format!("compatibility/{donor}-donor-commit.txt"));
-        assert!(
-            pins.lines()
-                .any(|line| line == format!("{donor}={}", pinned.trim())),
-            "{donor}"
-        );
-        assert!(
-            coverage.contains(&format!("steps.coverage-oracles.outputs['{donor}']")),
-            "{donor}"
-        );
-    }
+    let pinned = read("compatibility/libxslt-1.1.45-donor-commit.txt");
+    assert!(
+        pins.lines()
+            .any(|line| line == format!("libxslt={}", pinned.trim()))
+    );
+    assert!(coverage.contains("ref: ${{ steps.coverage-oracles.outputs.libxslt }}"));
+    // The libxmlsec1 oracle is upstream master, recorded by the run.
+    assert!(coverage.contains("repository: lsh123/xmlsec\n          ref: master\n"));
+    assert!(!coverage.contains("libxmlsec1-1.3.13"));
 }
 
 #[test]

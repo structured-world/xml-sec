@@ -49,44 +49,38 @@ jobs:
   coverage:
     name: canonical line coverage (85%)
     runs-on: ubuntu-latest
-    # The C surface (XMLSEC1_PREFIX) follows upstream master; the CLI and
-    # interoperability tests (XMLSEC1_BIN) still follow the recorded snapshot.
+    # The C surface and the interoperability tests use one libxmlsec1 oracle,
+    # built from upstream master as it is when the job runs.
     env:
       PKCS11_MODULE: /usr/lib/softhsm/libsofthsm2.so
       LIBXSLT_SOURCE_DIR: ${{ github.workspace }}/donors/libxslt
       XMLSEC1_PREFIX: ${{ github.workspace }}/.tools/xmlsec1-master
+      XMLSEC1_BIN: ${{ github.workspace }}/.tools/xmlsec1-master/bin/xmlsec1
+      LD_LIBRARY_PATH: ${{ github.workspace }}/.tools/xmlsec1-master/lib
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: ./.github/actions/free-runner-disk
-      - name: Read pinned oracle revisions
+      - name: Read pinned libxslt revision
         id: coverage-oracles
         run: |
-          for donor in libxmlsec1-1.3.13 libxslt-1.1.45; do
-            commit="$(cat compatibility/$donor-donor-commit.txt)"
-            [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
-            echo "$donor=$commit" >> "$GITHUB_OUTPUT"
-          done
-      - uses: actions/checkout@v7
-        with:
-          repository: lsh123/xmlsec
-          ref: ${{ steps.coverage-oracles.outputs['libxmlsec1-1.3.13'] }}
-          path: donors/xmlsec
-          persist-credentials: false
+          commit="$(cat compatibility/libxslt-1.1.45-donor-commit.txt)"
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          echo "libxslt=$commit" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v7
         with:
           repository: lsh123/xmlsec
           ref: master
-          path: donors/xmlsec-master
+          path: donors/xmlsec
           persist-credentials: false
       - name: Record the upstream master commit
         id: master-source
-        run: echo "commit=$(git -C donors/xmlsec-master rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        run: echo "commit=$(git -C donors/xmlsec rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v7
         with:
           repository: GNOME/libxslt
-          ref: ${{ steps.coverage-oracles.outputs['libxslt-1.1.45'] }}
+          ref: ${{ steps.coverage-oracles.outputs.libxslt }}
           path: donors/libxslt
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
@@ -103,27 +97,19 @@ jobs:
       - uses: ./.github/actions/xmlsec-oracle-cache
         with:
           profile: modern
-          commit: ${{ steps.coverage-oracles.outputs['libxmlsec1-1.3.13'] }}
-          prefix: ${{ github.workspace }}/.tools/xmlsec1-1.3.13
-      - uses: ./.github/actions/xmlsec-oracle-cache
-        with:
-          profile: modern
           commit: ${{ steps.master-source.outputs.commit }}
           prefix: ${{ env.XMLSEC1_PREFIX }}
       - name: Install oracle build dependencies and token
         uses: ./.github/actions/apt-packages
         with:
           packages: autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config softhsm2 cmake zlib1g-dev liblzma-dev
-      - name: Provision independent oracles and disposable token support
+      - name: Provision the oracle and disposable token support
         env:
           XMLSEC1_MODERN_ORACLE: "1"
-          SNAPSHOT_PREFIX: ${{ github.workspace }}/.tools/xmlsec1-1.3.13
+          XMLSEC1_SOURCE_DIR: ${{ github.workspace }}/donors/xmlsec
         run: |
-          XMLSEC1_PREFIX="$SNAPSHOT_PREFIX" XMLSEC1_SOURCE_DIR="$GITHUB_WORKSPACE/donors/xmlsec" \
-            cargo run --quiet -p xml-sec-tools -- install-xmlsec1
-          XMLSEC1_SOURCE_DIR="$GITHUB_WORKSPACE/donors/xmlsec-master" \
-            cargo run --quiet -p xml-sec-tools -- install-xmlsec1
-          echo "OPENSSL_BIN=$SNAPSHOT_PREFIX/bin/openssl" >> "$GITHUB_ENV"
+          cargo run --quiet -p xml-sec-tools -- install-xmlsec1
+          echo "OPENSSL_BIN=$XMLSEC1_PREFIX/bin/openssl" >> "$GITHUB_ENV"
       - name: Execute every workspace target and enforce canonical coverage
         run: cargo run --quiet -p xml-sec-tools -- hardening coverage "$RUNNER_TEMP/coverage"
       - name: Build the packaged crate and run every test from its archive
@@ -442,10 +428,15 @@ jobs:
     name: test block (${{ matrix.block }})
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    # The external-oracle tests run against upstream master as it is when the
+    # job runs.
     env:
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
+      XMLSEC1_PREFIX: ${{ github.workspace }}/.tools/xmlsec1-master
+      XMLSEC1_BIN: ${{ github.workspace }}/.tools/xmlsec1-master/bin/xmlsec1
+      LD_LIBRARY_PATH: ${{ github.workspace }}/.tools/xmlsec1-master/lib
     strategy:
       fail-fast: false
       matrix:
@@ -460,18 +451,15 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/free-runner-disk
-      - name: Read pinned donor revision
-        id: test-donor-revision
-        run: |
-          commit="$(cat compatibility/libxmlsec1-1.3.13-donor-commit.txt)"
-          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
-          echo "commit=$commit" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v7
         with:
           repository: lsh123/xmlsec
-          ref: ${{ steps.test-donor-revision.outputs.commit }}
+          ref: master
           path: donors/xmlsec
           persist-credentials: false
+      - name: Record the upstream master commit
+        id: test-donor-revision
+        run: echo "commit=$(git -C donors/xmlsec rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -496,7 +484,7 @@ jobs:
         uses: ./.github/actions/apt-packages
         with:
           packages: autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config
-      - name: Build pinned xmlsec1 for external-oracle tests
+      - name: Build the xmlsec1 oracle from the checked-out master
         env:
           XMLSEC1_SOURCE_DIR: ${{ github.workspace }}/donors/xmlsec
           XMLSEC1_MODERN_ORACLE: "1"
