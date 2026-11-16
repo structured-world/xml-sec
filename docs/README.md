@@ -38,12 +38,16 @@ implied by this documentation.
 ## Reproduce Documentation Checks
 
 Run `cargo run -p xml-sec-tools -- documentation`.
-It rejects missing core/config public rustdoc and broken intra-doc links, compiles
+It rejects `xml-sec` dependency examples outside the release line of the
+package version, missing core/config public rustdoc and broken intra-doc links, compiles
 doctests, executes both API levels and their rejection paths, and tests the
 exact policy sample through the real configuration loader/compiler. It needs
 Rust, cargo-nextest and the [native FIPS build toolchain](features.md) for
 all-feature rustdoc, but no network oracle or token.
 `cargo run -p xml-sec-tools -- documentation docs` runs only the core/config rustdoc gate.
+`cargo run -p xml-sec-tools -- documentation readme` checks only the dependency
+examples in the README, the guides and the crate READMEs; `--write` sets them to the
+release line, which the release workflow does on the release pull request.
 
 Public core rustdoc covers exported library items, not the unpublished private
 XPath/parser implementation kernels. Alloc-only (no `std`) and native-provider

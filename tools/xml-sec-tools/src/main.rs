@@ -44,7 +44,7 @@ commands:
   capi [--sanitize | --xmlsec1]
   check-features PROFILE [all|lint|test|doc]
   ci-blocks BLOCK
-  documentation [all|docs]
+  documentation [all|docs|readme [--write]]
   donor-fixtures [--xmlenc-corpora | PATH... | --cli [--check]]
   fetch-standards
   fuzz-security TARGET|asan [smoke|campaign|replay] [--cache-managed]
