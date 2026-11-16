@@ -117,7 +117,7 @@ fn builder_preserves_context_through_public_signing_pipeline() {
         DsigStatus, EdDsaSigningKey, ReferenceBuilder, SignContext, SignatureAlgorithm,
         SignatureBuilder, SignatureContext, SigningKey, Transform, VerificationKey, VerifyContext,
     };
-    // Context is authenticated SignedInfo data, not an out-of-band signer option.
+    // Context is signature input carried in the document, not an out-of-band signer option.
     // The builder must encode it and the verifier must recover the same bytes.
     let algorithm = SignatureAlgorithm::Ed25519Ctx;
     let der = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])
@@ -136,7 +136,30 @@ fn builder_preserves_context_through_public_signing_pipeline() {
         .sign_with_builder("<root>payload</root>", &builder)
         .unwrap()
         .output;
-    assert!(signed.contains(">Zm9v</"));
+    // draft-eastlake-rfc9231bis-xmlsec-uris-09 section 3.3.15 places the
+    // context in a ds:Object, not among the SignatureMethod parameters.
+    let document = xml_sec::Document::parse(&signed).unwrap();
+    let context = document
+        .descendants()
+        .find(|node| node.has_tag_name((CONTEXT_NS, "SignatureContext")))
+        .unwrap();
+    assert_eq!(context.text(), Some("Zm9v"));
+    assert!(
+        context
+            .parent()
+            .unwrap()
+            .has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "Object"))
+    );
+    assert!(
+        document
+            .descendants()
+            .find(
+                |node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "SignatureMethod"))
+            )
+            .unwrap()
+            .children()
+            .all(|node| !node.is_element())
+    );
     let verifier = VerificationKey {
         algorithm,
         public_key_bytes: key.public_key_info().unwrap().spki_der().unwrap().to_vec(),

@@ -355,8 +355,9 @@ impl SignatureBuilder {
         self
     }
 
-    /// Set the authenticated cryptographic context for a context-capable method.
-    /// Nonempty contexts on other methods are rejected, never silently ignored.
+    /// Set the cryptographic context for a context-capable method; it is
+    /// written as the `SignatureContext` of a `ds:Object`. Nonempty contexts on
+    /// other methods are rejected, never silently ignored.
     #[must_use]
     pub fn signature_context(mut self, context: SignatureContext) -> Self {
         self.signature_context = context;
@@ -505,6 +506,7 @@ impl SignatureBuilder {
         for object in &self.objects {
             write_object(writer, prefix, object)?;
         }
+        self.write_signature_context(writer, prefix)?;
         writer.end(&signature_name)?;
         Ok(())
     }
@@ -544,33 +546,43 @@ impl SignatureBuilder {
             writer.end("SaltLength")?;
             writer.end("RSAPSSParams")?;
             writer.end(&method_name)?;
-        } else if self.signature_context.as_bytes().is_empty() {
-            write_algorithm(writer, prefix, "SignatureMethod", self.sign_method.uri())?;
         } else {
-            let method_name = qualified_name(prefix, "SignatureMethod");
-            writer.start(&method_name, [("Algorithm", self.sign_method.uri())])?;
-            // RFC 8032 §5 defines the octet context; this XML parameter is
-            // upstream libxmlsec1's extension, not part of RFC 9231's URI contract.
-            // https://www.rfc-editor.org/rfc/rfc8032.html#section-5
-            // Use a local default namespace to avoid collisions with caller prefixes.
-            if !self.sign_method.takes_signature_context() {
-                return Err(SignatureBuilderError::SignatureContextNotApplicable(
-                    self.sign_method.uri(),
-                ));
-            }
-            let context_name = super::parse::SIGNATURE_CONTEXT_ELEMENT;
-            writer.start(
-                context_name,
-                [("xmlns", super::parse::SIGNATURE_CONTEXT_NS)],
-            )?;
-            let mut encoded = [0_u8; 340];
-            let length = base64::engine::general_purpose::STANDARD
-                .encode_slice(self.signature_context.as_bytes(), &mut encoded)
-                .map_err(std::io::Error::other)?;
-            writer.text(std::str::from_utf8(&encoded[..length]).map_err(std::io::Error::other)?)?;
-            writer.end(context_name)?;
-            writer.end(&method_name)?;
+            write_algorithm(writer, prefix, "SignatureMethod", self.sign_method.uri())?;
         }
+        Ok(())
+    }
+
+    /// A nonempty context as the `SignatureContext` of its own `ds:Object`
+    /// (draft-eastlake-rfc9231bis-xmlsec-uris-09 section 3.3.15). The bytes
+    /// are RFC 8032 section 5 / FIPS 204 domain separation: changing them
+    /// fails verification although the Object lies outside `SignedInfo`.
+    fn write_signature_context<W: Write>(
+        &self,
+        writer: &mut Writer<W>,
+        prefix: Option<&str>,
+    ) -> Result<(), SignatureBuilderError> {
+        if self.signature_context.as_bytes().is_empty() {
+            return Ok(());
+        }
+        if !self.sign_method.takes_signature_context() {
+            return Err(SignatureBuilderError::SignatureContextNotApplicable(
+                self.sign_method.uri(),
+            ));
+        }
+        write_start(writer, prefix, "Object")?;
+        // A local default namespace cannot collide with caller prefixes.
+        let context_name = super::parse::SIGNATURE_CONTEXT_ELEMENT;
+        writer.start(
+            context_name,
+            [("xmlns", super::parse::SIGNATURE_CONTEXT_NS)],
+        )?;
+        let mut encoded = [0_u8; 340];
+        let length = base64::engine::general_purpose::STANDARD
+            .encode_slice(self.signature_context.as_bytes(), &mut encoded)
+            .map_err(std::io::Error::other)?;
+        writer.text(std::str::from_utf8(&encoded[..length]).map_err(std::io::Error::other)?)?;
+        writer.end(context_name)?;
+        write_end(writer, prefix, "Object")?;
         Ok(())
     }
 

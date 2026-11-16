@@ -769,8 +769,10 @@ verification, and before signing-key callbacks. Unsupported signature methods re
 This early parameter check does not query key metadata; template signing queries it once in
 the key preflight before producing the signature.
 
-`SignatureBuilder::signature_context(SignatureContext)` places context bytes inside the
-authenticated `SignedInfo/SignatureMethod`. Contexts are limited to 255 octets by the
+`SignatureBuilder::signature_context(SignatureContext)` places context bytes in a `ds:Object`
+of the generated signature. They lie outside `SignedInfo`, but they are an input to the
+signature algorithm, so a changed or removed context fails verification. Contexts are limited
+to 255 octets by the
 cryptographic wire contract; a nonempty context on a method without context support is rejected
 rather than ignored. Context-capable methods default to an empty context. The context is a
 `SignatureContext` element in the `http://www.w3.org/2026/08/xmldsig-more#` namespace, defined
