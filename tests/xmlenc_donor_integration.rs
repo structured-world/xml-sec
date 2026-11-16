@@ -3104,6 +3104,73 @@ mod ml_kem_corpus;
 #[path = "common/xmlenc_snapshot.rs"]
 mod corpus_snapshot;
 
+#[cfg(feature = "experimental-pq")]
+#[test]
+fn decrypts_an_ml_kem_encrypted_key_named_by_a_retrieval_method() {
+    use xml_sec::provider::{KeyDecapsulationKey as _, RustCryptoMlKemPrivateKey};
+    // A same-document RetrievalMethod may name the ML-KEM EncryptedKey instead
+    // of carrying it; the key is decapsulated exactly as a direct child would
+    // be. A transformed reference to it is refused while parsing, not by a
+    // late key-transport policy error.
+    let xml =
+        std::fs::read_to_string(format!("{VECTOR_DIR}/enc-aes128gcm-kt-ml-kem-512.xml")).unwrap();
+    let expected = std::fs::read(format!("{VECTOR_DIR}/enc-aes128gcm-kt-ml-kem-512.data")).unwrap();
+    let start = xml.find("<EncryptedKey Id=\"EK\">").unwrap();
+    let end = xml.find("</EncryptedKey>").unwrap() + "</EncryptedKey>".len();
+    let key = xml[start..end].replacen(
+        "<EncryptedKey Id=\"EK\">",
+        "<EncryptedKey xmlns=\"http://www.w3.org/2001/04/xmlenc#\" xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\" Id=\"EK\">",
+        1,
+    );
+    let retrieval = |transforms: &str| {
+        let detached = format!(
+            "{}<ds:RetrievalMethod URI=\"#EK\" Type=\"http://www.w3.org/2001/04/xmlenc#EncryptedKey\">{transforms}</ds:RetrievalMethod>{}",
+            &xml[..start],
+            &xml[end..]
+        );
+        detached.replacen(
+            "<Name>John Smith</Name>",
+            &format!("<Name>John Smith</Name>{key}"),
+            1,
+        )
+    };
+    let private = RustCryptoMlKemPrivateKey::from_pkcs8_der(
+        &std::fs::read("tests/fixtures/xmldsig/keys/ml-kem/ml-kem-512-key.der").unwrap(),
+    )
+    .unwrap();
+    let resolver = xml_sec::xmlenc::EncapsulationDecryptor::new(&private);
+    let mut policy = xml_sec::policy::DecryptionPolicy::default();
+    policy
+        .key_establishment
+        .encapsulation_algorithms
+        .insert(private.algorithm());
+    policy.data_algorithms = Some([xml_sec::xmlenc::DataEncryptionAlgorithm::Aes128Gcm].into());
+    let context = DecryptContext::new(&resolver).policy(policy);
+    let output = context
+        .decrypt_document(&retrieval(""), Some("ED"))
+        .unwrap()
+        .output;
+    let c14n = xml_sec::c14n::C14nAlgorithm::new(xml_sec::c14n::C14nMode::Inclusive1_0, false);
+    // The retrieved key stays in the document beside the decrypted content.
+    let wanted = String::from_utf8(expected).unwrap().replacen(
+        "<Name>John Smith</Name>",
+        &format!("<Name>John Smith</Name>{key}"),
+        1,
+    );
+    assert_eq!(
+        xml_sec::c14n::canonicalize_xml(output.as_bytes(), &c14n).unwrap(),
+        xml_sec::c14n::canonicalize_xml(wanted.as_bytes(), &c14n).unwrap()
+    );
+    let transformed = retrieval(
+        "<ds:Transforms><ds:Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/></ds:Transforms>",
+    );
+    let error = context
+        .decrypt_document(&transformed, Some("ED"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("ML-KEM EncryptedKey"), "{error}");
+}
+
 #[cfg(feature = "legacy-algorithms")]
 #[test]
 fn rejects_original_phaos_bad_wrapping_with_permitted_algorithms() {

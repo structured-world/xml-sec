@@ -907,6 +907,17 @@ fn parse_retrieved_key_info<'doc>(
             .push(super::derived_key::parse(target, policy.resources)?);
         return Ok(());
     }
+    // A named ML-KEM EncryptedKey is decapsulated as a direct child would be.
+    if crate::key_establishment::encapsulation_algorithm(target).is_some() {
+        return parse_key_info_encapsulation(
+            target,
+            policy,
+            allow_empty_cipher_values,
+            budget,
+            depth,
+            parsed,
+        );
+    }
     budget.charge_recipient(policy.resources, parsed.encrypted_keys.len())?;
     parsed.source_nodes.push(target.id());
     parsed.encrypted_keys.push(parse_encrypted_key(
@@ -1189,6 +1200,14 @@ fn parse_processed_key_reference(
                     target,
                     child_budget.policy.resources,
                 )?));
+            }
+            // A KEM ciphertext keeps no binding to a transformed or external
+            // copy of the document, so it is named only in the same document.
+            if crate::key_establishment::encapsulation_algorithm(target).is_some() {
+                return Err(XmlEncError::InvalidStructure(
+                    "an ML-KEM EncryptedKey can be retrieved only from the same document without transforms"
+                        .into(),
+                ));
             }
             let mut key = parse_encrypted_key(
                 target,
