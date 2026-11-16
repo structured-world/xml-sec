@@ -894,6 +894,64 @@ fn more_than_one_signature_context_is_refused() {
 }
 
 #[test]
+fn an_object_context_on_a_method_without_contexts_is_refused() {
+    use pkcs8::EncodePrivateKey;
+    use xml_sec::xmldsig::{
+        DsigStatus, EdDsaSigningKey, SignContext, SignatureAlgorithm, SigningKey, VerificationKey,
+        VerifyContext,
+    };
+    // Pure Ed25519 takes no context. A nonempty one in a ds:Object would
+    // otherwise be signed and verified as the empty context, so the document
+    // could carry and change bytes the signature never covered. Duplicates
+    // are refused before the method is considered, as for any method.
+    let algorithm = SignatureAlgorithm::Ed25519;
+    let der = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])
+        .to_pkcs8_der()
+        .unwrap();
+    let key = EdDsaSigningKey::from_pkcs8_der(algorithm, der.as_bytes()).unwrap();
+    let context = format!("<c:SignatureContext xmlns:c=\"{CONTEXT_NS}\">Zm9v</c:SignatureContext>");
+    let empty = format!("<c:SignatureContext xmlns:c=\"{CONTEXT_NS}\"/>");
+    for xml in [
+        template_with_objects(algorithm, &[&context]),
+        template_with_objects(algorithm, &[&empty, &empty]),
+    ] {
+        assert!(SignContext::new(&key).sign_template(&xml).is_err(), "{xml}");
+    }
+    // A signed document gains the context afterwards: verification refuses it.
+    let signed = SignContext::new(&key)
+        .sign_template(&template(algorithm))
+        .unwrap()
+        .output;
+    let verifier = VerificationKey {
+        algorithm,
+        public_key_bytes: key.public_key_info().unwrap().spki_der().unwrap().to_vec(),
+        certificate_der: None,
+        name: None,
+    };
+    let carried = signed.replace(
+        "</Signature>",
+        &format!("<Object>{context}</Object></Signature>"),
+    );
+    assert_eq!(
+        VerifyContext::new()
+            .key(&verifier)
+            .verify(&signed)
+            .unwrap()
+            .status,
+        DsigStatus::Valid
+    );
+    assert!(
+        VerifyContext::new()
+            .key(&verifier)
+            .verify(&carried)
+            .is_err()
+    );
+    // The empty context is the absent one, which pure Ed25519 accepts.
+    let with_empty = template_with_objects(algorithm, &[&empty]);
+    assert!(SignContext::new(&key).sign_template(&with_empty).is_ok());
+}
+
+#[test]
 fn the_released_experimental_context_syntax_is_refused() {
     use pkcs8::EncodePrivateKey;
     use xml_sec::xmldsig::{EdDsaSigningKey, SignContext, SignatureAlgorithm};

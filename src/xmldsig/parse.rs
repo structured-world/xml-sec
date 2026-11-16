@@ -1061,18 +1061,32 @@ pub fn parse_signature_method(
             uri: uri.to_string(),
         })?;
     ensure_no_non_whitespace_text(node, "SignatureMethod")?;
-    if matches!(algorithm, SignatureAlgorithm::RsaPss(_)) {
+    // Object contexts are found and validated whatever the method, so a
+    // duplicate or a nonempty context on a method without one is refused
+    // instead of being signed and verified as the empty context.
+    let in_object = signature_object_context(node)?;
+    let mut hmac = None;
+    let in_method = if algorithm.takes_signature_context() {
+        method_signature_context(node)?
+    } else if matches!(algorithm, SignatureAlgorithm::RsaPss(_)) {
         algorithm = SignatureAlgorithm::RsaPss(parse_rsa_pss_parameters(node)?);
-        return Ok((algorithm, None, SignatureContext::default()));
-    }
-    let (hmac, context) = if algorithm.takes_signature_context() {
-        (None, parse_signature_context(node, resources)?)
+        None
     } else {
-        (
-            parse_hmac_output_length(node, algorithm)?,
-            SignatureContext::default(),
-        )
+        hmac = parse_hmac_output_length(node, algorithm)?;
+        None
     };
+    if in_method.is_some() && in_object.is_some() {
+        return Err(more_than_one_context());
+    }
+    let context = match in_method.or(in_object) {
+        Some(element) => decode_signature_context(element, resources)?,
+        None => SignatureContext::default(),
+    };
+    if !algorithm.takes_signature_context() && !context.0.is_empty() {
+        return Err(ParseError::InvalidStructure(
+            "the signature method takes no SignatureContext".into(),
+        ));
+    }
     Ok((algorithm, hmac, context))
 }
 
@@ -1281,35 +1295,40 @@ fn is_signature_context(node: Node<'_, '_>) -> bool {
     node.has_tag_name((SIGNATURE_CONTEXT_NS, SIGNATURE_CONTEXT_ELEMENT))
 }
 
-/// The context of the signature whose `SignatureMethod` is `node`: a direct
-/// child of a `ds:Object` of the same `ds:Signature`
-/// (draft-eastlake-rfc9231bis-xmlsec-uris-09 section 3.3.15, "at most one"),
-/// or the method's only parameter as upstream libxmlsec1 also accepts, and
-/// never both or twice. An absent context is the empty string (same section).
-fn parse_signature_context(
-    node: Node<'_, '_>,
-    resources: &crate::policy::ResourcePolicy,
-) -> Result<SignatureContext, ParseError> {
+fn more_than_one_context() -> ParseError {
+    ParseError::InvalidStructure("a signature has more than one SignatureContext".into())
+}
+
+/// The context a context-taking `SignatureMethod` carries as its only
+/// parameter, as upstream libxmlsec1 also accepts.
+fn method_signature_context<'a>(node: Node<'a, 'a>) -> Result<Option<Node<'a, 'a>>, ParseError> {
+    let mismatch = || {
+        ParseError::InvalidStructure(
+            "SignatureMethod parameters do not match the selected algorithm".into(),
+        )
+    };
     let mut children = element_children(node);
-    let mut found = match children.next() {
+    let found = match children.next() {
         Some(child) if is_signature_context(child) => Some(child),
         None => None,
-        Some(_) => {
-            return Err(ParseError::InvalidStructure(
-                "SignatureMethod parameters do not match the selected algorithm".into(),
-            ));
-        }
+        Some(_) => return Err(mismatch()),
     };
     if children.next().is_some() {
-        return Err(ParseError::InvalidStructure(
-            "SignatureMethod parameters do not match the selected algorithm".into(),
-        ));
+        return Err(mismatch());
     }
+    Ok(found)
+}
+
+/// The context element in a direct child of a `ds:Object` of the
+/// `ds:Signature` whose `SignatureMethod` is `node`
+/// (draft-eastlake-rfc9231bis-xmlsec-uris-09 section 3.3.15, "at most one").
+fn signature_object_context<'a>(node: Node<'a, 'a>) -> Result<Option<Node<'a, 'a>>, ParseError> {
     let signature = node
         .parent_element()
         .filter(|parent| is_ds_element(*parent, "SignedInfo"))
         .and_then(Node::parent_element)
         .filter(|parent| is_ds_element(*parent, "Signature"));
+    let mut found = None;
     let in_objects = signature
         .into_iter()
         .flat_map(element_children)
@@ -1318,14 +1337,18 @@ fn parse_signature_context(
         .filter(|child| is_signature_context(*child));
     for context in in_objects {
         if found.replace(context).is_some() {
-            return Err(ParseError::InvalidStructure(
-                "a signature has more than one SignatureContext".into(),
-            ));
+            return Err(more_than_one_context());
         }
     }
-    let Some(child) = found else {
-        return Ok(SignatureContext::default());
-    };
+    Ok(found)
+}
+
+/// The bytes of a `SignatureContext` element; an absent element is the empty
+/// context (draft section 3.3.15).
+fn decode_signature_context(
+    child: Node<'_, '_>,
+    resources: &crate::policy::ResourcePolicy,
+) -> Result<SignatureContext, ParseError> {
     // Borrow text and validate widths before allocating. RFC 8032 §5's
     // 255-octet ceiling implies at most 340 padded Base64 characters:
     // https://www.rfc-editor.org/rfc/rfc8032.html#section-5
