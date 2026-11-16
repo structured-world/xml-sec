@@ -480,6 +480,8 @@ fn build(
         || "--with-openssl".to_owned(),
         |(openssl, _)| format!("--with-openssl={}", openssl.display()),
     );
+    // The deprecated algorithms xml-sec still processes are enabled so the
+    // oracle can check them; upstream master builds Triple DES only on request.
     let mut options = vec![
         prefix.as_str(),
         "--disable-static",
@@ -487,6 +489,7 @@ fn build(
         "--without-nss",
         "--enable-md5",
         "--enable-ripemd160",
+        "--enable-des",
     ];
     if install.modern {
         options.push("--enable-ml-kem");

@@ -945,9 +945,17 @@ fn relationship_signatures_interoperate_reciprocally_with_xmlsec1() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let certificate = root.join("tests/fixtures/keys/rsa/rsa-2048-cert.pem");
     let key = root.join("tests/fixtures/keys/rsa/rsa-2048-key.pem");
+    // xmlsec1 refuses a Reference to another file unless its URI kinds are
+    // enabled; the donor's own relationship recipes enable them all.
     let verified = xmlsec1::command()
         .current_dir(directory.path())
-        .args(["--verify", "--lax-key-search", "--pubkey-cert-pem"])
+        .args([
+            "--verify",
+            "--lax-key-search",
+            "--enabled-reference-uris",
+            "any",
+        ])
+        .arg("--pubkey-cert-pem")
         .arg(&certificate)
         .arg("signed.xml")
         .output()
@@ -959,7 +967,13 @@ fn relationship_signatures_interoperate_reciprocally_with_xmlsec1() {
     );
     let signed_by_oracle = xmlsec1::command()
         .current_dir(directory.path())
-        .args(["--sign", "--lax-key-search", "--privkey-pem"])
+        .args([
+            "--sign",
+            "--lax-key-search",
+            "--enabled-reference-uris",
+            "any",
+        ])
+        .arg("--privkey-pem")
         .arg(format!("{},{}", key.display(), certificate.display()))
         .args(["--output", "oracle.xml", "signed.xml"])
         .output()
