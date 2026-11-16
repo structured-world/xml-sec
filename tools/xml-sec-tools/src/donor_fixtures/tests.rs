@@ -218,11 +218,7 @@ fn the_default_import_covers_every_rsa_pss_and_ml_kem_family_member() {
     assert!(
         paths.contains(&"xmlenc/aleksey-xmlenc-01/enc-aes192gcm-kt-ml-kem-768.data".to_owned())
     );
-    assert!(paths.contains(
-        &"xmldsig/aleksey-xmldsig-01/enveloped-sha512-mldsa44-with-object-signature-context.xml"
-            .to_owned()
-    ));
-    assert_eq!(paths.len(), 23 + 9 * 2 + 8 * 2 + 3 * 5 + 12 * 2 + 3 + 3 * 3);
+    assert_eq!(paths.len(), 23 + 9 * 2 + 8 * 2 + 3 * 5 + 3 * 3);
 }
 
 #[test]

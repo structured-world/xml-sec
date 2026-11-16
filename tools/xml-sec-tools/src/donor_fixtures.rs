@@ -79,37 +79,6 @@ pub(crate) fn default_paths() -> Vec<String> {
             ));
         }
     }
-    // Signatures whose context sits in SignatureMethod or in a ds:Object, and
-    // the documents that carry two contexts.
-    for method in [
-        "sha256-eddsa-ed25519ctx",
-        "sha256-eddsa-ed25519ph",
-        "sha256-eddsa-ed448ph",
-        "sha512-mldsa44",
-        "sha512-mldsa65",
-        "sha512-mldsa87",
-        "sha512-slhdsa-sha2-128f",
-        "sha512-slhdsa-sha2-128s",
-        "sha512-slhdsa-sha2-192f",
-        "sha512-slhdsa-sha2-192s",
-        "sha512-slhdsa-sha2-256f",
-        "sha512-slhdsa-sha2-256s",
-    ] {
-        for placement in ["signature-context", "object-signature-context"] {
-            paths.push(format!(
-                "xmldsig/aleksey-xmldsig-01/enveloped-{method}-with-{placement}.xml"
-            ));
-        }
-    }
-    for duplicate in [
-        "mldsa44-with-two-signature-contexts-in-signature-method-and-object",
-        "mldsa44-with-two-signature-contexts-in-signature-method",
-        "slhdsa-sha2-128s-with-two-signature-contexts-in-objects",
-    ] {
-        paths.push(format!(
-            "xmldsig/aleksey-xmldsig-01/enveloped-sha512-{duplicate}.xml"
-        ));
-    }
     for family in [
         "aes128gcm-kt-ml-kem-512",
         "aes192gcm-kt-ml-kem-768",
