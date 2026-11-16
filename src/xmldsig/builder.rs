@@ -552,16 +552,19 @@ impl SignatureBuilder {
         } else {
             let method_name = qualified_name(prefix, "SignatureMethod");
             writer.start(&method_name, [("Algorithm", self.sign_method.uri())])?;
-            // RFC 8032 §5 defines the octet context; this XML parameter is an
-            // explicit libxmlsec1 extension, not part of RFC 9231's URI contract.
+            // RFC 8032 §5 defines the octet context; this XML parameter is
+            // upstream libxmlsec1's extension, not part of RFC 9231's URI contract.
             // https://www.rfc-editor.org/rfc/rfc8032.html#section-5
             // Use a local default namespace to avoid collisions with caller prefixes.
-            let context_name = self.sign_method.context_element().ok_or(
-                SignatureBuilderError::SignatureContextNotApplicable(self.sign_method.uri()),
-            )?;
+            if !self.sign_method.takes_signature_context() {
+                return Err(SignatureBuilderError::SignatureContextNotApplicable(
+                    self.sign_method.uri(),
+                ));
+            }
+            let context_name = super::parse::SIGNATURE_CONTEXT_ELEMENT;
             writer.start(
                 context_name,
-                [("xmlns", super::parse::EXPERIMENTAL_SIGNATURE_NS)],
+                [("xmlns", super::parse::SIGNATURE_CONTEXT_NS)],
             )?;
             let mut encoded = [0_u8; 340];
             let length = base64::engine::general_purpose::STANDARD
@@ -689,7 +692,7 @@ impl SignatureBuilder {
             return Err(SignatureBuilderError::InvalidRsaPssParameters);
         }
         if !self.signature_context.as_bytes().is_empty()
-            && self.sign_method.context_element().is_none()
+            && !self.sign_method.takes_signature_context()
         {
             return Err(SignatureBuilderError::SignatureContextNotApplicable(
                 self.sign_method.uri(),

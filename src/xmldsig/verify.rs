@@ -2248,7 +2248,7 @@ pub fn verify_signature_with_pem_key(
             if context.as_bytes().is_empty() {
                 return self.verify(algorithm, signed_data, signature_value);
             }
-            if algorithm.context_element().is_none() {
+            if !algorithm.takes_signature_context() {
                 return Err(SignatureVerificationError::UnsupportedAlgorithm {
                     uri: algorithm.uri().to_owned(),
                 }

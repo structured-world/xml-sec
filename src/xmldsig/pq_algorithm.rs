@@ -37,31 +37,21 @@ impl PqAlgorithm {
         Self::SlhDsaSha2_256s,
     ];
 
-    /// Experimental XML URI used by libxmlsec1 1.3.13.
+    /// XML method URI of draft-eastlake-rfc9231bis-xmlsec-uris, which upstream
+    /// libxmlsec1 also uses; the draft may still change it.
+    /// <https://datatracker.ietf.org/doc/draft-eastlake-rfc9231bis-xmlsec-uris/>
     #[must_use]
     pub const fn uri(self) -> &'static str {
         match self {
-            Self::MlDsa44 => "http://www.aleksey.com/xmlsec/2025/12/xmldsig-more#ml-dsa-44",
-            Self::MlDsa65 => "http://www.aleksey.com/xmlsec/2025/12/xmldsig-more#ml-dsa-65",
-            Self::MlDsa87 => "http://www.aleksey.com/xmlsec/2025/12/xmldsig-more#ml-dsa-87",
-            Self::SlhDsaSha2_128f => {
-                "http://www.aleksey.com/xmlsec/2025/12/xmldsig-more#slh-dsa-sha2-128f"
-            }
-            Self::SlhDsaSha2_128s => {
-                "http://www.aleksey.com/xmlsec/2025/12/xmldsig-more#slh-dsa-sha2-128s"
-            }
-            Self::SlhDsaSha2_192f => {
-                "http://www.aleksey.com/xmlsec/2025/12/xmldsig-more#slh-dsa-sha2-192f"
-            }
-            Self::SlhDsaSha2_192s => {
-                "http://www.aleksey.com/xmlsec/2025/12/xmldsig-more#slh-dsa-sha2-192s"
-            }
-            Self::SlhDsaSha2_256f => {
-                "http://www.aleksey.com/xmlsec/2025/12/xmldsig-more#slh-dsa-sha2-256f"
-            }
-            Self::SlhDsaSha2_256s => {
-                "http://www.aleksey.com/xmlsec/2025/12/xmldsig-more#slh-dsa-sha2-256s"
-            }
+            Self::MlDsa44 => "http://www.w3.org/2026/08/xmldsig-more#ml-dsa-44",
+            Self::MlDsa65 => "http://www.w3.org/2026/08/xmldsig-more#ml-dsa-65",
+            Self::MlDsa87 => "http://www.w3.org/2026/08/xmldsig-more#ml-dsa-87",
+            Self::SlhDsaSha2_128f => "http://www.w3.org/2026/08/xmldsig-more#slh-dsa-sha2-128f",
+            Self::SlhDsaSha2_128s => "http://www.w3.org/2026/08/xmldsig-more#slh-dsa-sha2-128s",
+            Self::SlhDsaSha2_192f => "http://www.w3.org/2026/08/xmldsig-more#slh-dsa-sha2-192f",
+            Self::SlhDsaSha2_192s => "http://www.w3.org/2026/08/xmldsig-more#slh-dsa-sha2-192s",
+            Self::SlhDsaSha2_256f => "http://www.w3.org/2026/08/xmldsig-more#slh-dsa-sha2-256f",
+            Self::SlhDsaSha2_256s => "http://www.w3.org/2026/08/xmldsig-more#slh-dsa-sha2-256s",
         }
     }
 
@@ -107,13 +97,6 @@ impl PqAlgorithm {
             Self::SlhDsaSha2_192s => 16224,
             Self::SlhDsaSha2_256f => 49856,
             Self::SlhDsaSha2_256s => 29792,
-        }
-    }
-
-    pub(crate) const fn context_element(self) -> &'static str {
-        match self {
-            Self::MlDsa44 | Self::MlDsa65 | Self::MlDsa87 => "MLDSAContextString",
-            _ => "SLHDSAContextString",
         }
     }
 }

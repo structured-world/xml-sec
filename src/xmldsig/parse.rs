@@ -53,8 +53,12 @@ const MAX_DER_ENCODED_KEY_VALUE_BASE64_LEN: usize = MAX_DER_ENCODED_KEY_VALUE_LE
 pub(crate) const MAX_KEY_NAME_TEXT_LEN: usize = 4096;
 const MAX_KEY_INFO_CHILD_COUNT: usize = 64;
 const MAX_HMAC_OUTPUT_LENGTH_TEXT_LEN: usize = 32;
-pub(crate) const EXPERIMENTAL_SIGNATURE_NS: &str =
-    "http://www.aleksey.com/xmlsec/2025/12/xmldsig-more#";
+/// Namespace of the `SignatureContext` element. No specification defines the
+/// element; upstream libxmlsec1 places it in the namespace of
+/// draft-eastlake-rfc9231bis-xmlsec-uris, and xml-sec follows it.
+pub(crate) const SIGNATURE_CONTEXT_NS: &str = "http://www.w3.org/2026/08/xmldsig-more#";
+/// Local name of the element carrying a signature context.
+pub(crate) const SIGNATURE_CONTEXT_ELEMENT: &str = "SignatureContext";
 
 /// Cryptographic domain-separation context, bounded by the algorithm wire contract.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -388,14 +392,12 @@ impl SignatureAlgorithm {
         }
     }
 
-    pub(crate) const fn context_element(self) -> Option<&'static str> {
-        match self {
-            Self::Ed25519Ctx | Self::Ed25519Ph | Self::Ed448 | Self::Ed448Ph => {
-                Some("EdDSAContextString")
-            }
-            Self::PostQuantum(algorithm) => Some(algorithm.context_element()),
-            _ => None,
-        }
+    /// Whether the method takes an RFC 8032 / FIPS 204 / FIPS 205 context.
+    pub(crate) const fn takes_signature_context(self) -> bool {
+        matches!(
+            self,
+            Self::Ed25519Ctx | Self::Ed25519Ph | Self::Ed448 | Self::Ed448Ph | Self::PostQuantum(_)
+        )
     }
 
     /// Fixed `XMLDSig` component width for DSA's `r || s` representation.
@@ -1064,8 +1066,8 @@ pub fn parse_signature_method(
         algorithm = SignatureAlgorithm::RsaPss(parse_rsa_pss_parameters(node)?);
         return Ok((algorithm, None, SignatureContext::default()));
     }
-    let (hmac, context) = if algorithm.context_element().is_some() {
-        (None, parse_signature_context(node, algorithm, resources)?)
+    let (hmac, context) = if algorithm.takes_signature_context() {
+        (None, parse_signature_context(node, resources)?)
     } else {
         (
             parse_hmac_output_length(node, algorithm)?,
@@ -1276,28 +1278,54 @@ fn parse_hmac_output_length(
     ))
 }
 
+fn is_signature_context(node: Node<'_, '_>) -> bool {
+    node.has_tag_name((SIGNATURE_CONTEXT_NS, SIGNATURE_CONTEXT_ELEMENT))
+}
+
+/// The context of the signature whose `SignatureMethod` is `node`: the
+/// method's only parameter, or a direct child of a `ds:Object` of the same
+/// `ds:Signature`, and never both or twice. RFC 9231 defines the method URIs,
+/// not this element; the placement follows upstream libxmlsec1.
 fn parse_signature_context(
     node: Node<'_, '_>,
-    algorithm: SignatureAlgorithm,
     resources: &crate::policy::ResourcePolicy,
 ) -> Result<SignatureContext, ParseError> {
-    let Some(element_name) = algorithm.context_element() else {
-        return Ok(SignatureContext::default());
-    };
     let mut children = element_children(node);
-    let Some(child) = children.next() else {
-        return Ok(SignatureContext::default());
+    let mut found = match children.next() {
+        Some(child) if is_signature_context(child) => Some(child),
+        None => None,
+        Some(_) => {
+            return Err(ParseError::InvalidStructure(
+                "SignatureMethod parameters do not match the selected algorithm".into(),
+            ));
+        }
     };
-    // RFC 9231 defines method identifiers, not this XML parameter syntax.
-    // This explicit experimental extension matches libxmlsec1 1.3.13.
-    if child.tag_name().namespace() != Some(EXPERIMENTAL_SIGNATURE_NS)
-        || child.tag_name().name() != element_name
-        || children.next().is_some()
-    {
+    if children.next().is_some() {
         return Err(ParseError::InvalidStructure(
             "SignatureMethod parameters do not match the selected algorithm".into(),
         ));
     }
+    let signature = node
+        .parent_element()
+        .filter(|parent| is_ds_element(*parent, "SignedInfo"))
+        .and_then(Node::parent_element)
+        .filter(|parent| is_ds_element(*parent, "Signature"));
+    let in_objects = signature
+        .into_iter()
+        .flat_map(element_children)
+        .filter(|child| is_ds_element(*child, "Object"))
+        .flat_map(element_children)
+        .filter(|child| is_signature_context(*child));
+    for context in in_objects {
+        if found.replace(context).is_some() {
+            return Err(ParseError::InvalidStructure(
+                "a signature has more than one SignatureContext".into(),
+            ));
+        }
+    }
+    let Some(child) = found else {
+        return Ok(SignatureContext::default());
+    };
     // Borrow text and validate widths before allocating. RFC 8032 §5's
     // 255-octet ceiling implies at most 340 padded Base64 characters:
     // https://www.rfc-editor.org/rfc/rfc8032.html#section-5
