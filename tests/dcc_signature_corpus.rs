@@ -13,7 +13,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Output;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 #[path = "common/xmlsec1.rs"]
 mod xmlsec1;
@@ -208,34 +207,27 @@ fn pki() -> Pki {
     }
 }
 
-/// Files the xmlsec1 command line reads, removed with the directory.
+/// Files the xmlsec1 command line reads, in a directory this run owns alone
+/// and that is removed with it, even on panic.
 struct Scratch {
-    directory: PathBuf,
+    directory: tempfile::TempDir,
 }
-
-static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl Scratch {
     fn new() -> Self {
-        let directory = std::env::temp_dir().join(format!(
-            "xml-sec-dcc-{}-{}",
-            std::process::id(),
-            SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&directory).unwrap();
-        Self { directory }
+        Self {
+            directory: tempfile::tempdir().unwrap(),
+        }
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.directory.path().join(name)
     }
 
     fn file(&self, name: &str, contents: &str) -> PathBuf {
-        let path = self.directory.join(name);
+        let path = self.path(name);
         fs::write(&path, contents).unwrap();
         path
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.directory);
     }
 }
 
@@ -348,7 +340,7 @@ fn sign_under(
                 "template.xml",
                 &append_before_root_end(xml, &template(profile, coverage)),
             );
-            let output = scratch.directory.join("signed.xml");
+            let output = scratch.path("signed.xml");
             let credentials = format!("{},{}", key.display(), certificate.display());
             // xmlsec1 signs the first Signature it finds unless told otherwise.
             let last = "(//*[local-name()='Signature'])[last()]";

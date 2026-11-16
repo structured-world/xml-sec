@@ -61,49 +61,66 @@ fn publisher() -> Publisher {
     }
 }
 
+fn locations(xsd: &str) -> Vec<String> {
+    imports(xsd)
+        .unwrap()
+        .into_iter()
+        .map(|import| import.location)
+        .collect()
+}
+
 #[test]
 fn imports_lists_import_and_include_locations() {
-    // Only schema composition elements name further schemas to read.
-    let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+    // Only schema composition elements name further schemas to read, and
+    // each import points at the exact source text of its location value.
+    let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:o="urn:o">
       <xs:import namespace="urn:a" schemaLocation="a.xsd"/>
-      <xs:include schemaLocation="b.xsd"/>
+      <xs:include
+          o:schemaLocation="decoy.xsd" schemaLocation = 'b.xsd' />
       <xs:import namespace="urn:c"/>
       <xs:element name="import"/>
     </xs:schema>"#;
-    assert_eq!(imports(xsd).unwrap(), ["a.xsd", "b.xsd"]);
+    assert_eq!(locations(xsd), ["a.xsd", "b.xsd"]);
+    for import in imports(xsd).unwrap() {
+        assert_eq!(&xsd[import.value.clone()], import.location);
+    }
     assert!(imports("<unclosed").is_err());
 }
 
 #[test]
-fn relative_locations_resolve_against_the_importing_schema() {
-    // XSD 1.0 Part 1 section 4.2.3: schemaLocation is a URI reference read
-    // against the base URI of the importing schema.
-    assert_eq!(
-        resolve(
-            "https://www.ptb.de/si/v2.2.1/SI_Format.xsd",
-            "qudt/quantitykind.xsd"
-        ),
-        "https://www.ptb.de/si/v2.2.1/qudt/quantitykind.xsd"
-    );
-    assert_eq!(
-        resolve("https://www.ptb.de/dcc/dcc.xsd", "https://ptb.de/si/SI.xsd"),
-        "https://ptb.de/si/SI.xsd"
-    );
+fn relocate_rewrites_every_location_value_whatever_its_layout() {
+    // XML 1.0 section 3.1 admits whitespace around `=` and either quote; a
+    // schema repeating the same include keeps both elements, each rewritten.
+    let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+      <xs:include schemaLocation = "t.xsd"/>
+      <xs:include schemaLocation='t.xsd'/>
+      <xs:import namespace="urn:a" schemaLocation="https://example.invalid/a.xsd"/>
+    </xs:schema>"#;
+    let relocated = relocate(xsd, &imports(xsd).unwrap(), |location| {
+        format!("local-{}", location.len())
+    });
+    assert_eq!(locations(&relocated), ["local-5", "local-5", "local-29"]);
+    assert_eq!(relocated.matches("<xs:include").count(), 2);
 }
 
 #[test]
-fn relocate_rewrites_only_the_quoted_attribute() {
-    // Both XML quote styles are rewritten; an unwritten location is an error
-    // rather than a schema left pointing at the network.
-    assert_eq!(
-        relocate(r#"<i schemaLocation="u"/>"#, "u", "l.xsd").unwrap(),
-        r#"<i schemaLocation="l.xsd"/>"#
-    );
-    assert_eq!(
-        relocate("<i schemaLocation='u'/>", "u", "l.xsd").unwrap(),
-        "<i schemaLocation='l.xsd'/>"
-    );
-    assert!(relocate(r#"<i schemaLocation = "u"/>"#, "u", "l.xsd").is_err());
+fn locations_resolve_as_uri_references() {
+    // XSD 1.0 Part 1 section 4.2.3 reads schemaLocation as a URI reference
+    // against the importing schema; RFC 3986 section 5.2 resolves it.
+    let base = "https://www.ptb.de/si/v2.2.1/SI_Format.xsd";
+    for (location, resolved) in [
+        (
+            "qudt/quantitykind.xsd",
+            "https://www.ptb.de/si/v2.2.1/qudt/quantitykind.xsd",
+        ),
+        ("./units.xsd", "https://www.ptb.de/si/v2.2.1/units.xsd"),
+        ("../v2.2.0/SI.xsd", "https://www.ptb.de/si/v2.2.0/SI.xsd"),
+        ("/dcc/dcc.xsd", "https://www.ptb.de/dcc/dcc.xsd"),
+        ("//ptb.de/si/SI.xsd", "https://ptb.de/si/SI.xsd"),
+        ("https://ptb.de/si/SI.xsd", "https://ptb.de/si/SI.xsd"),
+    ] {
+        assert_eq!(resolve(base, location), resolved, "{location}");
+    }
 }
 
 #[test]
@@ -121,9 +138,9 @@ fn fetch_reads_every_imported_schema_and_points_at_local_copies() {
     assert_eq!(publisher.commands.len(), 4);
     let entry = std::fs::read_to_string(entry).unwrap();
     assert!(!entry.contains("example.invalid"), "{entry}");
-    for location in imports(&entry).unwrap() {
+    for location in locations(&entry) {
         let imported = std::fs::read_to_string(directory.path().join(location)).unwrap();
-        for nested in imports(&imported).unwrap() {
+        for nested in locations(&imported) {
             assert!(directory.path().join(nested).exists());
         }
     }
