@@ -1,11 +1,11 @@
 #!/bin/sh
 #
-# This script needs to be called from testrun.sh script
+# This script needs to be called from the testrun.sh script
 #
 
-# ensure this script is called from testrun.sh
+# ensure this script is called from the testrun.sh script
 if [ -z "$xmlsec_app" -o -z "$xmlsec_params" ]; then
-    echo "This script needs to be called from testrun.sh script"
+    echo "This script needs to be called from the testrun.sh script"
     exit 1
 fi
 
@@ -60,6 +60,10 @@ execDSigTestWithCryptoConfig() {
     params2="$7"
     params3="$8"
     crypto_config="$9"
+    # consume the global extra_message so that a message set for this test
+    # does not leak into the next test when this one returns early
+    cur_extra_message="$extra_message"
+    extra_message=""
     failures=0
 
     if [ -n "$XMLSEC_TEST_NAME" -a "$XMLSEC_TEST_NAME" != "$filename" ]; then
@@ -83,25 +87,24 @@ execDSigTestWithCryptoConfig() {
     if [ -n "$folder" ] ; then
         cd $topfolder/$folder
         full_file=$filename
-        echo "Test: $folder/$filename $extra_message"
-        echo "Test: $folder/$filename in folder " `pwd` " $extra_message -- expected $expected_res" > $curlogfile
+        echo "Test: $folder/$filename $cur_extra_message"
+        echo "Test: $folder/$filename in folder " `pwd` " $cur_extra_message -- expected $expected_res" > $curlogfile
     else
         full_file=$topfolder/$filename
-        echo "Test: $filename $extra_message"
-        echo "Test: $folder/$filename $extra_message -- $expected_res" > $curlogfile
+        echo "Test: $filename $cur_extra_message"
+        echo "Test: $filename $cur_extra_message -- expected $expected_res" > $curlogfile
     fi
-    extra_message=""
 
     # check transforms
     if [ -n "$req_transforms" ] ; then
         printf "    Checking required transforms                         "
         echo "$extra_vars $xmlsec_app check-transforms  --crypto-config $crypto_config $xmlsec_params $req_transforms" >> $curlogfile
         $xmlsec_app check-transforms $xmlsec_params  --crypto-config $crypto_config $req_transforms >> $curlogfile 2>> $curlogfile
-        printCheckStatus $?
         res=$?
+        printCheckStatus $res
         if [ $res -ne 0 ]; then
             cat $curlogfile >> $logfile
-	        tearDownTest
+            tearDownTest
             return
         fi
     fi
@@ -111,11 +114,11 @@ execDSigTestWithCryptoConfig() {
         printf "    Checking required key data                           "
         echo "$extra_vars $xmlsec_app check-key-data $xmlsec_params --crypto-config $crypto_config $req_key_data" >> $curlogfile
         $xmlsec_app check-key-data $xmlsec_params --crypto-config $crypto_config $req_key_data >> $curlogfile 2>> $curlogfile
-        printCheckStatus $?
         res=$?
+        printCheckStatus $res
         if [ $res -ne 0 ]; then
             cat $curlogfile >> $logfile
-	        tearDownTest
+            tearDownTest
             return
         fi
     fi
@@ -144,7 +147,7 @@ execDSigTestWithCryptoConfig() {
     fi
 
     # update existing signature if verification failed
-    if [  "z$XMLSEC_TEST_UPDATE_XML_ON_FAILURE" = "zyes" -a "z$xml_verification_failed" = "zyes" ] ; then
+    if [  "z$XMLSEC_TEST_UPDATE_XML_ON_FAILURE" = "zyes" -a "z$xml_verification_failed" = "zyes" -a -n "$params2" ] ; then
         printf "    Update existing signature                            "
         echo "cp $tmpfile $full_file.xml" >> $curlogfile 2>> $curlogfile
         cp $tmpfile $full_file.xml
@@ -182,6 +185,10 @@ execDSigPrintXmlDebugTest() {
     req_key_data="$4"
     params1="$5"
     crypto_config="$6"
+    # consume the global extra_message so that a message set for this test
+    # does not leak into the next test when this one returns early
+    cur_extra_message="$extra_message"
+    extra_message=""
     failures=0
     test_name="$filename (with --print-xml-debug)"
 
@@ -200,14 +207,13 @@ execDSigPrintXmlDebugTest() {
     if [ -n "$folder" ] ; then
         cd $topfolder/$folder
         full_file=$filename
-        echo "Test: $folder/$test_name $extra_message"
-        echo "Test: $folder/$test_name in folder " `pwd` " $extra_message -- expected $res_success" > $curlogfile
+        echo "Test: $folder/$test_name $cur_extra_message"
+        echo "Test: $folder/$test_name in folder " `pwd` " $cur_extra_message -- expected $res_success" > $curlogfile
     else
         full_file=$topfolder/$filename
-        echo "Test: $test_name $extra_message"
-        echo "Test: $test_name $extra_message -- $res_success" > $curlogfile
+        echo "Test: $test_name $cur_extra_message"
+        echo "Test: $test_name $cur_extra_message -- $res_success" > $curlogfile
     fi
-    extra_message=""
 
     # check transforms
     if [ -n "$req_transforms" ] ; then
@@ -216,7 +222,7 @@ execDSigPrintXmlDebugTest() {
         $xmlsec_app check-transforms $xmlsec_params --crypto-config $crypto_config $req_transforms >> $curlogfile 2>> $curlogfile
         res=$?
 
-        printCheckStatus $?
+        printCheckStatus $res
         if [ $res -ne 0 ]; then
             cat $curlogfile >> $logfile
             tearDownTest
@@ -231,7 +237,7 @@ execDSigPrintXmlDebugTest() {
         $xmlsec_app check-key-data $xmlsec_params --crypto-config $crypto_config $req_key_data >> $curlogfile 2>> $curlogfile
         res=$?
 
-        printCheckStatus $?
+        printCheckStatus $res
         if [ $res -ne 0 ]; then
             cat $curlogfile >> $logfile
             tearDownTest
@@ -240,14 +246,14 @@ execDSigPrintXmlDebugTest() {
     fi
 
     # run test
-     rm -f $tmpfile $tmpfile.2
+    rm -f $tmpfile $tmpfile.2
     if [ -n "$params1" ] ; then
         printf "    Verify with --print-xml-debug                        "
         echo "$extra_vars $VALGRIND $xmlsec_app verify --X509-skip-strict-checks $xmlsec_params --print-xml-debug --crypto-config $crypto_config $params1 $full_file.xml > $tmpfile.2" >> $curlogfile
         $VALGRIND $xmlsec_app verify --X509-skip-strict-checks $xmlsec_params --print-xml-debug --crypto-config $crypto_config $params1 $full_file.xml > $tmpfile.2 2>> $curlogfile
         res=$?
 
-        printRes $expected_res $?
+        printRes $res_success $res
         if [ $? -ne 0 ]; then
             failures=`expr $failures + 1`
             cat $curlogfile >> $logfile
@@ -265,7 +271,7 @@ execDSigPrintXmlDebugTest() {
 
         res=$?
 
-        printCheckStatus $?
+        printCheckStatus $res
         if [ $res -ne 0 ]; then
             failures=`expr $failures + 1`
             cat $curlogfile >> $logfile
@@ -297,7 +303,7 @@ echo "--------- Positive Testing ----------"
 
 ##########################################################################
 #
-# xmldsig11-interop-2011 (https://www.w3.org/TR/2012/NOTE-xmldsig-core1-interop-20121113/)
+# xmldsig11-interop-2012 (https://www.w3.org/TR/2012/NOTE-xmldsig-core1-interop-20121113/)
 #
 ##########################################################################
 
@@ -314,13 +320,6 @@ execDSigTest $res_success \
     "xmldsig11-interop-2012" \
     "signature-enveloping-hmac-sha1-truncated160" \
     "c14n sha1 hmac-sha1" \
-    "" \
-    "--lax-key-search --hmackey keys/hmackey.bin"
-
-execDSigTest $res_success \
-    "xmldsig11-interop-2012" \
-    "signature-enveloping-hmac-sha224" \
-    "c14n sha1 hmac-sha224" \
     "" \
     "--lax-key-search --hmackey keys/hmackey.bin"
 
@@ -354,7 +353,7 @@ execDSigTest $res_success \
 
 # ECDSA
 
-# Diabled tests with PublicKey X,Y components (RFC4050, not part XMLDSig 1.1 spec):
+# Disabled tests with PublicKey X,Y components (RFC4050, not part of the XMLDSig 1.1 spec):
 #   signature-enveloping-p256_sha1_4050.xml
 #   signature-enveloping-p256_sha512_4050.xml
 #   signature-enveloping-p384_sha384_4050.xml
@@ -522,7 +521,7 @@ execDSigTest $res_success \
 execDSigTest $res_success \
     "xmldsig11-interop-2012" \
     "signature-enveloping-rsa_sha384" \
-    "c14n sha1 rsa-sha256" \
+    "c14n sha1 rsa-sha384" \
     "rsa" \
     "--enabled-key-data key-value,rsa"
 
@@ -725,6 +724,302 @@ if [ "z$xmlsec_feature_x509_data_lookup" = "zyes" ] ; then
         "--enabled-key-data x509 --pubkey-cert-der $topfolder/keys/rsa/rsa-4096-cert.der"
 fi
 
+##########################################################################
+#
+# xmldsig11-interop-2012.modern
+#
+##########################################################################
+
+#
+# The same documents as in xmldsig11-interop-2012, but re-signed with
+# modern algorithms and keys from tests/keys: hmac-sha256 (hmackey.bin),
+# ecdsa-sha224/256/384/512 (ec-prime256v1/prime384v1/prime521v1) and
+# rsa-sha224/256/384/512 (rsa-2048/rsa-4096).  The deprecated hmac-sha1
+# signatures and sha1 digests were replaced with their modern
+# equivalents and the ecdsa-sha1 tests were dropped as duplicates of
+# the ecdsa-sha256 tests.  Every test has a .tmpl and a pre-signed .xml
+# file.
+#
+
+# HMAC
+# None of the tests include KeyInfo so we use "--lax-key-search" for *any* hmac key
+execDSigTest $res_success \
+    "xmldsig11-interop-2012.modern" \
+    "signature-enveloping-hmac-sha256-truncated40" \
+    "c14n sha256 hmac-sha256" \
+    "" \
+    "--lax-key-search --hmac-min-out-len 40 --hmackey $topfolder/keys/hmackey.bin" \
+    "--lax-key-search --hmac-min-out-len 40 --hmackey $topfolder/keys/hmackey.bin" \
+    "--lax-key-search --hmac-min-out-len 40 --hmackey $topfolder/keys/hmackey.bin"
+
+execDSigTest $res_success \
+    "xmldsig11-interop-2012.modern" \
+    "signature-enveloping-hmac-sha256-truncated160" \
+    "c14n sha256 hmac-sha256" \
+    "" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin"
+
+execDSigTest $res_success \
+    "xmldsig11-interop-2012.modern" \
+    "signature-enveloping-hmac-sha224" \
+    "c14n sha256 hmac-sha224" \
+    "" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin"
+
+execDSigTest $res_success \
+    "xmldsig11-interop-2012.modern" \
+    "signature-enveloping-hmac-sha256" \
+    "c14n sha256 hmac-sha256" \
+    "" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin"
+
+execDSigTest $res_success \
+    "xmldsig11-interop-2012.modern" \
+    "signature-enveloping-hmac-sha384" \
+    "c14n sha256 hmac-sha384" \
+    "" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin"
+
+execDSigTest $res_success \
+    "xmldsig11-interop-2012.modern" \
+    "signature-enveloping-hmac-sha512" \
+    "c14n sha256 hmac-sha512" \
+    "" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin"
+
+# ECDSA
+execDSigTest $res_success \
+    "xmldsig11-interop-2012.modern" \
+    "signature-enveloping-p256_sha224" \
+    "c14n sha224 ecdsa-sha224" \
+    "key-value ec" \
+    "--enabled-key-data key-value,ec" \
+    "--enabled-key-data key-name,key-value,ec $priv_key_option:TestKeyName-ec-prime256v1 $topfolder/keys/ec/ec-prime256v1-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-key-data key-value,ec"
+
+execDSigTest $res_success \
+    "xmldsig11-interop-2012.modern" \
+    "signature-enveloping-p256_sha256" \
+    "c14n sha256 ecdsa-sha256" \
+    "key-value ec" \
+    "--enabled-key-data key-value,ec" \
+    "--enabled-key-data key-name,key-value,ec $priv_key_option:TestKeyName-ec-prime256v1 $topfolder/keys/ec/ec-prime256v1-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-key-data key-value,ec"
+
+execDSigTest $res_success \
+    "xmldsig11-interop-2012.modern" \
+    "signature-enveloping-p256_sha384" \
+    "c14n sha384 ecdsa-sha384" \
+    "key-value ec" \
+    "--enabled-key-data key-value,ec" \
+    "--enabled-key-data key-name,key-value,ec $priv_key_option:TestKeyName-ec-prime256v1 $topfolder/keys/ec/ec-prime256v1-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-key-data key-value,ec"
+
+execDSigTest $res_success \
+    "xmldsig11-interop-2012.modern" \
+    "signature-enveloping-p256_sha512" \
+    "c14n sha512 ecdsa-sha512" \
+    "key-value ec" \
+    "--enabled-key-data key-value,ec" \
+    "--enabled-key-data key-name,key-value,ec $priv_key_option:TestKeyName-ec-prime256v1 $topfolder/keys/ec/ec-prime256v1-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-key-data key-value,ec"
+
+execDSigTest $res_success \
+    "xmldsig11-interop-2012.modern" \
+    "signature-enveloping-p384_sha224" \
+    "c14n sha224 ecdsa-sha224" \
+    "key-value ec" \
+    "--enabled-key-data key-value,ec" \
+    "--enabled-key-data key-name,key-value,ec $priv_key_option:TestKeyName-ec-prime384v1 $topfolder/keys/ec/ec-prime384v1-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-key-data key-value,ec"
+
+execDSigTest $res_success \
+    "xmldsig11-interop-2012.modern" \
+    "signature-enveloping-p384_sha256" \
+    "c14n sha256 ecdsa-sha256" \
+    "key-value ec" \
+    "--enabled-key-data key-value,ec" \
+    "--enabled-key-data key-name,key-value,ec $priv_key_option:TestKeyName-ec-prime384v1 $topfolder/keys/ec/ec-prime384v1-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-key-data key-value,ec"
+
+execDSigTest $res_success \
+    "xmldsig11-interop-2012.modern" \
+    "signature-enveloping-p384_sha384" \
+    "c14n sha384 ecdsa-sha384" \
+    "key-value ec" \
+    "--enabled-key-data key-value,ec" \
+    "--enabled-key-data key-name,key-value,ec $priv_key_option:TestKeyName-ec-prime384v1 $topfolder/keys/ec/ec-prime384v1-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-key-data key-value,ec"
+
+execDSigTest $res_success \
+    "xmldsig11-interop-2012.modern" \
+    "signature-enveloping-p384_sha512" \
+    "c14n sha512 ecdsa-sha512" \
+    "key-value ec" \
+    "--enabled-key-data key-value,ec" \
+    "--enabled-key-data key-name,key-value,ec $priv_key_option:TestKeyName-ec-prime384v1 $topfolder/keys/ec/ec-prime384v1-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-key-data key-value,ec"
+
+execDSigTest $res_success \
+    "xmldsig11-interop-2012.modern" \
+    "signature-enveloping-p521_sha224" \
+    "c14n sha224 ecdsa-sha224" \
+    "key-value ec" \
+    "--enabled-key-data key-value,ec" \
+    "--enabled-key-data key-name,key-value,ec $priv_key_option:TestKeyName-ec-prime521v1 $topfolder/keys/ec/ec-prime521v1-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-key-data key-value,ec"
+
+execDSigTest $res_success \
+    "xmldsig11-interop-2012.modern" \
+    "signature-enveloping-p521_sha256" \
+    "c14n sha256 ecdsa-sha256" \
+    "key-value ec" \
+    "--enabled-key-data key-value,ec" \
+    "--enabled-key-data key-name,key-value,ec $priv_key_option:TestKeyName-ec-prime521v1 $topfolder/keys/ec/ec-prime521v1-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-key-data key-value,ec"
+
+execDSigTest $res_success \
+    "xmldsig11-interop-2012.modern" \
+    "signature-enveloping-p521_sha384" \
+    "c14n sha384 ecdsa-sha384" \
+    "key-value ec" \
+    "--enabled-key-data key-value,ec" \
+    "--enabled-key-data key-name,key-value,ec $priv_key_option:TestKeyName-ec-prime521v1 $topfolder/keys/ec/ec-prime521v1-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-key-data key-value,ec"
+
+execDSigTest $res_success \
+    "xmldsig11-interop-2012.modern" \
+    "signature-enveloping-p521_sha512" \
+    "c14n sha512 ecdsa-sha512" \
+    "key-value ec" \
+    "--enabled-key-data key-value,ec" \
+    "--enabled-key-data key-name,key-value,ec $priv_key_option:TestKeyName-ec-prime521v1 $topfolder/keys/ec/ec-prime521v1-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-key-data key-value,ec"
+
+# RSA
+execDSigTest $res_success \
+    "xmldsig11-interop-2012.modern" \
+    "signature-enveloping-rsa-sha224" \
+    "c14n sha256 rsa-sha224" \
+    "rsa" \
+    "--enabled-key-data key-value,rsa" \
+    "--enabled-key-data key-name,key-value,rsa $priv_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-key-data key-value,rsa"
+
+execDSigTest $res_success \
+    "xmldsig11-interop-2012.modern" \
+    "signature-enveloping-rsa-sha256" \
+    "c14n sha256 rsa-sha256" \
+    "rsa" \
+    "--enabled-key-data key-value,rsa" \
+    "--enabled-key-data key-name,key-value,rsa $priv_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-key-data key-value,rsa"
+
+execDSigTest $res_success \
+    "xmldsig11-interop-2012.modern" \
+    "signature-enveloping-rsa_sha384" \
+    "c14n sha256 rsa-sha384" \
+    "rsa" \
+    "--enabled-key-data key-value,rsa" \
+    "--enabled-key-data key-name,key-value,rsa $priv_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-key-data key-value,rsa"
+
+execDSigTest $res_success \
+    "xmldsig11-interop-2012.modern" \
+    "signature-enveloping-rsa_sha512" \
+    "c14n sha256 rsa-sha512" \
+    "rsa" \
+    "--enabled-key-data key-value,rsa" \
+    "--enabled-key-data key-name,key-value,rsa $priv_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-key-data key-value,rsa"
+
+execDSigTest $res_success \
+    "xmldsig11-interop-2012.modern" \
+    "signature-enveloping-sha224-rsa_sha256" \
+    "c14n sha224 rsa-sha256" \
+    "rsa" \
+    "--enabled-key-data key-value,rsa" \
+    "--enabled-key-data key-name,key-value,rsa $priv_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-key-data key-value,rsa"
+
+execDSigTest $res_success \
+    "xmldsig11-interop-2012.modern" \
+    "signature-enveloping-sha256-rsa-sha256" \
+    "c14n sha256 rsa-sha256" \
+    "rsa" \
+    "--enabled-key-data key-value,rsa" \
+    "--enabled-key-data key-name,key-value,rsa $priv_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-key-data key-value,rsa"
+
+execDSigTest $res_success \
+    "xmldsig11-interop-2012.modern" \
+    "signature-enveloping-sha384-rsa_sha256" \
+    "c14n sha384 rsa-sha256" \
+    "rsa" \
+    "--enabled-key-data key-value,rsa" \
+    "--enabled-key-data key-name,key-value,rsa $priv_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-key-data key-value,rsa"
+
+execDSigTest $res_success \
+    "xmldsig11-interop-2012.modern" \
+    "signature-enveloping-sha512-rsa_sha256" \
+    "c14n sha512 rsa-sha256" \
+    "rsa" \
+    "--enabled-key-data key-value,rsa" \
+    "--enabled-key-data key-name,key-value,rsa $priv_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-key-data key-value,rsa"
+
+# KeyInfoReference
+execDSigTest $res_success \
+    "xmldsig11-interop-2012.modern" \
+    "signature-enveloping-keyinforeference-rsa" \
+    "c14n sha256 rsa-sha256" \
+    "key-info-reference key-name key-value rsa" \
+    "--enabled-key-data key-info-reference,key-name,key-value,rsa" \
+    "$priv_key_option:TestKeyName-rsa-4096 $topfolder/keys/rsa/rsa-4096-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-key-data key-info-reference,key-name,rsa $pub_key_option:TestKeyName-rsa-4096 $topfolder/keys/rsa/rsa-4096-pubkey$rsa_pub_key_suffix.$pub_key_format"
+
+# DEREncodedKeyValue
+execDSigTest $res_success \
+    "xmldsig11-interop-2012.modern" \
+    "signature-enveloping-derencoded-rsa" \
+    "c14n sha256 rsa-sha256" \
+    "der-encoded-key-value rsa" \
+    "--enabled-key-data der-encoded-key-value,rsa" \
+    "--enabled-key-data der-encoded-key-value,key-name,rsa $priv_key_option:TestKeyName-rsa-4096 $topfolder/keys/rsa/rsa-4096-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-key-data der-encoded-key-value,rsa"
+
+execDSigTest $res_success \
+    "xmldsig11-interop-2012.modern" \
+    "signature-enveloping-derencoded-ec" \
+    "c14n sha256 ecdsa-sha256" \
+    "der-encoded-key-value ec" \
+    "--enabled-key-data der-encoded-key-value,ec" \
+    "--enabled-key-data der-encoded-key-value,key-name,ec $priv_key_option:TestKeyName-ec-prime256v1 $topfolder/keys/ec/ec-prime256v1-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-key-data der-encoded-key-value,ec"
+
+# X509Digest (the key is looked up by X509 data, only backends that
+# support it (OpenSSL, NSS, GnuTLS) can run this test)
+if [ "z$xmlsec_feature_x509_data_lookup" = "zyes" ] ; then
+    execDSigTest $res_success \
+        "xmldsig11-interop-2012.modern" \
+        "signature-enveloping-x509digest-rsa" \
+        "c14n sha256 rsa-sha256" \
+        "x509" \
+        "--enabled-key-data x509 --pubkey-cert-der $topfolder/keys/rsa/rsa-4096-cert.der" \
+        "--enabled-key-data x509 $priv_key_option $topfolder/keys/rsa/rsa-4096-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+        "--enabled-key-data x509 --pubkey-cert-der $topfolder/keys/rsa/rsa-4096-cert.der"
+fi
 
 ##########################################################################
 #
@@ -741,18 +1036,18 @@ execDSigTest $res_success \
     "defCan-1" \
     "c14n11 sha1 hmac-sha1" \
     "hmac" \
-    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
-    "--hmackey:TeskKeyName-Hmac $topfolder/keys/hmackey.bin" \
-    "--hmackey:TeskKeyName-Hmac $topfolder/keys/hmackey.bin"
+    "--enabled-reference-uris any --lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
+    "--enabled-reference-uris any --hmackey:TeskKeyName-Hmac $topfolder/keys/hmackey.bin" \
+    "--enabled-reference-uris any --hmackey:TeskKeyName-Hmac $topfolder/keys/hmackey.bin"
 
 execDSigTest $res_success \
     "xmldsig2ed-tests" \
     "defCan-2" \
     "c14n11 xslt xpath sha1 hmac-sha1" \
     "hmac" \
-    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
-    "--hmackey:TeskKeyName-Hmac $topfolder/keys/hmackey.bin" \
-    "--hmackey:TeskKeyName-Hmac $topfolder/keys/hmackey.bin"
+    "--enabled-reference-uris any --lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
+    "--enabled-reference-uris any --hmackey:TeskKeyName-Hmac $topfolder/keys/hmackey.bin" \
+    "--enabled-reference-uris any --hmackey:TeskKeyName-Hmac $topfolder/keys/hmackey.bin"
 
 #
 # differences in XSLT transform output, tbd
@@ -811,13 +1106,111 @@ execDSigTest $res_success \
 
 ##########################################################################
 #
+# xmldsig2ed-tests.modern
+#
+# http://www.w3.org/TR/xmldsig2ed-tests/
+#
+# The same documents as in xmldsig2ed-tests, but re-signed with the
+# modern algorithms and the key from tests/keys: the deprecated
+# hmac-sha1 signatures and sha1 digests were replaced with their
+# modern equivalents (hmac-sha256 and sha256).  The defCan tests
+# reference the external c14n11/xml-base-input.xml file (copied from
+# the original folder), so --enabled-reference-uris any is required.
+# None of the xpointer tests include KeyInfo so we use
+# "--lax-key-search" for *any* hmac key.
+#
+##########################################################################
+
+execDSigTest $res_success \
+    "xmldsig2ed-tests.modern" \
+    "defCan-1" \
+    "c14n11 sha256 hmac-sha256" \
+    "hmac" \
+    "--enabled-reference-uris any --lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
+    "--enabled-reference-uris any --hmackey:TeskKeyName-Hmac $topfolder/keys/hmackey.bin" \
+    "--enabled-reference-uris any --hmackey:TeskKeyName-Hmac $topfolder/keys/hmackey.bin"
+
+execDSigTest $res_success \
+    "xmldsig2ed-tests.modern" \
+    "defCan-2" \
+    "c14n11 xslt xpath sha256 hmac-sha256" \
+    "hmac" \
+    "--enabled-reference-uris any --lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
+    "--enabled-reference-uris any --hmackey:TeskKeyName-Hmac $topfolder/keys/hmackey.bin" \
+    "--enabled-reference-uris any --hmackey:TeskKeyName-Hmac $topfolder/keys/hmackey.bin"
+
+execDSigTest $res_success \
+    "xmldsig2ed-tests.modern" \
+    "defCan-3" \
+    "c14n11 xslt xpath sha256 hmac-sha256" \
+    "hmac" \
+    "--enabled-reference-uris any --lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
+    "--enabled-reference-uris any --hmackey:TeskKeyName-Hmac $topfolder/keys/hmackey.bin" \
+    "--enabled-reference-uris any --hmackey:TeskKeyName-Hmac $topfolder/keys/hmackey.bin"
+
+execDSigTest $res_success \
+    "xmldsig2ed-tests.modern" \
+    "xpointer-1-SUN" \
+    "c14n11 xpointer sha256 hmac-sha256" \
+    "hmac" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin"
+
+execDSigTest $res_success \
+    "xmldsig2ed-tests.modern" \
+    "xpointer-2-SUN" \
+    "c14n11 xpointer sha256 hmac-sha256" \
+    "hmac" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin"
+
+execDSigTest $res_success \
+    "xmldsig2ed-tests.modern" \
+    "xpointer-3-SUN" \
+    "c14n11 xpointer sha256 hmac-sha256" \
+    "hmac" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin"
+
+execDSigTest $res_success \
+    "xmldsig2ed-tests.modern" \
+    "xpointer-4-SUN" \
+    "c14n11 xpointer sha256 hmac-sha256" \
+    "hmac" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin"
+
+execDSigTest $res_success \
+    "xmldsig2ed-tests.modern" \
+    "xpointer-5-SUN" \
+    "c14n11 xpointer sha256 hmac-sha256" \
+    "hmac" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin"
+
+execDSigTest $res_success \
+    "xmldsig2ed-tests.modern" \
+    "xpointer-6-SUN" \
+    "c14n11 xpointer sha256 hmac-sha256" \
+    "hmac" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin"
+
+##########################################################################
+#
 # aleksey-xmldsig-01
 #
 ##########################################################################
 
 
 
-# These tests verify certificates lookup, keys lookup is tested in XMLEnc.sh
+# These tests verify certificates lookup, keys lookup is tested in testEnc.sh
 if [ "z$xmlsec_feature_x509_data_lookup" = "zyes" ] ; then
     execDSigTest $res_success \
         "" \
@@ -963,16 +1356,16 @@ fi
 execDSigTest $res_success \
     "" \
     "aleksey-xmldsig-01/signature-two-keynames" \
-    "sha1 rsa-sha1" \
+    "sha256 rsa-sha256" \
     "rsa x509" \
-    "$pub_key_option:key2  $topfolder/keys/rsa/rsa-2048-pubkey$rsa_pub_key_suffix.$pub_key_format $url_map_xml_stylesheet_2018" \
-    "$priv_key_option:key2 $topfolder/keys/rsa/rsa-2048-key.$priv_key_format --pwd secret123 $url_map_xml_stylesheet_2018" \
-    "$pub_key_option:key2  $topfolder/keys/rsa/rsa-2048-pubkey$rsa_pub_key_suffix.$pub_key_format $url_map_xml_stylesheet_2018"
+    "--enabled-reference-uris any $pub_key_option:key2  $topfolder/keys/rsa/rsa-2048-pubkey$rsa_pub_key_suffix.$pub_key_format $url_map_xml_stylesheet_2018" \
+    "--enabled-reference-uris any $priv_key_option:key2 $topfolder/keys/rsa/rsa-2048-key.$priv_key_format --pwd secret123 $url_map_xml_stylesheet_2018" \
+    "--enabled-reference-uris any $pub_key_option:key2  $topfolder/keys/rsa/rsa-2048-pubkey$rsa_pub_key_suffix.$pub_key_format $url_map_xml_stylesheet_2018"
 
 execDSigTest $res_success \
     "" \
-    "aleksey-xmldsig-01/enveloping-dsa-x509chain" \
-    "sha1 dsa-sha1" \
+    "aleksey-xmldsig-01/enveloping-sha256-dsa1024-sha256-x509chain" \
+    "sha256 dsa-sha256" \
     "dsa x509" \
     "--trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509" \
     "$priv_key_option:TestKeyName-dsa-1024 $topfolder/keys/dsa/dsa-1024-key.$priv_key_format --pwd secret123" \
@@ -981,7 +1374,7 @@ execDSigTest $res_success \
 execDSigTest $res_success \
     "" \
     "aleksey-xmldsig-01/enveloping-rsa-x509chain" \
-    "sha1 rsa-sha1" \
+    "sha256 rsa-sha256" \
     "rsa x509" \
     "--trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509" \
     "$priv_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-key.$priv_key_format --pwd secret123" \
@@ -1023,10 +1416,21 @@ execDSigTest $res_success \
     "--hmackey:TeskKeyName-Hmac $topfolder/keys/hmackey.bin" \
     "--hmackey:TeskKeyName-Hmac $topfolder/keys/hmackey.bin"
 
+# the legacy (RFC 4051) XPointer transform identifier test
+execDSigTest $res_success \
+    "" \
+    "aleksey-xmldsig-01/xpointer-hmac-legacy" \
+    "xpointer-legacy sha256 hmac-sha256" \
+    "hmac" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
+    "--hmackey:TeskKeyName-Hmac $topfolder/keys/hmackey.bin" \
+    "--hmackey:TeskKeyName-Hmac $topfolder/keys/hmackey.bin"
+
+# the XPointer transform identifier from draft-rfc9231bis-xmlsec-uris test
 execDSigTest $res_success \
     "" \
     "aleksey-xmldsig-01/xpointer-hmac" \
-    "xpointer sha1 hmac-sha1" \
+    "xpointer sha256 hmac-sha256" \
     "hmac" \
     "--lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
     "--hmackey:TeskKeyName-Hmac $topfolder/keys/hmackey.bin" \
@@ -1167,14 +1571,160 @@ execDSigTest $res_success \
     "$priv_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123" \
     "--trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509"
 
+# Exclusive C14N (2001) canonicalization method for SignedInfo and for the reference data.
+execDSigTest $res_success \
+    "" \
+    "aleksey-xmldsig-01/enveloping-sha256-rsa-sha256-exc-c14n" \
+    "exc-c14n xpointer sha256 rsa-sha256" \
+    "rsa x509" \
+    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509" \
+    "$priv_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509"
+
+# Exclusive C14N with comments canonicalization method for SignedInfo and for the reference data.
+execDSigTest $res_success \
+    "" \
+    "aleksey-xmldsig-01/enveloping-sha256-rsa-sha256-exc-c14n-with-comments" \
+    "exc-c14n-with-comments xpointer sha256 rsa-sha256" \
+    "rsa x509" \
+    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509" \
+    "$priv_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509"
+
+# C14N 1.1 (2006) canonicalization method for SignedInfo and for the reference data.
+execDSigTest $res_success \
+    "" \
+    "aleksey-xmldsig-01/enveloping-sha256-rsa-sha256-c14n11" \
+    "c14n11 xpointer sha256 rsa-sha256" \
+    "rsa x509" \
+    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509" \
+    "$priv_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509"
+
+# C14N 1.1 with comments canonicalization method for SignedInfo and for the reference data.
+execDSigTest $res_success \
+    "" \
+    "aleksey-xmldsig-01/enveloping-sha256-rsa-sha256-c14n11-with-comments" \
+    "c14n11-with-comments xpointer sha256 rsa-sha256" \
+    "rsa x509" \
+    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509" \
+    "$priv_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509"
+
+# XSLT reference transform (requires the libxslt support to be enabled at build time).
+execDSigTest $res_success \
+    "" \
+    "aleksey-xmldsig-01/enveloping-sha256-rsa-sha256-xslt" \
+    "xslt sha256 rsa-sha256" \
+    "rsa x509" \
+    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509" \
+    "$priv_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509"
+
 execDSigTest $res_success \
     "aleksey-xmldsig-01" \
     "enveloping-sha256-rsa-sha256-relationship" \
     "sha256 rsa-sha256 relationship" \
     "rsa x509" \
-    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509" \
-    "$priv_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123" \
-    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509"
+    "--enabled-reference-uris any --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509" \
+    "--enabled-reference-uris any $priv_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-reference-uris any --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509"
+
+# Relationship transform: whitespace/text nodes between elements must be dropped (spec step 3).
+execDSigTest $res_success \
+    "aleksey-xmldsig-01" \
+    "enveloping-sha256-rsa-sha256-relationship-whitespace" \
+    "sha256 rsa-sha256 relationship" \
+    "rsa x509" \
+    "--enabled-reference-uris any --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509" \
+    "--enabled-reference-uris any $priv_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-reference-uris any --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509"
+
+# Relationship transform: attribute values containing & and " must be escaped (well-formed output).
+execDSigTest $res_success \
+    "aleksey-xmldsig-01" \
+    "enveloping-sha256-rsa-sha256-relationship-attr-escape" \
+    "sha256 rsa-sha256 relationship" \
+    "rsa x509" \
+    "--enabled-reference-uris any --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509" \
+    "--enabled-reference-uris any $priv_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-reference-uris any --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509"
+
+# Relationship transform: MCE/versioning attributes and ignorable foreign attributes must be removed.
+execDSigTest $res_success \
+    "aleksey-xmldsig-01" \
+    "enveloping-sha256-rsa-sha256-relationship-mce-attr" \
+    "sha256 rsa-sha256 relationship" \
+    "rsa x509" \
+    "--enabled-reference-uris any --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509" \
+    "--enabled-reference-uris any $priv_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-reference-uris any --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509"
+
+# Relationship transform: foreign namespace declarations must be removed (spec step 2.1).
+execDSigTest $res_success \
+    "aleksey-xmldsig-01" \
+    "enveloping-sha256-rsa-sha256-relationship-ns" \
+    "sha256 rsa-sha256 relationship" \
+    "rsa x509" \
+    "--enabled-reference-uris any --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509" \
+    "--enabled-reference-uris any $priv_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-reference-uris any --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509"
+
+# Relationship transform: ignorable foreign elements must be removed before sorting/filtering.
+execDSigTest $res_success \
+    "aleksey-xmldsig-01" \
+    "enveloping-sha256-rsa-sha256-relationship-foreign" \
+    "sha256 rsa-sha256 relationship" \
+    "rsa x509" \
+    "--enabled-reference-uris any --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509" \
+    "--enabled-reference-uris any $priv_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-reference-uris any --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509"
+
+# Relationship transform: any contents of the Relationship element must be removed (spec step 3.2).
+execDSigTest $res_success \
+    "aleksey-xmldsig-01" \
+    "enveloping-sha256-rsa-sha256-relationship-content" \
+    "sha256 rsa-sha256 relationship" \
+    "rsa x509" \
+    "--enabled-reference-uris any --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509" \
+    "--enabled-reference-uris any $priv_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-reference-uris any --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509"
+
+# XPath2 (xmldsig-filter2) transform with a relative expression: per the xmldsig-filter2
+# REC (sec 3.3) the expression is evaluated with the document root node (the document node
+# itself) as the context node, context position and size 1. Without the context node the
+# relative expression "descendant::data" resolves to an empty node set and the stored
+# reference digest no longer matches.
+execDSigTest $res_success \
+    "" \
+    "aleksey-xmldsig-01/filter2-relative-sha256-rsa-sha256" \
+    "xpath2 c14n sha256 rsa-sha256" \
+    "key-value rsa" \
+    "--enabled-key-data key-value,rsa" \
+    "--enabled-key-data key-value,key-name,rsa $priv_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-key-data key-value,rsa"
+
+# Relationship transform (legacy mode): with --relationship-legacy the old behaviour is restored,
+# so text/comment nodes are serialized as spurious elements instead of being removed.
+execDSigTest $res_success \
+    "aleksey-xmldsig-01" \
+    "enveloping-sha256-rsa-sha256-relationship-whitespace-legacy" \
+    "sha256 rsa-sha256 relationship" \
+    "rsa x509" \
+    "--relationship-legacy --enabled-reference-uris any --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509" \
+    "--relationship-legacy --enabled-reference-uris any $priv_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--relationship-legacy --enabled-reference-uris any --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509"
+
+# Relationship transform (legacy mode): with --relationship-legacy the old behaviour is restored,
+# so foreign namespace declarations are written as a single unprefixed xmlns="..." instead of being removed.
+execDSigTest $res_success \
+    "aleksey-xmldsig-01" \
+    "enveloping-sha256-rsa-sha256-relationship-ns-legacy" \
+    "sha256 rsa-sha256 relationship" \
+    "rsa x509" \
+    "--relationship-legacy --enabled-reference-uris any --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509" \
+    "--relationship-legacy --enabled-reference-uris any $priv_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--relationship-legacy --enabled-reference-uris any --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509"
 
 execDSigTest $res_success \
     "" \
@@ -1563,7 +2113,7 @@ execDSigTest $res_success \
 execDSigTest $res_success \
     "" \
     "aleksey-xmldsig-01/x509data-test" \
-    "xpath2 sha1 rsa-sha1" \
+    "xpath2 sha256 rsa-sha256" \
     "rsa x509" \
     "--trusted-$cert_format $topfolder/keys/cacert.$cert_format" \
     "$priv_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-key.$priv_key_format --pwd secret123" \
@@ -1573,14 +2123,14 @@ execDSigTest $res_success \
 execDSigPrintXmlDebugTest \
     "" \
     "aleksey-xmldsig-01/x509data-test" \
-    "xpath2 sha1 rsa-sha1" \
+    "xpath2 sha256 rsa-sha256" \
     "rsa x509" \
     "--trusted-$cert_format $topfolder/keys/cacert.$cert_format"
 
 execDSigTest $res_success \
     "" \
     "aleksey-xmldsig-01/x509data-sn-test" \
-    "xpath2 sha1 rsa-sha1" \
+    "xpath2 sha256 rsa-sha256" \
     "rsa x509" \
     "--trusted-$cert_format $topfolder/keys/cacert.$cert_format --untrusted-$cert_format $topfolder/keys/ca2cert.$cert_format  --untrusted-$cert_format $topfolder/keys/rsa/rsa-2048-cert.$cert_format --enabled-key-data x509" \
     "$priv_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-key.$priv_key_format --pwd secret123" \
@@ -1620,11 +2170,36 @@ execDSigTest $res_success \
 if [ "z$xmlsec_feature_context_string" = "zyes" ] ; then
     execDSigTest $res_success \
         "" \
-        "aleksey-xmldsig-01/enveloped-sha512-mldsa44-with-context-string" \
+        "aleksey-xmldsig-01/enveloped-sha512-mldsa44-with-signature-context" \
         "sha512 ml-dsa-44" \
         "ml-dsa" \
         "$pub_key_option:TestKeyName-ml-dsa-44 $topfolder/keys/ml-dsa/ml-dsa-44-pubkey.$pub_key_format" \
         "$priv_key_option:TestKeyName-ml-dsa-44 $topfolder/keys/ml-dsa/ml-dsa-44-key.$priv_key_format --pwd secret123" \
+        "$pub_key_option:TestKeyName-ml-dsa-44 $topfolder/keys/ml-dsa/ml-dsa-44-pubkey.$pub_key_format"
+
+    execDSigTest $res_success \
+        "" \
+        "aleksey-xmldsig-01/enveloped-sha512-mldsa44-with-object-signature-context" \
+        "sha512 ml-dsa-44" \
+        "ml-dsa" \
+        "$pub_key_option:TestKeyName-ml-dsa-44 $topfolder/keys/ml-dsa/ml-dsa-44-pubkey.$pub_key_format" \
+        "$priv_key_option:TestKeyName-ml-dsa-44 $topfolder/keys/ml-dsa/ml-dsa-44-key.$priv_key_format --pwd secret123" \
+        "$pub_key_option:TestKeyName-ml-dsa-44 $topfolder/keys/ml-dsa/ml-dsa-44-pubkey.$pub_key_format"
+
+    extra_message="Negative test: two SignatureContext elements in SignatureMethod, should fail"
+    execDSigTest $res_fail \
+        "" \
+        "aleksey-xmldsig-01/enveloped-sha512-mldsa44-with-two-signature-contexts-in-signature-method" \
+        "sha512 ml-dsa-44" \
+        "ml-dsa" \
+        "$pub_key_option:TestKeyName-ml-dsa-44 $topfolder/keys/ml-dsa/ml-dsa-44-pubkey.$pub_key_format"
+
+    extra_message="Negative test: SignatureContext in SignatureMethod and in Object, should fail"
+    execDSigTest $res_fail \
+        "" \
+        "aleksey-xmldsig-01/enveloped-sha512-mldsa44-with-two-signature-contexts-in-signature-method-and-object" \
+        "sha512 ml-dsa-44" \
+        "ml-dsa" \
         "$pub_key_option:TestKeyName-ml-dsa-44 $topfolder/keys/ml-dsa/ml-dsa-44-pubkey.$pub_key_format"
 fi
 
@@ -1640,7 +2215,16 @@ execDSigTest $res_success \
 if [ "z$xmlsec_feature_context_string" = "zyes" ] ; then
     execDSigTest $res_success \
         "" \
-        "aleksey-xmldsig-01/enveloped-sha512-mldsa65-with-context-string" \
+        "aleksey-xmldsig-01/enveloped-sha512-mldsa65-with-signature-context" \
+        "sha512 ml-dsa-65" \
+        "ml-dsa" \
+        "$pub_key_option:TestKeyName-ml-dsa-65 $topfolder/keys/ml-dsa/ml-dsa-65-pubkey.$pub_key_format" \
+        "$priv_key_option:TestKeyName-ml-dsa-65 $topfolder/keys/ml-dsa/ml-dsa-65-key.$priv_key_format --pwd secret123" \
+        "$pub_key_option:TestKeyName-ml-dsa-65 $topfolder/keys/ml-dsa/ml-dsa-65-pubkey.$pub_key_format"
+
+    execDSigTest $res_success \
+        "" \
+        "aleksey-xmldsig-01/enveloped-sha512-mldsa65-with-object-signature-context" \
         "sha512 ml-dsa-65" \
         "ml-dsa" \
         "$pub_key_option:TestKeyName-ml-dsa-65 $topfolder/keys/ml-dsa/ml-dsa-65-pubkey.$pub_key_format" \
@@ -1660,7 +2244,16 @@ execDSigTest $res_success \
 if [ "z$xmlsec_feature_context_string" = "zyes" ] ; then
     execDSigTest $res_success \
         "" \
-        "aleksey-xmldsig-01/enveloped-sha512-mldsa87-with-context-string" \
+        "aleksey-xmldsig-01/enveloped-sha512-mldsa87-with-signature-context" \
+        "sha512 ml-dsa-87" \
+        "ml-dsa" \
+        "$pub_key_option:TestKeyName-ml-dsa-87 $topfolder/keys/ml-dsa/ml-dsa-87-pubkey.$pub_key_format" \
+        "$priv_key_option:TestKeyName-ml-dsa-87 $topfolder/keys/ml-dsa/ml-dsa-87-key.$priv_key_format --pwd secret123" \
+        "$pub_key_option:TestKeyName-ml-dsa-87 $topfolder/keys/ml-dsa/ml-dsa-87-pubkey.$pub_key_format"
+
+    execDSigTest $res_success \
+        "" \
+        "aleksey-xmldsig-01/enveloped-sha512-mldsa87-with-object-signature-context" \
         "sha512 ml-dsa-87" \
         "ml-dsa" \
         "$pub_key_option:TestKeyName-ml-dsa-87 $topfolder/keys/ml-dsa/ml-dsa-87-pubkey.$pub_key_format" \
@@ -1682,7 +2275,16 @@ execDSigTest $res_success \
 if [ "z$xmlsec_feature_context_string" = "zyes" ] ; then
     execDSigTest $res_success \
         "" \
-        "aleksey-xmldsig-01/enveloped-sha512-slhdsa-sha2-128f-with-context-string" \
+        "aleksey-xmldsig-01/enveloped-sha512-slhdsa-sha2-128f-with-signature-context" \
+        "sha512 slh-dsa-sha2-128f" \
+        "slh-dsa" \
+        "$pub_key_option:TestKeyName-slh-dsa-sha2-128f $topfolder/keys/slh-dsa/slh-dsa-sha2-128f-pubkey.$pub_key_format" \
+        "$priv_key_option:TestKeyName-slh-dsa-sha2-128f $topfolder/keys/slh-dsa/slh-dsa-sha2-128f-key.$priv_key_format --pwd secret123" \
+        "$pub_key_option:TestKeyName-slh-dsa-sha2-128f $topfolder/keys/slh-dsa/slh-dsa-sha2-128f-pubkey.$pub_key_format"
+
+    execDSigTest $res_success \
+        "" \
+        "aleksey-xmldsig-01/enveloped-sha512-slhdsa-sha2-128f-with-object-signature-context" \
         "sha512 slh-dsa-sha2-128f" \
         "slh-dsa" \
         "$pub_key_option:TestKeyName-slh-dsa-sha2-128f $topfolder/keys/slh-dsa/slh-dsa-sha2-128f-pubkey.$pub_key_format" \
@@ -1703,11 +2305,28 @@ execDSigTest $res_success \
 if [ "z$xmlsec_feature_context_string" = "zyes" ] ; then
     execDSigTest $res_success \
         "" \
-        "aleksey-xmldsig-01/enveloped-sha512-slhdsa-sha2-128s-with-context-string" \
+        "aleksey-xmldsig-01/enveloped-sha512-slhdsa-sha2-128s-with-signature-context" \
         "sha512 slh-dsa-sha2-128s" \
         "slh-dsa" \
         "$pub_key_option:TestKeyName-slh-dsa-sha2-128s $topfolder/keys/slh-dsa/slh-dsa-sha2-128s-pubkey.$pub_key_format" \
         "$priv_key_option:TestKeyName-slh-dsa-sha2-128s $topfolder/keys/slh-dsa/slh-dsa-sha2-128s-key.$priv_key_format --pwd secret123" \
+        "$pub_key_option:TestKeyName-slh-dsa-sha2-128s $topfolder/keys/slh-dsa/slh-dsa-sha2-128s-pubkey.$pub_key_format"
+
+    execDSigTest $res_success \
+        "" \
+        "aleksey-xmldsig-01/enveloped-sha512-slhdsa-sha2-128s-with-object-signature-context" \
+        "sha512 slh-dsa-sha2-128s" \
+        "slh-dsa" \
+        "$pub_key_option:TestKeyName-slh-dsa-sha2-128s $topfolder/keys/slh-dsa/slh-dsa-sha2-128s-pubkey.$pub_key_format" \
+        "$priv_key_option:TestKeyName-slh-dsa-sha2-128s $topfolder/keys/slh-dsa/slh-dsa-sha2-128s-key.$priv_key_format --pwd secret123" \
+        "$pub_key_option:TestKeyName-slh-dsa-sha2-128s $topfolder/keys/slh-dsa/slh-dsa-sha2-128s-pubkey.$pub_key_format"
+
+    extra_message="Negative test: two SignatureContext elements in Objects, should fail"
+    execDSigTest $res_fail \
+        "" \
+        "aleksey-xmldsig-01/enveloped-sha512-slhdsa-sha2-128s-with-two-signature-contexts-in-objects" \
+        "sha512 slh-dsa-sha2-128s" \
+        "slh-dsa" \
         "$pub_key_option:TestKeyName-slh-dsa-sha2-128s $topfolder/keys/slh-dsa/slh-dsa-sha2-128s-pubkey.$pub_key_format"
 fi
 
@@ -1724,7 +2343,16 @@ execDSigTest $res_success \
 if [ "z$xmlsec_feature_context_string" = "zyes" ] ; then
     execDSigTest $res_success \
         "" \
-        "aleksey-xmldsig-01/enveloped-sha512-slhdsa-sha2-192f-with-context-string" \
+        "aleksey-xmldsig-01/enveloped-sha512-slhdsa-sha2-192f-with-signature-context" \
+        "sha512 slh-dsa-sha2-192f" \
+        "slh-dsa" \
+        "$pub_key_option:TestKeyName-slh-dsa-sha2-192f $topfolder/keys/slh-dsa/slh-dsa-sha2-192f-pubkey.$pub_key_format" \
+        "$priv_key_option:TestKeyName-slh-dsa-sha2-192f $topfolder/keys/slh-dsa/slh-dsa-sha2-192f-key.$priv_key_format --pwd secret123" \
+        "$pub_key_option:TestKeyName-slh-dsa-sha2-192f $topfolder/keys/slh-dsa/slh-dsa-sha2-192f-pubkey.$pub_key_format"
+
+    execDSigTest $res_success \
+        "" \
+        "aleksey-xmldsig-01/enveloped-sha512-slhdsa-sha2-192f-with-object-signature-context" \
         "sha512 slh-dsa-sha2-192f" \
         "slh-dsa" \
         "$pub_key_option:TestKeyName-slh-dsa-sha2-192f $topfolder/keys/slh-dsa/slh-dsa-sha2-192f-pubkey.$pub_key_format" \
@@ -1744,7 +2372,16 @@ execDSigTest $res_success \
 if [ "z$xmlsec_feature_context_string" = "zyes" ] ; then
     execDSigTest $res_success \
         "" \
-        "aleksey-xmldsig-01/enveloped-sha512-slhdsa-sha2-192s-with-context-string" \
+        "aleksey-xmldsig-01/enveloped-sha512-slhdsa-sha2-192s-with-signature-context" \
+        "sha512 slh-dsa-sha2-192s" \
+        "slh-dsa" \
+        "$pub_key_option:TestKeyName-slh-dsa-sha2-192s $topfolder/keys/slh-dsa/slh-dsa-sha2-192s-pubkey.$pub_key_format" \
+        "$priv_key_option:TestKeyName-slh-dsa-sha2-192s $topfolder/keys/slh-dsa/slh-dsa-sha2-192s-key.$priv_key_format --pwd secret123" \
+        "$pub_key_option:TestKeyName-slh-dsa-sha2-192s $topfolder/keys/slh-dsa/slh-dsa-sha2-192s-pubkey.$pub_key_format"
+
+    execDSigTest $res_success \
+        "" \
+        "aleksey-xmldsig-01/enveloped-sha512-slhdsa-sha2-192s-with-object-signature-context" \
         "sha512 slh-dsa-sha2-192s" \
         "slh-dsa" \
         "$pub_key_option:TestKeyName-slh-dsa-sha2-192s $topfolder/keys/slh-dsa/slh-dsa-sha2-192s-pubkey.$pub_key_format" \
@@ -1764,7 +2401,16 @@ execDSigTest $res_success \
 if [ "z$xmlsec_feature_context_string" = "zyes" ] ; then
     execDSigTest $res_success \
         "" \
-        "aleksey-xmldsig-01/enveloped-sha512-slhdsa-sha2-256f-with-context-string" \
+        "aleksey-xmldsig-01/enveloped-sha512-slhdsa-sha2-256f-with-signature-context" \
+        "sha512 slh-dsa-sha2-256f" \
+        "slh-dsa" \
+        "$pub_key_option:TestKeyName-slh-dsa-sha2-256f $topfolder/keys/slh-dsa/slh-dsa-sha2-256f-pubkey.$pub_key_format" \
+        "$priv_key_option:TestKeyName-slh-dsa-sha2-256f $topfolder/keys/slh-dsa/slh-dsa-sha2-256f-key.$priv_key_format --pwd secret123" \
+        "$pub_key_option:TestKeyName-slh-dsa-sha2-256f $topfolder/keys/slh-dsa/slh-dsa-sha2-256f-pubkey.$pub_key_format"
+
+    execDSigTest $res_success \
+        "" \
+        "aleksey-xmldsig-01/enveloped-sha512-slhdsa-sha2-256f-with-object-signature-context" \
         "sha512 slh-dsa-sha2-256f" \
         "slh-dsa" \
         "$pub_key_option:TestKeyName-slh-dsa-sha2-256f $topfolder/keys/slh-dsa/slh-dsa-sha2-256f-pubkey.$pub_key_format" \
@@ -1784,7 +2430,16 @@ execDSigTest $res_success \
 if [ "z$xmlsec_feature_context_string" = "zyes" ] ; then
     execDSigTest $res_success \
         "" \
-        "aleksey-xmldsig-01/enveloped-sha512-slhdsa-sha2-256s-with-context-string" \
+        "aleksey-xmldsig-01/enveloped-sha512-slhdsa-sha2-256s-with-signature-context" \
+        "sha512 slh-dsa-sha2-256s" \
+        "slh-dsa" \
+        "$pub_key_option:TestKeyName-slh-dsa-sha2-256s $topfolder/keys/slh-dsa/slh-dsa-sha2-256s-pubkey.$pub_key_format" \
+        "$priv_key_option:TestKeyName-slh-dsa-sha2-256s $topfolder/keys/slh-dsa/slh-dsa-sha2-256s-key.$priv_key_format --pwd secret123" \
+        "$pub_key_option:TestKeyName-slh-dsa-sha2-256s $topfolder/keys/slh-dsa/slh-dsa-sha2-256s-pubkey.$pub_key_format"
+
+    execDSigTest $res_success \
+        "" \
+        "aleksey-xmldsig-01/enveloped-sha512-slhdsa-sha2-256s-with-object-signature-context" \
         "sha512 slh-dsa-sha2-256s" \
         "slh-dsa" \
         "$pub_key_option:TestKeyName-slh-dsa-sha2-256s $topfolder/keys/slh-dsa/slh-dsa-sha2-256s-pubkey.$pub_key_format" \
@@ -1794,35 +2449,32 @@ fi
 
 
 ## ML-KEM (HMAC signature with encapsulated key)
-if [ "z$xmlsec_feature_ml_kem" = "zyes" ] ; then
 execDSigTest $res_success \
     "" \
-    "aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-em-ml-kem-512" \
+    "aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-kt-ml-kem-512" \
     "sha256 hmac-sha256 ml-kem-512" \
-    "hmac ml-kem" \
-    "$mlkem_priv_key_option:TestKeyName-ml-kem-512 $topfolder/keys/ml-kem/ml-kem-512-key.$mlkem_priv_key_format --pwd secret123 --enabled-key-data key-name,encapsulation-mechanism" \
-    "$mlkem_pub_key_option:TestKeyName-ml-kem-512 $topfolder/keys/ml-kem/ml-kem-512-pubkey.$mlkem_pub_key_format --enabled-key-data key-name,encapsulation-mechanism" \
-    "$mlkem_priv_key_option:TestKeyName-ml-kem-512 $topfolder/keys/ml-kem/ml-kem-512-key.$mlkem_priv_key_format --pwd secret123 --enabled-key-data key-name,encapsulation-mechanism"
+    "hmac" \
+    "$mlkem_priv_key_option:TestKeyName-ml-kem-512 $topfolder/keys/ml-kem/ml-kem-512-key.$mlkem_priv_key_format --pwd secret123 --enabled-key-data key-name,enc-key" \
+    "$mlkem_pub_key_option:TestKeyName-ml-kem-512 $topfolder/keys/ml-kem/ml-kem-512-pubkey.$mlkem_pub_key_format --enabled-key-data key-name,enc-key" \
+    "$mlkem_priv_key_option:TestKeyName-ml-kem-512 $topfolder/keys/ml-kem/ml-kem-512-key.$mlkem_priv_key_format --pwd secret123 --enabled-key-data key-name,enc-key"
 
 execDSigTest $res_success \
     "" \
-    "aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-em-ml-kem-768" \
+    "aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-kt-ml-kem-768" \
     "sha256 hmac-sha256 ml-kem-768" \
-    "hmac ml-kem" \
-    "$mlkem_priv_key_option:TestKeyName-ml-kem-768 $topfolder/keys/ml-kem/ml-kem-768-key.$mlkem_priv_key_format --pwd secret123 --enabled-key-data key-name,encapsulation-mechanism" \
-    "$mlkem_pub_key_option:TestKeyName-ml-kem-768 $topfolder/keys/ml-kem/ml-kem-768-pubkey.$mlkem_pub_key_format --enabled-key-data key-name,encapsulation-mechanism" \
-    "$mlkem_priv_key_option:TestKeyName-ml-kem-768 $topfolder/keys/ml-kem/ml-kem-768-key.$mlkem_priv_key_format --pwd secret123 --enabled-key-data key-name,encapsulation-mechanism"
+    "hmac" \
+    "$mlkem_priv_key_option:TestKeyName-ml-kem-768 $topfolder/keys/ml-kem/ml-kem-768-key.$mlkem_priv_key_format --pwd secret123 --enabled-key-data key-name,enc-key" \
+    "$mlkem_pub_key_option:TestKeyName-ml-kem-768 $topfolder/keys/ml-kem/ml-kem-768-pubkey.$mlkem_pub_key_format --enabled-key-data key-name,enc-key" \
+    "$mlkem_priv_key_option:TestKeyName-ml-kem-768 $topfolder/keys/ml-kem/ml-kem-768-key.$mlkem_priv_key_format --pwd secret123 --enabled-key-data key-name,enc-key"
 
 execDSigTest $res_success \
     "" \
-    "aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-em-ml-kem-1024" \
+    "aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-kt-ml-kem-1024" \
     "sha256 hmac-sha256 ml-kem-1024" \
-    "hmac ml-kem" \
-    "$mlkem_priv_key_option:TestKeyName-ml-kem-1024 $topfolder/keys/ml-kem/ml-kem-1024-key.$mlkem_priv_key_format --pwd secret123 --enabled-key-data key-name,encapsulation-mechanism" \
-    "$mlkem_pub_key_option:TestKeyName-ml-kem-1024 $topfolder/keys/ml-kem/ml-kem-1024-pubkey.$mlkem_pub_key_format --enabled-key-data key-name,encapsulation-mechanism" \
-    "$mlkem_priv_key_option:TestKeyName-ml-kem-1024 $topfolder/keys/ml-kem/ml-kem-1024-key.$mlkem_priv_key_format --pwd secret123 --enabled-key-data key-name,encapsulation-mechanism"
-fi # xmlsec_feature_ml_kem
-
+    "hmac" \
+    "$mlkem_priv_key_option:TestKeyName-ml-kem-1024 $topfolder/keys/ml-kem/ml-kem-1024-key.$mlkem_priv_key_format --pwd secret123 --enabled-key-data key-name,enc-key" \
+    "$mlkem_pub_key_option:TestKeyName-ml-kem-1024 $topfolder/keys/ml-kem/ml-kem-1024-pubkey.$mlkem_pub_key_format --enabled-key-data key-name,enc-key" \
+    "$mlkem_priv_key_option:TestKeyName-ml-kem-1024 $topfolder/keys/ml-kem/ml-kem-1024-key.$mlkem_priv_key_format --pwd secret123 --enabled-key-data key-name,enc-key"
 
 ## EdDSA
 execDSigTest $res_success \
@@ -1846,7 +2498,16 @@ execDSigTest $res_success \
 # context string is required for Ed25519ctx so no point in checking feature flag
 execDSigTest $res_success \
     "" \
-    "aleksey-xmldsig-01/enveloped-sha256-eddsa-ed25519ctx-with-context-string" \
+    "aleksey-xmldsig-01/enveloped-sha256-eddsa-ed25519ctx-with-signature-context" \
+    "sha256 eddsa-ed25519ctx" \
+    "eddsa" \
+    "$pub_key_option:TestKeyName-eddsa-ed25519 $topfolder/keys/eddsa/eddsa-ed25519-pubkey.$pub_key_format" \
+    "$eddsa_priv_key_option:TestKeyName-eddsa-ed25519 $topfolder/keys/eddsa/eddsa-ed25519-key.$eddsa_priv_key_format --pwd secret123" \
+    "$pub_key_option:TestKeyName-eddsa-ed25519 $topfolder/keys/eddsa/eddsa-ed25519-pubkey.$pub_key_format"
+
+execDSigTest $res_success \
+    "" \
+    "aleksey-xmldsig-01/enveloped-sha256-eddsa-ed25519ctx-with-object-signature-context" \
     "sha256 eddsa-ed25519ctx" \
     "eddsa" \
     "$pub_key_option:TestKeyName-eddsa-ed25519 $topfolder/keys/eddsa/eddsa-ed25519-pubkey.$pub_key_format" \
@@ -1857,7 +2518,16 @@ if [ "z$xmlsec_feature_context_string" = "zyes" ] ; then
 
     execDSigTest $res_success \
         "" \
-        "aleksey-xmldsig-01/enveloped-sha256-eddsa-ed25519ph-with-context-string" \
+        "aleksey-xmldsig-01/enveloped-sha256-eddsa-ed25519ph-with-signature-context" \
+        "sha256 eddsa-ed25519ph" \
+        "eddsa" \
+        "$pub_key_option:TestKeyName-eddsa-ed25519 $topfolder/keys/eddsa/eddsa-ed25519-pubkey.$pub_key_format" \
+        "$eddsa_priv_key_option:TestKeyName-eddsa-ed25519 $topfolder/keys/eddsa/eddsa-ed25519-key.$eddsa_priv_key_format --pwd secret123" \
+        "$pub_key_option:TestKeyName-eddsa-ed25519 $topfolder/keys/eddsa/eddsa-ed25519-pubkey.$pub_key_format"
+
+    execDSigTest $res_success \
+        "" \
+        "aleksey-xmldsig-01/enveloped-sha256-eddsa-ed25519ph-with-object-signature-context" \
         "sha256 eddsa-ed25519ph" \
         "eddsa" \
         "$pub_key_option:TestKeyName-eddsa-ed25519 $topfolder/keys/eddsa/eddsa-ed25519-pubkey.$pub_key_format" \
@@ -1886,7 +2556,16 @@ execDSigTest $res_success \
 if [ "z$xmlsec_feature_context_string" = "zyes" ] ; then
     execDSigTest $res_success \
         "" \
-        "aleksey-xmldsig-01/enveloped-sha256-eddsa-ed448ph-with-context-string" \
+        "aleksey-xmldsig-01/enveloped-sha256-eddsa-ed448ph-with-signature-context" \
+        "sha256 eddsa-ed448ph" \
+        "eddsa" \
+        "$pub_key_option:TestKeyName-eddsa-ed448 $topfolder/keys/eddsa/eddsa-ed448-pubkey.$pub_key_format" \
+        "$eddsa_priv_key_option:TestKeyName-eddsa-ed448 $topfolder/keys/eddsa/eddsa-ed448-key.$eddsa_priv_key_format --pwd secret123" \
+        "$pub_key_option:TestKeyName-eddsa-ed448 $topfolder/keys/eddsa/eddsa-ed448-pubkey.$pub_key_format"
+
+    execDSigTest $res_success \
+        "" \
+        "aleksey-xmldsig-01/enveloped-sha256-eddsa-ed448ph-with-object-signature-context" \
         "sha256 eddsa-ed448ph" \
         "eddsa" \
         "$pub_key_option:TestKeyName-eddsa-ed448 $topfolder/keys/eddsa/eddsa-ed448-pubkey.$pub_key_format" \
@@ -1911,7 +2590,7 @@ extra_message="Negative test: expired cert"
 execDSigTest $res_fail \
     "" \
     "aleksey-xmldsig-01/enveloping-expired-cert" \
-    "sha1 rsa-sha1" \
+    "sha256 rsa-sha256" \
     "rsa x509" \
     "--trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509"
 
@@ -1920,7 +2599,7 @@ extra_message="Expired cert but there is verification timestamp overwrite"
 execDSigTest $res_success \
     "" \
     "aleksey-xmldsig-01/enveloping-expired-cert" \
-    "sha1 rsa-sha1" \
+    "sha256 rsa-sha256" \
     "rsa x509" \
     "--trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509 --verification-gmt-time 2026-03-15+00:00:00"
 
@@ -1929,14 +2608,14 @@ if [ "z$xmlsec_feature_cert_check_skip_time" = "zyes" ] ; then
     execDSigTest $res_success \
         "" \
         "aleksey-xmldsig-01/enveloping-expired-cert" \
-        "sha1 rsa-sha1" \
+        "sha256 rsa-sha256" \
         "rsa x509" \
         "--trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509 --X509-skip-time-checks"
 fi
 
 # 'Verify existing signature' MUST fail here, as --trusted-... is not passed.
 # If this passes, that's a bug. Note that we need to cleanup NSS certs DB
-# since it automaticall stores trusted certs
+# since it automatically stores trusted certs
 extra_message="Missing trusted cert "
 execDSigTest $res_fail \
     "aleksey-xmldsig-01" \
@@ -1961,7 +2640,7 @@ execDSigTest $res_success \
 # Test was created using the following command:
 # xmlsec1 sign --crypto openssl  --lax-key-search --privkey-pem tests/keys/same-subj-key1.pem,tests/keys/same-subj-cert1.pem --output tests/aleksey-xmldsig-01/enveloped-x509-same-subj-cert.xml tests/aleksey-xmldsig-01/enveloped-x509-same-subj-cert.tmpl
 
-# this should succeeed with good cert
+# this should succeed with good cert
 extra_message="Cert chain is good"
 execDSigTest $res_success \
     "" \
@@ -1979,7 +2658,7 @@ execDSigTest $res_fail \
     "x509" \
     "--trusted-$cert_format $topfolder/keys/same-subj-cert2.$cert_format --enabled-key-data x509"
 
-# this should succeeed with both good (cert1) and bad (cert2) certs present (simulating key rotation)
+# this should succeed with both good (cert1) and bad (cert2) certs present (simulating key rotation)
 extra_message="Cert chain is good: both good (cert1) and bad (cert2) certs present"
 execDSigTest $res_success \
     "" \
@@ -1988,7 +2667,7 @@ execDSigTest $res_success \
     "x509" \
     "--trusted-$cert_format $topfolder/keys/same-subj-cert1.$cert_format --trusted-$cert_format $topfolder/keys/same-subj-cert2.$cert_format --enabled-key-data x509"
 
-# this should succeeed with both bad (cert2) and good (cert1) certs present (simulating key rotation)
+# this should succeed with both bad (cert2) and good (cert1) certs present (simulating key rotation)
 extra_message="Cert chain is good: both bad (cert2) and good (cert1) certs present"
 execDSigTest $res_success \
     "" \
@@ -2002,8 +2681,8 @@ execDSigTest $res_success \
 # xmlsec1 sign --lax-key-search --privkey-pem tests/keys/rsa/rsa-2048-key.pem,tests/keys/rsa/rsa-2048-cert.pem --output tests/aleksey-xmldsig-01/enveloped-x509-missing-cert.xml tests/aleksey-xmldsig-01/enveloped-x509-missing-cert.tmpl
 #
 
-# this should succeeed with both intermidiate and trusted certs provided
-extra_message="Cert chain is good: both intermidiate and trusted certs provided"
+# this should succeed with both intermediate and trusted certs provided
+extra_message="Cert chain is good: both intermediate and trusted certs provided"
 execDSigTest $res_success \
     "" \
     "aleksey-xmldsig-01/enveloped-x509-missing-cert" \
@@ -2011,7 +2690,7 @@ execDSigTest $res_success \
     "x509" \
     "--untrusted-$cert_format $topfolder/keys/ca2cert.$cert_format --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509"
 
-# this should succeeed too because we bypass all cert checks with --insecure mode
+# this should succeed too because we bypass all cert checks with --insecure mode
 extra_message="Cert chain is missing but there is --insecure bypass"
 execDSigTest $res_success \
     "" \
@@ -2020,8 +2699,8 @@ execDSigTest $res_success \
     "x509" \
     "--insecure --enabled-key-data x509"
 
-# this should fail: missing intermidiate cert (ca2cert)
-extra_message="Negative test: Missing intermidiate cert"
+# this should fail: missing intermediate cert (ca2cert)
+extra_message="Negative test: Missing intermediate cert"
 execDSigTest $res_fail \
     "" \
     "aleksey-xmldsig-01/enveloped-x509-missing-cert" \
@@ -2029,8 +2708,8 @@ execDSigTest $res_fail \
     "x509" \
     "--trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509"
 
-# this should fail: wront trusted cert (rsa-4096-cert)
-extra_message="Negative test: Wront trusted cert"
+# this should fail: wrong trusted cert (rsa-4096-cert)
+extra_message="Negative test: Wrong trusted cert"
 execDSigTest $res_fail \
     "" \
     "aleksey-xmldsig-01/enveloped-x509-missing-cert" \
@@ -2046,20 +2725,11 @@ if [ "z$xmlsec_feature_crl_load" = "zyes" ] ; then
         "aleksey-xmldsig-01/enveloped-x509-missing-cert" \
         "sha256 rsa-sha256" \
         "x509" \
-        "--verification-gmt-time 2023-04-01+00:00:00 --untrusted-$cert_format $topfolder/keys/ca2cert.$cert_format --trusted-$cert_format $topfolder/keys/cacert.$cert_format --crl-$cert_format $topfolder/keys/rsa/rsa-2048-cert-revoked-crl.$cert_format --enabled-key-data x509"
+        "--verification-gmt-time 2026-04-01+00:00:00 --untrusted-$cert_format $topfolder/keys/ca2cert.$cert_format --trusted-$cert_format $topfolder/keys/cacert.$cert_format --crl-$cert_format $topfolder/keys/rsa/rsa-2048-cert-revoked-crl.$cert_format --enabled-key-data x509"
 
-    # this should fail because while CRL is past due, it's still better than nothing
-    extra_message="Negative test: CRL is past due"
-    execDSigTest $res_fail \
-        "" \
-        "aleksey-xmldsig-01/enveloped-x509-missing-cert" \
-        "sha256 rsa-sha256" \
-        "x509" \
-        "--verification-gmt-time 2023-05-01+00:00:00 --untrusted-$cert_format $topfolder/keys/ca2cert.$cert_format --trusted-$cert_format $topfolder/keys/cacert.$cert_format --crl-$cert_format $topfolder/keys/rsa/rsa-2048-cert-revoked-crl.$cert_format --enabled-key-data x509"
-
-    # NSS / GnuTLS doesn't allow CRL verification by time (https://github.com/lsh123/xmlsec/issues/579)
+    # NSS doesn't allow CRL verification by time (https://github.com/lsh123/xmlsec/issues/579)
     if [ "z$xmlsec_feature_crl_check_skip_time" = "zyes" ] ; then
-        # this should succeeed because CRL is not valid yet
+        # this should succeed because CRL is not valid yet
         extra_message="CRL is not valid yet"
         execDSigTest $res_success \
             "" \
@@ -2069,7 +2739,7 @@ if [ "z$xmlsec_feature_crl_load" = "zyes" ] ; then
             "--verification-gmt-time 2026-03-10+00:00:00 --untrusted-$cert_format $topfolder/keys/ca2cert.$cert_format --trusted-$cert_format $topfolder/keys/cacert.$cert_format --crl-$cert_format $topfolder/keys/rsa/rsa-2048-cert-revoked-crl.$cert_format --enabled-key-data x509"
     fi
 
-    # this should succeeed too because we bypass all cert checks with --insecure mode
+    # this should succeed too because we bypass all cert checks with --insecure mode
     extra_message="CRL is present but there is --insecure bypass"
     execDSigTest $res_success \
         "" \
@@ -2089,7 +2759,7 @@ if [ "z$xmlsec_feature_crl_verification" = "zyes" ] ; then
         "rsa x509" \
         "--verification-gmt-time 2026-03-10+00:00:00 --crl-$cert_format $topfolder/keys/rsa/rsa-2048-cert-revoked-crl.$cert_format --untrusted-$cert_format $topfolder/keys/rsa/rsa-4096-cert.$cert_format --untrusted-$cert_format $topfolder/keys/ca2cert.$cert_format --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509"
 
-    # GnuTLS doesn't allow CRL verification by time (https://github.com/lsh123/xmlsec/issues/579)
+    # NSS doesn't allow CRL verification by time (https://github.com/lsh123/xmlsec/issues/579)
     if [ "z$xmlsec_feature_crl_check_skip_time" = "zyes" ] ; then
         extra_message="Verify CRL: this should succeed because CRL is valid"
         execDSigTest $res_success \
@@ -2101,7 +2771,7 @@ if [ "z$xmlsec_feature_crl_verification" = "zyes" ] ; then
     fi
 
     # this should fail because CRL is past due
-    extra_message="Verify CRL: this should fail becaused CRL is past due"
+    extra_message="Verify CRL: this should fail because CRL is past due"
     execDSigTest $res_fail \
         "" \
         "aleksey-xmldsig-01/enveloped-x509-subjectname" \
@@ -2123,7 +2793,7 @@ fi
 
 
 if [ "z$xmlsec_feature_key_check" = "zyes" ] ; then
-    # this should succeeed because key verification is not requested (no --verify-keys option)
+    # this should succeed because key verification is not requested (no --verify-keys option)
     extra_message="Successfully use key without verification"
     execDSigTest $res_success \
         "" \
@@ -2150,7 +2820,7 @@ if [ "z$xmlsec_feature_key_check" = "zyes" ] ; then
         "x509" \
         "--verify-keys --verification-gmt-time 1980-01-01+00:00:00  --pubkey-cert-$cert_format:TestKeyName-rsa-4096  $topfolder/keys/rsa/rsa-4096-cert.$cert_format --untrusted-$cert_format $topfolder/keys/ca2cert.$cert_format --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data key-name"
 
-    # this should succeeed because key can be verified
+    # this should succeed because key can be verified
     extra_message="Successfully verify key"
     execDSigTest $res_success \
         "" \
@@ -2227,36 +2897,36 @@ execDSigTest $res_success \
     "merlin-xmldsig-twenty-three/signature-external-b64-dsa" \
     "base64 sha1 dsa-sha1" \
     "dsa" \
-    "--enabled-key-data key-value,key-name,dsa $url_map_xml_stylesheet_b64_2005" \
-    "--enabled-key-data key-value,key-name,dsa $priv_key_option:TestKeyName-dsa-1024 $topfolder/keys/dsa/dsa-1024-key.$priv_key_format --pwd secret123 $url_map_xml_stylesheet_b64_2005" \
-    "--enabled-key-data key-value,key-name,dsa $url_map_xml_stylesheet_b64_2005"
+    "--enabled-reference-uris any --enabled-key-data key-value,key-name,dsa $url_map_xml_stylesheet_b64_2005" \
+    "--enabled-reference-uris any --enabled-key-data key-value,key-name,dsa $priv_key_option:TestKeyName-dsa-1024 $topfolder/keys/dsa/dsa-1024-key.$priv_key_format --pwd secret123 $url_map_xml_stylesheet_b64_2005" \
+    "--enabled-reference-uris any --enabled-key-data key-value,key-name,dsa $url_map_xml_stylesheet_b64_2005"
 
 execDSigTest $res_success \
     "" \
     "merlin-xmldsig-twenty-three/signature-external-dsa" \
     "sha1 dsa-sha1" \
     "dsa" \
-    "$url_map_xml_stylesheet_2005 --enabled-key-data key-value,key-name,dsa" \
-    "$url_map_xml_stylesheet_2005 --enabled-key-data key-value,key-name,dsa $priv_key_option:TestKeyName-dsa-1024 $topfolder/keys/dsa/dsa-1024-key.$priv_key_format --pwd secret123" \
-    "$url_map_xml_stylesheet_2005 --enabled-key-data key-value,key-name,dsa"
+    "--enabled-reference-uris any $url_map_xml_stylesheet_2005 --enabled-key-data key-value,key-name,dsa" \
+    "--enabled-reference-uris any $url_map_xml_stylesheet_2005 --enabled-key-data key-value,key-name,dsa $priv_key_option:TestKeyName-dsa-1024 $topfolder/keys/dsa/dsa-1024-key.$priv_key_format --pwd secret123" \
+    "--enabled-reference-uris any $url_map_xml_stylesheet_2005 --enabled-key-data key-value,key-name,dsa"
 
 execDSigTest $res_success \
     "" \
     "merlin-xmldsig-twenty-three/signature-keyname" \
     "sha1 dsa-sha1" \
     "dsa x509" \
-    "$url_map_xml_stylesheet_2005 --pubkey-cert-$cert_format:Lugh $topfolder/merlin-xmldsig-twenty-three/certs/lugh-cert.$cert_format" \
-    "$url_map_xml_stylesheet_2005 $priv_key_option:TestKeyName-dsa-1024 $topfolder/keys/dsa/dsa-1024-key.$priv_key_format --pwd secret123" \
-    "$url_map_xml_stylesheet_2005 $pub_key_option:TestKeyName-dsa-1024 $topfolder/keys/dsa/dsa-1024-pubkey$rsa_pub_key_suffix.$pub_key_format"
+    "--enabled-reference-uris any $url_map_xml_stylesheet_2005 --pubkey-cert-$cert_format:Lugh $topfolder/merlin-xmldsig-twenty-three/certs/lugh-cert.$cert_format" \
+    "--enabled-reference-uris any $url_map_xml_stylesheet_2005 $priv_key_option:TestKeyName-dsa-1024 $topfolder/keys/dsa/dsa-1024-key.$priv_key_format --pwd secret123" \
+    "--enabled-reference-uris any $url_map_xml_stylesheet_2005 $pub_key_option:TestKeyName-dsa-1024 $topfolder/keys/dsa/dsa-1024-pubkey$rsa_pub_key_suffix.$pub_key_format"
 
 execDSigTest $res_success \
     "" \
     "merlin-xmldsig-twenty-three/signature-x509-crt" \
     "sha1 dsa-sha1" \
     "dsa x509" \
-    "--trusted-$cert_format $topfolder/merlin-xmldsig-twenty-three/certs/ca.$cert_format --verification-gmt-time 2005-01-01+10:00:00 $url_map_xml_stylesheet_2005" \
-    "$priv_key_option:TestKeyName-dsa-1024 $topfolder/keys/dsa/dsa-1024-key.$priv_key_format --pwd secret123 $url_map_xml_stylesheet_2005"\
-    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format $url_map_xml_stylesheet_2005"
+    "--enabled-reference-uris any --trusted-$cert_format $topfolder/merlin-xmldsig-twenty-three/certs/ca.$cert_format --verification-gmt-time 2005-01-01+10:00:00 $url_map_xml_stylesheet_2005" \
+    "--enabled-reference-uris any $priv_key_option:TestKeyName-dsa-1024 $topfolder/keys/dsa/dsa-1024-key.$priv_key_format --pwd secret123 $url_map_xml_stylesheet_2005"\
+    "--enabled-reference-uris any --trusted-$cert_format $topfolder/keys/cacert.$cert_format $url_map_xml_stylesheet_2005"
 
 extra_message="Negative test: CRL is present"
 execDSigTest $res_fail \
@@ -2272,45 +2942,216 @@ execDSigTest $res_success \
     "merlin-xmldsig-twenty-three/signature-x509-sn" \
     "sha1 dsa-sha1" \
     "dsa x509" \
-    "--trusted-$cert_format $topfolder/merlin-xmldsig-twenty-three/certs/ca.$cert_format --untrusted-$cert_format $topfolder/merlin-xmldsig-twenty-three/certs/badb.$cert_format --verification-gmt-time 2005-01-01+10:00:00 $url_map_xml_stylesheet_2005" \
-    "$priv_key_option:TestKeyName-dsa-1024 $topfolder/keys/dsa/dsa-1024-key.$priv_key_format --pwd secret123 $url_map_xml_stylesheet_2005"\
-    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format $url_map_xml_stylesheet_2005"
+    "--enabled-reference-uris any --trusted-$cert_format $topfolder/merlin-xmldsig-twenty-three/certs/ca.$cert_format --untrusted-$cert_format $topfolder/merlin-xmldsig-twenty-three/certs/badb.$cert_format --verification-gmt-time 2005-01-01+10:00:00 $url_map_xml_stylesheet_2005" \
+    "--enabled-reference-uris any $priv_key_option:TestKeyName-dsa-1024 $topfolder/keys/dsa/dsa-1024-key.$priv_key_format --pwd secret123 $url_map_xml_stylesheet_2005"\
+    "--enabled-reference-uris any --trusted-$cert_format $topfolder/keys/cacert.$cert_format $url_map_xml_stylesheet_2005"
 
 execDSigTest $res_success \
     "" \
     "merlin-xmldsig-twenty-three/signature-x509-is" \
     "sha1 dsa-sha1" \
     "dsa x509" \
-    "--trusted-$cert_format $topfolder/merlin-xmldsig-twenty-three/certs/ca.$cert_format --untrusted-$cert_format $topfolder/merlin-xmldsig-twenty-three/certs/macha.$cert_format --verification-gmt-time 2005-01-01+10:00:00 $url_map_xml_stylesheet_2005" \
-    "$priv_key_option:TestKeyName-dsa-1024 $topfolder/keys/dsa/dsa-1024-key.$priv_key_format --pwd secret123 $url_map_xml_stylesheet_2005"\
-    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format $url_map_xml_stylesheet_2005"
+    "--enabled-reference-uris any --trusted-$cert_format $topfolder/merlin-xmldsig-twenty-three/certs/ca.$cert_format --untrusted-$cert_format $topfolder/merlin-xmldsig-twenty-three/certs/macha.$cert_format --verification-gmt-time 2005-01-01+10:00:00 $url_map_xml_stylesheet_2005" \
+    "--enabled-reference-uris any $priv_key_option:TestKeyName-dsa-1024 $topfolder/keys/dsa/dsa-1024-key.$priv_key_format --pwd secret123 $url_map_xml_stylesheet_2005"\
+    "--enabled-reference-uris any --trusted-$cert_format $topfolder/keys/cacert.$cert_format $url_map_xml_stylesheet_2005"
 
 execDSigTest $res_success \
     "" \
     "merlin-xmldsig-twenty-three/signature-x509-ski" \
     "sha1 dsa-sha1" \
     "dsa x509" \
-    "--trusted-$cert_format $topfolder/merlin-xmldsig-twenty-three/certs/ca.$cert_format --untrusted-$cert_format $topfolder/merlin-xmldsig-twenty-three/certs/nemain.$cert_format --verification-gmt-time 2005-01-01+10:00:00 $url_map_xml_stylesheet_2005" \
-    "$priv_key_option:TestKeyName-dsa-1024 $topfolder/keys/dsa/dsa-1024-key.$priv_key_format --pwd secret123 $url_map_xml_stylesheet_2005"\
-    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format $url_map_xml_stylesheet_2005"
+    "--enabled-reference-uris any --trusted-$cert_format $topfolder/merlin-xmldsig-twenty-three/certs/ca.$cert_format --untrusted-$cert_format $topfolder/merlin-xmldsig-twenty-three/certs/nemain.$cert_format --verification-gmt-time 2005-01-01+10:00:00 $url_map_xml_stylesheet_2005" \
+    "--enabled-reference-uris any $priv_key_option:TestKeyName-dsa-1024 $topfolder/keys/dsa/dsa-1024-key.$priv_key_format --pwd secret123 $url_map_xml_stylesheet_2005"\
+    "--enabled-reference-uris any --trusted-$cert_format $topfolder/keys/cacert.$cert_format $url_map_xml_stylesheet_2005"
 
 execDSigTest $res_success \
     "" \
     "merlin-xmldsig-twenty-three/signature-retrievalmethod-rawx509crt" \
     "sha1 dsa-sha1" \
     "dsa x509" \
-    "--trusted-$cert_format $topfolder/merlin-xmldsig-twenty-three/certs/ca.$cert_format --untrusted-$cert_format $topfolder/merlin-xmldsig-twenty-three/certs/nemain.$cert_format --verification-gmt-time 2005-01-01+10:00:00 $url_map_xml_stylesheet_2005" \
-    "--lax-key-search $priv_key_option:TestKeyName-dsa-1024 $topfolder/keys/dsa/dsa-1024-key.$priv_key_format --pwd secret123 $url_map_xml_stylesheet_2005"\
-    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format --trusted-$cert_format $topfolder/keys/ca2cert.$cert_format $url_map_xml_stylesheet_2005"
+    "--enabled-reference-uris any --enabled-retrieval-method-uris remote --trusted-$cert_format $topfolder/merlin-xmldsig-twenty-three/certs/ca.$cert_format --untrusted-$cert_format $topfolder/merlin-xmldsig-twenty-three/certs/nemain.$cert_format --verification-gmt-time 2005-01-01+10:00:00 $url_map_xml_stylesheet_2005" \
+    "--enabled-reference-uris any --enabled-retrieval-method-uris remote --lax-key-search $priv_key_option:TestKeyName-dsa-1024 $topfolder/keys/dsa/dsa-1024-key.$priv_key_format --pwd secret123 $url_map_xml_stylesheet_2005"\
+    "--enabled-reference-uris any --enabled-retrieval-method-uris remote  --trusted-$cert_format $topfolder/keys/cacert.$cert_format --trusted-$cert_format $topfolder/keys/ca2cert.$cert_format $url_map_xml_stylesheet_2005"
 
 execDSigTest $res_success \
     "" \
     "merlin-xmldsig-twenty-three/signature" \
     "base64 xpath xslt enveloped-signature c14n-with-comments sha1 dsa-sha1" \
     "dsa x509" \
-    "--trusted-$cert_format $topfolder/merlin-xmldsig-twenty-three/certs/merlin.$cert_format --verification-gmt-time 2005-01-01+10:00:00 $url_map_xml_stylesheet_2005 $url_map_xml_stylesheet_b64_2005" \
-    "--lax-key-search $priv_key_option:TestKeyName-dsa-1024 $topfolder/keys/dsa/dsa-1024-key.$priv_key_format --pwd secret123 $url_map_xml_stylesheet_2005 $url_map_xml_stylesheet_b64_2005" \
-    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format --untrusted-$cert_format $topfolder/keys/ca2cert.$cert_format $url_map_xml_stylesheet_2005 $url_map_xml_stylesheet_b64_2005"
+    "--enabled-reference-uris any --trusted-$cert_format $topfolder/merlin-xmldsig-twenty-three/certs/merlin.$cert_format --verification-gmt-time 2005-01-01+10:00:00 $url_map_xml_stylesheet_2005 $url_map_xml_stylesheet_b64_2005" \
+    "--enabled-reference-uris any --lax-key-search $priv_key_option:TestKeyName-dsa-1024 $topfolder/keys/dsa/dsa-1024-key.$priv_key_format --pwd secret123 $url_map_xml_stylesheet_2005 $url_map_xml_stylesheet_b64_2005" \
+    "--enabled-reference-uris any --trusted-$cert_format $topfolder/keys/cacert.$cert_format --untrusted-$cert_format $topfolder/keys/ca2cert.$cert_format $url_map_xml_stylesheet_2005 $url_map_xml_stylesheet_b64_2005"
+
+
+##########################################################################
+#
+# merlin-xmldsig-twenty-three.modern
+#
+##########################################################################
+
+#
+# The same documents as in merlin-xmldsig-twenty-three, but signed with
+# modern algorithms and keys from tests/keys: ecdsa-sha256 (prime256v1),
+# rsa-sha256 (rsa-2048) and hmac-sha256 (hmackey.bin).
+#
+
+execDSigTest $res_success \
+    "merlin-xmldsig-twenty-three.modern" \
+    "signature-enveloped-ecdsa" \
+    "enveloped-signature sha256 ecdsa-sha256" \
+    "ec key-value" \
+    "--enabled-key-data key-value,ec" \
+    "--enabled-key-data key-name,key-value,ec $priv_key_option:TestKeyName-ec-prime256v1 $topfolder/keys/ec/ec-prime256v1-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-key-data key-value,ec"
+
+execDSigTest $res_success \
+    "merlin-xmldsig-twenty-three.modern" \
+    "signature-enveloping-ecdsa" \
+    "sha256 ecdsa-sha256" \
+    "ec key-value" \
+    "--enabled-key-data key-value,ec" \
+    "--enabled-key-data key-name,key-value,ec $priv_key_option:TestKeyName-ec-prime256v1 $topfolder/keys/ec/ec-prime256v1-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-key-data key-value,ec"
+
+execDSigTest $res_success \
+    "merlin-xmldsig-twenty-three.modern" \
+    "signature-enveloping-b64-ecdsa" \
+    "base64 sha256 ecdsa-sha256" \
+    "ec key-value" \
+    "--enabled-key-data key-value,ec" \
+    "--enabled-key-data key-name,key-value,ec $priv_key_option:TestKeyName-ec-prime256v1 $topfolder/keys/ec/ec-prime256v1-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-key-data key-value,ec"
+
+execDSigTest $res_success \
+    "merlin-xmldsig-twenty-three.modern" \
+    "signature-enveloping-hmac-sha256-40" \
+    "sha256 hmac-sha256" \
+    "hmac" \
+    "--hmackey:TeskKeyName-Hmac $topfolder/keys/hmackey.bin" \
+    "--hmackey:TeskKeyName-Hmac $topfolder/keys/hmackey.bin" \
+    "--hmackey:TeskKeyName-Hmac $topfolder/keys/hmackey.bin"
+
+execDSigTest $res_success \
+    "merlin-xmldsig-twenty-three.modern" \
+    "signature-enveloping-hmac-sha256" \
+    "sha256 hmac-sha256" \
+    "hmac" \
+    "--hmackey:TeskKeyName-Hmac $topfolder/keys/hmackey.bin" \
+    "--hmackey:TeskKeyName-Hmac $topfolder/keys/hmackey.bin" \
+    "--hmackey:TeskKeyName-Hmac $topfolder/keys/hmackey.bin"
+
+execDSigTest $res_success \
+    "merlin-xmldsig-twenty-three.modern" \
+    "signature-enveloping-rsa" \
+    "sha256 rsa-sha256" \
+    "rsa key-value" \
+    "--enabled-key-data key-value,rsa" \
+    "--enabled-key-data key-name,key-value,rsa $priv_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-key-data key-value,rsa"
+
+execDSigTest $res_success \
+    "merlin-xmldsig-twenty-three.modern" \
+    "signature-external-b64-ecdsa" \
+    "base64 sha256 ecdsa-sha256" \
+    "ec key-value" \
+    "--enabled-reference-uris any $url_map_xml_stylesheet_b64_2005 --enabled-key-data key-value,ec" \
+    "--enabled-reference-uris any $url_map_xml_stylesheet_b64_2005 --enabled-key-data key-name,key-value,ec $priv_key_option:TestKeyName-ec-prime256v1 $topfolder/keys/ec/ec-prime256v1-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-reference-uris any $url_map_xml_stylesheet_b64_2005 --enabled-key-data key-value,ec"
+
+execDSigTest $res_success \
+    "merlin-xmldsig-twenty-three.modern" \
+    "signature-external-ecdsa" \
+    "sha256 ecdsa-sha256" \
+    "ec key-value" \
+    "--enabled-reference-uris any $url_map_xml_stylesheet_2005 --enabled-key-data key-value,ec" \
+    "--enabled-reference-uris any $url_map_xml_stylesheet_2005 --enabled-key-data key-name,key-value,ec $priv_key_option:TestKeyName-ec-prime256v1 $topfolder/keys/ec/ec-prime256v1-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-reference-uris any $url_map_xml_stylesheet_2005 --enabled-key-data key-value,ec"
+
+execDSigTest $res_success \
+    "merlin-xmldsig-twenty-three.modern" \
+    "signature-keyname" \
+    "sha256 ecdsa-sha256" \
+    "ec x509" \
+    "--enabled-reference-uris any $url_map_xml_stylesheet_2005 --pubkey-cert-$cert_format:TestKeyName-ec-prime256v1 $topfolder/keys/ec/ec-prime256v1-cert.$cert_format" \
+    "--enabled-reference-uris any $url_map_xml_stylesheet_2005 $priv_key_option:TestKeyName-ec-prime256v1 $topfolder/keys/ec/ec-prime256v1-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-reference-uris any $url_map_xml_stylesheet_2005 $pub_key_option:TestKeyName-ec-prime256v1 $topfolder/keys/ec/ec-prime256v1-pubkey.$pub_key_format"
+
+execDSigTest $res_success \
+    "merlin-xmldsig-twenty-three.modern" \
+    "signature-x509-crt" \
+    "sha256 ecdsa-sha256" \
+    "ec x509" \
+    "--enabled-reference-uris any $url_map_xml_stylesheet_2005 --trusted-$cert_format $topfolder/keys/cacert.$cert_format" \
+    "--enabled-reference-uris any $url_map_xml_stylesheet_2005 $priv_key_option:TestKeyName-ec-prime256v1 $topfolder/keys/ec/ec-prime256v1-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-reference-uris any $url_map_xml_stylesheet_2005 --trusted-$cert_format $topfolder/keys/cacert.$cert_format"
+
+execDSigTest $res_success \
+    "merlin-xmldsig-twenty-three.modern" \
+    "signature-x509-crt-crl" \
+    "sha256 rsa-sha256" \
+    "rsa x509" \
+    "--enabled-reference-uris any $url_map_xml_stylesheet_2005 --trusted-$cert_format $topfolder/keys/cacert.$cert_format" \
+    "--enabled-reference-uris any $url_map_xml_stylesheet_2005 $priv_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-reference-uris any $url_map_xml_stylesheet_2005 --trusted-$cert_format $topfolder/keys/cacert.$cert_format"
+
+if [ "z$xmlsec_feature_crl_load" = "zyes" ] ; then
+    # this should fail because there is a CRL for the cert used for signing
+    extra_message="Negative test: CRL is present"
+    execDSigTest $res_fail \
+        "merlin-xmldsig-twenty-three.modern" \
+        "signature-x509-crt-crl" \
+        "sha256 rsa-sha256" \
+        "rsa x509" \
+        "--verification-gmt-time 2026-04-01+00:00:00 --untrusted-$cert_format $topfolder/keys/ca2cert.$cert_format --trusted-$cert_format $topfolder/keys/cacert.$cert_format --crl-$cert_format $topfolder/keys/rsa/rsa-2048-cert-revoked-crl.$cert_format --enabled-key-data x509 --enabled-reference-uris any $url_map_xml_stylesheet_2005"
+fi
+
+# these tests require the key to be found by X509 data in the keys store
+if [ "z$xmlsec_feature_x509_data_lookup" = "zyes" ] ; then
+    execDSigTest $res_success \
+        "merlin-xmldsig-twenty-three.modern" \
+        "signature-x509-sn" \
+        "sha256 ecdsa-sha256" \
+        "ec x509" \
+        "--enabled-reference-uris any $url_map_xml_stylesheet_2005 --untrusted-$cert_format $topfolder/keys/ec/ec-prime256v1-cert.$cert_format --untrusted-$cert_format $topfolder/keys/ca2cert.$cert_format --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509" \
+        "--enabled-reference-uris any $url_map_xml_stylesheet_2005 $priv_key_option:TestKeyName-ec-prime256v1 $topfolder/keys/ec/ec-prime256v1-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+        "--enabled-reference-uris any $url_map_xml_stylesheet_2005 --untrusted-$cert_format $topfolder/keys/ec/ec-prime256v1-cert.$cert_format --untrusted-$cert_format $topfolder/keys/ca2cert.$cert_format --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509"
+
+    execDSigTest $res_success \
+        "merlin-xmldsig-twenty-three.modern" \
+        "signature-x509-is" \
+        "sha256 ecdsa-sha256" \
+        "ec x509" \
+        "--enabled-reference-uris any $url_map_xml_stylesheet_2005 --untrusted-$cert_format $topfolder/keys/ec/ec-prime256v1-cert.$cert_format --untrusted-$cert_format $topfolder/keys/ca2cert.$cert_format --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509" \
+        "--enabled-reference-uris any $url_map_xml_stylesheet_2005 $priv_key_option:TestKeyName-ec-prime256v1 $topfolder/keys/ec/ec-prime256v1-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+        "--enabled-reference-uris any $url_map_xml_stylesheet_2005 --untrusted-$cert_format $topfolder/keys/ec/ec-prime256v1-cert.$cert_format --untrusted-$cert_format $topfolder/keys/ca2cert.$cert_format --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509"
+
+    execDSigTest $res_success \
+        "merlin-xmldsig-twenty-three.modern" \
+        "signature-x509-ski" \
+        "sha256 ecdsa-sha256" \
+        "ec x509" \
+        "--enabled-reference-uris any $url_map_xml_stylesheet_2005 --untrusted-$cert_format $topfolder/keys/ec/ec-prime256v1-cert.$cert_format --untrusted-$cert_format $topfolder/keys/ca2cert.$cert_format --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509" \
+        "--enabled-reference-uris any $url_map_xml_stylesheet_2005 $priv_key_option:TestKeyName-ec-prime256v1 $topfolder/keys/ec/ec-prime256v1-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+        "--enabled-reference-uris any $url_map_xml_stylesheet_2005 --untrusted-$cert_format $topfolder/keys/ec/ec-prime256v1-cert.$cert_format --untrusted-$cert_format $topfolder/keys/ca2cert.$cert_format --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509"
+fi
+
+execDSigTest $res_success \
+    "merlin-xmldsig-twenty-three.modern" \
+    "signature-retrievalmethod-rawx509crt" \
+    "sha256 ecdsa-sha256" \
+    "ec retrieval-method raw-x509-cert x509" \
+    "--enabled-reference-uris any $url_map_xml_stylesheet_2005 --enabled-retrieval-method-uris remote --enabled-key-data retrieval-method,raw-x509-cert,x509 --untrusted-$cert_format $topfolder/keys/ca2cert.$cert_format --trusted-$cert_format $topfolder/keys/cacert.$cert_format" \
+    "--enabled-reference-uris any $url_map_xml_stylesheet_2005 --enabled-retrieval-method-uris remote --lax-key-search $priv_key_option $topfolder/keys/ec/ec-prime256v1-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-reference-uris any $url_map_xml_stylesheet_2005 --enabled-retrieval-method-uris remote --enabled-key-data retrieval-method,raw-x509-cert,x509 --untrusted-$cert_format $topfolder/keys/ca2cert.$cert_format --trusted-$cert_format $topfolder/keys/cacert.$cert_format"
+
+execDSigTest $res_success \
+    "merlin-xmldsig-twenty-three.modern" \
+    "signature" \
+    "base64 xpath xslt enveloped-signature c14n-with-comments sha256 ecdsa-sha256" \
+    "ec x509" \
+    "--enabled-reference-uris any $url_map_xml_stylesheet_2005 $url_map_xml_stylesheet_b64_2005 --trusted-$cert_format $topfolder/keys/cacert.$cert_format --untrusted-$cert_format $topfolder/keys/ca2cert.$cert_format" \
+    "--enabled-reference-uris any $url_map_xml_stylesheet_2005 $url_map_xml_stylesheet_b64_2005 --lax-key-search $priv_key_option $topfolder/keys/ec/ec-prime256v1-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-reference-uris any $url_map_xml_stylesheet_2005 $url_map_xml_stylesheet_b64_2005 --trusted-$cert_format $topfolder/keys/cacert.$cert_format --untrusted-$cert_format $topfolder/keys/ca2cert.$cert_format"
 
 
 ##########################################################################
@@ -2319,7 +3160,7 @@ execDSigTest $res_success \
 #
 # While the main operation is signature (and this is why we have these
 # tests here instead of testEnc.sh), these tests check the encryption
-# key transport/wrapper algorightms
+# key transport/wrapper algorithms
 #
 ##########################################################################
 execDSigTest $res_success \
@@ -2327,37 +3168,37 @@ execDSigTest $res_success \
     "merlin-xmlenc-five/encsig-ripemd160-hmac-ripemd160-kw-tripledes" \
     "ripemd160 hmac-ripemd160 kw-tripledes" \
     "hmac des" \
-    "--keys-file $topfolder/merlin-xmlenc-five/keys.xml $url_map_xml_stylesheet_2005" \
-    "--session-key hmac-192 --keys-file $topfolder/merlin-xmlenc-five/keys.xml $url_map_xml_stylesheet_2005" \
-    "--keys-file $topfolder/merlin-xmlenc-five/keys.xml $url_map_xml_stylesheet_2005"
+    "--enabled-reference-uris any --keys-file $topfolder/merlin-xmlenc-five/keys.xml $url_map_xml_stylesheet_2005" \
+    "--enabled-reference-uris any --session-key hmac-192 --keys-file $topfolder/merlin-xmlenc-five/keys.xml $url_map_xml_stylesheet_2005" \
+    "--enabled-reference-uris any --keys-file $topfolder/merlin-xmlenc-five/keys.xml $url_map_xml_stylesheet_2005"
 
 execDSigTest $res_success \
     "" \
     "merlin-xmlenc-five/encsig-sha256-hmac-sha256-kw-aes128" \
     "sha256 hmac-sha256 kw-aes128" \
     "hmac aes" \
-    "--keys-file $topfolder/merlin-xmlenc-five/keys.xml $url_map_xml_stylesheet_2005"
+    "--enabled-reference-uris any --keys-file $topfolder/merlin-xmlenc-five/keys.xml $url_map_xml_stylesheet_2005"
 
 execDSigTest $res_success \
     "" \
     "merlin-xmlenc-five/encsig-sha384-hmac-sha384-kw-aes192" \
     "sha384 hmac-sha384 kw-aes192" \
     "hmac aes" \
-    "--keys-file $topfolder/merlin-xmlenc-five/keys.xml $url_map_xml_stylesheet_2005"
+    "--enabled-reference-uris any --keys-file $topfolder/merlin-xmlenc-five/keys.xml $url_map_xml_stylesheet_2005"
 
 execDSigTest $res_success \
     "" \
     "merlin-xmlenc-five/encsig-sha512-hmac-sha512-kw-aes256" \
     "sha512 hmac-sha512 kw-aes256" \
     "hmac aes" \
-    "--keys-file $topfolder/merlin-xmlenc-five/keys.xml $url_map_xml_stylesheet_2005"
+    "--enabled-reference-uris any --keys-file $topfolder/merlin-xmlenc-five/keys.xml $url_map_xml_stylesheet_2005"
 
 execDSigTest $res_success \
     "" \
     "merlin-xmlenc-five/encsig-hmac-sha256-rsa-1_5" \
     "sha1 hmac-sha256 rsa-1_5" \
     "hmac rsa" \
-    "--lax-key-search $priv_key_option $topfolder/merlin-xmlenc-five/rsapriv.$priv_key_format --pwd secret --verification-gmt-time 2005-01-01+10:00:00 $url_map_xml_stylesheet_2005"
+    "--enabled-reference-uris any --lax-key-search $priv_key_option $topfolder/merlin-xmlenc-five/rsapriv.$priv_key_format --pwd secret --verification-gmt-time 2005-01-01+10:00:00 $url_map_xml_stylesheet_2005"
 
 if [  "z$xmlsec_feature_rsa_oaep_sha1" = "zyes" -a "z$xmlsec_feature_rsa_oaep_different_digest_and_mgf1" = "zyes" ] ; then
     execDSigTest $res_success \
@@ -2365,8 +3206,89 @@ if [  "z$xmlsec_feature_rsa_oaep_sha1" = "zyes" -a "z$xmlsec_feature_rsa_oaep_di
         "merlin-xmlenc-five/encsig-hmac-sha256-rsa-oaep-mgf1p" \
         "sha1 hmac-sha256 rsa-oaep-mgf1p sha1 sha1" \
         "hmac rsa" \
-        "--lax-key-search $priv_key_option $topfolder/merlin-xmlenc-five/rsapriv.$priv_key_format --pwd secret $url_map_xml_stylesheet_2005"
+        "--enabled-reference-uris any --lax-key-search $priv_key_option $topfolder/merlin-xmlenc-five/rsapriv.$priv_key_format --pwd secret $url_map_xml_stylesheet_2005"
 fi
+
+
+##########################################################################
+#
+# merlin-xmlenc-five.modern
+#
+# While the main operation is signature (and this is why we have these
+# tests here instead of testEnc.sh), these tests check the encryption
+# key transport/wrapper algorithms
+#
+##########################################################################
+execDSigTest $res_success \
+    "" \
+    "merlin-xmlenc-five.modern/encsig-sha256-hmac-sha256-kw-aes256" \
+    "sha256 hmac-sha256 kw-aes256" \
+    "hmac aes" \
+    "--enabled-reference-uris any --keys-file $topfolder/keys/keys.xml $url_map_xml_stylesheet_2005" \
+    "--enabled-reference-uris any --session-key hmac-256 --keys-file $topfolder/keys/keys.xml $url_map_xml_stylesheet_2005" \
+    "--enabled-reference-uris any --keys-file $topfolder/keys/keys.xml $url_map_xml_stylesheet_2005"
+
+execDSigTest $res_success \
+    "" \
+    "merlin-xmlenc-five.modern/encsig-sha256-hmac-sha256-kw-aes128" \
+    "sha256 hmac-sha256 kw-aes128" \
+    "hmac aes" \
+    "--enabled-reference-uris any --keys-file $topfolder/keys/keys.xml $url_map_xml_stylesheet_2005" \
+    "--enabled-reference-uris any --session-key hmac-256 --keys-file $topfolder/keys/keys.xml $url_map_xml_stylesheet_2005" \
+    "--enabled-reference-uris any --keys-file $topfolder/keys/keys.xml $url_map_xml_stylesheet_2005"
+
+execDSigTest $res_success \
+    "" \
+    "merlin-xmlenc-five.modern/encsig-sha384-hmac-sha384-kw-aes192" \
+    "sha384 hmac-sha384 kw-aes192" \
+    "hmac aes" \
+    "--enabled-reference-uris any --keys-file $topfolder/keys/keys.xml $url_map_xml_stylesheet_2005" \
+    "--enabled-reference-uris any --session-key hmac-384 --keys-file $topfolder/keys/keys.xml $url_map_xml_stylesheet_2005" \
+    "--enabled-reference-uris any --keys-file $topfolder/keys/keys.xml $url_map_xml_stylesheet_2005"
+
+execDSigTest $res_success \
+    "" \
+    "merlin-xmlenc-five.modern/encsig-sha512-hmac-sha512-kw-aes256" \
+    "sha512 hmac-sha512 kw-aes256" \
+    "hmac aes" \
+    "--enabled-reference-uris any --keys-file $topfolder/keys/keys.xml $url_map_xml_stylesheet_2005" \
+    "--enabled-reference-uris any --session-key hmac-512 --keys-file $topfolder/keys/keys.xml $url_map_xml_stylesheet_2005" \
+    "--enabled-reference-uris any --keys-file $topfolder/keys/keys.xml $url_map_xml_stylesheet_2005"
+
+if [ "z$xmlsec_feature_rsa_oaep_sha256" = "zyes" ] ; then
+    execDSigTest $res_success \
+        "" \
+        "merlin-xmlenc-five.modern/encsig-hmac-sha256-rsa-oaep-sha256" \
+        "sha256 hmac-sha256 rsa-oaep-mgf1p sha256 sha256" \
+        "hmac rsa" \
+        "--enabled-reference-uris any $priv_key_option:TestKeyName-rsa-4096 $topfolder/keys/rsa/rsa-4096-key.$priv_key_format --pwd secret123 $url_map_xml_stylesheet_2005" \
+        "--enabled-reference-uris any --session-key hmac-256 $pub_key_option:TestKeyName-rsa-4096 $topfolder/keys/rsa/rsa-4096-pubkey$rsa_pub_key_suffix.$pub_key_format $url_map_xml_stylesheet_2005" \
+        "--enabled-reference-uris any $priv_key_option:TestKeyName-rsa-4096 $topfolder/keys/rsa/rsa-4096-key.$priv_key_format --pwd secret123 $url_map_xml_stylesheet_2005"
+fi
+
+#
+# DH-ES key agreement (RFC 5114 group 3 keys). The signing key is derived
+# from the AgreementMethod, so the originator signs with the first private
+# key (plus the second public key) and verification uses the second private
+# key (plus the first public key).
+#
+execDSigTest $res_success \
+    "" \
+    "merlin-xmlenc-five.modern/encsig-hmac-sha256-dh" \
+    "sha256 hmac-sha256 dh-es concatkdf" \
+    "agreement-method dh" \
+    "--enabled-key-data agreement-method,key-value,key-name,dh --enabled-reference-uris any $dhx_priv_key_option:dhx-rfc5114-3-second $topfolder/keys/dhx/dhx-rfc5114-3-second-key.$dhx_priv_key_format $dhx_pub_key_option:dhx-rfc5114-3-first $topfolder/keys/dhx/dhx-rfc5114-3-first-pubkey.$dhx_pub_key_format $url_map_xml_stylesheet_2005" \
+    "--enabled-key-data agreement-method,key-value,key-name,dh --enabled-reference-uris any $dhx_priv_key_option:dhx-rfc5114-3-first $topfolder/keys/dhx/dhx-rfc5114-3-first-key.$dhx_priv_key_format $dhx_pub_key_option:dhx-rfc5114-3-second $topfolder/keys/dhx/dhx-rfc5114-3-second-pubkey.$dhx_pub_key_format $url_map_xml_stylesheet_2005" \
+    "--enabled-key-data agreement-method,key-value,key-name,dh --enabled-reference-uris any $dhx_priv_key_option:dhx-rfc5114-3-second $topfolder/keys/dhx/dhx-rfc5114-3-second-key.$dhx_priv_key_format $dhx_pub_key_option:dhx-rfc5114-3-first $topfolder/keys/dhx/dhx-rfc5114-3-first-pubkey.$dhx_pub_key_format $url_map_xml_stylesheet_2005"
+
+execDSigTest $res_success \
+    "" \
+    "merlin-xmlenc-five.modern/encsig-hmac-sha256-kw-aes256-dh" \
+    "sha256 hmac-sha256 kw-aes256 dh-es concatkdf" \
+    "agreement-method enc-key dh" \
+    "--enabled-key-data agreement-method,enc-key,key-value,key-name,dh --max-encrypted-key-level 3 --enabled-reference-uris any $dhx_priv_key_option:dhx-rfc5114-3-second $topfolder/keys/dhx/dhx-rfc5114-3-second-key.$dhx_priv_key_format $dhx_pub_key_option:dhx-rfc5114-3-first $topfolder/keys/dhx/dhx-rfc5114-3-first-pubkey.$dhx_pub_key_format $url_map_xml_stylesheet_2005" \
+    "--enabled-key-data agreement-method,enc-key,key-value,key-name,dh --max-encrypted-key-level 3 --session-key hmac-256 --enabled-reference-uris any $dhx_priv_key_option:dhx-rfc5114-3-first $topfolder/keys/dhx/dhx-rfc5114-3-first-key.$dhx_priv_key_format $dhx_pub_key_option:dhx-rfc5114-3-second $topfolder/keys/dhx/dhx-rfc5114-3-second-pubkey.$dhx_pub_key_format $url_map_xml_stylesheet_2005" \
+    "--enabled-key-data agreement-method,enc-key,key-value,key-name,dh --max-encrypted-key-level 3 --enabled-reference-uris any $dhx_priv_key_option:dhx-rfc5114-3-second $topfolder/keys/dhx/dhx-rfc5114-3-second-key.$dhx_priv_key_format $dhx_pub_key_option:dhx-rfc5114-3-first $topfolder/keys/dhx/dhx-rfc5114-3-first-pubkey.$dhx_pub_key_format $url_map_xml_stylesheet_2005"
 
 
 ##########################################################################
@@ -2390,12 +3312,90 @@ execDSigTest $res_success \
 #
 ##########################################################################
 
+# The document contains references with empty (0-length) digest input, so
+# the test has to allow empty input.
 execDSigTest $res_success \
     "" \
     "merlin-c14n-three/signature" \
     "c14n c14n-with-comments exc-c14n exc-c14n-with-comments xpath sha1 dsa-sha1" \
     "dsa" \
-    "--enabled-key-data key-value,dsa"
+    "--allow-empty-input --enabled-key-data key-value,dsa"
+
+
+##########################################################################
+#
+# merlin-c14n-three.modern
+#
+##########################################################################
+
+#
+# The same document as in merlin-c14n-three, but signed with a modern
+# algorithm and key from tests/keys: ecdsa-sha256 (prime256v1).
+#
+
+# The document contains references with empty (0-length) digest input, so
+# the test has to allow empty input.
+execDSigTest $res_success \
+    "merlin-c14n-three.modern" \
+    "signature" \
+    "c14n c14n-with-comments exc-c14n exc-c14n-with-comments xpath sha256 ecdsa-sha256" \
+    "ec key-value" \
+    "--allow-empty-input --enabled-key-data key-value,ec" \
+    "--allow-empty-input --enabled-key-data key-name,key-value,ec $priv_key_option:TestKeyName-ec-prime256v1 $topfolder/keys/ec/ec-prime256v1-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--allow-empty-input --enabled-key-data key-value,ec"
+
+
+##########################################################################
+#
+# merlin-exc-c14n-one.modern
+#
+##########################################################################
+
+#
+# The same document as in merlin-exc-c14n-one, but signed with a modern
+# algorithm and key from tests/keys: ecdsa-sha256 (prime256v1).
+#
+
+execDSigTest $res_success \
+    "merlin-exc-c14n-one.modern" \
+    "exc-signature" \
+    "exc-c14n exc-c14n-with-comments sha256 ecdsa-sha256" \
+    "ec key-value" \
+    "--enabled-key-data key-value,key-name,ec" \
+    "--enabled-key-data key-value,key-name,ec $priv_key_option:TestKeyName-ec-prime256v1 $topfolder/keys/ec/ec-prime256v1-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--enabled-key-data key-value,key-name,ec"
+
+##########################################################################
+#
+# merlin-xpath-filter2-three.modern
+#
+##########################################################################
+
+#
+# The same documents as in merlin-xpath-filter2-three, but signed with
+# modern algorithms and keys from tests/keys: ecdsa-sha256 (prime256v1)
+# and hmac-sha256.
+#
+
+execDSigTest $res_success \
+    "merlin-xpath-filter2-three.modern" \
+    "sign-xfdl" \
+    "enveloped-signature xpath2 sha256 ecdsa-sha256 hmac-sha256" \
+    "ec key-value hmac" \
+    "--enabled-key-data key-value,ec" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin"
+
+# The document contains references with empty (0-length) digest input, so
+# the test has to allow empty input.
+execDSigTest $res_success \
+    "merlin-xpath-filter2-three.modern" \
+    "sign-spec" \
+    "enveloped-signature xpath2 sha256 ecdsa-sha256" \
+    "ec key-value" \
+    "--allow-empty-input --enabled-key-data key-value,ec" \
+    "--allow-empty-input --enabled-key-data key-name,key-value,ec $priv_key_option:TestKeyName-ec-prime256v1 $topfolder/keys/ec/ec-prime256v1-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--allow-empty-input --enabled-key-data key-value,ec"
 
 ##########################################################################
 #
@@ -2410,12 +3410,14 @@ execDSigTest $res_success \
     "dsa" \
     "--enabled-key-data key-value,dsa"
 
+# The document contains references with empty (0-length) digest input, so
+# the test has to allow empty input.
 execDSigTest $res_success \
     "" \
     "merlin-xpath-filter2-three/sign-spec" \
     "enveloped-signature xpath2 sha1 dsa-sha1" \
     "dsa" \
-    "--enabled-key-data key-value,dsa"
+    "--allow-empty-input --enabled-key-data key-value,dsa"
 ##########################################################################
 #
 # phaos-xmldsig-three
@@ -2427,14 +3429,14 @@ execDSigTest $res_success \
     "signature-big" \
     "base64 xslt xpath sha1 rsa-sha1" \
     "rsa x509" \
-    "--lax-key-search --pubkey-cert-$cert_format certs/rsa-cert.$cert_format $url_map_rfc3161"
+    "--enabled-reference-uris any --lax-key-search --pubkey-cert-$cert_format certs/rsa-cert.$cert_format $url_map_rfc3161"
 
 execDSigTest $res_success \
     "phaos-xmldsig-three" \
     "signature-dsa-detached" \
     "sha1 dsa-sha1" \
     "dsa x509" \
-    "--trusted-$cert_format certs/dsa-ca-cert.$cert_format --verification-gmt-time 2009-01-01+10:00:00 $url_map_rfc3161"
+    "--enabled-reference-uris any --trusted-$cert_format certs/dsa-ca-cert.$cert_format --verification-gmt-time 2009-01-01+10:00:00 $url_map_rfc3161"
 
 execDSigTest $res_success \
     "phaos-xmldsig-three" \
@@ -2455,7 +3457,7 @@ execDSigTest $res_success \
     "signature-dsa-manifest" \
     "sha1 dsa-sha1" \
     "dsa x509" \
-    "--enabled-key-data key-value,dsa,x509 --trusted-$cert_format certs/dsa-ca-cert.$cert_format --verification-gmt-time 2009-01-01+10:00:00 $url_map_rfc3161"
+    "--enabled-reference-uris any --enabled-key-data key-value,dsa,x509 --trusted-$cert_format certs/dsa-ca-cert.$cert_format --verification-gmt-time 2009-01-01+10:00:00 $url_map_rfc3161"
 
 execDSigTest $res_success \
     "phaos-xmldsig-three" \
@@ -2469,21 +3471,21 @@ execDSigTest $res_success \
     "signature-hmac-sha1-40-c14n-comments-detached" \
     "c14n-with-comments sha1 hmac-sha1" \
     "hmac" \
-    "--lax-key-search --hmackey certs/hmackey.bin  $url_map_rfc3161"
+    "--enabled-reference-uris any --lax-key-search --hmackey certs/hmackey.bin  $url_map_rfc3161"
 
 execDSigTest $res_success \
     "phaos-xmldsig-three" \
     "signature-hmac-sha1-40-exclusive-c14n-comments-detached" \
     "exc-c14n-with-comments sha1 hmac-sha1" \
     "hmac" \
-    "--lax-key-search --hmackey certs/hmackey.bin $url_map_rfc3161"
+    "--enabled-reference-uris any --lax-key-search --hmackey certs/hmackey.bin $url_map_rfc3161"
 
 execDSigTest $res_success \
     "phaos-xmldsig-three" \
     "signature-hmac-sha1-exclusive-c14n-comments-detached" \
     "exc-c14n-with-comments sha1 hmac-sha1" \
     "hmac" \
-    "--lax-key-search --hmackey certs/hmackey.bin  $url_map_rfc3161"
+    "--enabled-reference-uris any --lax-key-search --hmackey certs/hmackey.bin  $url_map_rfc3161"
 
 execDSigTest $res_success \
     "phaos-xmldsig-three" \
@@ -2497,14 +3499,14 @@ execDSigTest $res_success \
     "signature-rsa-detached-b64-transform" \
     "base64 sha1 rsa-sha1" \
     "rsa x509" \
-    "--enabled-key-data key-value,rsa,x509  --trusted-$cert_format certs/rsa-ca-cert.$cert_format --verification-gmt-time 2009-01-01+10:00:00  $url_map_rfc3161"
+    "--enabled-reference-uris any --enabled-key-data key-value,rsa,x509  --trusted-$cert_format certs/rsa-ca-cert.$cert_format --verification-gmt-time 2009-01-01+10:00:00  $url_map_rfc3161"
 
 execDSigTest $res_success \
     "phaos-xmldsig-three" \
     "signature-rsa-detached-xpath-transform" \
     "xpath sha1 rsa-sha1" \
     "rsa x509" \
-    "--enabled-key-data key-value,rsa,x509 --trusted-$cert_format certs/rsa-ca-cert.$cert_format --verification-gmt-time 2009-01-01+10:00:00  $url_map_rfc3161"
+    "--enabled-reference-uris any --enabled-key-data key-value,rsa,x509 --trusted-$cert_format certs/rsa-ca-cert.$cert_format --verification-gmt-time 2009-01-01+10:00:00  $url_map_rfc3161"
 
 
 execDSigTest $res_success \
@@ -2512,14 +3514,14 @@ execDSigTest $res_success \
     "signature-rsa-detached-xslt-transform" \
     "xslt sha1 rsa-sha1" \
     "rsa x509" \
-    "--enabled-key-data key-value,rsa,x509 --trusted-$cert_format certs/rsa-ca-cert.$cert_format --verification-gmt-time 2009-01-01+10:00:00  $url_map_rfc3161"
+    "--enabled-reference-uris any --enabled-key-data key-value,rsa,x509 --trusted-$cert_format certs/rsa-ca-cert.$cert_format --verification-gmt-time 2009-01-01+10:00:00  $url_map_rfc3161"
 
 execDSigTest $res_success \
     "phaos-xmldsig-three" \
     "signature-rsa-manifest" \
     "sha1 rsa-sha1" \
     "rsa x509" \
-    "--enabled-key-data key-value,rsa,x509 --trusted-$cert_format certs/rsa-ca-cert.$cert_format --verification-gmt-time 2009-01-01+10:00:00 $url_map_rfc3161"
+    "--enabled-reference-uris any --enabled-key-data key-value,rsa,x509 --trusted-$cert_format certs/rsa-ca-cert.$cert_format --verification-gmt-time 2009-01-01+10:00:00 $url_map_rfc3161"
 
 if [ "z$xmlsec_feature_md5_certs" = "zyes" ] ; then
     execDSigTest $res_success \
@@ -2527,14 +3529,14 @@ if [ "z$xmlsec_feature_md5_certs" = "zyes" ] ; then
         "signature-rsa-detached" \
         "sha1 rsa-sha1" \
         "rsa x509" \
-        "--trusted-$cert_format certs/rsa-ca-cert.$cert_format --verification-gmt-time 2009-01-01+10:00:00  $url_map_rfc3161"
+        "--enabled-reference-uris any --trusted-$cert_format certs/rsa-ca-cert.$cert_format --verification-gmt-time 2009-01-01+10:00:00  $url_map_rfc3161"
 
     execDSigTest $res_success \
         "phaos-xmldsig-three" \
         "signature-rsa-detached-xslt-transform-retrieval-method" \
         "xslt sha1 rsa-sha1" \
         "rsa x509" \
-        "--trusted-$cert_format certs/rsa-ca-cert.$cert_format --verification-gmt-time 2009-01-01+10:00:00  $url_map_rfc3161"
+        "--enabled-reference-uris any --enabled-retrieval-method-uris remote --trusted-$cert_format certs/rsa-ca-cert.$cert_format --verification-gmt-time 2009-01-01+10:00:00  $url_map_rfc3161"
 
     execDSigTest $res_success \
         "phaos-xmldsig-three" \
@@ -2555,35 +3557,35 @@ if [ "z$xmlsec_feature_md5_certs" = "zyes" ] ; then
         "signature-rsa-manifest-x509-data-cert-chain" \
         "sha1 rsa-sha1" \
         "rsa x509" \
-        "--trusted-$cert_format certs/rsa-ca-cert.$cert_format --verification-gmt-time 2009-01-01+10:00:00 $url_map_rfc3161"
+        "--enabled-reference-uris any --trusted-$cert_format certs/rsa-ca-cert.$cert_format --verification-gmt-time 2009-01-01+10:00:00 $url_map_rfc3161"
 
     execDSigTest $res_success \
         "phaos-xmldsig-three" \
         "signature-rsa-manifest-x509-data-cert" \
         "sha1 rsa-sha1" \
         "rsa x509" \
-        "--trusted-$cert_format certs/rsa-ca-cert.$cert_format --verification-gmt-time 2009-01-01+10:00:00 $url_map_rfc3161"
+        "--enabled-reference-uris any --trusted-$cert_format certs/rsa-ca-cert.$cert_format --verification-gmt-time 2009-01-01+10:00:00 $url_map_rfc3161"
 
     execDSigTest $res_success \
         "phaos-xmldsig-three" \
         "signature-rsa-manifest-x509-data-issuer-serial" \
         "sha1 rsa-sha1" \
         "rsa x509" \
-        "--trusted-$cert_format certs/rsa-ca-cert.$cert_format --untrusted-$cert_format certs/rsa-cert.$cert_format --verification-gmt-time 2009-01-01+10:00:00 $url_map_rfc3161"
+        "--enabled-reference-uris any --trusted-$cert_format certs/rsa-ca-cert.$cert_format --untrusted-$cert_format certs/rsa-cert.$cert_format --verification-gmt-time 2009-01-01+10:00:00 $url_map_rfc3161"
 
     execDSigTest $res_success \
         "phaos-xmldsig-three" \
         "signature-rsa-manifest-x509-data-ski" \
         "sha1 rsa-sha1" \
         "rsa x509" \
-        "--trusted-$cert_format certs/rsa-ca-cert.$cert_format --untrusted-$cert_format certs/rsa-cert.$cert_format --verification-gmt-time 2009-01-01+10:00:00 $url_map_rfc3161"
+        "--enabled-reference-uris any --trusted-$cert_format certs/rsa-ca-cert.$cert_format --untrusted-$cert_format certs/rsa-cert.$cert_format --verification-gmt-time 2009-01-01+10:00:00 $url_map_rfc3161"
 
     execDSigTest $res_success \
         "phaos-xmldsig-three" \
         "signature-rsa-manifest-x509-data-subject-name" \
         "sha1 rsa-sha1" \
         "rsa x509" \
-        "--trusted-$cert_format certs/rsa-ca-cert.$cert_format --untrusted-$cert_format certs/rsa-cert.$cert_format --verification-gmt-time 2009-01-01+10:00:00 $url_map_rfc3161"
+        "--enabled-reference-uris any --trusted-$cert_format certs/rsa-ca-cert.$cert_format --untrusted-$cert_format certs/rsa-cert.$cert_format --verification-gmt-time 2009-01-01+10:00:00 $url_map_rfc3161"
 
     execDSigTest $res_success \
         "phaos-xmldsig-three" \
@@ -2627,6 +3629,312 @@ execDSigTest $res_fail \
 
 
 ##########################################################################
+#
+# phaos-xmldsig-three.modern
+#
+##########################################################################
+
+#
+# The same documents as in phaos-xmldsig-three, but signed with modern
+# algorithms and keys from tests/keys: rsa-sha256 (rsa-2048),
+# ecdsa-sha256 (prime256v1) and hmac-sha256 (hmackey.bin).
+#
+
+execDSigTest $res_success \
+    "phaos-xmldsig-three.modern" \
+    "signature-big" \
+    "base64 xslt xpath sha256 rsa-sha256" \
+    "rsa x509" \
+    "--lax-key-search --pubkey-cert-$cert_format $topfolder/keys/rsa/rsa-2048-cert.$cert_format --enabled-reference-uris any $url_map_rfc3161" \
+    "--lax-key-search $priv_key_option $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123 --enabled-reference-uris any $url_map_rfc3161" \
+    "--lax-key-search --pubkey-cert-$cert_format $topfolder/keys/rsa/rsa-2048-cert.$cert_format --enabled-reference-uris any $url_map_rfc3161"
+
+execDSigTest $res_success \
+    "phaos-xmldsig-three.modern" \
+    "signature-ecdsa-detached" \
+    "sha256 ecdsa-sha256" \
+    "ec x509" \
+    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-reference-uris any $url_map_rfc3161" \
+    "$priv_key_option:TestKeyName-ec-prime256v1-phaos $topfolder/keys/ec/ec-prime256v1-key$priv_key_suffix.$priv_key_format --pwd secret123 --enabled-reference-uris any $url_map_rfc3161" \
+    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-reference-uris any $url_map_rfc3161"
+
+execDSigTest $res_success \
+    "phaos-xmldsig-three.modern" \
+    "signature-ecdsa-enveloped" \
+    "enveloped-signature sha256 ecdsa-sha256" \
+    "ec x509" \
+    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format" \
+    "$priv_key_option:TestKeyName-ec-prime256v1-phaos $topfolder/keys/ec/ec-prime256v1-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format"
+
+execDSigTest $res_success \
+    "phaos-xmldsig-three.modern" \
+    "signature-ecdsa-enveloping" \
+    "sha256 ecdsa-sha256" \
+    "ec x509" \
+    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format" \
+    "$priv_key_option:TestKeyName-ec-prime256v1-phaos $topfolder/keys/ec/ec-prime256v1-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format"
+
+execDSigTest $res_success \
+    "phaos-xmldsig-three.modern" \
+    "signature-ecdsa-manifest" \
+    "sha256 ecdsa-sha256" \
+    "key-value ec" \
+    "--enabled-key-data key-value,ec --enabled-reference-uris any $url_map_rfc3161" \
+    "--enabled-key-data key-name,key-value,ec $priv_key_option:TestKeyName-ec-prime256v1-phaos $topfolder/keys/ec/ec-prime256v1-key$priv_key_suffix.$priv_key_format --pwd secret123 --enabled-reference-uris any $url_map_rfc3161" \
+    "--enabled-key-data key-value,ec --enabled-reference-uris any $url_map_rfc3161"
+
+execDSigTest $res_success \
+    "phaos-xmldsig-three.modern" \
+    "signature-hmac-sha256-c14n-enveloping" \
+    "sha256 hmac-sha256" \
+    "hmac" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin"
+
+execDSigTest $res_success \
+    "phaos-xmldsig-three.modern" \
+    "signature-hmac-sha256-40-c14n-comments-detached" \
+    "c14n-with-comments sha256 hmac-sha256" \
+    "hmac" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin --enabled-reference-uris any $url_map_rfc3161" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin --enabled-reference-uris any $url_map_rfc3161" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin --enabled-reference-uris any $url_map_rfc3161"
+
+execDSigTest $res_success \
+    "phaos-xmldsig-three.modern" \
+    "signature-hmac-sha256-40-exclusive-c14n-comments-detached" \
+    "exc-c14n-with-comments sha256 hmac-sha256" \
+    "hmac" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin --enabled-reference-uris any $url_map_rfc3161" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin --enabled-reference-uris any $url_map_rfc3161" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin --enabled-reference-uris any $url_map_rfc3161"
+
+execDSigTest $res_success \
+    "phaos-xmldsig-three.modern" \
+    "signature-hmac-sha256-exclusive-c14n-comments-detached" \
+    "exc-c14n-with-comments sha256 hmac-sha256" \
+    "hmac" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin --enabled-reference-uris any $url_map_rfc3161" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin --enabled-reference-uris any $url_map_rfc3161" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin --enabled-reference-uris any $url_map_rfc3161"
+
+execDSigTest $res_success \
+    "phaos-xmldsig-three.modern" \
+    "signature-hmac-sha256-exclusive-c14n-enveloped" \
+    "enveloped-signature exc-c14n sha256 hmac-sha256" \
+    "hmac" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin" \
+    "--lax-key-search --hmackey $topfolder/keys/hmackey.bin"
+
+execDSigTest $res_success \
+    "phaos-xmldsig-three.modern" \
+    "signature-rsa-detached-b64-transform" \
+    "base64 sha256 rsa-sha256" \
+    "key-value rsa" \
+    "--enabled-key-data key-value,rsa --enabled-reference-uris any" \
+    "--enabled-key-data key-name,key-value,rsa $priv_key_option:TestKeyName-rsa-2048-phaos $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123 --enabled-reference-uris any" \
+    "--enabled-key-data key-value,rsa --enabled-reference-uris any"
+
+execDSigTest $res_success \
+    "phaos-xmldsig-three.modern" \
+    "signature-rsa-detached-xpath-transform" \
+    "xpath sha256 rsa-sha256" \
+    "key-value rsa" \
+    "--enabled-key-data key-value,rsa --enabled-reference-uris any" \
+    "--enabled-key-data key-name,key-value,rsa $priv_key_option:TestKeyName-rsa-2048-phaos $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123 --enabled-reference-uris any" \
+    "--enabled-key-data key-value,rsa --enabled-reference-uris any"
+
+execDSigTest $res_success \
+    "phaos-xmldsig-three.modern" \
+    "signature-rsa-detached-xslt-transform" \
+    "xslt sha256 rsa-sha256" \
+    "key-value rsa" \
+    "--enabled-key-data key-value,rsa --enabled-reference-uris any" \
+    "--enabled-key-data key-name,key-value,rsa $priv_key_option:TestKeyName-rsa-2048-phaos $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123 --enabled-reference-uris any" \
+    "--enabled-key-data key-value,rsa --enabled-reference-uris any"
+
+execDSigTest $res_success \
+    "phaos-xmldsig-three.modern" \
+    "signature-rsa-manifest" \
+    "sha256 rsa-sha256" \
+    "key-value rsa" \
+    "--enabled-key-data key-value,rsa --enabled-reference-uris any $url_map_rfc3161" \
+    "--enabled-key-data key-name,key-value,rsa $priv_key_option:TestKeyName-rsa-2048-phaos $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123 --enabled-reference-uris any $url_map_rfc3161" \
+    "--enabled-key-data key-value,rsa --enabled-reference-uris any $url_map_rfc3161"
+
+execDSigTest $res_success \
+    "phaos-xmldsig-three.modern" \
+    "signature-rsa-detached" \
+    "sha256 rsa-sha256" \
+    "rsa x509" \
+    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-reference-uris any $url_map_rfc3161" \
+    "$priv_key_option:TestKeyName-rsa-2048-phaos $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123 --enabled-reference-uris any $url_map_rfc3161" \
+    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-reference-uris any $url_map_rfc3161"
+
+execDSigTest $res_success \
+    "phaos-xmldsig-three.modern" \
+    "signature-rsa-detached-xslt-transform-retrieval-method" \
+    "xslt sha256 rsa-sha256" \
+    "retrieval-method raw-x509-cert x509" \
+    "--untrusted-$cert_format $topfolder/keys/ca2cert.$cert_format --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-retrieval-method-uris remote --enabled-key-data retrieval-method,raw-x509-cert,x509 --enabled-reference-uris any $url_map_rfc3161" \
+    "--enabled-key-data key-name $priv_key_option:TestKeyName-rsa-2048-phaos $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123 --enabled-reference-uris any $url_map_rfc3161" \
+    "--untrusted-$cert_format $topfolder/keys/ca2cert.$cert_format --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-retrieval-method-uris remote --enabled-key-data retrieval-method,raw-x509-cert,x509 --enabled-reference-uris any $url_map_rfc3161"
+
+execDSigTest $res_success \
+    "phaos-xmldsig-three.modern" \
+    "signature-rsa-enveloped" \
+    "enveloped-signature sha256 rsa-sha256" \
+    "rsa x509" \
+    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format" \
+    "$priv_key_option:TestKeyName-rsa-2048-phaos $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format"
+
+execDSigTest $res_success \
+    "phaos-xmldsig-three.modern" \
+    "signature-rsa-enveloping" \
+    "sha256 rsa-sha256" \
+    "rsa x509" \
+    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format" \
+    "$priv_key_option:TestKeyName-rsa-2048-phaos $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format"
+
+execDSigTest $res_success \
+    "phaos-xmldsig-three.modern" \
+    "signature-rsa-manifest-x509-data-cert" \
+    "sha256 rsa-sha256" \
+    "rsa x509" \
+    "--untrusted-$cert_format $topfolder/keys/ca2cert.$cert_format --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-reference-uris any $url_map_rfc3161" \
+    "$priv_key_option:TestKeyName-rsa-2048-phaos $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123 --enabled-reference-uris any $url_map_rfc3161" \
+    "--untrusted-$cert_format $topfolder/keys/ca2cert.$cert_format --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-reference-uris any $url_map_rfc3161"
+
+execDSigTest $res_success \
+    "phaos-xmldsig-three.modern" \
+    "signature-rsa-manifest-x509-data-cert-chain" \
+    "sha256 rsa-sha256" \
+    "rsa x509" \
+    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-reference-uris any $url_map_rfc3161" \
+    "$priv_key_option:TestKeyName-rsa-2048-phaos $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123 --enabled-reference-uris any $url_map_rfc3161" \
+    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-reference-uris any $url_map_rfc3161"
+
+execDSigTest $res_success \
+    "phaos-xmldsig-three.modern" \
+    "signature-rsa-manifest-x509-data-crl" \
+    "sha256 rsa-sha256" \
+    "rsa x509" \
+    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-reference-uris any $url_map_rfc3161" \
+    "$priv_key_option:TestKeyName-rsa-2048-phaos $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123 --enabled-reference-uris any $url_map_rfc3161" \
+    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-reference-uris any $url_map_rfc3161"
+
+# these tests require the key to be found by X509 data in the keys store
+if [ "z$xmlsec_feature_x509_data_lookup" = "zyes" ] ; then
+    execDSigTest $res_success \
+        "phaos-xmldsig-three.modern" \
+        "signature-rsa-manifest-x509-data-issuer-serial" \
+        "sha256 rsa-sha256" \
+        "rsa x509" \
+        "--untrusted-$cert_format $topfolder/keys/rsa/rsa-2048-cert.$cert_format --untrusted-$cert_format $topfolder/keys/ca2cert.$cert_format --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509 --enabled-reference-uris any $url_map_rfc3161" \
+        "$priv_key_option $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123 --enabled-reference-uris any $url_map_rfc3161" \
+        "--untrusted-$cert_format $topfolder/keys/rsa/rsa-2048-cert.$cert_format --untrusted-$cert_format $topfolder/keys/ca2cert.$cert_format --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509 --enabled-reference-uris any $url_map_rfc3161"
+
+    execDSigTest $res_success \
+        "phaos-xmldsig-three.modern" \
+        "signature-rsa-manifest-x509-data-ski" \
+        "sha256 rsa-sha256" \
+        "rsa x509" \
+        "--untrusted-$cert_format $topfolder/keys/rsa/rsa-2048-cert.$cert_format --untrusted-$cert_format $topfolder/keys/ca2cert.$cert_format --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509 --enabled-reference-uris any $url_map_rfc3161" \
+        "$priv_key_option $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123 --enabled-reference-uris any $url_map_rfc3161" \
+        "--untrusted-$cert_format $topfolder/keys/rsa/rsa-2048-cert.$cert_format --untrusted-$cert_format $topfolder/keys/ca2cert.$cert_format --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509 --enabled-reference-uris any $url_map_rfc3161"
+
+    execDSigTest $res_success \
+        "phaos-xmldsig-three.modern" \
+        "signature-rsa-manifest-x509-data-subject-name" \
+        "sha256 rsa-sha256" \
+        "rsa x509" \
+        "--untrusted-$cert_format $topfolder/keys/rsa/rsa-2048-cert.$cert_format --untrusted-$cert_format $topfolder/keys/ca2cert.$cert_format --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509 --enabled-reference-uris any $url_map_rfc3161" \
+        "$priv_key_option $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123 --enabled-reference-uris any $url_map_rfc3161" \
+        "--untrusted-$cert_format $topfolder/keys/rsa/rsa-2048-cert.$cert_format --untrusted-$cert_format $topfolder/keys/ca2cert.$cert_format --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-key-data x509 --enabled-reference-uris any $url_map_rfc3161"
+fi
+
+execDSigTest $res_success \
+    "phaos-xmldsig-three.modern" \
+    "signature-rsa-xpath-transform-enveloped" \
+    "enveloped-signature xpath sha256 rsa-sha256" \
+    "rsa x509" \
+    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format" \
+    "$priv_key_option:TestKeyName-rsa-2048-phaos $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format"
+
+extra_message="Negative test: bad retrieval method"
+execDSigTest $res_fail \
+    "phaos-xmldsig-three.modern" \
+    "signature-rsa-detached-xslt-transform-bad-retrieval-method" \
+    "xslt sha256 rsa-sha256" \
+    "retrieval-method raw-x509-cert x509" \
+    "--untrusted-$cert_format $topfolder/keys/ca2cert.$cert_format --trusted-$cert_format $topfolder/keys/cacert.$cert_format --enabled-retrieval-method-uris remote --enabled-key-data retrieval-method,raw-x509-cert,x509"
+
+extra_message="Negative test: bad digest"
+execDSigTest $res_fail \
+    "phaos-xmldsig-three.modern" \
+    "signature-rsa-enveloped-bad-digest-val" \
+    "enveloped-signature sha256 rsa-sha256" \
+    "rsa x509" \
+    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format"
+
+extra_message="Negative test: bad sig"
+execDSigTest $res_fail \
+    "phaos-xmldsig-three.modern" \
+    "signature-rsa-enveloped-bad-sig" \
+    "enveloped-signature sha256 rsa-sha256" \
+    "rsa x509" \
+    "--trusted-$cert_format $topfolder/keys/cacert.$cert_format"
+
+if [ "z$xmlsec_feature_crl_load" = "zyes" ] ; then
+    # this should fail because there is a CRL for the cert used for signing
+    extra_message="Negative test: CRL present"
+    execDSigTest $res_fail \
+        "phaos-xmldsig-three.modern" \
+        "signature-rsa-manifest-x509-data-crl" \
+        "sha256 rsa-sha256" \
+        "rsa x509" \
+        "--verification-gmt-time 2026-04-01+00:00:00 --untrusted-$cert_format $topfolder/keys/ca2cert.$cert_format --trusted-$cert_format $topfolder/keys/cacert.$cert_format --crl-$cert_format $topfolder/keys/rsa/rsa-2048-cert-revoked-crl.$cert_format --enabled-key-data x509 --enabled-reference-uris any $url_map_rfc3161"
+fi
+
+
+##########################################################################
+#
+# Empty (0-length) input for digest and signature transforms
+#
+##########################################################################
+
+# The Reference in this document uses an XPath transform that matches no
+# nodes, so the digest transform receives no input data at all. Without
+# the --allow-empty-input option, verification (and signing) of such a
+# document must fail with an error.
+extra_message="Negative test: empty (0-length) input for the digest transform is not allowed by default, should fail"
+execDSigTest $res_fail \
+    "" \
+    "aleksey-xmldsig-01/enveloped-empty-input-sha256-rsa-sha256" \
+    "sha256 rsa-sha256" \
+    "rsa" \
+    "$pub_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-pubkey$rsa_pub_key_suffix.$pub_key_format"
+
+# The same document can be signed and verified successfully when the
+# --allow-empty-input option is used.
+execDSigTest $res_success \
+    "" \
+    "aleksey-xmldsig-01/enveloped-empty-input-sha256-rsa-sha256" \
+    "sha256 rsa-sha256" \
+    "rsa" \
+    "--allow-empty-input $pub_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-pubkey$rsa_pub_key_suffix.$pub_key_format" \
+    "--allow-empty-input $priv_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-key$priv_key_suffix.$priv_key_format --pwd secret123" \
+    "--allow-empty-input $pub_key_option:TestKeyName-rsa-2048 $topfolder/keys/rsa/rsa-2048-pubkey$rsa_pub_key_suffix.$pub_key_format"
+
+
+##########################################################################
 ##########################################################################
 ##########################################################################
 echo "--------- These tests CAN FAIL (extra OS config required) ----------"
@@ -2664,5 +3972,5 @@ execDSigTest $res_success \
 echo "--- testDSig finished" >> $logfile
 echo "--- testDSig finished"
 if [ -z "$XMLSEC_TEST_REPRODUCIBLE" ]; then
-    echo "--- detailed log is written to  $logfile"
+    echo "--- detailed log is written to $logfile"
 fi

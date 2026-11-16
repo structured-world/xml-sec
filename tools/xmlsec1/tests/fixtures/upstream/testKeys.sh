@@ -13,14 +13,14 @@ fi
 ##########################################################################
 ##########################################################################
 if [ -z "$XMLSEC_TEST_REPRODUCIBLE" ]; then
-    echo "--- testKeys started for xmlsec-$crypto library ($timestamp) ---"
+    echo "--- testKeys started for xmlsec-$crypto library ($timestamp)"
 fi
 echo "--- LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
 echo "--- LTDL_LIBRARY_PATH=$LTDL_LIBRARY_PATH"
 if [ -z "$XMLSEC_TEST_REPRODUCIBLE" ]; then
     echo "--- log file is $logfile"
 fi
-echo "--- testKeys started for xmlsec-$crypto library ($timestamp) ---" >> $logfile
+echo "--- testKeys started for xmlsec-$crypto library ($timestamp)" >> $logfile
 echo "--- LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> $logfile
 echo "--- LTDL_LIBRARY_PATH=$LTDL_LIBRARY_PATH" >> $logfile
 
@@ -73,6 +73,7 @@ execKeysTestWithCryptoConfig() {
         xmlsec_feature_privkey_pem="no"
         xmlsec_feature_privkey_der="no"
         xmlsec_feature_pubkey_pem="no"
+        xmlsec_feature_gen_key="no"
 
         case "$alg_name" in
             eddsa-ed25519)
@@ -149,11 +150,11 @@ execKeysTestWithCryptoConfig() {
         printf "    Checking required key data                            "
         echo "$extra_vars $xmlsec_app check-key-data $xmlsec_params --crypto-config $crypto_config $req_key_data" >> $curlogfile
         $xmlsec_app check-key-data $xmlsec_params --crypto-config $crypto_config $req_key_data >> $curlogfile 2>> $curlogfile
-        printCheckStatus $?
         res=$?
+        printCheckStatus $res
         if [ $res -ne 0 ]; then
-	        cat $curlogfile >> $logfile
-	        tearDownTest
+            cat $curlogfile >> $logfile
+            tearDownTest
             return
         fi
     fi
@@ -167,8 +168,8 @@ execKeysTestWithCryptoConfig() {
         if [ -f $keysfile ] ; then
             params="$params --keys-file $keysfile"
         fi
-        echo "$extra_vars $VALGRIND $xmlsec_app keys $params $xmlsec_params  --crypto-config $crypto_config $keysfile" >>  $curlogfile
-        $VALGRIND $xmlsec_app keys $params $xmlsec_params  --crypto-config $crypto_config $keysfile >> $curlogfile 2>> $curlogfile
+        echo "$extra_vars $VALGRIND $xmlsec_app keys $params $xmlsec_params --crypto-config $crypto_config $keysfile" >> $curlogfile
+        $VALGRIND $xmlsec_app keys $params $xmlsec_params --crypto-config $crypto_config $keysfile >> $curlogfile 2>> $curlogfile
         printRes $expected_res $?
         if [ $? -ne 0 ]; then
             failures=`expr $failures + 1`
@@ -181,7 +182,7 @@ execKeysTestWithCryptoConfig() {
             printf "    Reading private key from pkcs12 file                  "
             rm -f $tmpfile
             params="--lax-key-search --pkcs12 $privkey_file.p12 $pkcs12_key_extra_options $key_test_options --output $tmpfile $asym_key_test.tmpl"
-            echo "$extra_vars $VALGRIND $xmlsec_app sign $xmlsec_params --crypto-config $crypto_config $params" >>  $curlogfile
+            echo "$extra_vars $VALGRIND $xmlsec_app sign $xmlsec_params --crypto-config $crypto_config $params" >> $curlogfile
             $VALGRIND $xmlsec_app sign $xmlsec_params --crypto-config $crypto_config $params >> $curlogfile 2>> $curlogfile
             printRes $expected_res $?
             if [ $? -ne 0 ]; then
@@ -192,7 +193,7 @@ execKeysTestWithCryptoConfig() {
             printf "    Reading private key from pkcs12 file (persist)        "
             rm -f $tmpfile
             params="--lax-key-search --pkcs12 $privkey_file.p12 $pkcs12_key_extra_options $key_test_options --output $tmpfile $asym_key_test.tmpl"
-            echo "$extra_vars $VALGRIND $xmlsec_app sign $xmlsec_params --crypto-config $crypto_config $params" >>  $curlogfile
+            echo "$extra_vars $VALGRIND $xmlsec_app sign $xmlsec_params --crypto-config $crypto_config $params" >> $curlogfile
             $VALGRIND $xmlsec_app sign $xmlsec_params --crypto-config $crypto_config $params >> $curlogfile 2>> $curlogfile
             printRes $expected_res $?
             if [ $? -ne 0 ]; then
@@ -203,7 +204,7 @@ execKeysTestWithCryptoConfig() {
             printf "    Reading private key name from pkcs12 file             "
             rm -f $tmpfile
             params="--pkcs12 $privkey_file.p12 $pkcs12_key_extra_options $key_test_options --output $tmpfile $asym_key_test.tmpl"
-            echo "$extra_vars $VALGRIND $xmlsec_app sign $xmlsec_params --crypto-config $crypto_config $params" >>  $curlogfile
+            echo "$extra_vars $VALGRIND $xmlsec_app sign $xmlsec_params --crypto-config $crypto_config $params" >> $curlogfile
             $VALGRIND $xmlsec_app sign $xmlsec_params --crypto-config $crypto_config $params >> $curlogfile 2>> $curlogfile
             printRes $expected_res $?
             if [ $? -ne 0 ]; then
@@ -213,8 +214,8 @@ execKeysTestWithCryptoConfig() {
         if [ "z$xmlsec_feature_pkcs12_keyname" = "zyes" -a "z$xmlsec_feature_pkcs12_persist" = "zyes" ] ; then
             printf "    Reading private key name from pkcs12 file (persist)   "
             rm -f $tmpfile
-            params="--pkcs12-persist  --pkcs12 $privkey_file.p12 $pkcs12_key_extra_options $key_test_options --output $tmpfile $asym_key_test.tmpl"
-            echo "$extra_vars $VALGRIND $xmlsec_app sign $xmlsec_params --crypto-config $crypto_config $params" >>  $curlogfile
+            params="--pkcs12-persist --pkcs12 $privkey_file.p12 $pkcs12_key_extra_options $key_test_options --output $tmpfile $asym_key_test.tmpl"
+            echo "$extra_vars $VALGRIND $xmlsec_app sign $xmlsec_params --crypto-config $crypto_config $params" >> $curlogfile
             $VALGRIND $xmlsec_app sign $xmlsec_params --crypto-config $crypto_config $params >> $curlogfile 2>> $curlogfile
             printRes $expected_res $?
             if [ $? -ne 0 ]; then
@@ -226,7 +227,7 @@ execKeysTestWithCryptoConfig() {
             printf "    Reading private key from pkcs12 file using ossl-store "
             rm -f $tmpfile
             params="--lax-key-search --privkey-openssl-store $privkey_file.p12 $pkcs12_key_extra_options $key_test_options --output $tmpfile $asym_key_test.tmpl"
-            echo "$extra_vars $VALGRIND $xmlsec_app sign $xmlsec_params --crypto-config $crypto_config $params" >>  $curlogfile
+            echo "$extra_vars $VALGRIND $xmlsec_app sign $xmlsec_params --crypto-config $crypto_config $params" >> $curlogfile
             $VALGRIND $xmlsec_app sign $xmlsec_params --crypto-config $crypto_config $params >> $curlogfile 2>> $curlogfile
             printRes $expected_res $?
             if [ $? -ne 0 ]; then
@@ -238,8 +239,8 @@ execKeysTestWithCryptoConfig() {
             printf "    Reading private key from pkcs8 pem file               "
             rm -f $tmpfile
             params="--lax-key-search --pkcs8-pem $privkey_file.p8-pem $key_test_options --output $tmpfile $asym_key_test.tmpl"
-            echo "$extra_vars $VALGRIND $xmlsec_app sign $xmlsec_params --crypto-config $v $params" >>  $curlogfile
-            $VALGRIND $xmlsec_app  sign $xmlsec_params --crypto-config $crypto_config $params >> $curlogfile 2>> $curlogfile
+            echo "$extra_vars $VALGRIND $xmlsec_app sign $xmlsec_params --crypto-config $crypto_config $params" >> $curlogfile
+            $VALGRIND $xmlsec_app sign $xmlsec_params --crypto-config $crypto_config $params >> $curlogfile 2>> $curlogfile
             printRes $expected_res $?
             if [ $? -ne 0 ]; then
                 failures=`expr $failures + 1`
@@ -250,8 +251,8 @@ execKeysTestWithCryptoConfig() {
             printf "    Reading private key from pkcs8 der file               "
             rm -f $tmpfile
             params="--lax-key-search --pkcs8-der $privkey_file.p8-der $key_test_options --output $tmpfile $asym_key_test.tmpl"
-            echo "$extra_vars $VALGRIND $xmlsec_app sign $xmlsec_params --crypto-config $crypto_config $params" >>  $curlogfile
-            $VALGRIND $xmlsec_app  sign $xmlsec_params --crypto-config $crypto_config $params >> $curlogfile 2>> $curlogfile
+            echo "$extra_vars $VALGRIND $xmlsec_app sign $xmlsec_params --crypto-config $crypto_config $params" >> $curlogfile
+            $VALGRIND $xmlsec_app sign $xmlsec_params --crypto-config $crypto_config $params >> $curlogfile 2>> $curlogfile
             printRes $expected_res $?
             if [ $? -ne 0 ]; then
                 failures=`expr $failures + 1`
@@ -262,8 +263,8 @@ execKeysTestWithCryptoConfig() {
             printf "    Reading private key from pem file                     "
             rm -f $tmpfile
             params="--lax-key-search --privkey-pem $privkey_file.pem $key_test_options --output $tmpfile $asym_key_test.tmpl"
-            echo "$extra_vars $VALGRIND $xmlsec_app sign $xmlsec_params --crypto-config $crypto_config $params" >>  $curlogfile
-            $VALGRIND $xmlsec_app  sign $xmlsec_params --crypto-config $crypto_config $params >> $curlogfile 2>> $curlogfile
+            echo "$extra_vars $VALGRIND $xmlsec_app sign $xmlsec_params --crypto-config $crypto_config $params" >> $curlogfile
+            $VALGRIND $xmlsec_app sign $xmlsec_params --crypto-config $crypto_config $params >> $curlogfile 2>> $curlogfile
             printRes $expected_res $?
             if [ $? -ne 0 ]; then
                 failures=`expr $failures + 1`
@@ -274,8 +275,8 @@ execKeysTestWithCryptoConfig() {
             printf "    Reading private key from der file                     "
             rm -f $tmpfile
             params="--lax-key-search --privkey-der $privkey_file.der $key_test_options --output $tmpfile $asym_key_test.tmpl"
-            echo "$extra_vars $VALGRIND $xmlsec_app sign $xmlsec_params --crypto-config $crypto_config $params" >>  $curlogfile
-            $VALGRIND $xmlsec_app  sign $xmlsec_params --crypto-config $crypto_config $params >> $curlogfile 2>> $curlogfile
+            echo "$extra_vars $VALGRIND $xmlsec_app sign $xmlsec_params --crypto-config $crypto_config $params" >> $curlogfile
+            $VALGRIND $xmlsec_app sign $xmlsec_params --crypto-config $crypto_config $params >> $curlogfile 2>> $curlogfile
             printRes $expected_res $?
             if [ $? -ne 0 ]; then
                 failures=`expr $failures + 1`
@@ -289,7 +290,7 @@ execKeysTestWithCryptoConfig() {
             printf "    Reading public key from pem file using ossl-store     "
             rm -f $tmpfile
             params="--lax-key-search --pubkey-openssl-store $pubkey_file.pem $key_test_options $asym_key_test.xml"
-            echo "$extra_vars $VALGRIND $xmlsec_app verify $xmlsec_params --crypto-config $crypto_config $params" >>  $curlogfile
+            echo "$extra_vars $VALGRIND $xmlsec_app verify $xmlsec_params --crypto-config $crypto_config $params" >> $curlogfile
             $VALGRIND $xmlsec_app verify $xmlsec_params --crypto-config $crypto_config $params >> $curlogfile 2>> $curlogfile
             printRes $expected_res $?
             if [ $? -ne 0 ]; then
@@ -302,7 +303,7 @@ execKeysTestWithCryptoConfig() {
             printf "    Reading public key from pem file                      "
             rm -f $tmpfile
             params="--lax-key-search --pubkey-pem $pubkey_file.pem $key_test_options $asym_key_test.xml"
-            echo "$extra_vars $VALGRIND $xmlsec_app verify $xmlsec_params --crypto-config $crypto_config $params" >>  $curlogfile
+            echo "$extra_vars $VALGRIND $xmlsec_app verify $xmlsec_params --crypto-config $crypto_config $params" >> $curlogfile
             $VALGRIND $xmlsec_app verify $xmlsec_params --crypto-config $crypto_config $params >> $curlogfile 2>> $curlogfile
             printRes $expected_res $?
             if [ $? -ne 0 ]; then
@@ -318,7 +319,7 @@ execKeysTestWithCryptoConfig() {
             printf "    Reading public key from der file                      "
             rm -f $tmpfile
             params="--lax-key-search --pubkey-der $pubkey_file.der $key_test_options $asym_key_test.xml"
-            echo "$extra_vars $VALGRIND $xmlsec_app verify $xmlsec_params --crypto-config $crypto_config $params" >>  $curlogfile
+            echo "$extra_vars $VALGRIND $xmlsec_app verify $xmlsec_params --crypto-config $crypto_config $params" >> $curlogfile
             $VALGRIND $xmlsec_app verify $xmlsec_params --crypto-config $crypto_config $params >> $curlogfile 2>> $curlogfile
             printRes $expected_res $?
             if [ $? -ne 0 ]; then
@@ -332,7 +333,7 @@ execKeysTestWithCryptoConfig() {
             printf "    Reading public key from pem cert file                 "
             rm -f $tmpfile
             params="--lax-key-search --pubkey-cert-pem $certkey_file.pem $key_test_options $asym_key_test.xml"
-            echo "$extra_vars $VALGRIND $xmlsec_app verify $xmlsec_params --crypto-config $crypto_config $params" >>  $curlogfile
+            echo "$extra_vars $VALGRIND $xmlsec_app verify $xmlsec_params --crypto-config $crypto_config $params" >> $curlogfile
             $VALGRIND $xmlsec_app verify $xmlsec_params --crypto-config $crypto_config $params >> $curlogfile 2>> $curlogfile
             printRes $expected_res $?
             if [ $? -ne 0 ]; then
@@ -344,7 +345,7 @@ execKeysTestWithCryptoConfig() {
             printf "    Reading public key from der cert file                 "
             rm -f $tmpfile
             params="--lax-key-search --pubkey-cert-der $certkey_file.der $key_test_options $asym_key_test.xml"
-            echo "$extra_vars $VALGRIND $xmlsec_app verify $xmlsec_params --crypto-config $crypto_config $params" >>  $curlogfile
+            echo "$extra_vars $VALGRIND $xmlsec_app verify $xmlsec_params --crypto-config $crypto_config $params" >> $curlogfile
             $VALGRIND $xmlsec_app verify $xmlsec_params --crypto-config $crypto_config $params >> $curlogfile 2>> $curlogfile
             printRes $expected_res $?
             if [ $? -ne 0 ]; then
@@ -606,8 +607,8 @@ execKeysTest $res_success   \
 ##########################################################################
 ##########################################################################
 ##########################################################################
-echo "--- testKeys finished ---" >> $logfile
-echo "--- testKeys finished ---"
+echo "--- testKeys finished" >> $logfile
+echo "--- testKeys finished"
 if [ -z "$XMLSEC_TEST_REPRODUCIBLE" ]; then
-    echo "--- detailed log is written to  $logfile ---"
+    echo "--- detailed log is written to $logfile"
 fi

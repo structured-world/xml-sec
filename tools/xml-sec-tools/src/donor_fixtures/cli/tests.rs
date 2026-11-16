@@ -1,4 +1,4 @@
-use super::{ASSETS, execute, pinned};
+use super::{ASSETS, execute};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -23,7 +23,7 @@ fn git(directory: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
-/// A donor checkout whose `tests` tree holds every asset, its pin and a target.
+/// A donor checkout whose `tests` tree holds every asset, and a target.
 struct Donor {
     directory: tempfile::TempDir,
     commit: String,
@@ -43,9 +43,7 @@ impl Donor {
         git(&repository, &["add", "."]);
         git(&repository, &["commit", "--quiet", "-m", "donor"]);
         let commit = git(&repository, &["rev-parse", "HEAD"]);
-        let donor = Self { directory, commit };
-        donor.pin(&format!("{}\n", donor.commit));
-        donor
+        Self { directory, commit }
     }
 
     fn tests(&self) -> PathBuf {
@@ -56,29 +54,35 @@ impl Donor {
         self.directory.path().join("snapshot")
     }
 
-    fn pin_path(&self) -> PathBuf {
-        self.directory.path().join("pin.txt")
-    }
-
-    fn pin(&self, text: &str) {
-        std::fs::write(self.pin_path(), text).unwrap();
-    }
-
-    fn import(&self, check: bool) -> Result<(), String> {
-        execute(&self.tests(), &self.target(), &self.pin_path(), check)
+    fn import(&self, check: bool) -> Result<String, String> {
+        execute(&self.tests(), &self.target(), check)
     }
 }
 
 #[test]
-fn an_import_copies_every_asset_with_its_commit_and_runner_modes() {
-    // The snapshot names its provenance; runner scripts stay executable.
+fn an_import_copies_every_asset_and_reports_its_commit() {
+    // The run names the upstream commit it copied, the snapshot stores none,
+    // and runner scripts stay executable.
     use std::os::unix::fs::PermissionsExt as _;
     let donor = Donor::new();
-    donor.import(false).unwrap();
+    assert_eq!(donor.import(false).unwrap(), donor.commit);
     let target = donor.target();
+    let mut stored: Vec<_> = std::fs::read_dir(&target)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    stored.sort();
     assert_eq!(
-        std::fs::read_to_string(target.join("DONOR_COMMIT")).unwrap(),
-        format!("{}\n", donor.commit)
+        stored,
+        [
+            "aleksey-xmldsig-01",
+            "phaos-xmldsig-three",
+            "testDSig.sh",
+            "testEnc.sh",
+            "testKeys.sh",
+            "testrun.sh",
+            "xmlenc11-interop-2012",
+        ]
     );
     for asset in ASSETS {
         assert_eq!(
@@ -95,47 +99,43 @@ fn an_import_copies_every_asset_with_its_commit_and_runner_modes() {
     };
     assert_eq!(mode("testDSig.sh"), 0o755);
     assert_eq!(mode("phaos-xmldsig-three/certs/rsa-ca-cert.der"), 0o644);
-    donor.import(true).unwrap();
+    assert_eq!(donor.import(true).unwrap(), donor.commit);
 }
 
 #[test]
 fn a_check_detects_drift_without_replacing_the_snapshot() {
-    // The CI gate observes; drift fails and stays in place for diagnosis.
+    // The CI gate observes; drift fails, names the upstream commit and stays
+    // in place for diagnosis.
     let donor = Donor::new();
     donor.import(false).unwrap();
     let changed = donor.target().join("testDSig.sh");
     std::fs::write(&changed, "local drift\n").unwrap();
     let error = donor.import(true).unwrap_err();
     assert!(error.contains("testDSig.sh"), "{error}");
+    assert!(error.contains(&donor.commit), "{error}");
     assert_eq!(std::fs::read_to_string(changed).unwrap(), "local drift\n");
 }
 
 #[test]
-fn missing_empty_and_malformed_pins_fail_closed() {
-    // Without an exact donor commit there is no provenance for the snapshot.
+fn a_newer_upstream_commit_is_drift_until_regenerated() {
+    // Upstream moving on is the signal: the check fails on the changed asset
+    // and passes once the snapshot is copied from the new commit.
     let donor = Donor::new();
-    for text in ["", "\n", "HEAD\n", "0123\n"] {
-        donor.pin(text);
-        assert!(pinned(&donor.pin_path()).is_err(), "{text:?}");
-        assert!(donor.import(false).is_err(), "{text:?}");
-    }
-    std::fs::remove_file(donor.pin_path()).unwrap();
-    assert!(donor.import(false).is_err());
-    assert!(!donor.target().exists());
-}
-
-#[test]
-fn a_checkout_at_another_revision_is_refused() {
-    // A well-formed pin proves nothing unless it is the copied checkout.
-    let donor = Donor::new();
-    donor.pin(&format!("{}\n", "0".repeat(40)));
-    let error = donor.import(false).unwrap_err();
-    assert!(error.contains("does not match pin"), "{error}");
+    donor.import(false).unwrap();
+    let repository = donor.directory.path().join("xmlsec");
+    std::fs::write(repository.join("tests/testEnc.sh"), "upstream edit\n").unwrap();
+    git(&repository, &["commit", "--quiet", "-am", "upstream"]);
+    let newer = git(&repository, &["rev-parse", "HEAD"]);
+    let error = donor.import(true).unwrap_err();
+    assert!(error.contains("testEnc.sh"), "{error}");
+    assert!(error.contains(&newer), "{error}");
+    assert_eq!(donor.import(false).unwrap(), newer);
+    assert_eq!(donor.import(true).unwrap(), newer);
 }
 
 #[test]
 fn a_locally_changed_asset_is_refused() {
-    // The bytes copied must be the pinned commit's, not a worktree edit.
+    // The bytes copied must be the checkout commit's, not a worktree edit.
     let donor = Donor::new();
     std::fs::write(donor.tests().join("testEnc.sh"), "edited\n").unwrap();
     let error = donor.import(false).unwrap_err();

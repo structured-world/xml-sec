@@ -1,6 +1,8 @@
 //! `donor-fixtures --cli [--check]`: the upstream runner scripts and vectors
 //! the native CLI's integration suite executes unmodified, copied from the
-//! pinned donor commit together with that commit.
+//! committed state of an upstream checkout. The run prints the commit it
+//! copied or compared; none is stored, so CI checks the snapshot against
+//! upstream master as it is when the job runs.
 
 use super::{beside, install, replace};
 use crate::libxslt_fixtures::differences;
@@ -26,34 +28,6 @@ pub(crate) const ASSETS: [&str; 12] = [
     "xmlenc11-interop-2012/xenc11-example-AES128-GCM.key",
 ];
 
-/// The pinned donor commit; a missing, empty or malformed pin is no provenance.
-pub(crate) fn pinned(pin: &Path) -> Result<String, String> {
-    let text = std::fs::read_to_string(pin).map_err(|error| {
-        format!(
-            "donor commit pin is missing or empty: {}: {error}",
-            pin.display()
-        )
-    })?;
-    let commit = text.strip_suffix('\n').unwrap_or(&text);
-    if commit.is_empty() {
-        return Err(format!(
-            "donor commit pin is missing or empty: {}",
-            pin.display()
-        ));
-    }
-    let object_id = (commit.len() == 40 || commit.len() == 64)
-        && commit
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
-    if !object_id {
-        return Err(format!(
-            "donor commit pin is not a Git object ID: {}",
-            pin.display()
-        ));
-    }
-    Ok(commit.to_owned())
-}
-
 /// A Git query in `directory`; its trimmed output, or `None` when Git refuses.
 fn git(directory: &Path, args: &[&str]) -> Result<Option<String>, String> {
     let output = Command::new("git")
@@ -68,8 +42,9 @@ fn git(directory: &Path, args: &[&str]) -> Result<Option<String>, String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned()))
 }
 
-/// Copies every asset of the donor checkout at `commit` into `staging`.
-fn stage(donor_tests: &Path, commit: &str, staging: &Path) -> Result<(), String> {
+/// Copies every asset of the donor checkout into `staging`, refusing any
+/// asset whose bytes differ from the checkout's commit; returns that commit.
+fn stage(donor_tests: &Path, staging: &Path) -> Result<String, String> {
     let not_checkout = || {
         format!(
             "donor tests must belong to a Git checkout: {}",
@@ -79,7 +54,7 @@ fn stage(donor_tests: &Path, commit: &str, staging: &Path) -> Result<(), String>
     let repository = PathBuf::from(
         git(donor_tests, &["rev-parse", "--show-toplevel"])?.ok_or_else(not_checkout)?,
     );
-    let head = git(donor_tests, &["rev-parse", "HEAD"])?.ok_or_else(not_checkout)?;
+    let commit = git(donor_tests, &["rev-parse", "HEAD"])?.ok_or_else(not_checkout)?;
     let canonical = |path: &Path| {
         path.canonicalize()
             .map_err(|error| format!("{}: {error}", path.display()))
@@ -90,25 +65,17 @@ fn stage(donor_tests: &Path, commit: &str, staging: &Path) -> Result<(), String>
             donor_tests.display()
         ));
     }
-    if head != commit {
-        return Err(format!(
-            "donor checkout revision {head} does not match pin {commit}"
-        ));
-    }
     for asset in ASSETS {
         let source = donor_tests.join(asset);
         if !source.is_file() {
-            return Err(format!(
-                "pinned donor asset is missing: {}",
-                source.display()
-            ));
+            return Err(format!("donor asset is missing: {}", source.display()));
         }
         let tracked = format!("tests/{asset}");
         let pristine = git(&repository, &["ls-files", "--error-unmatch", &tracked])?.is_some()
-            && git(&repository, &["diff", "--quiet", commit, "--", &tracked])?.is_some();
+            && git(&repository, &["diff", "--quiet", &commit, "--", &tracked])?.is_some();
         if !pristine {
             return Err(format!(
-                "pinned donor asset has uncommitted changes: {}",
+                "donor asset has uncommitted changes: {}",
                 source.display()
             ));
         }
@@ -124,43 +91,41 @@ fn stage(donor_tests: &Path, commit: &str, staging: &Path) -> Result<(), String>
                 .map_err(|error| error.to_string())?;
         }
     }
-    std::fs::write(staging.join("DONOR_COMMIT"), format!("{commit}\n"))
-        .map_err(|error| error.to_string())
+    Ok(commit)
 }
 
 /// Imports the snapshot into `target`, or with `check` reports how it differs
-/// and leaves it untouched.
-pub(crate) fn execute(
-    donor_tests: &Path,
-    target: &Path,
-    pin: &Path,
-    check: bool,
-) -> Result<(), String> {
-    let commit = pinned(pin)?;
+/// and leaves it untouched; returns the upstream commit it was taken from.
+pub(crate) fn execute(donor_tests: &Path, target: &Path, check: bool) -> Result<String, String> {
     let parent = target.parent().ok_or("the snapshot target has a parent")?;
     std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     let staging = beside(target, "import")?;
     std::fs::create_dir_all(&staging).map_err(|error| error.to_string())?;
-    let staged = stage(donor_tests, &commit, &staging);
-    let checked = staged.and_then(|()| {
+    let staged = stage(donor_tests, &staging);
+    let checked = staged.and_then(|commit| {
         if check {
-            differences(target, &staging)
+            differences(target, &staging).map(|found| (commit, found))
         } else {
-            Ok(Vec::new())
+            Ok((commit, Vec::new()))
         }
     });
     if check || checked.is_err() {
         std::fs::remove_dir_all(&staging).map_err(|error| error.to_string())?;
     }
-    let found = checked?;
+    let (commit, found) = checked?;
     if check {
         return if found.is_empty() {
-            Ok(())
+            Ok(commit)
         } else {
-            Err(found.join("\n"))
+            Err(format!(
+                "the CLI fixture snapshot differs from upstream {commit}:\n{}\n\
+                 run `cargo run -p xml-sec-tools -- donor-fixtures --cli` and review the diff",
+                found.join("\n")
+            ))
         };
     }
-    replace(&staging, target)
+    replace(&staging, target)?;
+    Ok(commit)
 }
 
 pub(crate) fn run(args: &[String]) -> Result<(), String> {
@@ -178,10 +143,8 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
     let donor = variable("XMLSEC_DONOR_ROOT").unwrap_or_else(|| root.join("donors/xmlsec/tests"));
     let target = variable("XMLSEC_FIXTURE_TARGET")
         .unwrap_or_else(|| root.join("tools/xmlsec1/tests/fixtures/upstream"));
-    execute(
-        &donor,
-        &target,
-        &root.join("compatibility/libxmlsec1-1.3.13-donor-commit.txt"),
-        check,
-    )
+    let commit = execute(&donor, &target, check)?;
+    let action = if check { "matches" } else { "copied from" };
+    println!("CLI fixture snapshot {action} upstream {commit}");
+    Ok(())
 }
