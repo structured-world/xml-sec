@@ -47,6 +47,35 @@ fn a_stale_requirement_is_reported_and_rewritten_in_place() {
 }
 
 #[test]
+fn a_single_quoted_requirement_is_reported_and_keeps_its_quotes() {
+    // TOML literal strings are valid in both declaration forms; a stale one
+    // must not pass the check, and the rewrite keeps the author's delimiter.
+    let text = "xml-sec = '0.4'\n\
+                xml-sec = { version = '0.5', features = [\"xmldsig\"] }\n\
+                xml-sec = '0.6'\n";
+    let (aligned, stale) = align(text, "0.6");
+    assert_eq!(
+        stale,
+        [
+            Stale {
+                line: 1,
+                found: "0.4".into()
+            },
+            Stale {
+                line: 2,
+                found: "0.5".into()
+            },
+        ]
+    );
+    assert_eq!(
+        aligned,
+        "xml-sec = '0.6'\n\
+         xml-sec = { version = '0.6', features = [\"xmldsig\"] }\n\
+         xml-sec = '0.6'\n"
+    );
+}
+
+#[test]
 fn other_packages_and_path_declarations_are_left_alone() {
     // A sibling crate has its own versions, and a path dependency has none.
     let text = "xml-sec-config = \"0.1\"\n\

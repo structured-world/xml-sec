@@ -42,17 +42,21 @@ pub(crate) struct Stale {
 
 /// `text` with every `xml-sec` version requirement set to `wanted`, and the
 /// declarations that differed. Both `xml-sec = "…"` and the table form with
-/// a `version` key count; path-only declarations and other packages do not.
+/// a `version` key count, in basic or literal strings (TOML 1.0 "String");
+/// path-only declarations and other packages do not.
 pub(crate) fn align(text: &str, wanted: &str) -> (String, Vec<Stale>) {
-    let declaration =
-        Regex::new(r#"^(\s*xml-sec\s*=\s*(?:\{[^}\n]*?\bversion\s*=\s*)?")([^"\n]*)""#)
-            .expect("the declaration pattern is valid");
+    let declaration = Regex::new(
+        r#"^\s*xml-sec\s*=\s*(?:\{[^}\n]*?\bversion\s*=\s*)?(?:"([^"\n]*)"|'([^'\n]*)')"#,
+    )
+    .expect("the declaration pattern is valid");
     let mut stale = Vec::new();
     let mut aligned = String::with_capacity(text.len());
     for (index, line) in text.split_inclusive('\n').enumerate() {
-        match declaration.captures(line) {
-            Some(found) if &found[2] != wanted => {
-                let requirement = found.get(2).expect("the pattern has two groups");
+        let requirement = declaration
+            .captures(line)
+            .and_then(|found| found.get(1).or_else(|| found.get(2)));
+        match requirement {
+            Some(requirement) if requirement.as_str() != wanted => {
                 stale.push(Stale {
                     line: index + 1,
                     found: requirement.as_str().to_owned(),
