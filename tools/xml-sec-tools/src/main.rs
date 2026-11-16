@@ -5,6 +5,7 @@ mod capi;
 mod check_features;
 mod ci_blocks;
 mod coverage;
+mod dcc_schema;
 mod documentation;
 mod donor_fixtures;
 mod fetch_standards;
@@ -44,6 +45,7 @@ commands:
   capi [--sanitize | --xmlsec1]
   check-features PROFILE [all|lint|test|doc]
   ci-blocks BLOCK
+  dcc-schema
   documentation [all|docs|readme [--write]]
   donor-fixtures [--xmlenc-corpora | PATH... | --cli [--check]]
   fetch-standards
@@ -76,6 +78,7 @@ fn main() -> ExitCode {
         Some("capi") => capi::run(args),
         Some("check-features") => check_features::run(args),
         Some("ci-blocks") => ci_blocks::run(args).map_err(Failure::from),
+        Some("dcc-schema") => dcc_schema::run(args),
         Some("documentation") => documentation::run(args),
         Some("donor-fixtures") => donor_fixtures::run(args),
         Some("fetch-standards") => fetch_standards::run(args),

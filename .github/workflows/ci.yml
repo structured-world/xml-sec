@@ -306,7 +306,10 @@ jobs:
       - name: Install oracle build dependencies
         uses: ./.github/actions/apt-packages
         with:
-          packages: autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config
+          packages: autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxml2-utils libxslt1-dev perl pkg-config
+      # The DCC corpus follows the schema PTB publishes when the job runs.
+      - name: Check the DCC corpus against the current PTB schema
+        run: cargo run --quiet -p xml-sec-tools -- dcc-schema
       - name: Build the libxmlsec1 oracle from the checked-out master
         env:
           XMLSEC1_SOURCE_DIR: ${{ github.workspace }}/donors/xmlsec
