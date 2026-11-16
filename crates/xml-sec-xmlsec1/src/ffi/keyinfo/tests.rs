@@ -27,7 +27,8 @@ use crate::ffi::transforms::io::{xmlSecIOInit, xmlSecIORegisterCallbacks, xmlSec
 use crate::ffi::tree::{XmlDoc, nodes};
 use crate::ffi::{asymkeys, symkeys};
 
-/// `XMLSEC_KEYINFO_FLAGS_KEYNAME_STOP_ON_UNKNOWN`.
+/// `XMLSEC_KEYINFO_FLAGS_KEYNAME_STOP_ON_UNKNOWN`, deprecated and read by
+/// nothing.
 const KEYNAME_STOP_ON_UNKNOWN: u32 = 0x0000_0004;
 
 /// `XMLSEC_KEYINFO_FLAGS_LAX_KEY_SEARCH`.
@@ -238,11 +239,15 @@ fn key_reference_depth_counts_both_kinds_of_reference() {
 }
 
 #[test]
-fn an_unknown_key_name_stops_the_read_when_the_flag_asks() {
-    // keyinfo.h: XMLSEC_KEYINFO_FLAGS_KEYNAME_STOP_ON_UNKNOWN aborts on a
-    // name the keys manager does not know, rather than reading on.
-    let doc = parse(
+fn an_unknown_key_name_names_the_key_and_a_second_name_is_refused() {
+    // A name the keys manager does not know still names the key, whatever
+    // the deprecated XMLSEC_KEYINFO_FLAGS_KEYNAME_STOP_ON_UNKNOWN says; a
+    // key already named otherwise is a mismatch.
+    let alice = parse(
         "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>alice</KeyName></KeyInfo>",
+    );
+    let bob = parse(
+        "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>bob</KeyName></KeyInfo>",
     );
     // SAFETY: objects created and destroyed here.
     unsafe {
@@ -251,17 +256,30 @@ fn an_unknown_key_name_stops_the_read_when_the_flag_asks() {
         let store = xmlSecKeyStoreCreate(xmlSecSimpleKeysStoreGetKlass());
         assert_eq!(xmlSecKeysMngrAdoptKeysStore(mngr, store), 0);
         let ctx = xmlSecKeyInfoCtxCreate(mngr);
-        let key = xmlSecKeyCreate();
-        assert_eq!(xmlSecKeyInfoNodeRead(xsDocGetRootElement(doc), key, ctx), 0);
         (*ctx).flags = KEYNAME_STOP_ON_UNKNOWN;
+        let key = xmlSecKeyCreate();
         assert_eq!(
-            xmlSecKeyInfoNodeRead(xsDocGetRootElement(doc), key, ctx),
+            xmlSecKeyInfoNodeRead(xsDocGetRootElement(alice), key, ctx),
+            0
+        );
+        assert_eq!(
+            std::ffi::CStr::from_ptr((*key).name.cast()),
+            c"alice",
+            "the unknown name names the key"
+        );
+        assert_eq!(
+            xmlSecKeyInfoNodeRead(xsDocGetRootElement(alice), key, ctx),
+            0
+        );
+        assert_eq!(
+            xmlSecKeyInfoNodeRead(xsDocGetRootElement(bob), key, ctx),
             -1
         );
         xmlSecKeyDestroy(key);
         xmlSecKeyInfoCtxDestroy(ctx);
         xmlSecKeysMngrDestroy(mngr);
-        xsFreeDoc(doc);
+        xsFreeDoc(alice);
+        xsFreeDoc(bob);
     }
 }
 
@@ -420,9 +438,9 @@ fn an_rsa_key_value_past_the_resource_limit_is_refused() {
 }
 
 #[test]
-fn a_copy_onto_itself_is_refused() {
-    // Copying a context or a list onto itself would alias the destination
-    // with the source; the call is refused and leaves both as they were.
+fn a_copy_onto_itself_changes_nothing() {
+    // A context or a list copied onto itself already is the copy: the call
+    // succeeds and leaves it as it was, without appending its own items.
     // SAFETY: a context created and destroyed here.
     unsafe {
         assert_eq!(xmlSecKeyDataIdsInit(), 0);
@@ -432,13 +450,13 @@ fn a_copy_onto_itself_is_refused() {
             xmlSecPtrListAdd(enabled, asymkeys::rsa().cast_mut().cast()),
             0
         );
-        assert_eq!(super::xmlSecKeyInfoCtxCopyUserPref(ctx, ctx), -1);
+        assert_eq!(super::xmlSecKeyInfoCtxCopyUserPref(ctx, ctx), 0);
         let transforms = &raw mut (*ctx).retrieval_method_ctx;
         assert_eq!(
             crate::ffi::transforms::ctx::xmlSecTransformCtxCopyUserPref(transforms, transforms),
-            -1
+            0
         );
-        assert_eq!(crate::ffi::list::xmlSecPtrListCopy(enabled, enabled), -1);
+        assert_eq!(crate::ffi::list::xmlSecPtrListCopy(enabled, enabled), 0);
         assert_eq!(crate::ffi::list::xmlSecPtrListGetSize(enabled), 1);
         xmlSecKeyInfoCtxDestroy(ctx);
     }
@@ -641,6 +659,20 @@ unsafe extern "C" fn close(_context: *mut std::ffi::c_void) -> std::ffi::c_int {
     0
 }
 
+/// `xmlSecTransformUriTypeAny`.
+const URI_TYPE_ANY: std::ffi::c_uint = 0xFFFF;
+
+/// Lets the `KeyInfoReference`s of `ctx` dereference any URI, as a caller
+/// of a context whose default admits only same-document ones does; the
+/// policy's classes still apply.
+///
+/// # Safety
+/// `ctx` is a context.
+unsafe fn admit_external_references(ctx: *mut super::XmlSecKeyInfoCtx) {
+    // SAFETY: by the caller's contract.
+    unsafe { (*ctx).key_info_reference_ctx.enabled_uris = URI_TYPE_ANY };
+}
+
 #[test]
 fn a_key_info_read_keeps_the_policy_it_started_under() {
     // A policy republished while a KeyInfo read follows a reference reaches
@@ -666,6 +698,7 @@ fn a_key_info_read_keeps_the_policy_it_started_under() {
             0
         );
         let ctx = xmlSecKeyInfoCtxCreate(std::ptr::null_mut());
+        admit_external_references(ctx);
         let doc = parse(
             "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\" \
              xmlns:dsig11=\"http://www.w3.org/2009/xmldsig11#\">\
@@ -748,6 +781,7 @@ fn the_references_of_one_read_share_its_resource_budget() {
             0
         );
         let ctx = xmlSecKeyInfoCtxCreate(std::ptr::null_mut());
+        admit_external_references(ctx);
         assert_eq!(read_reported(one, ctx).0, 0, "one resource fits");
         assert_eq!(read_reported(two, ctx).0, -1, "two pass the aggregate");
         assert_eq!(read_reported(one, ctx).0, 0, "a new read starts afresh");
@@ -823,6 +857,12 @@ fn a_key_reference_opens_its_uri_under_the_key_reference_classes() {
             0
         );
         let ctx = xmlSecKeyInfoCtxCreate(std::ptr::null_mut());
+        // A fresh context dereferences only same-document URIs, whatever the
+        // policy admits.
+        let (read, reasons) = read_reported(xml, ctx);
+        assert_eq!(read, -1);
+        assert_eq!(reasons.first(), Some(&errors::R_INVALID_URI_TYPE));
+        admit_external_references(ctx);
         let (read, reasons) = read_reported(xml, ctx);
         assert_eq!((read, reasons), (0, Vec::new()));
         xmlSecKeyInfoCtxDestroy(ctx);

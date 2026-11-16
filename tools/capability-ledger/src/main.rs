@@ -8,10 +8,6 @@ use std::process::Command;
 
 mod abi;
 
-const EXPECTED_VERSION: &str = "1.3.13";
-const EXPECTED_COMMIT: &str =
-    include_str!("../../../compatibility/libxmlsec1-1.3.13-donor-commit.txt");
-
 #[derive(Debug, Deserialize)]
 struct RulesFile {
     schema_version: u32,
@@ -62,12 +58,24 @@ struct Ledger {
     items: Vec<LedgerItem>,
 }
 
+/// The upstream a ledger describes: the version its `configure.ac` declares.
+/// The commit is printed by the run, not stored, so an upstream commit that
+/// changes nothing the ledger records leaves it as it is.
 #[derive(Debug, Serialize)]
 struct Upstream {
     project: String,
     version: String,
-    commit: String,
     repository: String,
+}
+
+impl Upstream {
+    fn libxmlsec1(version: &str) -> Self {
+        Self {
+            project: "libxmlsec1".into(),
+            version: version.into(),
+            repository: "https://github.com/lsh123/xmlsec".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -214,13 +222,15 @@ fn main() -> Result<(), String> {
         return Err(usage());
     }
 
-    verify_donor(&donor)?;
-    let donor_snapshot = snapshot_donor(&donor, EXPECTED_COMMIT.trim())?;
-    verify_donor_version(donor_snapshot.path())?;
+    let commit = donor_head(&donor)?;
+    let donor_snapshot = snapshot_donor(&donor, &commit)?;
+    let version = donor_version(donor_snapshot.path())?;
+    eprintln!("libxmlsec1 {version} at upstream {commit}");
     if command.starts_with("behavior-") {
         return generate_behavior_ledger(
             command == "behavior-check",
             donor_snapshot.path(),
+            &version,
             &rules_path,
             &output,
         );
@@ -235,7 +245,7 @@ fn main() -> Result<(), String> {
     }
 
     let surface = extract_surface(donor_snapshot.path())?;
-    let ledger = classify(surface, rules)?;
+    let ledger = classify(surface, rules, Upstream::libxmlsec1(&version))?;
     let mut bytes = serde_json::to_vec_pretty(&ledger).map_err(|error| error.to_string())?;
     bytes.push(b'\n');
 
@@ -266,6 +276,7 @@ fn usage() -> String {
 fn generate_behavior_ledger(
     check: bool,
     donor: &Path,
+    version: &str,
     rules_path: &Path,
     output: &Path,
 ) -> Result<(), String> {
@@ -330,12 +341,7 @@ fn generate_behavior_ledger(
     behaviors.sort_by(|left, right| left.id.cmp(&right.id));
     let ledger = BehaviorLedger {
         schema_version: 1,
-        upstream: Upstream {
-            project: "libxmlsec1".into(),
-            version: EXPECTED_VERSION.into(),
-            commit: EXPECTED_COMMIT.trim().into(),
-            repository: "https://github.com/lsh123/xmlsec".into(),
-        },
+        upstream: Upstream::libxmlsec1(version),
         generated_by: "xml-sec-capability-ledger behavior-generate".into(),
         evidence: rules.evidence,
         behaviors,
@@ -536,8 +542,8 @@ fn resolve_donor_anchor(donor: &Path, anchor: DonorAnchorRule) -> Result<DonorAn
     })
 }
 
-fn verify_donor(donor: &Path) -> Result<(), String> {
-    let expected_commit = EXPECTED_COMMIT.trim();
+/// The commit checked out in `donor`, the source the ledger is generated from.
+fn donor_head(donor: &Path) -> Result<String, String> {
     let output = Command::new("git")
         .args([
             "-C",
@@ -554,21 +560,32 @@ fn verify_donor(donor: &Path) -> Result<(), String> {
         .map_err(|_| "git donor identity is not UTF-8")?
         .trim()
         .to_owned();
-    if commit != expected_commit {
-        return Err(format!(
-            "libxmlsec donor revision mismatch: expected {expected_commit}, got {commit}"
-        ));
+    if commit.len() != 40 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!("donor HEAD is not a commit: {commit:?}"));
     }
-    Ok(())
+    Ok(commit)
 }
 
-fn verify_donor_version(donor: &Path) -> Result<(), String> {
+/// The version the donor's `configure.ac` declares: the second bracketed
+/// argument of xmlsec1's `AC_INIT`.
+fn donor_version(donor: &Path) -> Result<String, String> {
     let configure = fs::read_to_string(donor.join("configure.ac"))
         .map_err(|error| format!("read donor configure.ac: {error}"))?;
-    if !configure.contains(&format!("AC_INIT([xmlsec1],[{EXPECTED_VERSION}]")) {
-        return Err(format!("donor does not declare xmlsec1 {EXPECTED_VERSION}"));
-    }
-    Ok(())
+    configured_version(&configure)
+        .ok_or_else(|| "donor configure.ac declares no xmlsec1 version".into())
+}
+
+fn configured_version(configure: &str) -> Option<String> {
+    let arguments = configure
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("AC_INIT("))?;
+    let mut quoted = arguments
+        .split('[')
+        .skip(1)
+        .filter_map(|part| part.split_once(']'));
+    let (name, _) = quoted.next()?;
+    let (version, _) = quoted.next()?;
+    (name == "xmlsec1" && !version.is_empty()).then(|| version.to_owned())
 }
 
 fn snapshot_donor(donor: &Path, commit: &str) -> Result<tempfile::TempDir, String> {
@@ -852,6 +869,10 @@ fn extract_enum(
 fn extract_header(donor: &Path, source: &str, items: &mut Vec<SurfaceItem>) -> Result<(), String> {
     let (extraction_source, content) = header_source(donor, source)?;
     let lines: Vec<_> = content.lines().collect();
+    // Comments and literals blanked, line for line: a comment naming an
+    // export macro declares nothing.
+    let code = sanitize_c(&content);
+    let code: Vec<_> = code.lines().collect();
     let conditions = preprocessor_conditions(&content)
         .map_err(|error| format!("parse conditions in {extraction_source}: {error}"))?;
     let HeaderPatterns {
@@ -936,7 +957,7 @@ fn extract_header(donor: &Path, source: &str, items: &mut Vec<SurfaceItem>) -> R
             })?;
             extract_typedef(&block, &extraction_source, line_number, items)?;
             index = end;
-        } else if line.contains("_EXPORT") && !line.trim_start().starts_with('#') {
+        } else if code[index].contains("_EXPORT") && !line.trim_start().starts_with('#') {
             let (block, end) = collect_declaration(&lines, index).map_err(|error| {
                 format!("parse export at {extraction_source}:{line_number}: {error}")
             })?;
@@ -975,13 +996,15 @@ fn extract_internal_exports(donor: &Path, items: &mut Vec<SurfaceItem>) -> Resul
         let content =
             fs::read_to_string(&path).map_err(|error| format!("read {source}: {error}"))?;
         let lines: Vec<_> = content.lines().collect();
+        let code = sanitize_c(&content);
+        let code: Vec<_> = code.lines().collect();
         let conditions = preprocessor_conditions(&content)
             .map_err(|error| format!("parse conditions in {source}: {error}"))?;
         let mut index = 0;
         while index < lines.len() {
             let line = lines[index];
             let line_number = index + 1;
-            if line.contains("XMLSEC_EXPORT") && !line.trim_start().starts_with('#') {
+            if code[index].contains("XMLSEC_EXPORT") && !line.trim_start().starts_with('#') {
                 let (block, end) = collect_declaration(&lines, index)
                     .map_err(|error| format!("parse export at {source}:{line_number}: {error}"))?;
                 if block.contains("_EXPORT_VAR") {
@@ -1349,17 +1372,19 @@ fn extract_cli_options_from_content(content: &str) -> Result<Vec<SurfaceItem>, S
 
 fn extract_cli_exit_statuses(content: &str) -> Result<Vec<SurfaceItem>, String> {
     let definitions = [
+        // `main`'s success: the line after the command it executed returned.
         (
             "success",
-            r"(?m)^[ \t]*/\* sucecss! \*/\r?\n(?P<target>[ \t]*res = 0;)$",
+            r"(?s)ret = xmlSecAppExecute\(command, [^;]*\);\s*if\(ret < 0\) \{\s*goto done;\s*\}\s*/\* success! \*/\r?\n(?P<target>[ \t]*res = 0;)",
             "0",
             0,
         ),
+        // An unknown command leaves `res` at its failure value.
         (
             "unknown-command",
-            r"(?s)if\(command == xmlSecAppCommandUnknown\) \{.*?\n(?P<target>[ \t]*res = 0;)\r?\n[ \t]*goto done;",
-            "0 after printing usage",
-            0,
+            r#"(?s)if\(command == xmlSecAppCommandUnknown\) \{\s*fprintf\(stderr, "Error: unknown command[^;]*;\s*xmlSecAppPrintUsage\(\);\r?\n(?P<target>[ \t]*goto done;)"#,
+            "1 after printing usage",
+            1,
         ),
         (
             "failure",
@@ -1411,8 +1436,9 @@ fn extract_test_families(donor: &Path, items: &mut Vec<SurfaceItem>) -> Result<(
     Ok(())
 }
 
+/// The runners of the CLI tier gate.
 fn required_test_runner_items(tests: &Path) -> Result<Vec<SurfaceItem>, String> {
-    ["testDSig.sh", "testEnc.sh", "testKeys.sh", "testRes.sh"]
+    ["testDSig.sh", "testEnc.sh", "testKeys.sh"]
         .into_iter()
         .map(|script| {
             if !tests.join(script).is_file() {
@@ -1429,7 +1455,11 @@ fn required_test_runner_items(tests: &Path) -> Result<Vec<SurfaceItem>, String> 
         .collect()
 }
 
-fn classify(surface: Vec<SurfaceItem>, rules: RulesFile) -> Result<Ledger, String> {
+fn classify(
+    surface: Vec<SurfaceItem>,
+    rules: RulesFile,
+    upstream: Upstream,
+) -> Result<Ledger, String> {
     let compiled: Vec<_> = rules
         .rules
         .iter()
@@ -1514,12 +1544,7 @@ fn classify(surface: Vec<SurfaceItem>, rules: RulesFile) -> Result<Ledger, Strin
     }
     Ok(Ledger {
         schema_version: 2,
-        upstream: Upstream {
-            project: "libxmlsec1".into(),
-            version: EXPECTED_VERSION.into(),
-            commit: EXPECTED_COMMIT.trim().into(),
-            repository: "https://github.com/lsh123/xmlsec".into(),
-        },
+        upstream,
         generated_by: "xml-sec-capability-ledger/2".into(),
         evidence: rules.evidence,
         classifications,
@@ -1681,7 +1706,13 @@ fn sanitize_c(value: &str) -> String {
     let mut escaped = false;
     while let Some(ch) = chars.next() {
         if in_line_comment {
-            if ch == '\n' {
+            if ch == '\\' && chars.peek() == Some(&'\n') {
+                // Line splicing precedes comment removal (C11 5.1.1.2), so
+                // the comment goes on; the line break stays for line numbers.
+                output.push(' ');
+                output.push('\n');
+                chars.next();
+            } else if ch == '\n' {
                 in_line_comment = false;
                 output.push(ch);
             } else {
@@ -1699,7 +1730,9 @@ fn sanitize_c(value: &str) -> String {
                 output.push(' ');
             }
         } else if let Some(delimiter) = quote {
-            output.push(' ');
+            // A literal continued with a backslash-newline keeps its line
+            // break, so the output stays line for line with the input.
+            output.push(if ch == '\n' { '\n' } else { ' ' });
             if escaped {
                 escaped = false;
             } else if ch == '\\' {

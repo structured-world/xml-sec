@@ -101,7 +101,6 @@ functions_table! {
         transform_dh_es,
         transform_dsa_sha1, transform_dsa_sha256,
         transform_ecdh,
-        transform_x448, transform_x25519,
         transform_ecdsa_ripemd160, transform_ecdsa_sha1, transform_ecdsa_sha224,
         transform_ecdsa_sha256, transform_ecdsa_sha384, transform_ecdsa_sha512,
         transform_ecdsa_sha3_224, transform_ecdsa_sha3_256, transform_ecdsa_sha3_384,
@@ -131,6 +130,7 @@ functions_table! {
         transform_sha1,
         transform_sha224, transform_sha256, transform_sha384, transform_sha512,
         transform_sha3_224, transform_sha3_256, transform_sha3_384, transform_sha3_512,
+        transform_x25519, transform_x448,
     }
     app {
         crypto_app_init: Option<unsafe extern "C" fn(*const c_char) -> c_int>,
@@ -188,7 +188,6 @@ static BUILTIN: Global<XmlSecCryptoDLFunctions> = Global::new(XmlSecCryptoDLFunc
     key_data_camellia: Some(symkeys::camellia),
     key_data_chacha20: Some(symkeys::chacha20),
     key_data_concat_kdf: Some(symkeys::concat_kdf),
-    key_data_des: Some(symkeys::des),
     key_data_der_encoded_key_value: Some(asymkeys::der_encoded_key_value),
     key_data_dsa: Some(asymkeys::dsa),
     key_data_ec: Some(asymkeys::ec),
@@ -695,13 +694,11 @@ impl XmlSecCryptoDLFunctions {
         ]
     }
 
-    /// The first transform getters in libxmlsec1's registration order;
-    /// AES-192-CBC comes twice, as libxmlsec1 registers it.
-    fn transforms_in_registration_order(&self) -> [TransformGetter; 50] {
+    /// The first transform getters in libxmlsec1's registration order.
+    fn transforms_in_registration_order(&self) -> [TransformGetter; 49] {
         let table = self;
         [
             table.transform_aes128_cbc,
-            table.transform_aes192_cbc,
             table.transform_aes192_cbc,
             table.transform_aes256_cbc,
             table.transform_aes128_gcm,
@@ -840,7 +837,9 @@ fn missing_method(here: errors::Here, name: &str) {
         std::ptr::null(),
         std::ptr::null(),
         errors::R_NOT_IMPLEMENTED,
-        &format!("Method is missing in the dynamically loaded library: {name}"),
+        &format!(
+            "Crypto library was not loaded or the method is missing in the dynamically loaded library: {name}"
+        ),
     );
 }
 
@@ -867,6 +866,8 @@ macro_rules! klass_getters {
 
 klass_getters! { XmlSecKeyDataKlass =>
     xmlSecKeyDataAesGetKlass = key_data_aes, "keyDataAesGetKlass";
+    xmlSecKeyDataCamelliaGetKlass = key_data_camellia, "keyDataCamelliaGetKlass";
+    xmlSecKeyDataChaCha20GetKlass = key_data_chacha20, "keyDataChaCha20GetKlass";
     xmlSecKeyDataConcatKdfGetKlass = key_data_concat_kdf, "keyDataConcatKdfGetKlass";
     xmlSecKeyDataDesGetKlass = key_data_des, "keyDataDesGetKlass";
     xmlSecKeyDataDhGetKlass = key_data_dh, "keyDataDhGetKlass";
@@ -904,6 +905,14 @@ klass_getters! { XmlSecTransformKlass =>
     xmlSecTransformKWAes128GetKlass = transform_kw_aes128, "transformKWAes128GetKlass";
     xmlSecTransformKWAes192GetKlass = transform_kw_aes192, "transformKWAes192GetKlass";
     xmlSecTransformKWAes256GetKlass = transform_kw_aes256, "transformKWAes256GetKlass";
+    xmlSecTransformCamellia128CbcGetKlass = transform_camellia128_cbc, "transformCamellia128CbcGetKlass";
+    xmlSecTransformCamellia192CbcGetKlass = transform_camellia192_cbc, "transformCamellia192CbcGetKlass";
+    xmlSecTransformCamellia256CbcGetKlass = transform_camellia256_cbc, "transformCamellia256CbcGetKlass";
+    xmlSecTransformKWCamellia128GetKlass = transform_kw_camellia128, "transformKWCamellia128GetKlass";
+    xmlSecTransformKWCamellia192GetKlass = transform_kw_camellia192, "transformKWCamellia192GetKlass";
+    xmlSecTransformKWCamellia256GetKlass = transform_kw_camellia256, "transformKWCamellia256GetKlass";
+    xmlSecTransformChaCha20GetKlass = transform_chacha20, "transformChaCha20GetKlass";
+    xmlSecTransformChaCha20Poly1305GetKlass = transform_chacha20_poly1305, "transformChaCha20Poly1305GetKlass";
     xmlSecTransformDes3CbcGetKlass = transform_des3_cbc, "transformDes3CbcGetKlass";
     xmlSecTransformKWDes3GetKlass = transform_kw_des3, "transformKWDes3GetKlass";
     xmlSecTransformDhEsGetKlass = transform_dh_es, "transformDhEsGetKlass";

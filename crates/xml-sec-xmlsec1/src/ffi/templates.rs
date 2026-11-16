@@ -16,8 +16,8 @@ use super::strings::{
     xmlSecAttrAlgorithm, xmlSecAttrEncoding, xmlSecAttrFilter, xmlSecAttrId, xmlSecAttrMimeType,
     xmlSecAttrPrefixList, xmlSecAttrRecipient, xmlSecAttrTarget, xmlSecAttrType, xmlSecAttrURI,
     xmlSecDSig11Ns, xmlSecDSigNs, xmlSecEnc11Ns, xmlSecEncNs, xmlSecNodeCanonicalizationMethod,
-    xmlSecNodeCipherData, xmlSecNodeCipherReference, xmlSecNodeCipherValue,
-    xmlSecNodeDataReference, xmlSecNodeDigestMethod, xmlSecNodeDigestValue,
+    xmlSecNodeCarriedKeyName, xmlSecNodeCipherData, xmlSecNodeCipherReference,
+    xmlSecNodeCipherValue, xmlSecNodeDataReference, xmlSecNodeDigestMethod, xmlSecNodeDigestValue,
     xmlSecNodeEncryptedData, xmlSecNodeEncryptedKey, xmlSecNodeEncryptionMethod,
     xmlSecNodeEncryptionProperties, xmlSecNodeEncryptionProperty, xmlSecNodeHMACOutputLength,
     xmlSecNodeInclusiveNamespaces, xmlSecNodeKeyInfo, xmlSecNodeKeyName, xmlSecNodeKeyReference,
@@ -27,8 +27,8 @@ use super::strings::{
     xmlSecNodeSignatureValue, xmlSecNodeSignedInfo, xmlSecNodeTransform, xmlSecNodeTransforms,
     xmlSecNodeX509CRL, xmlSecNodeX509Certificate, xmlSecNodeX509Data, xmlSecNodeX509Digest,
     xmlSecNodeX509IssuerName, xmlSecNodeX509IssuerSerial, xmlSecNodeX509SKI,
-    xmlSecNodeX509SerialNumber, xmlSecNodeX509SubjectName, xmlSecNodeXPath, xmlSecNodeXPointer,
-    xmlSecNsExcC14N, xmlSecXPath2Ns, xmlSecXPointerNs,
+    xmlSecNodeX509SerialNumber, xmlSecNodeX509SubjectName, xmlSecNodeXPath, xmlSecNodeXPath2,
+    xmlSecNodeXPointer, xmlSecNsExcC14N, xmlSecXPath2Ns, xmlSecXPointerNs,
 };
 use super::transforms::XmlSecTransformKlass;
 use super::tree::{XmlDoc, XmlNode, c_text, name_for_report, nodes, xmlStrEqual};
@@ -151,12 +151,14 @@ unsafe fn add(
     cur
 }
 
-/// `xmlNodeSetContent(node, content)` for content without markup, whose
-/// outcome libxmlsec1 does not read.
-fn set_content(node: *mut XmlNode, content: &str) {
-    if nodes::set_content(node, content).is_err() {
-        // libxml2's setter returns nothing libxmlsec1 reads.
+/// `xmlNodeSetContent(node, content)` for content without markup; false,
+/// reported at `here`, when the tree refuses it.
+fn content_set(node: *mut XmlNode, content: &str, here: Here) -> bool {
+    let set = nodes::set_content(node, content).is_ok();
+    if !set {
+        errors::xml_failed(here, std::ptr::null(), c"xmlNodeSetContent");
     }
+    set
 }
 
 /// Detaches and frees a partly built element.
@@ -608,7 +610,8 @@ pub(crate) unsafe extern "C" fn xmlSecTmplSignatureAddObject(
     })
 }
 
-/// The child `node` of the `SignedInfo` of `sign_node`.
+/// The child `node` of the `SignedInfo` of `sign_node`, either reported as
+/// not found when absent.
 ///
 /// # Safety
 /// `sign_node` is a live node.
@@ -623,7 +626,7 @@ unsafe fn signed_info_child(
         if signed_info.is_null() {
             return signed_info;
         }
-        xmlSecFindChild(signed_info, name(node), name(&xmlSecDSigNs))
+        required(signed_info, node, &xmlSecDSigNs, here)
     }
 }
 
@@ -682,19 +685,23 @@ pub(crate) unsafe extern "C" fn xmlSecTmplSignatureGetC14NMethodNode(
 }
 
 /// A `<Transform>` of algorithm `href` in the `Transforms` child of
-/// `parent` (namespace `transforms_ns`), created at the end when absent.
+/// `parent` (namespace `transforms_ns`), created at the end when absent;
+/// `made` tells that the caller created the `transforms` it passes. A
+/// failure leaves the template as it was: a `Transforms` this call created
+/// goes too.
 ///
 /// # Safety
 /// `parent` is a live node; `href` is NUL-terminated.
 unsafe fn add_transform(
     parent: *mut XmlNode,
-    transforms: *mut XmlNode,
+    (transforms, made): (*mut XmlNode, bool),
     transforms_ns: &'static [u8],
     href: *const u8,
     here: Here,
 ) -> *mut XmlNode {
     // SAFETY: by the caller's contract.
     unsafe {
+        let created = made || transforms.is_null();
         let transforms = if transforms.is_null() {
             let added = add(
                 parent,
@@ -717,14 +724,16 @@ unsafe fn add_transform(
             c"xmlSecAddChild(xmlSecNodeTransform)",
             here,
         );
-        if res.is_null() {
+        if !res.is_null() && set_algorithm(res, href, here) {
             return res;
         }
-        if !set_algorithm(res, href, here) {
+        if !res.is_null() {
             discard(res);
-            return std::ptr::null_mut();
         }
-        res
+        if created {
+            discard(transforms);
+        }
+        std::ptr::null_mut()
     }
 }
 
@@ -766,7 +775,8 @@ pub(crate) unsafe extern "C" fn xmlSecTmplReferenceAddTransform(
                 name(&xmlSecNodeTransforms),
                 name(&xmlSecDSigNs),
             );
-            if transforms.is_null() {
+            let made = transforms.is_null();
+            if made {
                 let first = xmlSecGetNextElementNode(nodes::first_child(reference_node));
                 if !first.is_null() {
                     transforms = xmlSecAddPrevSibling(
@@ -784,7 +794,13 @@ pub(crate) unsafe extern "C" fn xmlSecTmplReferenceAddTransform(
                     }
                 }
             }
-            add_transform(reference_node, transforms, &xmlSecDSigNs, href, here)
+            add_transform(
+                reference_node,
+                (transforms, made),
+                &xmlSecDSigNs,
+                href,
+                here,
+            )
         }
     })
 }
@@ -932,7 +948,12 @@ unsafe fn prepare_enc_data(parent: *mut XmlNode, method: *const XmlSecTransformK
                 c"xmlSecAddChild(xmlSecNodeEncryptionMethod)",
                 here,
             );
-            if cur.is_null() || !set_algorithm(cur, klass.href, here) {
+            if cur.is_null() {
+                return false;
+            }
+            // An `EncryptionMethod` without its required `Algorithm` goes.
+            if !set_algorithm(cur, klass.href, here) {
+                discard(cur);
                 return false;
             }
         }
@@ -994,7 +1015,6 @@ pub(crate) unsafe extern "C" fn xmlSecTmplEncDataCreate(
                     c"xmlNewNs",
                     &format!("ns={}", text(&xmlSecEncNs)),
                 );
-                // libxmlsec1 leaks the node here; it is freed instead.
                 xsFreeNode(enc_node);
                 return std::ptr::null_mut();
             }
@@ -1061,8 +1081,39 @@ pub(crate) unsafe extern "C" fn xmlSecTmplEncDataEnsureKeyInfo(
     })
 }
 
+/// Adds the element `node` to `enc_node` where the `EncryptedType` schema
+/// puts it: before the first of `followers` present, at the end otherwise
+/// (XML Encryption 1.1 section 3.1, `EncryptedType` and `EncryptedKeyType`).
+///
+/// # Safety
+/// `enc_node` is a live node.
+unsafe fn add_in_sequence(
+    enc_node: *mut XmlNode,
+    node: &'static [u8],
+    followers: &[&'static [u8]],
+    (before, after): (&CStr, &CStr),
+    here: Here,
+) -> *mut XmlNode {
+    // SAFETY: by the caller's contract.
+    unsafe {
+        let next = followers
+            .iter()
+            .map(|follower| xmlSecFindChild(enc_node, name(follower), name(&xmlSecEncNs)))
+            .find(|found| !found.is_null());
+        let Some(next) = next else {
+            return add(enc_node, node, &xmlSecEncNs, after, here);
+        };
+        let res = xmlSecAddPrevSibling(next, name(node), name(&xmlSecEncNs));
+        if res.is_null() {
+            errors::internal(here, std::ptr::null(), before);
+        }
+        res
+    }
+}
+
 /// `xmlSecTmplEncDataEnsureEncProperties`: the `EncryptionProperties` of
-/// `enc_node`, appended when absent, with `Id` set when `id` is set.
+/// `enc_node`, added after `CipherData` and before `ReferenceList` and
+/// `CarriedKeyName` when absent, with `Id` set when `id` is set.
 ///
 /// # Safety
 /// `enc_node` is null or a live node; `id` null or NUL-terminated.
@@ -1088,11 +1139,14 @@ pub(crate) unsafe extern "C" fn xmlSecTmplEncDataEnsureEncProperties(
             );
             let created = res.is_null();
             if created {
-                res = add(
+                res = add_in_sequence(
                     enc_node,
                     &xmlSecNodeEncryptionProperties,
-                    &xmlSecEncNs,
-                    c"xmlSecAddChild(xmlSecNodeEncryptionProperties)",
+                    &[&xmlSecNodeReferenceList, &xmlSecNodeCarriedKeyName],
+                    (
+                        c"xmlSecAddPrevSibling(xmlSecNodeEncryptionProperties)",
+                        c"xmlSecAddChild(xmlSecNodeEncryptionProperties)",
+                    ),
                     here,
                 );
                 if res.is_null() {
@@ -1272,10 +1326,11 @@ pub(crate) unsafe extern "C" fn xmlSecTmplEncDataGetEncMethodNode(
         );
         // SAFETY: `enc_node` is live.
         unsafe {
-            xmlSecFindChild(
+            required(
                 enc_node,
-                name(&xmlSecNodeEncryptionMethod),
-                name(&xmlSecEncNs),
+                &xmlSecNodeEncryptionMethod,
+                &xmlSecEncNs,
+                here!("xmlSecTmplEncDataGetEncMethodNode"),
             )
         }
     })
@@ -1318,13 +1373,20 @@ pub(crate) unsafe extern "C" fn xmlSecTmplCipherReferenceAddTransform(
                 name(&xmlSecNodeTransforms),
                 name(&xmlSecEncNs),
             );
-            add_transform(cipher_reference_node, transforms, &xmlSecEncNs, href, here)
+            add_transform(
+                cipher_reference_node,
+                (transforms, false),
+                &xmlSecEncNs,
+                href,
+                here,
+            )
         }
     })
 }
 
 /// A reference `node` with `URI` set when `uri` is set, in the
-/// `ReferenceList` of `enc_node`.
+/// `ReferenceList` of `enc_node`, which is added before `CarriedKeyName`
+/// when absent. A failure may leave the added `ReferenceList`.
 ///
 /// # Safety
 /// `enc_node` is a live node; `uri` null or NUL-terminated.
@@ -1340,14 +1402,22 @@ unsafe fn add_list_reference(
         let mut list =
             xmlSecFindChild(enc_node, name(&xmlSecNodeReferenceList), name(&xmlSecEncNs));
         if list.is_null() {
-            list = add(
+            list = add_in_sequence(
                 enc_node,
                 &xmlSecNodeReferenceList,
-                &xmlSecEncNs,
-                c"xmlSecAddChild(xmlSecNodeReferenceList)",
-                here,
+                &[&xmlSecNodeCarriedKeyName],
+                (
+                    c"xmlSecAddPrevSibling(xmlSecNodeReferenceList)",
+                    c"xmlSecAddChild(xmlSecNodeReferenceList)",
+                ),
+                here!("xmlSecTmplEncDataEnsureReferenceList"),
             );
             if list.is_null() {
+                errors::internal(
+                    here,
+                    std::ptr::null(),
+                    c"xmlSecTmplEncDataEnsureReferenceList",
+                );
                 return list;
             }
         }
@@ -1428,7 +1498,7 @@ pub(crate) unsafe extern "C" fn xmlSecTmplReferenceListAddKeyReference(
 // <dsig:KeyInfo/> and <dsig:X509Data/>
 
 /// An element `node` appended to `parent` whose escaped content is `value`
-/// when set.
+/// when set; an element whose content cannot be set goes again.
 ///
 /// # Safety
 /// `parent` is a live node; `value` null or NUL-terminated.
@@ -1444,6 +1514,7 @@ unsafe fn add_text(
         let res = add(parent, node, &xmlSecDSigNs, failed, here);
         if !res.is_null() && !value.is_null() && xmlSecNodeEncodeAndSetContent(res, value) < 0 {
             errors::internal(here, std::ptr::null(), c"xmlSecNodeEncodeAndSetContent");
+            discard(res);
             return std::ptr::null_mut();
         }
         res
@@ -1615,7 +1686,13 @@ pub(crate) unsafe extern "C" fn xmlSecTmplRetrievalMethodAddTransform(
                 name(&xmlSecNodeTransforms),
                 name(&xmlSecDSigNs),
             );
-            add_transform(retr_method_node, transforms, &xmlSecDSigNs, href, here)
+            add_transform(
+                retr_method_node,
+                (transforms, false),
+                &xmlSecDSigNs,
+                href,
+                here,
+            )
         }
     })
 }
@@ -1690,6 +1767,9 @@ unsafe fn add_once(
     }
 }
 
+/// Declares a function appending one more child `$node` to an `X509Data`:
+/// `X509DataType` allows each of its children any number of times (`XMLDSig`
+/// 1.1 section 4.5.4).
 macro_rules! x509_child {
     ($func:ident, $name:literal, $node:ident, $failed:literal, $doc:literal) => {
         #[doc = concat!("`", $name, "`: ", $doc)]
@@ -1706,7 +1786,7 @@ macro_rules! x509_child {
                     std::ptr::null_mut()
                 );
                 // SAFETY: `x509_data_node` is live.
-                unsafe { add_once(x509_data_node, &$node, &xmlSecDSigNs, $failed, here!($name)) }
+                unsafe { add(x509_data_node, &$node, &xmlSecDSigNs, $failed, here!($name)) }
             })
         }
     };
@@ -1717,39 +1797,39 @@ x509_child!(
     "xmlSecTmplX509DataAddIssuerSerial",
     xmlSecNodeX509IssuerSerial,
     c"xmlSecAddChild(xmlSecNodeX509IssuerSerial)",
-    "the only `<X509IssuerSerial>` of `x509_data_node`."
+    "an `<X509IssuerSerial>` appended to `x509_data_node`."
 );
 x509_child!(
     xmlSecTmplX509DataAddSubjectName,
     "xmlSecTmplX509DataAddSubjectName",
     xmlSecNodeX509SubjectName,
     c"xmlSecAddChild(xmlSecNodeX509SubjectName)",
-    "the only `<X509SubjectName>` of `x509_data_node`."
+    "an `<X509SubjectName>` appended to `x509_data_node`."
 );
 x509_child!(
     xmlSecTmplX509DataAddSKI,
     "xmlSecTmplX509DataAddSKI",
     xmlSecNodeX509SKI,
     c"xmlSecAddChild(xmlSecNodeX509SKI)",
-    "the only `<X509SKI>` of `x509_data_node`."
+    "an `<X509SKI>` appended to `x509_data_node`."
 );
 x509_child!(
     xmlSecTmplX509DataAddCertificate,
     "xmlSecTmplX509DataAddCertificate",
     xmlSecNodeX509Certificate,
     c"xmlSecAddChild(xmlSecNodeX509Certificate)",
-    "the only `<X509Certificate>` of `x509_data_node`."
+    "an `<X509Certificate>` appended to `x509_data_node`, as a chain has many."
 );
 x509_child!(
     xmlSecTmplX509DataAddCRL,
     "xmlSecTmplX509DataAddCRL",
     xmlSecNodeX509CRL,
     c"xmlSecAddChild(xmlSecNodeX509CRL)",
-    "the only `<X509CRL>` of `x509_data_node`."
+    "an `<X509CRL>` appended to `x509_data_node`."
 );
 
-/// `xmlSecTmplX509DataAddDigest`: the only `XMLDSig` 1.1 `<X509Digest>` of
-/// `x509_data_node`, of algorithm `digest_algorithm`.
+/// `xmlSecTmplX509DataAddDigest`: an `XMLDSig` 1.1 `<X509Digest>` of
+/// algorithm `digest_algorithm` appended to `x509_data_node`.
 ///
 /// # Safety
 /// `x509_data_node` is null or a live node; `digest_algorithm` null or
@@ -1775,7 +1855,7 @@ pub(crate) unsafe extern "C" fn xmlSecTmplX509DataAddDigest(
         let here = here!("xmlSecTmplX509DataAddDigest");
         // SAFETY: `x509_data_node` is live; a partial element is removed.
         unsafe {
-            let res = add_once(
+            let res = add(
                 x509_data_node,
                 &xmlSecNodeX509Digest,
                 &xmlSecDSig11Ns,
@@ -1908,10 +1988,9 @@ pub(crate) unsafe extern "C" fn xmlSecTmplTransformAddHmacOutputLength(
                 c"xmlSecAddChild(xmlSecNodeHMACOutputLength)",
                 here,
             );
-            if cur.is_null() {
+            if cur.is_null() || !content_set(cur, &bits_len.to_string(), here) {
                 return -1;
             }
-            set_content(cur, &bits_len.to_string());
         }
         0
     })
@@ -1972,10 +2051,12 @@ pub(crate) unsafe extern "C" fn xmlSecTmplTransformAddRsaOaepParam(
                 );
                 return -1;
             }
-            if let Some(text) = c_text(base64) {
-                set_content(node, text);
-            }
+            // The empty element stays on a failure, as libxmlsec1 leaves it.
+            let set = c_text(base64).is_some_and(|text| content_set(node, text, here));
             free(base64.cast());
+            if !set {
+                return -1;
+            }
         }
         0
     })
@@ -2026,13 +2107,19 @@ pub(crate) unsafe extern "C" fn xmlSecTmplTransformAddRsaMgf(
             c"transformNode != NULL",
             -1
         );
+        check!(
+            !algorithm.is_null(),
+            "xmlSecTmplTransformAddRsaMgf",
+            c"algorithm != NULL",
+            -1
+        );
         // SAFETY: `transform_node` is live.
         unsafe {
             add_algorithm_child(
                 transform_node,
                 &xmlSecNodeRsaMGF,
                 &xmlSecEnc11Ns,
-                c"xmlSecAddChild(xmlSecNodeRsaMgf)",
+                c"xmlSecAddChild(xmlSecNodeRsaMGF)",
                 algorithm,
                 here!("xmlSecTmplTransformAddRsaMgf"),
             )
@@ -2056,6 +2143,12 @@ pub(crate) unsafe extern "C" fn xmlSecTmplTransformAddRsaDigest(
             !transform_node.is_null(),
             "xmlSecTmplTransformAddRsaDigest",
             c"transformNode != NULL",
+            -1
+        );
+        check!(
+            !algorithm.is_null(),
+            "xmlSecTmplTransformAddRsaDigest",
+            c"algorithm != NULL",
             -1
         );
         // SAFETY: `transform_node` is live.
@@ -2118,7 +2211,13 @@ pub(crate) unsafe extern "C" fn xmlSecTmplTransformAddXsltStylesheet(
                 errors::xml_failed(here, std::ptr::null(), c"xmlReadMemory");
                 return -1;
             }
-            let root = xsDocCopyNode(xsDocGetRootElement(doc), nodes::doc(transform_node), 1);
+            let parsed_root = xsDocGetRootElement(doc);
+            if parsed_root.is_null() {
+                errors::xml_failed(here, std::ptr::null(), c"xmlDocGetRootElement");
+                xsFreeDoc(doc);
+                return -1;
+            }
+            let root = xsDocCopyNode(parsed_root, nodes::doc(transform_node), 1);
             xsFreeDoc(doc);
             if root.is_null() || xmlSecReplaceContent(transform_node, root) < 0 {
                 errors::internal(here, std::ptr::null(), c"xmlSecReplaceContent");
@@ -2232,8 +2331,10 @@ unsafe fn write_ns_list(parent: *mut XmlNode, ns_list: *const *const u8) -> c_in
     0
 }
 
-/// An expression element `node` in namespace `ns` with the escaped
-/// `expression` and the namespaces of `ns_list` declared on it.
+/// Fills the expression element `node` just added: the escaped `expression`
+/// and the namespaces of `ns_list` declared on it. An element whose content
+/// cannot be set goes again; one whose namespaces fail stays, as libxmlsec1
+/// leaves it.
 ///
 /// # Safety
 /// `node` is a live node; `expression` NUL-terminated; `ns_list` null or a
@@ -2248,6 +2349,7 @@ unsafe fn fill_expression(
     unsafe {
         if xmlSecNodeEncodeAndSetContent(node, expression) < 0 {
             errors::internal(here, std::ptr::null(), c"xmlSecNodeEncodeAndSetContent");
+            discard(node);
             return -1;
         }
         if ns_list.is_null() {
@@ -2335,13 +2437,14 @@ pub(crate) unsafe extern "C" fn xmlSecTmplTransformAddXPath2(
             -1
         );
         let here = here!("xmlSecTmplTransformAddXPath2");
-        // SAFETY: `transform_node` is live.
+        // SAFETY: `transform_node` is live. Filter 2.0 takes a sequence of
+        // expressions, so each call appends one.
         unsafe {
             let node = add(
                 transform_node,
-                &xmlSecNodeXPath,
+                &xmlSecNodeXPath2,
                 &xmlSecXPath2Ns,
-                c"xmlSecAddChild(xmlSecNodeXPath)",
+                c"xmlSecAddChild(xmlSecNodeXPath2)",
                 here,
             );
             if node.is_null() {
@@ -2370,15 +2473,15 @@ pub(crate) unsafe extern "C" fn xmlSecTmplTransformAddXPointer(
 ) -> c_int {
     contain(-1, || {
         check!(
-            !expression.is_null(),
-            "xmlSecTmplTransformAddXPointer",
-            c"expression != NULL",
-            -1
-        );
-        check!(
             !transform_node.is_null(),
             "xmlSecTmplTransformAddXPointer",
             c"transformNode != NULL",
+            -1
+        );
+        check!(
+            !expression.is_null(),
+            "xmlSecTmplTransformAddXPointer",
+            c"expression != NULL",
             -1
         );
         let here = here!("xmlSecTmplTransformAddXPointer");

@@ -29,6 +29,7 @@ pub(crate) mod symkeys;
 pub(crate) mod templates;
 pub(crate) mod transforms;
 pub(crate) mod tree;
+pub(crate) mod version;
 pub(crate) mod xmltree;
 
 #[cfg(test)]
@@ -87,16 +88,59 @@ unsafe fn write_stream(stream: *mut c_void, text: &str) {
     unsafe { libc::fputs(text.as_ptr(), stream.cast()) };
 }
 
+/// Why an allocation cannot grow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GrowthRefused {
+    /// The size is more than `limit`, past which the grown size overflows.
+    TooLarge { limit: usize },
+    /// The allocation mode is none of libxmlsec1's.
+    UnknownMode,
+}
+
 /// The size an allocation grows to for `size` bytes or items under
-/// `alloc_mode`, never below `initial`; `None` on overflow. An unknown mode
-/// grows to `initial`, as libxmlsec1's mode switch without a default does.
-pub(crate) fn grown(alloc_mode: c_int, size: usize, initial: usize) -> Option<usize> {
+/// `alloc_mode`, never below `initial`.
+pub(crate) fn grown(
+    alloc_mode: c_int,
+    size: usize,
+    initial: usize,
+) -> Result<usize, GrowthRefused> {
     let wanted = match alloc_mode {
-        ALLOC_MODE_EXACT => size.checked_add(8)?,
-        ALLOC_MODE_DOUBLE => size.checked_mul(2)?.checked_add(32)?,
-        _ => 0,
+        ALLOC_MODE_EXACT => {
+            let limit = usize::MAX - 8;
+            if size > limit {
+                return Err(GrowthRefused::TooLarge { limit });
+            }
+            size + 8
+        }
+        ALLOC_MODE_DOUBLE => {
+            let limit = (usize::MAX - 32) / 2;
+            if size > limit {
+                return Err(GrowthRefused::TooLarge { limit });
+            }
+            2 * size + 32
+        }
+        _ => return Err(GrowthRefused::UnknownMode),
     };
-    Some(wanted.max(initial))
+    Ok(wanted.max(initial))
+}
+
+/// Reports `refused` as libxmlsec1 reports a refused growth of `size` in
+/// `alloc_mode`.
+fn report_growth(
+    here: errors::Here,
+    object: *const std::ffi::c_char,
+    refused: GrowthRefused,
+    size: usize,
+    alloc_mode: c_int,
+) {
+    match refused {
+        GrowthRefused::TooLarge { limit } => {
+            errors::size_more_than(here, object, "size", size, limit);
+        }
+        GrowthRefused::UnknownMode => {
+            errors::unsupported_enum(here, object, "alloc mode", alloc_mode);
+        }
+    }
 }
 
 /// Runs an exported function's body; a panic is reported as an internal

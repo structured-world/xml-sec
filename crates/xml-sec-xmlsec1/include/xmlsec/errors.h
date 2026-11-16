@@ -5,8 +5,8 @@
  *
  * Copyright (C) 2002-2026 Aleksey Sanin <aleksey@aleksey.com>. All Rights Reserved.
  */
-#ifndef __XMLSEC_ERRORS_H__
-#define __XMLSEC_ERRORS_H__
+#ifndef XMLSEC_ERRORS_H
+#define XMLSEC_ERRORS_H
 
 /**
  * @defgroup xmlsec_core_errors Error Reporting
@@ -16,6 +16,7 @@
  */
 
 #include <xmlsec/exports.h>
+#include <xmlsec/xmlsec.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -25,7 +26,7 @@ extern "C" {
  *
  * Error codes
  *
-  *****************************************************************************/
+******************************************************************************/
 /**
  * @brief An XMLSec function failed.
  */
@@ -63,7 +64,7 @@ extern "C" {
 
 /**
  * @brief The feature is disabled during compilation.
- * @details The feature is disabled during compilation. Check './configure --help' for details on how to enable it.
+ * @details Check './configure --help' for the options that enable this feature.
  */
 #define XMLSEC_ERRORS_R_DISABLED                        8
 
@@ -113,7 +114,7 @@ extern "C" {
 #define XMLSEC_ERRORS_R_INVALID_FORMAT                  17
 
 /**
- * @brief The data do not match our expectation.
+ * @brief The data does not match our expectation.
  */
 #define XMLSEC_ERRORS_R_DATA_NOT_MATCH                  18
 
@@ -204,7 +205,7 @@ extern "C" {
 #define XMLSEC_ERRORS_R_KEY_DATA_ALREADY_EXIST          43
 
 /**
- * @brief Invalid key size.
+ * @brief Invalid key data size.
  */
 #define XMLSEC_ERRORS_R_INVALID_KEY_DATA_SIZE           44
 
@@ -219,7 +220,7 @@ extern "C" {
 #define XMLSEC_ERRORS_R_KEYDATA_DISABLED                46
 
 /**
- * @brief Max allowed retrievals level reached.
+ * @brief Maximum retrieval level reached.
  */
 #define XMLSEC_ERRORS_R_MAX_RETRIEVALS_LEVEL            51
 
@@ -227,12 +228,18 @@ extern "C" {
  * @brief Key data type mismatch in dsig:RetrievalMethod node.
  * @details The retrieved key data type does not match the one specified in the &lt;dsig:RetrievalMethod/&gt; node.
  */
-#define XMLSEC_ERRORS_R_MAX_RETRIEVAL_TYPE_MISMATCH     52
+#define XMLSEC_ERRORS_R_RETRIEVAL_TYPE_MISMATCH         52
+
+/**
+ * @brief Key data type mismatch in dsig:RetrievalMethod node.
+ * DEPRECATED. Use #XMLSEC_ERRORS_R_RETRIEVAL_TYPE_MISMATCH instead.
+ */
+#define XMLSEC_ERRORS_R_MAX_RETRIEVAL_TYPE_MISMATCH     XMLSEC_ERRORS_R_RETRIEVAL_TYPE_MISMATCH
 
 /**
  * @brief Max allowed KeyInfoReference level reached.
  */
-#define XMLSEC_ERRORS_R_MAX_KEYINFOREFERENCE_LEVEL        51
+#define XMLSEC_ERRORS_R_MAX_KEYINFOREFERENCE_LEVEL      53
 
 /**
  * @brief Max EncryptedKey level reached.
@@ -272,20 +279,20 @@ extern "C" {
 /**
  * @brief CRL verification failed.
  */
-#define XMLSEC_ERRORS_R_CRL_VERIFY_FAILED              77
+#define XMLSEC_ERRORS_R_CRL_VERIFY_FAILED               77
 
 /**
  * @brief "Last update" CRL verification failed.
  */
-#define XMLSEC_ERRORS_R_CRL_NOT_YET_VALID              78
+#define XMLSEC_ERRORS_R_CRL_NOT_YET_VALID               78
 
 /**
- * @brief "Next update" verification failed.
+ * @brief "Next update" CRL verification failed.
  */
-#define XMLSEC_ERRORS_R_CRL_HAS_EXPIRED                79
+#define XMLSEC_ERRORS_R_CRL_HAS_EXPIRED                 79
 
 /**
- * @brief The &lt;dsig:Reference/&gt; nodes not found.
+ * @brief The &lt;dsig:Reference/&gt; nodes were not found.
  */
 #define XMLSEC_ERRORS_R_DSIG_NO_REFERENCES              81
 
@@ -302,26 +309,33 @@ extern "C" {
 /**
  * @brief Impossible to cast from one type to another.
  */
-#define XMLSEC_ERROR_R_CAST_IMPOSSIBLE                  101
+#define XMLSEC_ERRORS_R_CAST_IMPOSSIBLE                 101
 
 /**
- * @brief The maximum xmlsec errors number.
+ * @brief Impossible to cast from one type to another.
+ * DEPRECATED. Use #XMLSEC_ERRORS_R_CAST_IMPOSSIBLE instead.
+ */
+#define XMLSEC_ERROR_R_CAST_IMPOSSIBLE                  XMLSEC_ERRORS_R_CAST_IMPOSSIBLE
+
+/**
+ * @brief The legacy upper bound of the xmlsec error code space.
+ * DEPRECATED. No longer used by the library; provided for source compatibility with xmlsec 1.3.12 and earlier.
  */
 #define XMLSEC_ERRORS_MAX_NUMBER                        256
-
 
 
 /******************************************************************************
  *
  * Error functions
  *
-  *****************************************************************************/
+******************************************************************************/
 /**
  * @brief The errors reporting callback function.
+ * @param file the error location file name (__FILE__ macro).
  * @param line the error location line number (__LINE__ macro).
- * @param func the error location function name (__func__ macro).
- * @param errorObject the error specific error object (e.g. transform, key data, etc).
- * @param errorSubject the error specific error subject.
+ * @param func the error location function name (XMLSEC_FUNCTION macro).
+ * @param errorObject the specific error object (e.g. transform, key data, etc).
+ * @param errorSubject the specific error subject.
  * @param reason the error code.
  * @param msg the additional error message.
  */
@@ -334,9 +348,11 @@ typedef void (*xmlSecErrorsCallback)                            (const char* fil
                                                                  const char* msg);
 
 
+
 XMLSEC_EXPORT void              xmlSecErrorsInit                (void);
 XMLSEC_EXPORT void              xmlSecErrorsShutdown            (void);
 XMLSEC_EXPORT void              xmlSecErrorsSetCallback         (xmlSecErrorsCallback callback);
+XMLSEC_EXPORT void              xmlSecErrorsClearCallback       (void);
 XMLSEC_EXPORT void              xmlSecErrorsDefaultCallback     (const char* file,
                                                                  int line,
                                                                  const char* func,
@@ -353,31 +369,38 @@ XMLSEC_EXPORT const char*       xmlSecErrorsGetMsg              (xmlSecSize pos)
 
 XMLSEC_EXPORT void              xmlSecErrorsPrintCryptoLibraryLogOnExitSet      (int enabled);
 
-#if !defined(__XMLSEC_FUNCTION__)
+#if !defined(XMLSEC_FUNCTION)
 
-/* __FUNCTION__ is defined for MSC compiler < MS VS .NET 2003 */
+/* __FUNCTION__ is defined for MSC compiler >= MS VS .NET 2003 */
 #if defined(_MSC_VER) && (_MSC_VER >= 1300)
-#define __XMLSEC_FUNCTION__ __FUNCTION__
+
+/** @brief The current function name (compiler-specific).
+ * @details This macro expands to the name of the current function as a string.
+ */
+#define XMLSEC_FUNCTION __FUNCTION__
 
 /* and for GCC too */
 #elif defined(__GNUC__)
-/**
- * @brief The current function name (compiler-specific).
- */
-#define __XMLSEC_FUNCTION__ __func__
+#define XMLSEC_FUNCTION __func__
 
-/* fallback for __FUNCTION__ */
+/* fallback: empty string for other compilers */
 #else
-#define __XMLSEC_FUNCTION__  ""
+#define XMLSEC_FUNCTION  ""
 #endif
 
-#endif /*!defined(__XMLSEC_FUNCTION__) */
+#endif /*!defined(XMLSEC_FUNCTION) */
+
+/**
+ * @brief The current function name (compiler-specific).
+ * DEPRECATED. Use #XMLSEC_FUNCTION instead.
+ */
+#define __XMLSEC_FUNCTION__                     XMLSEC_FUNCTION
 
 /**
  * @brief The macro specifying the error location (file, line, function) for xmlSecError().
  * @details The macro that specifies the location (file, line and function) for the xmlSecError() function.
  */
-#define XMLSEC_ERRORS_HERE                      __FILE__,__LINE__,__XMLSEC_FUNCTION__
+#define XMLSEC_ERRORS_HERE                      __FILE__,__LINE__,XMLSEC_FUNCTION
 #ifdef __GNUC__
 /**
  * @brief Printf-style format-string attribute for xmlSecError() (GCC/Clang only).
@@ -389,14 +412,14 @@ XMLSEC_EXPORT void              xmlSecErrorsPrintCryptoLibraryLogOnExitSet      
 #endif /* __GNUC__ */
 
 /**
- * @brief Macro. Returns @p str if it is not NULL or pointer to "NULL" otherwise.
+ * @brief Macro. Returns @p str if it is not NULL or a pointer to "NULL" otherwise.
  * @param str the string.
  */
 #define xmlSecErrorsSafeString(str) \
         (((str) != NULL) ? ((const char*)(str)) : (const char*)"NULL")
 
 /**
- * @brief Empty error message " ".
+ * @brief Placeholder/blank error message " ".
  */
 #define XMLSEC_ERRORS_NO_MESSAGE                " "
 
@@ -413,20 +436,22 @@ XMLSEC_EXPORT void xmlSecError                          (const char* file,
  *
  * Assertions
  *
-  *****************************************************************************/
+******************************************************************************/
 /**
  * @brief Macro. Verifies that @p is true and calls return() otherwise.
  * @param p the expression.
  */
 #define xmlSecAssert( p ) \
-        if(!( p ) ) { \
-            xmlSecError(XMLSEC_ERRORS_HERE, \
-                        NULL, \
-                        #p, \
-                        XMLSEC_ERRORS_R_ASSERTION, \
-                        XMLSEC_ERRORS_NO_MESSAGE); \
-            return; \
-        }
+        do { \
+            if(!( p ) ) { \
+                xmlSecError(XMLSEC_ERRORS_HERE, \
+                            NULL, \
+                            #p, \
+                            XMLSEC_ERRORS_R_ASSERTION, \
+                            XMLSEC_ERRORS_NO_MESSAGE); \
+                return; \
+            } \
+        } while(0)
 
 /**
  * @brief Macro. Verifies that @p is true and calls return(@p ret) otherwise.
@@ -434,20 +459,22 @@ XMLSEC_EXPORT void xmlSecError                          (const char* file,
  * @param ret the return value.
  */
 #define xmlSecAssert2( p, ret ) \
-        if(!( p ) ) { \
-            xmlSecError(XMLSEC_ERRORS_HERE, \
-                        NULL, \
-                        #p, \
-                        XMLSEC_ERRORS_R_ASSERTION, \
-                        XMLSEC_ERRORS_NO_MESSAGE); \
-            return(ret); \
-        }
+        do { \
+            if(!( p ) ) { \
+                xmlSecError(XMLSEC_ERRORS_HERE, \
+                            NULL, \
+                            #p, \
+                            XMLSEC_ERRORS_R_ASSERTION, \
+                            XMLSEC_ERRORS_NO_MESSAGE); \
+                return(ret); \
+            } \
+        } while(0)
 
 
 #ifdef __cplusplus
 }
 #endif /* __cplusplus */
 
-/** @} */ /** xmlsec_core_errors */
+/** @} */ /* xmlsec_core_errors */
 
-#endif /* __XMLSEC_ERRORS_H__ */
+#endif /* XMLSEC_ERRORS_H */

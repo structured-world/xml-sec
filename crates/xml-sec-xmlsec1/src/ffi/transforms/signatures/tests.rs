@@ -7,7 +7,7 @@ use std::ffi::c_int;
 use crate::ffi::tests::own_process;
 
 use super::super::super::app::key_load_memory;
-use super::super::super::buffer::{xmlSecBufferGetData, xmlSecBufferGetSize};
+use super::super::super::buffer::{xmlSecBufferAppend, xmlSecBufferGetData, xmlSecBufferGetSize};
 use super::super::super::keys::{XmlSecKey, xmlSecKeyDestroy};
 use super::super::super::policy;
 use super::super::ctx::{
@@ -15,8 +15,8 @@ use super::super::ctx::{
     xmlSecTransformCtxDestroy,
 };
 use super::super::{
-    OPERATION_SIGN, OPERATION_VERIFY, STATUS_OK, xmlSecTransformPushBin, xmlSecTransformSetKey,
-    xmlSecTransformVerify,
+    OPERATION_SIGN, OPERATION_VERIFY, STATUS_OK, xmlSecTransformExecute, xmlSecTransformPushBin,
+    xmlSecTransformSetKey, xmlSecTransformVerify,
 };
 use super::rsa_sha256;
 use xml_sec::policy::{Instant, PolicyValidity};
@@ -62,9 +62,21 @@ fn run(
     input: &[u8],
     value: &[u8],
 ) -> Result<Vec<u8>, c_int> {
+    run_with_flags(0, operation, key, input, value)
+}
+
+/// [`run`] in a context with the transform context flags `flags`.
+fn run_with_flags(
+    flags: std::ffi::c_uint,
+    operation: c_int,
+    key: *mut XmlSecKey,
+    input: &[u8],
+    value: &[u8],
+) -> Result<Vec<u8>, c_int> {
     // SAFETY: every object is created and released here.
     unsafe {
         let ctx = xmlSecTransformCtxCreate();
+        (*ctx).flags = flags;
         let transform = xmlSecTransformCtxCreateAndAppend(ctx, rsa_sha256());
         (*transform).operation = operation;
         let mut result = Err(-1);
@@ -419,12 +431,127 @@ fn an_ecdsa_value_follows_the_signing_policy_encoding() {
 }
 
 #[test]
-fn a_signature_over_the_empty_message_verifies() {
-    // The empty message is signed and its signature verifies, as libxmlsec1
-    // accepts it.
-    let value = run(OPERATION_SIGN, private_key(), &[], &[]).expect("the empty message signs");
+fn the_empty_message_is_signed_only_when_the_context_allows_it() {
+    // Signing or verifying nothing is refused by default; a context with
+    // XMLSEC_TRANSFORMCTX_FLAGS_ALLOW_EMPTY_INPUT signs the empty message and
+    // its signature verifies.
+    assert_eq!(run(OPERATION_SIGN, private_key(), &[], &[]), Err(-1));
+    assert_eq!(run(OPERATION_VERIFY, public_key(), &[], &[0; 256]), Err(-1));
+    let allow = crate::ffi::transforms::ctx::FLAGS_ALLOW_EMPTY_INPUT;
+    let value = run_with_flags(allow, OPERATION_SIGN, private_key(), &[], &[])
+        .expect("the empty message signs");
     assert_eq!(
-        run(OPERATION_VERIFY, public_key(), &[], &value),
+        run_with_flags(allow, OPERATION_VERIFY, public_key(), &[], &value),
         Err(STATUS_OK)
     );
+}
+
+#[test]
+fn a_policy_refusing_empty_digest_input_overrides_the_contexts_permission() {
+    // The context flag allows the empty message only while the operation's
+    // policy accepts empty digest input: a policy that refuses it refuses
+    // signing and verifying nothing even in a context that allows it. The
+    // signature verified under the refusing policy is valid, so its refusal
+    // can only come from the policy.
+    own_process();
+    let allow = crate::ffi::transforms::ctx::FLAGS_ALLOW_EMPTY_INPUT;
+    let value = run_with_flags(allow, OPERATION_SIGN, private_key(), &[], &[])
+        .expect("the default policy signs the empty message");
+    assert_eq!(
+        run_with_flags(allow, OPERATION_VERIFY, public_key(), &[], &value),
+        Err(STATUS_OK),
+        "the signature is valid"
+    );
+    let refuse = xml_sec::policy::EmptyDigestInput::Refuse;
+    policy::republish(
+        |verification| verification.transforms.empty_digest_input = refuse,
+        |signing| signing.transforms.empty_digest_input = refuse,
+    )
+    .expect("the library policy compiles");
+    assert_eq!(
+        run_with_flags(allow, OPERATION_SIGN, private_key(), &[], &[]),
+        Err(-1)
+    );
+    assert_eq!(
+        run_with_flags(allow, OPERATION_VERIFY, public_key(), &[], &value),
+        Err(-1)
+    );
+    assert!(run(OPERATION_SIGN, private_key(), b"data", &[]).is_ok());
+}
+
+#[test]
+fn buffered_input_consumed_before_the_last_chunk_is_not_empty() {
+    // A caller that buffers its bytes, executes a non-final chunk that
+    // consumes them and then finishes signed a non-empty message: the last
+    // call does not refuse it as empty.
+    let message = b"buffered, then streamed";
+    let pushed = run(OPERATION_SIGN, private_key(), message, &[]).expect("pushed bytes sign");
+    // SAFETY: every object is created and released here.
+    let streamed = unsafe {
+        let ctx = xmlSecTransformCtxCreate();
+        let transform = xmlSecTransformCtxCreateAndAppend(ctx, rsa_sha256());
+        (*transform).operation = OPERATION_SIGN;
+        let key = private_key();
+        assert_eq!(xmlSecTransformSetKey(transform, key.cast()), 0);
+        assert_eq!(
+            xmlSecBufferAppend(
+                &raw mut (*transform).in_buf,
+                message.as_ptr(),
+                message.len()
+            ),
+            0
+        );
+        assert_eq!(xmlSecTransformExecute(transform, 0, ctx), 0);
+        let executed = xmlSecTransformExecute(transform, 1, ctx);
+        let output = &raw mut (*transform).out_buf;
+        let signature = if executed == 0 {
+            std::slice::from_raw_parts(xmlSecBufferGetData(output), xmlSecBufferGetSize(output))
+                .to_vec()
+        } else {
+            Vec::new()
+        };
+        xmlSecTransformCtxDestroy(ctx);
+        xmlSecKeyDestroy(key);
+        assert_eq!(executed, 0, "consumed buffered input is not empty");
+        signature
+    };
+    assert_eq!(streamed, pushed);
+}
+
+#[test]
+fn input_a_caller_buffered_itself_is_not_empty() {
+    // Bytes appended to the transform's input buffer and executed as the
+    // last chunk are input like pushed bytes: they are signed, not refused
+    // as empty, and give the signature pushing them gives.
+    let message = b"buffered by the caller";
+    let pushed = run(OPERATION_SIGN, private_key(), message, &[]).expect("pushed bytes sign");
+    // SAFETY: every object is created and released here.
+    let buffered = unsafe {
+        let ctx = xmlSecTransformCtxCreate();
+        let transform = xmlSecTransformCtxCreateAndAppend(ctx, rsa_sha256());
+        (*transform).operation = OPERATION_SIGN;
+        let key = private_key();
+        assert_eq!(xmlSecTransformSetKey(transform, key.cast()), 0);
+        assert_eq!(
+            xmlSecBufferAppend(
+                &raw mut (*transform).in_buf,
+                message.as_ptr(),
+                message.len()
+            ),
+            0
+        );
+        let executed = xmlSecTransformExecute(transform, 1, ctx);
+        let output = &raw mut (*transform).out_buf;
+        let signature = if executed == 0 {
+            std::slice::from_raw_parts(xmlSecBufferGetData(output), xmlSecBufferGetSize(output))
+                .to_vec()
+        } else {
+            Vec::new()
+        };
+        xmlSecTransformCtxDestroy(ctx);
+        xmlSecKeyDestroy(key);
+        assert_eq!(executed, 0, "buffered input is not empty");
+        signature
+    };
+    assert_eq!(buffered, pushed);
 }

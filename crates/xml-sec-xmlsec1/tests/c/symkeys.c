@@ -2,9 +2,10 @@
  * binary key-data value they are made of, as a libxmlsec1 caller uses them:
  * the klasses' identities, generating a key, reading and writing a KeyValue
  * child and raw bytes, the checks against a value the key already has and
- * against the key requirements, duplicating, and the debug dumps. Built
- * against the pinned libxmlsec1 with its default crypto library and against
- * this crate, both must print the same. */
+ * against the key requirements, duplicating, and the debug dumps. DES is off
+ * in the default build, so its klass is only looked up. Built against the
+ * libxmlsec1 oracle with its default crypto library and against this crate,
+ * both must print the same. */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -103,7 +104,6 @@ static void bin_write(const char *label, xmlSecKeyDataId id, xmlSecKeyPtr key,
 }
 
 int main(void) {
-    xmlSecCryptoDLFunctionsPtr table;
     xmlSecKeyInfoCtxPtr ctx;
     xmlSecKeyPtr key;
     xmlSecKeyPtr copy;
@@ -119,18 +119,35 @@ int main(void) {
         printf("crypto init failed\n");
         return 1;
     }
-    table = xmlSecCryptoDLGetFunctions();
-
     describe("aes", xmlSecKeyDataAesId);
     describe("des", xmlSecKeyDataDesId);
     describe("hmac", xmlSecKeyDataHmacId);
     describe("concatkdf", xmlSecKeyDataConcatKdfId);
     describe("pbkdf2", xmlSecKeyDataPbkdf2Id);
     describe("hkdf", xmlSecKeyDataHkdfId);
-    describe("camellia",
-             table->keyDataCamelliaGetKlass != NULL ? table->keyDataCamelliaGetKlass() : NULL);
-    describe("chacha20",
-             table->keyDataChaCha20GetKlass != NULL ? table->keyDataChaCha20GetKlass() : NULL);
+    describe("camellia", xmlSecKeyDataCamelliaId);
+    describe("chacha20", xmlSecKeyDataChaCha20Id);
+    /* the transform klass getters app.h declares are exported: the program
+     * links only when the library defines every one. The reads are volatile
+     * so the compiler keeps the array and its references to the symbols; the
+     * getters are not called, as the built-in provider has no cipher
+     * transforms to return. */
+    {
+        static xmlSecTransformId (*const volatile getters[])(void) = {
+            xmlSecTransformCamellia128CbcGetKlass, xmlSecTransformCamellia192CbcGetKlass,
+            xmlSecTransformCamellia256CbcGetKlass, xmlSecTransformKWCamellia128GetKlass,
+            xmlSecTransformKWCamellia192GetKlass,  xmlSecTransformKWCamellia256GetKlass,
+            xmlSecTransformChaCha20GetKlass,       xmlSecTransformChaCha20Poly1305GetKlass,
+        };
+        size_t i;
+        int linked = 0;
+        for (i = 0; i < sizeof(getters) / sizeof(getters[0]); i++) {
+            if (getters[i] != NULL) {
+                linked++;
+            }
+        }
+        printf("camellia and chacha20 transform getters: %d\n", linked);
+    }
     printf("registered aes: %d\n",
            xmlSecKeyDataIdListFind(xmlSecKeyDataIdsGet(), xmlSecKeyDataAesId));
 
@@ -141,7 +158,7 @@ int main(void) {
     key = xmlSecKeyGenerate(xmlSecKeyDataHmacId, 12, xmlSecKeyDataTypeSymmetric);
     show_key("generate 12", key);
     xmlSecKeyDestroy(key);
-    data = xmlSecKeyDataCreate(xmlSecKeyDataDesId);
+    data = xmlSecKeyDataCreate(xmlSecKeyDataHmacId);
     printf("empty: size=%d type=0x%x\n", (int)xmlSecKeyDataGetSize(data),
            xmlSecKeyDataGetType(data));
     printf("empty dump:\n");
@@ -161,7 +178,7 @@ int main(void) {
     printf("same again: %d\n", read_value(xmlSecKeyDataAesId, key, ctx, "AAECAwQFBgcICQoLDA0ODw=="));
     printf("other bytes: %d\n", read_value(xmlSecKeyDataAesId, key, ctx, "DwECAwQFBgcICQoLDA0ODw=="));
     printf("other size: %d\n", read_value(xmlSecKeyDataAesId, key, ctx, "AAECAw=="));
-    printf("other klass: %d\n", read_value(xmlSecKeyDataDesId, key, ctx, "AAECAwQFBgcICQoLDA0ODw=="));
+    printf("other klass: %d\n", read_value(xmlSecKeyDataHmacId, key, ctx, "AAECAwQFBgcICQoLDA0ODw=="));
 
     /* Duplicating copies the value. */
     copy = xmlSecKeyDuplicate(key);
@@ -189,7 +206,7 @@ int main(void) {
 
     /* The key requirements decide what is accepted. */
     xmlSecKeyInfoCtxReset(ctx);
-    ctx->keyReq.keyId = xmlSecKeyDataDesId;
+    ctx->keyReq.keyId = xmlSecKeyDataAesId;
     printf("wrong required klass: %d\n", read_value(xmlSecKeyDataHmacId, key, ctx, "AAECAw=="));
     ctx->keyReq.keyId = xmlSecKeyDataHmacId;
     ctx->keyReq.keyBitsSize = 64;

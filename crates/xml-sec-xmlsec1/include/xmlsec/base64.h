@@ -5,13 +5,13 @@
  *
  * Copyright (C) 2002-2026 Aleksey Sanin <aleksey@aleksey.com>. All Rights Reserved.
  */
-#ifndef __XMLSEC_BASE64_H__
-#define __XMLSEC_BASE64_H__
+#ifndef XMLSEC_BASE64_H
+#define XMLSEC_BASE64_H
 
 /**
- * @brief Base64 encoding/decoding functions and transform implementation.
  * @defgroup xmlsec_core_base64 Base64 Encode/Decode
  * @ingroup xmlsec_core
+ * @brief Base64 encoding/decoding functions.
  *
  * @{
  */
@@ -20,7 +20,6 @@
 
 #include <xmlsec/exports.h>
 #include <xmlsec/xmlsec.h>
-#include <xmlsec/transforms.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -28,7 +27,9 @@ extern "C" {
 
 
 /**
- * @brief The default maximum base64 encoded line size.
+ * @brief The initial default base64 encoded line size.
+ * @details The initial default base64 encoded line size; it can be changed
+ * at runtime with xmlSecBase64SetDefaultLineSize().
  */
 #define XMLSEC_BASE64_LINESIZE                          64
 
@@ -54,26 +55,26 @@ XMLSEC_EXPORT int               xmlSecBase64CtxUpdate_ex        (xmlSecBase64Ctx
                                                                  xmlSecByte* out,
                                                                  xmlSecSize outSize,
                                                                  xmlSecSize* outWritten);
-XMLSEC_EXPORT int                xmlSecBase64CtxFinal_ex        (xmlSecBase64CtxPtr ctx,
+XMLSEC_EXPORT int               xmlSecBase64CtxFinal_ex         (xmlSecBase64CtxPtr ctx,
                                                                  xmlSecByte* out,
                                                                  xmlSecSize outSize,
                                                                  xmlSecSize* outWritten);
 
-/* Standalone routines to do base64 encode/decode "at once" */
-XMLSEC_EXPORT xmlChar*           xmlSecBase64Encode             (const xmlSecByte* in,
+/* Standalone routines to do base64 encoding/decoding "at once" */
+XMLSEC_EXPORT xmlChar*          xmlSecBase64Encode              (const xmlSecByte* in,
                                                                  xmlSecSize inSize,
                                                                  int columns);
-XMLSEC_EXPORT int                xmlSecBase64Decode_ex          (const xmlChar* str,
+XMLSEC_EXPORT int               xmlSecBase64Decode_ex           (const xmlChar* str,
                                                                  xmlSecByte* out,
                                                                  xmlSecSize outSize,
                                                                  xmlSecSize* outWritten);
-XMLSEC_EXPORT int                xmlSecBase64DecodeInPlace      (xmlChar* str,
+XMLSEC_EXPORT int               xmlSecBase64DecodeInPlace       (xmlChar* str,
                                                                  xmlSecSize* outWritten);
 
 #ifdef __cplusplus
 }
 #endif /* __cplusplus */
 
-/** @} */  /* xmlsec_core_base64 */
+/** @} */ /* xmlsec_core_base64 */
 
-#endif /* __XMLSEC_BASE64_H__ */
+#endif /* XMLSEC_BASE64_H */

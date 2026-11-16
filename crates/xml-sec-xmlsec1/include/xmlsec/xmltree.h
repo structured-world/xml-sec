@@ -5,8 +5,8 @@
  *
  * Copyright (C) 2002-2026 Aleksey Sanin <aleksey@aleksey.com>. All Rights Reserved.
  */
-#ifndef __XMLSEC_TREE_H__
-#define __XMLSEC_TREE_H__
+#ifndef XMLSEC_XMLTREE_H
+#define XMLSEC_XMLTREE_H
 
 /**
  * @defgroup xmlsec_core_xmltree XML Tree Utilities
@@ -34,7 +34,7 @@ extern "C" {
 
 /**
  * @brief Macro. Returns node's name.
- * @param node the pointer to node.
+ * @param node the pointer to the node.
  */
 #define xmlSecNodeGetName(node) \
     (((node)) ? ((const char*)xsNodeName(node)) : NULL)
@@ -118,7 +118,7 @@ XMLSEC_EXPORT xmlChar*          xmlSecGetQName          (xmlNodePtr node,
                                                          const xmlChar* local);
 
 /**
- * @brief for XML tree walk.
+ * @brief Callback invoked for XML tree walk.
  * @param cur the current XML node.
  * @param data the user data passed to the callback.
  * @return 1 to continue the walk, 0 to stop the walk, or a negative value to stop the walk with an error.
@@ -134,7 +134,7 @@ XMLSEC_EXPORT int               xmlSecPrintXmlString    (FILE * fd,
 
 /**
  * @brief Returns 1 if the character is a hex digit.
- * @details Macro. Returns 1 if @c is a hex digit or 0 other wise.
+ * @details Macro. Returns 1 if @p c is a hex digit or 0 otherwise.
  * @param c the character.
  */
 #define xmlSecIsHex(c) \
@@ -143,15 +143,17 @@ XMLSEC_EXPORT int               xmlSecPrintXmlString    (FILE * fd,
        (('A' <= (c)) && ((c) <= 'F')) ) ? 1 : 0)
 
 /**
- * @brief Deprecated. Returns the hex value of a character.
+ * @brief Deprecated. Use xmlSecFromHex() instead. Returns the hex value of a character.
  * @details Deprecated. Macro. Returns the hex value of the @p ch.
- * @param ch the character,
+ * @param ch the character.
  */
 #define xmlSecGetHex(ch)         xmlSecFromHex(ch)
 
 /**
  * @brief Macro. Returns the hex value of the @p ch.
- * @param ch the character,
+ * @details Macro. Returns the hex value of the @p ch. Any character that is not a
+ * hex digit (0-9, a-f, A-F) silently yields 0.
+ * @param ch the character.
  */
 #define xmlSecFromHex(ch)                                                       \
         ((xmlSecByte)(                                                          \
@@ -166,22 +168,24 @@ XMLSEC_EXPORT int               xmlSecPrintXmlString    (FILE * fd,
 
 /**
  * @brief Returns the hex value of a two-character pair.
- * @details Macro. Returns the hex value of the pair (@p c1 @p c2).
- * @param ch1 the first character,
- * @param ch2 the second character,
+ * @details Macro. Returns the hex value of the pair (@p ch1 @p ch2).
+ * @param ch1 the first character.
+ * @param ch2 the second character.
  */
 #define xmlSecFromHex2(ch1, ch2)   ((xmlSecByte)((xmlSecFromHex(ch1) << 4) | (xmlSecFromHex(ch2))))
 
 /**
  * @brief Macro. Returns the hex character of the @p vv.
- * @param vv the value,
+ * @details Macro. Returns the hex character of the @p vv. Values outside the 0..15
+ * range yield 0 (NUL).
+ * @param vv the value.
  */
-#define xmlSecToHex(vv)                                                 \
-        ((xmlChar)(                                                     \
-            ((0 <= (vv)) && ((vv) <= 9)) ? (vv) + '0' :                 \
-                (                                                       \
-                    ((10 <= (vv)) && ((vv) <= 15)) ? (vv) + 'A' : 0     \
-                )                                                       \
+#define xmlSecToHex(vv)                                                     \
+        ((xmlChar)(                                                         \
+            ((0 <= (vv)) && ((vv) <= 9)) ? (vv) + '0' :                     \
+                (                                                           \
+                    ((10 <= (vv)) && ((vv) <= 15)) ? (vv) + 'A' - 10 : 0    \
+                )                                                           \
         ))
 
 
@@ -190,15 +194,17 @@ XMLSEC_EXPORT int               xmlSecPrintXmlString    (FILE * fd,
  *
  * QName <-> Integer mapping
  *
-  *****************************************************************************/
+ *****************************************************************************/
 
 /**
  * @brief QName <-> Integer conversion definition.
+ * @details The mapping array must be NULL-terminated (it must end with an entry
+ * whose qnameLocalPart is NULL).
  */
 typedef struct _xmlSecQName2IntegerInfo         xmlSecQName2IntegerInfo, *xmlSecQName2IntegerInfoPtr;
 struct _xmlSecQName2IntegerInfo {
     const xmlChar*      qnameHref;  /**< the QName href */
-    const xmlChar*      qnameLocalPart;  /**< the QName local */
+    const xmlChar*      qnameLocalPart;  /**< the QName local part */
     int                 intValue;  /**< the integer value */
 };
 
@@ -253,7 +259,7 @@ XMLSEC_EXPORT void              xmlSecQName2IntegerDebugXmlDump(xmlSecQName2Inte
  *
  * QName <-> Bitmask mapping
  *
-  *****************************************************************************/
+ *****************************************************************************/
 
 /**
  * @brief Bitmask datatype.
@@ -262,12 +268,14 @@ typedef unsigned int                                    xmlSecBitMask;
 
 /**
  * @brief QName <-> Bitmask conversion definition.
+ * @details The mapping array must be NULL-terminated (it must end with an entry
+ * whose qnameLocalPart is NULL).
  */
 typedef struct _xmlSecQName2BitMaskInfo         xmlSecQName2BitMaskInfo, *xmlSecQName2BitMaskInfoPtr;
 
 struct _xmlSecQName2BitMaskInfo {
     const xmlChar*      qnameHref;  /**< the QName href */
-    const xmlChar*      qnameLocalPart;  /**< the QName local */
+    const xmlChar*      qnameLocalPart;  /**< the QName local part */
     xmlSecBitMask       mask;  /**< the bitmask value */
 };
 
@@ -281,9 +289,9 @@ XMLSEC_EXPORT xmlSecQName2BitMaskInfoConstPtr xmlSecQName2BitMaskGetInfo
                                                                 (xmlSecQName2BitMaskInfoConstPtr info,
                                                                  xmlSecBitMask mask);
 XMLSEC_EXPORT int               xmlSecQName2BitMaskGetBitMask   (xmlSecQName2BitMaskInfoConstPtr info,
-                                                                 const xmlChar* qnameLocalPart,
-                                                                 const xmlChar* qnameHref,
-                                                                 xmlSecBitMask* mask);
+                                                                  const xmlChar* qnameLocalPart,
+                                                                  const xmlChar* qnameHref,
+                                                                  xmlSecBitMask* mask);
 XMLSEC_EXPORT int               xmlSecQName2BitMaskNodesRead    (xmlSecQName2BitMaskInfoConstPtr info,
                                                                  xmlNodePtr* node,
                                                                  const xmlChar* nodeName,
@@ -318,7 +326,7 @@ XMLSEC_EXPORT void              xmlSecQName2BitMaskDebugXmlDump(xmlSecQName2BitM
  *
  * Windows string conversions
  *
-  *****************************************************************************/
+ *****************************************************************************/
 #if defined(XMLSEC_WINDOWS)
 XMLSEC_EXPORT LPWSTR             xmlSecWin32ConvertLocaleToUnicode(const char* str);
 
@@ -337,6 +345,6 @@ XMLSEC_EXPORT LPTSTR             xmlSecWin32ConvertUtf8ToTstr     (const xmlChar
 }
 #endif /* __cplusplus */
 
-/** @} */ /** xmlsec_core_xmltree */
+/** @} */ /* xmlsec_core_xmltree */
 
-#endif /* __XMLSEC_TREE_H__ */
+#endif /* XMLSEC_XMLTREE_H */

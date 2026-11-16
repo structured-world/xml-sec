@@ -1,5 +1,32 @@
 use super::*;
 
+#[test]
+fn sanitized_code_keeps_every_line_of_a_continued_literal() {
+    // Export detection indexes the sanitized text by physical line, so a
+    // string literal continued with a backslash-newline keeps its newline
+    // and the export after it stays on its own line.
+    let header = "#define XMLSEC_TEXT \"first\\\nsecond\"\nXMLSEC_EXPORT int xmlSecAfter(void);\n";
+    let code = sanitize_c(header);
+    let lines: Vec<_> = code.lines().collect();
+    assert_eq!(lines.len(), header.lines().count());
+    assert!(lines[2].contains("XMLSEC_EXPORT"), "{lines:?}");
+    assert!(!lines[1].contains("XMLSEC_EXPORT"), "{lines:?}");
+}
+
+#[test]
+fn a_line_comment_continued_with_a_backslash_hides_the_next_line() {
+    // Line splicing comes before comment removal (C11 5.1.1.2, phases 2 and
+    // 3), so a `//` comment ending in a backslash also covers the next
+    // line: the declaration there is comment text, while the line count
+    // stays that of the input.
+    let header = "// Hidden declaration \\\nXMLSEC_EXPORT int xmlSecHidden(void);\nXMLSEC_EXPORT int xmlSecReal(void);\n";
+    let code = sanitize_c(header);
+    let lines: Vec<_> = code.lines().collect();
+    assert_eq!(lines.len(), header.lines().count());
+    assert!(!lines[1].contains("xmlSecHidden"), "{lines:?}");
+    assert!(lines[2].contains("xmlSecReal"), "{lines:?}");
+}
+
 fn evidence() -> BTreeMap<String, Evidence> {
     BTreeMap::from([(
         "test".into(),
@@ -278,18 +305,29 @@ fn installed_header_assignment_stops_without_a_continuation() {
 #[test]
 fn cli_exit_statuses_are_derived_from_donor_control_flow() {
     // Evidence lines must follow the donor statements instead of generator constants.
-    let content = r"int main(void) {
+    // An unknown command leaves `res` at 1; a helper's own "success" comment
+    // is not main's.
+    let content = r#"static int helper(void) {
+    /* success! */
+    res = 0;
+}
+int main(void) {
     int res = 1;
     if(command == xmlSecAppCommandUnknown) {
+        fprintf(stderr, "Error: unknown command \"%s\"\n", utf8_argv[1]);
         xmlSecAppPrintUsage();
-        res = 0;
         goto done;
     }
-    /* sucecss! */
+    ret = xmlSecAppExecute(command, utf8_argv + pos, argc - pos);
+    if(ret < 0) {
+        goto done;
+    }
+
+    /* success! */
     res = 0;
 done:
     return(res);
-}";
+}"#;
     let entries = extract_cli_exit_statuses(content).expect("fixture must be recognized");
     assert_eq!(
         entries
@@ -297,14 +335,17 @@ done:
             .map(|entry| (entry.name.as_str(), entry.line, entry.exit_code))
             .collect::<Vec<_>>(),
         vec![
-            ("success", 9, Some(0)),
-            ("unknown-command", 5, Some(0)),
-            ("failure", 2, Some(1)),
+            ("success", 18, Some(0)),
+            ("unknown-command", 10, Some(1)),
+            ("failure", 6, Some(1)),
         ]
     );
 
-    let error = extract_cli_exit_statuses(&content.replace("/* sucecss! */", "/* done */"))
-        .expect_err("missing semantic marker must fail closed");
+    let error = extract_cli_exit_statuses(&content.replace(
+        "    /* success! */\n    res = 0;\ndone:",
+        "    /* done */\n    res = 0;\ndone:",
+    ))
+    .expect_err("missing semantic marker must fail closed");
     assert!(error.contains("success"), "{error}");
 }
 
@@ -319,12 +360,12 @@ fn required_test_runners_fail_closed() {
         fs::remove_dir_all(&directory).expect("stale runner fixture must be removable");
     }
     fs::create_dir_all(&directory).expect("runner fixture must be creatable");
-    for script in ["testDSig.sh", "testEnc.sh", "testKeys.sh"] {
+    for script in ["testDSig.sh", "testEnc.sh"] {
         fs::write(directory.join(script), "#!/bin/sh\n").expect("runner fixture must be writable");
     }
     let error =
         required_test_runner_items(&directory).expect_err("a missing required runner must fail");
-    assert!(error.contains("testRes.sh"), "{error}");
+    assert!(error.contains("testKeys.sh"), "{error}");
     fs::remove_dir_all(directory).expect("runner fixture must be removable");
 }
 
@@ -350,6 +391,7 @@ fn first_matching_rule_wins() {
                 rule("fallback", &["algorithm-uri"], None),
             ],
         },
+        Upstream::libxmlsec1("1.3.14"),
     )
     .expect("both ordered rules must classify at least one item");
     assert_eq!(ledger.items[0].classification, "supported");
@@ -367,6 +409,7 @@ fn rejects_items_without_a_classification() {
             evidence: evidence(),
             rules: vec![rule("headers", &["header"], None)],
         },
+        Upstream::libxmlsec1("1.3.14"),
     )
     .expect_err("unclassified item must fail");
     assert!(error.contains("matched no classification rule"));
@@ -385,6 +428,7 @@ fn rejects_rules_that_no_longer_match_upstream() {
                 rule("removed", &["algorithm-uri"], None),
             ],
         },
+        Upstream::libxmlsec1("1.3.14"),
     )
     .expect_err("unused rule must fail");
     assert!(error.contains("removed"));
@@ -780,17 +824,37 @@ fn donor_clone_terminates_options_before_caller_paths() {
 }
 
 #[test]
-fn rejects_a_different_donor_commit() {
-    // A version-shaped checkout at another Git object must not regenerate the baseline.
+fn the_version_comes_from_the_donors_ac_init() {
+    // The ledger describes whatever version the checked-out upstream declares;
+    // only xmlsec1's own AC_INIT names it.
+    assert_eq!(
+        configured_version("AC_INIT([xmlsec1],[1.3.14],[http://www.aleksey.com/xmlsec])\n")
+            .as_deref(),
+        Some("1.3.14")
+    );
+    for configure in [
+        "",
+        "AC_INIT([other],[1.3.14])\n",
+        "AC_INIT([xmlsec1],[])\n",
+        "dnl AC_INIT([xmlsec1],[1.3.14])\n",
+    ] {
+        assert_eq!(configured_version(configure), None, "{configure:?}");
+    }
+}
+
+#[test]
+fn the_donor_is_read_at_its_checked_out_commit() {
+    // Whatever commit the donor checkout has is the one generated from: the
+    // ledger follows upstream as it is when the run checks it out.
     let directory =
-        env::temp_dir().join(format!("xml-sec-ledger-donor-drift-{}", std::process::id()));
+        env::temp_dir().join(format!("xml-sec-ledger-donor-head-{}", std::process::id()));
     if directory.exists() {
         fs::remove_dir_all(&directory).expect("stale donor test directory must be removable");
     }
     fs::create_dir_all(&directory).expect("donor test directory must be creatable");
     fs::write(
         directory.join("configure.ac"),
-        "AC_INIT([xmlsec1],[1.3.13])\n",
+        "AC_INIT([xmlsec1],[1.3.14])\n",
     )
     .expect("donor version fixture must be writable");
     assert!(
@@ -826,7 +890,12 @@ fn rejects_a_different_donor_commit() {
             .success()
     );
 
-    let error = verify_donor(&directory).expect_err("different donor commit must fail");
-    assert!(error.contains("revision mismatch"));
+    let head = Command::new("git")
+        .args(["-C", directory.to_str().unwrap(), "rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    let head = String::from_utf8(head.stdout).unwrap();
+    assert_eq!(donor_head(&directory).as_deref(), Ok(head.trim()));
+    assert_eq!(donor_version(&directory).as_deref(), Ok("1.3.14"));
     fs::remove_dir_all(directory).expect("donor test directory must be removable");
 }

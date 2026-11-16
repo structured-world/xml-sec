@@ -90,10 +90,11 @@ fn text(value: *const u8) -> String {
     }
 }
 
-/// A possibly-null C string as printf's `%s` prints it.
+/// A possibly-null table string as libxmlsec1's dumps print it: empty for
+/// null.
 fn printed(value: *const u8) -> String {
     if value.is_null() {
-        "(null)".to_owned()
+        String::new()
     } else {
         text(value)
     }
@@ -764,12 +765,10 @@ pub(crate) unsafe extern "C" fn xmlSecQName2IntegerDebugXmlDump(
         unsafe {
             if let Some(entry) = xmlSecQName2IntegerGetInfo(info, int_value).as_ref() {
                 let name = text(name);
-                // libxmlsec1 writes an opening tag where the closing one
-                // belongs.
                 write_stream(
                     output,
                     &format!(
-                        "<{name} value=\"{int_value}\" href=\"{}\">{}<{name}>\n",
+                        "<{name} value=\"{int_value}\" href=\"{}\">{}</{name}>\n",
                         printed(entry.href),
                         printed(entry.local)
                     ),
@@ -781,20 +780,6 @@ pub(crate) unsafe extern "C" fn xmlSecQName2IntegerDebugXmlDump(
 
 // ----------------------------------------------------------------------------
 // QName <-> bit mask
-
-/// Asserts libxmlsec1's invariant of a bit-mask table at `here`: no entry
-/// has a zero mask.
-///
-/// # Safety
-/// `info` is a table.
-unsafe fn masks_valid(info: *const QName2BitMaskInfo, here: Here) -> bool {
-    // SAFETY: by the caller's contract.
-    let valid = unsafe { entries(info) }.all(|entry| entry.mask != 0);
-    if !valid {
-        errors::assertion(here, c"info[ii].mask != 0");
-    }
-    valid
-}
 
 /// `xmlSecQName2BitMaskGetInfo`: the entry with `mask`, or null.
 ///
@@ -831,18 +816,14 @@ pub(crate) unsafe extern "C" fn xmlSecQName2BitMaskGetInfo(
 /// `xmlSecQName2BitMaskGetBitMask`: the mask of the name `qname_local_part`
 /// in namespace `qname_href`; -1 when the table has none.
 ///
-/// The href comes first, as in the libxmlsec1 snapshot the differential
-/// oracle is built from, though the header declares the local part first;
-/// the order moves to the header's together with the oracle (#457).
-///
 /// # Safety
 /// `info` is null or a table; the names null or NUL-terminated; `mask` null
 /// or writable.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecQName2BitMaskGetBitMask(
     info: *const QName2BitMaskInfo,
-    qname_href: *const u8,
     qname_local_part: *const u8,
+    qname_href: *const u8,
     mask: *mut c_uint,
 ) -> c_int {
     contain(-1, || {
@@ -929,7 +910,7 @@ pub(crate) unsafe extern "C" fn xmlSecQName2BitMaskGetBitMaskFromString(
             let Some((href, local)) = resolve(node, qname, here) else {
                 return -1;
             };
-            if xmlSecQName2BitMaskGetBitMask(info, href, local, mask) < 0 {
+            if xmlSecQName2BitMaskGetBitMask(info, local, href, mask) < 0 {
                 errors::internal_with(
                     here,
                     std::ptr::null(),
@@ -1185,19 +1166,25 @@ pub(crate) unsafe extern "C" fn xmlSecQName2BitMaskDebugDump(
         }
         // SAFETY: by the caller's contract.
         unsafe {
-            if !masks_valid(info, here!("xmlSecQName2BitMaskDebugDump")) {
-                return;
-            }
             write_stream(output, &format!("== {} (0x{mask:08x}): ", text(name)));
-            for entry in entries(info).filter(|entry| mask & entry.mask != 0) {
-                write_stream(
-                    output,
-                    &format!(
-                        "name=\"{}\" (href=\"{}\"),",
-                        printed(entry.local),
-                        printed(entry.href)
-                    ),
-                );
+            let mut separator = "";
+            for entry in entries(info) {
+                // libxmlsec1 stops mid-line at an invalid entry.
+                if entry.mask == 0 {
+                    errors::assertion(here!("xmlSecQName2BitMaskDebugDump"), c"info[ii].mask != 0");
+                    return;
+                }
+                if mask & entry.mask != 0 {
+                    write_stream(
+                        output,
+                        &format!(
+                            "{separator}name=\"{}\" (href=\"{}\")",
+                            printed(entry.local),
+                            printed(entry.href)
+                        ),
+                    );
+                    separator = ",";
+                }
             }
             write_stream(output, "\n");
         }
@@ -1237,20 +1224,27 @@ pub(crate) unsafe extern "C" fn xmlSecQName2BitMaskDebugXmlDump(
         }
         // SAFETY: by the caller's contract.
         unsafe {
-            if !masks_valid(info, here!("xmlSecQName2BitMaskDebugXmlDump")) {
-                return;
-            }
             let name = text(name);
             write_stream(output, &format!("<{name}List>\n"));
-            for entry in entries(info).filter(|entry| mask & entry.mask != 0) {
-                write_stream(
-                    output,
-                    &format!(
-                        "<{name} href=\"{}\">{}</{name}>\n",
-                        printed(entry.href),
-                        printed(entry.local)
-                    ),
-                );
+            for entry in entries(info) {
+                // libxmlsec1 stops before closing the list at an invalid entry.
+                if entry.mask == 0 {
+                    errors::assertion(
+                        here!("xmlSecQName2BitMaskDebugXmlDump"),
+                        c"info[ii].mask != 0",
+                    );
+                    return;
+                }
+                if mask & entry.mask != 0 {
+                    write_stream(
+                        output,
+                        &format!(
+                            "<{name} href=\"{}\">{}</{name}>\n",
+                            printed(entry.href),
+                            printed(entry.local)
+                        ),
+                    );
+                }
             }
             write_stream(output, &format!("</{name}List>\n"));
         }

@@ -50,6 +50,7 @@ fn registry_holds_the_defaults_in_order() {
                 "xpath",
                 "xpath2",
                 "xpointer",
+                "xpointer-legacy",
                 "relationship",
             ]
         );
@@ -65,6 +66,22 @@ fn registry_holds_the_defaults_in_order() {
         );
         xmlSecTransformIdsShutdown();
         assert_eq!(xmlSecPtrListGetSize(ids), 0);
+    }
+}
+
+/// A reset drops the parent key info context with the run: it belongs to the
+/// caller that set it for one run and must not reach the next one.
+#[test]
+fn a_reset_forgets_the_parent_key_info_context() {
+    // SAFETY: the context is created and destroyed here; the parent pointer
+    // is only stored, never dereferenced.
+    unsafe {
+        let ctx = xmlSecTransformCtxCreate();
+        let mut parent = 0_u8;
+        (*ctx).parent_key_info_ctx = (&raw mut parent).cast();
+        super::ctx::xmlSecTransformCtxReset(ctx);
+        assert!((*ctx).parent_key_info_ctx.is_null());
+        xmlSecTransformCtxDestroy(ctx);
     }
 }
 

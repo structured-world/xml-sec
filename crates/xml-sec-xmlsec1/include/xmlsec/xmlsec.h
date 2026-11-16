@@ -5,8 +5,8 @@
  *
  * Copyright (C) 2002-2026 Aleksey Sanin <aleksey@aleksey.com>. All Rights Reserved.
  */
-#ifndef __XMLSEC_H__
-#define __XMLSEC_H__
+#ifndef XMLSEC_XMLSEC_H
+#define XMLSEC_XMLSEC_H
 
 /**
  * @defgroup xmlsec_core XML Security Core Library
@@ -14,6 +14,8 @@
  */
 
 #include <xs_tree.h>
+#include <stdint.h>
+#include <stddef.h>
 
 #include <xmlsec/version.h>
 #include <xmlsec/exports.h>
@@ -26,27 +28,27 @@ extern "C" {
 /**
  * @defgroup xmlsec_core_helpers XML Security Init/Shutdown
  * @ingroup xmlsec_core
- * @brief Library initialisation, shutdown, configuration, and other helper functions and macros.
+ * @brief Library initialization, shutdown, configuration, and other helper functions and macros.
  * @{
  */
 
 /**
- * @brief Marks function as deprecated.
+ * @brief Marks a function as deprecated.
  */
-#if !defined(IN_XMLSEC) && !defined(IN_XMLSEC_CRYPTO)
-#if defined(__GNUC__)
-#define XMLSEC_DEPRECATED __attribute__((deprecated))
-#elif defined(__clang__)
-#define XMLSEC_DEPRECATED __attribute__((deprecated))
-#elif defined(_MSC_VER)
-#define XMLSEC_DEPRECATED __declspec(deprecated)
-#else /* defined(_MSC_VER) */
-#warning "WARNING: You need to implement XMLSEC_DEPRECATED for this compiler"
-#define XMLSEC_DEPRECATED
-#endif /* defined(_MSC_VER) */
-#else  /* !defined(IN_XMLSEC) && !defined(IN_XMLSEC_CRYPTO) */
-#define XMLSEC_DEPRECATED
-#endif /* !defined(IN_XMLSEC) && !defined(IN_XMLSEC_CRYPTO) */
+#if !defined(XMLSEC_DEPRECATED)
+#  if !defined(IN_XMLSEC) && !defined(IN_XMLSEC_CRYPTO)
+#    if defined(__GNUC__) || defined(__clang__)
+#      define XMLSEC_DEPRECATED __attribute__((deprecated))
+#    elif defined(_MSC_VER)
+#      define XMLSEC_DEPRECATED __declspec(deprecated)
+#    else /* !defined(__GNUC__) && !defined(__clang__) && !defined(_MSC_VER) */
+/* No deprecation attribute is available for this compiler; XMLSEC_DEPRECATED is a no-op. */
+#      define XMLSEC_DEPRECATED
+#    endif /* defined(__GNUC__) || defined(__clang__) */
+#  else  /* !defined(IN_XMLSEC) && !defined(IN_XMLSEC_CRYPTO) */
+#    define XMLSEC_DEPRECATED
+#  endif /* !defined(IN_XMLSEC) && !defined(IN_XMLSEC_CRYPTO) */
+#endif /* !defined(XMLSEC_DEPRECATED) */
 
 /******************************************************************************
  *
@@ -68,14 +70,14 @@ typedef void*                                   xmlSecPtr;
 #define XMLSEC_SIZE_T_FMT                      "%llu"
 #elif defined(__MINGW32__)
 #define XMLSEC_SIZE_T_FMT                      "%lu"
-#else /*defined(__MINGW32__) */
+#else /* !defined(__MINGW64__) && !defined(__MINGW32__) */
 #define XMLSEC_SIZE_T_FMT                      "%zu"
-#endif /* defined(__MINGW32__) */
+#endif /* defined(__MINGW64__) */
 
 /**
  * @brief Size of something.
  */
-typedef size_t xmlSecSize;
+typedef size_t                                  xmlSecSize;
 
 /**
  * @brief The minimum value of #xmlSecSize (0).
@@ -93,7 +95,7 @@ typedef size_t xmlSecSize;
 /**
  * @brief One byte.
  */
-typedef unsigned char xmlSecByte;
+typedef unsigned char                           xmlSecByte;
 
 /******************************************************************************
  *
@@ -132,19 +134,17 @@ XMLSEC_EXPORT xmlSecSize                        xmlSecStrlen            (const x
  *
  *****************************************************************************/
 /**
- * @brief Checks if loaded library version exactly matches.
+ * @brief Checks if the loaded library version exactly matches.
  * @details Macro. Returns 1 if the loaded xmlsec library version exactly matches
- * the one used to compile the caller, 0 if it does not or a negative
- * value if an error occurs.
+ * the one used to compile the caller, 0 if it does not.
  */
 #define xmlSecCheckVersionExact()       \
     xmlSecCheckVersionExt(XMLSEC_VERSION_MAJOR, XMLSEC_VERSION_MINOR, XMLSEC_VERSION_SUBMINOR, xmlSecCheckVersionExactMatch)
 
 /**
- * @brief Checks if loaded library version is ABI compatible.
- * @details Macro. Returns 1 if the loaded xmlsec library version ABI compatible with
- * the one used to compile the caller, 0 if it does not or a negative
- * value if an error occurs.
+ * @brief Checks if the loaded library version is ABI compatible.
+ * @details Macro. Returns 1 if the loaded xmlsec library version is ABI compatible with
+ * the one used to compile the caller, 0 if it does not.
  */
 #define xmlSecCheckVersion()    \
     xmlSecCheckVersionExt(XMLSEC_VERSION_MAJOR, XMLSEC_VERSION_MINOR, XMLSEC_VERSION_SUBMINOR, xmlSecCheckVersionABICompatible)
@@ -168,4 +168,4 @@ XMLSEC_EXPORT int       xmlSecCheckVersionExt   (int major,
 }
 #endif /* __cplusplus */
 
-#endif /* __XMLSEC_H__ */
+#endif /* XMLSEC_XMLSEC_H */

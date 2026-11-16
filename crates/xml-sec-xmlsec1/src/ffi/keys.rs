@@ -36,8 +36,8 @@ pub(crate) const TYPE_PUBLIC: c_uint = 0x0001;
 pub(crate) const TYPE_PRIVATE: c_uint = 0x0002;
 /// `xmlSecKeyDataTypeSymmetric`.
 pub(crate) const TYPE_SYMMETRIC: c_uint = 0x0004;
-/// `xmlSecKeyDataUsageUnknown`.
-const DATA_USAGE_UNKNOWN: c_uint = 0;
+/// `xmlSecKeyUsageUnknown`.
+const USAGE_UNKNOWN: c_uint = 0;
 /// `xmlSecKeyDataUsageAny`.
 const DATA_USAGE_ANY: c_uint = 0xFFFFF;
 /// `XMLSEC_ERRORS_R_KEY_DATA_NOT_FOUND`.
@@ -414,7 +414,7 @@ pub(crate) unsafe extern "C" fn xmlSecKeyUseWithDebugDump(
             write_stream(
                 output,
                 &format!(
-                    "=== KeyUseWith: application=\"{}\",identifier=\"{}\"\n",
+                    "=== KeyUseWith: application=\"{}\", identifier=\"{}\"\n",
                     shown((*key_use_with).application),
                     shown((*key_use_with).identifier)
                 ),
@@ -571,7 +571,7 @@ pub(crate) unsafe extern "C" fn xmlSecKeyReqReset(key_req: *mut XmlSecKeyReq) {
             xmlSecPtrListEmpty(&raw mut (*key_req).key_use_with_list);
             let req = &mut *key_req;
             req.key_id = std::ptr::null();
-            req.key_type = 0;
+            req.key_type = TYPE_UNKNOWN;
             req.key_usage = USAGE_ANY;
             req.key_bits_size = 0;
         }
@@ -593,8 +593,7 @@ pub(crate) unsafe extern "C" fn xmlSecKeyReqCopy(
         check!(!src.is_null(), "xmlSecKeyReqCopy", c"src != NULL", -1);
         // Requirements copied onto themselves are already the copy; copying
         // a list into itself would append to it while reading it. Distinct
-        // requirements replace the destination's use-with records, as
-        // libxmlsec1 1.3.13 empties the list before copying.
+        // requirements replace the destination's use-with records.
         if std::ptr::eq(dst, src) {
             return 0;
         }
@@ -623,7 +622,8 @@ pub(crate) unsafe extern "C" fn xmlSecKeyReqCopy(
 }
 
 /// `xmlSecKeyReqMatchKey`: 1 when `key` has a type, usage and value the
-/// requirements accept, otherwise 0.
+/// requirements accept, otherwise 0; a key without a value never matches,
+/// so a store search skips it.
 ///
 /// # Safety
 /// `key_req` is null or initialized requirements; `key` null or a key.
@@ -639,19 +639,27 @@ pub(crate) unsafe extern "C" fn xmlSecKeyReqMatchKey(
             c"keyReq != NULL",
             -1
         );
-        // SAFETY: null or a key.
-        let valid = unsafe { key_valid(key) };
-        check!(valid, "xmlSecKeyReqMatchKey", c"xmlSecKeyIsValid(key)", -1);
-        // SAFETY: valid requirements and key.
+        check!(!key.is_null(), "xmlSecKeyReqMatchKey", c"key != NULL", -1);
+        // SAFETY: requirements and a key.
         unsafe {
             let req = &*key_req;
             if req.key_type != TYPE_UNKNOWN && xmlSecKeyGetType(key) & req.key_type == 0 {
                 return 0;
             }
-            if req.key_usage != DATA_USAGE_UNKNOWN && req.key_usage & (*key).usage == 0 {
+            if req.key_usage != USAGE_UNKNOWN && req.key_usage & (*key).usage == 0 {
                 return 0;
             }
-            xmlSecKeyReqMatchKeyValue(key_req, (*key).value)
+            let value = (*key).value;
+            if value.is_null() {
+                return 0;
+            }
+            check!(
+                super::keysdata::data_valid(value),
+                "xmlSecKeyReqMatchKey",
+                c"xmlSecKeyDataIsValid(value)",
+                -1
+            );
+            xmlSecKeyReqMatchKeyValue(key_req, value)
         }
     })
 }
@@ -941,7 +949,7 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDuplicate(key: *mut XmlSecKey) -> *mut 
 }
 
 /// `xmlSecKeyMatch`: 1 when `key` has the name `name` (any for null) and
-/// meets `key_req`, otherwise 0.
+/// meets `key_req`, 0 when not, negative on an error.
 ///
 /// # Safety
 /// `key` is null or a key; `name` null or NUL-terminated; `key_req` null or
@@ -953,11 +961,9 @@ pub(crate) unsafe extern "C" fn xmlSecKeyMatch(
     key_req: *mut XmlSecKeyReq,
 ) -> c_int {
     contain(-1, || {
-        // SAFETY: null or a key.
-        let valid = unsafe { key_valid(key) };
-        check!(valid, "xmlSecKeyMatch", c"xmlSecKeyIsValid(key)", -1);
+        check!(!key.is_null(), "xmlSecKeyMatch", c"key != NULL", -1);
         check!(!key_req.is_null(), "xmlSecKeyMatch", c"keyReq != NULL", -1);
-        // SAFETY: a valid key and requirements.
+        // SAFETY: a key and requirements.
         unsafe {
             if !name.is_null() && xmlStrEqual((*key).name, name) == 0 {
                 return 0;
@@ -1105,6 +1111,14 @@ pub(crate) unsafe extern "C" fn xmlSecKeySetValue(
 ) -> c_int {
     contain(-1, || {
         check!(!key.is_null(), "xmlSecKeySetValue", c"key != NULL", -1);
+        // SAFETY: null or key data.
+        let valid = value.is_null() || unsafe { super::keysdata::data_valid(value) };
+        check!(
+            valid,
+            "xmlSecKeySetValue",
+            c"(value == NULL) || xmlSecKeyDataIsValid(value)",
+            -1
+        );
         // SAFETY: a key owning its value.
         unsafe {
             let owned = &mut *key;
@@ -1329,31 +1343,40 @@ unsafe fn kind(key: *mut XmlSecKey) -> &'static str {
     }
 }
 
-/// `xmlSecKeyDebugDump`: prints the key, its value and data.
+/// The node name of the klass of a key's value, if it has a value.
+///
+/// # Safety
+/// `key` is a key.
+unsafe fn method(key: &XmlSecKey) -> Option<*const u8> {
+    // SAFETY: by the caller's contract, the value is null or key data.
+    unsafe {
+        key.value.as_ref().map(|value| {
+            value
+                .id
+                .as_ref()
+                .map_or(std::ptr::null(), |klass| klass.data_node_name)
+        })
+    }
+}
+
+/// `xmlSecKeyDebugDump`: prints the key, its value when it has one, and its
+/// data.
 ///
 /// # Safety
 /// `key` is null or a key; `output` null or a live C stream.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecKeyDebugDump(key: *mut XmlSecKey, output: *mut c_void) {
     contain((), || {
-        // SAFETY: null or a key.
-        let valid = unsafe { key_valid(key) };
-        check!(valid, "xmlSecKeyDebugDump", c"xmlSecKeyIsValid(key)");
+        check!(!key.is_null(), "xmlSecKeyDebugDump", c"key != NULL");
         check!(!output.is_null(), "xmlSecKeyDebugDump", c"output != NULL");
-        // SAFETY: a valid key and a live stream.
+        // SAFETY: a key and a live stream.
         unsafe {
             let owned = &*key;
-            let out = format!(
-                "== KEY\n=== method: {}\n=== key type: {}\n",
-                text(
-                    (*owned.value.cast_const())
-                        .id
-                        .as_ref()
-                        .map_or(std::ptr::null(), |klass| klass.data_node_name)
-                ),
-                kind(key)
-            );
-            write_stream(output, &out);
+            write_stream(output, "=== KEY\n");
+            if let Some(method) = method(owned) {
+                write_stream(output, &format!("=== method: {}\n", text(method)));
+            }
+            write_stream(output, &format!("=== key type: {}\n", kind(key)));
             if !owned.name.is_null() {
                 write_stream(output, &format!("=== key name: {}\n", text(owned.name)));
             }
@@ -1367,7 +1390,9 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDebugDump(key: *mut XmlSecKey, output: 
                     ),
                 );
             }
-            xmlSecKeyDataDebugDump(owned.value, output);
+            if !owned.value.is_null() {
+                xmlSecKeyDataDebugDump(owned.value, output);
+            }
             if !owned.data_list.is_null() {
                 xmlSecPtrListDebugDump(owned.data_list, output);
             }
@@ -1382,31 +1407,24 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDebugDump(key: *mut XmlSecKey, output: 
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecKeyDebugXmlDump(key: *mut XmlSecKey, output: *mut c_void) {
     contain((), || {
-        // SAFETY: null or a key.
-        let valid = unsafe { key_valid(key) };
-        check!(valid, "xmlSecKeyDebugXmlDump", c"xmlSecKeyIsValid(key)");
+        check!(!key.is_null(), "xmlSecKeyDebugXmlDump", c"key != NULL");
         check!(
             !output.is_null(),
             "xmlSecKeyDebugXmlDump",
             c"output != NULL"
         );
-        // SAFETY: a valid key and a live stream.
+        // SAFETY: a key and a live stream.
         unsafe {
             let owned = &*key;
-            write_stream(output, "<KeyInfo>\n<KeyMethod>");
-            xmlSecPrintXmlString(
-                output,
-                (*owned.value)
-                    .id
-                    .as_ref()
-                    .map_or(std::ptr::null(), |klass| klass.data_node_name),
-            );
+            write_stream(output, "<KeyInfo>\n");
+            if let Some(method) = method(owned) {
+                write_stream(output, "<KeyMethod>");
+                xmlSecPrintXmlString(output, method);
+                write_stream(output, "</KeyMethod>\n");
+            }
             write_stream(
                 output,
-                &format!(
-                    "</KeyMethod>\n<KeyType>{}\n</KeyType>\n<KeyName>",
-                    kind(key)
-                ),
+                &format!("<KeyType>{}\n</KeyType>\n<KeyName>", kind(key)),
             );
             xmlSecPrintXmlString(output, owned.name);
             write_stream(output, "</KeyName>\n");
@@ -1419,7 +1437,9 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDebugXmlDump(key: *mut XmlSecKey, outpu
                     ),
                 );
             }
-            xmlSecKeyDataDebugXmlDump(owned.value, output);
+            if !owned.value.is_null() {
+                xmlSecKeyDataDebugXmlDump(owned.value, output);
+            }
             if !owned.data_list.is_null() {
                 xmlSecPtrListDebugXmlDump(owned.data_list, output);
             }
@@ -1535,6 +1555,13 @@ pub(crate) unsafe extern "C" fn xmlSecKeyReadBuffer(
             !buffer.is_null(),
             "xmlSecKeyReadBuffer",
             c"buffer != NULL",
+            std::ptr::null_mut()
+        );
+        check!(
+            // SAFETY: a buffer.
+            unsafe { super::buffer::xmlSecBufferGetSize(buffer) } > 0,
+            "xmlSecKeyReadBuffer",
+            c"!xmlSecBufferIsEmpty(buffer)",
             std::ptr::null_mut()
         );
         // SAFETY: a klass and a buffer holding its size in bytes.

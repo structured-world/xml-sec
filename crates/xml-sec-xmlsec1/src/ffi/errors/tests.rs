@@ -1,13 +1,14 @@
 //! Error reporting against libxmlsec1's semantics: the reason table, the
-//! callback priority, message formatting and truncation. Each test that sets
+//! callback priority, message formatting and overlong messages. Each test that sets
 //! a callback checks that it runs in its own process, so the process-wide
 //! callbacks it sets are its own.
 
 use crate::ffi::tests::own_process;
 
 use super::{
-    ErrorsCallback, MESSAGE_CAPACITY, R_ASSERTION, here, report, xmlSecError, xmlSecErrorsGetCode,
-    xmlSecErrorsGetMsg, xmlSecErrorsSetCallback, xmlSecErrorsSetSystemCallback,
+    ErrorsCallback, MESSAGE_CAPACITY, R_ASSERTION, here, report, xmlSecError,
+    xmlSecErrorsClearCallback, xmlSecErrorsGetCode, xmlSecErrorsGetMsg, xmlSecErrorsSetCallback,
+    xmlSecErrorsSetSystemCallback,
 };
 use std::ffi::{CStr, c_char, c_int};
 use std::sync::Mutex;
@@ -87,11 +88,17 @@ fn reason_table_matches_libxmlsec1() {
         assert_eq!(xmlSecErrorsGetCode(25), 28);
         assert_eq!(
             text(xmlSecErrorsGetMsg(25)).as_deref(),
-            Some("node node found")
+            Some("node not found")
         );
-        assert_eq!(xmlSecErrorsGetCode(52), 100);
-        assert_eq!(xmlSecErrorsGetCode(53), 0);
-        assert!(xmlSecErrorsGetMsg(53).is_null());
+        assert_eq!(xmlSecErrorsGetCode(40), 53);
+        assert_eq!(
+            text(xmlSecErrorsGetMsg(40)).as_deref(),
+            Some("maximum KeyInfoReference level")
+        );
+        assert_eq!(xmlSecErrorsGetCode(53), 100);
+        assert_eq!(xmlSecErrorsGetCode(54), 101);
+        assert_eq!(xmlSecErrorsGetCode(55), 0);
+        assert!(xmlSecErrorsGetMsg(55).is_null());
         assert_eq!(xmlSecErrorsGetCode(usize::MAX), 0);
     }
 }
@@ -160,31 +167,53 @@ fn user_callback_takes_priority_and_null_disables() {
     }
 }
 
-/// Messages are cut to 1023 bytes, as libxmlsec1's buffer cuts them, both
-/// for `xmlSecError` and for the library's own reports.
+/// Clearing the application's callback, null included, hands reports back to
+/// the system callback.
 #[test]
-fn long_messages_are_truncated() {
+fn clearing_the_user_callback_restores_the_system_one() {
     own_process();
-    let long = "x".repeat(4000);
-    let format = std::ffi::CString::new(long.clone()).expect("no NUL");
-    // SAFETY: the callback has the callback's signature; the format has no
+    // SAFETY: the callbacks have the callback's signature.
+    unsafe {
+        xmlSecErrorsSetSystemCallback(Some(other as ErrorsCallback));
+        xmlSecErrorsSetCallback(None);
+        report(here!("probe"), std::ptr::null(), std::ptr::null(), 1, "a");
+        assert_eq!(take(), []);
+        xmlSecErrorsClearCallback();
+        report(here!("probe"), std::ptr::null(), std::ptr::null(), 1, "a");
+        let reports = take();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].func, "system");
+    }
+}
+
+/// A message that does not fit libxmlsec1's 1024-byte buffer is replaced by
+/// its fixed "cannot format" text rather than cut, both for `xmlSecError`
+/// and for the library's own reports; one that just fits is kept whole.
+#[test]
+fn long_messages_are_replaced() {
+    own_process();
+    let fits = "x".repeat(MESSAGE_CAPACITY - 1);
+    let long = "x".repeat(MESSAGE_CAPACITY);
+    // SAFETY: the callback has the callback's signature; the formats have no
     // conversions.
     unsafe {
         xmlSecErrorsSetCallback(Some(record as ErrorsCallback));
-        xmlSecError(
-            std::ptr::null(),
-            0,
-            std::ptr::null(),
-            std::ptr::null(),
-            std::ptr::null(),
-            1,
-            format.as_ptr(),
-        );
+        for text in [&fits, &long] {
+            let format = std::ffi::CString::new(text.as_str()).expect("no NUL");
+            xmlSecError(
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+                format.as_ptr(),
+            );
+        }
     }
+    report(here!("probe"), std::ptr::null(), std::ptr::null(), 1, &fits);
     report(here!("probe"), std::ptr::null(), std::ptr::null(), 1, &long);
-    let reports = take();
-    assert_eq!(reports.len(), 2);
-    for report in reports {
-        assert_eq!(report.message.len(), MESSAGE_CAPACITY - 1);
-    }
+    let messages: Vec<String> = take().into_iter().map(|report| report.message).collect();
+    let fatal = "Can not format error message".to_owned();
+    assert_eq!(messages, [fits.clone(), fatal.clone(), fits, fatal]);
 }

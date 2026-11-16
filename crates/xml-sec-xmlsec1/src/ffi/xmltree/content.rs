@@ -142,41 +142,58 @@ pub(super) fn set_reported(node: *mut XmlNode, content: &str, here: errors::Here
     set
 }
 
-/// `strtol(text, &end, 10)` over `text`, which has no leading white space:
-/// the value and the number of bytes it read. A value beyond `long` is
-/// `long`'s bound, as `strtol` clamps it; no digits read nothing.
-fn strtol(text: &[u8]) -> (i128, usize) {
-    let (negative, digits_at) = match text.first() {
-        Some(b'-') => (true, 1),
-        Some(b'+') => (false, 1),
-        _ => (false, 0),
-    };
-    let digits = text[digits_at..]
-        .iter()
-        .take_while(|byte| byte.is_ascii_digit())
-        .count();
-    if digits == 0 {
-        return (0, 0);
-    }
-    let bound = i128::from(libc::c_long::MAX);
-    let mut value: i128 = 0;
-    for &digit in &text[digits_at..digits_at + digits] {
-        // Accumulation stops above the bound, so it never nears `i128`'s.
-        if value <= bound {
-            value = value * 10 + i128::from(digit - b'0');
-        }
-    }
-    let value = if negative {
-        (-value).max(i128::from(libc::c_long::MIN))
-    } else {
-        value.min(bound)
-    };
-    (value, digits_at + digits)
+/// Why a node's content is not a size, in libxmlsec1's words.
+enum NotSize {
+    /// A leading `-` or `+`: the schema types these values come from
+    /// (`xs:positiveInteger`, `xs:nonNegativeInteger`) allow no sign.
+    Sign,
+    /// More digits than an unsigned 64-bit value holds.
+    OutOfRange,
+    /// Anything but digits, or digits followed by anything but white space.
+    Extra,
 }
 
-/// `xmlSecGetNodeContentAsSize`: the trimmed content of `cur` as a
-/// non-negative decimal (`strtol` with nothing but white space after it),
-/// or `def_value` when `cur` has no content.
+impl NotSize {
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Sign => "can't parse node content as size (invalid sign)",
+            Self::OutOfRange => "can't parse node content as size (value out of range)",
+            Self::Extra => "can't parse node content as size (extra characters at the end)",
+        }
+    }
+}
+
+/// C's `isspace` in the C locale, vertical tab included.
+fn c_isspace(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r')
+}
+
+/// `text`, which has no leading white space, as libxmlsec1 reads a size:
+/// no sign, `strtoull` over the digits, and nothing but white space after.
+fn parse_size(text: &[u8]) -> Result<u64, NotSize> {
+    if matches!(text.first(), Some(b'-' | b'+')) {
+        return Err(NotSize::Sign);
+    }
+    let digits = text.iter().take_while(|byte| byte.is_ascii_digit()).count();
+    let value = text[..digits].iter().try_fold(0u64, |value, digit| {
+        value
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(u64::from(digit - b'0')))
+    });
+    let Some(value) = value else {
+        return Err(NotSize::OutOfRange);
+    };
+    // Without digits `strtoull` reads nothing, so the whole text is extra.
+    if digits > 0 && text[digits..].iter().all(|byte| c_isspace(*byte)) {
+        Ok(value)
+    } else {
+        Err(NotSize::Extra)
+    }
+}
+
+/// `xmlSecGetNodeContentAsSize`: the trimmed content of `cur` as an unsigned
+/// decimal with nothing but white space after it, or `def_value` when `cur`
+/// has no content or only white space.
 ///
 /// # Safety
 /// `res` is null or writable.
@@ -205,45 +222,25 @@ pub(crate) unsafe extern "C" fn xmlSecGetNodeContentAsSize(
             unsafe { res.write(def_value) };
             return 0;
         };
-        let (value, read) = strtol(content.as_bytes());
-        if value < 0 || value == i128::from(libc::c_long::MAX) {
-            // SAFETY: `cur` is a node pointer, validated by the report.
-            unsafe {
-                errors::invalid_node_content(
-                    here,
-                    cur,
-                    std::ptr::null(),
-                    "can't parse node content as size",
-                );
-            }
-            return -1;
+        let text = content.as_bytes();
+        let start = text.iter().take_while(|byte| c_isspace(**byte)).count();
+        if start == text.len() {
+            // SAFETY: writable by the caller's contract.
+            unsafe { res.write(def_value) };
+            return 0;
         }
-        // The content is trimmed, so only the end of the number may follow.
-        if read != content.len() {
-            // SAFETY: as above.
-            unsafe {
-                errors::invalid_node_content(
-                    here,
-                    cur,
-                    std::ptr::null(),
-                    "can't parse node content as size (extra characters at the end)",
-                );
+        let value = match parse_size(&text[start..]) {
+            Ok(value) => value,
+            Err(not_size) => {
+                // SAFETY: `cur` is a node pointer, validated by the report.
+                unsafe {
+                    errors::invalid_node_content(here, cur, std::ptr::null(), not_size.reason());
+                }
+                return -1;
             }
-            return -1;
-        }
-        // A non-negative `long` fits a size on every supported target, whose
-        // `long` is no wider than a pointer; a target where it does not
-        // reports the content as unparsable rather than truncating it.
+        };
         let Ok(size) = usize::try_from(value) else {
-            // SAFETY: as above.
-            unsafe {
-                errors::invalid_node_content(
-                    here,
-                    cur,
-                    std::ptr::null(),
-                    "can't parse node content as size",
-                );
-            }
+            errors::cast_impossible_u64_to_size(here, value);
             return -1;
         };
         // SAFETY: writable by the caller's contract.

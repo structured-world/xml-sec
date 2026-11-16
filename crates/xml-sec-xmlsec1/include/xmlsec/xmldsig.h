@@ -5,8 +5,8 @@
  *
  * Copyright (C) 2002-2026 Aleksey Sanin <aleksey@aleksey.com>. All Rights Reserved.
  */
-#ifndef __XMLSEC_XMLDSIG_H__
-#define __XMLSEC_XMLDSIG_H__
+#ifndef XMLSEC_XMLDSIG_H
+#define XMLSEC_XMLDSIG_H
 
 /**
  * @defgroup xmlsec_core_xmldsig XML Digital Signatures
@@ -16,6 +16,8 @@
  */
 
 #ifndef XMLSEC_NO_XMLDSIG
+
+#include <stdio.h>
 
 #include <xs_tree.h>
 
@@ -36,7 +38,7 @@ typedef struct _xmlSecDSigReferenceCtx          xmlSecDSigReferenceCtx,
                                                 *xmlSecDSigReferenceCtxPtr;
 
 /**
- * @brief XML Digital signature processing status.
+ * @brief XML Digital Signature processing status.
  */
 typedef enum {
     xmlSecDSigStatusUnknown = 0,  /**< the status is unknown. */
@@ -45,15 +47,15 @@ typedef enum {
 } xmlSecDSigStatus;
 
 /**
- * @brief XML Digital signature processing failure reason.
- * @details XML Digital signature processing failure reason. The application should use
+ * @brief XML Digital Signature processing failure reason.
+ * @details XML Digital Signature processing failure reason. The application should use
  * #xmlSecDSigStatus to find out the operation status first.
  */
 typedef enum {
     xmlSecDSigFailureReasonUnknown = 0,  /**< the failure reason is unknown. */
     xmlSecDSigFailureReasonReference,  /**< the reference processing failure (e.g. digest doesn't match). */
     xmlSecDSigFailureReasonSignature,  /**< the signature processing failure (e.g. signature doesn't match). */
-    xmlSecDSigFailureReasonKeyNotFound,  /**< the key not found. */
+    xmlSecDSigFailureReasonKeyNotFound,  /**< the key is not found. */
 } xmlSecDSigFailureReason;
 
 
@@ -61,31 +63,35 @@ typedef enum {
  *
  * xmlSecDSigCtx
  *
-  *****************************************************************************/
+ *****************************************************************************/
 
 /**
- * @brief If set, dsig:Manifests nodes will not be processed.
- * @details If this flag is set then &lt;dsig:Manifests/&gt; nodes will not be processed.
+ * @brief If set, dsig:Manifest nodes will not be processed.
+ * @details If this flag is set then &lt;dsig:Manifest/&gt; nodes will not be processed.
  */
 #define XMLSEC_DSIG_FLAGS_IGNORE_MANIFESTS                      0x00000001
 
 /**
- * @brief If set, pre-digest buffer for SignedInfo References is stored in xmlSecDSigCtx.
- * @details If this flag is set then pre-digest buffer for &lt;dsig:Reference/&gt; child
- * of &lt;dsig:KeyInfo/&gt; element will be stored in xmlSecDSigCtx.
+ * @brief If set, the pre-digest buffer for SignedInfo References is stored per-Reference.
+ * @details If this flag is set then the pre-digest buffer for &lt;dsig:Reference/&gt; child
+ * of &lt;dsig:SignedInfo/&gt; element will be stored in the &lt;dsig:Reference/&gt; processing
+ * context (see the preDigestMemBufMethod field of #_xmlSecDSigReferenceCtx) and can be
+ * retrieved via #xmlSecDSigReferenceCtxGetPreDigestBuffer.
  */
 #define XMLSEC_DSIG_FLAGS_STORE_SIGNEDINFO_REFERENCES           0x00000002
 
 /**
- * @brief If set, pre-digest buffer for Manifest References is stored in xmlSecDSigCtx.
- * @details If this flag is set then pre-digest buffer for &lt;dsig:Reference/&gt; child
- * of &lt;dsig:Manifest/&gt; element will be stored in xmlSecDSigCtx.
+ * @brief If set, the pre-digest buffer for Manifest References is stored per-Reference.
+ * @details If this flag is set then the pre-digest buffer for &lt;dsig:Reference/&gt; child
+ * of &lt;dsig:Manifest/&gt; element will be stored in the &lt;dsig:Reference/&gt; processing
+ * context (see the preDigestMemBufMethod field of #_xmlSecDSigReferenceCtx) and can be
+ * retrieved via #xmlSecDSigReferenceCtxGetPreDigestBuffer.
  */
 #define XMLSEC_DSIG_FLAGS_STORE_MANIFEST_REFERENCES             0x00000004
 
 /**
- * @brief If set, pre-signature buffer for SignedInfo is stored in xmlSecDSigCtx.
- * @details If this flag is set then pre-signature buffer for &lt;dsig:SignedInfo/&gt;
+ * @brief If set, the pre-signature buffer for SignedInfo is stored in xmlSecDSigCtx.
+ * @details If this flag is set then the pre-signature buffer for &lt;dsig:SignedInfo/&gt;
  * element processing will be stored in xmlSecDSigCtx.
  */
 #define XMLSEC_DSIG_FLAGS_STORE_SIGNATURE                       0x00000008
@@ -100,20 +106,39 @@ typedef enum {
 
 
 /**
- * @brief If set, use ASN1 encoded ECDSA signature values.
- * @details If this flag is set then ASN1 encoded ECDSA signature values will be
+ * @brief If set, use ASN1 encoded DSA/ECDSA signature values.
+ * @details If this flag is set then ASN1 encoded DSA/ECDSA signature values will be
  * used (see https://github.com/lsh123/xmlsec/issues/995).
  */
 #define XMLSEC_DSIG_FLAGS_USE_ASN1_SIGNATURE_VALUES             0x00000020
 
 /**
+ * @brief If set, use the legacy Relationship transform behaviour.
+ * @details If this flag is set then the Relationship transform restores its historical
+ * behaviour for foreign namespace declarations and text/comment node removal (see
+ * #XMLSEC_TRANSFORMCTX_FLAGS_RELATIONSHIP_LEGACY). This is propagated to the transform
+ * context of every Reference. It exists purely for backward compatibility with documents
+ * signed by older xmlsec versions and is off by default.
+ */
+#define XMLSEC_DSIG_FLAGS_RELATIONSHIP_LEGACY                   0x00000040
+
+/**
+ * @brief If set, allow empty (0-length) input for digest and signature transforms.
+ * @details By default digest and signature transforms reject empty (0-length) input
+ * with an error. If this flag is set then empty (0-length) input is allowed (see
+ * #XMLSEC_TRANSFORMCTX_FLAGS_ALLOW_EMPTY_INPUT). This is propagated to the transform
+ * context of every Reference and to the <dsig:SignedInfo/> processing context.
+ */
+#define XMLSEC_DSIG_FLAGS_ALLOW_EMPTY_INPUT                     0x00000080
+
+/**
  * @brief XML DSig processing context.
  */
 struct _xmlSecDSigCtx {
-    /* these data user can set before performing the operation */
-    void*                       userData;  /**< the pointer to user data (xmlsec and xmlsec-crypto libraries never touches this). */
+    /* these data the user can set before performing the operation */
+    void*                       userData;  /**< the pointer to user data (the library does not modify the pointed-to data; the pointer value is copied into each &lt;dsig:Reference/&gt; processing context and this field is zeroed when the context is finalized). */
     unsigned int                flags;  /**< the XML Digital Signature processing flags. */
-    unsigned int                flags2;  /**< the XML Digital Signature processing flags. */
+    unsigned int                flags2;  /**< reserved for future. */
     xmlSecKeyInfoCtx            keyInfoReadCtx;  /**< the reading key context. */
     xmlSecKeyInfoCtx            keyInfoWriteCtx;  /**< the writing key context (not used for signature verification). */
     xmlSecTransformCtx          transformCtx;  /**< the &lt;dsig:SignedInfo/&gt; node processing context. */
@@ -125,14 +150,14 @@ struct _xmlSecDSigCtx {
     xmlSecTransformId           defDigestMethodId;  /**< the default digest method klass. */
 
     /* these data are returned */
-    xmlSecKeyPtr                signKey;  /**< the signature key; application may set #signKey before calling #xmlSecDSigCtxSign or #xmlSecDSigCtxVerify functions. */
+    xmlSecKeyPtr                signKey;  /**< the signature key; application may set #signKey before calling #xmlSecDSigCtxSign or #xmlSecDSigCtxVerify functions. The library takes ownership of the key and destroys it when the context is finalized/destroyed (see #xmlSecDSigCtxFinalize and #xmlSecDSigCtxDestroy). */
     xmlSecTransformOperation    operation;  /**< the operation: sign or verify. */
-    xmlSecBufferPtr             result;  /**< the pointer to signature (not valid for signature verification). */
+    xmlSecBufferPtr             result;  /**< the pointer to signature (not valid for signature verification). The buffer is owned by the context and freed when the context is finalized or destroyed, so the pointer becomes invalid after #xmlSecDSigCtxFinalize or #xmlSecDSigCtxDestroy. */
     xmlSecDSigStatus            status;  /**< the &lt;dsig:Signature/&gt; processing status. */
-    xmlSecDSigFailureReason     failureReason;  /**< the detailed failure reason (if known); the application should check @p status first. */
+    xmlSecDSigFailureReason     failureReason;  /**< the detailed failure reason (if known); the application should check #status first. */
     xmlSecTransformPtr          signMethod;  /**< the pointer to signature transform. */
     xmlSecTransformPtr          c14nMethod;  /**< the pointer to c14n transform. */
-    xmlSecTransformPtr          preSignMemBufMethod;  /**< the pointer to binary buffer right before signature (valid only if #XMLSEC_DSIG_FLAGS_STORE_SIGNATURE flag is set). */
+    xmlSecTransformPtr          preSignMemBufMethod;  /**< the pointer to binary buffer right before signature (valid only if #XMLSEC_DSIG_FLAGS_STORE_SIGNATURE flag is set). The buffer is owned by the context and freed when the context is finalized or destroyed, so the pointer becomes invalid after #xmlSecDSigCtxFinalize or #xmlSecDSigCtxDestroy. */
     xmlNodePtr                  signValueNode;  /**< the pointer to &lt;dsig:SignatureValue/&gt; node. */
     xmlChar*                    id;  /**< the pointer to Id attribute of &lt;dsig:Signature/&gt; node. */
     xmlSecPtrList               signedInfoReferences;  /**< the list of references in &lt;dsig:SignedInfo/&gt; node. */
@@ -153,10 +178,12 @@ XMLSEC_EXPORT int               xmlSecDSigCtxSign               (xmlSecDSigCtxPt
                                                                  xmlNodePtr tmpl);
 XMLSEC_EXPORT int               xmlSecDSigCtxVerify             (xmlSecDSigCtxPtr dsigCtx,
                                                                  xmlNodePtr node);
-XMLSEC_EXPORT int               xmlSecDSigCtxEnableReferenceTransform(xmlSecDSigCtxPtr dsigCtx,
-                                                                xmlSecTransformId transformId);
-XMLSEC_EXPORT int               xmlSecDSigCtxEnableSignatureTransform(xmlSecDSigCtxPtr dsigCtx,
-                                                                xmlSecTransformId transformId);
+XMLSEC_EXPORT int               xmlSecDSigCtxEnableReferenceTransform
+                                                                (xmlSecDSigCtxPtr dsigCtx,
+                                                                 xmlSecTransformId transformId);
+XMLSEC_EXPORT int               xmlSecDSigCtxEnableSignatureTransform
+                                                                (xmlSecDSigCtxPtr dsigCtx,
+                                                                 xmlSecTransformId transformId);
 XMLSEC_EXPORT xmlSecBufferPtr   xmlSecDSigCtxGetPreSignBuffer   (xmlSecDSigCtxPtr dsigCtx);
 XMLSEC_EXPORT void              xmlSecDSigCtxDebugDump          (xmlSecDSigCtxPtr dsigCtx,
                                                                  FILE* output);
@@ -172,35 +199,35 @@ XMLSEC_EXPORT const char*       xmlSecDSigCtxGetFailureReasonString(xmlSecDSigFa
  *
  * xmlSecDSigReferenceCtx
  *
-  *****************************************************************************/
+ *****************************************************************************/
 /**
  * @brief The possible dsig:Reference node locations (SignedInfo or Manifest).
  * @details The possible &lt;dsig:Reference/&gt; node locations: in the &lt;dsig:SignedInfo/&gt;
  * node or in the &lt;dsig:Manifest/&gt; node.
  */
-typedef enum  {
+typedef enum {
     xmlSecDSigReferenceOriginSignedInfo,  /**< reference in &lt;dsig:SignedInfo/&gt; node. */
-    xmlSecDSigReferenceOriginManifest  /**< reference &lt;dsig:Manifest/&gt; node. */
+    xmlSecDSigReferenceOriginManifest  /**< reference in &lt;dsig:Manifest/&gt; node. */
 } xmlSecDSigReferenceOrigin;
 
 /**
  * @brief The dsig:Reference processing context.
  */
 struct _xmlSecDSigReferenceCtx {
-    void*                       userData;  /**< the pointer to user data (xmlsec and xmlsec-crypto libraries never touches this). */
-    xmlSecDSigCtxPtr            dsigCtx;  /**< the pointer to "parent" &lt;dsig:Signature/&gt; processing context. */
-    xmlSecDSigReferenceOrigin   origin;  /**< the signature origin (&lt;dsig:SignedInfo/&gt; or &lt;dsig:Manifest/&gt;). */
+    void*                       userData;  /**< the pointer to user data (xmlsec and xmlsec-crypto libraries never touch this). */
+    xmlSecDSigCtxPtr            dsigCtx;  /**< the pointer to "parent" &lt;dsig:Signature/&gt; processing context (the pointer is cleared when this context is finalized, see #xmlSecDSigReferenceCtxFinalize). */
+    xmlSecDSigReferenceOrigin   origin;  /**< the reference origin (&lt;dsig:SignedInfo/&gt; or &lt;dsig:Manifest/&gt;). */
     xmlSecTransformCtx          transformCtx;  /**< the reference processing transforms context. */
     xmlSecTransformPtr          digestMethod;  /**< the pointer to digest transform. */
 
     xmlSecBufferPtr             result;  /**< the pointer to digest result. */
     xmlSecDSigStatus            status;  /**< the reference processing status. */
-    xmlSecTransformPtr          preDigestMemBufMethod;  /**< the pointer to binary buffer right before digest (valid only if either #XMLSEC_DSIG_FLAGS_STORE_SIGNEDINFO_REFERENCES or #XMLSEC_DSIG_FLAGS_STORE_MANIFEST_REFERENCES flags are set). */
+    xmlSecTransformPtr          preDigestMemBufMethod;  /**< the pointer to binary buffer right before digest (valid only if the #XMLSEC_DSIG_FLAGS_STORE_SIGNEDINFO_REFERENCES flag is set for SignedInfo References or the #XMLSEC_DSIG_FLAGS_STORE_MANIFEST_REFERENCES flag is set for Manifest References). The buffer is owned by the context and freed when the context is finalized or destroyed, so the pointer becomes invalid after #xmlSecDSigReferenceCtxFinalize or #xmlSecDSigReferenceCtxDestroy. */
     xmlChar*                    id;  /**< the &lt;dsig:Reference/&gt; node ID attribute. */
     xmlChar*                    uri;  /**< the &lt;dsig:Reference/&gt; node URI attribute. */
     xmlChar*                    type;  /**< the &lt;dsig:Reference/&gt; node Type attribute. */
 
-     /* reserved for future */
+    /* reserved for future */
     void*                       reserved0;  /**< reserved for the future. */
     void*                       reserved1;  /**< reserved for the future. */
 };
@@ -225,7 +252,7 @@ XMLSEC_EXPORT void              xmlSecDSigReferenceCtxDebugXmlDump(xmlSecDSigRef
  *
  * xmlSecDSigReferenceCtxListKlass
  *
-  *****************************************************************************/
+ *****************************************************************************/
 /**
  * @brief The references list klass.
  */
@@ -239,6 +266,6 @@ XMLSEC_EXPORT xmlSecPtrListId   xmlSecDSigReferenceCtxListGetKlass(void);
 
 #endif /* XMLSEC_NO_XMLDSIG */
 
-/** @} */ /** xmlsec_core_xmldsig */
+/** @} */ /* xmlsec_core_xmldsig */
 
-#endif /* __XMLSEC_XMLDSIG_H__ */
+#endif /* XMLSEC_XMLDSIG_H */

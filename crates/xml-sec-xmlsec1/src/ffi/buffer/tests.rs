@@ -254,8 +254,9 @@ fn max_size_and_swap() {
     assert_eq!(right.contents(), b"left");
 }
 
-/// Hex input of either case decodes; an odd length is refused, and a bad
-/// digit fails after storing the bytes before it, as libxmlsec1 does.
+/// Hex input of either case decodes; an odd length is refused and leaves the
+/// contents, and a bad digit fails and leaves the buffer empty, never partly
+/// decoded, as libxmlsec1 does.
 #[test]
 fn hex_read_decodes_and_refuses() {
     let buf = Buffer::new(0);
@@ -264,10 +265,9 @@ fn hex_read_decodes_and_refuses() {
         assert_eq!(xmlSecBufferHexRead(buf.0, c"0aFf10".as_ptr().cast()), 0);
         assert_eq!(buf.contents(), [0x0a, 0xff, 0x10]);
         assert_eq!(xmlSecBufferHexRead(buf.0, c"abc".as_ptr().cast()), -1);
+        assert_eq!(buf.contents(), [0x0a, 0xff, 0x10]);
         assert_eq!(xmlSecBufferHexRead(buf.0, c"11zz".as_ptr().cast()), -1);
-        // The size is already set and the first byte stored; the second
-        // keeps the previous contents, which sizing does not clear.
-        assert_eq!(buf.contents(), [0x11, 0xff]);
+        assert_eq!(buf.size(), 0);
         assert_eq!(xmlSecBufferHexRead(buf.0, c"".as_ptr().cast()), 0);
         assert_eq!(buf.size(), 0);
     }

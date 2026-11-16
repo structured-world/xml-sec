@@ -245,10 +245,7 @@ fn the_layout_program_prints_every_baseline_record() {
     assert!(program.contains("offsetof(struct _S, b)"));
     assert!(program.contains("(int)eOne"));
     assert!(layout_program("{}").is_err());
-    let real = layout_program(&read(
-        "compatibility/libxmlsec1-1.3.13-abi-linux-x86_64.json",
-    ))
-    .unwrap();
+    let real = layout_program(&read("compatibility/libxmlsec1-abi-linux-x86_64.json")).unwrap();
     assert!(real.contains("offsetof(struct _xmlSecTransformCtx, enabledTransforms)"));
 }
 

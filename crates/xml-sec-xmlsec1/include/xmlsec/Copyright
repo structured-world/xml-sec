@@ -1,5 +1,6 @@
 The headers in this directory are the generic headers of the XML Security
-Library (libxmlsec1) 1.3.13, unmodified. Their notice:
+Library (libxmlsec1) from its upstream development line; xmlversion.h names
+the release they declare. Their notice:
 
 ------------------------------------------------------------------------------
 xmlsec, xmlsec-openssl, xmlsec-gnutls, xmlsec-gcrypt libraries

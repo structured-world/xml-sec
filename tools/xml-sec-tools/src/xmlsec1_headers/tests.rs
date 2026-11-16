@@ -1,4 +1,4 @@
-use super::{HEADERS, adapted, copy, declared_strings, differences, render};
+use super::{HEADERS, LEDGER, adapted, copy, declared_strings, differences, render};
 use crate::test_support::read;
 
 /// libxml2's includes become one include of the tree header, and a
@@ -84,13 +84,15 @@ fn edited_or_missing_headers_are_reported() {
     );
 }
 
-/// The ledger names every exported string constant, in a stable order.
+/// The ledger names every exported string constant once, in a stable order;
+/// the count follows the upstream line it is generated from.
 #[test]
 fn the_ledger_names_the_string_constants() {
-    let names = declared_strings(&read("compatibility/libxmlsec1-1.3.13.json")).expect("ledger");
-    assert_eq!(names.len(), 435);
+    let names = declared_strings(&read(LEDGER)).expect("ledger");
     assert!(names.contains(&"xmlSecDSigNs".to_owned()));
+    assert!(names.contains(&"xmlSecXPointerNs".to_owned()));
     assert!(names.is_sorted());
+    assert!(names.windows(2).all(|pair| pair[0] != pair[1]), "unique");
 }
 
 /// The table exports each constant with its exact bytes and NUL, escapes

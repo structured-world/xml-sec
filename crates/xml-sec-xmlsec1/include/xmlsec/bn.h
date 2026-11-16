@@ -5,13 +5,15 @@
  *
  * Copyright (C) 2002-2026 Aleksey Sanin <aleksey@aleksey.com>. All Rights Reserved.
  */
-#ifndef __XMLSEC_BN_H__
-#define __XMLSEC_BN_H__
+#ifndef XMLSEC_BN_H
+#define XMLSEC_BN_H
 
 /**
  * @defgroup xmlsec_core_bn Big Numbers
  * @ingroup xmlsec_core
  * @brief Big-number (arbitrary-precision integer) utility functions.
+ * @details Values are always treated as unsigned magnitudes; operations that would
+ * produce a result below zero return an error.
  * @{
  */
 
@@ -35,10 +37,10 @@ typedef xmlSecBuffer                                            xmlSecBn;
 typedef xmlSecBn                                                *xmlSecBnPtr;
 
 /**
- * @brief The big numbers formats.
+ * @brief The big number formats.
  */
 typedef enum {
-    xmlSecBnBase64,  /**< the base64 decoded binary blob. */
+    xmlSecBnBase64,  /**< the base64 encoded node content. */
     xmlSecBnHex,  /**< the hex number. */
     xmlSecBnDec  /**< the decimal number. */
 } xmlSecBnFormat;
@@ -76,6 +78,7 @@ XMLSEC_EXPORT int               xmlSecBnDiv                     (xmlSecBnPtr bn,
 XMLSEC_EXPORT int               xmlSecBnAdd                     (xmlSecBnPtr bn,
                                                                  int delta);
 XMLSEC_EXPORT int               xmlSecBnReverse                 (xmlSecBnPtr bn);
+XMLSEC_EXPORT int               xmlSecBnPrependZeroIfMsbSet     (xmlSecBnPtr bn);
 XMLSEC_EXPORT int               xmlSecBnCompare                 (xmlSecBnPtr bn,
                                                                  const xmlSecByte* data,
                                                                  xmlSecSize dataSize);
@@ -102,6 +105,6 @@ XMLSEC_EXPORT int               xmlSecBnBlobSetNodeValue        (const xmlSecByt
 }
 #endif /* __cplusplus */
 
-/** @} */ /** xmlsec_core_bn */
+/** @} */ /* xmlsec_core_bn */
 
-#endif /* __XMLSEC_BN_H__ */
+#endif /* XMLSEC_BN_H */

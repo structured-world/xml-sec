@@ -613,14 +613,20 @@ unsafe extern "C" fn debug_dump(data: *mut XmlSecKeyData, output: *mut c_void) {
     });
 }
 
-/// `debugXmlDump`: the element name and key size as an XML element.
+/// `debugXmlDump`: the element name (the klass name for a klass without an
+/// element) and key size as an XML element.
 unsafe extern "C" fn debug_xml_dump(data: *mut XmlSecKeyData, output: *mut c_void) {
     contain((), || {
         // SAFETY: the dispatcher passes valid key data and a C stream.
         unsafe {
-            let name = klass_text((*(*data).id).data_node_name);
+            let klass = &*(*data).id;
+            let name = if klass.data_node_name.is_null() {
+                klass_text(klass.name)
+            } else {
+                klass_text(klass.data_node_name)
+            };
             let size = xmlSecKeyDataGetSize(data);
-            write_stream(output, &format!("<{name}Key size=\"{size}\"/>\n"));
+            write_stream(output, &format!("<{name} size=\"{size}\"/>\n"));
         }
     });
 }

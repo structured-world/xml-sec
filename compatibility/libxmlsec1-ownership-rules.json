@@ -258,18 +258,18 @@
   "unmarked_exports": [
     {
       "id": "openssl-backend-private",
-      "names": ["xmlSecOpenSSLGenerateRandomBytes", "xmlSecOpenSSLKeyDataX509GetCerts", "xmlSecOpenSSLKeyDataX509GetCrls", "xmlSecOpenSSLKeyValueRsaCheckKeyType", "xmlSecOpenSSLX509Asn1TimeToTime", "xmlSecOpenSSLX509CertLoadBIO", "xmlSecOpenSSLX509CrlLoadBIO", "xmlSecOpenSSLX509FindCertCtxFinalize", "xmlSecOpenSSLX509FindCertCtxInitialize", "xmlSecOpenSSLX509FindCertCtxInitializeFromValue", "xmlSecOpenSSLX509FindCertCtxMatch", "xmlSecOpenSSLX509FindKeyByValue", "xmlSecOpenSSLX509GetDigestFromAlgorithm", "xmlSecOpenSSLX509NameToString", "xmlSecOpenSSLX509StoreFindCertByValue", "xmlSecOpenSslEvpGetProviderQuery"],
+      "names": ["xmlSecOpenSSLGenerateRandomBytes", "xmlSecOpenSSLKeyDataX509GetCerts", "xmlSecOpenSSLKeyDataX509GetCrls", "xmlSecOpenSSLKeyValueRsaCheckKeyType", "xmlSecOpenSSLX509Asn1TimeToTime", "xmlSecOpenSSLX509CertLoadBIO", "xmlSecOpenSSLX509CrlLoadBIO", "xmlSecOpenSSLX509FindCertCtxFinalize", "xmlSecOpenSSLX509FindCertCtxInitialize", "xmlSecOpenSSLX509FindCertCtxInitializeFromValue", "xmlSecOpenSSLX509FindCertCtxMatch", "xmlSecOpenSSLX509FindKeyByValue", "xmlSecOpenSSLX509GetDigestFromAlgorithm", "xmlSecOpenSSLX509NameToString", "xmlSecOpenSSLX509StoreFindCertByValue", "xmlSecOpenSSLEvpGetProviderQuery"],
       "rationale": "Helpers shared between the OpenSSL backend's own source files, declared without XMLSEC_CRYPTO_EXPORT in src/openssl/private.h and src/openssl/openssl_compat.h, which are not installed. They are exported only because the library is linked without a symbol visibility list; every caller is inside libxmlsec1-openssl."
+    },
+    {
+      "id": "core-private-helpers",
+      "names": ["xmlSecEncCtxMapOperation", "xmlSecTransformCtxClearNodeRefs", "xmlSecTransformReadKeyInfoNode", "xmlSecTransformWriteKeyInfoNode"],
+      "rationale": "Helpers shared between libxmlsec1's own source files, declared without XMLSEC_EXPORT in src/transform_helpers.h and src/xmlenc_helpers.h, which are not installed. They are exported only because the library is linked without a symbol visibility list; every caller is inside libxmlsec1."
     },
     {
       "id": "xslt-lifecycle",
       "names": ["xmlSecTransformXsltInitialize", "xmlSecTransformXsltShutdown"],
       "rationale": "Declared without XMLSEC_EXPORT in src/xslt.h, which is not installed; called only by xmlSecInit and xmlSecShutdown (xmlsec.c)."
-    },
-    {
-      "id": "kdf-node-names",
-      "names": ["xmlSecNodeConcatKdfKeyValue", "xmlSecNodeHkdfKeyValue", "xmlSecNodePbkdf2KeyValue"],
-      "rationale": "Constant strings defined in strings.c that no header declares, unlike the other node names in strings.h; nothing outside libxmlsec1 can name them."
     }
   ]
 }

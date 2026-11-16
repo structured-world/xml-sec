@@ -48,6 +48,8 @@ pub(crate) const R_INVALID_CONFIG: c_int = 10;
 pub(crate) const R_INVALID_SIZE: c_int = 11;
 /// `XMLSEC_ERRORS_R_INVALID_DATA`.
 pub(crate) const R_INVALID_DATA: c_int = 12;
+/// `XMLSEC_ERRORS_R_INVALID_RESULT`.
+pub(crate) const R_INVALID_RESULT: c_int = 13;
 /// `XMLSEC_ERRORS_R_INVALID_TYPE`.
 pub(crate) const R_INVALID_TYPE: c_int = 14;
 /// `XMLSEC_ERRORS_R_INVALID_OPERATION`.
@@ -82,8 +84,6 @@ pub(crate) const R_TRANSFORM_DISABLED: c_int = 35;
 pub(crate) const R_TRANSFORM_SAME_DOCUMENT_REQUIRED: c_int = 34;
 /// `XMLSEC_ERRORS_R_INVALID_KEY_DATA`.
 pub(crate) const R_INVALID_KEY_DATA: c_int = 41;
-/// `XMLSEC_ERRORS_R_KEY_DATA_ALREADY_EXIST`.
-pub(crate) const R_KEY_DATA_ALREADY_EXIST: c_int = 43;
 /// `XMLSEC_ERRORS_R_INVALID_KEY_DATA_SIZE`.
 pub(crate) const R_INVALID_KEY_DATA_SIZE: c_int = 44;
 /// `XMLSEC_ERRORS_R_KEY_NOT_FOUND`.
@@ -97,7 +97,7 @@ pub(crate) const R_CAST_IMPOSSIBLE: c_int = 101;
 
 /// libxmlsec1's reason table, in its order; positions past it hold no code
 /// and no message.
-static TABLE: [(c_int, &CStr); 53] = [
+static TABLE: [(c_int, &CStr); 55] = [
     (1, c"xmlsec library function failed"),
     (2, c"malloc function failed"),
     (3, c"strdup function failed"),
@@ -115,7 +115,7 @@ static TABLE: [(c_int, &CStr); 53] = [
     (15, c"invalid operation"),
     (16, c"invalid status"),
     (17, c"invalid format"),
-    (18, c"data do not match"),
+    (18, c"data does not match"),
     (19, c"invalid version"),
     (21, c"invalid node"),
     (22, c"invalid node content"),
@@ -123,7 +123,7 @@ static TABLE: [(c_int, &CStr); 53] = [
     (25, c"missing node attribute"),
     (26, c"node already present"),
     (27, c"unexpected node"),
-    (28, c"node node found"),
+    (28, c"node not found"),
     (31, c"invalid transform"),
     (32, c"invalid transform key"),
     (33, c"invalid URI type"),
@@ -132,12 +132,13 @@ static TABLE: [(c_int, &CStr); 53] = [
     (36, c"invalid or unsupported algorithm"),
     (41, c"invalid key data"),
     (42, c"key data is not found"),
-    (43, c"key data already exist"),
+    (43, c"key data already exists"),
     (44, c"invalid key data size"),
     (45, c"key is not found"),
     (46, c"key data is disabled"),
     (51, c"maximum key retrieval level"),
     (52, c"key retrieval type mismatch"),
+    (53, c"maximum KeyInfoReference level"),
     (61, c"maximum encrypted key level"),
     (71, c"certificate verification failed"),
     (72, c"certificate is not found"),
@@ -151,10 +152,8 @@ static TABLE: [(c_int, &CStr); 53] = [
     (81, c"Reference nodes are not found"),
     (82, c"Reference verification failed"),
     (100, c"assertion"),
+    (101, c"cast from one type to another is impossible"),
 ];
-
-/// `XMLSEC_ERRORS_MAX_NUMBER`.
-const MAX_NUMBER: usize = 256;
 
 /// The capacity of a formatted message, terminator included.
 const MESSAGE_CAPACITY: usize = 1024;
@@ -162,33 +161,44 @@ const MESSAGE_CAPACITY: usize = 1024;
 /// The message a format that cannot be expanded reports instead.
 const FATAL: &CStr = c"Can not format error message";
 
-/// A callback slot: whether it was set, and the callback set (null disables
-/// reporting). Unset, the system slot holds the default callback.
+/// The address that marks a slot as never set; no callback has it.
+static UNSET: u8 = 0;
+
+/// A callback slot in one atomic word, so a store and a clear from different
+/// threads each replace the whole setting: never set ([`UNSET`]'s address),
+/// set to null (reporting disabled), or set to a callback. Unset, the system
+/// slot holds the default callback.
 struct Slot {
-    set: AtomicBool,
-    callback: AtomicPtr<c_void>,
+    setting: AtomicPtr<c_void>,
 }
 
 impl Slot {
     const fn new() -> Self {
         Self {
-            set: AtomicBool::new(false),
-            callback: AtomicPtr::new(std::ptr::null_mut()),
+            setting: AtomicPtr::new(Self::unset()),
         }
+    }
+
+    const fn unset() -> *mut c_void {
+        (&raw const UNSET).cast::<c_void>().cast_mut()
     }
 
     fn store(&self, callback: Option<ErrorsCallback>) {
         let pointer = callback.map_or(std::ptr::null_mut(), |callback| callback as *mut c_void);
-        self.callback.store(pointer, Ordering::Relaxed);
-        self.set.store(true, Ordering::Release);
+        self.setting.store(pointer, Ordering::Release);
+    }
+
+    /// Returns the slot to never set.
+    fn clear(&self) {
+        self.setting.store(Self::unset(), Ordering::Release);
     }
 
     /// What the slot holds.
     fn load(&self) -> Setting {
-        if !self.set.load(Ordering::Acquire) {
+        let pointer = self.setting.load(Ordering::Acquire);
+        if pointer == Self::unset() {
             return Setting::Unset;
         }
-        let pointer = self.callback.load(Ordering::Relaxed);
         if pointer.is_null() {
             return Setting::Set(None);
         }
@@ -243,6 +253,16 @@ pub(crate) unsafe extern "C" fn xmlSecErrorsShutdown() {}
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecErrorsSetCallback(callback: Option<ErrorsCallback>) {
     USER.store(callback);
+}
+
+/// `xmlSecErrorsClearCallback`: drops the application's callback, so reports
+/// go to the system callback again.
+///
+/// # Safety
+/// Callable at any time.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn xmlSecErrorsClearCallback() {
+    USER.clear();
 }
 
 /// `xmlSecErrorsSetSystemCallback`: the crypto layer's callback, used while
@@ -329,7 +349,6 @@ pub(crate) unsafe extern "C" fn xmlSecErrorsDefaultCallback(
         }
         let known = TABLE
             .iter()
-            .take(MAX_NUMBER)
             .find(|(code, _)| *code == reason)
             .map_or(&b""[..], |(_, text)| text.to_bytes());
         let mut text = Vec::new();
@@ -383,7 +402,8 @@ pub(crate) unsafe extern "C" fn xmlSecError(
         // SAFETY: the buffer holds its capacity; the caller's arguments match
         // the format.
         let written = unsafe { vsnprintf(message.as_mut_ptr(), MESSAGE_CAPACITY, msg, args) };
-        if written < 0 {
+        // A message that does not fit is replaced, not truncated.
+        if !usize::try_from(written).is_ok_and(|written| written < MESSAGE_CAPACITY) {
             for (slot, byte) in message.iter_mut().zip(FATAL.to_bytes_with_nul()) {
                 *slot = byte.cast_signed();
             }
@@ -416,8 +436,8 @@ macro_rules! here {
 }
 pub(crate) use here;
 
-/// Reports one failure of the library to the current callback; `message` is
-/// truncated to 1023 bytes, as `xmlSecError` truncates.
+/// Reports one failure of the library to the current callback; a `message`
+/// longer than 1023 bytes is replaced, as `xmlSecError` replaces it.
 pub(crate) fn report(
     here: Here,
     object: *const c_char,
@@ -429,7 +449,9 @@ pub(crate) fn report(
         return;
     };
     let mut bytes: Vec<u8> = message.bytes().take_while(|byte| *byte != 0).collect();
-    bytes.truncate(MESSAGE_CAPACITY - 1);
+    if bytes.len() >= MESSAGE_CAPACITY {
+        bytes = FATAL.to_bytes().to_vec();
+    }
     let Ok(message) = std::ffi::CString::new(bytes) else {
         return;
     };
@@ -547,6 +569,21 @@ pub(crate) fn int_to_size_impossible(here: Here, value: c_int) {
     );
 }
 
+/// libxmlsec1's `XMLSEC_SAFE_CAST_ULLONG_TO_SIZE` report for a value wider
+/// than a size, which only a target with a size narrower than 64 bits makes.
+pub(crate) fn cast_impossible_u64_to_size(here: Here, value: u64) {
+    report(
+        here,
+        std::ptr::null(),
+        std::ptr::null(),
+        R_CAST_IMPOSSIBLE,
+        &format!(
+            "src-type=unsigned long long; src-val={value};dst-type=xmlSecSize; dst-min=0;dst-max={}",
+            usize::MAX
+        ),
+    );
+}
+
 /// The tree layer's last error on this thread as libxmlsec1 writes
 /// libxml2's: `xml error: <code>: <msg>`.
 fn last_xml_error() -> String {
@@ -613,6 +650,24 @@ pub(crate) fn unsupported_enum(here: Here, object: *const c_char, name: &str, va
         std::ptr::null(),
         R_INVALID_TYPE,
         &format!("unsupported value for '{name}': {value}"),
+    );
+}
+
+/// libxmlsec1's `xmlSecInvalidSizeMoreThanError`: `name` is `actual`, more
+/// than `expected` allows.
+pub(crate) fn size_more_than(
+    here: Here,
+    object: *const c_char,
+    name: &str,
+    actual: usize,
+    expected: usize,
+) {
+    report(
+        here,
+        object,
+        std::ptr::null(),
+        R_INVALID_SIZE,
+        &format!("invalid size for '{name}': actual={actual} is greater than expected={expected}"),
     );
 }
 

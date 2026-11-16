@@ -38,8 +38,17 @@ pub(crate) type PreExecuteCallback = Option<unsafe extern "C" fn(*mut XmlSecTran
 
 /// `XMLSEC_TRANSFORMCTX_FLAGS_USE_VISA3D_HACK`.
 const FLAGS_USE_VISA3D_HACK: c_uint = 0x0001;
-/// `xmlSecTransformUriTypeAny`.
-const URI_TYPE_ANY: c_uint = 0xFFFF;
+/// `XMLSEC_TRANSFORMCTX_FLAGS_ALLOW_EMPTY_INPUT`.
+pub(crate) const FLAGS_ALLOW_EMPTY_INPUT: c_uint = 0x0008;
+/// `xmlSecTransformUriTypeEmpty | xmlSecTransformUriTypeSameDocument`: the
+/// URIs a context dereferences until the caller enables more.
+///
+/// This is the documented initial value of the caller-owned `enabledUris`
+/// field of the libxmlsec1 ABI (`transforms.h`), not a deployment default.
+/// It never widens the compiled policy: a dereference needs both the
+/// caller's mask and the policy's URI classes, so a program written for
+/// libxmlsec1 that leaves the mask alone keeps its opt-in for external URIs.
+const URI_TYPES_DEFAULT: c_uint = 0x0001 | 0x0002;
 /// `xmlSecNodeSetTree`.
 const TREE: c_int = 2;
 /// `xmlSecNodeSetTreeWithoutComments`.
@@ -535,7 +544,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxInitialize(
                 );
                 return -1;
             }
-            (*ctx).enabled_uris = URI_TYPE_ANY;
+            (*ctx).enabled_uris = URI_TYPES_DEFAULT;
             (*ctx).binary_chunk_size = xmlSecTransformCtxGetDefaultBinaryChunkSize();
             (*ctx).max_depth = xmlSecTransformCtxGetDefaultMaxDepth();
         }
@@ -561,7 +570,8 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxFinalize(ctx: *mut XmlSecTrans
 }
 
 /// `xmlSecTransformCtxReset`: destroys the chain, the URI, the extra key
-/// data and the result, keeping the user settings.
+/// data and the result and forgets the parent key info context, keeping the
+/// user settings.
 ///
 /// # Safety
 /// `ctx` is null or an initialized context.
@@ -595,6 +605,9 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxReset(ctx: *mut XmlSecTransfor
             }
             context.first = std::ptr::null_mut();
             context.last = std::ptr::null_mut();
+            // The parent key info context belongs to the caller that set it
+            // for this run.
+            context.parent_key_info_ctx = std::ptr::null_mut();
         }
     });
 }
@@ -622,14 +635,10 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxCopyUserPref(
             c"src != NULL",
             -1
         );
-        // The contexts are borrowed apart below; one context as both would
-        // alias them.
-        check!(
-            dst != src,
-            "xmlSecTransformCtxCopyUserPref",
-            c"dst != src",
-            -1
-        );
+        // A context copied onto itself already holds its preferences.
+        if dst == src {
+            return 0;
+        }
         // SAFETY: initialized contexts.
         unsafe {
             let (target, source) = (&mut *dst, &mut *src);
@@ -1126,7 +1135,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxSetUri(
                     location,
                     std::ptr::null(),
                     std::ptr::null(),
-                    errors::R_INVALID_KEY_DATA_SIZE,
+                    errors::R_INVALID_URI_TYPE,
                     &format!("uri={}", text_or_null(uri, text)),
                 );
                 return -1;
@@ -1681,7 +1690,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxDebugXmlDump(
             write_stream(
                 output,
                 &format!(
-                    "<TransformCtx status=\"{}\">\n<Flags>{:08x}</Flags>\n<maxDepth>{}</maxDepth>\n",
+                    "<TransformCtx status=\"{}\">\n<Flags>{:08x}</Flags>\n<MaxDepth>{}</MaxDepth>\n",
                     context.status, context.flags, context.max_depth
                 ),
             );

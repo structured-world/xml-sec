@@ -5,8 +5,8 @@
  *
  * Copyright (C) 2002-2026 Aleksey Sanin <aleksey@aleksey.com>. All Rights Reserved.
  */
-#ifndef __XMLSEC_EXPORTS_H__
-#define __XMLSEC_EXPORTS_H__
+#ifndef XMLSEC_EXPORTS_H
+#define XMLSEC_EXPORTS_H
 /**
  * @brief Platform-specific symbol visibility and export macros.
  */
@@ -15,25 +15,26 @@
 extern "C" {
 #endif /* __cplusplus */
 
-/* There are many variations of Windows */
+/* There are many variations of Windows builds: MCVC, Cygwin, MinGW, etc.
+ * In most cases, the checks for WIN32/WIN64 are sufficient but just to
+ * be thorough, we also check for other Windows-specific macros. */
 #if !defined(XMLSEC_WINDOWS)
-
-#if defined(WIN32) || defined(_WIN32) || defined(WINDOWS) || defined(_WINDOWS)
-#define XMLSEC_WINDOWS 1
-#elif defined(_MSC_VER)
-#define XMLSEC_WINDOWS 1
-#elif defined(__MINGW32__) || defined(__MINGW64__)
-#define XMLSEC_WINDOWS 1
-#elif defined(__CYGWIN__)
-#define XMLSEC_WINDOWS 1
-#endif /* */
-
+#    if defined(WIN32) || defined(_WIN32) || defined(_WIN64) || defined(WIN64)
+#         define XMLSEC_WINDOWS 1
+#    elif defined(_MSC_VER)
+#         define XMLSEC_WINDOWS 1
+#    elif defined(__CYGWIN__)
+#         define XMLSEC_WINDOWS 1
+#    elif defined(__MINGW32__) || defined(__MINGW64__)
+#         define XMLSEC_WINDOWS 1
+#    endif /*  */
 #endif /* !defined(XMLSEC_WINDOWS) */
 
-/* Now, the export fun begins. The following we must do for the
-   Windows platform. */
+/* Windows platform REQUIRES export / import functions from the DLL,
+ * for other platforms it is not required. */
 
-#if !defined XMLSEC_EXPORT
+ /* XMLSEC_EXPORT macro should only be used in the "core" library */
+#if !defined(XMLSEC_EXPORT)
 #  if defined(XMLSEC_WINDOWS)
      /* if we compile libxmlsec itself: */
 #    if defined(IN_XMLSEC)
@@ -43,23 +44,26 @@ extern "C" {
 #        define XMLSEC_EXPORT extern
 #      endif
      /* if a client program includes this file: */
-#    else /* defined(IN_XMLSEC) */
+#    else
 #      if !defined(XMLSEC_STATIC)
 #        define XMLSEC_EXPORT __declspec(dllimport)
 #      else
 #        define XMLSEC_EXPORT extern
 #      endif
 #    endif /* defined(IN_XMLSEC) */
-   /* This holds on all other platforms/compilers, which are easier to
-      handle in regard to this. */
 #  else /* defined(XMLSEC_WINDOWS) */
-#    define XMLSEC_EXPORT
+#    if defined(__GNUC__) || defined(__clang__)
+#      define XMLSEC_EXPORT __attribute__((visibility("default")))
+#    else
+#      define XMLSEC_EXPORT
+#    endif
 #  endif /* defined(XMLSEC_WINDOWS) */
-#endif /* !defined XMLSEC_EXPORT */
+#endif /* !defined(XMLSEC_EXPORT) */
 
-#if !defined XMLSEC_CRYPTO_EXPORT
+ /* XMLSEC_CRYPTO_EXPORT macro should only be used in the xmlsec-<crypto> libraries */
+#if !defined(XMLSEC_CRYPTO_EXPORT)
 #  if defined(XMLSEC_WINDOWS)
-     /* if we compile libxmlsec itself: */
+     /* if we compile libxmlsec-<crypto> itself: */
 #    if defined(IN_XMLSEC_CRYPTO)
 #      if !defined(XMLSEC_STATIC)
 #        define XMLSEC_CRYPTO_EXPORT __declspec(dllexport)
@@ -76,12 +80,18 @@ extern "C" {
 #    endif /* defined(IN_XMLSEC_CRYPTO) */
    /* This holds on all other platforms/compilers, which are easier to
       handle in regard to this. */
-#  else  /* defined(XMLSEC_WINDOWS) */
-#    define XMLSEC_CRYPTO_EXPORT
-#  endif  /* defined(XMLSEC_WINDOWS) */
-#endif /* !defined XMLSEC_CRYPTO_EXPORT */
+#  else /* defined(XMLSEC_WINDOWS) */
+#    if defined(__GNUC__) || defined(__clang__)
+#      define XMLSEC_CRYPTO_EXPORT __attribute__((visibility("default")))
+#    else
+#      define XMLSEC_CRYPTO_EXPORT
+#    endif
+#  endif /* defined(XMLSEC_WINDOWS) */
+#endif /* !defined(XMLSEC_CRYPTO_EXPORT) */
 
-#if !defined XMLSEC_EXPORT_VAR
+
+ /* XMLSEC_EXPORT_VAR macro should only be used in the "core" and xmlsec-<crypto> libraries */
+#if !defined(XMLSEC_EXPORT_VAR)
 #  if defined(XMLSEC_WINDOWS)
      /* if we compile libxmlsec itself: */
 #    if defined(IN_XMLSEC)
@@ -92,7 +102,11 @@ extern "C" {
 #      endif
      /* if we compile libxmlsec-crypto itself: */
 #    elif defined(IN_XMLSEC_CRYPTO)
+#      if !defined(XMLSEC_STATIC)
+#        define XMLSEC_EXPORT_VAR __declspec(dllexport) extern
+#      else
 #        define XMLSEC_EXPORT_VAR extern
+#      endif
      /* if a client program includes this file: */
 #    else
 #      if !defined(XMLSEC_STATIC)
@@ -104,12 +118,16 @@ extern "C" {
    /* This holds on all other platforms/compilers, which are easier to
       handle in regard to this. */
 #  else /* defined(XMLSEC_WINDOWS) */
-#    define XMLSEC_EXPORT_VAR extern
-#  endif  /* defined(XMLSEC_WINDOWS) */
-#endif
+#    if defined(__GNUC__) || defined(__clang__)
+#      define XMLSEC_EXPORT_VAR __attribute__((visibility("default"))) extern
+#    else
+#      define XMLSEC_EXPORT_VAR extern
+#    endif
+#  endif /* defined(XMLSEC_WINDOWS) */
+#endif /* !defined(XMLSEC_EXPORT_VAR) */
 
 #ifdef __cplusplus
 }
 #endif /* __cplusplus */
 
-#endif /* __XMLSEC_EXPORTS_H__ */
+#endif /* XMLSEC_EXPORTS_H */
