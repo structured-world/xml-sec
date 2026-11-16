@@ -35,12 +35,31 @@ jobs:
       # workflows, so the current release-plz is resolved at run time. A
       # numbered tag such as v0.5.147 is no more immutable than v0.5.
       - name: Create release PR
+        id: release-pr
         uses: release-plz/action@v0.5
         with:
           command: release-pr
           config: .release-plz.toml
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+
+      # release-plz raises the version in Cargo.toml only. The dependency
+      # declarations the documentation shows follow it on the release PR's
+      # branch, which CI then checks like any other branch. The action has
+      # already configured the git identity of the token.
+      - name: Align documented dependency versions
+        if: steps.release-pr.outputs.prs_created == 'true'
+        env:
+          RELEASE_BRANCH: ${{ fromJSON(steps.release-pr.outputs.pr).head_branch }}
+        run: |
+          git fetch origin "$RELEASE_BRANCH"
+          git switch --detach FETCH_HEAD
+          cargo run --quiet -p xml-sec-tools -- documentation readme --write
+          if ! git diff --quiet; then
+            git commit --all --message "docs(release): require the new release line in dependency examples"
+            git push origin "HEAD:refs/heads/$RELEASE_BRANCH"
+          fi
+          git switch --detach "$GITHUB_SHA"
 
       - name: Create GitHub Release
         uses: release-plz/action@v0.5

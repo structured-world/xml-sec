@@ -1,9 +1,11 @@
-//! `documentation [all|docs]`: qualifies the published core contract and
-//! executes the examples users actually read.
+//! `documentation [all|docs|readme [--write]]`: qualifies the published core
+//! contract, executes the examples users actually read and keeps the
+//! dependency declarations they copy on the current release line.
 
 use crate::repo::{Failure, Run, Step, System, require};
 use std::path::Path;
 
+mod readme;
 #[cfg(test)]
 mod tests;
 
@@ -173,6 +175,22 @@ pub(crate) fn execute(
 
 pub(crate) fn run(mut args: impl Iterator<Item = String>) -> Result<(), Failure> {
     let phase = args.next().unwrap_or_else(|| "all".into());
+    match phase.as_str() {
+        "readme" => {
+            return match args.next().as_deref() {
+                None => readme::run(false),
+                Some("--write") => readme::run(true),
+                Some(other) => Err(Failure {
+                    code: 2,
+                    message: format!("unknown documentation readme argument: {other}"),
+                }),
+            };
+        }
+        // The cheapest check first: a stale dependency example fails before
+        // any example is built.
+        "all" => readme::run(false)?,
+        _ => {}
+    }
     // Removed when dropped, on success and on failure alike.
     let store = tempfile::Builder::new()
         .prefix("xml-sec-doc-examples.")
