@@ -208,6 +208,8 @@ fn download(url: &str, output: &Path) -> Step {
             "120",
             "--silent",
             "--show-error",
+            "--write-out",
+            "%{url_effective}",
             url,
             "-o",
             &output,
@@ -227,12 +229,19 @@ pub(crate) fn fetch(
     names.insert(schema.to_owned(), "schema-0.xsd".to_owned());
     while let Some(url) = pending.pop() {
         let local = directory.join(&names[&url]);
-        require(run.status(&download(&url, &local))?)?;
+        // RFC 3986 section 5.1.3: the base of a schema is the URI it was
+        // finally retrieved from, after the redirects curl followed.
+        let (status, retrieved) = run.stdout(&download(&url, &local))?;
+        require(status)?;
+        if retrieved.is_empty() {
+            return Err(format!("{url}: curl reported no retrieved URL").into());
+        }
+        let base = retrieved.as_str();
         let text = std::fs::read_to_string(&local)
             .map_err(|error| format!("{}: {error}", local.display()))?;
         let found = imports(&text).map_err(|error| format!("{url}: {error}"))?;
         let text = relocate(&text, &found, |location| {
-            let absolute = resolve(&url, location);
+            let absolute = resolve(base, location);
             let next = names.len();
             names
                 .entry(absolute.clone())

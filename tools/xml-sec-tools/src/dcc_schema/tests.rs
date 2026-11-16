@@ -4,17 +4,20 @@ use std::collections::BTreeMap;
 use std::os::unix::process::ExitStatusExt as _;
 use std::process::ExitStatus;
 
-/// A publisher serving fixed schemas by URL, recording every command it runs.
+/// A publisher serving fixed schemas by URL, following its redirects as
+/// `curl --location` does, and recording every command it runs.
 struct Publisher {
     schemas: BTreeMap<&'static str, &'static str>,
+    redirects: BTreeMap<&'static str, &'static str>,
     commands: Vec<Vec<String>>,
 }
 
-impl Run for Publisher {
-    fn status(&mut self, step: &Step) -> Result<ExitStatus, String> {
+impl Publisher {
+    /// Serves a curl step; returns its exit status and the URL it retrieved.
+    fn serve(&mut self, step: &Step) -> (ExitStatus, String) {
         self.commands.push(step.args.clone());
         if step.program != "curl" {
-            return Ok(ExitStatus::from_raw(0));
+            return (ExitStatus::from_raw(0), String::new());
         }
         let output = step
             .args
@@ -22,16 +25,23 @@ impl Run for Publisher {
             .skip_while(|arg| *arg != "-o")
             .nth(1)
             .unwrap();
-        let url = step.args.iter().rev().nth(2).unwrap();
-        let Some(body) = self.schemas.get(url.as_str()) else {
-            return Ok(ExitStatus::from_raw(22 << 8));
+        let requested = step.args.iter().rev().nth(2).unwrap().as_str();
+        let url = self.redirects.get(requested).copied().unwrap_or(requested);
+        let Some(body) = self.schemas.get(url) else {
+            return (ExitStatus::from_raw(22 << 8), String::new());
         };
         std::fs::write(output, body).unwrap();
-        Ok(ExitStatus::from_raw(0))
+        (ExitStatus::from_raw(0), url.to_owned())
+    }
+}
+
+impl Run for Publisher {
+    fn status(&mut self, step: &Step) -> Result<ExitStatus, String> {
+        Ok(self.serve(step).0)
     }
 
     fn stdout(&mut self, step: &Step) -> Result<(ExitStatus, String), String> {
-        Err(format!("unexpected query: {}", step.label))
+        Ok(self.serve(step))
     }
 
     fn combined(&mut self, step: &Step) -> Result<(ExitStatus, String), String> {
@@ -57,6 +67,7 @@ fn publisher() -> Publisher {
             ("https://example.invalid/si/qudt/quantitykind.xsd", QUDT),
             ("https://example.invalid/d-sig/xmldsig.xsd", DSIG),
         ]),
+        redirects: BTreeMap::new(),
         commands: Vec::new(),
     }
 }
@@ -144,6 +155,35 @@ fn fetch_reads_every_imported_schema_and_points_at_local_copies() {
             assert!(directory.path().join(nested).exists());
         }
     }
+}
+
+#[test]
+fn relative_imports_resolve_against_the_redirect_target() {
+    // RFC 3986 section 5.1.3: the base of a retrieved schema is the URI it was
+    // finally retrieved from, so an unversioned address redirecting into a
+    // release directory reads the release's relative imports from there.
+    let directory = tempfile::tempdir().unwrap();
+    let mut publisher = publisher();
+    publisher.redirects.insert(
+        "https://example.invalid/dcc.xsd",
+        "https://example.invalid/v3/dcc.xsd",
+    );
+    publisher.schemas.insert(
+        "https://example.invalid/v3/dcc.xsd",
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:include schemaLocation="types.xsd"/>
+</xs:schema>"#,
+    );
+    publisher
+        .schemas
+        .insert("https://example.invalid/v3/types.xsd", QUDT);
+    fetch(
+        &mut publisher,
+        "https://example.invalid/dcc.xsd",
+        directory.path(),
+    )
+    .unwrap();
+    assert_eq!(publisher.commands.len(), 2);
 }
 
 #[test]
