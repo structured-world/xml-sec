@@ -95,7 +95,7 @@ pub fn xmlsec_oracle(data: &[u8]) {
         .arg(&native);
     run(&mut verify, &diagnostics);
 
-    // libxmlsec1 1.3.13 defaults to strict KeyInfo selection. Name the
+    // libxmlsec1 defaults to strict KeyInfo selection. Name the
     // explicitly loaded fixture key rather than enabling lax key search.
     let signature = builder
         .build_template()

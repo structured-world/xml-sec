@@ -2,13 +2,10 @@
 
 This directory contains the XMLDSig test documents used by integration tests.
 They are checked into the repository so CI never depends on a local donor clone.
-The current compatibility oracle is the xmlsec1 1.3.13 development snapshot at
-the commit recorded in the canonical
-[`libxmlsec1-1.3.13-donor-commit.txt`](../../../compatibility/libxmlsec1-1.3.13-donor-commit.txt)
-pin; upstream had bumped the
-version but had not published a release tag when this snapshot was pinned.
-`xml-sec-tools install-xmlsec1` verifies both that source commit and the live
-`xmlsec1 --version` output before reusing a cached development installation.
+The compatibility oracle is upstream libxmlsec1 master as it is when the tests
+run. `xml-sec-tools install-xmlsec1` records the source commit it built and
+verifies it and the live `xmlsec1 --version` output before reusing a cached
+installation.
 
 ## Importing Vectors
 

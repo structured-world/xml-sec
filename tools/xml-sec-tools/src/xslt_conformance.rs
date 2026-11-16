@@ -1,8 +1,8 @@
 //! `xslt-conformance [--cache-managed]`: the XSLT conformance gate. It admits
-//! only the pinned xmlsec1 oracle with its XSLT transform, then runs the engine
-//! suites and the reciprocal oracle checks on the complete corpus.
+//! only an xmlsec1 oracle the installer built, with its XSLT transform, then
+//! runs the engine suites and the reciprocal oracle checks on the complete corpus.
 
-use crate::repo::{Failure, Run, Step, System, require, root};
+use crate::repo::{Failure, Run, Step, System, require};
 use std::path::Path;
 
 #[cfg(test)]
@@ -56,30 +56,38 @@ pub(crate) fn plan(cleanup: bool) -> Vec<Step> {
     steps
 }
 
-/// Admits only the pinned oracle build with its XSLT transform; anything else
-/// would let the interoperability tests skip silently.
-pub(crate) fn admit(run: &mut impl Run, xmlsec: &Path, pinned: &str) -> Result<(), Failure> {
+/// Admits only an oracle the installer built, whose binary reports the
+/// version of the source it recorded, with its XSLT transform; anything else
+/// would let the interoperability tests skip silently. Returns that source.
+pub(crate) fn admit(
+    run: &mut impl Run,
+    xmlsec: &Path,
+) -> Result<crate::install_xmlsec1::Source, Failure> {
     let prefix = xmlsec
         .parent()
         .and_then(Path::parent)
         .ok_or("XMLSEC1_BIN must name an installed oracle binary")?;
-    let recorded = crate::install_xmlsec1::installed(prefix);
-    if recorded.as_ref().map(|source| source.commit.as_str()) != Some(pinned) {
-        return Err("Oracle source provenance must match the pinned installer revision".into());
-    }
+    let recorded = crate::install_xmlsec1::installed(prefix)
+        .ok_or("The oracle has no source provenance from the installer")?;
     let binary = xmlsec.display().to_string();
     let query = |flag: &str| Step::new(format!("xmlsec1 {flag}"), &binary, &[flag]);
     let (status, version) = run.stdout(&query("--version"))?;
     require(status)?;
-    if !version.starts_with("xmlsec1 1.3.13 ") {
-        return Err(format!("Expected xmlsec1 1.3.13, got {}", version.trim()).into());
+    if !version.starts_with(&format!("xmlsec1 {} ", recorded.version)) {
+        return Err(format!(
+            "Expected xmlsec1 {} built from {}, got {}",
+            recorded.version,
+            recorded.commit,
+            version.trim()
+        )
+        .into());
     }
     let (status, transforms) = run.stdout(&query("--list-transforms"))?;
     require(status)?;
     if !transforms.contains("\"xslt\"") {
         return Err("The oracle must provide its XSLT transform".into());
     }
-    Ok(())
+    Ok(recorded)
 }
 
 /// Runs the gate; a failed suite keeps its exit status and the build evidence.
@@ -96,10 +104,11 @@ pub(crate) fn execute(
     };
     required("LIBXSLT_SOURCE_DIR", "the pinned libxslt source checkout")?;
     let xmlsec = required("XMLSEC1_BIN", "the explicitly provisioned xmlsec1 oracle")?;
-    let pin = root().join("compatibility/libxmlsec1-1.3.13-donor-commit.txt");
-    let pinned =
-        std::fs::read_to_string(&pin).map_err(|error| format!("{}: {error}", pin.display()))?;
-    admit(run, Path::new(&xmlsec), pinned.trim())?;
+    let oracle = admit(run, Path::new(&xmlsec))?;
+    println!(
+        "XSLT conformance oracle: xmlsec1 {} built from upstream {}",
+        oracle.version, oracle.commit
+    );
     fixtures()?;
     for step in plan(cleanup) {
         require(run.status(&step)?)?;

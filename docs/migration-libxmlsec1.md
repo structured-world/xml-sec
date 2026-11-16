@@ -1,6 +1,6 @@
 # Migrating From libxmlsec1
 
-The comparison baseline is pinned libxmlsec1 1.3.13. Consult the generated
+The comparison baseline is upstream libxmlsec1 master as it is when CI runs. Consult the generated
 [declaration and behavior ledgers](compatibility-ledger.md) for exact outcomes.
 Native Rust, the process CLI, C source compatibility, libxml2 DOM compatibility
 and binary ABI are independent tiers. This source tree implements no libxmlsec1

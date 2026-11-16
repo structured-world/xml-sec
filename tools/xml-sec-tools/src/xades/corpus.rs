@@ -486,10 +486,12 @@ fn versions(corpus: &Corpus, results: &Path) -> Result<Map<String, Value>, Strin
         return Err("oracle version query failed; inspect versions/xmlsec1.stderr".into());
     }
     let oracle_version = text(&oracle.stdout).trim().to_owned();
-    if !["xmlsec1 1.3.12 (openssl)", "xmlsec1 1.3.13 (openssl)"].contains(&oracle_version.as_str())
-    {
+    // The byte-dump parser reads the oracle's debug output in the format of
+    // upstream master; a new upstream version fails here until the corpus has
+    // been run against it.
+    if oracle_version != "xmlsec1 1.3.14 (openssl)" {
         return Err(format!(
-            "byte-dump parser requires qualified native xmlsec1 1.3.12/1.3.13 (openssl), got: {oracle_version}"
+            "byte-dump parser requires qualified native xmlsec1 1.3.14 (openssl), got: {oracle_version}"
         ));
     }
     let commit = corpus.command(&line(&[&"git", &"rev-parse", &"HEAD"]), &log("commit"))?;
@@ -589,7 +591,8 @@ fn oracle_octets(stdout: &[u8], succeeded: bool, values: &[String]) -> Result<Oc
     }
     Ok(Octets {
         references,
-        signed_info: debug_buffer(stdout, "PreSigned")?,
+        // Upstream master labels the SignedInfo buffer "PreSign data".
+        signed_info: debug_buffer(stdout, "PreSign")?,
     })
 }
 

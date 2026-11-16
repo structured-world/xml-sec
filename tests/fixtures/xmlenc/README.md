@@ -1,13 +1,11 @@
 # XMLEnc Donor Fixtures
 
 These fixtures are tracked so decryption interoperability tests do not depend
-on network access or a local xmlsec1 checkout. They were imported from the
-`xmlsec_1_3_13` tag of
-[lsh123/xmlsec](https://github.com/lsh123/xmlsec/tree/xmlsec_1_3_13/tests).
-The commit recorded in the canonical
-[`libxmlsec1-1.3.13-donor-commit.txt`](../../../compatibility/libxmlsec1-1.3.13-donor-commit.txt)
-contains no changes to these
-fixture bytes; reciprocal CLI tests run against that newer snapshot.
+on network access or a local xmlsec1 checkout. They are imported from the tests
+of upstream [lsh123/xmlsec](https://github.com/lsh123/xmlsec/tree/master/tests)
+master with `cargo run -p xml-sec-tools -- donor-fixtures --xmlenc-corpora`;
+`corpora.sha256` pins every imported byte, and reciprocal tests run against an
+oracle built from upstream master.
 
 Imported donor artifacts are kept byte-for-byte, including upstream wording
 and spelling. Repository-specific clarifications belong in this wrapper rather

@@ -160,7 +160,8 @@ fn capture_native_octets(directory: &Path) -> Result<(), String> {
             expected,
         )?;
     }
-    let signed_info = debug_buffer(&stdout, "PreSigned")?
+    // Upstream master labels the SignedInfo buffer "PreSign data".
+    let signed_info = debug_buffer(&stdout, "PreSign")?
         .ok_or_else(|| format!("missing native SignedInfo: {name}"))?;
     write(&directory.join("expected-signedinfo.bin"), signed_info)
 }
