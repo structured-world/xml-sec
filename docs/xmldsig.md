@@ -29,8 +29,10 @@ feature, must fail at an explicit typed boundary rather than being skipped.
 
 ## Experimental Recipient Encapsulation
 
-`experimental-pq` supports libxmlsec1 1.3.13's experimental
-`EncapsulationMechanism` inside signature `KeyInfo`. It is an extension, not a
+`experimental-pq` supports an ML-KEM `EncryptedKey` inside signature `KeyInfo`,
+whose shared secret is the HMAC key, as upstream libxmlsec1 does; its
+`EncryptionMethod` carries the ML-KEM identifier of
+draft-eastlake-rfc9231bis-xmlsec-uris section 3.6.9. It is an extension, not a
 W3C signature algorithm. Use `SignContext::new_encapsulation(&recipient_public)`
 with an HMAC builder/template and an explicitly permitting `SigningPolicy`.
 The context fills the KEM ciphertext before canonicalization and reference
@@ -767,22 +769,32 @@ verification, and before signing-key callbacks. Unsupported signature methods re
 This early parameter check does not query key metadata; template signing queries it once in
 the key preflight before producing the signature.
 
-`SignatureBuilder::signature_context(SignatureContext)` places context bytes inside the
-authenticated `SignedInfo/SignatureMethod`. Contexts are limited to 255 octets by the
+`SignatureBuilder::signature_context(SignatureContext)` places context bytes in a `ds:Object`
+of the generated signature. They lie outside `SignedInfo`, but they are an input to the
+signature algorithm, so a changed or removed context fails verification. Contexts are limited
+to 255 octets by the
 cryptographic wire contract; a nonempty context on a method without context support is rejected
-rather than ignored. Context-capable methods default to an empty context. The XML context
-elements use libxmlsec1's explicit experimental namespace
-`http://www.aleksey.com/xmlsec/2025/12/xmldsig-more#`; these parameter elements are not
-standardized by RFC 9231. Parsing enforces text and decoded-width bounds before allocating
+rather than ignored. Context-capable methods default to an empty context. The context is a
+`SignatureContext` element in the `http://www.w3.org/2026/08/xmldsig-more#` namespace, defined
+by draft-eastlake-rfc9231bis-xmlsec-uris section 3.3.15 as content of a `ds:Object`.
+Verification and template signing read it as a direct child of a `ds:Object` of the same
+`ds:Signature` or, as upstream libxmlsec1 also does, as the only child of `SignatureMethod`, and
+refuse a signature with more than one. A context in a `ds:Object` lies outside `SignedInfo`, but it is
+an input to the signature algorithm, so changing it fails verification. The `EdDSAContextString`,
+`MLDSAContextString` and `SLHDSAContextString` elements of libxmlsec1 1.3.13's experimental
+namespace are no longer read. Parsing enforces text and decoded-width bounds before allocating
 context storage and rejects malformed Base64, nested elements, and incompatible parameters.
-The pinned libxmlsec1 1.3.13 oracle does not read the XML context element for pure Ed448;
-it does for Ed448ph. This library supports pure Ed448's RFC 8032 context through the explicit
-extension and validates it against RFC 8032 section 7.4's known-answer vector. For reciprocal
-pure-Ed448 interoperability with that donor, use an empty context.
+libxmlsec1 does not read the context element for pure Ed448; it does for Ed448ph. This library
+supports pure Ed448's RFC 8032 context through the same element and validates it against RFC
+8032 section 7.4's known-answer vector. For reciprocal pure-Ed448 interoperability with
+libxmlsec1, use an empty context.
 
 The optional `experimental-pq` feature compiles ML-DSA-44/65/87 and
-SLH-DSA-SHA2-128f/128s/192f/192s/256f/256s. Their XML signature identifiers are experimental
-libxmlsec1 extensions, not W3C-standardized XML methods. Compilation alone does not grant
+SLH-DSA-SHA2-128f/128s/192f/192s/256f/256s. Their XML signature identifiers are those of
+draft-eastlake-rfc9231bis-xmlsec-uris in the `http://www.w3.org/2026/08/xmldsig-more#` namespace,
+as upstream libxmlsec1 uses them; the draft is not yet an RFC and may still change them. The
+`http://www.aleksey.com/xmlsec/2025/12/xmldsig-more#` identifiers of libxmlsec1 1.3.13 are not
+recognized. Compilation alone does not grant
 permission: signing and verification require an explicit algorithm allowlist in the immutable
 operation policy. PKCS#8 and SPKI use RFC 9881/RFC 9909 encodings. ML-DSA import accepts
 seed-only, expanded-only, and consistent seed-plus-expanded keys; expanded imports are checked

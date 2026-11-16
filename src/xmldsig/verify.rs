@@ -2248,7 +2248,7 @@ pub fn verify_signature_with_pem_key(
             if context.as_bytes().is_empty() {
                 return self.verify(algorithm, signed_data, signature_value);
             }
-            if algorithm.context_element().is_none() {
+            if !algorithm.takes_signature_context() {
                 return Err(SignatureVerificationError::UnsupportedAlgorithm {
                     uri: algorithm.uri().to_owned(),
                 }
@@ -4000,7 +4000,13 @@ struct KeyInfoMaterializationState {
     retain_encapsulation_target: bool,
     encapsulation_depth: usize,
     reference_depth_base: usize,
-    encapsulation_target: Option<(super::uri::TraversalDocumentIdentity, NodeId, NodeId)>,
+    /// Document, `CipherValue` and the optional recipient `KeyInfo` of the
+    /// ML-KEM `EncryptedKey`.
+    encapsulation_target: Option<(
+        super::uri::TraversalDocumentIdentity,
+        NodeId,
+        Option<NodeId>,
+    )>,
     encapsulation: Option<ResolvedEncapsulation>,
     // Present while candidates are retained: RetrievalMethods left unread
     // inside an external KeyInfo. They never reach key selection, which would
@@ -4055,7 +4061,7 @@ impl KeyInfoMaterializationState {
             self.encapsulation_target = Some((
                 resolver.traversal_document_identity(),
                 mechanism.cipher_value.id(),
-                mechanism.key_info.id(),
+                mechanism.key_info.map(Node::id),
             ));
         }
         self.encapsulation = Some(ResolvedEncapsulation {
@@ -4853,10 +4859,7 @@ fn visit_encapsulation<P: KeyInfoReferencePolicy>(
         };
         *work += 1;
         resources.validate_key_candidates(*work)?;
-        if child.has_tag_name((
-            crate::key_establishment::ENCAPSULATION_NS,
-            "EncapsulationMechanism",
-        )) {
+        if crate::key_establishment::encapsulation_algorithm(child).is_some() {
             if state.materialization.is_none() {
                 return Ok(true);
             }
@@ -4987,7 +4990,12 @@ fn inspect_signature_key_info_with_budgets<P: KeyInfoReferencePolicy>(
                     reason: "recipient metadata requires its original document context",
                 });
             }
-            if retain_recipient_hints {
+            // An EncryptedKey without KeyInfo names no recipient key: the
+            // signature's own KeyInfo hints describe the HMAC key, not it.
+            if retain_recipient_hints && recipient.is_none() {
+                key_info = super::parse::KeyInfo::default();
+            }
+            if retain_recipient_hints && let Some(recipient) = recipient {
                 let recipient =
                     resolver
                         .node_for_node_id(recipient)

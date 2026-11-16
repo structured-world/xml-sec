@@ -70,19 +70,19 @@ pub(crate) fn default_paths() -> Vec<String> {
     for size in [512, 768, 1024] {
         for extension in ["xml", "tmpl"] {
             paths.push(format!(
-                "xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-em-ml-kem-{size}.{extension}"
+                "xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-kt-ml-kem-{size}.{extension}"
             ));
         }
         for extension in ["xml", "tmpl", "data"] {
             paths.push(format!(
-                "xmlenc/aleksey-xmlenc-01/enc-aes256-em-ml-kem-{size}.{extension}"
+                "xmlenc/aleksey-xmlenc-01/enc-aes256-kt-ml-kem-{size}.{extension}"
             ));
         }
     }
     for family in [
-        "aes128gcm-em-ml-kem-512",
-        "aes192gcm-em-ml-kem-768",
-        "aes256gcm-em-ml-kem-1024",
+        "aes128gcm-kt-ml-kem-512",
+        "aes192gcm-kt-ml-kem-768",
+        "aes256gcm-kt-ml-kem-1024",
     ] {
         for extension in ["xml", "tmpl", "data"] {
             paths.push(format!("xmlenc/aleksey-xmlenc-01/enc-{family}.{extension}"));
@@ -91,9 +91,12 @@ pub(crate) fn default_paths() -> Vec<String> {
     paths
 }
 
+/// Fixture directories whose upstream directory has another name.
+const RENAMED: [(&str, &str); 1] = [("01-phaos-xmlenc-3", "phaos-xmlenc-three-01")];
+
 /// The donor path below `xmldsig/` or `xmlenc/`, refusing anything that could
 /// leave the donor or fixture tree.
-pub(crate) fn donor_path(relative: &str) -> Result<&str, String> {
+pub(crate) fn donor_path(relative: &str) -> Result<String, String> {
     let rest = relative
         .strip_prefix("xmldsig/")
         .or_else(|| relative.strip_prefix("xmlenc/"))
@@ -106,7 +109,14 @@ pub(crate) fn donor_path(relative: &str) -> Result<&str, String> {
             "fixture path contains an empty, current, or parent component: {relative}"
         ));
     }
-    Ok(rest)
+    let (first, tail) = rest
+        .split_once('/')
+        .map_or((rest, None), |(first, tail)| (first, Some(tail)));
+    let first = RENAMED
+        .iter()
+        .find(|(fixture, _)| *fixture == first)
+        .map_or(first, |(_, donor)| donor);
+    Ok(tail.map_or_else(|| first.to_owned(), |tail| format!("{first}/{tail}")))
 }
 
 /// A fresh hidden name beside `target` for staging or backup.

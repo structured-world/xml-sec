@@ -266,8 +266,9 @@ fn fixture_file_count_matches_expected() {
         // Agreement recipes additionally need all 66 EC and 12 DHX key files.
         // Completing the 79-file XML Encryption 1.1 snapshot adds 70 files
         // to the nine RSA files retained by the earlier subset.
-        // The checksum manifest pins every imported file's contents.
-        ("xmlenc", 1072),
+        // The checksum manifest pins every imported file's contents. Upstream
+        // master adds Triple DES key wrap, empty data and KA-Nonce vectors.
+        ("xmlenc", 1081),
     ];
 
     for (corpus, expected_count) in expected {

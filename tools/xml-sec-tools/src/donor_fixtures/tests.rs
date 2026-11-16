@@ -58,9 +58,10 @@ fn a_complete_xmlenc_import_keeps_every_corpus_byte_and_pins_it() {
         ("unlisted extra.data", b"not in a curated vector list\r\n"),
     ];
     for corpus in XMLENC_CORPORA {
-        let donor = corpus.strip_prefix("xmlenc/").unwrap();
+        // A renamed upstream directory is read under its upstream name.
+        let donor = donor_path(corpus).unwrap();
         for (name, bytes) in payloads {
-            write(&trees.donor.join(donor).join(name), bytes);
+            write(&trees.donor.join(&donor).join(name), bytes);
         }
         write(
             &trees.fixtures.join(corpus).join("obsolete.xml"),
@@ -185,6 +186,11 @@ fn fixture_paths_stay_inside_the_donor_and_fixture_trees() {
     // A path names one donor entry below xmldsig/ or xmlenc/, nothing else.
     assert_eq!(donor_path("xmldsig/keys/ml-kem").unwrap(), "keys/ml-kem");
     assert_eq!(donor_path("xmlenc/nist-aesgcm").unwrap(), "nist-aesgcm");
+    // Upstream renamed this directory; the fixture keeps its name.
+    assert_eq!(
+        donor_path("xmlenc/01-phaos-xmlenc-3/payment.xml").unwrap(),
+        "phaos-xmlenc-three-01/payment.xml"
+    );
     for path in [
         "keys/ml-kem",
         "xmldsig/",
@@ -210,7 +216,7 @@ fn the_default_import_covers_every_rsa_pss_and_ml_kem_family_member() {
             .any(|path| path.contains("enveloped-sha1-rsa-pss-sha1"))
     );
     assert!(
-        paths.contains(&"xmlenc/aleksey-xmlenc-01/enc-aes192gcm-em-ml-kem-768.data".to_owned())
+        paths.contains(&"xmlenc/aleksey-xmlenc-01/enc-aes192gcm-kt-ml-kem-768.data".to_owned())
     );
     assert_eq!(paths.len(), 23 + 9 * 2 + 8 * 2 + 3 * 5 + 3 * 3);
 }

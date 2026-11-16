@@ -1652,8 +1652,7 @@ fn injected_key_info_carries_alternate_prefix_bindings() {
 #[cfg(feature = "experimental-pq")]
 fn kem_template(mechanism_info: &str, outer_info: &str, sibling: &str) -> String {
     format!(
-        "<root xmlns:x=\"{XMLENC_NS}\" xmlns:d=\"{XMLDSIG_NS}\" xmlns:i=\"http://www.w3.org/2009/xmldsig11#\" xmlns:k=\"{}\"><x:EncryptedData Id=\"data\"><x:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><d:KeyInfo>{outer_info}</d:KeyInfo><x:CipherData><x:CipherValue/></x:CipherData></x:EncryptedData><d:KeyInfo Id=\"mechanism\"><k:EncapsulationMechanism Algorithm=\"{}\"><d:KeyInfo>{mechanism_info}</d:KeyInfo><x:CipherData><x:CipherValue/></x:CipherData></k:EncapsulationMechanism></d:KeyInfo>{sibling}</root>",
-        xml_sec::key_establishment::ENCAPSULATION_NS,
+        "<root xmlns:x=\"{XMLENC_NS}\" xmlns:d=\"{XMLDSIG_NS}\" xmlns:i=\"http://www.w3.org/2009/xmldsig11#\"><x:EncryptedData Id=\"data\"><x:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><d:KeyInfo>{outer_info}</d:KeyInfo><x:CipherData><x:CipherValue/></x:CipherData></x:EncryptedData><d:KeyInfo Id=\"mechanism\"><x:EncryptedKey><x:EncryptionMethod Algorithm=\"{}\"/><d:KeyInfo>{mechanism_info}</d:KeyInfo><x:CipherData><x:CipherValue/></x:CipherData></x:EncryptedKey></d:KeyInfo>{sibling}</root>",
         xml_sec::provider::KeyEncapsulationAlgorithm::MlKem512.uri(),
     )
 }
@@ -1721,12 +1720,7 @@ fn kem_template_rejects_unexecuted_nested_recipient() {
     let document = Document::parse(&template).unwrap();
     let mechanism = document
         .descendants()
-        .find(|node| {
-            node.has_tag_name((
-                xml_sec::key_establishment::ENCAPSULATION_NS,
-                "EncapsulationMechanism",
-            ))
-        })
+        .find(|node| is_kem_encrypted_key(*node))
         .unwrap();
     let nested = format!(
         "<x:EncryptedKey><x:EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#kw-aes256\"/><d:KeyInfo>{}</d:KeyInfo><x:CipherData><x:CipherValue/></x:CipherData></x:EncryptedKey>",
@@ -1753,7 +1747,7 @@ fn kem_template_rejects_unexecuted_nested_recipient() {
         .err()
         .expect("unexecuted mechanism must be rejected");
         assert!(
-            error.to_string().contains("nested EncapsulationMechanism"),
+            error.to_string().contains("nested ML-KEM EncryptedKey"),
             "{error}"
         );
     }
@@ -1828,8 +1822,7 @@ fn kem_template_updates_referenced_cipher_value() {
     );
     let ciphertext = base64::engine::general_purpose::STANDARD.encode([7; 768]);
     let generated = format!(
-        "<x:EncryptedData xmlns:x=\"{XMLENC_NS}\" xmlns:d=\"{XMLDSIG_NS}\" xmlns:k=\"{}\"><x:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><d:KeyInfo><k:EncapsulationMechanism Algorithm=\"{}\"><d:KeyInfo><d:KeyName>wanted</d:KeyName></d:KeyInfo><x:CipherData><x:CipherValue>{ciphertext}</x:CipherValue></x:CipherData></k:EncapsulationMechanism></d:KeyInfo><x:CipherData><x:CipherValue>AA==</x:CipherValue></x:CipherData></x:EncryptedData>",
-        xml_sec::key_establishment::ENCAPSULATION_NS,
+        "<x:EncryptedData xmlns:x=\"{XMLENC_NS}\" xmlns:d=\"{XMLDSIG_NS}\"><x:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><d:KeyInfo><x:EncryptedKey><x:EncryptionMethod Algorithm=\"{}\"/><d:KeyInfo><d:KeyName>wanted</d:KeyName></d:KeyInfo><x:CipherData><x:CipherValue>{ciphertext}</x:CipherValue></x:CipherData></x:EncryptedKey></d:KeyInfo><x:CipherData><x:CipherValue>AA==</x:CipherValue></x:CipherData></x:EncryptedData>",
         xml_sec::provider::KeyEncapsulationAlgorithm::MlKem512.uri(),
     );
     let rendered = apply_encryption_template(
@@ -1844,12 +1837,7 @@ fn kem_template_updates_referenced_cipher_value() {
     let document = Document::parse(&rendered).unwrap();
     let mechanisms: Vec<_> = document
         .descendants()
-        .filter(|node| {
-            node.has_tag_name((
-                xml_sec::key_establishment::ENCAPSULATION_NS,
-                "EncapsulationMechanism",
-            ))
-        })
+        .filter(|node| is_kem_encrypted_key(*node))
         .collect();
     assert_eq!(mechanisms.len(), 1);
     assert_eq!(

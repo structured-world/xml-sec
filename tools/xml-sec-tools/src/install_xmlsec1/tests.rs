@@ -269,7 +269,11 @@ fn an_oracle_without_the_xslt_transform_is_refused() {
     // of the XSLT interoperability tests.
     let prefix = Prefix::new(true);
     let mut toolchain = Toolchain::new(&prefix.path());
-    toolchain.transforms = listed(&COMPATIBILITY[..7]);
+    let without_xslt: Vec<&str> = COMPATIBILITY
+        .into_iter()
+        .filter(|transform| *transform != "xslt")
+        .collect();
+    toolchain.transforms = listed(&without_xslt);
     let error = execute(&mut toolchain, &prefix.install(false, None)).unwrap_err();
     assert!(error.contains("missing required"), "{error}");
     assert!(prefix.previous_kept());
@@ -381,6 +385,29 @@ fn a_cache_of_masters_current_commit_is_reused_without_building() {
     execute(&mut toolchain, &prefix.install(false, None)).unwrap();
     assert!(prefix.previous_kept());
     assert!(!built(&toolchain));
+}
+
+#[test]
+fn a_cache_without_triple_des_is_not_reused() {
+    // Upstream master builds Triple DES only on request; a cache of the same
+    // commit built before the request would leave the Triple DES corpus
+    // without its transform, so it is rebuilt.
+    let prefix = cached(COMMIT);
+    let mut toolchain = Toolchain::new(&prefix.path());
+    toolchain.transforms = listed(&[
+        "md5",
+        "ripemd160",
+        "rsa-md5",
+        "rsa-ripemd160",
+        "hmac-md5",
+        "hmac-ripemd160",
+        "ecdsa-ripemd160",
+        "xslt",
+    ]);
+    let error = execute(&mut toolchain, &prefix.install(false, None)).unwrap_err();
+    assert!(built(&toolchain));
+    assert!(error.contains("missing required"), "{error}");
+    assert!(prefix.previous_kept());
 }
 
 #[test]

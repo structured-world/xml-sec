@@ -51,12 +51,15 @@ fn key_data_capabilities_are_distinct_from_generation_algorithms() {
 fn kem_capabilities_follow_the_selected_engine() {
     // XML algorithm recognition never implies that an engine implements it.
     let provider = xml_sec::provider::RustCryptoProvider;
+    // ML-KEM key transport is an EncryptedKey, so upstream libxmlsec1 master
+    // registers no separate encapsulation key data.
     assert_eq!(
-        KEY_DATA.contains(&"encapsulation-mechanism"),
+        KEY_DATA.contains(&"ml-kem"),
         cfg!(feature = "experimental-pq")
     );
+    assert!(!KEY_DATA.contains(&"encapsulation-mechanism"));
     assert_eq!(
-        key_data_available("encapsulation-mechanism", &provider),
+        key_data_available("ml-kem", &provider),
         cfg!(feature = "experimental-pq")
     );
     for name in ["ml-kem-512", "ml-kem-768", "ml-kem-1024"] {

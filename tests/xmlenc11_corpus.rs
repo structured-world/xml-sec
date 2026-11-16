@@ -360,6 +360,10 @@ fn rsa_key_name(bits: u16) -> &'static str {
     }
 }
 
+/// xmlsec1 counts an `AgreementMethod` and its `EncryptedKey` as nested levels and
+/// allows one by default; the donor's own key agreement recipes raise it.
+const AGREEMENT_DEPTH: [&str; 2] = ["--max-encrypted-key-level", "3"];
+
 /// The donor recipe's xmlsec1 credentials for encrypting `case`'s template.
 fn oracle_encrypt_credentials(command: &mut std::process::Command, case: &Case) {
     match case.credential {
@@ -390,6 +394,7 @@ fn oracle_encrypt_credentials(command: &mut std::process::Command, case: &Case) 
                 EcdhCurve::P521 => 521,
             };
             command
+                .args(AGREEMENT_DEPTH)
                 .arg("--enabled-key-data")
                 .arg("agreement-method,enc-key,key-value,key-name,ec")
                 .arg(format!("--privkey-der:EC-P{bits}"))
@@ -399,6 +404,7 @@ fn oracle_encrypt_credentials(command: &mut std::process::Command, case: &Case) 
         }
         Credential::Dh => {
             command
+                .args(AGREEMENT_DEPTH)
                 .arg("--enabled-key-data")
                 .arg("agreement-method,enc-key,key-value,key-name,dh")
                 .arg("--privkey-der:dhx-rfc5114-3-first")
@@ -433,6 +439,7 @@ fn oracle_decrypt_credentials(command: &mut std::process::Command, case: &Case) 
         }
         Credential::Ec(_, stem) => {
             command
+                .args(AGREEMENT_DEPTH)
                 .arg("--enabled-key-data")
                 .arg("agreement-method,enc-key,key-value,key-name,ec")
                 .arg(format!("--privkey-der:TestKeyName-{stem}"))
@@ -440,6 +447,7 @@ fn oracle_decrypt_credentials(command: &mut std::process::Command, case: &Case) 
         }
         Credential::Dh => {
             command
+                .args(AGREEMENT_DEPTH)
                 .arg("--enabled-key-data")
                 .arg("agreement-method,enc-key,key-value,key-name,dh")
                 .arg("--privkey-der:dhx-rfc5114-3-second")

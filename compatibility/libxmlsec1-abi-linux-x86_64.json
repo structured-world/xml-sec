@@ -21,7 +21,6 @@
       "-DXMLSEC_CRYPTO_DYNAMIC_LOADING=1",
       "-DXMLSEC_DL_LIBLTDL=1",
       "-DXMLSEC_FUNCTION=__func__",
-      "-DXMLSEC_NO_DES=1",
       "-DXMLSEC_NO_FTP=1",
       "-DXMLSEC_NO_GOST2012=1",
       "-DXMLSEC_NO_GOST=1",
@@ -5535,9 +5534,34 @@
           "declaration": "export-function"
         },
         {
+          "name": "xmlSecTransformKWDes3Execute",
+          "kind": "function",
+          "declaration": "internal-export"
+        },
+        {
+          "name": "xmlSecTransformKWDes3Finalize",
+          "kind": "function",
+          "declaration": "internal-export"
+        },
+        {
           "name": "xmlSecTransformKWDes3GetKlass",
           "kind": "function",
           "declaration": "export-function"
+        },
+        {
+          "name": "xmlSecTransformKWDes3Initialize",
+          "kind": "function",
+          "declaration": "internal-export"
+        },
+        {
+          "name": "xmlSecTransformKWDes3SetKey",
+          "kind": "function",
+          "declaration": "internal-export"
+        },
+        {
+          "name": "xmlSecTransformKWDes3SetKeyReq",
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformKWRfc3394Execute",
@@ -6312,6 +6336,16 @@
           "declaration": "backend-api"
         },
         {
+          "name": "xmlSecOpenSSLKeyDataDesGetKlass",
+          "kind": "function",
+          "declaration": "backend-api"
+        },
+        {
+          "name": "xmlSecOpenSSLKeyDataDesSet",
+          "kind": "function",
+          "declaration": "backend-api"
+        },
+        {
           "name": "xmlSecOpenSSLKeyDataDhAdoptEvp",
           "kind": "function",
           "declaration": "backend-api"
@@ -6619,6 +6653,11 @@
           "declaration": "backend-api"
         },
         {
+          "name": "xmlSecOpenSSLTransformDes3CbcGetKlass",
+          "kind": "function",
+          "declaration": "backend-api"
+        },
+        {
           "name": "xmlSecOpenSSLTransformDhEsGetKlass",
           "kind": "function",
           "declaration": "backend-api"
@@ -6780,6 +6819,11 @@
         },
         {
           "name": "xmlSecOpenSSLTransformKWCamellia256GetKlass",
+          "kind": "function",
+          "declaration": "backend-api"
+        },
+        {
+          "name": "xmlSecOpenSSLTransformKWDes3GetKlass",
           "kind": "function",
           "declaration": "backend-api"
         },
@@ -12001,6 +12045,18 @@
       }
     },
     {
+      "name": "xmlSecOpenSSLKeyDataDesGetKlass",
+      "returns": {
+        "kind": "static"
+      }
+    },
+    {
+      "name": "xmlSecOpenSSLKeyDataDesSet",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
       "name": "xmlSecOpenSSLKeyDataDhAdoptEvp",
       "returns": {
         "kind": "value"
@@ -12399,6 +12455,12 @@
       }
     },
     {
+      "name": "xmlSecOpenSSLTransformDes3CbcGetKlass",
+      "returns": {
+        "kind": "static"
+      }
+    },
+    {
       "name": "xmlSecOpenSSLTransformDhEsGetKlass",
       "returns": {
         "kind": "static"
@@ -12592,6 +12654,12 @@
     },
     {
       "name": "xmlSecOpenSSLTransformKWCamellia256GetKlass",
+      "returns": {
+        "kind": "static"
+      }
+    },
+    {
+      "name": "xmlSecOpenSSLTransformKWDes3GetKlass",
       "returns": {
         "kind": "static"
       }
@@ -14486,9 +14554,39 @@
       }
     },
     {
+      "name": "xmlSecTransformKWDes3Execute",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecTransformKWDes3Finalize",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
       "name": "xmlSecTransformKWDes3GetKlass",
       "returns": {
         "kind": "static"
+      }
+    },
+    {
+      "name": "xmlSecTransformKWDes3Initialize",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecTransformKWDes3SetKey",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecTransformKWDes3SetKeyReq",
+      "returns": {
+        "kind": "value"
       }
     },
     {

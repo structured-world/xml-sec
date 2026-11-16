@@ -676,7 +676,10 @@ fn parse_key_info_encapsulation<'doc>(
         .into());
     }
     budget.shared.retained_cipher_bytes += bytes;
-    let info = parse_encapsulation_key_info(mechanism.key_info, budget, depth + 1)?;
+    let info = match mechanism.key_info {
+        Some(key_info) => parse_encapsulation_key_info(key_info, budget, depth + 1)?,
+        None => crate::xmldsig::parse::KeyInfo::default(),
+    };
     if allow_empty_cipher_values && budget.encrypted_key_depth == 0 {
         budget.encapsulation_values.push(mechanism.cipher_value);
     }
@@ -904,6 +907,17 @@ fn parse_retrieved_key_info<'doc>(
             .push(super::derived_key::parse(target, policy.resources)?);
         return Ok(());
     }
+    // A named ML-KEM EncryptedKey is decapsulated as a direct child would be.
+    if crate::key_establishment::encapsulation_algorithm(target).is_some() {
+        return parse_key_info_encapsulation(
+            target,
+            policy,
+            allow_empty_cipher_values,
+            budget,
+            depth,
+            parsed,
+        );
+    }
     budget.charge_recipient(policy.resources, parsed.encrypted_keys.len())?;
     parsed.source_nodes.push(target.id());
     parsed.encrypted_keys.push(parse_encrypted_key(
@@ -925,9 +939,14 @@ fn parse_key_info<'doc>(
 ) -> Result<ParsedKeyInfo, XmlEncError> {
     require_element(node, XMLDSIG_NS, "KeyInfo")?;
     policy.resources.validate_key_info_reference_depth(depth)?;
+    // Counts what `charge_recipient` counts below: an ML-KEM EncryptedKey is
+    // a KEM ciphertext bounded by the key-source budget, not a recipient.
     let recipients = node
         .children()
-        .filter(|child| child.has_tag_name((XMLENC_NS, "EncryptedKey")))
+        .filter(|child| {
+            child.has_tag_name((XMLENC_NS, "EncryptedKey"))
+                && crate::key_establishment::encapsulation_algorithm(*child).is_none()
+        })
         .count();
     if recipients > policy.resources.max_encryption_recipients {
         return Err(crate::policy::PolicyViolation::ResourceLimit {
@@ -945,10 +964,9 @@ fn parse_key_info<'doc>(
     budget.ancestry.push(node.id());
     let mut parsed = ParsedKeyInfo::default();
     for child in node.children().filter(Node::is_element) {
-        if child.has_tag_name((
-            crate::key_establishment::ENCAPSULATION_NS,
-            "EncapsulationMechanism",
-        )) {
+        // An ML-KEM EncryptedKey carries a KEM ciphertext, not a wrapped or
+        // RSA-encrypted key, so it is decapsulated rather than decrypted.
+        if crate::key_establishment::encapsulation_algorithm(child).is_some() {
             parse_key_info_encapsulation(
                 child,
                 policy,
@@ -1182,6 +1200,14 @@ fn parse_processed_key_reference(
                     target,
                     child_budget.policy.resources,
                 )?));
+            }
+            // A KEM ciphertext keeps no binding to a transformed or external
+            // copy of the document, so it is named only in the same document.
+            if crate::key_establishment::encapsulation_algorithm(target).is_some() {
+                return Err(XmlEncError::InvalidStructure(
+                    "an ML-KEM EncryptedKey can be retrieved only from the same document without transforms"
+                        .into(),
+                ));
             }
             let mut key = parse_encrypted_key(
                 target,

@@ -18,6 +18,35 @@ fn pure_eddsa_identifiers_are_recognized() {
     }
 }
 
+#[cfg(feature = "experimental-pq")]
+#[test]
+fn pq_identifiers_follow_the_rfc9231bis_draft() {
+    use xml_sec::xmldsig::{PqAlgorithm, SignatureAlgorithm};
+    // draft-eastlake-rfc9231bis-xmlsec-uris names ML-DSA and SLH-DSA in the
+    // 2026/08 namespace, as libxmlsec1 master does; the identifiers of the
+    // released 1.3.13 experimental namespace are no longer methods.
+    for (algorithm, name) in [
+        (PqAlgorithm::MlDsa44, "ml-dsa-44"),
+        (PqAlgorithm::MlDsa65, "ml-dsa-65"),
+        (PqAlgorithm::MlDsa87, "ml-dsa-87"),
+        (PqAlgorithm::SlhDsaSha2_128f, "slh-dsa-sha2-128f"),
+        (PqAlgorithm::SlhDsaSha2_128s, "slh-dsa-sha2-128s"),
+        (PqAlgorithm::SlhDsaSha2_192f, "slh-dsa-sha2-192f"),
+        (PqAlgorithm::SlhDsaSha2_192s, "slh-dsa-sha2-192s"),
+        (PqAlgorithm::SlhDsaSha2_256f, "slh-dsa-sha2-256f"),
+        (PqAlgorithm::SlhDsaSha2_256s, "slh-dsa-sha2-256s"),
+    ] {
+        let uri = format!("http://www.w3.org/2026/08/xmldsig-more#{name}");
+        assert_eq!(algorithm.uri(), uri);
+        assert_eq!(
+            SignatureAlgorithm::from_uri(&uri),
+            Some(SignatureAlgorithm::PostQuantum(algorithm))
+        );
+        let released = format!("http://www.aleksey.com/xmlsec/2025/12/xmldsig-more#{name}");
+        assert_eq!(SignatureAlgorithm::from_uri(&released), None);
+    }
+}
+
 #[test]
 fn ed25519ctx_matches_rfc8032_known_answer() {
     use pkcs8::EncodePrivateKey;
@@ -88,7 +117,7 @@ fn builder_preserves_context_through_public_signing_pipeline() {
         DsigStatus, EdDsaSigningKey, ReferenceBuilder, SignContext, SignatureAlgorithm,
         SignatureBuilder, SignatureContext, SigningKey, Transform, VerificationKey, VerifyContext,
     };
-    // Context is authenticated SignedInfo data, not an out-of-band signer option.
+    // Context is signature input carried in the document, not an out-of-band signer option.
     // The builder must encode it and the verifier must recover the same bytes.
     let algorithm = SignatureAlgorithm::Ed25519Ctx;
     let der = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])
@@ -107,7 +136,30 @@ fn builder_preserves_context_through_public_signing_pipeline() {
         .sign_with_builder("<root>payload</root>", &builder)
         .unwrap()
         .output;
-    assert!(signed.contains(">Zm9v</"));
+    // draft-eastlake-rfc9231bis-xmlsec-uris-09 section 3.3.15 places the
+    // context in a ds:Object, not among the SignatureMethod parameters.
+    let document = xml_sec::Document::parse(&signed).unwrap();
+    let context = document
+        .descendants()
+        .find(|node| node.has_tag_name((CONTEXT_NS, "SignatureContext")))
+        .unwrap();
+    assert_eq!(context.text(), Some("Zm9v"));
+    assert!(
+        context
+            .parent()
+            .unwrap()
+            .has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "Object"))
+    );
+    assert!(
+        document
+            .descendants()
+            .find(
+                |node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "SignatureMethod"))
+            )
+            .unwrap()
+            .children()
+            .all(|node| !node.is_element())
+    );
     let verifier = VerificationKey {
         algorithm,
         public_key_bytes: key.public_key_info().unwrap().spki_der().unwrap().to_vec(),
@@ -164,10 +216,7 @@ fn all_eddsa_context_and_prehash_methods_complete_xml_pipeline() {
         let key = EdDsaSigningKey::from_pkcs8_der(algorithm, der.as_bytes()).unwrap();
         let xml = template(algorithm);
         let marker = format!("<SignatureMethod Algorithm=\"{}\"/>", algorithm.uri());
-        let replacement = format!(
-            "<SignatureMethod Algorithm=\"{}\"><e:EdDSAContextString xmlns:e=\"http://www.aleksey.com/xmlsec/2025/12/xmldsig-more#\">Zm9v</e:EdDSAContextString></SignatureMethod>",
-            algorithm.uri()
-        );
+        let replacement = context_method(algorithm, "Zm9v");
         assert!(xml.contains(&marker));
         let signed = SignContext::new(&key)
             .sign_template(&xml.replace(&marker, &replacement))
@@ -213,11 +262,7 @@ fn context_whitespace_uses_the_operation_document_budget() {
         .unwrap();
     let key = EdDsaSigningKey::from_pkcs8_der(algorithm, der.as_bytes()).unwrap();
     let marker = format!("<SignatureMethod Algorithm=\"{}\"/>", algorithm.uri());
-    let method = format!(
-        "<SignatureMethod Algorithm=\"{}\"><e:EdDSAContextString xmlns:e=\"http://www.aleksey.com/xmlsec/2025/12/xmldsig-more#\">{}Zm9v</e:EdDSAContextString></SignatureMethod>",
-        algorithm.uri(),
-        " ".repeat(4097)
-    );
+    let method = context_method(algorithm, &format!("{}Zm9v", " ".repeat(4097)));
     let xml = template(algorithm).replace(&marker, &method);
     let signed = SignContext::new(&key).sign_template(&xml).unwrap().output;
     let verifier = xml_sec::xmldsig::VerificationKey {
@@ -267,12 +312,7 @@ fn context_parameter_accepts_exact_wire_limit_and_rejects_malformed_base64() {
     let key = EdDsaSigningKey::from_pkcs8_der(algorithm, der.as_bytes()).unwrap();
     let xml = template(algorithm);
     let marker = format!("<SignatureMethod Algorithm=\"{}\"/>", algorithm.uri());
-    let with_context = |text: &str| {
-        xml.replace(&marker, &format!(
-        "<SignatureMethod Algorithm=\"{}\"><EdDSAContextString xmlns=\"http://www.aleksey.com/xmlsec/2025/12/xmldsig-more#\">{text}</EdDSAContextString></SignatureMethod>",
-        algorithm.uri()
-    ))
-    };
+    let with_context = |text: &str| xml.replace(&marker, &context_method(algorithm, text));
     let encoded = base64::engine::general_purpose::STANDARD.encode([0x42; 255]);
     let split = format!(
         " {}<!-- text boundary -->\n{} ",
@@ -762,6 +802,178 @@ fn template(algorithm: xml_sec::xmldsig::SignatureAlgorithm) -> String {
     )
 }
 
+/// The namespace libxmlsec1 master gives the `SignatureContext` element.
+const CONTEXT_NS: &str = "http://www.w3.org/2026/08/xmldsig-more#";
+
+/// A `SignatureMethod` carrying `text` as its `SignatureContext`.
+fn context_method(algorithm: xml_sec::xmldsig::SignatureAlgorithm, text: &str) -> String {
+    format!(
+        "<SignatureMethod Algorithm=\"{}\"><c:SignatureContext xmlns:c=\"{CONTEXT_NS}\">{text}</c:SignatureContext></SignatureMethod>",
+        algorithm.uri()
+    )
+}
+
+/// `template` with `objects` appended as `ds:Object` children of the Signature.
+fn template_with_objects(
+    algorithm: xml_sec::xmldsig::SignatureAlgorithm,
+    objects: &[&str],
+) -> String {
+    let mut tail = String::new();
+    for content in objects {
+        tail.push_str("<Object>");
+        tail.push_str(content);
+        tail.push_str("</Object>");
+    }
+    tail.push_str("</Signature>");
+    template(algorithm).replace("</Signature>", &tail)
+}
+
+#[test]
+fn a_context_in_a_signature_object_is_the_signature_context() {
+    use pkcs8::EncodePrivateKey;
+    use xml_sec::xmldsig::{
+        DsigStatus, EdDsaSigningKey, SignContext, SignatureAlgorithm, SigningKey, VerificationKey,
+        VerifyContext,
+    };
+    // libxmlsec1 master reads the context from a ds:Object of the Signature
+    // when the SignatureMethod carries none. The bytes are domain separation:
+    // the same signature fails once the Object's context changes.
+    let algorithm = SignatureAlgorithm::Ed25519Ctx;
+    let der = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])
+        .to_pkcs8_der()
+        .unwrap();
+    let key = EdDsaSigningKey::from_pkcs8_der(algorithm, der.as_bytes()).unwrap();
+    let context = format!("<c:SignatureContext xmlns:c=\"{CONTEXT_NS}\">Zm9v</c:SignatureContext>");
+    let xml = template_with_objects(algorithm, &["<unrelated xmlns=\"urn:x\"/>", &context]);
+    let signed = SignContext::new(&key).sign_template(&xml).unwrap().output;
+    let verifier = VerificationKey {
+        algorithm,
+        public_key_bytes: key.public_key_info().unwrap().spki_der().unwrap().to_vec(),
+        certificate_der: None,
+        name: None,
+    };
+    assert_eq!(
+        VerifyContext::new()
+            .key(&verifier)
+            .verify(&signed)
+            .unwrap()
+            .status,
+        DsigStatus::Valid
+    );
+    // Only the Object's context changes; SignedInfo and its digests do not.
+    assert_ne!(
+        VerifyContext::new()
+            .key(&verifier)
+            .verify(&signed.replace(">Zm9v<", ">YmFy<"))
+            .unwrap()
+            .status,
+        DsigStatus::Valid
+    );
+}
+
+#[test]
+fn more_than_one_signature_context_is_refused() {
+    use pkcs8::EncodePrivateKey;
+    use xml_sec::xmldsig::{EdDsaSigningKey, SignContext, SignatureAlgorithm};
+    // At most one context element per signature, wherever it is placed, so
+    // a document cannot offer a signer and a verifier different contexts.
+    let algorithm = SignatureAlgorithm::Ed25519Ctx;
+    let der = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])
+        .to_pkcs8_der()
+        .unwrap();
+    let key = EdDsaSigningKey::from_pkcs8_der(algorithm, der.as_bytes()).unwrap();
+    let context = format!("<c:SignatureContext xmlns:c=\"{CONTEXT_NS}\">Zm9v</c:SignatureContext>");
+    let marker = format!("<SignatureMethod Algorithm=\"{}\"/>", algorithm.uri());
+    let in_method_and_object = template_with_objects(algorithm, &[&context])
+        .replace(&marker, &context_method(algorithm, "Zm9v"));
+    let in_two_objects = template_with_objects(algorithm, &[&context, &context]);
+    let twice_in_one_object = template_with_objects(algorithm, &[&format!("{context}{context}")]);
+    for xml in [in_method_and_object, in_two_objects, twice_in_one_object] {
+        assert!(SignContext::new(&key).sign_template(&xml).is_err(), "{xml}");
+    }
+}
+
+#[test]
+fn an_object_context_on_a_method_without_contexts_is_refused() {
+    use pkcs8::EncodePrivateKey;
+    use xml_sec::xmldsig::{
+        DsigStatus, EdDsaSigningKey, SignContext, SignatureAlgorithm, SigningKey, VerificationKey,
+        VerifyContext,
+    };
+    // Pure Ed25519 takes no context. A nonempty one in a ds:Object would
+    // otherwise be signed and verified as the empty context, so the document
+    // could carry and change bytes the signature never covered. Duplicates
+    // are refused before the method is considered, as for any method.
+    let algorithm = SignatureAlgorithm::Ed25519;
+    let der = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])
+        .to_pkcs8_der()
+        .unwrap();
+    let key = EdDsaSigningKey::from_pkcs8_der(algorithm, der.as_bytes()).unwrap();
+    let context = format!("<c:SignatureContext xmlns:c=\"{CONTEXT_NS}\">Zm9v</c:SignatureContext>");
+    let empty = format!("<c:SignatureContext xmlns:c=\"{CONTEXT_NS}\"/>");
+    for xml in [
+        template_with_objects(algorithm, &[&context]),
+        template_with_objects(algorithm, &[&empty, &empty]),
+    ] {
+        assert!(SignContext::new(&key).sign_template(&xml).is_err(), "{xml}");
+    }
+    // A signed document gains the context afterwards: verification refuses it.
+    let signed = SignContext::new(&key)
+        .sign_template(&template(algorithm))
+        .unwrap()
+        .output;
+    let verifier = VerificationKey {
+        algorithm,
+        public_key_bytes: key.public_key_info().unwrap().spki_der().unwrap().to_vec(),
+        certificate_der: None,
+        name: None,
+    };
+    let carried = signed.replace(
+        "</Signature>",
+        &format!("<Object>{context}</Object></Signature>"),
+    );
+    assert_eq!(
+        VerifyContext::new()
+            .key(&verifier)
+            .verify(&signed)
+            .unwrap()
+            .status,
+        DsigStatus::Valid
+    );
+    assert!(
+        VerifyContext::new()
+            .key(&verifier)
+            .verify(&carried)
+            .is_err()
+    );
+    // The empty context is the absent one, which pure Ed25519 accepts.
+    let with_empty = template_with_objects(algorithm, &[&empty]);
+    assert!(SignContext::new(&key).sign_template(&with_empty).is_ok());
+}
+
+#[test]
+fn the_released_experimental_context_syntax_is_refused() {
+    use pkcs8::EncodePrivateKey;
+    use xml_sec::xmldsig::{EdDsaSigningKey, SignContext, SignatureAlgorithm};
+    // libxmlsec1 master no longer reads the 1.3.13 `EdDSAContextString`
+    // element of the experimental namespace, and neither does xml-sec.
+    let algorithm = SignatureAlgorithm::Ed25519Ctx;
+    let der = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])
+        .to_pkcs8_der()
+        .unwrap();
+    let key = EdDsaSigningKey::from_pkcs8_der(algorithm, der.as_bytes()).unwrap();
+    let marker = format!("<SignatureMethod Algorithm=\"{}\"/>", algorithm.uri());
+    let old = format!(
+        "<SignatureMethod Algorithm=\"{}\"><e:EdDSAContextString xmlns:e=\"http://www.aleksey.com/xmlsec/2025/12/xmldsig-more#\">Zm9v</e:EdDSAContextString></SignatureMethod>",
+        algorithm.uri()
+    );
+    assert!(
+        SignContext::new(&key)
+            .sign_template(&template(algorithm).replace(&marker, &old))
+            .is_err()
+    );
+}
+
 #[test]
 fn ed448_context_survives_the_provider_boundary() {
     use pkcs8::EncodePrivateKey;
@@ -777,7 +989,8 @@ fn ed448_context_survives_the_provider_boundary() {
         .to_pkcs8_der()
         .unwrap();
     let key = EdDsaSigningKey::from_pkcs8_der(algorithm, der.as_bytes()).unwrap();
-    let xml = template(algorithm).replace("#eddsa-ed448\"/>", "#eddsa-ed448\"><e:EdDSAContextString xmlns:e=\"http://www.aleksey.com/xmlsec/2025/12/xmldsig-more#\">Zm9v</e:EdDSAContextString></SignatureMethod>");
+    let marker = format!("<SignatureMethod Algorithm=\"{}\"/>", algorithm.uri());
+    let xml = template(algorithm).replace(&marker, &context_method(algorithm, "Zm9v"));
     let signed = SignContext::new(&key).sign_template(&xml).unwrap().output;
     let verifier = VerificationKey {
         algorithm,

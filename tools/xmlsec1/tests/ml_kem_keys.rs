@@ -129,15 +129,13 @@ fn check_kem_signing(
     private: &std::path::Path,
 ) {
     let template = fixture_path(&format!(
-        "xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-em-ml-kem-{size}.tmpl"
+        "xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-kt-ml-kem-{size}.tmpl"
     ));
     let signed = directory.join(format!("signed-{size}.xml"));
     let anonymous_template = directory.join(format!("anonymous-{size}.tmpl"));
     let template_xml = std::fs::read_to_string(&template).expect("KEM template");
-    let without_name = template_xml.replace(
-        &format!("<ds:KeyName>TestKeyName-ml-kem-{size}</ds:KeyName>"),
-        "",
-    );
+    let without_name =
+        template_xml.replace(&format!("<KeyName>TestKeyName-ml-kem-{size}</KeyName>"), "");
     assert_ne!(without_name, template_xml);
     std::fs::write(&anonymous_template, without_name).expect("unnamed recipient template");
     run_cli(&[
@@ -186,7 +184,7 @@ fn check_kem_signing(
             .args([
                 "--verify",
                 "--enabled-key-data",
-                "key-name,encapsulation-mechanism",
+                "key-name,enc-key",
                 &format!("--privkey-pem:TestKeyName-ml-kem-{size}"),
             ])
             .arg(raw)
@@ -229,7 +227,7 @@ fn kem_encryption_template(directory: &std::path::Path, size: u16) -> std::path:
         _ => 256,
     };
     let encryption = fixture_path(&format!(
-        "xmlenc/aleksey-xmlenc-01/enc-aes{width}gcm-em-ml-kem-{size}.tmpl"
+        "xmlenc/aleksey-xmlenc-01/enc-aes{width}gcm-kt-ml-kem-{size}.tmpl"
     ));
     if size == 768 && !cfg!(feature = "legacy-algorithms") {
         // The full donor template runs in the legacy-capability matrix.
@@ -260,7 +258,7 @@ fn oracle_decrypts_kem_output(size: u16, encrypted: &std::path::Path) {
         .args([
             "--decrypt",
             "--enabled-key-data",
-            "key-name,encapsulation-mechanism",
+            "key-name,enc-key",
             &format!("--privkey-pem:TestKeyName-ml-kem-{size}"),
         ])
         .arg(raw)
@@ -330,12 +328,11 @@ fn cli_decrypt_resolves_referenced_kem_key_info() {
     // XMLDSig 1.1 section 4.5.10 permits a same-document KeyInfoReference.
     // Recipient selection must follow the same source graph as core decryption.
     let mut xml = std::fs::read_to_string(fixture_path(
-        "xmlenc/aleksey-xmlenc-01/enc-aes128gcm-em-ml-kem-512.xml",
+        "xmlenc/aleksey-xmlenc-01/enc-aes128gcm-kt-ml-kem-512.xml",
     ))
     .unwrap();
     let start = xml.find("<ds:KeyInfo>").unwrap();
-    let end =
-        xml.find("</as:EncapsulationMechanism>").unwrap() + "</as:EncapsulationMechanism>".len();
+    let end = xml.find("</EncryptedKey>").unwrap() + "</EncryptedKey>".len();
     let end = end + xml[end..].find("</ds:KeyInfo>").unwrap() + "</ds:KeyInfo>".len();
     let referenced = xml[start..end].replacen(
         "<ds:KeyInfo>",
@@ -404,7 +401,7 @@ fn all_donor_hmac_encapsulation_ciphertexts_verify() {
     // code must not decapsulate and inject a raw HMAC key on its behalf.
     for size in [512, 768, 1024] {
         let xml = std::fs::read_to_string(fixture_path(&format!(
-            "xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-em-ml-kem-{size}.xml"
+            "xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-kt-ml-kem-{size}.xml"
         )))
         .expect("signed donor XML");
         let key =
@@ -434,7 +431,7 @@ fn pinned_kem_recipient_ignores_unrelated_key_hints() {
     // Unsigned lookup hints cannot invalidate verification with a pinned
     // recipient; the actual encapsulation mechanism must still be validated.
     let xml = std::fs::read_to_string(fixture_path(
-        "xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-em-ml-kem-512.xml",
+        "xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-kt-ml-kem-512.xml",
     ))
     .unwrap();
     let key = RustCryptoMlKemPrivateKey::from_pkcs8_der(&fixture("ml-kem-512-key.der")).unwrap();
@@ -505,7 +502,7 @@ const XML_DECLARATION: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>";
 /// `KeyInfo` re-rooted as a standalone element with `Id="recipient"`.
 fn kem_reference_fixture() -> (String, std::ops::Range<usize>, String) {
     let xml = std::fs::read_to_string(fixture_path(
-        "xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-em-ml-kem-512.xml",
+        "xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-kt-ml-kem-512.xml",
     ))
     .unwrap();
     let range = xml_sec::Document::parse(&xml)
@@ -599,10 +596,13 @@ fn check_same_document_key_info_references(
             .unwrap_err()
             .contains("cycle")
     );
-    let two_mechanisms = original.replacen(
-        "</KeyInfo>",
-        "<KeyInfoReference xmlns=\"http://www.w3.org/2009/xmldsig11#\" URI=\"#recipient\"/></KeyInfo>",
-        1,
+    // The reference joins the signature's own KeyInfo, which closes last; the
+    // recipient KeyInfo inside the EncryptedKey closes earlier.
+    let close = original.rfind("</KeyInfo>").unwrap();
+    let two_mechanisms = format!(
+        "{}<KeyInfoReference xmlns=\"http://www.w3.org/2009/xmldsig11#\" URI=\"#recipient\"/>{}",
+        &original[..close],
+        &original[close..]
     );
     let ambiguous = format!(
         "<root>{}{target}</root>",
@@ -937,7 +937,7 @@ fn cli_verify_selects_named_kem_recipient() {
     // lax search was explicitly requested; private options are still key sources.
     let key = fixture_path("xmldsig/keys/ml-kem/ml-kem-512-key.der");
     let xml =
-        fixture_path("xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-em-ml-kem-512.xml");
+        fixture_path("xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-kt-ml-kem-512.xml");
     let run = |name: &str| {
         std::process::Command::new(env!("CARGO_BIN_EXE_xmlsec1"))
             .args(["verify", "--insecure", "--pkcs8-der:unrelated"])
@@ -1036,7 +1036,7 @@ fn hmac_templates_establish_fresh_keys_and_obey_policy() {
     // digests. Reusing a template creates fresh ciphertext, not a reused secret.
     for size in [512, 768, 1024] {
         let template = std::fs::read_to_string(fixture_path(&format!(
-            "xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-em-ml-kem-{size}.tmpl"
+            "xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-kt-ml-kem-{size}.tmpl"
         )))
         .unwrap();
         let private =
@@ -1087,7 +1087,7 @@ fn hmac_templates_establish_fresh_keys_and_obey_policy() {
 fn ordinary_hmac_cannot_ignore_an_encapsulation_template() {
     // A raw key must not turn an unexecuted KEM instruction into valid output.
     let template = std::fs::read_to_string(fixture_path(
-        "xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-em-ml-kem-512.tmpl",
+        "xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-kt-ml-kem-512.tmpl",
     ))
     .unwrap();
     let key = xml_sec::xmldsig::HmacSigningKey::new(vec![7; 32]).unwrap();
@@ -1102,7 +1102,7 @@ fn ordinary_hmac_cannot_ignore_an_encapsulation_template() {
 fn pinned_hmac_rejects_referenced_encapsulation() {
     // Unsigned lookup indirection must not hide an instruction from pinned keys.
     let template = std::fs::read_to_string(fixture_path(
-        "xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-em-ml-kem-512.tmpl",
+        "xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-kt-ml-kem-512.tmpl",
     ))
     .unwrap();
     let document = xml_sec::Document::parse(&template).unwrap();
@@ -1148,10 +1148,15 @@ fn pinned_hmac_rejects_referenced_encapsulation() {
             .status,
         xml_sec::xmldsig::DsigStatus::Valid
     );
+    // An ML-KEM EncryptedKey without CipherData is a mechanism that cannot be
+    // executed, so it is refused rather than passed over.
+    let broken_mechanism = format!(
+        "<x:EncryptedKey xmlns:x=\"http://www.w3.org/2001/04/xmlenc#\"><x:EncryptionMethod Algorithm=\"{}\"/></x:EncryptedKey>",
+        xml_sec::provider::KeyEncapsulationAlgorithm::MlKem512.uri()
+    );
     let indirect = format!(
-        "<root>{}<d:KeyInfo xmlns:d=\"http://www.w3.org/2000/09/xmldsig#\" Id=\"recipient\"><k:EncapsulationMechanism xmlns:k=\"{}\"/></d:KeyInfo></root>",
+        "<root>{}<d:KeyInfo xmlns:d=\"http://www.w3.org/2000/09/xmldsig#\" Id=\"recipient\">{broken_mechanism}</d:KeyInfo></root>",
         indirect.trim_start_matches("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"),
-        xml_sec::key_establishment::ENCAPSULATION_NS
     );
     assert!(
         xml_sec::xmldsig::VerifyContext::new()
@@ -1165,7 +1170,7 @@ fn pinned_hmac_rejects_referenced_encapsulation() {
     let external = signed.replace("<KeyInfo/>", "<KeyInfo><KeyInfoReference xmlns=\"http://www.w3.org/2009/xmldsig11#\" URI=\"https://example.test/recipient.xml\"/></KeyInfo>");
     let resources = std::collections::BTreeMap::from([(
         "https://example.test/recipient.xml".to_owned(),
-        format!("<d:KeyInfo xmlns:d=\"http://www.w3.org/2000/09/xmldsig#\"><k:EncapsulationMechanism xmlns:k=\"{}\"/></d:KeyInfo>", xml_sec::key_establishment::ENCAPSULATION_NS).into_bytes(),
+        format!("<d:KeyInfo xmlns:d=\"http://www.w3.org/2000/09/xmldsig#\">{broken_mechanism}</d:KeyInfo>").into_bytes(),
     )]);
     let mut permitted = verification;
     permitted.uris.key_info_references = xml_sec::xmldsig::UriTypeSet::ALL;
@@ -1185,7 +1190,7 @@ fn pinned_hmac_rejects_referenced_encapsulation() {
 fn ordinary_hmac_ignores_unconsumed_key_hints() {
     // An explicit HMAC key consumes no lookup hints, including malformed DER.
     let template = std::fs::read_to_string(fixture_path(
-        "xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-em-ml-kem-512.tmpl",
+        "xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-kt-ml-kem-512.tmpl",
     ))
     .unwrap();
     let document = xml_sec::Document::parse(&template).unwrap();
@@ -1234,7 +1239,7 @@ fn signing_reserves_complete_kem_output_before_crypto() {
         }
     }
     let template = std::fs::read_to_string(fixture_path(
-        "xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-em-ml-kem-512.tmpl",
+        "xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-kt-ml-kem-512.tmpl",
     ))
     .unwrap();
     let key = CountedKey {
@@ -1269,7 +1274,11 @@ fn signing_reserves_complete_kem_output_before_crypto() {
 fn mechanism_discovery_bounds_reference_work_without_decoding_hints() {
     // The presence probe shares URI normalization and rejects exhausted memory
     // before percent decoding; unused malformed/cyclic hints stay unconsumed.
-    let xml = r##"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:d="http://www.w3.org/2009/xmldsig11#" xmlns:e="http://www.aleksey.com/xmlsec/2025/12/xmldsig-more#"><ds:KeyInfo Id="entry"><d:DEREncodedKeyValue>not-base64!</d:DEREncodedKeyValue><d:KeyInfoReference URI="#missing"/><d:KeyInfoReference URI="#entry"/><d:KeyInfoReference URI="#%74arget"/></ds:KeyInfo><ds:KeyInfo Id="target"><e:EncapsulationMechanism/></ds:KeyInfo></root>"##;
+    let mechanism = r#"<e:EncryptedKey><e:EncryptionMethod Algorithm="http://www.w3.org/2026/08/xmldsig-more#ml-kem-512"/></e:EncryptedKey>"#;
+    let xml = format!(
+        r##"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:d="http://www.w3.org/2009/xmldsig11#" xmlns:e="http://www.w3.org/2001/04/xmlenc#"><ds:KeyInfo Id="entry"><d:DEREncodedKeyValue>not-base64!</d:DEREncodedKeyValue><d:KeyInfoReference URI="#missing"/><d:KeyInfoReference URI="#entry"/><d:KeyInfoReference URI="#%74arget"/></ds:KeyInfo><ds:KeyInfo Id="target">{mechanism}</ds:KeyInfo></root>"##
+    );
+    let xml = xml.as_str();
     let document = xml_sec::Document::parse(xml).unwrap();
     let resolver = xml_sec::xmldsig::uri::UriReferenceResolver::new(&document);
     let entry = resolver.node_for_id("entry").unwrap();
@@ -1295,7 +1304,11 @@ fn mechanism_discovery_bounds_reference_work_without_decoding_hints() {
             xml_sec::xmldsig::has_same_document_encapsulation(entry, &resolver, &bounded).is_err()
         );
     }
-    let without_mechanism = xml.replace("<e:EncapsulationMechanism/>", "");
+    // A key-wrap EncryptedKey in the same place is no ML-KEM mechanism.
+    let without_mechanism = xml.replace("#ml-kem-512", "#kw-aes256").replace(
+        "http://www.w3.org/2026/08/xmldsig-more#kw-aes256",
+        "http://www.w3.org/2001/04/xmlenc#kw-aes256",
+    );
     let document = xml_sec::Document::parse(&without_mechanism).unwrap();
     let resolver = xml_sec::xmldsig::uri::UriReferenceResolver::new(&document);
     assert!(
@@ -1314,7 +1327,7 @@ fn cli_rejects_inapplicable_key_options_before_key_io() {
     // A KEM template needs a recipient public key, not a signing private/raw
     // key. Report the option and command before touching the supplied path.
     let template =
-        fixture_path("xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-em-ml-kem-512.tmpl");
+        fixture_path("xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-kt-ml-kem-512.tmpl");
     for option in ["hmac-key", "privkey-pem", "pkcs8-der"] {
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_xmlsec1"))
             .arg("sign")
@@ -1327,7 +1340,7 @@ fn cli_rejects_inapplicable_key_options_before_key_io() {
         assert_eq!(
             String::from_utf8(output.stderr).unwrap(),
             format!(
-                "Error: --{option} is inapplicable to sign with EncapsulationMechanism; supply a recipient public key\n"
+                "Error: --{option} is inapplicable to sign with an ML-KEM EncryptedKey; supply a recipient public key\n"
             )
         );
     }
@@ -1337,7 +1350,7 @@ fn cli_rejects_inapplicable_key_options_before_key_io() {
 fn multiple_signatures_share_the_encapsulation_allowance() {
     // A second Signature must not restart the operation-wide KEM allowance.
     let template = std::fs::read_to_string(fixture_path(
-        "xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-em-ml-kem-512.tmpl",
+        "xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-kt-ml-kem-512.tmpl",
     ))
     .unwrap();
     let element = &template[template.find("<Signature").unwrap()..];
@@ -1500,7 +1513,7 @@ fn direct_kem_cbc_requires_external_authentication_permission() {
         .encapsulation_algorithms
         .insert(private.algorithm());
     let xml = std::fs::read_to_string(fixture_path(
-        "xmlenc/aleksey-xmlenc-01/enc-aes256-em-ml-kem-512.xml",
+        "xmlenc/aleksey-xmlenc-01/enc-aes256-kt-ml-kem-512.xml",
     ))
     .unwrap();
     assert!(matches!(
@@ -1571,7 +1584,7 @@ fn encapsulation_candidate_budget_precedes_nested_der_decode() {
     // Malformed base64 proves exhaustion is detected before key decoding.
     use base64::Engine as _;
     let xml = std::fs::read_to_string(fixture_path(
-        "xmlenc/aleksey-xmlenc-01/enc-aes128gcm-em-ml-kem-512.xml",
+        "xmlenc/aleksey-xmlenc-01/enc-aes128gcm-kt-ml-kem-512.xml",
     ))
     .unwrap()
     .replace(
@@ -1626,7 +1639,7 @@ fn decrypt_resolves_external_encapsulation_recipient() {
     // XMLDSig 1.1 §4.5.10: a permitted external reference must resolve to
     // KeyInfo, with the same resource and depth limits as local recipients.
     let xml = std::fs::read_to_string(fixture_path(
-        "xmlenc/aleksey-xmlenc-01/enc-aes128gcm-em-ml-kem-512.xml",
+        "xmlenc/aleksey-xmlenc-01/enc-aes128gcm-kt-ml-kem-512.xml",
     ))
     .unwrap();
     let document = xml_sec::Document::parse(&xml).unwrap();
@@ -1635,10 +1648,7 @@ fn decrypt_resolves_external_encapsulation_recipient() {
         .find(|node| {
             node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyInfo"))
                 && node.parent().is_some_and(|parent| {
-                    parent.has_tag_name((
-                        xml_sec::key_establishment::ENCAPSULATION_NS,
-                        "EncapsulationMechanism",
-                    ))
+                    xml_sec::key_establishment::encapsulation_algorithm(parent).is_some()
                 })
         })
         .unwrap();
@@ -1875,7 +1885,7 @@ fn encrypted_data_builder_round_trips_all_kem_parameter_sets() {
         );
         let mechanism = outer_info
             .children()
-            .find(|node| node.tag_name().name() == "EncapsulationMechanism")
+            .find(|node| xml_sec::key_establishment::encapsulation_algorithm(*node).is_some())
             .unwrap();
         assert!(
             !mechanism
@@ -2056,8 +2066,8 @@ fn cli_refuses_xml_data_template_with_referenced_recipient_metadata() {
     let encrypted = directory.path().join("encrypted.xml");
     std::fs::write(&plaintext, "<message>referenced recipient</message>").unwrap();
     std::fs::write(&template, format!(
-        "<root xmlns:x=\"http://www.w3.org/2001/04/xmlenc#\" xmlns:d=\"http://www.w3.org/2000/09/xmldsig#\" xmlns:i=\"http://www.w3.org/2009/xmldsig11#\" xmlns:k=\"{}\"><x:EncryptedData Id=\"data\"><x:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><d:KeyInfo><i:KeyInfoReference URI=\"#mechanism\"/></d:KeyInfo><x:CipherData><x:CipherValue/></x:CipherData></x:EncryptedData><d:KeyInfo Id=\"mechanism\"><k:EncapsulationMechanism Algorithm=\"{}\"><d:KeyInfo><i:KeyInfoReference URI=\"#recipient\"/></d:KeyInfo><x:CipherData><x:CipherValue/></x:CipherData></k:EncapsulationMechanism></d:KeyInfo><d:KeyInfo custom=\"recipient\"><d:KeyName>wanted</d:KeyName></d:KeyInfo></root>",
-        xml_sec::key_establishment::ENCAPSULATION_NS, algorithm.uri(),
+        "<root xmlns:x=\"http://www.w3.org/2001/04/xmlenc#\" xmlns:d=\"http://www.w3.org/2000/09/xmldsig#\" xmlns:i=\"http://www.w3.org/2009/xmldsig11#\"><x:EncryptedData Id=\"data\"><x:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><d:KeyInfo><i:KeyInfoReference URI=\"#mechanism\"/></d:KeyInfo><x:CipherData><x:CipherValue/></x:CipherData></x:EncryptedData><d:KeyInfo Id=\"mechanism\"><x:EncryptedKey><x:EncryptionMethod Algorithm=\"{}\"/><d:KeyInfo><i:KeyInfoReference URI=\"#recipient\"/></d:KeyInfo><x:CipherData><x:CipherValue/></x:CipherData></x:EncryptedKey></d:KeyInfo><d:KeyInfo custom=\"recipient\"><d:KeyName>wanted</d:KeyName></d:KeyInfo></root>",
+        algorithm.uri(),
     )).unwrap();
     let result = std::process::Command::new(env!("CARGO_BIN_EXE_xmlsec1"))
         .args(["encrypt", "--add-id-attr", "custom", "--keys-file"])
@@ -2102,7 +2112,7 @@ fn cli_rejects_unexecutable_nested_template(
         .output()
         .unwrap();
     assert!(!rejected.status.success());
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("nested EncapsulationMechanism"));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("nested ML-KEM EncryptedKey"));
     assert!(!encrypted.exists());
 }
 
@@ -2114,9 +2124,15 @@ fn cli_skips_unrelated_nested_recipients(
     input: &std::path::Path,
     key: &std::path::Path,
 ) {
+    // The key-wrap EncryptedKey encloses the ML-KEM EncryptedKey, so it opens
+    // first and closes last; its own metadata goes before its own end tag.
     let key_start = xml.find("<x:EncryptedKey>").unwrap();
-    let key_end = xml.find("</x:EncryptedKey>").unwrap() + "</x:EncryptedKey>".len();
+    let key_end = xml.rfind("</x:EncryptedKey>").unwrap() + "</x:EncryptedKey>".len();
     let key_xml = &xml[key_start..key_end];
+    let with_metadata = |metadata: &str| {
+        let close = key_xml.rfind("</x:EncryptedKey>").unwrap();
+        format!("{}{metadata}{}", &key_xml[..close], &key_xml[close..])
+    };
     for (matching, unrelated, content_name, id_attribute) in [
         (
             "<x:ReferenceList><x:DataReference URI=\"#target\"/></x:ReferenceList>",
@@ -2137,12 +2153,8 @@ fn cli_skips_unrelated_nested_recipients(
             "custom",
         ),
     ] {
-        let selected =
-            key_xml.replace("</x:EncryptedKey>", &format!("{matching}</x:EncryptedKey>"));
-        let skipped = key_xml.replace(
-            "</x:EncryptedKey>",
-            &format!("{unrelated}</x:EncryptedKey>"),
-        );
+        let selected = with_metadata(matching);
+        let skipped = with_metadata(unrelated);
         let associated = xml
             .replace(key_xml, &format!("{skipped}{selected}"))
             .replacen(
@@ -2232,8 +2244,7 @@ fn nested_kem_wrap_recovery_shares_the_operation_budget() {
         .unwrap();
     let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
     let xml = format!(
-        "<x:EncryptedData xmlns:x=\"http://www.w3.org/2001/04/xmlenc#\" xmlns:d=\"http://www.w3.org/2000/09/xmldsig#\" xmlns:k=\"{}\"><x:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes256-gcm\"/><d:KeyInfo><x:EncryptedKey><x:EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#kw-aes256\"/><d:KeyInfo><k:EncapsulationMechanism Algorithm=\"{}\"><d:KeyInfo/><x:CipherData><x:CipherValue>{}</x:CipherValue></x:CipherData></k:EncapsulationMechanism></d:KeyInfo><x:CipherData><x:CipherValue>{}</x:CipherValue></x:CipherData></x:EncryptedKey></d:KeyInfo><x:CipherData><x:CipherValue>{}</x:CipherValue></x:CipherData></x:EncryptedData>",
-        xml_sec::key_establishment::ENCAPSULATION_NS,
+        "<x:EncryptedData xmlns:x=\"http://www.w3.org/2001/04/xmlenc#\" xmlns:d=\"http://www.w3.org/2000/09/xmldsig#\"><x:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes256-gcm\"/><d:KeyInfo><x:EncryptedKey><x:EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#kw-aes256\"/><d:KeyInfo><x:EncryptedKey><x:EncryptionMethod Algorithm=\"{}\"/><x:CipherData><x:CipherValue>{}</x:CipherValue></x:CipherData></x:EncryptedKey></d:KeyInfo><x:CipherData><x:CipherValue>{}</x:CipherValue></x:CipherData></x:EncryptedKey></d:KeyInfo><x:CipherData><x:CipherValue>{}</x:CipherValue></x:CipherData></x:EncryptedData>",
         private.algorithm().uri(),
         encode(&result.ciphertext),
         encode(&wrapped),
@@ -2264,9 +2275,14 @@ fn nested_kem_wrap_recovery_shares_the_operation_budget() {
     cli_selects_nested_kem_recipient(&xml, &private, &content_key);
     // Nested KeyReference associations must select only the KEM protecting the
     // parent key, including a caller-registered ID rather than a typed Id field.
-    let mechanism_start = xml.find("<k:EncapsulationMechanism ").unwrap();
-    let mechanism_end =
-        xml.find("</k:EncapsulationMechanism>").unwrap() + "</k:EncapsulationMechanism>".len();
+    let mechanism_start = xml
+        .find(&format!(
+            "<x:EncryptedKey><x:EncryptionMethod Algorithm=\"{}\"",
+            private.algorithm().uri()
+        ))
+        .unwrap();
+    // The inner ML-KEM EncryptedKey closes first.
+    let mechanism_end = xml.find("</x:EncryptedKey>").unwrap() + "</x:EncryptedKey>".len();
     let mechanism = &xml[mechanism_start..mechanism_end];
     let nested = |target: &str| {
         format!(
