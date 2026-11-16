@@ -771,11 +771,11 @@ the key preflight before producing the signature.
 authenticated `SignedInfo/SignatureMethod`. Contexts are limited to 255 octets by the
 cryptographic wire contract; a nonempty context on a method without context support is rejected
 rather than ignored. Context-capable methods default to an empty context. The context is a
-`SignatureContext` element in the `http://www.w3.org/2026/08/xmldsig-more#` namespace, as
-upstream libxmlsec1 writes it; RFC 9231 and its draft successor define the method URIs, not
-this element. Verification and template signing read it either as the only child of
-`SignatureMethod` or as a direct child of a `ds:Object` of the same `ds:Signature`, and refuse a
-signature with more than one. A context in a `ds:Object` lies outside `SignedInfo`, but it is
+`SignatureContext` element in the `http://www.w3.org/2026/08/xmldsig-more#` namespace, defined
+by draft-eastlake-rfc9231bis-xmlsec-uris section 3.3.15 as content of a `ds:Object`.
+Verification and template signing read it as a direct child of a `ds:Object` of the same
+`ds:Signature` or, as upstream libxmlsec1 also does, as the only child of `SignatureMethod`, and
+refuse a signature with more than one. A context in a `ds:Object` lies outside `SignedInfo`, but it is
 an input to the signature algorithm, so changing it fails verification. The `EdDSAContextString`,
 `MLDSAContextString` and `SLHDSAContextString` elements of libxmlsec1 1.3.13's experimental
 namespace are no longer read. Parsing enforces text and decoded-width bounds before allocating

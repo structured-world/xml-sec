@@ -53,9 +53,8 @@ const MAX_DER_ENCODED_KEY_VALUE_BASE64_LEN: usize = MAX_DER_ENCODED_KEY_VALUE_LE
 pub(crate) const MAX_KEY_NAME_TEXT_LEN: usize = 4096;
 const MAX_KEY_INFO_CHILD_COUNT: usize = 64;
 const MAX_HMAC_OUTPUT_LENGTH_TEXT_LEN: usize = 32;
-/// Namespace of the `SignatureContext` element. No specification defines the
-/// element; upstream libxmlsec1 places it in the namespace of
-/// draft-eastlake-rfc9231bis-xmlsec-uris, and xml-sec follows it.
+/// Namespace of the `SignatureContext` element of
+/// draft-eastlake-rfc9231bis-xmlsec-uris-09 section 3.3.15 and appendix E.
 pub(crate) const SIGNATURE_CONTEXT_NS: &str = "http://www.w3.org/2026/08/xmldsig-more#";
 /// Local name of the element carrying a signature context.
 pub(crate) const SIGNATURE_CONTEXT_ELEMENT: &str = "SignatureContext";
@@ -1282,10 +1281,11 @@ fn is_signature_context(node: Node<'_, '_>) -> bool {
     node.has_tag_name((SIGNATURE_CONTEXT_NS, SIGNATURE_CONTEXT_ELEMENT))
 }
 
-/// The context of the signature whose `SignatureMethod` is `node`: the
-/// method's only parameter, or a direct child of a `ds:Object` of the same
-/// `ds:Signature`, and never both or twice. RFC 9231 defines the method URIs,
-/// not this element; the placement follows upstream libxmlsec1.
+/// The context of the signature whose `SignatureMethod` is `node`: a direct
+/// child of a `ds:Object` of the same `ds:Signature`
+/// (draft-eastlake-rfc9231bis-xmlsec-uris-09 section 3.3.15, "at most one"),
+/// or the method's only parameter as upstream libxmlsec1 also accepts, and
+/// never both or twice. An absent context is the empty string (same section).
 fn parse_signature_context(
     node: Node<'_, '_>,
     resources: &crate::policy::ResourcePolicy,
