@@ -5,6 +5,7 @@
 //! comments, or the inverse) and combined with the members before it by an
 //! operation. Membership is decided per node, as libxmlsec1 decides it.
 
+use std::cell::Cell;
 use std::ffi::{c_int, c_void};
 
 use super::errors::{self, check, here};
@@ -436,6 +437,8 @@ struct Walk {
     callback:
         unsafe extern "C" fn(*mut XmlSecNodeSet, *mut XmlNode, *mut XmlNode, *mut c_void) -> c_int,
     data: *mut c_void,
+    /// Set when the callback stopped the walk.
+    interrupted: Cell<bool>,
 }
 
 /// Calls the walk's callback for `node` when the set contains it; false when
@@ -450,25 +453,30 @@ unsafe fn visit(walk: &Walk, node: *mut XmlNode, parent: *mut XmlNode) -> bool {
     }
 }
 
-/// The tree walk's callback: the node, then for an element or document its
-/// attributes and the namespace nodes in scope at it, the nearest
-/// declaration of each prefix, as libxmlsec1 visits them; the implicit `xml`
-/// binding is not declared, so it is not visited.
+/// The tree walk's callback: the node, then for an element its attributes
+/// and the namespace nodes in scope at it, the nearest declaration of each
+/// prefix, as libxmlsec1 visits them; the implicit `xml` binding is not
+/// declared, so it is not visited. A callback that stops the walk ends the
+/// tree walk (returning 0) and marks the walk interrupted, which is not an
+/// error.
 unsafe extern "C" fn walk_node(current: *mut XmlNode, data: *mut c_void) -> c_int {
     // SAFETY: `data` is the walk the caller set up.
     let walk = unsafe { &*data.cast::<Walk>() };
+    let stop = || {
+        walk.interrupted.set(true);
+        0
+    };
     // SAFETY: as above.
     if !unsafe { visit(walk, current, nodes::parent(current)) } {
-        return -1;
+        return stop();
     }
-    let kind = nodes::kind(current);
-    if kind != XML_ELEMENT_NODE && kind != XML_DOCUMENT_NODE {
+    if nodes::kind(current) != XML_ELEMENT_NODE {
         return 1;
     }
     for attribute in nodes::attributes(current) {
         // SAFETY: as above.
         if !unsafe { visit(walk, attribute.cast(), current) } {
-            return -1;
+            return stop();
         }
     }
     for namespace in nodes::namespace_nodes(current) {
@@ -477,7 +485,7 @@ unsafe extern "C" fn walk_node(current: *mut XmlNode, data: *mut c_void) -> c_in
         }
         // SAFETY: as above.
         if !unsafe { visit(walk, namespace, current) } {
-            return -1;
+            return stop();
         }
     }
     1
@@ -556,7 +564,8 @@ fn children<T>(parent: *const T) -> Vec<*mut XmlNode> {
 }
 
 /// `xmlSecNodeSetWalk`: calls `walk_func` for every node of the set,
-/// stopping at the first negative return: from the listed nodes when the
+/// stopping at the first negative return, which is not an error (the
+/// walk still returns 0): from the listed nodes when the
 /// set lies in their subtrees (in list order, a start inside another's
 /// subtree skipped, a listed document walked from its children), otherwise
 /// over the whole document in document order.
@@ -587,6 +596,7 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetWalk(
             set,
             callback,
             data,
+            interrupted: Cell::new(false),
         };
         let walk_data = (&raw const walk).cast_mut().cast::<c_void>();
         // SAFETY: a live node set.
@@ -620,12 +630,22 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetWalk(
                 );
                 return -1;
             }
+            if walk.interrupted.get() {
+                break;
+            }
         }
         0
     })
 }
 
-/// Writes a text node's content to the output buffer in `data`.
+/// A text dump: its output buffer, and whether a write failed. A failed
+/// write interrupts the walk, which the walk itself does not report.
+struct TextDump {
+    out: *mut OutputBuffer,
+    failed: Cell<bool>,
+}
+
+/// Writes a text node's content to the output buffer of the dump in `data`.
 unsafe extern "C" fn dump_text(
     _set: *mut XmlSecNodeSet,
     node: *mut XmlNode,
@@ -637,21 +657,22 @@ unsafe extern "C" fn dump_text(
     if !matches!(nodes::kind(node), XML_TEXT_NODE | XML_CDATA_SECTION_NODE) {
         return 0;
     }
+    // SAFETY: `data` is the dump the caller set up.
+    let dump = unsafe { &*data.cast::<TextDump>() };
     let text = nodes::text(node).unwrap_or_default();
     let written = c_int::try_from(text.len()).is_ok_and(|length| {
-        // SAFETY: `data` is the output buffer the caller passed; `text`
-        // holds `length` bytes.
-        let result = unsafe {
-            xmlOutputBufferWrite(data.cast::<OutputBuffer>(), length, text.as_ptr().cast())
-        };
+        // SAFETY: the dump's output buffer is the one the caller passed;
+        // `text` holds `length` bytes.
+        let result = unsafe { xmlOutputBufferWrite(dump.out, length, text.as_ptr().cast()) };
         result >= 0
     });
     if !written {
         errors::xml_failed(
-            here!("xmlSecNodeSetDumpTextNodes"),
+            here!("xmlSecNodeSetDumpTextNodesWalkCallback"),
             std::ptr::null(),
             c"xmlOutputBufferWriteString",
         );
+        dump.failed.set(true);
         return -1;
     }
     0
@@ -680,8 +701,22 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetDumpTextNodes(
             c"out != NULL",
             -1
         );
-        // SAFETY: as the caller passes.
-        unsafe { xmlSecNodeSetWalk(set, Some(dump_text), out.cast()) }
+        let dump = TextDump {
+            out,
+            failed: Cell::new(false),
+        };
+        // SAFETY: as the caller passes; the dump outlives the walk.
+        let walked =
+            unsafe { xmlSecNodeSetWalk(set, Some(dump_text), (&raw const dump).cast_mut().cast()) };
+        if walked < 0 {
+            errors::internal(
+                here!("xmlSecNodeSetDumpTextNodes"),
+                std::ptr::null(),
+                c"xmlSecNodeSetWalk",
+            );
+            return -1;
+        }
+        if dump.failed.get() { -1 } else { 0 }
     })
 }
 

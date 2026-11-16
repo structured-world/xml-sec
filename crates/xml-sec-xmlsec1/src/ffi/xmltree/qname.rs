@@ -147,6 +147,10 @@ unsafe fn resolve(
     Some((href, local))
 }
 
+/// Where the bit mask readers report an unbound prefix: libxmlsec1 resolves
+/// their names in its own static `xmlSecQName2BitMaskQNameResolve`.
+const QNAME_RESOLVE: Here = here!("xmlSecQName2BitMaskQNameResolve");
+
 /// The value of the entry named `local` in namespace `href`.
 ///
 /// # Safety
@@ -907,7 +911,7 @@ pub(crate) unsafe extern "C" fn xmlSecQName2BitMaskGetBitMaskFromString(
         let here = here!("xmlSecQName2BitMaskGetBitMaskFromString");
         // SAFETY: by the caller's contract; libxml2 is available.
         unsafe {
-            let Some((href, local)) = resolve(node, qname, here) else {
+            let Some((href, local)) = resolve(node, qname, QNAME_RESOLVE) else {
                 return -1;
             };
             if xmlSecQName2BitMaskGetBitMask(info, local, href, mask) < 0 {
@@ -1022,21 +1026,22 @@ pub(crate) unsafe extern "C" fn xmlSecQName2BitMaskNodesRead(
                     );
                     return -1;
                 }
-                let mut bit = 0;
-                let read =
-                    xmlSecQName2BitMaskGetBitMaskFromString(info, cur, content, &raw mut bit);
-                if read < 0 || (stop_on_unknown != 0 && bit == 0) {
-                    errors::internal_with(
-                        here,
-                        std::ptr::null(),
-                        c"xmlSecQName2BitMaskGetBitMaskFromString",
-                        &format!("value={}", text(content)),
-                    );
+                let Some((href, local)) = resolve(cur, content, QNAME_RESOLVE) else {
                     free(content.cast());
                     return -1;
+                };
+                let mut bit = 0;
+                if xmlSecQName2BitMaskGetBitMask(info, local, href, &raw mut bit) < 0 {
+                    // Without `stop_on_unknown` an unknown value is skipped.
+                    if stop_on_unknown != 0 {
+                        errors::invalid_node_content(here, cur, std::ptr::null(), "unknown value");
+                        free(content.cast());
+                        return -1;
+                    }
+                } else {
+                    mask.write(mask.read() | bit);
                 }
                 free(content.cast());
-                mask.write(mask.read() | bit);
                 cur = xmlSecGetNextElementNode(nodes::next(cur));
             }
             node.write(cur);
