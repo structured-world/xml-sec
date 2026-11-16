@@ -56,6 +56,10 @@ compile_error!(
 
 #[cfg(feature = "xmldsig")]
 pub mod api;
+/// Runs the DCC verification guide's example as a doctest.
+#[cfg(all(doctest, feature = "xmldsig", feature = "std"))]
+#[doc = include_str!("../docs/examples/dcc-signature-verification.md")]
+pub struct DccSignatureVerificationGuide;
 #[cfg(feature = "benchmark-internals")]
 #[doc(hidden)]
 pub mod benchmark_support;

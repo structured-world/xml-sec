@@ -272,6 +272,10 @@ fn verify_expected(xml: &str, key: &dyn VerifyingKey) -> Result<bool, Box<dyn st
 }
 ```
 
+An element without an ID, such as a ring of a PTB Digital Calibration Certificate, is located by
+walking `view.document()` and named by `view.identity_of(node)`, which refuses a node of another
+document; [the DCC guide](examples/dcc-signature-verification.md) shows a complete request.
+
 `signature_identities` is bounded discovery, not authentication; it does no cryptographic work.
 Reports bind the processed Signature and Reference elements to the retained document generation.
 `accepted` and `covers_element` reject foreign documents and every later document mutation.

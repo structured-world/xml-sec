@@ -96,6 +96,27 @@ unit error in the upstream README. The upstream corpus also lacks a separately
 named expired-certificate signature, so expiry coverage uses the original Phaos
 leaf and CA at a fixed modern verification time without modifying donor data.
 
+### `dcc`
+
+A PTB Digital Calibration Certificate (DCC 3.3.0, namespace `https://ptb.de/dcc`)
+written for this repository, not imported from a donor. `calibration-certificate.xml`
+is the unsigned certificate; `signed-calibration-certificate.xml` is the same
+certificate signed by xmlsec1 in the form of the PTB DCC wiki (inclusive C14N,
+`URI=""` with the enveloped-signature transform, RSA-SHA256) with the
+`rsa/rsa-2048` key and certificate, and backs the guide in
+`docs/examples/dcc-signature-verification.md`. Both validate against the DCC
+schema PTB publishes: `cargo run -p xml-sec-tools -- dcc-schema` reads that
+schema and its imports from PTB when it runs, so a new schema release fails the
+check until the corpus follows it.
+
+`tests/dcc_signature_corpus.rs` signs the certificate with this library and
+with xmlsec1, with RSA-SHA1/SHA-1 as in the wiki example and with RSA-SHA256,
+and verifies every result with both, under a PKI it generates for a fixed
+verification time. The schema gives `administrativeData` and
+`measurementResults` no ID, so narrower references and the signature-wrapping
+case use the IDs it does declare, on `measurementResult`; the wrapped copy sits
+in `dcc:comment`, whose content the schema admits unvalidated.
+
 ## Test Contract
 
 ### Modern key fixtures
