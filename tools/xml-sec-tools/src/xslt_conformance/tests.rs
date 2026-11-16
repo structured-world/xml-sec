@@ -153,3 +153,25 @@ fn an_unqualified_oracle_fails_before_any_suite() {
         assert!(!checked && recorder.steps.is_empty(), "{name}");
     }
 }
+
+#[test]
+fn a_recorded_oracle_below_the_interop_minimum_fails_before_any_suite() {
+    // An installer-built 1.3.12 matches its own marker, but the interop tests
+    // skip below their minimum version, so the gate would pass without them.
+    let directory = tempfile::tempdir().unwrap();
+    let xmlsec = oracle(directory.path(), Some("1.3.12"));
+    let mut recorder = Recorder::new();
+    recorder.version = "xmlsec1 1.3.12 (openssl)\n";
+    let (result, checked) = gate(&mut recorder, &xmlsec, true);
+    let failure = result.unwrap_err();
+    assert!(failure.message.contains("1.3.13"), "{}", failure.message);
+    assert!(!checked && recorder.steps.is_empty());
+}
+
+#[test]
+fn the_interop_minimum_is_read_from_the_test_helper() {
+    // The gate takes its floor from the declaration the interop tests skip by.
+    let source = "pub const REQUIRED_VERSION: (u16, u16, u16) = (2, 10, 4);\n";
+    assert_eq!(super::declared_minimum(source), Some((2, 10, 4)));
+    assert_eq!(super::declared_minimum("no declaration"), None);
+}

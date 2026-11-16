@@ -56,6 +56,39 @@ pub(crate) fn plan(cleanup: bool) -> Vec<Step> {
     steps
 }
 
+/// The interop test helper, whose `REQUIRED_VERSION` the oracle tests skip by.
+const INTEROP_HELPER: &str = include_str!("../../../tests/common/xmlsec1.rs");
+
+/// The `REQUIRED_VERSION` tuple a test helper's source declares.
+fn declared_minimum(source: &str) -> Option<(u16, u16, u16)> {
+    let (_, rest) = source.split_once("REQUIRED_VERSION: (u16, u16, u16) = (")?;
+    let (tuple, _) = rest.split_once(')')?;
+    let mut parts = tuple.split(',').map(|part| part.trim().parse::<u16>());
+    let version = (
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+    );
+    parts.next().is_none().then_some(version)
+}
+
+/// The minimum version below which the interop tests skip.
+fn interop_minimum() -> (u16, u16, u16) {
+    declared_minimum(INTEROP_HELPER)
+        .expect("tests/common/xmlsec1.rs declares REQUIRED_VERSION as a (u16, u16, u16) tuple")
+}
+
+/// A dotted `major.minor.patch` version.
+fn dotted(version: &str) -> Option<(u16, u16, u16)> {
+    let mut parts = version.split('.').map(str::parse::<u16>);
+    let parsed = (
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+    );
+    parts.next().is_none().then_some(parsed)
+}
+
 /// Admits only an oracle the installer built, whose binary reports the
 /// version of the source it recorded, with its XSLT transform; anything else
 /// would let the interoperability tests skip silently. Returns that source.
@@ -79,6 +112,17 @@ pub(crate) fn admit(
             recorded.version,
             recorded.commit,
             version.trim()
+        )
+        .into());
+    }
+    // The installer accepts any checkout through XMLSEC1_SOURCE_DIR, so a
+    // recorded source can still be older than the interop tests run against.
+    let minimum = interop_minimum();
+    if dotted(&recorded.version).is_none_or(|version| version < minimum) {
+        let (major, minor, patch) = minimum;
+        return Err(format!(
+            "The interop tests skip below xmlsec1 {major}.{minor}.{patch}; the oracle is {}",
+            recorded.version
         )
         .into());
     }
