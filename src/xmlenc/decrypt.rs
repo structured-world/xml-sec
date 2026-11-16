@@ -6082,7 +6082,7 @@ mod tests {
         let data = super::super::parse_encrypted_data_node_with_policy(node, &policy)
             .expect("an ML-KEM EncryptedKey is not a wrapped recipient");
         assert_eq!(data.encapsulation_methods.len(), 1);
-        assert!(data.encrypted_keys.is_empty());
+        assert_eq!(data.encrypted_keys.len(), 0);
     }
 
     #[cfg(feature = "experimental-pq")]
