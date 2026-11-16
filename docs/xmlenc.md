@@ -23,8 +23,18 @@ element order or namespaces remain `XmlEncError::InvalidStructure`.
 With `experimental-pq`, `EncryptedDataBuilder::encapsulation_key` establishes
 a fresh content key for an explicitly supplied recipient. Grant the exact
 ML-KEM parameter set through the operation's `KeyEstablishmentPolicy`.
+The key travels in an `EncryptedKey` whose `EncryptionMethod` names
+`http://www.w3.org/2026/08/xmldsig-more#ml-kem-512`, `-768` or `-1024` and whose
+`CipherValue` holds the FIPS 203 ciphertext, as draft-eastlake-rfc9231bis-xmlsec-uris
+section 3.6.9 and upstream libxmlsec1 define it; the first octets of the 32-byte
+shared secret that the content algorithm needs are its key, as upstream does. The
+draft identifiers may still change. The `EncapsulationMechanism` element and
+`http://www.aleksey.com/xmlsec/2025/12/xmldsig-more#` identifiers of libxmlsec1
+1.3.13 are no longer read. Such an `EncryptedKey` takes no `EncryptionMethod`
+parameters, and its optional `KeyInfo` names the recipient key; a `ReferenceList`
+or `CarriedKeyName` in it is refused because this transport does not process it.
 `direct_key_name` names only the outer content key, not the recipient key
-inside `EncapsulationMechanism`; an explicit recipient is supplied by the caller.
+inside that `EncryptedKey`; an explicit recipient is supplied by the caller.
 `EncapsulationDecryptor::new` borrows a private recipient handle;
 `EncapsulationDecryptor::provider_key` owns an imported handle.
 `KeyInventory::decryption_resolver_with_provider` selects these keys by their

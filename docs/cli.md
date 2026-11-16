@@ -472,9 +472,10 @@ are not standardized algorithm URIs; see [XMLDSig details](xmldsig.md).
 The compatibility executable explicitly permits compiled PQ XML methods for both signing
 and verification; core library defaults still require an explicit algorithm allowlist.
 ML-KEM-512/768/1024 also require `experimental-pq`. In such builds,
-`list-key-data` and `check-key-data` expose the
-`encapsulation-mechanism` handler only when the selected crypto engine supports KEM.
-For an `EncapsulationMechanism` template, `sign` and `encrypt` take the recipient
+`list-key-data` and `check-key-data` expose the `ml-kem` key data only when the
+selected crypto engine supports KEM; as in upstream libxmlsec1, the ML-KEM
+`EncryptedKey` is ordinary `enc-key` data, not a separate handler.
+For a template with an ML-KEM `EncryptedKey`, `sign` and `encrypt` take the recipient
 `--pubkey-pem`/`--pubkey-der`; `verify` and `decrypt` take the recipient
 `--privkey-pem`/`--privkey-der` or `--pkcs8-pem`/`--pkcs8-der`, with `--pwd`
 for protected PKCS#8. For `sign` and `encrypt`, `--keys-file` can select a named

@@ -486,6 +486,43 @@ fn decrypts_ecdh_concat_hashes_with_the_pinned_recipient_keys() {
         );
         assert_documented_surplus_cek(&xml, &name, &method, &recipient, &peer, &policy);
     }
+    // A KA-Nonce beside an explicit ConcatKDF is accepted and does not enter
+    // the derivation: XML Encryption 1.1 section 5.6.1 feeds it only to the
+    // key derivation that names it.
+    // https://www.w3.org/TR/xmlenc-core1/#sec-KA-Nonce
+    let mut policy = policy;
+    policy.key_establishment.digest_algorithms = Some(BTreeSet::from([DigestAlgorithm::Sha512]));
+    let name = "enc_ecdh_p256_concatkdf_sha512_kw_aes256_aes128gcm_kanonce";
+    let descriptor = format!(
+        "<x:KeyDerivationMethod xmlns:x='http://www.w3.org/2009/xmlenc11#' Algorithm='http://www.w3.org/2009/xmlenc11#ConcatKDF'><x:ConcatKDFParams AlgorithmID='00123456' PartyUInfo='00123456' PartyVInfo='00123456'><d:DigestMethod xmlns:d='http://www.w3.org/2000/09/xmldsig#' Algorithm='{}'/></x:ConcatKDFParams></x:KeyDerivationMethod>",
+        DigestAlgorithm::Sha512.uri()
+    );
+    let method = AgreementMethod {
+        algorithm: xml_sec::policy::KeyAgreementAlgorithm::EcdhEs,
+        method: Some(parse_key_derivation_method(&descriptor, &policy).unwrap()),
+        nonce: b"foo".to_vec(),
+        legacy_digest: None,
+        originator: Some(key_name_info("originator-key-name")),
+        recipient: Some(key_name_info("recipient-key-name")),
+    };
+    let xml = std::fs::read_to_string(format!("{VECTOR_DIR}/{name}.xml")).unwrap();
+    let resolver =
+        AgreementDecryptor::wrapping(&method, &recipient, &peer, KeyWrapAlgorithm::AesKw256);
+    // The document parses with its nonce and reaches the same surplus-width
+    // refusal as its siblings, so the wrapping key it derived was right.
+    assert!(
+        matches!(
+            DecryptContext::new(&resolver)
+                .policy(policy.clone())
+                .decrypt_document(&xml, None),
+            Err(XmlEncError::InvalidWrappedKeyLength {
+                expected: 24,
+                actual: 40
+            })
+        ),
+        "{name}"
+    );
+    assert_documented_surplus_cek(&xml, name, &method, &recipient, &peer, &policy);
 }
 
 #[cfg(feature = "legacy-algorithms")]
@@ -1054,6 +1091,8 @@ fn decrypts_xmlsec1_direct_aes_keyname_vectors() {
         ("enc-aes128gcm-keyname", "test-aes128"),
         ("enc-aes256cbc-keyname", "test-aes256"),
         ("enc-aes256gcm-keyname", "test-aes256"),
+        // An empty plaintext still carries the GCM nonce and tag.
+        ("enc-aes128gcm-empty-data", "test-aes128"),
     ] {
         let xml = std::fs::read_to_string(format!("{VECTOR_DIR}/{name}.xml"))
             .expect("tracked donor XML must be readable");
@@ -1079,8 +1118,8 @@ fn decrypts_aleksey_legacy_direct_and_reference_shapes() {
     let aes = read_aes_keys(Path::new(KEY_INVENTORY));
     let des = std::fs::read(format!("{VECTOR_DIR}/test-des.bin")).unwrap();
     let mut policy = DecryptionPolicy {
-        data_algorithms: Some([D::TripleDesCbc, D::Aes192Cbc, D::Aes192Gcm].into()),
-        key_wrap_algorithms: Some([W::AesKw192, W::Cbc(D::Aes192Cbc)].into()),
+        data_algorithms: Some([D::TripleDesCbc, D::Aes128Cbc, D::Aes192Cbc, D::Aes192Gcm].into()),
+        key_wrap_algorithms: Some([W::AesKw192, W::Cbc(D::Aes192Cbc), W::TripleDes].into()),
         ..Default::default()
     };
     policy.xml.allow_internal_dtd = true;
@@ -1094,6 +1133,8 @@ fn decrypts_aleksey_legacy_direct_and_reference_shapes() {
         ("enc-des3cbc-keyname-element", true, false, false),
         ("enc-des3cbc-keyname-element-root", true, false, false),
         ("enc-des3cbc-aes192-keyname", false, true, true),
+        // An AES-128 content key wrapped with the Triple DES key.
+        ("enc-aes128cbc-kw-des3-keyname", false, false, true),
     ] {
         let (key, kind) = if aes_key {
             (&aes["test-aes192"], SymmetricKeyKind::Aes)
@@ -1232,7 +1273,6 @@ fn decrypts_aleksey_rsa_oaep_document_vectors() {
     }
 }
 
-#[cfg(feature = "legacy-algorithms")]
 #[test]
 fn decrypts_each_recipient_in_the_two_transport_key_vector() {
     // Each recipient must recover the same document independently. Testing
@@ -1243,7 +1283,7 @@ fn decrypts_each_recipient_in_the_two_transport_key_vector() {
     let xml = std::fs::read_to_string(format!("{VECTOR_DIR}/{name}.xml")).unwrap();
     let expected = std::fs::read(format!("{VECTOR_DIR}/{name}.data")).unwrap();
     let mut policy = DecryptionPolicy {
-        key_transport_algorithms: Some([KeyTransportAlgorithm::RsaPkcs1v15].into()),
+        key_transport_algorithms: Some([KeyTransportAlgorithm::RsaOaepMgf1p].into()),
         ..DecryptionPolicy::default()
     };
     policy.xml.allow_internal_dtd = true;
@@ -1266,7 +1306,6 @@ fn decrypts_each_recipient_in_the_two_transport_key_vector() {
     completed_vector(VECTOR_DIR, name, CorpusOutcome::Decrypted);
 }
 
-#[cfg(feature = "legacy-algorithms")]
 #[test]
 fn decrypts_iso_latin1_element_and_content_donor_documents() {
     // Both the source document and the replaced document cross the public
@@ -1276,7 +1315,7 @@ fn decrypts_iso_latin1_element_and_content_donor_documents() {
     let pem = std::fs::read_to_string("tests/fixtures/keys/rsa/rsa-4096-key.pem").unwrap();
     let resolver = PrivateKeyDecryptor::new(RsaPrivateKey::from_pkcs8_pem(&pem).unwrap());
     let policy = DecryptionPolicy {
-        key_transport_algorithms: Some([KeyTransportAlgorithm::RsaPkcs1v15].into()),
+        key_transport_algorithms: Some([KeyTransportAlgorithm::RsaOaepMgf1p].into()),
         ..DecryptionPolicy::default()
     };
     let context = DecryptContext::new(&resolver).policy(policy);
@@ -1335,9 +1374,39 @@ fn decrypts_rsa15_documents_with_certificate_selector_metadata() {
         "enc_rsa_1_5_x509_digest_sha3_256",
         "enc_rsa_1_5_x509_digest_sha3_384",
         "enc_rsa_1_5_x509_digest_sha3_512",
-        "enc-two-recipients",
-        "large_input",
     ] {
+        let xml = std::fs::read_to_string(format!("{VECTOR_DIR}/{name}.xml")).unwrap();
+        let expected = std::fs::read_to_string(format!("{VECTOR_DIR}/{name}.data")).unwrap();
+        let actual = context
+            .decrypt_document(&xml, None)
+            .unwrap_or_else(|error| panic!("{name}: {error}"))
+            .output;
+        assert_eq!(
+            canonicalize_dtd_document(&actual, &c14n),
+            canonicalize_dtd_document(&expected, &c14n),
+            "{name}",
+        );
+        completed_vector(VECTOR_DIR, name, CorpusOutcome::Decrypted);
+    }
+}
+
+#[test]
+fn decrypts_oaep_documents_with_two_recipients_and_large_input() {
+    // Upstream moved these documents from RSA 1.5 to RSA-OAEP; the caller's
+    // key still selects the recipient, and the large input stays one document.
+    use xml_sec::policy::DecryptionPolicy;
+    use xml_sec::xmlenc::KeyTransportAlgorithm;
+    let pem = std::fs::read_to_string("tests/fixtures/keys/rsa/rsa-4096-key.pem").unwrap();
+    let resolver = PrivateKeyDecryptor::new(RsaPrivateKey::from_pkcs8_pem(&pem).unwrap());
+    let mut policy = DecryptionPolicy {
+        data_algorithms: Some([xml_sec::xmlenc::DataEncryptionAlgorithm::Aes256Cbc].into()),
+        key_transport_algorithms: Some([KeyTransportAlgorithm::RsaOaepMgf1p].into()),
+        ..DecryptionPolicy::default()
+    };
+    policy.xml.allow_internal_dtd = true;
+    let context = DecryptContext::new(&resolver).policy(policy);
+    let c14n = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
+    for name in ["enc-two-recipients", "large_input"] {
         let xml = std::fs::read_to_string(format!("{VECTOR_DIR}/{name}.xml")).unwrap();
         let expected = std::fs::read_to_string(format!("{VECTOR_DIR}/{name}.data")).unwrap();
         let actual = context
@@ -3127,6 +3196,7 @@ fn complete_corpora_execute_every_vector_exactly_once() {
     decrypts_each_recipient_in_the_two_transport_key_vector();
     decrypts_iso_latin1_element_and_content_donor_documents();
     decrypts_rsa15_documents_with_certificate_selector_metadata();
+    decrypts_oaep_documents_with_two_recipients_and_large_input();
     legacy_oaep_donor_hashes_require_permission_then_decrypt();
     for name in ml_kem_corpus::execute(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))) {
         completed_vector(VECTOR_DIR, &name, CorpusOutcome::Decrypted);
@@ -3177,7 +3247,7 @@ fn complete_corpora_execute_every_vector_exactly_once() {
             .values()
             .filter(|outcome| **outcome == CorpusOutcome::DocumentedDeparture)
             .count(),
-        19
+        20
     );
     assert_eq!(
         completed

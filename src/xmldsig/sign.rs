@@ -1683,7 +1683,7 @@ impl<'a> SignContext<'a> {
     }
 
     /// Establish an HMAC key from an explicit recipient public key. The template
-    /// must contain one experimental `EncapsulationMechanism`; policy must grant
+    /// must contain one ML-KEM `EncryptedKey` in its `KeyInfo`; policy must grant
     /// its exact algorithm. KEM/HMAC alone does not authenticate the sender.
     pub fn new_encapsulation(key: &'a dyn crate::provider::KeyEncapsulationKey) -> Self {
         Self {
@@ -2068,7 +2068,7 @@ impl<'a> SignContext<'a> {
         if let Some(key) = self.encapsulation_key {
             if self.key_info_writer.is_some() {
                 return Err(crate::key_establishment::KeyEstablishmentError::Structure(
-                    "KeyInfo writer cannot overwrite EncapsulationMechanism",
+                    "KeyInfo writer cannot overwrite the ML-KEM EncryptedKey",
                 )
                 .into());
             }

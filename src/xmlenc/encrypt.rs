@@ -1700,21 +1700,14 @@ fn write_encrypted_data<W: Write>(
     {
         write_start(writer, "ds:KeyInfo", [])?;
         if let Some((algorithm, ciphertext)) = encapsulation {
-            write_start(
-                writer,
-                "kem:EncapsulationMechanism",
-                [
-                    ("xmlns:kem", crate::key_establishment::ENCAPSULATION_NS),
-                    ("Algorithm", algorithm.uri()),
-                ],
-            )?;
-            write_start(writer, "ds:KeyInfo", [])?;
-            // XMLDSig 1.1 §4.5.1: KeyName identifies the containing KeyInfo's
-            // key. The outer content key and inner recipient key are distinct.
-            // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-KeyName
-            write_end(writer, "ds:KeyInfo")?;
+            // ML-KEM key transport (draft-eastlake-rfc9231bis-xmlsec-uris-09
+            // 3.6.9). The EncryptedKey's optional KeyInfo would name the
+            // recipient key, which the builder does not know, so it is omitted;
+            // the outer KeyName names the content key, not the recipient key.
+            write_start(writer, "xenc:EncryptedKey", [])?;
+            write_empty_with_algorithm(writer, "xenc:EncryptionMethod", algorithm.uri())?;
             write_cipher_data(writer, ciphertext)?;
-            write_end(writer, "kem:EncapsulationMechanism")?;
+            write_end(writer, "xenc:EncryptedKey")?;
         }
         if let Some(key_name) = direct_key_name {
             write_text_element(writer, "ds:KeyName", key_name)?;

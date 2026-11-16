@@ -259,15 +259,17 @@ fn fixture_file_count_matches_expected() {
         // ML-KEM adds six key formats and two DSig inputs for each of three sets.
         // Two alloc-only inputs cover detached and multi-signature documents.
         // Five published DSTU 4145 signatures add one signed original and
-        // their provenance note.
-        ("xmldsig", 400),
+        // their provenance note. Upstream's signature-context vectors add
+        // both placements for twelve methods and three documents with two contexts.
+        ("xmldsig", 427),
         ("saml", 2),
         // Complete Merlin, Phaos and Aleksey snapshots, plus shared XDH keys.
         // Agreement recipes additionally need all 66 EC and 12 DHX key files.
         // Completing the 79-file XML Encryption 1.1 snapshot adds 70 files
         // to the nine RSA files retained by the earlier subset.
-        // The checksum manifest pins every imported file's contents.
-        ("xmlenc", 1072),
+        // The checksum manifest pins every imported file's contents. Upstream
+        // master adds Triple DES key wrap, empty data and KA-Nonce vectors.
+        ("xmlenc", 1081),
     ];
 
     for (corpus, expected_count) in expected {

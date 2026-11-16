@@ -29,8 +29,10 @@ feature, must fail at an explicit typed boundary rather than being skipped.
 
 ## Experimental Recipient Encapsulation
 
-`experimental-pq` supports libxmlsec1 1.3.13's experimental
-`EncapsulationMechanism` inside signature `KeyInfo`. It is an extension, not a
+`experimental-pq` supports an ML-KEM `EncryptedKey` inside signature `KeyInfo`,
+whose shared secret is the HMAC key, as upstream libxmlsec1 does; its
+`EncryptionMethod` carries the ML-KEM identifier of
+draft-eastlake-rfc9231bis-xmlsec-uris section 3.6.9. It is an extension, not a
 W3C signature algorithm. Use `SignContext::new_encapsulation(&recipient_public)`
 with an HMAC builder/template and an explicitly permitting `SigningPolicy`.
 The context fills the KEM ciphertext before canonicalization and reference

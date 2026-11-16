@@ -15,8 +15,8 @@ use zeroize::Zeroizing;
 /// Failures at the shared policy/provider boundary.
 #[derive(Debug, thiserror::Error)]
 pub enum KeyEstablishmentError {
-    /// Experimental XML grammar or consuming key width is invalid.
-    #[error("invalid EncapsulationMechanism: {0}")]
+    /// ML-KEM `EncryptedKey` grammar or consuming key width is invalid.
+    #[error("invalid ML-KEM EncryptedKey: {0}")]
     Structure(&'static str),
     /// Deployment permission or operation allowance was denied.
     #[error(transparent)]
@@ -26,10 +26,12 @@ pub enum KeyEstablishmentError {
     Provider(#[from] ProviderError),
 }
 
-/// libxmlsec1's experimental namespace, distinct from the W3C namespaces.
-pub const ENCAPSULATION_NS: &str = "http://www.aleksey.com/xmlsec/2025/12/xmldsig-more#";
+const XMLENC_NS: &str = "http://www.w3.org/2001/04/xmlenc#";
 
-/// Owned experimental mechanism retained by parsed XML Encryption input.
+/// ML-KEM key transport retained by parsed input: an `EncryptedKey` whose
+/// `EncryptionMethod` names an ML-KEM parameter set and whose `CipherValue`
+/// holds the FIPS 203 ciphertext (draft-eastlake-rfc9231bis-xmlsec-uris-09
+/// section 3.6.9).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncapsulationMechanism {
     /// Exact parameter set, not deployment permission.
@@ -45,8 +47,9 @@ pub struct EncapsulationMechanism {
 pub struct ParsedEncapsulation<'a, 'input> {
     /// Exact parameter set decoded from the mechanism.
     pub algorithm: KeyEncapsulationAlgorithm,
-    /// Borrowed recipient hints, never a trust grant.
-    pub key_info: crate::Node<'a, 'input>,
+    /// Borrowed recipient hints, never a trust grant; `EncryptedKey` makes
+    /// its `KeyInfo` optional.
+    pub key_info: Option<crate::Node<'a, 'input>>,
     /// Original ciphertext element for controlled template mutation.
     pub cipher_value: crate::Node<'a, 'input>,
     ciphertext: [u8; 1568],
@@ -66,7 +69,27 @@ impl ParsedEncapsulation<'_, '_> {
     }
 }
 
-/// Validate the experimental ordered grammar and decode into fixed storage.
+/// The ML-KEM parameter set `node` transports a key with: `node` is an
+/// `EncryptedKey` whose first element child is an `EncryptionMethod` naming
+/// one. Any other element, including an RSA or key-wrap `EncryptedKey`, is not.
+#[must_use]
+pub fn encapsulation_algorithm(node: crate::Node<'_, '_>) -> Option<KeyEncapsulationAlgorithm> {
+    if !node.has_tag_name((XMLENC_NS, "EncryptedKey")) {
+        return None;
+    }
+    node.children()
+        .find(crate::Node::is_element)
+        .filter(|method| method.has_tag_name((XMLENC_NS, "EncryptionMethod")))
+        .and_then(|method| method.attribute("Algorithm"))
+        .and_then(KeyEncapsulationAlgorithm::from_uri)
+}
+
+/// Validate an ML-KEM `EncryptedKey` and decode its ciphertext into fixed
+/// storage. XML Encryption 1.1 section 3.5.1 orders `EncryptionMethod`,
+/// optional `ds:KeyInfo` and `CipherData`; the ML-KEM method takes no
+/// parameters, and the `ReferenceList` and `CarriedKeyName` this transport
+/// does not process are refused rather than ignored.
+/// <https://www.w3.org/TR/xmlenc-core1/#sec-EncryptedKey>
 ///
 /// # Errors
 /// Returns a structure error for an unknown algorithm, malformed child order,
@@ -77,37 +100,35 @@ pub fn parse_encapsulation<'a, 'input>(
 ) -> Result<ParsedEncapsulation<'a, 'input>, KeyEstablishmentError> {
     use base64::Engine as _;
     let invalid = KeyEstablishmentError::Structure;
-    if !node.has_tag_name((ENCAPSULATION_NS, "EncapsulationMechanism")) {
-        return Err(invalid("wrong element name or namespace"));
-    }
-    let algorithm = node
-        .attribute("Algorithm")
-        .and_then(KeyEncapsulationAlgorithm::from_uri)
-        .ok_or(invalid("unsupported or missing Algorithm"))?;
-    // This is the experimental donor contract, not a W3C schema requirement:
-    // xmlsec 1.3.13 src/transform_helpers.c, xmlSecTransformKEMRead.
-    // https://github.com/lsh123/xmlsec/blob/xmlsec-1_3_13/src/transform_helpers.c
-    let mut children = node.children().filter(crate::Node::is_element);
-    let key_info = children
+    let algorithm = encapsulation_algorithm(node)
+        .ok_or(invalid("not an EncryptedKey with an ML-KEM method"))?;
+    let mut children = node.children().filter(crate::Node::is_element).peekable();
+    let method = children
         .next()
-        .filter(|n| n.has_tag_name((crate::xmldsig::parse::XMLDSIG_NS, "KeyInfo")))
-        .ok_or(invalid("expected KeyInfo first"))?;
+        .ok_or(invalid("expected EncryptionMethod"))?;
+    if method.children().any(|n| n.is_element()) {
+        return Err(invalid("ML-KEM EncryptionMethod takes no parameters"));
+    }
+    let key_info =
+        children.next_if(|n| n.has_tag_name((crate::xmldsig::parse::XMLDSIG_NS, "KeyInfo")));
     let data = children
         .next()
-        .filter(|n| n.has_tag_name(("http://www.w3.org/2001/04/xmlenc#", "CipherData")))
-        .ok_or(invalid("expected CipherData after KeyInfo"))?;
+        .filter(|n| n.has_tag_name((XMLENC_NS, "CipherData")))
+        .ok_or(invalid(
+            "expected CipherData after EncryptionMethod and KeyInfo",
+        ))?;
     if children.next().is_some() {
-        return Err(invalid("unexpected mechanism child"));
+        return Err(invalid("unexpected child after CipherData"));
     }
     let mut children = data.children().filter(crate::Node::is_element);
     let cipher_value = children
         .next()
-        .filter(|n| n.has_tag_name(("http://www.w3.org/2001/04/xmlenc#", "CipherValue")))
+        .filter(|n| n.has_tag_name((XMLENC_NS, "CipherValue")))
         .ok_or(invalid("expected CipherValue"))?;
     if children.next().is_some() || cipher_value.children().any(|n| n.is_element()) {
         return Err(invalid("unexpected CipherData or CipherValue child"));
     }
-    for parent in [node, data] {
+    for parent in [node, method, data] {
         if parent.children().filter(crate::Node::is_text).any(|n| {
             n.text()
                 .is_some_and(|s| !s.bytes().all(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n')))
@@ -160,7 +181,7 @@ pub fn direct_encapsulation<'a, 'input>(
 ) -> Result<Option<ParsedEncapsulation<'a, 'input>>, KeyEstablishmentError> {
     let mut mechanisms = key_info
         .children()
-        .filter(|n| n.has_tag_name((ENCAPSULATION_NS, "EncapsulationMechanism")));
+        .filter(|n| encapsulation_algorithm(*n).is_some());
     let Some(node) = mechanisms.next() else {
         return Ok(None);
     };
@@ -454,7 +475,7 @@ mod tests {
         // valid; a 1569-byte ciphertext with the same encoded length must fail.
         let mechanism = |bytes: &[u8]| {
             format!(
-                "<e:EncapsulationMechanism xmlns:e=\"{ENCAPSULATION_NS}\" xmlns:d=\"http://www.w3.org/2000/09/xmldsig#\" xmlns:x=\"http://www.w3.org/2001/04/xmlenc#\" Algorithm=\"{}\"><d:KeyInfo/><x:CipherData><x:CipherValue>{}</x:CipherValue></x:CipherData></e:EncapsulationMechanism>",
+                "<x:EncryptedKey xmlns:d=\"http://www.w3.org/2000/09/xmldsig#\" xmlns:x=\"{XMLENC_NS}\"><x:EncryptionMethod Algorithm=\"{}\"/><d:KeyInfo/><x:CipherData><x:CipherValue>{}</x:CipherValue></x:CipherData></x:EncryptedKey>",
                 KeyEncapsulationAlgorithm::MlKem1024.uri(),
                 base64::engine::general_purpose::STANDARD.encode(bytes)
             )
@@ -479,15 +500,20 @@ mod tests {
 
     #[test]
     fn mechanism_grammar_rejects_ambiguous_and_malformed_input() {
-        // The extension requires exactly ordered KeyInfo/CipherData; a
-        // template may omit ciphertext, but a decryption input may not.
+        // XML Encryption orders EncryptionMethod, optional KeyInfo and
+        // CipherData; a template may omit ciphertext, a decryption input may
+        // not, and what the transport does not process is refused.
         let valid = format!(
-            "<e:EncapsulationMechanism xmlns:e=\"{ENCAPSULATION_NS}\" xmlns:d=\"http://www.w3.org/2000/09/xmldsig#\" xmlns:x=\"http://www.w3.org/2001/04/xmlenc#\" Algorithm=\"{}\"><d:KeyInfo/><x:CipherData><x:CipherValue/></x:CipherData></e:EncapsulationMechanism>",
+            "<x:EncryptedKey xmlns:d=\"http://www.w3.org/2000/09/xmldsig#\" xmlns:x=\"{XMLENC_NS}\" Id=\"EK\"><x:EncryptionMethod Algorithm=\"{}\"/><d:KeyInfo/><x:CipherData><x:CipherValue/></x:CipherData></x:EncryptedKey>",
             KeyEncapsulationAlgorithm::MlKem512.uri()
         );
         let document = crate::Document::parse(&valid).expect("template XML");
         assert!(parse_encapsulation(document.root_element(), true).is_ok());
         assert!(parse_encapsulation(document.root_element(), false).is_err());
+        let without_key_info = valid.replace("<d:KeyInfo/>", "");
+        let document = crate::Document::parse(&without_key_info).expect("template XML");
+        let parsed = parse_encapsulation(document.root_element(), true).expect("KeyInfo optional");
+        assert!(parsed.key_info.is_none());
         for invalid in [
             valid.replace("<d:KeyInfo/>", "<d:KeyInfo/><d:KeyInfo/>"),
             valid.replace("<d:KeyInfo/>", "unexpected<d:KeyInfo/>"),
@@ -498,9 +524,22 @@ mod tests {
             valid.replace("<x:CipherValue/>", "<x:CipherValue>AA==</x:CipherValue>"),
             valid.replace("<x:CipherValue/>", "<x:CipherValue>!</x:CipherValue>"),
             valid.replace("#ml-kem-512", "#ml-kem-512 "),
+            valid.replace(
+                "</x:CipherData>",
+                "</x:CipherData><x:CarriedKeyName>k</x:CarriedKeyName>",
+            ),
+            valid.replace(
+                "</x:CipherData>",
+                "</x:CipherData><x:ReferenceList><x:DataReference URI=\"#d\"/></x:ReferenceList>",
+            ),
+            valid.replace("\"/><d:KeyInfo/>", "\"><x:KeySize>256</x:KeySize></x:EncryptionMethod><d:KeyInfo/>"),
+            valid.replace(
+                &format!("<x:EncryptionMethod Algorithm=\"{}\"/>", KeyEncapsulationAlgorithm::MlKem512.uri()),
+                "<x:EncryptionMethod Algorithm=\"http://www.aleksey.com/xmlsec/2025/12/xmldsig-more#ml-kem-512\"/>",
+            ),
         ] {
             let document = crate::Document::parse(&invalid).expect("well-formed invalid mechanism");
-            assert!(parse_encapsulation(document.root_element(), true).is_err());
+            assert!(parse_encapsulation(document.root_element(), true).is_err(), "{invalid}");
         }
     }
 

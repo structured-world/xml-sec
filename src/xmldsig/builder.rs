@@ -486,21 +486,18 @@ impl SignatureBuilder {
         if let Some(algorithm) = encapsulation {
             policy.key_establishment.check_encapsulation(algorithm)?;
             write_start(writer, prefix, "KeyInfo")?;
+            // The HMAC key is an ML-KEM shared secret transported in an
+            // EncryptedKey (draft-eastlake-rfc9231bis-xmlsec-uris-09 3.6.9).
             writer.start(
-                "EncapsulationMechanism",
-                [
-                    ("xmlns", crate::key_establishment::ENCAPSULATION_NS),
-                    ("Algorithm", algorithm.uri()),
-                ],
-            )?;
-            writer.empty("KeyInfo", [("xmlns", XMLDSIG_NS)])?;
-            writer.start(
-                "CipherData",
+                "EncryptedKey",
                 [("xmlns", "http://www.w3.org/2001/04/xmlenc#")],
             )?;
+            writer.empty("EncryptionMethod", [("Algorithm", algorithm.uri())])?;
+            writer.empty("KeyInfo", [("xmlns", XMLDSIG_NS)])?;
+            writer.start("CipherData", std::iter::empty::<(&str, &str)>())?;
             writer.empty("CipherValue", std::iter::empty::<(&str, &str)>())?;
             writer.end("CipherData")?;
-            writer.end("EncapsulationMechanism")?;
+            writer.end("EncryptedKey")?;
             write_end(writer, prefix, "KeyInfo")?;
         } else if self.include_key_info {
             write_empty(writer, prefix, "KeyInfo")?;

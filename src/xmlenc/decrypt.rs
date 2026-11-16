@@ -5970,7 +5970,7 @@ mod tests {
         // Exercise the existing facade preflight with a permissive custom
         // resolver, including nested KEKs, rather than built-in KEM recovery.
         let document = crate::XmlDomDocument::parse(include_str!(
-            "../../tests/fixtures/xmlenc/aleksey-xmlenc-01/enc-aes128gcm-em-ml-kem-512.xml"
+            "../../tests/fixtures/xmlenc/aleksey-xmlenc-01/enc-aes128gcm-kt-ml-kem-512.xml"
         ))
         .expect("valid donor XML");
         let node = document
@@ -6059,7 +6059,7 @@ mod tests {
         // Typed input must charge the same base64-projected KEM ciphertext as
         // XML input, including descriptors nested under an EncryptedKey.
         let xml = include_str!(
-            "../../tests/fixtures/xmlenc/aleksey-xmlenc-01/enc-aes128gcm-em-ml-kem-512.xml"
+            "../../tests/fixtures/xmlenc/aleksey-xmlenc-01/enc-aes128gcm-kt-ml-kem-512.xml"
         );
         let document = crate::XmlDomDocument::parse(xml).expect("donor XML parses");
         let node = document

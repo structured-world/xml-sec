@@ -849,7 +849,7 @@ fn validate_sign_key_options(
     if encapsulation {
         if let Some(option) = invocation.ordered_values(SIGNING_KEY_OPTIONS).next() {
             return Err(CommandError::Usage(format!(
-                "--{} is inapplicable to sign with EncapsulationMechanism; supply a recipient public key",
+                "--{} is inapplicable to sign with an ML-KEM EncryptedKey; supply a recipient public key",
                 option.name
             )));
         }
@@ -858,7 +858,7 @@ fn validate_sign_key_options(
         .next()
     {
         return Err(CommandError::Usage(format!(
-            "--{} is inapplicable to sign without EncapsulationMechanism",
+            "--{} is inapplicable to sign without an ML-KEM EncryptedKey",
             option.name
         )));
     }
@@ -1927,7 +1927,7 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
         && let Some(option) = invocation.ordered_values(VERIFY_RECIPIENT_OPTIONS).next()
     {
         return Err(CommandError::Usage(format!(
-            "--{} is inapplicable to verify without EncapsulationMechanism",
+            "--{} is inapplicable to verify without an ML-KEM EncryptedKey",
             option.name
         )));
     }
@@ -3287,7 +3287,7 @@ fn configure_encryption_keys(
     let names = request.content_key_name.as_slice();
     if let Some((algorithm, names)) = &request.encapsulation {
         if !aes_keys.is_empty() || request.has_encrypted_key_recipient {
-            return Err(CommandError::Usage("direct EncapsulationMechanism cannot be combined with raw symmetric keys or EncryptedKey recipients".into()));
+            return Err(CommandError::Usage("a direct ML-KEM EncryptedKey cannot be combined with raw symmetric keys or other EncryptedKey recipients".into()));
         }
         let key = select_encapsulation_key(
             invocation,
@@ -3904,7 +3904,7 @@ fn recipient_key_metadata(
     let encrypted_keys = direct_child_element(encrypted_data, XMLDSIG_NS, "KeyInfo")
         .into_iter()
         .flat_map(Node::children)
-        .filter(|node| node.has_tag_name((XMLENC_NS, "EncryptedKey")))
+        .filter(|node| is_recipient_encrypted_key(*node))
         .collect::<Vec<_>>();
     if encrypted_keys.is_empty() {
         return Ok(vec![None; expected_recipients]);
@@ -4280,14 +4280,8 @@ fn merge_template_key_info_children(
     // Only generated element kinds the template lacks are appended.
     let mut children_to_append = generated_key_info
         .children()
-        .filter(|node| node.is_element() && !node.has_tag_name((XMLENC_NS, "EncryptedKey")))
-        .filter(|node| {
-            template_kem.is_empty()
-                || !node.has_tag_name((
-                    xml_sec::key_establishment::ENCAPSULATION_NS,
-                    "EncapsulationMechanism",
-                ))
-        })
+        .filter(|node| node.is_element() && !is_recipient_encrypted_key(*node))
+        .filter(|node| template_kem.is_empty() || !is_kem_encrypted_key(*node))
         .filter(|generated_child| {
             !template_key_info.children().any(|template_child| {
                 template_child.is_element()
@@ -4299,7 +4293,7 @@ fn merge_template_key_info_children(
     if template_values.is_empty() && !generated_values.is_empty() {
         let generated_keys = generated_key_info
             .children()
-            .filter(|node| node.has_tag_name((XMLENC_NS, "EncryptedKey")))
+            .filter(|node| is_recipient_encrypted_key(*node))
             .map(|node| standalone_element(generated, node))
             .collect::<Result<Vec<_>, _>>()?;
         if generated_keys.len() != generated_values.len() {
@@ -4357,12 +4351,7 @@ fn apply_encryption_template(
         parse_encryption_document(generated, policy.xml, &policy.resources, xml_backend)?;
     let template_data = select_encrypted_data(&template_document, start_node_id, id_attributes)?;
     let generated_data = generated_document.root_element();
-    let inspected = if template_document.descendants().any(|node| {
-        node.has_tag_name((
-            xml_sec::key_establishment::ENCAPSULATION_NS,
-            "EncapsulationMechanism",
-        ))
-    }) {
+    let inspected = if template_document.descendants().any(is_kem_encrypted_key) {
         Some(
             xml_sec::xmlenc::inspect_encrypted_data_template_node_with_context(
                 template_data,
@@ -4681,10 +4670,21 @@ fn encrypted_key_cipher_values<'a, 'input>(
         .collect()
 }
 
+/// An `EncryptedKey` transporting the key through ML-KEM: its ciphertext is
+/// produced by encapsulation, not by encrypting a key for a recipient.
+fn is_kem_encrypted_key(node: Node<'_, '_>) -> bool {
+    xml_sec::key_establishment::encapsulation_algorithm(node).is_some()
+}
+
+/// An `EncryptedKey` that encrypts or wraps the key for a recipient.
+fn is_recipient_encrypted_key(node: Node<'_, '_>) -> bool {
+    node.has_tag_name((XMLENC_NS, "EncryptedKey")) && !is_kem_encrypted_key(node)
+}
+
 fn direct_encrypted_keys<'a, 'input>(key_info: Node<'a, 'input>) -> Vec<Node<'a, 'input>> {
     key_info
         .children()
-        .filter(|node| node.has_tag_name((XMLENC_NS, "EncryptedKey")))
+        .filter(|node| is_recipient_encrypted_key(*node))
         .collect()
 }
 
@@ -4762,7 +4762,7 @@ fn companion_certificate_encoding(
     }
 }
 
-/// Decrypt through the recipient `EncapsulationMechanism` the inspection found.
+/// Decrypt through the recipient ML-KEM `EncryptedKey` the inspection found.
 fn decrypt_with_encapsulation(
     command: &DecryptCommand<'_>,
     policy: DecryptionPolicy,
@@ -4778,7 +4778,7 @@ fn decrypt_with_encapsulation(
         .check_encapsulation(mechanism.algorithm)?;
     if has_aes_keys {
         return Err(CommandError::Usage(
-            "EncapsulationMechanism requires a recipient private key, not --aes-key".into(),
+            "an ML-KEM EncryptedKey requires a recipient private key, not --aes-key".into(),
         ));
     }
     let names = mechanism
@@ -5188,12 +5188,7 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     // References may nominate a sibling KeyInfo, not only a descendant of the
     // selected data. With no mechanism anywhere in this same-document-only
     // source domain, keep ordinary decryption free of extra model construction.
-    let parsed = if document.descendants().any(|node| {
-        node.has_tag_name((
-            xml_sec::key_establishment::ENCAPSULATION_NS,
-            "EncapsulationMechanism",
-        ))
-    }) {
+    let parsed = if document.descendants().any(is_kem_encrypted_key) {
         Some(
             xml_sec::xmlenc::inspect_encrypted_data_node_with_context(
                 encrypted_data,
@@ -5764,7 +5759,7 @@ fn select_encapsulation_key<P: xml_sec::document::XmlDocumentPolicy>(
         .next()
     {
         return Err(CommandError::Usage(format!(
-            "--{} is inapplicable to {} with EncapsulationMechanism; supply --pubkey-pem, --pubkey-der or --keys-file",
+            "--{} is inapplicable to {} with an ML-KEM EncryptedKey; supply --pubkey-pem, --pubkey-der or --keys-file",
             option.name, invocation.command
         )));
     }
@@ -5791,7 +5786,7 @@ fn select_encapsulation_key<P: xml_sec::document::XmlDocumentPolicy>(
     }
     if options.is_empty() {
         return Err(CommandError::Usage(format!(
-            "{} with EncapsulationMechanism requires a recipient --pubkey-pem, --pubkey-der or --keys-file",
+            "{} with an ML-KEM EncryptedKey requires a recipient --pubkey-pem, --pubkey-der or --keys-file",
             invocation.command
         )));
     }
@@ -5866,7 +5861,7 @@ fn select_decapsulation_key<P: xml_sec::document::XmlDocumentPolicy>(
     let resources = policy.resource_policy();
     if invocation.values("pkcs12").next().is_some() {
         return Err(CommandError::Usage(format!(
-            "--pkcs12 is inapplicable to {} with EncapsulationMechanism; supply --privkey-pem/der or --pkcs8-pem/der",
+            "--pkcs12 is inapplicable to {} with an ML-KEM EncryptedKey; supply --privkey-pem/der or --pkcs8-pem/der",
             invocation.command
         )));
     }
@@ -5884,7 +5879,7 @@ fn select_decapsulation_key<P: xml_sec::document::XmlDocumentPolicy>(
     }
     if options.is_empty() {
         return Err(CommandError::Usage(format!(
-            "{} with EncapsulationMechanism requires a recipient --privkey-pem/der or --pkcs8-pem/der",
+            "{} with an ML-KEM EncryptedKey requires a recipient --privkey-pem/der or --pkcs8-pem/der",
             invocation.command
         )));
     }
@@ -6189,7 +6184,7 @@ fn encryption_template(
     .into_data();
     if has_nested_encapsulation(&parsed.encrypted_keys) {
         return Err(CommandError::Encryption(
-            "nested EncapsulationMechanism templates are not supported for encryption".into(),
+            "nested ML-KEM EncryptedKey templates are not supported for encryption".into(),
         ));
     }
     let algorithm = DataEncryptionAlgorithm::from_uri(&parsed.encryption_method.algorithm)
@@ -6373,7 +6368,7 @@ fn encrypted_key_recipient_names(
     key_info
         .into_iter()
         .flat_map(Node::children)
-        .filter(|node| node.has_tag_name((XMLENC_NS, "EncryptedKey")))
+        .filter(|node| is_recipient_encrypted_key(*node))
         .map(|encrypted_key| {
             let key_info = singleton_direct_child(
                 encrypted_key,

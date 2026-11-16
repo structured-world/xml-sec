@@ -10,12 +10,12 @@ pub fn execute(project_root: &Path) -> BTreeSet<String> {
     // Independently produced CBC/GCM documents cover all parameter sets and
     // consumer widths. An entry is recorded only after whole-document parity.
     for (name, size, width) in [
-        ("enc-aes256-em-ml-kem-512", 512, 32),
-        ("enc-aes256-em-ml-kem-768", 768, 32),
-        ("enc-aes256-em-ml-kem-1024", 1024, 32),
-        ("enc-aes128gcm-em-ml-kem-512", 512, 16),
-        ("enc-aes192gcm-em-ml-kem-768", 768, 24),
-        ("enc-aes256gcm-em-ml-kem-1024", 1024, 32),
+        ("enc-aes256-kt-ml-kem-512", 512, 32),
+        ("enc-aes256-kt-ml-kem-768", 768, 32),
+        ("enc-aes256-kt-ml-kem-1024", 1024, 32),
+        ("enc-aes128gcm-kt-ml-kem-512", 512, 16),
+        ("enc-aes192gcm-kt-ml-kem-768", 768, 24),
+        ("enc-aes256gcm-kt-ml-kem-1024", 1024, 32),
     ] {
         let path = fixtures.join(format!("xmlenc/aleksey-xmlenc-01/{name}"));
         let xml = std::fs::read_to_string(path.with_extension("xml")).unwrap();

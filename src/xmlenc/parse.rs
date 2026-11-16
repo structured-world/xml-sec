@@ -676,7 +676,10 @@ fn parse_key_info_encapsulation<'doc>(
         .into());
     }
     budget.shared.retained_cipher_bytes += bytes;
-    let info = parse_encapsulation_key_info(mechanism.key_info, budget, depth + 1)?;
+    let info = match mechanism.key_info {
+        Some(key_info) => parse_encapsulation_key_info(key_info, budget, depth + 1)?,
+        None => crate::xmldsig::parse::KeyInfo::default(),
+    };
     if allow_empty_cipher_values && budget.encrypted_key_depth == 0 {
         budget.encapsulation_values.push(mechanism.cipher_value);
     }
@@ -945,10 +948,9 @@ fn parse_key_info<'doc>(
     budget.ancestry.push(node.id());
     let mut parsed = ParsedKeyInfo::default();
     for child in node.children().filter(Node::is_element) {
-        if child.has_tag_name((
-            crate::key_establishment::ENCAPSULATION_NS,
-            "EncapsulationMechanism",
-        )) {
+        // An ML-KEM EncryptedKey carries a KEM ciphertext, not a wrapped or
+        // RSA-encrypted key, so it is decapsulated rather than decrypted.
+        if crate::key_establishment::encapsulation_algorithm(child).is_some() {
             parse_key_info_encapsulation(
                 child,
                 policy,

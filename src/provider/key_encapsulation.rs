@@ -5,7 +5,7 @@ use super::{CryptoProvider, ProviderBinding, ProviderError};
 use alloc::vec::Vec;
 use zeroize::Zeroizing;
 
-/// Experimental libxmlsec1 ML-KEM parameter sets (not signature algorithms).
+/// ML-KEM parameter sets for XML Encryption key transport (not signature algorithms).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum KeyEncapsulationAlgorithm {
     /// FIPS 203 category 1.
@@ -17,13 +17,14 @@ pub enum KeyEncapsulationAlgorithm {
 }
 
 impl KeyEncapsulationAlgorithm {
-    /// Exact libxmlsec1 experimental wire identifier, not a W3C algorithm URI.
+    /// `EncryptionMethod` identifier of draft-eastlake-rfc9231bis-xmlsec-uris-09
+    /// section 3.6.9, which upstream libxmlsec1 also uses; the draft may change it.
     #[must_use]
     pub const fn uri(self) -> &'static str {
         match self {
-            Self::MlKem512 => "http://www.aleksey.com/xmlsec/2025/12/xmldsig-more#ml-kem-512",
-            Self::MlKem768 => "http://www.aleksey.com/xmlsec/2025/12/xmldsig-more#ml-kem-768",
-            Self::MlKem1024 => "http://www.aleksey.com/xmlsec/2025/12/xmldsig-more#ml-kem-1024",
+            Self::MlKem512 => "http://www.w3.org/2026/08/xmldsig-more#ml-kem-512",
+            Self::MlKem768 => "http://www.w3.org/2026/08/xmldsig-more#ml-kem-768",
+            Self::MlKem1024 => "http://www.w3.org/2026/08/xmldsig-more#ml-kem-1024",
         }
     }
 
@@ -91,7 +92,7 @@ impl KeyEncapsulationAlgorithm {
 
 /// One encapsulation result. The secret is always exactly 32 bytes and erased on drop.
 pub struct EncapsulatedKey {
-    /// Public ciphertext to serialize into `EncapsulationMechanism`.
+    /// Public ciphertext to serialize into the `EncryptedKey`'s `CipherValue`.
     pub ciphertext: Vec<u8>,
     /// Shared secret; callers retain its erasing owner through the consuming operation.
     pub shared_secret: Zeroizing<[u8; 32]>,
