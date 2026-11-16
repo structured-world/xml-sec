@@ -12,9 +12,9 @@ All validation runs are local; fixtures are never uploaded to online validators.
 - Probe: `cargo build -p xml-sec-xades --example interop_probe`, default XAdES features.
   Core features: `std,xmldsig,c14n,xml-backend-xmloxide,embedded,no-unsafe`.
   This probe does not enable XMLEnc, XSLT, FIPS, PKCS#11 or legacy crypto.
-- Independent oracle: Homebrew **libxmlsec1 1.3.12 (openssl)**, native Mach-O binary.
-  This is not this repository's Rust `tools/xmlsec1`. Its linked OpenSSL is **3.6.4**;
-  the credential generator's separate `openssl` executable is **4.0.3**.
+- Independent oracle: native **libxmlsec1 1.3.14 (openssl)** built from upstream master
+  by `install-xmlsec1`, which also builds the OpenSSL it links. This is not this
+  repository's Rust `tools/xmlsec1`. The corpus refuses any other oracle version.
 - Independent profile diagnostics: **EU DSS 6.5.1**, Maven **3.9.12**, OpenJDK **21.0.12.1**.
   Versioned expectations are in `dss-evidence/expectations.json` and
   `dss-investigation/*expectations.json`; CI compares fresh observations with them.
@@ -95,7 +95,7 @@ the two explicit modes. These include negative cases that remain processable;
 they are not counts of fully valid signatures. Authentication failures retain their typed
 causes, and References behind an unverified signature remain unexecuted.
 
-libxmlsec1 1.3.12 needs `--verbose --store-references --store-signatures` to print the
+libxmlsec1 needs `--verbose --store-references --store-signatures` to print the
 buffers. They are **hex dumps**, not serialized XML. `debug_buffer` decodes them without
 stripping canonical whitespace. A null empty buffer has no marker; the harness accepts
 that representation only with successful reference processing and a signed
@@ -127,7 +127,7 @@ and streams are logged as commands run, so a cancelled phase keeps its diagnosti
 Individual investigation commands:
 
 ```sh
-XMLSEC1_BIN=/opt/homebrew/bin/xmlsec1 cargo run -p xml-sec-tools -- xades corpus --results /tmp/xml-sec-xades-recheck
+XMLSEC1_BIN="$PWD/.tools/xmlsec1-master/bin/xmlsec1" cargo run -p xml-sec-tools -- xades corpus --results /tmp/xml-sec-xades-recheck
 cargo nextest run -p xml-sec-tools xades
 cargo run -p xml-sec-tools -- xades dss --results target/xades-dss-recheck
 cargo run -p xml-sec-tools -- xades dss --results target/xades-dss-recheck --summarize

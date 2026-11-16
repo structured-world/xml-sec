@@ -47,7 +47,7 @@ The complete 79-file snapshot includes 17 ciphertexts, 13 templates, public test
 credentials, and original variants. `xmlenc11_corpus` executes AES-GCM, RSA-OAEP
 digest/MGF/label combinations, AES-KW, ConcatKDF, PBKDF2, ECDH P-256/P-384/P-521
 and DH-ES through public Rust APIs and every compiled XML backend. Every original
-template executes against the pinned native oracle; Rust encryption results are
+template executes against the native oracle built from upstream master; Rust encryption results are
 also decrypted independently. Agreement wrapping composes the public, budgeted
 agreement/KDF API with the AES-KW builder and retains the template's party/KDF
 metadata. These checks do not claim CLI support for agreement or derived keys.
@@ -82,8 +82,8 @@ algorithms, Diffie-Hellman agreement, or deliberately malformed metadata.
 
 ## Importing Vectors
 
-Point the repository helper at the pinned xmlsec1 1.3.13 development checkout
-and pass paths under the destination corpus. A directory argument imports its
+Point the repository helper at the `tests` directory of an upstream xmlsec
+master checkout and pass paths under the destination corpus. A directory argument imports its
 complete tree:
 
 ```sh
