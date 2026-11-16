@@ -2,8 +2,10 @@
  * binary key-data value they are made of, as a libxmlsec1 caller uses them:
  * the klasses' identities, generating a key, reading and writing a KeyValue
  * child and raw bytes, the checks against a value the key already has and
- * against the key requirements, duplicating, and the debug dumps. DES is off
- * in the default build, so its klass is only looked up. Built against the
+ * against the key requirements, duplicating, and the debug dumps. GOST is
+ * off in both builds, so its klass is only looked up; DES is not described,
+ * because the oracle enables it for its Triple DES corpus while the default
+ * libxmlsec1 build and this crate do not. Built against the
  * libxmlsec1 oracle with its default crypto library and against this crate,
  * both must print the same. */
 
@@ -120,7 +122,7 @@ int main(void) {
         return 1;
     }
     describe("aes", xmlSecKeyDataAesId);
-    describe("des", xmlSecKeyDataDesId);
+    describe("gost2001", xmlSecKeyDataGost2001Id);
     describe("hmac", xmlSecKeyDataHmacId);
     describe("concatkdf", xmlSecKeyDataConcatKdfId);
     describe("pbkdf2", xmlSecKeyDataPbkdf2Id);
