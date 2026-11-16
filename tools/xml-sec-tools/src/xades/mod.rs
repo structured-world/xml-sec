@@ -113,6 +113,10 @@ impl Corpus {
             &"Data",
             &"--id-attr:Id",
             &"Outside",
+            // The corpus judges XMLDSig validity, under which the digest of an
+            // empty node set is defined (XMLDSig 1.1 section 4.4.3.2); upstream
+            // refuses empty digest input unless asked, as an xml-sec policy can.
+            &"--allow-empty-input",
         ]);
         if action == "--verify" {
             args.extend(line(&[

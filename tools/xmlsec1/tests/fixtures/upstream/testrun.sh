@@ -1,11 +1,15 @@
-#!/bin/sh -x
+#!/bin/sh
 
 OS_ARCH=`uname -o 2>/dev/null || echo ""`
-OS_KERNEL=`uname -s`
 
 #
 # Get command line params
 #
+if [ "z$1" = "z" -o "z$2" = "z" -o "z$3" = "z" -o "z$4" = "z" -o "z$5" = "z" ] ; then
+    echo "Usage: $0 <testfile> <crypto> <topfolder> <xmlsec_app> <file_format>" >&2
+    exit 1
+fi
+
 testfile="$1"
 crypto="$2"
 topfolder="$3"
@@ -47,16 +51,15 @@ fi
 #
 # Valgrind
 #
+valgrind_suppression="--suppressions=$topfolder/valgrind.supp"
 if [ "z$crypto" = "zopenssl" ] ; then
-    valgrind_suppression="--suppressions=$topfolder/valgrind-openssl.supp"
+    valgrind_suppression="$valgrind_suppression --suppressions=$topfolder/valgrind-openssl.supp"
 elif [ "z$crypto" = "znss" ] ; then
-    valgrind_suppression="--suppressions=$topfolder/valgrind-nss.supp"
+    valgrind_suppression="$valgrind_suppression --suppressions=$topfolder/valgrind-nss.supp"
 elif [ "z$crypto" = "zgcrypt" ] ; then
-    valgrind_suppression="--suppressions=$topfolder/valgrind-gcrypt.supp"
+    valgrind_suppression="$valgrind_suppression --suppressions=$topfolder/valgrind-gcrypt.supp"
 elif [ "z$crypto" = "zgnutls" ] ; then
-    valgrind_suppression="--suppressions=$topfolder/valgrind-gcrypt.supp"
-else
-    valgrind_suppression=""
+    valgrind_suppression="$valgrind_suppression --suppressions=$topfolder/valgrind-gnutls.supp"
 fi
 
 valgrind_options="--leak-check=full --show-reachable=yes --num-callers=32 --track-origins=yes -s"
@@ -126,7 +129,7 @@ else
 fi
 
 
-# Only OpenSSL / NSS / GnuTLS currently has capability to lookup the certs/keys using X509 data
+# Only OpenSSL / NSS / GnuTLS currently have the capability to lookup the certs/keys using X509 data
 if [ "z$crypto" = "zopenssl" -o "z$crypto" = "znss" -o "z$crypto" = "zgnutls" ] ; then
     xmlsec_feature_x509_data_lookup="yes"
 else
@@ -167,7 +170,7 @@ fi
 
 
 # Only NSS can lookup certs in NSS DB, skip certs verification for signatures
-if [ "z$crypto" = "znss"  ] ; then
+if [ "z$crypto" = "znss" ] ; then
     xmlsec_feature_nssdb_lookup="yes"
 else
     xmlsec_feature_nssdb_lookup="no"
@@ -175,7 +178,7 @@ fi
 
 # currently only openssl and gnutls support skipping time checks
 # https://github.com/lsh123/xmlsec/issues/852
-if [ "z$crypto" = "zopenssl" -o "z$crypto" = "zgnutls" -o "z$crypto" = "zmscng"  ] ; then
+if [ "z$crypto" = "zopenssl" -o "z$crypto" = "zgnutls" -o "z$crypto" = "zmscng" ] ; then
     xmlsec_feature_cert_check_skip_time="yes"
 else
     xmlsec_feature_cert_check_skip_time="no"
@@ -183,7 +186,7 @@ fi
 
 # currently only openssl/gnutls/nss/mscng support loading CRL from the command line
 # https://github.com/lsh123/xmlsec/issues/583
-if [ "z$crypto" = "zopenssl" -o  "z$crypto" = "zgnutls" -o "z$crypto" = "znss" -o "z$crypto" = "zmscng" ] ; then
+if [ "z$crypto" = "zopenssl" -o "z$crypto" = "zgnutls" -o "z$crypto" = "znss" -o "z$crypto" = "zmscng" ] ; then
     xmlsec_feature_crl_load="yes"
 else
     xmlsec_feature_crl_load="no"
@@ -191,23 +194,23 @@ fi
 
 # only openssl/gnutls/nss/mscng support crl verification
 # https://github.com/lsh123/xmlsec/issues/585
-if [ "z$crypto" = "zopenssl" -o  "z$crypto" = "zgnutls" -o "z$crypto" = "znss" -o "z$crypto" = "zmscng" ] ; then
+if [ "z$crypto" = "zopenssl" -o "z$crypto" = "zgnutls" -o "z$crypto" = "znss" -o "z$crypto" = "zmscng" ] ; then
     xmlsec_feature_crl_verification="yes"
 else
     xmlsec_feature_crl_verification="no"
 fi
 
-# currently only openssl/mscng support CRL verification by time
+# currently only openssl/gnutls/mscng support CRL verification by time
 # https://github.com/lsh123/xmlsec/issues/579
-if [ "z$crypto" = "zopenssl" -o "z$crypto" = "zmscng" ] ; then
+if [ "z$crypto" = "zopenssl" -o "z$crypto" = "zgnutls" -o "z$crypto" = "zmscng" ] ; then
     xmlsec_feature_crl_check_skip_time="yes"
 else
     xmlsec_feature_crl_check_skip_time="no"
 fi
 
-# only openssl, gnutls, nss, and mcng support key verification
+# only openssl, gnutls, nss, and mscng support key verification
 # https://github.com/lsh123/xmlsec/issues/587
-if [ "z$crypto" = "zopenssl" -o  "z$crypto" = "zgnutls" -o "z$crypto" = "znss" -o "z$crypto" = "zmscng" ] ; then
+if [ "z$crypto" = "zopenssl" -o "z$crypto" = "zgnutls" -o "z$crypto" = "znss" -o "z$crypto" = "zmscng" ] ; then
     xmlsec_feature_key_check="yes"
 else
     xmlsec_feature_key_check="no"
@@ -257,7 +260,7 @@ fi
 
 
 # Support for ASN1 signatures
-if [ "z$crypto" = "zopenssl" -o  "z$crypto" = "zgnutls" -o "z$crypto" = "znss" -o  "z$crypto" = "zmscng"  ] ; then
+if [ "z$crypto" = "zopenssl" -o "z$crypto" = "zgnutls" -o "z$crypto" = "znss" -o "z$crypto" = "zmscng" ] ; then
     xmlsec_feature_asn1_signatures="yes"
 else
     xmlsec_feature_asn1_signatures="no"
@@ -270,12 +273,6 @@ else
     xmlsec_feature_context_string="no"
 fi
 
-# Support for ML-KEM key transport (OpenSSL 3.5+)
-if [ "z$crypto" = "zopenssl" ] ; then
-    xmlsec_feature_ml_kem="yes"
-else
-    xmlsec_feature_ml_kem="no"
-fi
 
 #
 # Setup keys config
@@ -387,13 +384,21 @@ else
 fi
 
 # ML-KEM keys have no certificates and cannot be stored in PKCS12.
-# Use PKCS8-PEM format for private keys and PEM for public keys on all platforms.
-mlkem_priv_key_option="--pkcs8-pem"
-mlkem_priv_key_format="p8-pem"
-mlkem_pub_key_option="--pubkey-pem"
-mlkem_pub_key_format="pem"
+# OpenSSL uses PKCS8-PEM format for private keys and PEM for public keys.
+# NSS and MSCng only support DER (unencrypted PKCS#8 / SubjectPublicKeyInfo) formats.
+if [ "z$crypto" = "znss" -o "z$crypto" = "zmscng" ] ; then
+    mlkem_priv_key_option="--privkey-der"
+    mlkem_priv_key_format="der"
+    mlkem_pub_key_option="--pubkey-der"
+    mlkem_pub_key_format="der"
+else
+    mlkem_priv_key_option="--pkcs8-pem"
+    mlkem_priv_key_format="p8-pem"
+    mlkem_pub_key_option="--pubkey-pem"
+    mlkem_pub_key_format="pem"
+fi
 
-# On Windows, we needs to specify Crypto Service Provider (CSP)
+# On Windows, we need to specify Crypto Service Provider (CSP)
 # in the pkcs12 file to ensure it is loaded correctly to be used
 # with SHA2 algorithms
 if [ "z$crypto" = "zmscrypto" -o "z$crypto" = "zmscng" ] ; then
@@ -431,7 +436,7 @@ setupCryptoConfig() {
     mkdir $crypto_config_folder
 
     # see https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-certopensystemstorea
-    if [ "z$crypto" = "zmscng" ] ; then
+    if [ "z$crypto" = "zmscng" -o "z$crypto" = "zmscrypto" ] ; then
         default_crypto_config="MY"
     else
         default_crypto_config="$crypto_config_folder"
@@ -484,11 +489,11 @@ printRes() {
     # check
     if [ "z$expected_res" = "z$actual_res_str" ] ; then
         count_success=`expr $count_success + 1`
-	    actual_res="0"
+        actual_res="0"
         echo "   OK"
     else
         count_fail=`expr $count_fail + 1`
-	    actual_res="1"
+        actual_res="1"
         echo " Fail"
     fi
 
@@ -505,7 +510,7 @@ printCheckStatus() {
     if [ $check_res -eq 0 ]; then
         echo "   OK"
     else
-	count_skip=`expr $count_skip + 1`
+        count_skip=`expr $count_skip + 1`
         echo " Skip"
     fi
     return "$check_res"
@@ -539,17 +544,17 @@ elif [ "z$crypto" = "zopenssl" -a "z$xmlsec_openssl_flavor" = "zboringssl" ] ; t
 elif [ "z$crypto" = "zopenssl" ] ; then
     echo "--- OPENSSL FLAVOR: $xmlsec_openssl_flavor" >> $logfile
     echo "--- OPENSSL FLAVOR: $xmlsec_openssl_flavor"
-    min_percent_success=90
+    min_percent_success=85
 elif [ "z$crypto" = "znss" ] ; then
-    min_percent_success=75
+    min_percent_success=85
 elif [ "z$crypto" = "zgnutls" ] ; then
-    min_percent_success=75
+    min_percent_success=85
 elif [ "z$crypto" = "zmscng" ] ; then
-    min_percent_success=75
+    min_percent_success=85
 elif [ "z$crypto" = "zmscrypto" ] ; then
-    min_percent_success=30
+    min_percent_success=20
 elif [ "z$crypto" = "zgcrypt" ] ; then
-    min_percent_success=30
+    min_percent_success=20
 else
     min_percent_success=50
 fi
@@ -559,16 +564,20 @@ fi
 echo "--- TOTAL OK: $count_success; OK (percent): $percent_success; TOTAL FAILED: $count_fail; TOTAL SKIPPED: $count_skip" >> $logfile
 echo "--- TOTAL OK: $count_success; OK (percent): $percent_success; TOTAL FAILED: $count_fail; TOTAL SKIPPED: $count_skip"
 
-# disable this check for test jeys since the number of tests is very small and the success percent is not representative
-if [[ "$testfile" =~ 'testKeys' ]]; then
-    XMLSEC_TEST_IGNORE_PERCENT_SUCCESS=1
-    echo "--- SUCCESS PERCENT check is disabled for testKeys tests since the number of tests is very small and the success percent is not representative" >> $logfile
-    echo "--- SUCCESS PERCENT check is disabled for testKeys tests since the number of tests is very small and the success percent is not representative"
-fi
+# disable this check for testKeys since the number of tests is very small and the success percent is not representative
+case "$testfile" in
+    *testKeys*)
+        XMLSEC_TEST_IGNORE_PERCENT_SUCCESS=1
+        echo "--- SUCCESS PERCENT check is disabled for testKeys tests since the number of tests is very small and the success percent is not representative" >> $logfile
+        echo "--- SUCCESS PERCENT check is disabled for testKeys tests since the number of tests is very small and the success percent is not representative"
+        ;;
+esac
 
 # print log file if failed (we have to have at least some good tests)
 if [ $count_fail -ne 0 ] ; then
-    cat $failedlogfile
+    if [ -f $failedlogfile ] ; then
+        cat $failedlogfile
+    fi
     exit_code=$count_fail
 elif [ $count_success -eq 0 ] ; then
     cat $logfile
@@ -585,6 +594,6 @@ elif [ -z "$XMLSEC_TEST_IGNORE_PERCENT_SUCCESS" -a $min_percent_success -gt $per
 fi
 
 # cleanup
-rm -rf $tmpfile $tmpfile.2 tmpfile.3 $curlogfile
+rm -rf $tmpfile $tmpfile.2 $tmpfile.3 $curlogfile
 
 exit $exit_code

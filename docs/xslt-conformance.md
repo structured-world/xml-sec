@@ -33,11 +33,10 @@ pre-digest output and digest mismatch instead of silently skipping it.
 
 ## Reproduce
 
-Provision the oracle from a checkout of the libxmlsec1 commit recorded in
-`compatibility/libxmlsec1-1.3.13-donor-commit.txt` with
-`XMLSEC1_SOURCE_DIR=/path/to/that/checkout cargo run -p xml-sec-tools -- install-xmlsec1`
-(without `XMLSEC1_SOURCE_DIR` the installer builds upstream master) and set its
-reported library path. Use a checkout of the libxslt commit recorded in
+Provision the libxmlsec1 oracle from upstream master with
+`cargo run -p xml-sec-tools -- install-xmlsec1` (or from a checkout with
+`XMLSEC1_SOURCE_DIR=/path/to/checkout`); the installer records the commit it built.
+Set its reported library path. Use a checkout of the libxslt commit recorded in
 `compatibility/libxslt-1.1.45-donor-commit.txt`:
 
 ```sh
@@ -46,8 +45,9 @@ XMLSEC1_BIN=/path/to/provisioned/bin/xmlsec1 \
 cargo run -p xml-sec-tools -- xslt-conformance
 ```
 
-The command verifies source/fixture provenance, requires xmlsec1 1.3.13 with its
-XSLT capability, runs the full engine suite and all selected public-pipeline
+The command verifies fixture provenance, requires an xmlsec1 oracle the installer
+built whose binary reports the version of the source it recorded, with its XSLT
+capability, prints that source commit, runs the full engine suite and all selected public-pipeline
 suites, and cleans successful builds. Developer case-range variables cannot
 reduce this gate. Missing or incompatible oracles fail before any tests; failed
 builds and reproducer data remain available for diagnosis.

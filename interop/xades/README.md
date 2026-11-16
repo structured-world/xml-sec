@@ -12,14 +12,14 @@ All validation runs are local; fixtures are never uploaded to online validators.
 - Probe: `cargo build -p xml-sec-xades --example interop_probe`, default XAdES features.
   Core features: `std,xmldsig,c14n,xml-backend-xmloxide,embedded,no-unsafe`.
   This probe does not enable XMLEnc, XSLT, FIPS, PKCS#11 or legacy crypto.
-- Independent oracle: Homebrew **libxmlsec1 1.3.12 (openssl)**, native Mach-O binary.
-  This is not this repository's Rust `tools/xmlsec1`. Its linked OpenSSL is **3.6.4**;
-  the credential generator's separate `openssl` executable is **4.0.3**.
+- Independent oracle: native **libxmlsec1 1.3.14 (openssl)** built from upstream master
+  by `install-xmlsec1`, which also builds the OpenSSL it links. This is not this
+  repository's Rust `tools/xmlsec1`. The corpus refuses any other oracle version.
 - Independent profile diagnostics: **EU DSS 6.5.1**, Maven **3.9.12**, OpenJDK **21.0.12.1**.
   Versioned expectations are in `dss-evidence/expectations.json` and
   `dss-investigation/*expectations.json`; CI compares fresh observations with them.
   Dependency trees, actual outputs and full reports are run artifacts, excluded from Git and the bundle.
-  CI uses native libxmlsec1 1.3.13 from the repository's pinned installer, stable Rust and JDK 21.
+  CI uses native libxmlsec1 built from upstream master by the repository's installer, stable Rust and JDK 21.
 
 The Rust probe uses `with_verified_request`, original `SignatureEvidence`,
 `select_signature`, `visit_authenticated_references`, and
@@ -95,7 +95,7 @@ the two explicit modes. These include negative cases that remain processable;
 they are not counts of fully valid signatures. Authentication failures retain their typed
 causes, and References behind an unverified signature remain unexecuted.
 
-libxmlsec1 1.3.12 needs `--verbose --store-references --store-signatures` to print the
+libxmlsec1 needs `--verbose --store-references --store-signatures` to print the
 buffers. They are **hex dumps**, not serialized XML. `debug_buffer` decodes them without
 stripping canonical whitespace. A null empty buffer has no marker; the harness accepts
 that representation only with successful reference processing and a signed
@@ -127,7 +127,7 @@ and streams are logged as commands run, so a cancelled phase keeps its diagnosti
 Individual investigation commands:
 
 ```sh
-XMLSEC1_BIN=/opt/homebrew/bin/xmlsec1 cargo run -p xml-sec-tools -- xades corpus --results /tmp/xml-sec-xades-recheck
+XMLSEC1_BIN="$PWD/.tools/xmlsec1-master/bin/xmlsec1" cargo run -p xml-sec-tools -- xades corpus --results /tmp/xml-sec-xades-recheck
 cargo nextest run -p xml-sec-tools xades
 cargo run -p xml-sec-tools -- xades dss --results target/xades-dss-recheck
 cargo run -p xml-sec-tools -- xades dss --results target/xades-dss-recheck --summarize
@@ -145,8 +145,11 @@ has accepted each result. The [benchmark runbook](https://github.com/structured-
 documents its boundaries and metrics; the link is absolute because the corpus
 archive carries this README without the repository's `docs/`.
 
-Set XMLSEC1_BIN to native **1.3.12 or 1.3.13 openssl**; both are explicitly qualified
-against the retained independent vectors. The XML verification run uses only empty/same-document
+Set XMLSEC1_BIN to native **1.3.14 openssl** built from upstream master; the byte-dump
+parser reads that version's debug output, and a new upstream version is refused until
+the corpus has been checked against it. Upstream refuses to digest empty data unless asked,
+so the run passes `--allow-empty-input`: an empty node set has a defined digest in
+XMLDSig. The XML verification run uses only empty/same-document
 Reference, RetrievalMethod and KeyInfoReference URI classes, plus explicit Id registrations
 for Signature, SignedProperties, Data and Outside. Equivalent declarations matter for the
 duplicate-ID probe. There is no `--insecure`, `--xxe`, network retrieval or file fallback.
@@ -194,10 +197,8 @@ The XAdES adapter builds without std; CI lints it on a bare-metal target and
 ceilings are test execution accounts.
 Generated `.tar.gz` bundles remain local artifacts; Git contains
 the reviewable sources, selected fixtures, independent expected bytes, expected conclusions and provenance.
-The full workspace CLI suite requires native libxmlsec1 1.3.13 and the pinned
-`donors/xmlsec` checkout, unlike the frozen byte-dump parser's 1.3.12 requirement.
-After checking out the revision in `compatibility/libxmlsec1-1.3.13-donor-commit.txt`,
-the macOS readiness commands are:
+The full workspace CLI suite requires native libxmlsec1 built from a `donors/xmlsec`
+checkout of upstream master. With that checkout, the macOS readiness commands are:
 
 ```sh
 XMLSEC1_SOURCE_DIR="$PWD/donors/xmlsec" XMLSEC1_PREFIX="$PWD/.tools/xmlsec1-pr" XMLSEC1_MODERN_ORACLE=1 cargo run -p xml-sec-tools -- install-xmlsec1
