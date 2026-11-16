@@ -33,6 +33,10 @@ draft identifiers may still change. The `EncapsulationMechanism` element and
 1.3.13 are no longer read. Such an `EncryptedKey` takes no `EncryptionMethod`
 parameters, and its optional `KeyInfo` names the recipient key; a `ReferenceList`
 or `CarriedKeyName` in it is refused because this transport does not process it.
+A same-document `RetrievalMethod` may name such an `EncryptedKey`, which is then
+decapsulated as a direct `KeyInfo` child is; a transformed or external reference
+to one is refused while parsing. It is not a wrapped recipient and does not count
+toward the recipient limit; the key-source and cipher-value budgets bound it.
 `direct_key_name` names only the outer content key, not the recipient key
 inside that `EncryptedKey`; an explicit recipient is supplied by the caller.
 `EncapsulationDecryptor::new` borrows a private recipient handle;
