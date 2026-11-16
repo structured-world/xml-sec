@@ -23,11 +23,12 @@ const OPENSSL_SHA256: &str = "603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb
 /// Where the oracle's OpenSSL reads its configuration, below the prefix: its
 /// `OPENSSLDIR` is the installation, not the build directory removed after it.
 const OPENSSL_CONFIGURATION: &str = "ssl/openssl.cnf";
-/// Historical algorithms are disabled by default upstream; the oracle must
-/// expose them to validate the optional compatibility path independently.
-/// The XSLT interoperability tests need the transform, which xmlsec1 builds
-/// only when libxslt development files are present.
-pub(crate) const COMPATIBILITY: [&str; 8] = [
+/// Historical algorithms, Triple DES included, are disabled by default
+/// upstream; the oracle must expose them to validate the optional
+/// compatibility path independently, and a cache built without one is
+/// rebuilt. The XSLT interoperability tests need the transform, which
+/// xmlsec1 builds only when libxslt development files are present.
+pub(crate) const COMPATIBILITY: [&str; 10] = [
     "md5",
     "ripemd160",
     "rsa-md5",
@@ -35,6 +36,8 @@ pub(crate) const COMPATIBILITY: [&str; 8] = [
     "hmac-md5",
     "hmac-ripemd160",
     "ecdsa-ripemd160",
+    "tripledes-cbc",
+    "kw-tripledes",
     "xslt",
 ];
 pub(crate) const MODERN: [&str; 8] = [
