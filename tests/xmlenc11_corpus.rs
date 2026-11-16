@@ -360,7 +360,7 @@ fn rsa_key_name(bits: u16) -> &'static str {
     }
 }
 
-/// xmlsec1 counts an AgreementMethod and its EncryptedKey as nested levels and
+/// xmlsec1 counts an `AgreementMethod` and its `EncryptedKey` as nested levels and
 /// allows one by default; the donor's own key agreement recipes raise it.
 const AGREEMENT_DEPTH: [&str; 2] = ["--max-encrypted-key-level", "3"];
 
