@@ -128,16 +128,25 @@ int main(void) {
     describe("camellia", xmlSecKeyDataCamelliaId);
     describe("chacha20", xmlSecKeyDataChaCha20Id);
     /* the transform klass getters app.h declares are exported: the program
-     * links only when the library defines every one */
+     * links only when the library defines every one. The reads are volatile
+     * so the compiler keeps the array and its references to the symbols; the
+     * getters are not called, as the built-in provider has no cipher
+     * transforms to return. */
     {
-        static xmlSecTransformId (*const getters[])(void) = {
+        static xmlSecTransformId (*const volatile getters[])(void) = {
             xmlSecTransformCamellia128CbcGetKlass, xmlSecTransformCamellia192CbcGetKlass,
             xmlSecTransformCamellia256CbcGetKlass, xmlSecTransformKWCamellia128GetKlass,
             xmlSecTransformKWCamellia192GetKlass,  xmlSecTransformKWCamellia256GetKlass,
             xmlSecTransformChaCha20GetKlass,       xmlSecTransformChaCha20Poly1305GetKlass,
         };
-        printf("camellia and chacha20 transform getters: %d\n",
-               (int)(sizeof(getters) / sizeof(getters[0])));
+        size_t i;
+        int linked = 0;
+        for (i = 0; i < sizeof(getters) / sizeof(getters[0]); i++) {
+            if (getters[i] != NULL) {
+                linked++;
+            }
+        }
+        printf("camellia and chacha20 transform getters: %d\n", linked);
     }
     printf("registered aes: %d\n",
            xmlSecKeyDataIdListFind(xmlSecKeyDataIdsGet(), xmlSecKeyDataAesId));
