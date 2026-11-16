@@ -54,7 +54,6 @@ struct Ledger {
     generated_by: String,
     evidence: BTreeMap<String, Evidence>,
     classifications: BTreeMap<String, Classification>,
-    availability: Vec<AvailabilitySpan>,
     items: Vec<LedgerItem>,
 }
 
@@ -83,6 +82,9 @@ struct SurfaceItem {
     kind: String,
     name: String,
     source: String,
+    /// Where the donor declares the item, for diagnostics only: the ledger
+    /// records what is declared, so a declaration moved by an unrelated
+    /// upstream edit leaves it unchanged.
     line: usize,
     detail: String,
     exit_code: Option<i32>,
@@ -94,8 +96,11 @@ struct LedgerItem {
     kind: String,
     name: String,
     source: String,
-    line: usize,
     detail: String,
+    /// The complete active preprocessor directive history; absent for an
+    /// unconditional item.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    conditions: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     exit_code: Option<i32>,
     classification: String,
@@ -106,14 +111,6 @@ struct Classification {
     outcome: Outcome,
     rationale: String,
     evidence: String,
-}
-
-#[derive(Debug, Serialize)]
-struct AvailabilitySpan {
-    source: String,
-    start_line: usize,
-    end_line: usize,
-    conditions: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -192,10 +189,10 @@ struct BehaviorLedgerItem {
     donor_anchors: Vec<DonorAnchor>,
 }
 
+/// A donor statement a behavior rests on, named by its unique text.
 #[derive(Debug, Serialize)]
 struct DonorAnchor {
     source: String,
-    line: usize,
     needle: String,
 }
 
@@ -530,14 +527,8 @@ fn resolve_donor_anchor(donor: &Path, anchor: DonorAnchorRule) -> Result<DonorAn
             matches.len()
         ));
     }
-    let line = source[..matches[0].0]
-        .bytes()
-        .filter(|byte| *byte == b'\n')
-        .count()
-        + 1;
     Ok(DonorAnchor {
         source: anchor.source,
-        line,
         needle: anchor.needle,
     })
 }
@@ -638,25 +629,32 @@ fn extract_surface(donor: &Path) -> Result<Vec<SurfaceItem>, String> {
     extract_test_families(donor, &mut items)?;
 
     items = deduplicate_surface(items);
-    items.sort_by(|left, right| {
-        (&left.kind, &left.name, &left.source, left.line).cmp(&(
-            &right.kind,
-            &right.name,
-            &right.source,
-            right.line,
-        ))
-    });
+    items.sort_by(|left, right| identity(left).cmp(&identity(right)));
     Ok(items)
+}
+
+/// What tells two surface items apart: the declaration and the branch it is
+/// in, never its position in the donor file.
+fn identity(entry: &SurfaceItem) -> (&str, &str, &str, &str, &[String]) {
+    (
+        &entry.kind,
+        &entry.name,
+        &entry.source,
+        &entry.detail,
+        &entry.conditions,
+    )
 }
 
 fn deduplicate_surface(mut items: Vec<SurfaceItem>) -> Vec<SurfaceItem> {
     let mut seen = BTreeSet::new();
     items.retain(|entry| {
+        let (kind, name, source, detail, conditions) = identity(entry);
         seen.insert((
-            entry.kind.clone(),
-            entry.name.clone(),
-            entry.source.clone(),
-            entry.line,
+            kind.to_owned(),
+            name.to_owned(),
+            source.to_owned(),
+            detail.to_owned(),
+            conditions.to_vec(),
         ))
     });
     items
@@ -845,10 +843,17 @@ fn extract_enum(
     line_number: usize,
     items: &mut Vec<SurfaceItem>,
 ) -> Result<(), String> {
-    let name = HEADER_PATTERNS.enum_name.captures(block).map_or_else(
-        || format!("anonymous-enum-{line_number}"),
-        |capture| capture[1].to_owned(),
-    );
+    let name = match HEADER_PATTERNS.enum_name.captures(block) {
+        Some(capture) => capture[1].to_owned(),
+        // Named by its first enumerator, which the enum owns, rather than by
+        // a position any upstream edit above it would move.
+        None => format!(
+            "anonymous-enum-{}",
+            first_enumerator(block).ok_or_else(|| {
+                format!("enum at {extraction_source}:{line_number} has no enumerator")
+            })?
+        ),
+    };
     let detail = normalize_c(block)
         .map_err(|error| format!("normalize enum at {extraction_source}:{line_number}: {error}"))?;
     items.push(item("enum", &name, extraction_source, line_number, &detail));
@@ -1484,7 +1489,6 @@ fn classify(
         })
         .collect::<Result<_, String>>()?;
 
-    let availability = availability_spans(&surface)?;
     let mut items = Vec::with_capacity(surface.len());
     let mut classifications = BTreeMap::new();
     let mut rule_matches = vec![0_usize; compiled.len()];
@@ -1528,8 +1532,8 @@ fn classify(
             kind: entry.kind,
             name: entry.name,
             source: entry.source,
-            line: entry.line,
             detail: entry.detail,
+            conditions: entry.conditions,
             exit_code: entry.exit_code,
             classification: rule.id.clone(),
         });
@@ -1543,54 +1547,13 @@ fn classify(
         }
     }
     Ok(Ledger {
-        schema_version: 2,
+        schema_version: 3,
         upstream,
-        generated_by: "xml-sec-capability-ledger/2".into(),
+        generated_by: "xml-sec-capability-ledger/3".into(),
         evidence: rules.evidence,
         classifications,
-        availability,
         items,
     })
-}
-
-fn availability_spans(surface: &[SurfaceItem]) -> Result<Vec<AvailabilitySpan>, String> {
-    let mut lines = BTreeMap::<(&str, usize), &[String]>::new();
-    for item in surface {
-        let key = (item.source.as_str(), item.line);
-        if let Some(existing) = lines.insert(key, &item.conditions)
-            && existing != item.conditions
-        {
-            return Err(format!(
-                "items at {}:{} have inconsistent preprocessor conditions",
-                item.source, item.line
-            ));
-        }
-    }
-
-    let mut spans: Vec<AvailabilitySpan> = Vec::new();
-    let mut interrupted = false;
-    for ((source, line), conditions) in lines {
-        if conditions.is_empty() {
-            interrupted = true;
-            continue;
-        }
-        if let Some(last) = spans.last_mut()
-            && !interrupted
-            && last.source == source
-            && last.conditions == conditions
-        {
-            last.end_line = line;
-            continue;
-        }
-        spans.push(AvailabilitySpan {
-            source: source.to_owned(),
-            start_line: line,
-            end_line: line,
-            conditions: conditions.to_vec(),
-        });
-        interrupted = false;
-    }
-    Ok(spans)
 }
 
 fn collect_macro_definition(lines: &[&str], start: usize) -> (String, usize) {
@@ -1872,6 +1835,18 @@ fn extract_identifiers(block: &str, prefix: &str) -> Vec<String> {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+/// The first enumerator of an enum declaration, comments removed.
+fn first_enumerator(block: &str) -> Option<String> {
+    let code = sanitize_c(block);
+    let body = &code[code.find('{')? + 1..];
+    let start = body.find(|c: char| c.is_ascii_alphabetic() || c == '_')?;
+    let identifier = &body[start..];
+    let end = identifier
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(identifier.len());
+    Some(identifier[..end].to_owned())
 }
 
 fn item(kind: &str, name: &str, source: &str, line: usize, detail: &str) -> SurfaceItem {

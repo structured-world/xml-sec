@@ -21,7 +21,6 @@ struct Ledger {
     generated_by: String,
     evidence: BTreeMap<String, Evidence>,
     classifications: BTreeMap<String, Classification>,
-    availability: Vec<AvailabilitySpan>,
     items: Vec<Item>,
 }
 
@@ -45,8 +44,9 @@ struct Item {
     kind: String,
     name: String,
     source: String,
-    line: usize,
     detail: String,
+    #[serde(default)]
+    conditions: Vec<String>,
     exit_code: Option<i32>,
     classification: String,
 }
@@ -59,21 +59,18 @@ struct Classification {
     evidence: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AvailabilitySpan {
-    source: String,
-    start_line: usize,
-    end_line: usize,
-    conditions: Vec<String>,
-}
-
 fn ledger() -> Ledger {
     serde_json::from_str(LEDGER_JSON).expect("committed capability ledger must be valid JSON")
 }
 
 fn item_id(item: &Item) -> String {
-    format!("{}:{}:{}:{}", item.kind, item.source, item.line, item.name)
+    format!(
+        "{}:{}:{}:{}",
+        item.kind,
+        item.source,
+        item.name,
+        item.conditions.join(" ")
+    )
 }
 
 fn classification<'a>(ledger: &'a Ledger, item: &Item) -> &'a Classification {
@@ -81,21 +78,6 @@ fn classification<'a>(ledger: &'a Ledger, item: &Item) -> &'a Classification {
         .classifications
         .get(&item.classification)
         .unwrap_or_else(|| panic!("{} references unknown classification", item_id(item)))
-}
-
-fn conditions_for<'a>(ledger: &'a Ledger, item: &Item) -> &'a [String] {
-    let mut matching = ledger.availability.iter().filter(|span| {
-        span.source == item.source && span.start_line <= item.line && item.line <= span.end_line
-    });
-    let conditions = matching
-        .next()
-        .map_or(&[][..], |span| span.conditions.as_slice());
-    assert!(
-        matching.next().is_none(),
-        "{} has overlapping availability spans",
-        item_id(item)
-    );
-    conditions
 }
 
 fn declared_tests() -> BTreeSet<&'static str> {
@@ -162,15 +144,14 @@ fn validate_evidence(ledger: &Ledger) -> Result<(), String> {
 fn complete_surface_categories_are_stable() {
     // Exact category counts make an upstream or extractor drift visible in review.
     let ledger = ledger();
-    assert_eq!(ledger.schema_version, 2);
+    assert_eq!(ledger.schema_version, 3);
     assert_eq!(ledger.upstream.project, "libxmlsec1");
     assert_eq!(
         ledger.upstream.repository,
         "https://github.com/lsh123/xmlsec"
     );
-    assert_eq!(ledger.generated_by, "xml-sec-capability-ledger/2");
+    assert_eq!(ledger.generated_by, "xml-sec-capability-ledger/3");
     assert_eq!(ledger.classifications.len(), 25);
-    assert_eq!(ledger.availability.len(), 497);
 
     let counts = ledger
         .items
@@ -190,7 +171,7 @@ fn complete_surface_categories_are_stable() {
             ("cli-command", 24),
             ("cli-exit-status", 3),
             ("cli-option", 77),
-            ("deprecated-api", 14),
+            ("deprecated-api", 15),
             ("enum", 15),
             ("export-function", 625),
             ("export-variable", 431),
@@ -209,39 +190,34 @@ fn complete_surface_categories_are_stable() {
 #[test]
 fn every_entry_is_unique_sorted_and_evidenced() {
     // Deterministic ordering and complete evidence keep regeneration reviewable.
+    // Identity is the declaration and its branch, never a donor line number.
     let ledger = ledger();
-    let ids: Vec<_> = ledger.items.iter().map(item_id).collect();
-    assert_eq!(ids.iter().collect::<BTreeSet<_>>().len(), ids.len());
-
     let sort_keys: Vec<_> = ledger
         .items
         .iter()
-        .map(|item| (&item.kind, &item.name, &item.source, item.line))
+        .map(|item| {
+            (
+                &item.kind,
+                &item.name,
+                &item.source,
+                &item.detail,
+                &item.conditions,
+            )
+        })
         .collect();
+    assert_eq!(
+        sort_keys.iter().collect::<BTreeSet<_>>().len(),
+        sort_keys.len()
+    );
     let mut sorted = sort_keys.clone();
     sorted.sort();
     assert_eq!(sort_keys, sorted);
-
-    for pair in ledger.availability.windows(2) {
-        let left = &pair[0];
-        let right = &pair[1];
-        assert!(
-            (left.source.as_str(), left.start_line) < (right.source.as_str(), right.start_line),
-            "availability spans must remain uniquely sorted"
-        );
-        assert!(
-            left.source != right.source || left.end_line < right.start_line,
-            "availability spans must not overlap in {}",
-            left.source
-        );
-    }
 
     for item in &ledger.items {
         let id = item_id(item);
         let classification = classification(&ledger, item);
         assert!(!item.name.is_empty(), "{id} has no name");
         assert!(!item.source.is_empty(), "{id} has no source");
-        assert!(item.line > 0, "{id} has no source line");
         assert!(!item.detail.is_empty(), "{id} has no extracted detail");
         assert_eq!(
             item.exit_code.is_some(),
@@ -259,7 +235,7 @@ fn every_entry_is_unique_sorted_and_evidenced() {
         );
         assert_ne!(item.classification, "");
         assert!(
-            conditions_for(&ledger, item)
+            item.conditions
                 .iter()
                 .all(|condition| condition.starts_with('#'))
         );
@@ -863,7 +839,8 @@ fn donor_declarations_are_extracted_without_truncation() {
         .find(|item| item.name == "xmlSecGCryptAppKeyCertLoad")
         .expect("guarded X.509 API must be inventoried");
     assert!(
-        conditions_for(&ledger, guarded_x509)
+        guarded_x509
+            .conditions
             .iter()
             .any(|condition| condition == "#ifndef XMLSEC_NO_X509")
     );
@@ -900,7 +877,7 @@ fn conditional_macro_variants_and_class_ids_are_complete() {
                 item.kind == "class-id"
                     && item.name == macro_item.name
                     && item.source == macro_item.source
-                    && item.line == macro_item.line
+                    && item.conditions == macro_item.conditions
             }),
             "{}",
             item_id(macro_item)

@@ -611,22 +611,122 @@ fn preprocessor_conditions_reject_malformed_branching() {
     }
 }
 
-#[test]
-fn availability_spans_normalize_repeated_item_conditions() {
-    // One source span replaces repeated per-item arrays without covering unguarded entries.
-    let mut guarded_a = item("macro", "A", "public.h", 10, "A");
-    guarded_a.conditions = vec!["#ifndef XMLSEC_NO_A".into()];
-    let mut guarded_b = item("macro", "B", "public.h", 20, "B");
-    guarded_b.conditions = guarded_a.conditions.clone();
-    let unguarded = item("macro", "C", "public.h", 30, "C");
-    let mut guarded_d = item("macro", "D", "public.h", 40, "D");
-    guarded_d.conditions = guarded_a.conditions.clone();
+fn serialized_ledger(surface: Vec<SurfaceItem>) -> String {
+    let ledger = classify(
+        surface,
+        RulesFile {
+            schema_version: 1,
+            evidence: evidence(),
+            rules: vec![rule("macros", &["macro"], None)],
+        },
+        Upstream::libxmlsec1("1.3.14"),
+    )
+    .expect("every macro is classified");
+    serde_json::to_string_pretty(&ledger).expect("the ledger serializes")
+}
 
-    let spans = availability_spans(&[guarded_a, guarded_b, unguarded, guarded_d])
-        .expect("consistent item conditions must normalize");
-    assert_eq!(spans.len(), 2);
-    assert_eq!((spans[0].start_line, spans[0].end_line), (10, 20));
-    assert_eq!((spans[1].start_line, spans[1].end_line), (40, 40));
+fn guarded(name: &str, line: usize, conditions: &[&str]) -> SurfaceItem {
+    let mut entry = item("macro", name, "public.h", line, name);
+    entry.conditions = conditions
+        .iter()
+        .map(|condition| (*condition).into())
+        .collect();
+    entry
+}
+
+#[test]
+fn an_upstream_edit_that_only_moves_declarations_leaves_the_ledger_unchanged() {
+    // Upstream master moves on with every commit. A comment added above a
+    // declaration changes no surface fact, so it must not make the
+    // committed ledger stale.
+    let before = serialized_ledger(vec![
+        guarded("A", 10, &["#ifndef XMLSEC_NO_A"]),
+        guarded("B", 20, &[]),
+    ]);
+    let after = serialized_ledger(vec![
+        guarded("A", 20, &["#ifndef XMLSEC_NO_A"]),
+        guarded("B", 35, &[]),
+    ]);
+    assert_eq!(before, after);
+}
+
+#[test]
+fn each_item_carries_its_own_preprocessor_conditions() {
+    // Availability belongs to the declaration: a changed guard is a ledger
+    // diff on exactly the items it guards, and an unguarded item stays bare.
+    let ledger = classify(
+        vec![
+            guarded("A", 10, &["#ifndef XMLSEC_NO_A"]),
+            guarded("B", 20, &[]),
+        ],
+        RulesFile {
+            schema_version: 1,
+            evidence: evidence(),
+            rules: vec![rule("macros", &["macro"], None)],
+        },
+        Upstream::libxmlsec1("1.3.14"),
+    )
+    .expect("every macro is classified");
+    assert_eq!(ledger.items[0].conditions, ["#ifndef XMLSEC_NO_A"]);
+    assert_eq!(ledger.items[1].conditions, Vec::<String>::new());
+    let changed = serialized_ledger(vec![
+        guarded("A", 10, &["#ifndef XMLSEC_NO_A", "#if XMLSEC_EXTRA"]),
+        guarded("B", 20, &[]),
+    ]);
+    assert_ne!(
+        changed,
+        serialized_ledger(vec![
+            guarded("A", 10, &["#ifndef XMLSEC_NO_A"]),
+            guarded("B", 20, &[]),
+        ])
+    );
+}
+
+#[test]
+fn definitions_in_separate_branches_stay_separate_entries() {
+    // The same name defined under #if and #else is two facts: their
+    // conditions, not their positions, tell them apart.
+    let surface = deduplicate_surface(vec![
+        guarded("A", 10, &["#if XMLSEC_ONE"]),
+        guarded("A", 12, &["#if XMLSEC_ONE", "#else"]),
+        guarded("A", 30, &["#if XMLSEC_ONE"]),
+    ]);
+    assert_eq!(surface.len(), 2);
+}
+
+#[test]
+fn an_anonymous_enum_is_named_by_its_first_enumerator() {
+    // A position-derived name would change with every edit above the enum.
+    let mut items = Vec::new();
+    extract_enum(
+        "typedef enum { /* first */ xmlSecFirst = 0, xmlSecSecond } ;",
+        "public.h",
+        40,
+        &mut items,
+    )
+    .expect("the enum is recognized");
+    assert_eq!(items[0].name, "anonymous-enum-xmlSecFirst");
+    assert!(extract_enum("typedef enum { } ;", "public.h", 40, &mut items).is_err());
+}
+
+#[test]
+fn donor_anchors_name_their_text_not_its_position() {
+    // A behavior anchor is the unique donor text it quotes; its line would
+    // make every unrelated upstream edit above it a ledger change.
+    let donor = tempfile::tempdir().expect("donor fixture directory");
+    fs::write(donor.path().join("dsig.c"), "/* moved */\nint anchor;\n").expect("donor fixture");
+    let anchor = resolve_donor_anchor(
+        donor.path(),
+        DonorAnchorRule {
+            source: "dsig.c".into(),
+            needle: "int anchor;".into(),
+        },
+    )
+    .expect("the needle matches once");
+    assert_eq!(
+        serde_json::to_value(&anchor).expect("the anchor serializes"),
+        serde_json::json!({"source": "dsig.c", "needle": "int anchor;"})
+    );
 }
 
 #[test]
