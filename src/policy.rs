@@ -162,6 +162,14 @@ pub enum PolicyViolation {
     #[cfg(feature = "xmldsig")]
     #[error("Manifest reference processing is disabled by policy")]
     ManifestProcessingDisabled,
+    /// A request selected a value the policy does not list in its
+    /// [`RequestSelections`].
+    #[cfg(feature = "xmldsig")]
+    #[error("policy does not let a request select its {setting}")]
+    RequestSelection {
+        /// The policy setting the request tried to select.
+        setting: &'static str,
+    },
     /// The policy refuses to digest a Reference whose transforms produce no
     /// octets ([`EmptyDigestInput::Refuse`]).
     #[cfg(feature = "xmldsig")]
@@ -1117,7 +1125,7 @@ pub enum OpcRelationshipEdition {
 
 /// `XMLDSig` transform and canonicalization decisions shared by signing and verification.
 #[cfg(feature = "xmldsig")]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SameDocumentIdSemantics {
     /// Require bare fragment identifiers to satisfy the XML `NCName` grammar.
     #[default]
@@ -1153,7 +1161,7 @@ pub enum XsltStylesheetSemantics {
 
 /// Wire representation used for ECDSA `SignatureValue` bytes.
 #[cfg(feature = "xmldsig")]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EcdsaSignatureValueEncoding {
     /// `XMLDSig` fixed-width `r || s` representation.
     #[default]
@@ -1410,7 +1418,7 @@ impl KeyTrustPolicy {
 /// Whether an `XMLDSig` operation evaluates Manifest references. Verification
 /// requires original authenticated coverage; signing populates direct Object/Manifest digests.
 #[cfg(feature = "xmldsig")]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ManifestProcessing {
     /// Leave Manifest reference values untouched and perform no Manifest work.
     #[default]
@@ -1443,6 +1451,142 @@ pub enum TimestampTokenEncoding {
     /// RFC 5652 BER. A level then asserts nothing about EN 319 132-1 §5.1.3.
     Ber,
 }
+
+/// Values a request may select for its own operation in place of the
+/// policy's: a caller's compatibility option (a libxmlsec1 context flag)
+/// takes effect only when the policy lists the value here, so a request
+/// never reaches a mode the deployment did not admit.
+#[cfg(feature = "xmldsig")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestSelections {
+    /// Same-document ID semantics a request may select.
+    pub same_document_id_semantics: BTreeSet<SameDocumentIdSemantics>,
+    /// ECDSA `SignatureValue` encodings a request may select.
+    pub ecdsa_signature_value_encodings: BTreeSet<EcdsaSignatureValueEncoding>,
+    /// Manifest processing a request may select.
+    pub manifest_processing: BTreeSet<ManifestProcessing>,
+}
+
+#[cfg(feature = "xmldsig")]
+impl RequestSelections {
+    /// Every value libxmlsec1's context flags select.
+    #[must_use]
+    pub fn libxmlsec1() -> Self {
+        Self {
+            same_document_id_semantics: BTreeSet::from([SameDocumentIdSemantics::XmlSecVisa3d]),
+            ecdsa_signature_value_encodings: BTreeSet::from([
+                EcdsaSignatureValueEncoding::XmlSecAsn1Der,
+            ]),
+            manifest_processing: BTreeSet::from([
+                ManifestProcessing::Ignore,
+                ManifestProcessing::Process,
+            ]),
+        }
+    }
+
+    /// The selections both `self` and `other` admit.
+    #[must_use]
+    pub fn intersection(&self, other: &Self) -> Self {
+        Self {
+            same_document_id_semantics: self
+                .same_document_id_semantics
+                .intersection(&other.same_document_id_semantics)
+                .copied()
+                .collect(),
+            ecdsa_signature_value_encodings: self
+                .ecdsa_signature_value_encodings
+                .intersection(&other.ecdsa_signature_value_encodings)
+                .copied()
+                .collect(),
+            manifest_processing: self
+                .manifest_processing
+                .intersection(&other.manifest_processing)
+                .copied()
+                .collect(),
+        }
+    }
+
+    /// `selected` when it is `current` or the policy lists it.
+    fn admit<T: Ord + Copy>(
+        listed: &BTreeSet<T>,
+        current: T,
+        selected: T,
+        setting: &'static str,
+    ) -> Result<T, PolicyViolation> {
+        if selected == current || listed.contains(&selected) {
+            Ok(selected)
+        } else {
+            Err(PolicyViolation::RequestSelection { setting })
+        }
+    }
+}
+
+/// Applies a request's selections to an `XMLDSig` operation policy.
+#[cfg(feature = "xmldsig")]
+macro_rules! select_methods {
+    ($policy:ty) => {
+        impl $policy {
+            /// Selects `semantics` for this request's same-document IDs.
+            ///
+            /// # Errors
+            /// [`PolicyViolation::RequestSelection`] when the policy does not
+            /// list it.
+            pub fn select_same_document_id_semantics(
+                &mut self,
+                semantics: SameDocumentIdSemantics,
+            ) -> Result<(), PolicyViolation> {
+                self.transforms.same_document_id_semantics = RequestSelections::admit(
+                    &self.request_selections.same_document_id_semantics,
+                    self.transforms.same_document_id_semantics,
+                    semantics,
+                    "same_document_id_semantics",
+                )?;
+                Ok(())
+            }
+
+            /// Selects `encoding` for this request's ECDSA signature values.
+            ///
+            /// # Errors
+            /// [`PolicyViolation::RequestSelection`] when the policy does not
+            /// list it.
+            pub fn select_ecdsa_signature_value_encoding(
+                &mut self,
+                encoding: EcdsaSignatureValueEncoding,
+            ) -> Result<(), PolicyViolation> {
+                self.ecdsa_signature_value_encoding = RequestSelections::admit(
+                    &self.request_selections.ecdsa_signature_value_encodings,
+                    self.ecdsa_signature_value_encoding,
+                    encoding,
+                    "ecdsa_signature_value_encoding",
+                )?;
+                Ok(())
+            }
+
+            /// Selects `processing` for this request's Manifests.
+            ///
+            /// # Errors
+            /// [`PolicyViolation::RequestSelection`] when the policy does not
+            /// list it.
+            pub fn select_manifest_processing(
+                &mut self,
+                processing: ManifestProcessing,
+            ) -> Result<(), PolicyViolation> {
+                self.manifest_processing = RequestSelections::admit(
+                    &self.request_selections.manifest_processing,
+                    self.manifest_processing,
+                    processing,
+                    "manifest_processing",
+                )?;
+                Ok(())
+            }
+        }
+    };
+}
+
+#[cfg(feature = "xmldsig")]
+select_methods!(VerificationPolicy);
+#[cfg(feature = "xmldsig")]
+select_methods!(SigningPolicy);
 
 /// Immutable policy snapshot for `XMLDSig` verification.
 #[cfg(feature = "xmldsig")]
@@ -1477,6 +1621,8 @@ pub struct VerificationPolicy {
     pub transforms: TransformPolicy,
     /// Whether authenticated Manifest references are processed.
     pub manifest_processing: ManifestProcessing,
+    /// Values a request may select in place of the policy's.
+    pub request_selections: RequestSelections,
     /// Whether a caller-attested digest may complete a detached Reference.
     pub detached_digest_attestation: DetachedDigestAttestation,
     /// How the signature's timestamp tokens are read.
@@ -1646,6 +1792,8 @@ pub struct SigningPolicy {
     pub transforms: TransformPolicy,
     /// Whether direct `<Object>/<Manifest>` reference digests are populated.
     pub manifest_processing: ManifestProcessing,
+    /// Values a request may select in place of the policy's.
+    pub request_selections: RequestSelections,
     /// XML parser rules.
     pub xml: XmlInputPolicy,
     /// Resource ceilings.

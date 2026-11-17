@@ -13,8 +13,8 @@
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use xml_sec::policy::{
-    DecryptionPolicy, EncryptionPolicy, PolicyCompileContext, PolicyCompiler, PolicyProfile,
-    SigningPolicy, VerificationPolicy,
+    DecryptionPolicy, EncryptionPolicy, ManifestProcessing, PolicyCompileContext, PolicyCompiler,
+    PolicyProfile, SigningPolicy, VerificationPolicy,
 };
 use xml_sec::provider::ProviderCapability;
 use xml_sec::xmldsig::UriTypeSet;
@@ -69,12 +69,16 @@ fn compile() -> Option<Published> {
         .ok()?;
     let mut verification = compiled.verification()?.clone();
     verification.uris.references = UriTypeSet::ALL;
+    // libxmlsec1 processes Manifests unless a context asks it not to; the
+    // profile lets a request select either.
+    verification.manifest_processing = ManifestProcessing::Process;
     // Signing admits what this boundary verifies, as libxmlsec1 signs with
     // every method it verifies; the xmlsec1 command opts in the same way.
     let mut signing = compiled.signing()?.clone();
     // A detached reference is digested when it is signed, from the same
     // caller-supplied bytes it is verified from.
     signing.uris.references = verification.uris.references;
+    signing.manifest_processing = verification.manifest_processing;
     signing.signature_algorithms = verification.signature_algorithms.as_ref().map(|methods| {
         methods
             .iter()
@@ -87,7 +91,10 @@ fn compile() -> Option<Published> {
         .clone_from(&verification.digest_algorithms);
     signing.parameterized_rsa_pss = verification.parameterized_rsa_pss;
     signing.hmac = verification.hmac;
-    let decryption = compiled.decryption()?.clone();
+    let mut decryption = compiled.decryption()?.clone();
+    // A CipherReference resolves as a signature's reference does: external
+    // URIs from the bytes the caller's input callbacks supply.
+    decryption.uris.references = verification.uris.references;
     // Encryption admits what this boundary decrypts, as libxmlsec1 encrypts
     // with every cipher it decrypts with.
     let mut encryption = compiled.encryption()?.clone();
@@ -192,6 +199,26 @@ pub fn republish(
         signing: Arc::new(signing),
         encryption: current.encryption,
         decryption: current.decryption,
+    });
+    Some(())
+}
+
+/// [`republish`] for the encryption and decryption snapshots.
+pub fn republish_encryption(
+    edit_encryption: impl FnOnce(&mut EncryptionPolicy),
+    edit_decryption: impl FnOnce(&mut DecryptionPolicy),
+) -> Option<()> {
+    let _turn = WRITER.lock().unwrap_or_else(PoisonError::into_inner);
+    let current = snapshots()?;
+    let mut encryption = EncryptionPolicy::clone(&current.encryption);
+    let mut decryption = DecryptionPolicy::clone(&current.decryption);
+    edit_encryption(&mut encryption);
+    edit_decryption(&mut decryption);
+    *PUBLISHED.write().ok()? = Some(Published {
+        verification: current.verification,
+        signing: current.signing,
+        encryption: Arc::new(encryption),
+        decryption: Arc::new(decryption),
     });
     Some(())
 }

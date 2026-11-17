@@ -2649,6 +2649,15 @@ impl<'a> SignContext<'a> {
         )?;
         let encoded_signature_len =
             padded_base64_len_for_xml(projected_signature_len, &self.policy)?;
+        // A laid out value carries one line feed between lines (`wrap_base64`):
+        // `(len - 1) / size` of them for a non-empty value. The value is at
+        // most half the address space, as a Base64 length the policy bounds.
+        let encoded_signature_len = match self.base64_line_size {
+            Some(size) if encoded_signature_len > 0 => {
+                encoded_signature_len + (encoded_signature_len - 1) / size
+            }
+            _ => encoded_signature_len,
+        };
         let signature_value_node = document.with_view(|view| {
             let signature = find_signing_signature_node(
                 view.document(),
@@ -2876,8 +2885,8 @@ impl<'a> SignContext<'a> {
             transform_options,
             &mut operation,
             request,
-            Some(setup_gate),
-            true,
+            (Some(setup_gate), true),
+            self.base64_line_size,
             analyzed,
         )?;
         let output = self.finish_signing_template::<O>(
@@ -4097,8 +4106,8 @@ fn fill_reference_digest_values_in_dependency_order_with_operation(
         transform_options,
         operation,
         request,
-        setup_gate,
-        defer_digests,
+        (setup_gate, defer_digests),
+        None,
         analyzed,
     )
 }
@@ -4148,13 +4157,16 @@ fn digests_can_defer(
         })
 }
 
+/// Fills every `Reference` digest level by level; with `line_size`, a value
+/// committed at a level is laid out in lines before a later level digests
+/// it. Deferred digests return unwrapped and are laid out by the caller.
 fn fill_analyzed_reference_digest_values(
     document: &mut XmlDocument,
     transform_options: TransformOptions<'_>,
     operation: &mut SigningExecution<'_>,
     request: SigningReferenceRequest<'_, '_>,
-    setup_gate: Option<OperationNodeId>,
-    defer_digests: bool,
+    (setup_gate, defer_digests): (Option<OperationNodeId>, bool),
+    line_size: Option<core::num::NonZeroUsize>,
     analyzed: AnalyzedReferences,
 ) -> Result<(SigningPlanNodes, Vec<(crate::NodeIdentity, String)>), SigningDigestError> {
     let can_defer = defer_digests && digests_can_defer(document, &analyzed);
@@ -4189,7 +4201,7 @@ fn fill_analyzed_reference_digest_values(
             &node_level,
             document,
             |document, budgets| {
-                let replacements = document.with_view(|view| {
+                let mut replacements = document.with_view(|view| {
                     reparsed_level_digests(
                         view,
                         budgets,
@@ -4198,6 +4210,11 @@ fn fill_analyzed_reference_digest_values(
                         level_request,
                     )
                 })?;
+                if let Some(size) = line_size {
+                    for (_, value) in &mut replacements {
+                        *value = wrap_base64(value, size);
+                    }
+                }
                 document
                     .replace_base64_contents_with_budget(
                         &replacements,

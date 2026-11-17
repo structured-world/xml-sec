@@ -175,6 +175,8 @@ static void binary_round_trip(void) {
 
 static const char resource[] = "resource bytes read through the caller's callbacks";
 static size_t resource_position;
+/* When set, the resource the callbacks read instead. */
+static xmlChar *referenced_value;
 
 static int match_resource(const char *uri) {
     return strncmp(uri, "example:", 8) == 0;
@@ -187,10 +189,11 @@ static void *open_resource(const char *uri) {
 }
 
 static int read_resource(void *context, char *buffer, int len) {
-    size_t left = sizeof(resource) - 1 - resource_position;
+    const char *source = referenced_value != NULL ? (const char *)referenced_value : resource;
+    size_t left = strlen(source) - resource_position;
     size_t count = left < (size_t)len ? left : (size_t)len;
     (void)context;
-    memcpy(buffer, resource + resource_position, count);
+    memcpy(buffer, source + resource_position, count);
     resource_position += count;
     return (int)count;
 }
@@ -221,6 +224,71 @@ static void uri_round_trip(void) {
     printf("  decrypted: %.*s\n", result != NULL ? (int)xmlSecBufferGetSize(result) : 0,
            result != NULL ? (const char *)xmlSecBufferGetData(result) : "");
     xmlSecEncCtxDestroy(ctx);
+    xsFreeDoc(doc);
+}
+
+/* An EncryptedData without EncryptionMethod, decrypted with the context's
+ * default method, as its recipient knows it (XML Encryption 1.1 section
+ * 3.1). */
+static void default_method(void) {
+    static const char bytes[] = "default method bytes";
+    xmlDocPtr doc = xsNewDoc(BAD_CAST "1.0");
+    xmlNodePtr tmpl = xmlSecTmplEncDataCreate(doc, xmlSecTransformAes128CbcId, NULL, NULL, NULL, NULL);
+    xmlSecEncCtxPtr ctx = xmlSecEncCtxCreate(NULL);
+    xmlSecBufferPtr result;
+    xmlNodePtr method;
+    xsDocSetRootElement(doc, tmpl);
+    xmlSecTmplEncDataEnsureCipherValue(tmpl);
+    printf("default method\n");
+    ctx->encKey = aes_key(0x88);
+    printf("  encrypt: %d\n",
+           xmlSecEncCtxBinaryEncrypt(ctx, tmpl, (const xmlSecByte *)bytes, sizeof(bytes) - 1));
+    xmlSecEncCtxDestroy(ctx);
+    method = xmlSecFindNode(tmpl, xmlSecNodeEncryptionMethod, xmlSecEncNs);
+    xsUnlinkNode(method);
+    xsFreeNode(method);
+    ctx = xmlSecEncCtxCreate(NULL);
+    ctx->encKey = aes_key(0x88);
+    ctx->defEncMethodId = xmlSecTransformAes128CbcId;
+    result = xmlSecEncCtxDecryptToBuffer(ctx, tmpl);
+    printf("  decrypted: %.*s\n", result != NULL ? (int)xmlSecBufferGetSize(result) : 0,
+           result != NULL ? (const char *)xmlSecBufferGetData(result) : "");
+    xmlSecEncCtxDestroy(ctx);
+    xsFreeDoc(doc);
+}
+
+/* An EncryptedData whose CipherReference names a resource the caller's
+ * input callbacks read: its cipher value moved out of the document. */
+static void cipher_reference(void) {
+    static const char bytes[] = "referenced cipher bytes";
+    xmlDocPtr doc = xsNewDoc(BAD_CAST "1.0");
+    xmlNodePtr tmpl = xmlSecTmplEncDataCreate(doc, xmlSecTransformAes128CbcId, NULL, NULL, NULL, NULL);
+    xmlNodePtr cipher;
+    xmlSecEncCtxPtr ctx = xmlSecEncCtxCreate(NULL);
+    xmlSecBufferPtr result;
+    xsDocSetRootElement(doc, tmpl);
+    xmlSecTmplEncDataEnsureCipherValue(tmpl);
+    printf("cipher reference\n");
+    ctx->encKey = aes_key(0x99);
+    printf("  encrypt: %d\n",
+           xmlSecEncCtxBinaryEncrypt(ctx, tmpl, (const xmlSecByte *)bytes, sizeof(bytes) - 1));
+    xmlSecEncCtxDestroy(ctx);
+    /* The Base64 cipher value becomes the external resource. */
+    cipher = xmlSecFindNode(tmpl, xmlSecNodeCipherValue, xmlSecEncNs);
+    referenced_value = xmlSecGetNodeContentAndTrim(cipher);
+    xsUnlinkNode(cipher);
+    xsFreeNode(cipher);
+    cipher = xmlSecTmplEncDataEnsureCipherReference(tmpl, BAD_CAST "example:cipher");
+    xmlSecTmplCipherReferenceAddTransform(cipher, xmlSecTransformBase64Id);
+    ctx = xmlSecEncCtxCreate(NULL);
+    ctx->encKey = aes_key(0x99);
+    ctx->transformCtx.enabledUris = xmlSecTransformUriTypeAny;
+    result = xmlSecEncCtxDecryptToBuffer(ctx, tmpl);
+    printf("  decrypted: %.*s\n", result != NULL ? (int)xmlSecBufferGetSize(result) : 0,
+           result != NULL ? (const char *)xmlSecBufferGetData(result) : "");
+    xmlSecEncCtxDestroy(ctx);
+    xsFree(referenced_value);
+    referenced_value = NULL;
     xsFreeDoc(doc);
 }
 
@@ -326,6 +394,8 @@ int main(void) {
     round_trip("encrypt without a type", NULL);
     binary_round_trip();
     uri_round_trip();
+    default_method();
+    cipher_reference();
     session_key("session key rsa-oaep", xmlSecTransformRsaOaepId, "recipient", 0);
     session_key("session key rsa-oaep tampered", xmlSecTransformRsaOaepId, "recipient", 1);
     session_key("session key rsa-1_5", xmlSecTransformRsaPkcs1Id, "recipient", 0);

@@ -84,6 +84,32 @@ fn gcm_refuses_a_tampered_cipher_value() {
 }
 
 #[test]
+fn decryption_refuses_plaintext_beyond_the_policy_limit() {
+    // A GCM value adds 28 octets of nonce and tag, inside the input framing
+    // allowance, so only a check of the recovered plaintext keeps one octet
+    // over the limit out. Republishing runs in this test's own process.
+    let key = aes_key(&[0x44; 16]);
+    let encrypted = run(aes128_gcm(), OPERATION_ENCRYPT, key, &[0x55; 17]).expect("encrypts");
+    xml_sec_libxml2::policy::republish_encryption(
+        |_| {},
+        |decryption| decryption.resources.max_encryption_plaintext_bytes = 16,
+    )
+    .expect("the library policy compiles");
+    assert_eq!(run(aes128_gcm(), OPERATION_DECRYPT, key, &encrypted), None);
+    xml_sec_libxml2::policy::republish_encryption(
+        |_| {},
+        |decryption| decryption.resources.max_encryption_plaintext_bytes = 17,
+    )
+    .expect("the library policy compiles");
+    assert_eq!(
+        run(aes128_gcm(), OPERATION_DECRYPT, key, &encrypted),
+        Some(vec![0x55; 17])
+    );
+    // SAFETY: the key created above.
+    unsafe { xmlSecKeyDestroy(key) };
+}
+
+#[test]
 fn a_short_key_is_refused_and_requirements_name_the_family_and_size() {
     // SAFETY: a context, a transform and a key created and destroyed here.
     unsafe {

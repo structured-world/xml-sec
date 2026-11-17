@@ -40,6 +40,56 @@ fn seconds_later(time: Instant, seconds: i64) -> Instant {
 }
 
 #[test]
+fn a_request_selects_only_what_its_policy_lists() {
+    // A caller's compatibility option never reaches a mode the deployment did
+    // not admit: the libxmlsec1 profile lists libxmlsec1's selections, the
+    // modern one none, so the same selection succeeds in one and is refused
+    // with a typed violation in the other.
+    use xml_sec::policy::{
+        EcdsaSignatureValueEncoding, ManifestProcessing, RequestSelections, SameDocumentIdSemantics,
+    };
+    let compat = compiler(PolicyProfile::XmlSecCompatible)
+        .compile(&context())
+        .unwrap();
+    let mut verification = compat.verification().unwrap().clone();
+    assert_eq!(
+        verification.request_selections,
+        RequestSelections::libxmlsec1()
+    );
+    verification
+        .select_same_document_id_semantics(SameDocumentIdSemantics::XmlSecVisa3d)
+        .unwrap();
+    assert_eq!(
+        verification.transforms.same_document_id_semantics,
+        SameDocumentIdSemantics::XmlSecVisa3d
+    );
+    let mut signing = compat.signing().unwrap().clone();
+    signing
+        .select_ecdsa_signature_value_encoding(EcdsaSignatureValueEncoding::XmlSecAsn1Der)
+        .unwrap();
+    signing
+        .select_manifest_processing(ManifestProcessing::Process)
+        .unwrap();
+    assert_eq!(signing.manifest_processing, ManifestProcessing::Process);
+
+    let modern = compiler(PolicyProfile::Modern).compile(&context()).unwrap();
+    let mut verification = modern.verification().unwrap().clone();
+    assert_eq!(
+        verification.select_same_document_id_semantics(SameDocumentIdSemantics::XmlSecVisa3d),
+        Err(PolicyViolation::RequestSelection {
+            setting: "same_document_id_semantics"
+        })
+    );
+    // The policy's own value is always selectable.
+    let current = verification.manifest_processing;
+    assert_eq!(verification.select_manifest_processing(current), Ok(()));
+
+    // A layer that lists nothing leaves a composed policy with nothing.
+    let narrowed = RequestSelections::libxmlsec1().intersection(&RequestSelections::default());
+    assert_eq!(narrowed, RequestSelections::default());
+}
+
+#[test]
 fn profiles_keep_parameterized_pss_permissions() {
     // An explicit preset allowlist must not erase its supported PSS family.
     use xml_sec::policy::RsaPssPermission;

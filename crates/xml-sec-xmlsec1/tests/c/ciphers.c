@@ -104,6 +104,7 @@ static void wrap(xmlSecTransformId id, xmlSecKeyDataId keyId, xmlSecSize kekSize
     xmlSecByte unwrapped[64];
     xmlSecKeyPtr kek = key_of(keyId, 0x0f, kekSize);
     int size;
+    int unwrapped_size;
     int i;
     printf("%s: href=%s usage=0x%x\n", id->name, id->href, id->usage);
     size = run(id, xmlSecTransformOperationEncrypt, kek, content_key, sizeof(content_key), wrapped);
@@ -112,9 +113,13 @@ static void wrap(xmlSecTransformId id, xmlSecKeyDataId keyId, xmlSecSize kekSize
         printf("%02x", wrapped[i]);
     }
     printf("\n");
-    printf("  unwrapped: %d same=%d\n",
-           run(id, xmlSecTransformOperationDecrypt, kek, wrapped, (xmlSecSize)size, unwrapped),
-           memcmp(unwrapped, content_key, sizeof(content_key)) == 0);
+    /* The recovery completes before its bytes are compared: the order in
+     * which printf's arguments are evaluated is unspecified. */
+    unwrapped_size =
+        run(id, xmlSecTransformOperationDecrypt, kek, wrapped, (xmlSecSize)size, unwrapped);
+    printf("  unwrapped: %d same=%d\n", unwrapped_size,
+           unwrapped_size == (int)sizeof(content_key) &&
+               memcmp(unwrapped, content_key, sizeof(content_key)) == 0);
     wrapped[0] ^= 0x01;
     printf("  tampered: %d\n",
            run(id, xmlSecTransformOperationDecrypt, kek, wrapped, (xmlSecSize)size, unwrapped));

@@ -181,14 +181,29 @@ impl SlotPin {
             if !(*slot).is_null() {
                 return Some(Self { slot, owned: false });
             }
+            Some(Self::hold_pinned(slot, Pinned::current(here)?))
+        }
+    }
+
+    /// Pins `pinned` into `slot` unless it holds a pin, so the read sees the
+    /// revision of the operation that makes it.
+    ///
+    /// # Safety
+    /// As for [`SlotPin::hold`].
+    pub(crate) unsafe fn hold_pinned(slot: *mut *mut c_void, pinned: Pinned) -> Self {
+        // SAFETY: by the caller's contract.
+        unsafe {
+            if !(*slot).is_null() {
+                return Self { slot, owned: false };
+            }
             let operation = Operation {
-                pinned: Pinned::current(here)?,
+                pinned,
                 spent: Cell::default(),
                 key_candidates: Cell::default(),
             };
             *slot = Box::into_raw(Box::new(operation)).cast();
         }
-        Some(Self { slot, owned: true })
+        Self { slot, owned: true }
     }
 }
 

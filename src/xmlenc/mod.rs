@@ -66,6 +66,12 @@ pub use types::{
     RsaOaepParameters, XmlEncError,
 };
 
+/// The longest RSA key-transport ciphertext any operation admits: the width
+/// of the largest RSA modulus the library accepts. A transport collecting
+/// its input refuses more before any key or policy is consulted.
+pub const KEY_TRANSPORT_CIPHERTEXT_CEILING: usize =
+    crate::hard_limits::RSA_MODULUS_BIT_CEILING.div_ceil(8);
+
 fn map_document_error(
     error: crate::document::XmlDocumentError,
     settings: crate::document::DocumentParseSettings,

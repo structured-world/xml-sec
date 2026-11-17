@@ -15,6 +15,7 @@
 #include <xmlsec/errors.h>
 #include <xmlsec/app.h>
 #include <xmlsec/dl.h>
+#include <xmlsec/io.h>
 #include <xmlsec/keys.h>
 #include <xmlsec/keysmngr.h>
 #include <xmlsec/templates.h>
@@ -161,6 +162,153 @@ static void verify(const char *label, xmlDocPtr doc, xmlSecKeyPtr key, unsigned 
     xmlSecDSigCtxDestroy(ctx);
 }
 
+/* Signs a template of `method` keeping the buffers the storage `flags` ask
+ * for: the canonical SignedInfo and the first reference's digested bytes. */
+static void sign_keeping(const char *label, unsigned int flags) {
+    xmlDocPtr doc = signed_template(xmlSecTransformHmacSha256Id);
+    xmlSecDSigCtxPtr ctx = xmlSecDSigCtxCreate(NULL);
+    printf("%s\n", label);
+    ctx->flags = flags;
+    ctx->signKey = hmac_key();
+    printf("  sign: %d\n", xmlSecDSigCtxSign(ctx, signature_of(doc)));
+    print_buffer("pre-sign", xmlSecDSigCtxGetPreSignBuffer(ctx));
+    print_buffer("pre-digest", xmlSecDSigReferenceCtxGetPreDigestBuffer(
+                                   (xmlSecDSigReferenceCtxPtr)xmlSecPtrListGetItem(
+                                       &(ctx->signedInfoReferences), 0)));
+    xmlSecDSigCtxDestroy(ctx);
+    xsFreeDoc(doc);
+}
+
+static int refuse_reference(xmlSecTransformCtxPtr ctx) {
+    (void)ctx;
+    return -1;
+}
+
+static int admit_reference(xmlSecTransformCtxPtr ctx) {
+    (void)ctx;
+    return 0;
+}
+
+/* Signs and verifies with a pre-execute callback the reference contexts
+ * inherit: one that refuses stops the operation, one that admits does not. */
+static void callbacks(void) {
+    xmlDocPtr doc = signed_template(xmlSecTransformHmacSha256Id);
+    xmlSecDSigCtxPtr ctx = xmlSecDSigCtxCreate(NULL);
+    printf("pre-execute callback\n");
+    ctx->transformCtx.preExecCallback = refuse_reference;
+    ctx->signKey = hmac_key();
+    printf("  refusing sign: %d\n", xmlSecDSigCtxSign(ctx, signature_of(doc)) < 0 ? -1 : 0);
+    xmlSecDSigCtxDestroy(ctx);
+    ctx = xmlSecDSigCtxCreate(NULL);
+    ctx->transformCtx.preExecCallback = admit_reference;
+    ctx->signKey = hmac_key();
+    printf("  admitting sign: %d\n", xmlSecDSigCtxSign(ctx, signature_of(doc)));
+    xmlSecDSigCtxDestroy(ctx);
+    ctx = xmlSecDSigCtxCreate(NULL);
+    ctx->transformCtx.preExecCallback = refuse_reference;
+    ctx->signKey = hmac_key();
+    printf("  refusing verify: %d\n", xmlSecDSigCtxVerify(ctx, signature_of(doc)) < 0 ? -1 : 0);
+    xmlSecDSigCtxDestroy(ctx);
+    ctx = xmlSecDSigCtxCreate(NULL);
+    ctx->referencePreExecuteCallback = refuse_reference;
+    ctx->signKey = hmac_key();
+    printf("  refusing reference verify: %d\n",
+           xmlSecDSigCtxVerify(ctx, signature_of(doc)) < 0 ? -1 : 0);
+    xmlSecDSigCtxDestroy(ctx);
+    ctx = xmlSecDSigCtxCreate(NULL);
+    ctx->referencePreExecuteCallback = admit_reference;
+    ctx->signKey = hmac_key();
+    printf("  admitting reference verify: %d", xmlSecDSigCtxVerify(ctx, signature_of(doc)));
+    printf(" status=%s\n", xmlSecDSigCtxGetStatusString(ctx->status));
+    xmlSecDSigCtxDestroy(ctx);
+    xsFreeDoc(doc);
+}
+
+static const char resource[] = "detached payload read through the caller's callbacks";
+static size_t resource_position;
+
+static int match_resource(const char *uri) {
+    return strncmp(uri, "example:", 8) == 0;
+}
+
+static void *open_resource(const char *uri) {
+    (void)uri;
+    resource_position = 0;
+    return &resource_position;
+}
+
+static int read_resource(void *context, char *buffer, int len) {
+    size_t left = sizeof(resource) - 1 - resource_position;
+    size_t count = left < (size_t)len ? left : (size_t)len;
+    (void)context;
+    memcpy(buffer, resource + resource_position, count);
+    resource_position += count;
+    return (int)count;
+}
+
+static int close_resource(void *context) {
+    (void)context;
+    return 0;
+}
+
+/* A detached signature over a resource the caller's input callbacks read:
+ * signed, then verified with the same callbacks. */
+static void detached(void) {
+    xmlDocPtr doc = xsNewDoc(BAD_CAST "1.0");
+    xmlNodePtr signature =
+        xmlSecTmplSignatureCreate(doc, xmlSecTransformExclC14NId, xmlSecTransformHmacSha256Id, NULL);
+    xmlSecDSigCtxPtr ctx = xmlSecDSigCtxCreate(NULL);
+    xsDocSetRootElement(doc, signature);
+    xmlSecTmplSignatureAddReference(signature, xmlSecTransformSha256Id, NULL,
+                                    BAD_CAST "example:payload", NULL);
+    printf("detached\n");
+    printf("  register: %d\n", xmlSecIORegisterCallbacks(match_resource, open_resource,
+                                                         read_resource, close_resource));
+    ctx->signKey = hmac_key();
+    ctx->enabledReferenceUris = xmlSecTransformUriTypeAny;
+    printf("  sign: %d\n", xmlSecDSigCtxSign(ctx, signature));
+    dump("  signed", doc);
+    xmlSecDSigCtxDestroy(ctx);
+    ctx = xmlSecDSigCtxCreate(NULL);
+    ctx->signKey = hmac_key();
+    ctx->enabledReferenceUris = xmlSecTransformUriTypeAny;
+    printf("  verify: %d", xmlSecDSigCtxVerify(ctx, signature));
+    printf(" status=%s\n", xmlSecDSigCtxGetStatusString(ctx->status));
+    xmlSecDSigCtxDestroy(ctx);
+    xsFreeDoc(doc);
+}
+
+/* A SignedInfo reference over a Manifest whose own reference covers the
+ * payload: signing writes both digests. */
+static void manifest(void) {
+    static const xmlChar *ids[] = {BAD_CAST "Id", NULL};
+    xmlDocPtr doc = xsReadMemory(payload, (int)strlen(payload), "doc.xml", NULL, 0);
+    xmlNodePtr signature = xmlSecTmplSignatureCreate(doc, xmlSecTransformExclC14NId,
+                                                     xmlSecTransformHmacSha256Id, NULL);
+    xmlNodePtr object;
+    xmlNodePtr list;
+    xmlSecDSigCtxPtr ctx = xmlSecDSigCtxCreate(NULL);
+    xmlSecAddChildNode(xsDocGetRootElement(doc), signature);
+    /* Each chain ends in a canonicalization, so neither library adds one. */
+    xmlSecTmplReferenceAddTransform(
+        xmlSecTmplSignatureAddReference(signature, xmlSecTransformSha256Id, NULL,
+                                        BAD_CAST "#manifest",
+                                        BAD_CAST "http://www.w3.org/2000/09/xmldsig#Manifest"),
+        xmlSecTransformExclC14NId);
+    object = xmlSecTmplSignatureAddObject(signature, NULL, NULL, NULL);
+    list = xmlSecTmplObjectAddManifest(object, BAD_CAST "manifest");
+    xmlSecTmplReferenceAddTransform(
+        xmlSecTmplManifestAddReference(list, xmlSecTransformSha256Id, NULL, BAD_CAST "#data", NULL),
+        xmlSecTransformExclC14NId);
+    xmlSecAddIDs(doc, NULL, ids);
+    printf("manifest\n");
+    ctx->signKey = hmac_key();
+    printf("  sign: %d\n", xmlSecDSigCtxSign(ctx, signature));
+    dump("  signed", doc);
+    xmlSecDSigCtxDestroy(ctx);
+    xsFreeDoc(doc);
+}
+
 /* Replaces the text of the first `name` element in `ns` of `doc`. */
 static void tamper(xmlDocPtr doc, const xmlChar *name, const xmlChar *ns, const char *text) {
     xmlNodePtr node = xmlSecFindNode(xsDocGetRootElement(doc), name, ns);
@@ -181,6 +329,12 @@ int main(void) {
         printf("crypto init failed\n");
         return 1;
     }
+
+    sign_keeping("hmac sign keeping buffers", XMLSEC_DSIG_FLAGS_STORE_SIGNATURE |
+                                                  XMLSEC_DSIG_FLAGS_STORE_SIGNEDINFO_REFERENCES);
+    callbacks();
+    detached();
+    manifest();
 
     doc = sign("hmac sign", xmlSecTransformHmacSha256Id, hmac_key());
     verify("hmac verify", doc, hmac_key(), 0);

@@ -8,14 +8,15 @@
 //! under the library policy, and its outcome becomes the contexts' status,
 //! failure reason, reference statuses and kept buffers.
 
+use std::collections::BTreeMap;
 use std::ffi::{c_int, c_void};
 use std::sync::Arc;
 
 use xml_sec::XmlDocument;
 use xml_sec::document::external::ExternalNode;
 use xml_sec::policy::{
-    EcdsaSignatureValueEncoding, EmptyDigestInput, ManifestProcessing, SameDocumentIdSemantics,
-    SigningPolicy, VerificationPolicy,
+    EcdsaSignatureValueEncoding, EmptyDigestInput, ManifestProcessing, PolicyViolation,
+    SameDocumentIdSemantics, SigningPolicy, VerificationPolicy,
 };
 use xml_sec::xmldsig::{
     DsigStatus, FailureReason, HmacSigningKey, HmacVerificationKey, ReferenceResult, SignContext,
@@ -34,14 +35,16 @@ use super::super::keyinfo::xmlSecKeyInfoNodeWrite;
 use super::super::keys::{XmlSecKey, xmlSecKeyGetValue, xmlSecKeyMatch};
 use super::super::keysdata::xmlSecKeyDataBinaryValueGetBuffer;
 use super::super::list::{xmlSecPtrListAdd, xmlSecPtrListGetItem, xmlSecPtrListGetSize};
+use super::super::nodeset::{xmlSecNodeSetDestroy, xmlSecNodeSetGetChildren};
 use super::super::policy::Pinned;
 use super::super::strings;
 use super::super::transforms::builtin::{
     xmlSecTransformBase64GetKlass, xmlSecTransformMemBufGetBuffer, xmlSecTransformMemBufGetKlass,
 };
 use super::super::transforms::ctx::{
-    xmlSecTransformCtxCreateAndAppend, xmlSecTransformCtxExecute, xmlSecTransformCtxNodeRead,
-    xmlSecTransformCtxNodesListRead, xmlSecTransformCtxSetUri,
+    read_resource, xmlSecTransformCtxCreate, xmlSecTransformCtxCreateAndAppend,
+    xmlSecTransformCtxDestroy, xmlSecTransformCtxExecute, xmlSecTransformCtxNodeRead,
+    xmlSecTransformCtxNodesListRead, xmlSecTransformCtxSetUri, xmlSecTransformCtxXmlExecute,
 };
 use super::super::transforms::signatures::signing_key;
 use super::super::transforms::{
@@ -49,7 +52,7 @@ use super::super::transforms::{
     USAGE_DIGEST_METHOD, USAGE_DSIG_TRANSFORM, USAGE_SIGNATURE_METHOD, xmlSecTransformSetKey,
     xmlSecTransformSetKeyReq, xmlSecTransformVerifyNodeContent,
 };
-use super::super::tree::{XmlNode, give, nodes};
+use super::super::tree::{XmlDoc, XmlNode, give, nodes};
 use super::super::xmltree::{xmlSecAddIDs, xmlSecCheckNodeName, xmlSecGetNextElementNode};
 use super::{
     FAILURE_KEY_NOT_FOUND, FAILURE_REFERENCE, FAILURE_SIGNATURE, FAILURE_UNKNOWN,
@@ -193,6 +196,28 @@ unsafe fn process_signature_node(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode) ->
             return -1;
         }
     }
+    // One policy revision governs the whole operation, from reading the
+    // signature to the core's run.
+    let Some(pinned) = Pinned::current(here) else {
+        return -1;
+    };
+    let policies = match operation_policies(ctx, &pinned) {
+        Ok(policies) => policies,
+        Err(violation) => {
+            errors::report(
+                here,
+                std::ptr::null(),
+                std::ptr::null(),
+                errors::R_INVALID_CONFIG,
+                &violation.to_string(),
+            );
+            return -1;
+        }
+    };
+    let max_references = match &policies {
+        OperationPolicies::Sign(policy) => policy.resources.max_references,
+        OperationPolicies::Verify(policy) => policy.resources.max_references,
+    };
     // SAFETY: live nodes of the caller's tree throughout.
     unsafe {
         if !is(node, name!(xmlSecNodeSignature)) {
@@ -227,7 +252,8 @@ unsafe fn process_signature_node(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode) ->
             std::ptr::null_mut()
         };
         while is(cur, name!(xmlSecNodeObject)) {
-            if ctx.flags & FLAGS_IGNORE_MANIFESTS == 0 && read_object(ctx, cur) < 0 {
+            if ctx.flags & FLAGS_IGNORE_MANIFESTS == 0 && read_object(ctx, cur, max_references) < 0
+            {
                 errors::internal(here, std::ptr::null(), c"xmlSecDSigCtxProcessObjectNode");
                 return -1;
             }
@@ -250,16 +276,184 @@ unsafe fn process_signature_node(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode) ->
             errors::internal(here, std::ptr::null(), c"xmlSecDSigCtxProcessKeyInfoNode");
             return -1;
         }
-        if read_references(ctx, first_reference) < 0 {
+        if read_references(ctx, first_reference, max_references) < 0 {
             errors::internal(here, std::ptr::null(), c"xmlSecDSigCtxProcessReferences");
             return -1;
         }
-        if ctx.operation == OPERATION_SIGN {
-            run_signing(ctx, node)
-        } else {
-            run_verification(ctx, node)
+        run_operation(ctx, node, policies)
+    }
+}
+
+/// The read signature's operation: every reference's pre-execute callback,
+/// then the core run under `policies` with the external resources the
+/// references name.
+///
+/// # Safety
+/// `node` is the read, live `Signature` element of the context.
+unsafe fn run_operation(
+    ctx: &mut XmlSecDSigCtx,
+    node: *mut XmlNode,
+    policies: OperationPolicies,
+) -> c_int {
+    // SAFETY: the context's read reference contexts and a live node.
+    unsafe {
+        if run_pre_execute_callbacks(ctx) < 0 {
+            return -1;
+        }
+        let Some(resources) = external_resources(ctx, node) else {
+            errors::internal(
+                here!("xmlSecDSigCtxProcessSignatureNode"),
+                std::ptr::null(),
+                c"xmlSecTransformCtxUriExecute",
+            );
+            return -1;
+        };
+        match policies {
+            OperationPolicies::Sign(policy) => run_signing(ctx, node, &policy, &resources),
+            OperationPolicies::Verify(policy) => run_verification(ctx, node, policy, &resources),
         }
     }
+}
+
+/// The policy of the context's operation with its flags applied.
+enum OperationPolicies {
+    Sign(Arc<SigningPolicy>),
+    Verify(Arc<VerificationPolicy>),
+}
+
+/// The pinned policy of the context's operation with the context's flags
+/// applied as the request's selections: a flag reaches only what the policy
+/// lets a request select, and leaving `ALLOW_EMPTY_INPUT` unset narrows the
+/// operation to refuse empty digest input, as libxmlsec1 refuses it.
+fn operation_policies(
+    ctx: &XmlSecDSigCtx,
+    pinned: &Pinned,
+) -> Result<OperationPolicies, PolicyViolation> {
+    macro_rules! select {
+        ($policy:expr) => {{
+            let mut policy = Arc::clone($policy);
+            if ctx.flags & FLAGS_IGNORE_MANIFESTS != 0 {
+                Arc::make_mut(&mut policy)
+                    .select_manifest_processing(ManifestProcessing::Ignore)?;
+            }
+            if ctx.flags & FLAGS_USE_VISA3D_HACK != 0 {
+                Arc::make_mut(&mut policy)
+                    .select_same_document_id_semantics(SameDocumentIdSemantics::XmlSecVisa3d)?;
+            }
+            if ctx.flags & FLAGS_USE_ASN1_SIGNATURE_VALUES != 0 {
+                Arc::make_mut(&mut policy).select_ecdsa_signature_value_encoding(
+                    EcdsaSignatureValueEncoding::XmlSecAsn1Der,
+                )?;
+            }
+            if ctx.flags & FLAGS_ALLOW_EMPTY_INPUT_DSIG == 0
+                && policy.transforms.empty_digest_input != EmptyDigestInput::Refuse
+            {
+                Arc::make_mut(&mut policy).transforms.empty_digest_input = EmptyDigestInput::Refuse;
+            }
+            policy
+        }};
+    }
+    Ok(if ctx.operation == OPERATION_SIGN {
+        OperationPolicies::Sign(select!(&pinned.signing))
+    } else {
+        OperationPolicies::Verify(select!(&pinned.verification))
+    })
+}
+
+/// The reference contexts of `list`.
+///
+/// # Safety
+/// `list` holds reference contexts that outlive the borrow.
+unsafe fn references<'a>(
+    list: *mut super::XmlSecPtrList,
+) -> impl Iterator<Item = &'a mut XmlSecDSigReferenceCtx> {
+    // SAFETY: by the caller's contract.
+    let size = unsafe { xmlSecPtrListGetSize(list) };
+    (0..size).filter_map(move |index| {
+        // SAFETY: an item of the list, a reference context.
+        unsafe {
+            xmlSecPtrListGetItem(list, index)
+                .cast::<XmlSecDSigReferenceCtx>()
+                .as_mut()
+        }
+    })
+}
+
+/// Runs the pre-execute callback of every reference context before the
+/// operation dereferences any, as libxmlsec1 runs it when each reference's
+/// chain is prepared: a negative return refuses the operation.
+///
+/// # Safety
+/// The context's reference lists hold read reference contexts.
+unsafe fn run_pre_execute_callbacks(ctx: &mut XmlSecDSigCtx) -> c_int {
+    let here = here!("xmlSecTransformCtxPrepare");
+    // The context's own chain is the one libxmlsec1 prepares for SignedInfo.
+    let signed_info = &raw mut ctx.transform_ctx;
+    if let Some(callback) = ctx.transform_ctx.pre_exec_callback
+        // SAFETY: the caller's callback with the context's chain.
+        && unsafe { callback(signed_info) } < 0
+    {
+        errors::internal(here, std::ptr::null(), c"ctx->preExecCallback");
+        return -1;
+    }
+    for list in [
+        &raw mut ctx.signed_info_references,
+        &raw mut ctx.manifest_references,
+    ] {
+        // SAFETY: the context's own lists of reference contexts.
+        for reference in unsafe { references(list) } {
+            let transforms = &raw mut reference.transform_ctx;
+            if let Some(callback) = reference.transform_ctx.pre_exec_callback
+                // SAFETY: the caller's callback with the reference's context.
+                && unsafe { callback(transforms) } < 0
+            {
+                errors::internal(here, std::ptr::null(), c"ctx->preExecCallback");
+                return -1;
+            }
+        }
+    }
+    0
+}
+
+/// The octets of every external resource the context's references name,
+/// keyed by their URI, read through the caller's input callbacks; `None`
+/// after a report.
+///
+/// # Safety
+/// The context's reference lists hold read reference contexts; `node` is a
+/// live node of their document.
+unsafe fn external_resources(
+    ctx: &mut XmlSecDSigCtx,
+    node: *mut XmlNode,
+) -> Option<BTreeMap<String, Vec<u8>>> {
+    let mut resources = BTreeMap::new();
+    // SAFETY: a live node.
+    let doc = unsafe { xsNodeGetDoc(node) };
+    for list in [
+        &raw mut ctx.signed_info_references,
+        &raw mut ctx.manifest_references,
+    ] {
+        // SAFETY: the context's own lists of reference contexts.
+        for reference in unsafe { references(list) } {
+            // SAFETY: the reference's URI copy and its `Reference` element.
+            unsafe {
+                let Some(uri) = super::super::tree::c_text(reference.uri) else {
+                    continue;
+                };
+                if uri.is_empty() || uri.starts_with('#') || resources.contains_key(uri) {
+                    continue;
+                }
+                let bytes = read_resource(
+                    &raw mut reference.transform_ctx,
+                    uri.as_bytes(),
+                    reference.reserved0.cast(),
+                    doc,
+                )?;
+                resources.insert(uri.to_owned(), bytes);
+            }
+        }
+    }
+    Some(resources)
 }
 
 /// libxmlsec1's `xmlSecDSigCtxProcessSignedInfoNode`: the canonicalization
@@ -286,13 +480,10 @@ unsafe fn read_signed_info(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode) -> Optio
                 return None;
             }
             cur = next_element(cur);
-        } else if !ctx.def_c14n_method_id.is_null() {
-            ctx.c14n_method = xmlSecTransformCtxCreateAndAppend(transforms, ctx.def_c14n_method_id);
-            if ctx.c14n_method.is_null() {
-                errors::internal(here, std::ptr::null(), c"xmlSecTransformCtxCreateAndAppend");
-                return None;
-            }
         } else {
+            // Departure: libxmlsec1 falls back to `defC14NMethodId`. SignedInfo
+            // requires its CanonicalizationMethod (XMLDSig 1.1 section 4.4), and
+            // the core signs and verifies the element as written.
             errors::invalid_node(here, cur, "CanonicalizationMethod", std::ptr::null());
             return None;
         }
@@ -319,13 +510,9 @@ unsafe fn read_signed_info(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode) -> Optio
                 return None;
             }
             cur = next_element(cur);
-        } else if !ctx.def_sign_method_id.is_null() {
-            ctx.sign_method = xmlSecTransformCtxCreateAndAppend(transforms, ctx.def_sign_method_id);
-            if ctx.sign_method.is_null() {
-                errors::internal(here, std::ptr::null(), c"xmlSecTransformCtxCreateAndAppend");
-                return None;
-            }
         } else {
+            // Departure: no `defSignMethodId` fallback; SignedInfo requires its
+            // SignatureMethod (XMLDSig 1.1 section 4.4).
             errors::invalid_node(here, cur, "SignatureMethod", std::ptr::null());
             return None;
         }
@@ -397,13 +584,13 @@ unsafe fn read_key(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode) -> c_int {
 ///
 /// # Safety
 /// `node` is a live node.
-unsafe fn read_object(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode) -> c_int {
+unsafe fn read_object(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode, max_references: usize) -> c_int {
     let here = here!("xmlSecDSigCtxProcessObjectNode");
     // SAFETY: live nodes.
     unsafe {
         let mut cur = first_element(node);
         while !cur.is_null() {
-            if is(cur, name!(xmlSecNodeManifest)) && read_manifest(ctx, cur) < 0 {
+            if is(cur, name!(xmlSecNodeManifest)) && read_manifest(ctx, cur, max_references) < 0 {
                 errors::internal(here, std::ptr::null(), c"xmlSecDSigCtxProcessManifestNode");
                 return -1;
             }
@@ -418,7 +605,11 @@ unsafe fn read_object(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode) -> c_int {
 ///
 /// # Safety
 /// `node` is a live node.
-unsafe fn read_manifest(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode) -> c_int {
+unsafe fn read_manifest(
+    ctx: &mut XmlSecDSigCtx,
+    node: *mut XmlNode,
+    max_references: usize,
+) -> c_int {
     let here = here!("xmlSecDSigCtxProcessManifestNode");
     let list = &raw mut ctx.manifest_references;
     // SAFETY: live nodes and the context's own list.
@@ -426,7 +617,7 @@ unsafe fn read_manifest(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode) -> c_int {
         let mut cur = first_element(node);
         let mut count = 0_usize;
         while is(cur, name!(xmlSecNodeReference)) {
-            if add_reference(ctx, list, ORIGIN_MANIFEST, cur).is_null() {
+            if add_reference(ctx, list, (ORIGIN_MANIFEST, max_references), cur).is_null() {
                 return -1;
             }
             count += 1;
@@ -449,7 +640,11 @@ unsafe fn read_manifest(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode) -> c_int {
 ///
 /// # Safety
 /// `first` is a live node.
-unsafe fn read_references(ctx: &mut XmlSecDSigCtx, first: *mut XmlNode) -> c_int {
+unsafe fn read_references(
+    ctx: &mut XmlSecDSigCtx,
+    first: *mut XmlNode,
+    max_references: usize,
+) -> c_int {
     let here = here!("xmlSecDSigCtxProcessReferences");
     let list = &raw mut ctx.signed_info_references;
     // SAFETY: the context's own list, empty before.
@@ -468,7 +663,7 @@ unsafe fn read_references(ctx: &mut XmlSecDSigCtx, first: *mut XmlNode) -> c_int
                 errors::invalid_node(here, cur, "Reference", std::ptr::null());
                 return -1;
             }
-            if add_reference(ctx, list, ORIGIN_SIGNED_INFO, cur).is_null() {
+            if add_reference(ctx, list, (ORIGIN_SIGNED_INFO, max_references), cur).is_null() {
                 return -1;
             }
             cur = next_element(cur);
@@ -478,19 +673,29 @@ unsafe fn read_references(ctx: &mut XmlSecDSigCtx, first: *mut XmlNode) -> c_int
 }
 
 /// A new reference context of `origin` for the `Reference` element `node`,
-/// added to `list` and read; null after a report.
+/// added to `list` and read; null after a report. The operation's
+/// `max_references` bounds the contexts of `SignedInfo` and its Manifests
+/// together, checked before another is made.
 ///
 /// # Safety
 /// `list` is one of the context's reference lists; `node` a live node.
 unsafe fn add_reference(
     ctx: &mut XmlSecDSigCtx,
     list: *mut super::XmlSecPtrList,
-    origin: c_int,
+    (origin, max_references): (c_int, usize),
     node: *mut XmlNode,
 ) -> *mut XmlSecDSigReferenceCtx {
     let here = here!("xmlSecDSigCtxProcessReferences");
     // SAFETY: the context outlives its references; the list owns them.
     unsafe {
+        // Each list holds at most `max_references` contexts, so the sum
+        // cannot overflow.
+        let held = xmlSecPtrListGetSize(&raw mut ctx.signed_info_references)
+            + xmlSecPtrListGetSize(&raw mut ctx.manifest_references);
+        if held >= max_references {
+            errors::limit_exceeded(here, std::ptr::null(), "max_references", max_references);
+            return std::ptr::null_mut();
+        }
         let reference = xmlSecDSigReferenceCtxCreate(ctx, origin);
         if reference.is_null() {
             errors::internal(here, std::ptr::null(), c"xmlSecDSigReferenceCtxCreate");
@@ -539,8 +744,7 @@ unsafe fn read_reference(
         errors::assertion(here, c"dsigRefCtx->digestMethod == NULL");
         return None;
     }
-    let (flags, operation, default_digest) =
-        (parent.flags, parent.operation, parent.def_digest_method_id);
+    let (flags, operation) = (parent.flags, parent.operation);
     let transforms = &raw mut reference.transform_ctx;
     reference.reserved0 = node.cast::<c_void>();
     reference.uri = attribute(node, "URI");
@@ -599,13 +803,9 @@ unsafe fn read_reference(
                 return None;
             }
             cur = next_element(cur);
-        } else if !default_digest.is_null() {
-            reference.digest_method = xmlSecTransformCtxCreateAndAppend(transforms, default_digest);
-            if reference.digest_method.is_null() {
-                errors::internal(here, std::ptr::null(), c"xmlSecTransformCtxCreateAndAppend");
-                return None;
-            }
         } else {
+            // Departure: no `defDigestMethodId` fallback; a Reference requires
+            // its DigestMethod (XMLDSig 1.1 section 4.4.3).
             errors::invalid_node(here, cur, "DigestMethod", std::ptr::null());
             return None;
         }
@@ -784,58 +984,6 @@ unsafe fn signer(
     signing_key(policy, algorithm, private)
 }
 
-/// The verification policy with the context's flags applied: a caller's
-/// choice for its own operation, as the flags of a transform context are.
-fn verification_policy(
-    ctx: &XmlSecDSigCtx,
-    policy: &Arc<VerificationPolicy>,
-) -> Arc<VerificationPolicy> {
-    let mut policy = Arc::clone(policy);
-    let manifests = if ctx.flags & FLAGS_IGNORE_MANIFESTS == 0 {
-        ManifestProcessing::Process
-    } else {
-        ManifestProcessing::Ignore
-    };
-    if policy.manifest_processing != manifests {
-        Arc::make_mut(&mut policy).manifest_processing = manifests;
-    }
-    if ctx.flags & FLAGS_USE_VISA3D_HACK != 0 {
-        Arc::make_mut(&mut policy)
-            .transforms
-            .same_document_id_semantics = SameDocumentIdSemantics::XmlSecVisa3d;
-    }
-    if ctx.flags & FLAGS_ALLOW_EMPTY_INPUT_DSIG != 0
-        && policy.transforms.empty_digest_input != EmptyDigestInput::Accept
-    {
-        Arc::make_mut(&mut policy).transforms.empty_digest_input = EmptyDigestInput::Accept;
-    }
-    if ctx.flags & FLAGS_USE_ASN1_SIGNATURE_VALUES != 0 {
-        Arc::make_mut(&mut policy).ecdsa_signature_value_encoding =
-            EcdsaSignatureValueEncoding::XmlSecAsn1Der;
-    }
-    policy
-}
-
-/// The signing policy with the context's flags applied.
-fn signing_policy(ctx: &XmlSecDSigCtx, policy: &Arc<SigningPolicy>) -> Arc<SigningPolicy> {
-    let mut policy = Arc::clone(policy);
-    if ctx.flags & FLAGS_USE_VISA3D_HACK != 0 {
-        Arc::make_mut(&mut policy)
-            .transforms
-            .same_document_id_semantics = SameDocumentIdSemantics::XmlSecVisa3d;
-    }
-    if ctx.flags & FLAGS_ALLOW_EMPTY_INPUT_DSIG != 0
-        && policy.transforms.empty_digest_input != EmptyDigestInput::Accept
-    {
-        Arc::make_mut(&mut policy).transforms.empty_digest_input = EmptyDigestInput::Accept;
-    }
-    if ctx.flags & FLAGS_USE_ASN1_SIGNATURE_VALUES != 0 {
-        Arc::make_mut(&mut policy).ecdsa_signature_value_encoding =
-            EcdsaSignatureValueEncoding::XmlSecAsn1Der;
-    }
-    policy
-}
-
 /// The tree node `node` is, as the core's documents of its tree name it. A
 /// lent tree refuses its handles, so this is read before lending it.
 fn external_of(node: *mut XmlNode) -> Option<ExternalNode> {
@@ -851,16 +999,19 @@ fn identity_in(document: &XmlDocument, external: ExternalNode) -> Option<xml_sec
     })
 }
 
-/// Runs the core verification of the `Signature` element `node` and reports
-/// its outcome in the contexts.
+/// Runs the core verification of the `Signature` element `node` under
+/// `policy`, with the external `resources` its references name, and
+/// reports its outcome in the contexts.
 ///
 /// # Safety
 /// `node` is a live node; the context's method and key are set.
-unsafe fn run_verification(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode) -> c_int {
+unsafe fn run_verification(
+    ctx: &mut XmlSecDSigCtx,
+    node: *mut XmlNode,
+    policy: Arc<VerificationPolicy>,
+    resources: &BTreeMap<String, Vec<u8>>,
+) -> c_int {
     let here = here!("xmlSecDSigCtxVerify");
-    let Some(pinned) = Pinned::current(here) else {
-        return -1;
-    };
     // SAFETY: the method was read.
     let Some(algorithm) = (unsafe { algorithm(ctx) }) else {
         errors::internal(here, std::ptr::null(), c"SignatureAlgorithm::from_uri");
@@ -871,7 +1022,6 @@ unsafe fn run_verification(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode) -> c_int
         errors::internal(here, std::ptr::null(), c"xmlSecKeyGetValue");
         return -1;
     };
-    let policy = verification_policy(ctx, &pinned.verification);
     let (document, _) = match xml_sec_libxml2::document::snapshot(node, &*policy) {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -898,6 +1048,7 @@ unsafe fn run_verification(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode) -> c_int
         .shared_policy(policy)
         .key(key.as_ref())
         .signature(signature)
+        .external_resources(resources)
         .store_pre_digest(store)
         .verify_document(&document);
     let result = match outcome {
@@ -1058,24 +1209,26 @@ unsafe fn keep(buffer: *mut XmlSecBuffer, bytes: &[u8]) {
     }
 }
 
-/// Runs the core signing of the template `node` in place and reports its
+/// Runs the core signing of the template `node` in place under `policy`,
+/// with the external `resources` its references name, and reports its
 /// outcome in the contexts.
 ///
 /// # Safety
 /// `node` is a live node; the context's method and key are set.
-unsafe fn run_signing(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode) -> c_int {
+unsafe fn run_signing(
+    ctx: &mut XmlSecDSigCtx,
+    node: *mut XmlNode,
+    policy: &Arc<SigningPolicy>,
+    resources: &BTreeMap<String, Vec<u8>>,
+) -> c_int {
     let here = here!("xmlSecDSigCtxSign");
-    let Some(pinned) = Pinned::current(here) else {
-        return -1;
-    };
     // SAFETY: the method was read.
     let Some(algorithm) = (unsafe { algorithm(ctx) }) else {
         errors::internal(here, std::ptr::null(), c"SignatureAlgorithm::from_uri");
         return -1;
     };
-    let policy = signing_policy(ctx, &pinned.signing);
     // SAFETY: the key matched the method's requirements.
-    let key = match unsafe { signer(ctx.sign_key, algorithm, &policy) } {
+    let key = match unsafe { signer(ctx.sign_key, algorithm, policy) } {
         Ok(key) => key,
         Err(error) => {
             errors::internal_with(here, std::ptr::null(), c"signing_key", &error);
@@ -1091,12 +1244,13 @@ unsafe fn run_signing(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode) -> c_int {
         usize::try_from(unsafe { super::super::base64::xmlSecBase64GetDefaultLineSize() })
             .ok()
             .and_then(std::num::NonZeroUsize::new);
-    let signed = xml_sec_libxml2::document::with_document(node, &*policy, |document, _| {
+    let signed = xml_sec_libxml2::document::with_document(node, &**policy, |document, _| {
         let Some(template) = identity_in(document, external) else {
             return Err("the template is not in its document".to_owned());
         };
         SignContext::new(key.as_ref())
-            .shared_policy(Arc::clone(&policy))
+            .shared_policy(Arc::clone(policy))
+            .external_resources(resources)
             // libxmlsec1 writes the values through Base64 transforms of the
             // default line size.
             .base64_line_size(line_size)
@@ -1129,14 +1283,100 @@ unsafe fn run_signing(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode) -> c_int {
     }
     // SAFETY: the context's own lists and its signature value element.
     unsafe {
-        let list = &raw mut ctx.signed_info_references;
-        for index in 0..xmlSecPtrListGetSize(list) {
-            let reference = xmlSecPtrListGetItem(list, index).cast::<XmlSecDSigReferenceCtx>();
-            if let Some(reference) = reference.as_mut() {
+        for reference in references(&raw mut ctx.signed_info_references) {
+            reference.status = STATUS_SUCCEEDED;
+        }
+        // The core wrote the Manifest digests it processes.
+        if policy.manifest_processing == ManifestProcessing::Process {
+            for reference in references(&raw mut ctx.manifest_references) {
                 reference.status = STATUS_SUCCEEDED;
             }
         }
+        if store_signing_inputs(ctx, node) < 0 {
+            return -1;
+        }
         keep_result(ctx)
+    }
+}
+
+/// Fills the buffers the storage flags asked for with the bytes signing
+/// used, as libxmlsec1 keeps them: each stored reference's chain runs again
+/// on the signed document, whose digested data is final, and `SignedInfo`
+/// is canonicalized by its method. Nothing runs without a storage flag.
+///
+/// # Safety
+/// `node` is the signed, live `Signature` element of the context.
+unsafe fn store_signing_inputs(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode) -> c_int {
+    let here = here!("xmlSecDSigCtxSign");
+    // SAFETY: a live node and the context's own reference contexts.
+    unsafe {
+        let doc = xsNodeGetDoc(node);
+        for list in [
+            &raw mut ctx.signed_info_references,
+            &raw mut ctx.manifest_references,
+        ] {
+            for reference in references(list) {
+                if reference.pre_digest_mem_buf_method.is_null() {
+                    continue;
+                }
+                // The callback ran once when the operation began.
+                let callback = reference.transform_ctx.pre_exec_callback.take();
+                let executed = xmlSecTransformCtxExecute(&raw mut reference.transform_ctx, doc);
+                reference.transform_ctx.pre_exec_callback = callback;
+                if executed < 0 {
+                    errors::internal(here, std::ptr::null(), c"xmlSecTransformCtxExecute");
+                    return -1;
+                }
+            }
+        }
+        if ctx.pre_sign_mem_buf_method.is_null() {
+            return 0;
+        }
+        let signed_info = first_element(node);
+        let Some(canonical) = canonical_signed_info(signed_info, doc) else {
+            errors::internal(here, std::ptr::null(), c"xmlSecTransformCtxXmlExecute");
+            return -1;
+        };
+        keep(
+            xmlSecTransformMemBufGetBuffer(ctx.pre_sign_mem_buf_method),
+            &canonical,
+        );
+    }
+    0
+}
+
+/// `SignedInfo` canonicalized by its `CanonicalizationMethod`, with the
+/// method's parameters, over its subtree with comments, as libxmlsec1 feeds
+/// it to the signature method; `None` after a report.
+///
+/// # Safety
+/// `signed_info` is a live `SignedInfo` element of `doc`.
+unsafe fn canonical_signed_info(signed_info: *mut XmlNode, doc: *mut XmlDoc) -> Option<Vec<u8>> {
+    // SAFETY: a context and node set created and released here; live nodes.
+    unsafe {
+        let ctx = xmlSecTransformCtxCreate();
+        if ctx.is_null() {
+            return None;
+        }
+        let method = first_element(signed_info);
+        let nodes = xmlSecNodeSetGetChildren(doc, signed_info, 1, 0);
+        let canonical = (!nodes.is_null()
+            && !xmlSecTransformCtxNodeRead(ctx, method, USAGE_C14N_METHOD).is_null()
+            && xmlSecTransformCtxXmlExecute(ctx, nodes) == 0)
+            .then(|| {
+                let result = (*ctx).result;
+                let data = xmlSecBufferGetData(result);
+                if data.is_null() {
+                    Vec::new()
+                } else {
+                    std::slice::from_raw_parts(data, xmlSecBufferGetSize(result)).to_vec()
+                }
+            });
+        if !nodes.is_null() {
+            xmlSecNodeSetDestroy(nodes);
+        }
+        xmlSecTransformCtxDestroy(ctx);
+        canonical
     }
 }
 

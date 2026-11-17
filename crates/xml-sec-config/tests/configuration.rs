@@ -874,6 +874,52 @@ fn empty_digest_input_reaches_the_compiled_snapshots() {
     ));
 }
 
+#[test]
+fn request_selections_reach_the_compiled_snapshots() {
+    // A deployment lists what a request may select: the libxmlsec1 profile
+    // lists libxmlsec1's selections, a layer can narrow them, and unknown
+    // values are schema errors.
+    use std::collections::BTreeSet;
+    use xml_sec::policy::{RequestSelections, SameDocumentIdSemantics};
+    let config = |base: &str, extra: &str| {
+        Configuration::from_str(
+            &format!("schema_version = 1\n[profiles.team]\nbase = '{base}'\n{extra}"),
+            LoadLimits::default(),
+        )
+    };
+    let selections = |base: &str, extra: &str| {
+        effective(&config(base, extra).expect("strict config"), "team")
+            .compiled()
+            .verification()
+            .unwrap()
+            .request_selections
+            .clone()
+    };
+    assert_eq!(
+        selections("XmlSecCompatible", ""),
+        RequestSelections::libxmlsec1()
+    );
+    assert_eq!(selections("Modern", ""), RequestSelections::default());
+    let narrowed = selections(
+        "XmlSecCompatible",
+        "[profiles.team.verification.request_selections]\n\
+         same_document_id_semantics=['XmlSecVisa3d']\n\
+         ecdsa_signature_value_encodings=[]\nmanifest_processing=[]",
+    );
+    assert_eq!(
+        narrowed.same_document_id_semantics,
+        BTreeSet::from([SameDocumentIdSemantics::XmlSecVisa3d])
+    );
+    assert!(narrowed.ecdsa_signature_value_encodings.is_empty());
+    assert!(matches!(
+        config(
+            "Modern",
+            "[profiles.team.verification.request_selections]\nmanifest_processing=['Sometimes']"
+        ),
+        Err(xml_sec_config::Error::Schema(message)) if message.contains("manifest_processing")
+    ));
+}
+
 #[cfg(feature = "xmldsig-sign")]
 #[test]
 fn configured_snapshots_enforce_real_sign_and_verify_limits() {

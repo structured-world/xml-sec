@@ -13,9 +13,9 @@ use std::sync::Arc;
 
 use xml_sec::provider::{CryptoProvider, RustCryptoRsaPublicKey};
 use xml_sec::xmlenc::{
-    EncryptionMethod, KeyTransportAlgorithm, OaepDigestAlgorithm, RsaOaepParameters, XmlEncError,
-    admit_key_transport_method, admit_oaep_parameters, validate_key_recovery_key,
-    validate_key_transport_recipient,
+    EncryptionMethod, KEY_TRANSPORT_CIPHERTEXT_CEILING, KeyTransportAlgorithm, OaepDigestAlgorithm,
+    RsaOaepParameters, XmlEncError, admit_key_transport_method, admit_oaep_parameters,
+    validate_key_recovery_key, validate_key_transport_recipient,
 };
 use zeroize::Zeroizing;
 
@@ -24,7 +24,6 @@ use super::super::buffer::{
     xmlSecBufferAppend, xmlSecBufferGetData, xmlSecBufferGetSize, xmlSecBufferRemoveHead,
 };
 use super::super::errors::{self, Here, here};
-use super::super::keyinfo::XmlSecKeyInfoCtx;
 use super::super::keys::{TYPE_PRIVATE, TYPE_PUBLIC, XmlSecKey, xmlSecKeyGetValue};
 use super::super::keysdata::check_id;
 use super::super::tree::XmlNode;
@@ -41,8 +40,6 @@ use super::{
 const KEY_USAGE_ENCRYPT: c_uint = 0x0000_0004;
 /// `xmlSecKeyUsageDecrypt`.
 const KEY_USAGE_DECRYPT: c_uint = 0x0000_0008;
-/// The longest key an RSA transport carries: a 16384-bit modulus.
-const MAX_TRANSPORTED: usize = 2048;
 
 /// The state of a key transport.
 struct Transport {
@@ -57,7 +54,14 @@ struct Transport {
     data: Zeroizing<Vec<u8>>,
     /// The library policy the run started under.
     policy: Option<policy::Pinned>,
+    /// The key width, in bytes, the `KeyInfo` reading the chain's
+    /// `EncryptedKey` requires, taken when the run starts.
+    #[cfg(feature = "legacy-algorithms")]
+    expected: Option<usize>,
 }
+
+#[cfg(test)]
+mod tests;
 
 /// A transport klass of `name` and `href`.
 const fn transport_klass(name: &'static [u8], href: &'static [u8]) -> XmlSecTransformKlass {
@@ -191,6 +195,8 @@ unsafe extern "C" fn initialize(transform: *mut XmlSecTransform) -> c_int {
                 private: None,
                 data: Zeroizing::new(Vec::new()),
                 policy: None,
+                #[cfg(feature = "legacy-algorithms")]
+                expected: None,
             });
         }
         0
@@ -366,22 +372,22 @@ fn parameters(
     })
 }
 
-/// Recovers an RSAES-PKCS1-v1_5 transported key of the `expected` width.
+/// Recovers an RSAES-PKCS1-v1_5 transported key of the width the reading
+/// `KeyInfo` requires.
 ///
 /// Departure: libxmlsec1 recovers a key of any width. Here the width is the
 /// one the `EncryptedKey`'s consumer requires, and a rejected recovery
 /// yields a random key of that width rather than an error, so the result
-/// never reveals padding validity (XML Encryption 1.1 section 6.1.2). A chain run outside
-/// a `KeyInfo` has no expected width and is refused.
+/// never reveals padding validity (XML Encryption 1.1 section 6.1.2). A chain
+/// run outside a `KeyInfo` has no expected width and is refused.
 /// <https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-bleichenbacher-attack>
 #[cfg(feature = "legacy-algorithms")]
 fn recover_pkcs1v15(
     provider: &dyn CryptoProvider,
     transport: &Transport,
     policy: &xml_sec::policy::DecryptionPolicy,
-    expected: Option<usize>,
 ) -> Result<Zeroizing<Vec<u8>>, String> {
-    let expected = expected.ok_or(
+    let expected = transport.expected.ok_or(
         "RSAES-PKCS1-v1_5 recovery needs the key width the EncryptedKey's consumer requires",
     )?;
     policy
@@ -398,14 +404,12 @@ fn recover_pkcs1v15(
         .map_err(|error| error.to_string())
 }
 
-/// Transports or recovers the collected key under the run's policy; a
-/// recovery inside a `KeyInfo` produces a key of the `expected` width.
+/// Transports or recovers the collected key under the run's policy.
 fn run(
     operation: c_int,
     algorithm: KeyTransportAlgorithm,
     transport: &Transport,
     pinned: &policy::Pinned,
-    expected: Option<usize>,
 ) -> Result<Zeroizing<Vec<u8>>, String> {
     let spki = transport.spki.as_deref().ok_or("no key")?;
     let public = RustCryptoRsaPublicKey::from_spki_der(spki).map_err(|error| error.to_string())?;
@@ -441,7 +445,7 @@ fn run(
     policy.validate().map_err(|error| error.to_string())?;
     #[cfg(feature = "legacy-algorithms")]
     if algorithm == KeyTransportAlgorithm::RsaPkcs1v15 {
-        return recover_pkcs1v15(provider, transport, policy, expected);
+        return recover_pkcs1v15(provider, transport, policy);
     }
     let method = transport
         .method
@@ -474,12 +478,13 @@ fn run(
 /// # Safety
 /// `ctx` is an initialized context whose parent is null or a live
 /// `KeyInfo` context.
+#[cfg(feature = "legacy-algorithms")]
 unsafe fn expected_width(ctx: *mut XmlSecTransformCtx) -> Option<usize> {
     // SAFETY: by the caller's contract.
     let parent = unsafe {
         (*ctx)
             .parent_key_info_ctx
-            .cast::<XmlSecKeyInfoCtx>()
+            .cast::<super::super::keyinfo::XmlSecKeyInfoCtx>()
             .as_ref()
     }?;
     let bits = parent.key_req.key_bits_size;
@@ -512,9 +517,19 @@ unsafe extern "C" fn execute(
                 return -1;
             };
             transport.policy = Some(pinned);
+            #[cfg(feature = "legacy-algorithms")]
+            {
+                // SAFETY: a non-null, initialized context.
+                transport.expected = unsafe { expected_width(ctx) };
+            }
             object.status = STATUS_WORKING;
         }
         if object.status == STATUS_FINISHED {
+            // SAFETY: the transform's own input buffer.
+            if unsafe { xmlSecBufferGetSize(&raw mut object.in_buf) } != 0 {
+                errors::assertion(here, c"xmlSecBufferGetSize(&(transform->inBuf)) == 0");
+                return -1;
+            }
             return 0;
         }
         if object.status != STATUS_WORKING {
@@ -531,9 +546,14 @@ unsafe extern "C" fn execute(
                     .data
                     .len()
                     .checked_add(size)
-                    .is_none_or(|total| total > MAX_TRANSPORTED)
+                    .is_none_or(|total| total > KEY_TRANSPORT_CIPHERTEXT_CEILING)
                 {
-                    errors::limit_exceeded(here, name, "RSA transport input", MAX_TRANSPORTED);
+                    errors::limit_exceeded(
+                        here,
+                        name,
+                        "RSA transport input",
+                        KEY_TRANSPORT_CIPHERTEXT_CEILING,
+                    );
                     return -1;
                 }
                 transport.data.extend_from_slice(std::slice::from_raw_parts(
@@ -553,9 +573,7 @@ unsafe extern "C" fn execute(
             errors::assertion(here, c"ctx->policy != NULL");
             return -1;
         };
-        // SAFETY: a non-null, initialized context.
-        let expected = unsafe { expected_width(ctx) };
-        let output = match run(object.operation, algorithm, transport, pinned, expected) {
+        let output = match run(object.operation, algorithm, transport, pinned) {
             Ok(output) => output,
             Err(error) => {
                 errors::report(

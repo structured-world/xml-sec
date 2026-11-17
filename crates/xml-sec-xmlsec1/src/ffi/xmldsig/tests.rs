@@ -88,6 +88,81 @@ fn a_failed_signature_value_leaves_its_references_undereferenced() {
 }
 
 #[test]
+fn references_beyond_the_policy_limit_are_refused_before_their_contexts_exist() {
+    // An untrusted signature names more references than the operation
+    // admits: the read stops at the limit instead of building a context and
+    // a transform chain for every one and leaving the refusal to the core.
+    own_process();
+    let reference = concat!(
+        "<Reference URI=\"#data\"><Transforms>",
+        "<Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/></Transforms>",
+        "<DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>",
+        "<DigestValue>AAAA</DigestValue></Reference>"
+    );
+    let document = format!(
+        "{}{}{}{}{}",
+        "<Envelope xmlns=\"urn:envelope\"><Data Id=\"data\">payload</Data>\
+         <Signature xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><SignedInfo>\
+         <CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>\
+         <SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#hmac-sha256\"/>",
+        reference,
+        reference,
+        "</SignedInfo><SignatureValue>AAAA</SignatureValue>",
+        "</Signature></Envelope>"
+    );
+    crate::ffi::policy::republish(
+        |verification| verification.resources.max_references = 1,
+        |_| {},
+    )
+    .expect("the library policy compiles");
+    // SAFETY: the library, a document, a key and a context set up and torn
+    // down here, on this thread alone.
+    unsafe {
+        assert_eq!(xmlSecInit(), 0);
+        assert_eq!(xmlSecCryptoDLLoadLibrary(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoAppInit(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoInit(), 0);
+        let doc = xsReadMemory(
+            document.as_ptr().cast(),
+            i32::try_from(document.len()).expect("a short document"),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        assert!(!doc.is_null());
+        let signature = xmlSecFindNode(
+            xsDocGetRootElement(doc),
+            c"Signature".as_ptr().cast(),
+            c"http://www.w3.org/2000/09/xmldsig#".as_ptr().cast(),
+        );
+        let ctx = xmlSecDSigCtxCreate(std::ptr::null_mut());
+        let secret = b"secret-of-thirty-two-octets-long";
+        let key = xmlSecKeyCreate();
+        assert_eq!(
+            xmlSecKeyDataBinRead(
+                symkeys::hmac(),
+                key.cast(),
+                secret.as_ptr(),
+                secret.len(),
+                (&raw mut (*ctx).key_info_read_ctx).cast(),
+            ),
+            0
+        );
+        (*ctx).sign_key = key;
+        assert_eq!(xmlSecDSigCtxVerify(ctx, signature), -1);
+        assert_eq!(
+            crate::ffi::list::xmlSecPtrListGetSize(&raw mut (*ctx).signed_info_references),
+            1
+        );
+        xmlSecDSigCtxDestroy(ctx);
+        xsFreeDoc(doc);
+        assert_eq!(xmlSecCryptoShutdown(), 0);
+        assert_eq!(xmlSecCryptoAppShutdown(), 0);
+        assert_eq!(xmlSecShutdown(), 0);
+    }
+}
+
+#[test]
 fn status_and_failure_strings_are_libxmlsec1s() {
     // The strings applications print and compare.
     assert_eq!(status_string(STATUS_SUCCEEDED), c"OK");

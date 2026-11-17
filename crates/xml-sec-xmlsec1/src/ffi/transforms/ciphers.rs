@@ -426,6 +426,11 @@ fn collect(
             return -1;
         }
     };
+    // The input allowance covers the framing, not the plaintext it frames.
+    if !encrypting && output.len() > maximum {
+        errors::limit_exceeded(here, name, "max_encryption_plaintext_bytes", maximum);
+        return -1;
+    }
     // SAFETY: the transform's own output buffer.
     let appended =
         unsafe { xmlSecBufferAppend(&raw mut object.out_buf, output.as_ptr(), output.len()) };

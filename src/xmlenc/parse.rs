@@ -23,6 +23,20 @@ pub(super) struct ParsingPolicy<'a> {
     resources: &'a crate::policy::ResourcePolicy,
     uris: Option<&'a crate::policy::UriPolicy>,
     transforms: Option<&'a crate::policy::TransformPolicy>,
+    /// The method an `EncryptedData` without `EncryptionMethod` uses: the
+    /// one its recipient knows (XML Encryption 1.1 section 3.1).
+    default_method: Option<super::DataEncryptionAlgorithm>,
+}
+
+impl ParsingPolicy<'_> {
+    /// This context with `method` for an `EncryptedData` that names none.
+    pub(super) fn with_default_method(
+        mut self,
+        method: Option<super::DataEncryptionAlgorithm>,
+    ) -> Self {
+        self.default_method = method;
+        self
+    }
 }
 
 impl<'a> From<&'a crate::policy::EncryptionPolicy> for ParsingPolicy<'a> {
@@ -33,6 +47,7 @@ impl<'a> From<&'a crate::policy::EncryptionPolicy> for ParsingPolicy<'a> {
             resources: &policy.resources,
             uris: None,
             transforms: None,
+            default_method: None,
         }
     }
 }
@@ -45,6 +60,7 @@ impl<'a> From<&'a crate::policy::DecryptionPolicy> for ParsingPolicy<'a> {
             resources: &policy.resources,
             uris: Some(&policy.uris),
             transforms: Some(&policy.transforms),
+            default_method: None,
         }
     }
 }
@@ -564,10 +580,25 @@ fn parse_encrypted_data_node_traced<'doc>(
     budget.xml_parse = xml_parse;
     validate_encrypted_type_attributes(node, policy)?;
     let mut children = element_children(node);
-    let encryption_method = parse_encryption_method_with_limit(
-        next_required(&mut children, "EncryptionMethod")?,
-        policy.resources.max_encryption_metadata_bytes,
-    )?;
+    let named = children
+        .peek()
+        .is_some_and(|child| child.has_tag_name((XMLENC_NS, "EncryptionMethod")));
+    let encryption_method = match policy.default_method {
+        // XML Encryption 1.1 section 3.1: EncryptionMethod is optional; when
+        // it is absent the recipient must know the algorithm.
+        Some(method) if !named => EncryptionMethod {
+            algorithm: method.uri().to_owned(),
+            key_size_bits: None,
+            oaep_digest: None,
+            mgf_algorithm: None,
+            oaep_params: None,
+            chacha: None,
+        },
+        _ => parse_encryption_method_with_limit(
+            next_required(&mut children, "EncryptionMethod")?,
+            policy.resources.max_encryption_metadata_bytes,
+        )?,
+    };
     if children
         .peek()
         .is_some_and(|child| child.has_tag_name((XMLENC_NS, "EncryptionMethod")))

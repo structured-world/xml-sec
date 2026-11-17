@@ -21,10 +21,12 @@ use super::super::errors::{self, here};
 use super::super::keyinfo::xmlSecKeyInfoNodeWrite;
 use super::super::keys::{xmlSecKeyGetValue, xmlSecKeyMatch};
 use super::super::keysdata::xmlSecKeyDataBinaryValueGetBuffer;
-use super::super::policy::Pinned;
+use super::super::policy::SlotPin;
 use super::super::strings;
 use super::super::transforms::builtin::xmlSecTransformBase64GetKlass;
-use super::super::transforms::ctx::{xmlSecTransformCtxBinaryExecute, xmlSecTransformCtxExecute};
+use super::super::transforms::ctx::{
+    read_resource, run_policy, xmlSecTransformCtxBinaryExecute, xmlSecTransformCtxExecute,
+};
 use super::super::transforms::ctx::{
     xmlSecTransformCtxCreateAndAppend, xmlSecTransformCtxCreateAndPrepend,
     xmlSecTransformCtxNodeRead, xmlSecTransformCtxNodesListRead, xmlSecTransformCtxSetUri,
@@ -711,6 +713,12 @@ unsafe fn read_method_and_key(ctx: &mut XmlSecEncCtx, add_base64: bool) -> c_int
         }
         let read = &raw mut ctx.key_info_read_ctx;
         if ctx.enc_key.is_null() {
+            // The key is read under the revision the operation runs under,
+            // the one its chain and its core decryption use.
+            let Some(pinned) = run_policy(transforms, here) else {
+                return -1;
+            };
+            let _read_pin = SlotPin::hold_pinned(&raw mut (*read).reserved0, pinned);
             let mngr = ctx.key_info_read_ctx.keys_mngr;
             if let Some(get_key) = mngr.as_ref().and_then(|mngr| mngr.get_key) {
                 ctx.enc_key = get_key(ctx.key_info_node, read);
@@ -867,6 +875,53 @@ unsafe fn content_key(ctx: &XmlSecEncCtx) -> Option<(DataEncryptionAlgorithm, Ze
     }
 }
 
+/// The octets of the external resource an `EncryptedData`'s
+/// `CipherReference` names, keyed by its URI and read through the caller's
+/// input callbacks; empty for a cipher value or a same-document reference,
+/// `None` after a report.
+///
+/// # Safety
+/// `node` is the read, live `EncryptedData` element of the context.
+unsafe fn cipher_reference_resources(
+    ctx: &mut XmlSecEncCtx,
+    node: *mut XmlNode,
+) -> Option<std::collections::BTreeMap<String, Vec<u8>>> {
+    let mut resources = std::collections::BTreeMap::new();
+    // SAFETY: live nodes and the context's own transform context.
+    unsafe {
+        let mut cur = first_element(node);
+        while !cur.is_null() && !is(cur, name!(xmlSecNodeCipherData), name!(xmlSecEncNs)) {
+            cur = next_element(cur);
+        }
+        let reference = if cur.is_null() {
+            cur
+        } else {
+            first_element(cur)
+        };
+        if !is(
+            reference,
+            name!(xmlSecNodeCipherReference),
+            name!(xmlSecEncNs),
+        ) {
+            return Some(resources);
+        }
+        let Some(uri) = nodes::property(reference, "URI") else {
+            return Some(resources);
+        };
+        if uri.is_empty() || uri.starts_with('#') {
+            return Some(resources);
+        }
+        let bytes = read_resource(
+            &raw mut ctx.transform_ctx,
+            uri.as_bytes(),
+            reference,
+            xsNodeGetDoc(node),
+        )?;
+        resources.insert(uri, bytes);
+    }
+    Some(resources)
+}
+
 /// Runs the core decryption of the `EncryptedData` element `node` and makes
 /// the plaintext the context's result, a buffer of its method.
 ///
@@ -874,7 +929,14 @@ unsafe fn content_key(ctx: &XmlSecEncCtx) -> Option<(DataEncryptionAlgorithm, Ze
 /// `node` is a live node; the context's method and key are set.
 unsafe fn run_decryption(ctx: &mut XmlSecEncCtx, node: *mut XmlNode) -> *mut XmlSecBuffer {
     let here = here!("xmlSecEncCtxDecryptToBuffer");
-    let Some(pinned) = Pinned::current(here) else {
+    // The revision the key was read under (`read_method_and_key`).
+    // SAFETY: the context's own transform context.
+    let Some(pinned) = (unsafe { run_policy(&raw mut ctx.transform_ctx, here) }) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: the context's read nodes.
+    let Some(resources) = (unsafe { cipher_reference_resources(ctx, node) }) else {
+        errors::internal(here, std::ptr::null(), c"xmlSecTransformCtxUriExecute");
         return std::ptr::null_mut();
     };
     // SAFETY: the method and key were read.
@@ -908,9 +970,15 @@ unsafe fn run_decryption(ctx: &mut XmlSecEncCtx, node: *mut XmlNode) -> *mut Xml
         return std::ptr::null_mut();
     };
     let resolver = SymmetricKeyDecryptor::with_kind(key.to_vec(), algorithm.key_kind());
-    let decrypted = DecryptContext::new(&resolver)
+    let mut context = DecryptContext::new(&resolver)
         .shared_policy(policy)
-        .decrypt_in_document(&document, target);
+        .external_resources(&resources);
+    // An EncryptedData without EncryptionMethod uses the context's default
+    // method, which the method was read from (`read_method_and_key`).
+    if ctx.enc_method_node.is_null() {
+        context = context.default_encryption_method(algorithm);
+    }
+    let decrypted = context.decrypt_in_document(&document, target);
     let plaintext = match decrypted.map(|audited| audited.output) {
         Ok(DecryptedContent::Xml(text)) => Zeroizing::new(text.into_bytes()),
         Ok(DecryptedContent::Bytes(bytes)) => Zeroizing::new(bytes),

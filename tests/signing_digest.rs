@@ -3630,6 +3630,115 @@ fn base64_line_size_lays_out_values_that_still_verify() {
 }
 
 #[test]
+fn base64_line_size_lays_out_digests_of_every_dependency_level() {
+    // A SignedInfo Reference over a Manifest digests the Manifest after its
+    // own Reference's digest is written, a level earlier; that earlier
+    // value is laid out in lines as well, before the later digest covers it.
+    let key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let template = r##"<root><payload Id="payload">p</payload><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#manifest"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/><ds:Object><ds:Manifest Id="manifest"><ds:Reference URI="#payload"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:Manifest></ds:Object></ds:Signature></root>"##;
+    let mut document = XmlDocument::parse(template).expect("the template parses");
+    SignContext::new(&key)
+        .policy(SigningPolicy {
+            manifest_processing: ManifestProcessing::Process,
+            ..SigningPolicy::default()
+        })
+        .base64_line_size(std::num::NonZeroUsize::new(16))
+        .sign_document(&mut document)
+        .expect("the template signs");
+    let digests: Vec<String> = document.with_view(|view| {
+        view.document()
+            .descendants()
+            .filter(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "DigestValue")))
+            .filter_map(|node| node.text().map(str::to_owned))
+            .collect()
+    });
+    assert_eq!(digests.len(), 2);
+    // A SHA-256 value is 44 characters: three lines of at most 16.
+    for digest in &digests {
+        assert_eq!(digest.matches('\n').count(), 2, "{digest}");
+    }
+}
+
+#[test]
+fn base64_line_size_counts_signature_line_feeds_before_signing() {
+    // The document limit is decided once, before the private key is used:
+    // the projection includes the line feeds the SignatureValue will carry.
+    let key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let line_size = std::num::NonZeroUsize::new(16);
+    let mut signed = XmlDocument::parse(TWO_TEMPLATES).expect("templates must parse");
+    let first = VerifyContext::new()
+        .signature_identities(&signed)
+        .expect("templates are discoverable")[0];
+    SignContext::new(&key)
+        .signature_template_selection(SignatureTemplateSelection::Exact(first))
+        .base64_line_size(line_size)
+        .sign_document(&mut signed)
+        .expect("the first template signs");
+    let mut policy = SigningPolicy::default();
+    policy.resources.max_xml_document_bytes = signed.content_len() - 1;
+    let mut document = XmlDocument::parse(TWO_TEMPLATES).expect("templates must parse");
+    let first = VerifyContext::new()
+        .signature_identities(&document)
+        .expect("templates are discoverable")[0];
+    let counted = CountingKey {
+        key,
+        signatures: std::cell::Cell::new(0),
+    };
+    let error = SignContext::new(&counted)
+        .policy(policy)
+        .signature_template_selection(SignatureTemplateSelection::Exact(first))
+        .base64_line_size(line_size)
+        .sign_document(&mut document)
+        .expect_err("the laid out signature exceeds the document limit");
+    assert!(
+        matches!(
+            error,
+            SigningError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit { .. })
+        ),
+        "{error:?}"
+    );
+    assert_eq!(counted.signatures.get(), 0, "the private key was used");
+}
+
+/// A signing key that counts the signatures it makes.
+struct CountingKey {
+    key: RsaSigningKey,
+    signatures: std::cell::Cell<usize>,
+}
+
+impl xml_sec::xmldsig::SigningKey for CountingKey {
+    fn sign(
+        &self,
+        algorithm: SignatureAlgorithm,
+        canonical_signed_info: &[u8],
+    ) -> Result<Vec<u8>, xml_sec::xmldsig::SigningKeyError> {
+        self.signatures.set(self.signatures.get() + 1);
+        self.key.sign(algorithm, canonical_signed_info)
+    }
+
+    fn sign_with_provider(
+        &self,
+        provider: &dyn xml_sec::provider::CryptoProvider,
+        algorithm: SignatureAlgorithm,
+        canonical_signed_info: &[u8],
+    ) -> Result<Vec<u8>, xml_sec::xmldsig::SigningKeyError> {
+        self.signatures.set(self.signatures.get() + 1);
+        self.key
+            .sign_with_provider(provider, algorithm, canonical_signed_info)
+    }
+
+    fn public_key_info(
+        &self,
+    ) -> Result<xml_sec::xmldsig::SigningPublicKeyInfo, xml_sec::xmldsig::SigningKeyError> {
+        self.key.public_key_info()
+    }
+}
+
+#[test]
 fn exact_template_selection_refuses_a_node_that_is_no_signature() {
     let key =
         RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))

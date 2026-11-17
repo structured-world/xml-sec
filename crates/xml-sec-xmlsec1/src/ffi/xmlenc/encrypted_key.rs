@@ -23,6 +23,7 @@ use super::super::keysdata::{
     xmlSecKeyDataEncryptedKeyGetKlass,
 };
 use super::super::list::xmlSecPtrListEmpty;
+use super::super::transforms::ctx::pin_run;
 use super::super::transforms::{
     OPERATION_DECRYPT, OPERATION_ENCRYPT, OPERATION_SIGN, OPERATION_VERIFY,
 };
@@ -419,6 +420,10 @@ pub(crate) unsafe extern "C" fn xml_read(
             // A transport recovering a key of a fixed width learns it from
             // the requirements of this context.
             (*enc).transform_ctx.parent_key_info_ctx = ctx.cast();
+            // The key is decrypted under the revision of the read it serves.
+            if let Some(pinned) = super::super::policy::pinned((*ctx).reserved0) {
+                pin_run(&raw mut (*enc).transform_ctx, pinned);
+            }
             if xmlSecEncCtxEncryptedKeyXmlRead(enc, node, key, ctx) < 0 {
                 errors::internal(here, name, c"xmlSecEncCtxEncryptedKeyXmlRead");
                 return -1;

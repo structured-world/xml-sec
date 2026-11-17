@@ -24,6 +24,19 @@ fn a_node_serializes_with_only_the_declarations_it_carries() {
     assert_eq!(tree.serialize_node(text).expect("a live node"), "t");
 }
 
+#[test]
+fn the_document_node_serializes_as_the_whole_document() {
+    // libxml2's xmlNodeDumpOutput writes a document node through
+    // xmlDocContentDumpOutput: the declaration and every child, as
+    // xmlDocDumpMemory writes the document.
+    let tree = parsed("<r><c/></r>");
+    assert_eq!(
+        tree.serialize_node(tree.document_node())
+            .expect("a live node"),
+        tree.serialize()
+    );
+}
+
 fn children(tree: &OwnedTree, node: TreeNode) -> Vec<TreeNode> {
     let mut found = Vec::new();
     let mut current = tree.first_child(node).expect("a live node");

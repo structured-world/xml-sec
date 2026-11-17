@@ -701,6 +701,7 @@ pub struct DecryptContext<'a> {
     xml_backend: crate::XmlBackend,
     id_attributes: &'a [crate::IdAttributeRegistration],
     external_resources: Option<&'a std::collections::BTreeMap<String, Vec<u8>>>,
+    default_encryption_method: Option<DataEncryptionAlgorithm>,
 }
 
 /// One decryption operation, sharing its policy snapshot.
@@ -858,7 +859,17 @@ impl<'a> DecryptContext<'a> {
             xml_backend: crate::XmlBackend::default(),
             id_attributes: &[],
             external_resources: None,
+            default_encryption_method: None,
         }
+    }
+
+    /// The method an `EncryptedData` without `EncryptionMethod` was encrypted
+    /// with, known to its recipient (XML Encryption 1.1 section 3.1); the
+    /// policy admits it as it admits a named method.
+    #[must_use]
+    pub fn default_encryption_method(mut self, method: DataEncryptionAlgorithm) -> Self {
+        self.default_encryption_method = Some(method);
+        self
     }
 
     /// Replace the complete immutable decryption policy snapshot.
@@ -1043,7 +1054,8 @@ impl<'a> DecryptContext<'a> {
                 let selected = selected_encrypted_node(document, node)?;
                 let (encrypted, origins) = super::parse::parse_encrypted_data_node_with_origins(
                     selected,
-                    (&**operation.policy()).into(),
+                    super::parse::ParsingPolicy::from(&**operation.policy())
+                        .with_default_method(self.default_encryption_method),
                     false,
                     self.id_attributes,
                     self.provider,

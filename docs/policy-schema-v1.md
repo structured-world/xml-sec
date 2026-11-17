@@ -27,6 +27,7 @@ a disabled operation. Encryption tables require an encryption-enabled build.
 | `signature_constraints` | verify, sign | `General`, `Saml`, `WsSecurity`, `Xades` |
 | `ecdsa_signature_value_encoding` | verify, sign | `XmlDsig`, `XmlSecAsn1Der` |
 | `manifest_processing` | verify, sign | `Ignore`, `Process` |
+| `request_selections` | verify, sign | Table of arrays a request may select in place of the policy's value: `same_document_id_semantics` (`Specification`, `XmlSecBarename`, `XmlSecVisa3d`), `ecdsa_signature_value_encodings` (`XmlDsig`, `XmlSecAsn1Der`), `manifest_processing` (`Ignore`, `Process`). Layers intersect; fewer values is restrictive |
 | `detached_digest_attestation` | verify | `Forbidden`, `Accepted` |
 | `timestamp_token_encoding` | verify | `Declared`, `Ber` |
 | `hmac` | verify, sign | `minimum_key_bits`, `minimum_output_bits` (nonnegative integers) |

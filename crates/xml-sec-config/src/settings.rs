@@ -13,10 +13,11 @@ use xml_sec::{
         EcdsaSignatureValueEncoding, EmptyDigestInput, ExtendedKeyPurpose, HmacPolicy, Instant,
         KemContentAuthentication, KeyAgreementAlgorithm, KeyDerivationAlgorithm,
         KeyEstablishmentPolicy, KeySourceKind, KeySourcePolicy, KeyTrustPolicy, ManifestProcessing,
-        OpcRelationshipEdition, PolicySet, PolicyValidity, ResourcePolicy, RsaKeyPolicy,
-        RsaPssPermission, SameDocumentIdSemantics, SignatureConstraints, SigningPolicy,
-        TimestampTokenEncoding, TransformPolicy, UnknownX509CertificateSemantics, UriPolicy,
-        VerificationPolicy, VerificationTrustMode, XmlInputPolicy, XsltStylesheetSemantics,
+        OpcRelationshipEdition, PolicySet, PolicyValidity, RequestSelections, ResourcePolicy,
+        RsaKeyPolicy, RsaPssPermission, SameDocumentIdSemantics, SignatureConstraints,
+        SigningPolicy, TimestampTokenEncoding, TransformPolicy, UnknownX509CertificateSemantics,
+        UriPolicy, VerificationPolicy, VerificationTrustMode, XmlInputPolicy,
+        XsltStylesheetSemantics,
     },
     provider::{KeyEncapsulationAlgorithm, X509SignatureAlgorithm},
     xmldsig::{
@@ -481,6 +482,46 @@ fn key_trust(p: &mut KeyTrustPolicy, v: &Value) -> Result<(), Error> {
     Ok(())
 }
 
+fn request_selections(p: &mut RequestSelections, v: &Value) -> Result<(), Error> {
+    for (key, value) in table(v, "request_selections")? {
+        match key.as_str() {
+            "same_document_id_semantics" => {
+                p.same_document_id_semantics = selected(value, key, |v| {
+                    Ok(choice!(
+                        v,
+                        key,
+                        SameDocumentIdSemantics::Specification,
+                        SameDocumentIdSemantics::XmlSecBarename,
+                        SameDocumentIdSemantics::XmlSecVisa3d
+                    ))
+                })?;
+            }
+            "ecdsa_signature_value_encodings" => {
+                p.ecdsa_signature_value_encodings = selected(value, key, |v| {
+                    Ok(choice!(
+                        v,
+                        key,
+                        EcdsaSignatureValueEncoding::XmlDsig,
+                        EcdsaSignatureValueEncoding::XmlSecAsn1Der
+                    ))
+                })?;
+            }
+            "manifest_processing" => {
+                p.manifest_processing = selected(value, key, |v| {
+                    Ok(choice!(
+                        v,
+                        key,
+                        ManifestProcessing::Ignore,
+                        ManifestProcessing::Process
+                    ))
+                })?;
+            }
+            _ => return Err(invalid(key)),
+        }
+    }
+    Ok(())
+}
+
 // Reuse the exact same field admissions for sign and verify. Encryption has
 // different applicable fields and must not accidentally accept signing knobs.
 macro_rules! signature_fields {
@@ -515,6 +556,7 @@ macro_rules! signature_fields {
                     ManifestProcessing::Process
                 )
             }
+            "request_selections" => request_selections(&mut $p.request_selections, $value)?,
             "hmac" => hmac(&mut $p.hmac, $value)?,
             "uris" => uris(&mut $p.uris, $value)?,
             "transforms" => transforms(&mut $p.transforms, $value)?,
@@ -777,6 +819,38 @@ fn uri_snapshot(p: UriPolicy) -> Value {
         ("key_info_references".into(), one(p.key_info_references)),
     ]))
 }
+fn request_selections_snapshot(p: &RequestSelections) -> Value {
+    let RequestSelections {
+        same_document_id_semantics,
+        ecdsa_signature_value_encodings,
+        manifest_processing,
+    } = p;
+    let list = |values: Vec<Value>| Value::Array(values);
+    Value::Table(Table::from_iter([
+        (
+            "same_document_id_semantics".into(),
+            list(
+                same_document_id_semantics
+                    .iter()
+                    .map(|v| named(*v))
+                    .collect(),
+            ),
+        ),
+        (
+            "ecdsa_signature_value_encodings".into(),
+            list(
+                ecdsa_signature_value_encodings
+                    .iter()
+                    .map(|v| named(*v))
+                    .collect(),
+            ),
+        ),
+        (
+            "manifest_processing".into(),
+            list(manifest_processing.iter().map(|v| named(*v)).collect()),
+        ),
+    ]))
+}
 fn transform_snapshot(p: &TransformPolicy) -> Value {
     Value::Table(Table::from_iter([
         (
@@ -1023,6 +1097,10 @@ macro_rules! signature_snapshot {
             ("uris".into(), uri_snapshot($p.uris)),
             ("transforms".into(), transform_snapshot(&$p.transforms)),
             ("manifest_processing".into(), named($p.manifest_processing)),
+            (
+                "request_selections".into(),
+                request_selections_snapshot(&$p.request_selections),
+            ),
             ("xml".into(), xml_snapshot($p.xml)),
             ("resources".into(), resource_snapshot(&$p.resources)),
             (
@@ -1081,6 +1159,7 @@ fn verification_snapshot(p: &VerificationPolicy) -> Result<Value, Error> {
         uris: _,
         transforms: _,
         manifest_processing: _,
+        request_selections: _,
         detached_digest_attestation: _,
         timestamp_token_encoding: _,
         xml: _,
@@ -1115,6 +1194,7 @@ fn signing_snapshot(p: &SigningPolicy) -> Result<Value, Error> {
         uris: _,
         transforms: _,
         manifest_processing: _,
+        request_selections: _,
         xml: _,
         resources: _,
     } = p;

@@ -8,8 +8,8 @@ use super::{
     KeyWrapAlgorithm, OaepDigestAlgorithm,
 };
 use super::{
-    DigestAlgorithm, KeySourceKind, KeySourcePolicy, PolicyViolation, RsaPssPermission,
-    SameDocumentIdSemantics, SignatureAlgorithm, SigningPolicy, TransformPolicy,
+    DigestAlgorithm, KeySourceKind, KeySourcePolicy, PolicyViolation, RequestSelections,
+    RsaPssPermission, SameDocumentIdSemantics, SignatureAlgorithm, SigningPolicy, TransformPolicy,
     UnknownX509CertificateSemantics, UriPolicy, UriTypeSet, VerificationPolicy,
     XsltStylesheetSemantics,
 };
@@ -441,6 +441,8 @@ fn verification_profile(
             SameDocumentIdSemantics::XmlSecBarename;
         verification.key_trust.unknown_x509_certificate =
             UnknownX509CertificateSemantics::Libxmlsec1;
+        // libxmlsec1's context flags select these for one operation.
+        verification.request_selections = RequestSelections::libxmlsec1();
     }
     if constraints != SignatureConstraints::General {
         verification.key_sources = KeySourcePolicy::from([
@@ -530,6 +532,8 @@ fn signing_profile(
         } else {
             UriPolicy::default()
         },
+        // A request selects for signing what it may select for verification.
+        request_selections: verification.request_selections.clone(),
         ..SigningPolicy::default()
     }
 }

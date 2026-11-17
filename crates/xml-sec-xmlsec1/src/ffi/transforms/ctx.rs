@@ -160,6 +160,19 @@ pub(crate) unsafe fn run_policy(
     run.policy.clone()
 }
 
+/// Makes `pinned` the revision of the fresh run of `ctx`, so a chain an
+/// operation runs for one of its parts reads that operation's revision.
+///
+/// # Safety
+/// `ctx` is an initialized context.
+pub(crate) unsafe fn pin_run(ctx: *mut XmlSecTransformCtx, pinned: &policy::Pinned) {
+    // SAFETY: by the caller's contract.
+    let run = unsafe { run_budget(ctx) };
+    if run.policy.is_none() {
+        run.policy = Some(pinned.clone());
+    }
+}
+
 /// Starts the fresh run of `ctx` under `pinned` with `spent` already charged,
 /// so a chain a `KeyInfo` read runs reads the revision of that read, opens
 /// its URI under the classes `uris` the read admits for that key reference,
@@ -1599,6 +1612,56 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxExecute(
             result
         }
     })
+}
+
+/// The octets of the external resource `uri` names (its fragment, if any,
+/// left to the reader of the octets), read through the caller's input
+/// callbacks as a chain with no transform reads it: under the URI classes
+/// `prefs` enables and the library policy's external-resource budgets. A
+/// core operation is handed these octets, as it performs no I/O itself.
+/// `None` after a report.
+///
+/// # Safety
+/// `prefs` is an initialized context; `here` a live node of `doc`.
+pub(crate) unsafe fn read_resource(
+    prefs: *mut XmlSecTransformCtx,
+    uri: &[u8],
+    here: *mut XmlNode,
+    doc: *mut XmlDoc,
+) -> Option<Vec<u8>> {
+    let location = here!("xmlSecTransformCtxUriExecute");
+    let base = uri.split(|&byte| byte == b'#').next().unwrap_or(uri);
+    let Ok(base) = std::ffi::CString::new(base) else {
+        errors::invalid_data(location, std::ptr::null(), "a URI holding a NUL octet");
+        return None;
+    };
+    // SAFETY: a context created and destroyed here; the caller's live node
+    // and document.
+    unsafe {
+        let ctx = xmlSecTransformCtxCreate();
+        if ctx.is_null() {
+            errors::internal(location, std::ptr::null(), c"xmlSecTransformCtxCreate");
+            return None;
+        }
+        (*ctx).enabled_uris = (*prefs).enabled_uris;
+        let bytes = (xmlSecTransformCtxSetUri(ctx, base.as_ptr().cast(), here) == 0
+            && xmlSecTransformCtxExecute(ctx, doc) == 0)
+            .then(|| {
+                let result = (*ctx).result;
+                let data = super::super::buffer::xmlSecBufferGetData(result);
+                if data.is_null() {
+                    Vec::new()
+                } else {
+                    std::slice::from_raw_parts(
+                        data,
+                        super::super::buffer::xmlSecBufferGetSize(result),
+                    )
+                    .to_vec()
+                }
+            });
+        xmlSecTransformCtxDestroy(ctx);
+        bytes
+    }
 }
 
 /// The C string or `NULL` for display.

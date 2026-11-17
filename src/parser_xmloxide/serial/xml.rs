@@ -141,9 +141,14 @@ pub fn serialize_with_options(doc: &Document, options: &SerializeOptions) -> Str
 
 /// Serializes the node `id` and its subtree as libxml2's `xmlNodeDumpOutput`
 /// writes it unformatted: no XML declaration, and only the namespace
-/// declarations the nodes themselves carry.
+/// declarations the nodes themselves carry. The document node is written as
+/// the whole document, declaration included, as `xmlNodeDumpOutput` writes it
+/// through `xmlDocContentDumpOutput`.
 #[must_use]
 pub fn serialize_subtree(doc: &Document, id: NodeId) -> String {
+    if id == doc.root() {
+        return serialize(doc);
+    }
     let mut output = String::new();
     serialize_node(
         doc,
