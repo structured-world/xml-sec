@@ -116,6 +116,62 @@ static void decrypt(const char *label, const xmlChar *type, const char *plaintex
     xsFreeDoc(doc);
 }
 
+/* Encrypts the `secret` element (or its content) of a document with a
+ * template of `type`, then decrypts it again. */
+static void round_trip(const char *label, const xmlChar *type) {
+    static const char xml[] =
+        "<Envelope xmlns=\"urn:envelope\"><secret Id=\"s\">pay<b>load</b></secret></Envelope>";
+    xmlDocPtr doc = xsReadMemory(xml, (int)strlen(xml), "doc.xml", NULL, 0);
+    xmlNodePtr secret = xmlSecFindNode(xsDocGetRootElement(doc), BAD_CAST "secret", BAD_CAST "urn:envelope");
+    xmlNodePtr tmpl = xmlSecTmplEncDataCreate(doc, xmlSecTransformAes128CbcId, NULL, type, NULL, NULL);
+    xmlSecEncCtxPtr ctx = xmlSecEncCtxCreate(NULL);
+    printf("%s\n", label);
+    xmlSecTmplEncDataEnsureCipherValue(tmpl);
+    ctx->encKey = aes_key(0x44);
+    printf("  encrypt: %d", xmlSecEncCtxXmlEncrypt(ctx, tmpl, secret));
+    printf(" replaced=%d base64=%d\n", ctx->resultReplaced, ctx->resultBase64Encoded);
+    printf("  encrypted data in place: %s\n", enc_data(doc) != NULL ? "yes" : "no");
+    xmlSecEncCtxDestroy(ctx);
+    ctx = xmlSecEncCtxCreate(NULL);
+    ctx->encKey = aes_key(0x44);
+    printf("  decrypt: %d\n", xmlSecEncCtxDecrypt(ctx, enc_data(doc)));
+    dump("  document", doc);
+    xmlSecEncCtxDestroy(ctx);
+    xsFreeDoc(doc);
+}
+
+/* Encrypts bytes into a standalone template and decrypts them to a buffer. */
+static void binary_round_trip(void) {
+    static const char bytes[] = "binary \x01\x02 bytes";
+    xmlDocPtr doc = xsNewDoc(BAD_CAST "1.0");
+    xmlNodePtr tmpl = xmlSecTmplEncDataCreate(doc, xmlSecTransformAes256GcmId, NULL, NULL, NULL, NULL);
+    xmlSecEncCtxPtr ctx = xmlSecEncCtxCreate(NULL);
+    xmlSecBufferPtr result;
+    xmlSecKeyInfoCtxPtr key_ctx = xmlSecKeyInfoCtxCreate(NULL);
+    xmlSecByte key_bytes[32];
+    xmlSecKeyPtr key;
+    memset(key_bytes, 0x55, sizeof(key_bytes));
+    xsDocSetRootElement(doc, tmpl);
+    xmlSecTmplEncDataEnsureCipherValue(tmpl);
+    printf("binary\n");
+    key = xmlSecKeyCreate();
+    xmlSecKeyDataBinRead(xmlSecKeyDataAesId, key, key_bytes, sizeof(key_bytes), key_ctx);
+    ctx->encKey = key;
+    printf("  encrypt: %d\n", xmlSecEncCtxBinaryEncrypt(ctx, tmpl, (const xmlSecByte *)bytes, sizeof(bytes) - 1));
+    xmlSecEncCtxDestroy(ctx);
+    ctx = xmlSecEncCtxCreate(NULL);
+    key = xmlSecKeyCreate();
+    xmlSecKeyDataBinRead(xmlSecKeyDataAesId, key, key_bytes, sizeof(key_bytes), key_ctx);
+    ctx->encKey = key;
+    result = xmlSecEncCtxDecryptToBuffer(ctx, tmpl);
+    printf("  decrypted: %d same=%d\n", result != NULL ? (int)xmlSecBufferGetSize(result) : -1,
+           result != NULL && xmlSecBufferGetSize(result) == sizeof(bytes) - 1 &&
+               memcmp(xmlSecBufferGetData(result), bytes, sizeof(bytes) - 1) == 0);
+    xmlSecEncCtxDestroy(ctx);
+    xmlSecKeyInfoCtxDestroy(key_ctx);
+    xsFreeDoc(doc);
+}
+
 int main(void) {
     xmlDocPtr doc;
     xmlSecEncCtxPtr ctx;
@@ -137,6 +193,10 @@ int main(void) {
             "<secret xmlns=\"urn:envelope\">payload</secret>", XMLSEC_ENC_FLAGS_RETURN_REPLACED_NODE);
     decrypt("content", xmlSecTypeEncContent, "text <b xmlns=\"urn:envelope\">bold</b>", 0);
     decrypt("no type", NULL, "raw bytes", 0);
+    round_trip("encrypt element", xmlSecTypeEncElement);
+    round_trip("encrypt content", xmlSecTypeEncContent);
+    round_trip("encrypt without a type", NULL);
+    binary_round_trip();
 
     /* No key: the keys manager has none. */
     key = aes_key(0x11);

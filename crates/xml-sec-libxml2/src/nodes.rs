@@ -318,6 +318,16 @@ pub fn text<T>(node: *const T) -> Option<String> {
     .flatten()
 }
 
+/// `xmlNodeDumpOutput` unformatted: `node` and its subtree as XML text,
+/// with only the namespace declarations the nodes carry.
+#[must_use]
+pub fn dump<T>(node: *const T) -> Option<String> {
+    let (document, node) = tree_node(node.cast())?;
+    handles::read_document(document, |tree| tree.serialize_node(node).ok())
+        .ok()
+        .flatten()
+}
+
 /// `xmlNodeGetContent`: the character data of an element or document and
 /// its descendants, a leaf's text, an attribute's value or a namespace's
 /// URI.

@@ -18,11 +18,13 @@ use super::super::buffer::{
     XmlSecBuffer, xmlSecBufferGetData, xmlSecBufferGetSize, xmlSecBufferSetData,
 };
 use super::super::errors::{self, here};
+use super::super::keyinfo::xmlSecKeyInfoNodeWrite;
 use super::super::keys::{xmlSecKeyGetValue, xmlSecKeyMatch};
 use super::super::keysdata::xmlSecKeyDataBinaryValueGetBuffer;
 use super::super::policy::Pinned;
 use super::super::strings;
 use super::super::transforms::builtin::xmlSecTransformBase64GetKlass;
+use super::super::transforms::ctx::xmlSecTransformCtxBinaryExecute;
 use super::super::transforms::ctx::{
     xmlSecTransformCtxCreateAndAppend, xmlSecTransformCtxCreateAndPrepend,
     xmlSecTransformCtxNodeRead, xmlSecTransformCtxNodesListRead, xmlSecTransformCtxSetUri,
@@ -34,7 +36,8 @@ use super::super::transforms::{
 use super::super::tree::{XmlNode, c_text, give, nodes};
 use super::super::xmltree::{
     xmlSecAddIDs, xmlSecCheckNodeName, xmlSecGetNextElementNode, xmlSecGetNodeContentAndTrim,
-    xmlSecReplaceNodeBuffer, xmlSecReplaceNodeBufferAndReturn,
+    xmlSecReplaceContentAndReturn, xmlSecReplaceNodeAndReturn, xmlSecReplaceNodeBuffer,
+    xmlSecReplaceNodeBufferAndReturn,
 };
 use super::{
     FAILURE_KEY_NOT_FOUND, FAILURE_UNKNOWN, FLAGS_RETURN_REPLACED_NODE, MODE_ENCRYPTED_DATA,
@@ -90,6 +93,227 @@ unsafe fn add_ids(node: *mut XmlNode) {
     let ids = [name!(xmlSecAttrId), std::ptr::null()];
     // SAFETY: a live node of its document and a null-terminated list.
     unsafe { xmlSecAddIDs(xsNodeGetDoc(node), node, ids.as_ptr()) };
+}
+
+/// The template `tmpl` read for an encryption, its `Id` attributes
+/// registered, after libxmlsec1's preconditions at `here`; negative after a
+/// report.
+///
+/// # Safety
+/// `tmpl` is null or a live node.
+unsafe fn begin_encryption(
+    ctx: &mut XmlSecEncCtx,
+    tmpl: *mut XmlNode,
+    here: errors::Here,
+) -> c_int {
+    if !ctx.result.is_null() {
+        errors::assertion(here, c"encCtx->result == NULL");
+        return -1;
+    }
+    if tmpl.is_null() {
+        errors::assertion(here, c"tmpl != NULL");
+        return -1;
+    }
+    ctx.operation = OPERATION_ENCRYPT;
+    // SAFETY: a live node.
+    unsafe {
+        add_ids(tmpl);
+        if read_enc_data(ctx, tmpl, true) < 0 {
+            errors::internal(here, std::ptr::null(), c"xmlSecEncCtxEncDataNodeRead");
+            return -1;
+        }
+    }
+    0
+}
+
+/// Encrypts `data` through the context's chain and writes the template.
+///
+/// # Safety
+/// The template was read.
+unsafe fn encrypt_bytes(ctx: &mut XmlSecEncCtx, data: &[u8], here: errors::Here) -> c_int {
+    let transforms = &raw mut ctx.transform_ctx;
+    // SAFETY: the context's own transform context and the caller's bytes.
+    unsafe {
+        if xmlSecTransformCtxBinaryExecute(transforms, data.as_ptr(), data.len()) < 0 {
+            errors::internal_with(
+                here,
+                std::ptr::null(),
+                c"xmlSecTransformCtxBinaryExecute",
+                &format!("dataSize={}", data.len()),
+            );
+            return -1;
+        }
+        ctx.result = ctx.transform_ctx.result;
+        if ctx.result.is_null() {
+            errors::assertion(here, c"encCtx->result != NULL");
+            return -1;
+        }
+        if write_enc_data(ctx) < 0 {
+            errors::internal(here, std::ptr::null(), c"xmlSecEncCtxEncDataNodeWrite");
+            return -1;
+        }
+    }
+    0
+}
+
+/// `xmlSecEncCtxBinaryEncrypt` past its first precondition.
+///
+/// # Safety
+/// `tmpl` is null or a live node; `data` holds `size` bytes or is null.
+pub(super) unsafe fn binary_encrypt(
+    ctx: &mut XmlSecEncCtx,
+    tmpl: *mut XmlNode,
+    data: *const u8,
+    size: usize,
+) -> c_int {
+    let here = here!("xmlSecEncCtxBinaryEncrypt");
+    if data.is_null() && size != 0 {
+        errors::assertion(here, c"(data != NULL) || (dataSize == 0)");
+        return -1;
+    }
+    // SAFETY: by the caller's contract.
+    unsafe {
+        if begin_encryption(ctx, tmpl, here) < 0 {
+            return -1;
+        }
+        let data = if data.is_null() {
+            &[][..]
+        } else {
+            std::slice::from_raw_parts(data, size)
+        };
+        encrypt_bytes(ctx, data, here)
+    }
+}
+
+/// `xmlSecEncCtxXmlEncrypt` past its first precondition: `node` (an
+/// `Element` template) or its content (a `Content` one) as libxml2 writes
+/// it, encrypted into the template, which then takes its place.
+///
+/// # Safety
+/// `tmpl` and `node` are null or live nodes.
+pub(super) unsafe fn xml_encrypt(
+    ctx: &mut XmlSecEncCtx,
+    tmpl: *mut XmlNode,
+    node: *mut XmlNode,
+) -> c_int {
+    let here = here!("xmlSecEncCtxXmlEncrypt");
+    if node.is_null() {
+        errors::assertion(here, c"node != NULL");
+        return -1;
+    }
+    // SAFETY: by the caller's contract.
+    unsafe {
+        if begin_encryption(ctx, tmpl, here) < 0 {
+            return -1;
+        }
+        // libxmlsec1 requires the Type: without it the decryptor could not
+        // restore the document (XMLEnc 1.1 section 3.1).
+        let element = match c_text(ctx.type_) {
+            Some("http://www.w3.org/2001/04/xmlenc#Element") => true,
+            Some("http://www.w3.org/2001/04/xmlenc#Content") => false,
+            other => {
+                // libxmlsec1's xmlSecInvalidStringTypeError.
+                errors::report(
+                    here,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    errors::R_INVALID_TYPE,
+                    &format!(
+                        "invalid type for 'encryption type': actual={}; expected=supported encryption type",
+                        other.unwrap_or("NULL")
+                    ),
+                );
+                return -1;
+            }
+        };
+        let text = if element {
+            nodes::dump(node)
+        } else {
+            let mut text = String::new();
+            let mut child = xsNodeGetChildren(node);
+            while !child.is_null() {
+                match nodes::dump(child) {
+                    Some(dumped) => text.push_str(&dumped),
+                    None => break,
+                }
+                child = nodes::next(child);
+            }
+            Some(text)
+        };
+        let Some(text) = text else {
+            errors::xml_failed(here, std::ptr::null(), c"xmlNodeDumpOutput");
+            return -1;
+        };
+        if encrypt_bytes(ctx, text.as_bytes(), here) < 0 {
+            return -1;
+        }
+        let returned = if ctx.flags & FLAGS_RETURN_REPLACED_NODE != 0 {
+            &raw mut ctx.replaced_node_list
+        } else {
+            std::ptr::null_mut()
+        };
+        let replaced = if element {
+            xmlSecReplaceNodeAndReturn(node, tmpl, returned)
+        } else {
+            xmlSecReplaceContentAndReturn(node, tmpl, returned)
+        };
+        if replaced < 0 {
+            let object = super::super::tree::name_for_report(node);
+            errors::internal(here, object.as_ptr(), c"xmlSecReplaceNode");
+            return -1;
+        }
+        ctx.result_replaced = 1;
+    }
+    0
+}
+
+/// libxmlsec1's `xmlSecEncCtxEncDataNodeWrite`: the method's parameters,
+/// the cipher value and the `KeyInfo` of the template.
+///
+/// # Safety
+/// The template was read and its result computed.
+unsafe fn write_enc_data(ctx: &mut XmlSecEncCtx) -> c_int {
+    let here = here!("xmlSecEncCtxEncDataNodeWrite");
+    // SAFETY: the context's method, nodes and result.
+    unsafe {
+        if !ctx.enc_method_node.is_null()
+            && let Some(write) = (*(*ctx.enc_method).id).write_node
+            && write(
+                ctx.enc_method,
+                ctx.enc_method_node,
+                &raw mut ctx.transform_ctx,
+            ) < 0
+        {
+            let object = super::super::tree::name_for_report(ctx.enc_method_node);
+            errors::internal(here, object.as_ptr(), c"writeNode");
+            return -1;
+        }
+        if !ctx.cipher_value_node.is_null() {
+            let data = xmlSecBufferGetData(ctx.result);
+            let size = xmlSecBufferGetSize(ctx.result);
+            let text = if data.is_null() {
+                String::new()
+            } else {
+                String::from_utf8_lossy(std::slice::from_raw_parts(data, size)).into_owned()
+            };
+            if nodes::set_content(ctx.cipher_value_node, &text).is_err() {
+                errors::xml_failed(here, std::ptr::null(), c"xmlNodeSetContentLen");
+                return -1;
+            }
+            ctx.result_replaced = 1;
+        }
+        if !ctx.key_info_node.is_null()
+            && xmlSecKeyInfoNodeWrite(
+                ctx.key_info_node,
+                ctx.enc_key,
+                &raw mut ctx.key_info_write_ctx,
+            ) < 0
+        {
+            errors::internal(here, std::ptr::null(), c"xmlSecKeyInfoNodeWrite");
+            return -1;
+        }
+    }
+    0
 }
 
 /// `xmlSecEncCtxDecrypt` past its preconditions.

@@ -9,6 +9,21 @@ fn parsed(xml: &str) -> OwnedTree {
     OwnedTree::parse_with_policy(xml, &VerificationPolicy::default()).expect("the document parses")
 }
 
+#[test]
+fn a_node_serializes_with_only_the_declarations_it_carries() {
+    // libxml2's xmlNodeDumpOutput writes a node as it is: a prefix bound on
+    // an ancestor is not redeclared, and no XML declaration is written.
+    let tree = parsed("<r xmlns:p=\"urn:p\"><p:a x=\"1\">t<b xmlns=\"urn:b\"/></p:a></r>");
+    let root = tree.root_element().expect("a root element");
+    let a = children(&tree, root)[0];
+    assert_eq!(
+        tree.serialize_node(a).expect("a live node"),
+        "<p:a x=\"1\">t<b xmlns=\"urn:b\"/></p:a>"
+    );
+    let text = children(&tree, a)[0];
+    assert_eq!(tree.serialize_node(text).expect("a live node"), "t");
+}
+
 fn children(tree: &OwnedTree, node: TreeNode) -> Vec<TreeNode> {
     let mut found = Vec::new();
     let mut current = tree.first_child(node).expect("a live node");

@@ -582,6 +582,17 @@ impl OwnedTree {
         xmloxide::serial::serialize(&self.document)
     }
 
+    /// The node `node` and its subtree as XML text, as libxml2's
+    /// `xmlNodeDumpOutput` writes it unformatted: only the namespace
+    /// declarations the nodes carry, no XML declaration.
+    ///
+    /// # Errors
+    /// [`TreeError::StaleNode`] for a node this tree does not hold.
+    pub fn serialize_node(&self, node: TreeNode) -> Result<String, TreeError> {
+        let id = self.live(node)?;
+        Ok(xmloxide::serial::serialize_subtree(&self.document, id))
+    }
+
     /// The node standing for the whole document.
     #[must_use]
     pub fn document_node(&self) -> TreeNode {

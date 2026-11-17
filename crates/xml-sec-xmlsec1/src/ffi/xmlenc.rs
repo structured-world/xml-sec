@@ -311,6 +311,56 @@ pub(crate) unsafe extern "C" fn xmlSecEncCtxCopyUserPref(
     })
 }
 
+/// `xmlSecEncCtxBinaryEncrypt`: encrypts `size` bytes at `data` into the
+/// template `tmpl`.
+///
+/// # Safety
+/// `ctx` is null or an initialized context; `tmpl` null or a live node;
+/// `data` null or `size` readable bytes.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn xmlSecEncCtxBinaryEncrypt(
+    ctx: *mut XmlSecEncCtx,
+    tmpl: *mut XmlNode,
+    data: *const u8,
+    size: usize,
+) -> c_int {
+    contain(-1, || {
+        check!(
+            !ctx.is_null(),
+            "xmlSecEncCtxBinaryEncrypt",
+            c"encCtx != NULL",
+            -1
+        );
+        // SAFETY: by the caller's contract.
+        unsafe { process::binary_encrypt(&mut *ctx, tmpl, data, size) }
+    })
+}
+
+/// `xmlSecEncCtxXmlEncrypt`: encrypts `node` (an `Element` template) or its
+/// content (a `Content` one) into the template `tmpl`, which then takes
+/// its place.
+///
+/// # Safety
+/// `ctx` is null or an initialized context; `tmpl` and `node` null or live
+/// nodes.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn xmlSecEncCtxXmlEncrypt(
+    ctx: *mut XmlSecEncCtx,
+    tmpl: *mut XmlNode,
+    node: *mut XmlNode,
+) -> c_int {
+    contain(-1, || {
+        check!(
+            !ctx.is_null(),
+            "xmlSecEncCtxXmlEncrypt",
+            c"encCtx != NULL",
+            -1
+        );
+        // SAFETY: by the caller's contract.
+        unsafe { process::xml_encrypt(&mut *ctx, tmpl, node) }
+    })
+}
+
 /// `xmlSecEncCtxDecrypt`: decrypts the `EncryptedData` element `node` and
 /// replaces it with the plaintext when its `Type` is `Element` or
 /// `Content`; one without a `Type` is left for the caller, who reads the
