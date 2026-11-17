@@ -1,5 +1,92 @@
 use super::*;
 
+use xml_sec_libxml2::ffi::tree::{xsDocGetRootElement, xsFreeDoc, xsReadMemory};
+
+use crate::ffi::crypto::{
+    xmlSecCryptoAppInit, xmlSecCryptoAppShutdown, xmlSecCryptoDLLoadLibrary, xmlSecCryptoInit,
+    xmlSecCryptoShutdown,
+};
+use crate::ffi::keys::xmlSecKeyCreate;
+use crate::ffi::keysdata::xmlSecKeyDataBinRead;
+use crate::ffi::library::{xmlSecInit, xmlSecShutdown};
+use crate::ffi::list::xmlSecPtrListGetItem;
+use crate::ffi::symkeys;
+use crate::ffi::tests::own_process;
+use crate::ffi::xmltree::{xmlSecAddIDs, xmlSecFindNode};
+
+/// An HMAC-SHA256 signature of `#data` libxmlsec1 wrote with the secret
+/// `secret-of-thirty-two-octets-long`, its value replaced.
+const TAMPERED: &str = concat!(
+    "<Envelope xmlns=\"urn:envelope\"><Data Id=\"data\">payload</Data>",
+    "<Signature xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><SignedInfo>",
+    "<CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>",
+    "<SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#hmac-sha256\"/>",
+    "<Reference URI=\"#data\"><Transforms>",
+    "<Transform Algorithm=\"http://www.w3.org/2000/09/xmldsig#enveloped-signature\"/>",
+    "<Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/></Transforms>",
+    "<DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>",
+    "<DigestValue>wFIbO8Tk9pDpGXaiAtlgRAKPJ6BFdyxSkyGlEOhZm/M=</DigestValue>",
+    "</Reference></SignedInfo>",
+    "<SignatureValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</SignatureValue>",
+    "</Signature></Envelope>"
+);
+
+#[test]
+fn a_failed_signature_value_leaves_its_references_undereferenced() {
+    // The core checks the signature value before it dereferences anything a
+    // signer did not authenticate; libxmlsec1 digests the references first
+    // and reports them OK.
+    own_process();
+    let secret = b"secret-of-thirty-two-octets-long";
+    // SAFETY: the library, a document, a key and a context set up and torn
+    // down here, on this thread alone.
+    unsafe {
+        assert_eq!(xmlSecInit(), 0);
+        assert_eq!(xmlSecCryptoDLLoadLibrary(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoAppInit(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoInit(), 0);
+        let doc = xsReadMemory(
+            TAMPERED.as_ptr().cast(),
+            i32::try_from(TAMPERED.len()).expect("a short document"),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        assert!(!doc.is_null());
+        let ids = [c"Id".as_ptr().cast::<u8>(), std::ptr::null()];
+        xmlSecAddIDs(doc, std::ptr::null_mut(), ids.as_ptr());
+        let signature = xmlSecFindNode(
+            xsDocGetRootElement(doc),
+            c"Signature".as_ptr().cast(),
+            c"http://www.w3.org/2000/09/xmldsig#".as_ptr().cast(),
+        );
+        let ctx = xmlSecDSigCtxCreate(std::ptr::null_mut());
+        let key = xmlSecKeyCreate();
+        assert_eq!(
+            xmlSecKeyDataBinRead(
+                symkeys::hmac(),
+                key.cast(),
+                secret.as_ptr(),
+                secret.len(),
+                (&raw mut (*ctx).key_info_read_ctx).cast(),
+            ),
+            0
+        );
+        (*ctx).sign_key = key;
+        assert_eq!(xmlSecDSigCtxVerify(ctx, signature), 0);
+        assert_eq!((*ctx).status, STATUS_INVALID);
+        assert_eq!((*ctx).failure_reason, FAILURE_SIGNATURE);
+        let reference = xmlSecPtrListGetItem(&raw mut (*ctx).signed_info_references, 0)
+            .cast::<XmlSecDSigReferenceCtx>();
+        assert_eq!((*reference).status, STATUS_UNKNOWN);
+        xmlSecDSigCtxDestroy(ctx);
+        xsFreeDoc(doc);
+        assert_eq!(xmlSecCryptoShutdown(), 0);
+        assert_eq!(xmlSecCryptoAppShutdown(), 0);
+        assert_eq!(xmlSecShutdown(), 0);
+    }
+}
+
 #[test]
 fn status_and_failure_strings_are_libxmlsec1s() {
     // The strings applications print and compare.
