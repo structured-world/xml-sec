@@ -13,15 +13,30 @@
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use xml_sec::policy::{
-    PolicyCompileContext, PolicyCompiler, PolicyProfile, SigningPolicy, VerificationPolicy,
+    DecryptionPolicy, EncryptionPolicy, PolicyCompileContext, PolicyCompiler, PolicyProfile,
+    SigningPolicy, VerificationPolicy,
 };
 use xml_sec::provider::ProviderCapability;
 use xml_sec::xmldsig::UriTypeSet;
 
-/// The published snapshots of both operations.
+/// The published snapshots of every operation.
 struct Published {
     verification: Arc<VerificationPolicy>,
     signing: Arc<SigningPolicy>,
+    encryption: Arc<EncryptionPolicy>,
+    decryption: Arc<DecryptionPolicy>,
+}
+
+/// One revision of every operation's snapshot, taken together.
+pub struct Snapshots {
+    /// The verification snapshot.
+    pub verification: Arc<VerificationPolicy>,
+    /// The signing snapshot.
+    pub signing: Arc<SigningPolicy>,
+    /// The encryption snapshot.
+    pub encryption: Arc<EncryptionPolicy>,
+    /// The decryption snapshot.
+    pub decryption: Arc<DecryptionPolicy>,
 }
 
 // no-std: spin::RwLock
@@ -72,9 +87,41 @@ fn compile() -> Option<Published> {
         .clone_from(&verification.digest_algorithms);
     signing.parameterized_rsa_pss = verification.parameterized_rsa_pss;
     signing.hmac = verification.hmac;
+    let decryption = compiled.decryption()?.clone();
+    // Encryption admits what this boundary decrypts, as libxmlsec1 encrypts
+    // with every cipher it decrypts with.
+    let mut encryption = compiled.encryption()?.clone();
+    encryption.data_algorithms = decryption.data_algorithms.as_ref().map(|ciphers| {
+        ciphers
+            .iter()
+            .copied()
+            .filter(|cipher| provider.supports(ProviderCapability::Encrypt(*cipher)))
+            .collect()
+    });
+    encryption
+        .key_wrap_algorithms
+        .clone_from(&decryption.key_wrap_algorithms);
+    encryption
+        .key_transport_algorithms
+        .clone_from(&decryption.key_transport_algorithms);
+    encryption.oaep_digests.clone_from(&decryption.oaep_digests);
     Some(Published {
         verification: Arc::new(verification),
         signing: Arc::new(signing),
+        encryption: Arc::new(encryption),
+        decryption: Arc::new(decryption),
+    })
+}
+
+/// Every operation's current snapshot, of one revision; `None` when the
+/// profile cannot be compiled.
+#[must_use]
+pub fn snapshots() -> Option<Snapshots> {
+    current(|published| Snapshots {
+        verification: Arc::clone(&published.verification),
+        signing: Arc::clone(&published.signing),
+        encryption: Arc::clone(&published.encryption),
+        decryption: Arc::clone(&published.decryption),
     })
 }
 
@@ -135,14 +182,16 @@ pub fn republish(
     // The lock guards no data, only the turn: a turn whose edit panicked
     // published nothing, so its poison is cleared.
     let _turn = WRITER.lock().unwrap_or_else(PoisonError::into_inner);
-    let (verification, signing) = snapshot()?;
-    let mut verification = VerificationPolicy::clone(&verification);
-    let mut signing = SigningPolicy::clone(&signing);
+    let current = snapshots()?;
+    let mut verification = VerificationPolicy::clone(&current.verification);
+    let mut signing = SigningPolicy::clone(&current.signing);
     edit_verification(&mut verification);
     edit_signing(&mut signing);
     *PUBLISHED.write().ok()? = Some(Published {
         verification: Arc::new(verification),
         signing: Arc::new(signing),
+        encryption: current.encryption,
+        decryption: current.decryption,
     });
     Some(())
 }

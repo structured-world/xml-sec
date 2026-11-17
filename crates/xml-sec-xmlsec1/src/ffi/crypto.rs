@@ -25,7 +25,7 @@ use super::list::{
     XmlSecPtrList, XmlSecPtrListKlass, xmlSecPtrListAdd, xmlSecPtrListFinalize, xmlSecPtrListRemove,
 };
 use super::transforms::{Global, XmlSecTransformKlass, xmlSecTransformIdsRegister, zero_list};
-use super::transforms::{digests, hmac, signatures};
+use super::transforms::{ciphers, digests, hmac, signatures};
 use super::{app, asymkeys, symkeys, x509};
 
 /// An opaque `xmlSecKeysMngrPtr`, `xmlSecKeyPtr` or `xmlSecKeyInfoCtxPtr`.
@@ -196,6 +196,17 @@ static BUILTIN: Global<XmlSecCryptoDLFunctions> = Global::new(XmlSecCryptoDLFunc
     key_data_dsa: Some(asymkeys::dsa),
     key_data_ec: Some(asymkeys::ec),
     key_data_rsa: Some(asymkeys::rsa),
+    transform_aes128_cbc: Some(ciphers::aes128_cbc),
+    #[cfg(feature = "legacy-algorithms")]
+    transform_aes192_cbc: Some(ciphers::aes192_cbc),
+    transform_aes256_cbc: Some(ciphers::aes256_cbc),
+    transform_aes128_gcm: Some(ciphers::aes128_gcm),
+    #[cfg(feature = "legacy-algorithms")]
+    transform_aes192_gcm: Some(ciphers::aes192_gcm),
+    transform_aes256_gcm: Some(ciphers::aes256_gcm),
+    transform_camellia128_cbc: Some(ciphers::camellia128_cbc),
+    transform_camellia192_cbc: Some(ciphers::camellia192_cbc),
+    transform_camellia256_cbc: Some(ciphers::camellia256_cbc),
     #[cfg(feature = "legacy-algorithms")]
     transform_hmac_md5: Some(hmac::hmac_md5),
     #[cfg(feature = "legacy-algorithms")]

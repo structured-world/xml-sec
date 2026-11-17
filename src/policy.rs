@@ -1784,6 +1784,18 @@ impl EncryptionPolicy {
         self.key_establishment.validate()?;
         self.rsa_keys.validate()
     }
+
+    /// Check whether content may be encrypted with `algorithm`.
+    ///
+    /// # Errors
+    /// Returns [`PolicyViolation::Algorithm`] for an algorithm the snapshot
+    /// does not admit.
+    pub fn check_data_algorithm(
+        &self,
+        algorithm: DataEncryptionAlgorithm,
+    ) -> Result<(), PolicyViolation> {
+        check_content_algorithm(self.data_algorithms.as_ref(), algorithm, "encryption")
+    }
 }
 
 /// Immutable policy snapshot for `XMLEnc` decryption.
@@ -1829,6 +1841,18 @@ impl DecryptionPolicy {
         self.resources.validate()?;
         self.key_establishment.validate()?;
         self.rsa_keys.validate()
+    }
+
+    /// Check whether content may be decrypted with `algorithm`.
+    ///
+    /// # Errors
+    /// Returns [`PolicyViolation::Algorithm`] for an algorithm the snapshot
+    /// does not admit.
+    pub fn check_data_algorithm(
+        &self,
+        algorithm: DataEncryptionAlgorithm,
+    ) -> Result<(), PolicyViolation> {
+        check_content_algorithm(self.data_algorithms.as_ref(), algorithm, "decryption")
     }
 }
 

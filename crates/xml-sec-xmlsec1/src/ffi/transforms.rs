@@ -27,6 +27,7 @@ use super::{contain, free, malloc, write_stream};
 use xml_sec::policy::{EmptyDigestInput, PolicyViolation};
 
 pub(crate) mod builtin;
+pub(crate) mod ciphers;
 pub(crate) mod ctx;
 pub(crate) mod digests;
 pub(crate) mod hmac;
@@ -65,6 +66,10 @@ pub(crate) const OPERATION_DECODE: c_int = 2;
 pub(crate) const OPERATION_SIGN: c_int = 3;
 /// `xmlSecTransformOperationVerify`.
 pub(crate) const OPERATION_VERIFY: c_int = 4;
+/// `xmlSecTransformOperationEncrypt`.
+pub(crate) const OPERATION_ENCRYPT: c_int = 5;
+/// `xmlSecTransformOperationDecrypt`.
+pub(crate) const OPERATION_DECRYPT: c_int = 6;
 
 /// `xmlSecTransformDataTypeUnknown`.
 pub(crate) const DATA_UNKNOWN: u8 = 0;
@@ -81,6 +86,8 @@ pub(crate) const USAGE_C14N_METHOD: c_uint = 0x0002;
 pub(crate) const USAGE_DIGEST_METHOD: c_uint = 0x0004;
 /// `xmlSecTransformUsageSignatureMethod`.
 pub(crate) const USAGE_SIGNATURE_METHOD: c_uint = 0x0008;
+/// `xmlSecTransformUsageEncryptionMethod`.
+pub(crate) const USAGE_ENCRYPTION_METHOD: c_uint = 0x0010;
 
 /// `XMLSEC_TRANSFORM_FLAGS_USER_SPECIFIED`.
 pub(crate) const FLAGS_USER_SPECIFIED: usize = 0x0001;

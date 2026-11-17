@@ -10,7 +10,9 @@ use std::sync::Arc;
 
 use super::errors::{self, Here};
 
-use xml_sec::policy::{ResourcePolicy, SigningPolicy, VerificationPolicy};
+use xml_sec::policy::{
+    DecryptionPolicy, EncryptionPolicy, ResourcePolicy, SigningPolicy, VerificationPolicy,
+};
 use xml_sec::xmldsig::UriTypeSet;
 
 /// The current verification snapshot; `None` when it cannot be compiled.
@@ -35,19 +37,23 @@ pub(crate) fn verification_at(here: Here) -> Option<Arc<VerificationPolicy>> {
 pub(crate) struct Pinned {
     pub(crate) verification: Arc<VerificationPolicy>,
     pub(crate) signing: Arc<SigningPolicy>,
+    pub(crate) encryption: Arc<EncryptionPolicy>,
+    pub(crate) decryption: Arc<DecryptionPolicy>,
 }
 
 impl Pinned {
     /// The current revision, reported at `here` when the profile is
     /// unavailable.
     pub(crate) fn current(here: Here) -> Option<Self> {
-        let Some((verification, signing)) = xml_sec_libxml2::policy::snapshot() else {
+        let Some(snapshots) = xml_sec_libxml2::policy::snapshots() else {
             errors::policy_unavailable(here);
             return None;
         };
         Some(Self {
-            verification,
-            signing,
+            verification: snapshots.verification,
+            signing: snapshots.signing,
+            encryption: snapshots.encryption,
+            decryption: snapshots.decryption,
         })
     }
 
