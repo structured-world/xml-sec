@@ -455,12 +455,122 @@ pub(super) unsafe fn decrypt_to_buffer(
     }
     // SAFETY: a live node.
     unsafe {
+        if ctx.mode == MODE_ENCRYPTED_KEY {
+            return encrypt_or_decrypt_to_buffer(ctx, node);
+        }
         add_ids(node);
         if read_enc_data(ctx, node, false) < 0 {
             errors::internal(here, std::ptr::null(), c"xmlSecEncCtxEncDataNodeRead");
             return std::ptr::null_mut();
         }
         run_decryption(ctx, node)
+    }
+}
+
+/// libxmlsec1's `xmlSecEncCtxEncryptOrDecryptToBuffer` for an
+/// `EncryptedKey`: the element read, then its chain run over the cipher
+/// value or the data its `CipherReference` names, in the context's
+/// operation. The key's own transport or wrap klass admits the method and
+/// the key under the library policy, as a standalone chain does.
+///
+/// # Safety
+/// `node` is a live node.
+pub(super) unsafe fn encrypt_or_decrypt_to_buffer(
+    ctx: &mut XmlSecEncCtx,
+    node: *mut XmlNode,
+) -> *mut XmlSecBuffer {
+    let here = here!("xmlSecEncCtxEncryptOrDecryptToBuffer");
+    if !ctx.result.is_null() {
+        errors::assertion(here, c"encCtx->result == NULL");
+        return std::ptr::null_mut();
+    }
+    if node.is_null() {
+        errors::assertion(here, c"node != NULL");
+        return std::ptr::null_mut();
+    }
+    let transforms = &raw mut ctx.transform_ctx;
+    // SAFETY: a live node, the context's own members and the trimmed copy
+    // freed here.
+    unsafe {
+        add_ids(node);
+        if read_enc_data(ctx, node, false) < 0 {
+            errors::internal(here, std::ptr::null(), c"xmlSecEncCtxEncDataNodeRead");
+            return std::ptr::null_mut();
+        }
+        if ctx.cipher_value_node.is_null() {
+            if xmlSecTransformCtxExecute(transforms, xsNodeGetDoc(node)) < 0 {
+                errors::internal(here, std::ptr::null(), c"xmlSecTransformCtxExecute");
+                return std::ptr::null_mut();
+            }
+        } else {
+            let data = xmlSecGetNodeContentAndTrim(ctx.cipher_value_node);
+            if data.is_null() {
+                errors::invalid_node_content(
+                    here,
+                    ctx.cipher_value_node,
+                    std::ptr::null(),
+                    "empty",
+                );
+                return std::ptr::null_mut();
+            }
+            let size = std::ffi::CStr::from_ptr(data.cast()).count_bytes();
+            let executed = xmlSecTransformCtxBinaryExecute(transforms, data, size);
+            super::super::free(data.cast());
+            if executed < 0 {
+                errors::internal(here, std::ptr::null(), c"xmlSecTransformCtxBinaryExecute");
+                return std::ptr::null_mut();
+            }
+        }
+        ctx.result = ctx.transform_ctx.result;
+        if ctx.result.is_null() {
+            errors::assertion(here, c"encCtx->result != NULL");
+        }
+        ctx.result
+    }
+}
+
+/// libxmlsec1's `xmlSecEncCtxEncryptedKeyXmlWrite` past its preconditions:
+/// the `EncryptedKey` template `node` read for an encryption, the key's
+/// binary value encrypted through its chain and written into it.
+///
+/// # Safety
+/// `node` is a live node; `key` a valid key; `key_info` the writing
+/// `KeyInfo` context.
+pub(super) unsafe fn encrypted_key_write(
+    ctx: &mut XmlSecEncCtx,
+    node: *mut XmlNode,
+    key: *mut super::super::keys::XmlSecKey,
+    key_info: *mut super::super::keyinfo::XmlSecKeyInfoCtx,
+) -> c_int {
+    let here = here!("xmlSecEncCtxEncryptedKeyXmlWrite");
+    // SAFETY: by the caller's contract.
+    unsafe {
+        ctx.operation = super::encrypted_key::map_operation((*key_info).operation);
+        if ctx.operation == 0 {
+            errors::internal_with(
+                here,
+                std::ptr::null(),
+                c"invalid operation",
+                &format!("operation={}", (*key_info).operation),
+            );
+            return -1;
+        }
+        add_ids(node);
+        if read_enc_data(ctx, node, true) < 0 {
+            errors::internal(here, std::ptr::null(), c"xmlSecEncCtxEncDataNodeRead");
+            return -1;
+        }
+        let Some(value) = super::encrypted_key::key_binary(key, key_info) else {
+            errors::internal(
+                here,
+                std::ptr::null(),
+                c"xmlSecEncCtxEncryptedKeyWriteKeyToBinary",
+            );
+            return -1;
+        };
+        let written = encrypt_bytes(ctx, &value, here);
+        ctx.result = std::ptr::null_mut();
+        written
     }
 }
 

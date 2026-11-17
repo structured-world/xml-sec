@@ -224,6 +224,82 @@ static void uri_round_trip(void) {
     xsFreeDoc(doc);
 }
 
+#define RSA_KEY "tests/fixtures/keys/rsa/rsa-2048-key.pem"
+
+/* A keys manager holding the RSA key "recipient" and the AES key "kek". */
+static xmlSecKeysMngrPtr recipients(void) {
+    static xmlSecByte bytes[8192];
+    size_t size;
+    xmlSecKeyPtr key;
+    xmlSecKeysMngrPtr mngr = xmlSecKeysMngrCreate();
+    FILE *file = fopen(RSA_KEY, "rb");
+    xmlSecCryptoAppDefaultKeysMngrInit(mngr);
+    if (file == NULL) {
+        return mngr;
+    }
+    size = fread(bytes, 1, sizeof(bytes), file);
+    fclose(file);
+    key = xmlSecCryptoAppKeyLoadMemory(bytes, (xmlSecSize)size, xmlSecKeyDataFormatPem, NULL, NULL,
+                                       NULL);
+    xmlSecKeySetName(key, BAD_CAST "recipient");
+    xmlSecCryptoAppDefaultKeysMngrAdoptKey(mngr, key);
+    key = aes_key(0x77);
+    xmlSecKeySetName(key, BAD_CAST "kek");
+    xmlSecCryptoAppDefaultKeysMngrAdoptKey(mngr, key);
+    return mngr;
+}
+
+/* Changes the first character of the EncryptedKey's cipher value. */
+static void tamper(xmlNodePtr enc_key) {
+    xmlNodePtr value = xmlSecFindNode(enc_key, xmlSecNodeCipherValue, xmlSecEncNs);
+    xmlChar *text = xmlSecGetNodeContentAndTrim(value);
+    text[0] = text[0] == 'A' ? 'B' : 'A';
+    xsNodeSetContent(value, text);
+    xsFree(text);
+}
+
+/* A generated AES session key carried to the recipient `name` in an
+ * EncryptedKey of `transport`: the data encrypted, then decrypted with the
+ * key the keys manager resolves; with `tampered` set, the EncryptedKey's
+ * cipher value is changed first. Every cipher value is random, so only
+ * the outcome is printed. */
+static void session_key(const char *label, xmlSecTransformId transport, const char *name,
+                        int tampered) {
+    static const char bytes[] = "session key payload";
+    xmlSecKeysMngrPtr mngr = recipients();
+    xmlDocPtr doc = xsNewDoc(BAD_CAST "1.0");
+    xmlNodePtr tmpl = xmlSecTmplEncDataCreate(doc, xmlSecTransformAes128CbcId, NULL, NULL, NULL, NULL);
+    xmlNodePtr enc_key;
+    xmlSecEncCtxPtr ctx = xmlSecEncCtxCreate(mngr);
+    xmlSecBufferPtr result;
+    xsDocSetRootElement(doc, tmpl);
+    xmlSecTmplEncDataEnsureCipherValue(tmpl);
+    enc_key = xmlSecTmplKeyInfoAddEncryptedKey(xmlSecTmplEncDataEnsureKeyInfo(tmpl, NULL), transport,
+                                               NULL, NULL, NULL);
+    xmlSecTmplEncDataEnsureCipherValue(enc_key);
+    xmlSecTmplKeyInfoAddKeyName(xmlSecTmplEncDataEnsureKeyInfo(enc_key, NULL), BAD_CAST name);
+    printf("%s\n", label);
+    ctx->encKey = xmlSecKeyGenerate(xmlSecKeyDataAesId, 128, xmlSecKeyDataTypeSession);
+    printf("  encrypt: %d\n",
+           xmlSecEncCtxBinaryEncrypt(ctx, tmpl, (const xmlSecByte *)bytes, sizeof(bytes) - 1));
+    xmlSecEncCtxDestroy(ctx);
+    if (tampered) {
+        tamper(enc_key);
+        quiet = 1;
+    }
+    ctx = xmlSecEncCtxCreate(mngr);
+    result = xmlSecEncCtxDecryptToBuffer(ctx, tmpl);
+    quiet = 0;
+    printf("  decrypted: %d same=%d failure=%s\n",
+           result != NULL ? (int)xmlSecBufferGetSize(result) : -1,
+           result != NULL && xmlSecBufferGetSize(result) == sizeof(bytes) - 1 &&
+               memcmp(xmlSecBufferGetData(result), bytes, sizeof(bytes) - 1) == 0,
+           xmlSecEncCtxGetFailureReasonString(ctx->failureReason));
+    xmlSecEncCtxDestroy(ctx);
+    xmlSecKeysMngrDestroy(mngr);
+    xsFreeDoc(doc);
+}
+
 int main(void) {
     xmlDocPtr doc;
     xmlSecEncCtxPtr ctx;
@@ -250,6 +326,11 @@ int main(void) {
     round_trip("encrypt without a type", NULL);
     binary_round_trip();
     uri_round_trip();
+    session_key("session key rsa-oaep", xmlSecTransformRsaOaepId, "recipient", 0);
+    session_key("session key rsa-oaep tampered", xmlSecTransformRsaOaepId, "recipient", 1);
+    session_key("session key rsa-1_5", xmlSecTransformRsaPkcs1Id, "recipient", 0);
+    session_key("session key kw-aes128", xmlSecTransformKWAes128Id, "kek", 0);
+    session_key("session key kw-aes128 tampered", xmlSecTransformKWAes128Id, "kek", 1);
 
     /* No key: the keys manager has none. */
     key = aes_key(0x11);

@@ -24,6 +24,7 @@ use super::super::buffer::{
     xmlSecBufferAppend, xmlSecBufferGetData, xmlSecBufferGetSize, xmlSecBufferRemoveHead,
 };
 use super::super::errors::{self, Here, here};
+use super::super::keyinfo::XmlSecKeyInfoCtx;
 use super::super::keys::{TYPE_PRIVATE, TYPE_PUBLIC, XmlSecKey, xmlSecKeyGetValue};
 use super::super::keysdata::check_id;
 use super::super::tree::XmlNode;
@@ -365,12 +366,46 @@ fn parameters(
     })
 }
 
-/// Transports or recovers the collected key under the run's policy.
+/// Recovers an RSAES-PKCS1-v1_5 transported key of the `expected` width.
+///
+/// Departure: libxmlsec1 recovers a key of any width. Here the width is the
+/// one the `EncryptedKey`'s consumer requires, and a rejected recovery
+/// yields a random key of that width rather than an error, so the result
+/// never reveals padding validity (XML Encryption 1.1 section 6.1.2). A chain run outside
+/// a `KeyInfo` has no expected width and is refused.
+/// <https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-bleichenbacher-attack>
+#[cfg(feature = "legacy-algorithms")]
+fn recover_pkcs1v15(
+    provider: &dyn CryptoProvider,
+    transport: &Transport,
+    policy: &xml_sec::policy::DecryptionPolicy,
+    expected: Option<usize>,
+) -> Result<Zeroizing<Vec<u8>>, String> {
+    let expected = expected.ok_or(
+        "RSAES-PKCS1-v1_5 recovery needs the key width the EncryptedKey's consumer requires",
+    )?;
+    policy
+        .check_key_transport_algorithm(KeyTransportAlgorithm::RsaPkcs1v15)
+        .map_err(|error| error.to_string())?;
+    let private = transport.private.as_deref().ok_or("no private key")?;
+    let recovery: Arc<dyn xml_sec::provider::KeyRecoveryKey> = provider
+        .import_recovery_key(private)
+        .map_err(|error| error.to_string())?;
+    validate_key_recovery_key(recovery.as_ref(), policy).map_err(|error| error.to_string())?;
+    provider
+        .recover_pkcs1v15(recovery.as_ref(), &transport.data, expected)
+        .and_then(xml_sec::provider::RecoveredContentKey::into_key_or_substitute)
+        .map_err(|error| error.to_string())
+}
+
+/// Transports or recovers the collected key under the run's policy; a
+/// recovery inside a `KeyInfo` produces a key of the `expected` width.
 fn run(
     operation: c_int,
     algorithm: KeyTransportAlgorithm,
     transport: &Transport,
     pinned: &policy::Pinned,
+    expected: Option<usize>,
 ) -> Result<Zeroizing<Vec<u8>>, String> {
     let spki = transport.spki.as_deref().ok_or("no key")?;
     let public = RustCryptoRsaPublicKey::from_spki_der(spki).map_err(|error| error.to_string())?;
@@ -402,14 +437,12 @@ fn run(
             .map(Zeroizing::new)
             .map_err(|error| error.to_string());
     }
-    // Departure: RSAES-PKCS1-v1_5 recovery reveals no padding validity, so it
-    // needs the expected key width, which only the EncryptedKey that carries
-    // the transport knows; a standalone chain is refused.
-    if algorithm.requires_explicit_permission() {
-        return Err("RSAES-PKCS1-v1_5 recovery runs only through the encryption context".into());
-    }
     let policy = &pinned.decryption;
     policy.validate().map_err(|error| error.to_string())?;
+    #[cfg(feature = "legacy-algorithms")]
+    if algorithm == KeyTransportAlgorithm::RsaPkcs1v15 {
+        return recover_pkcs1v15(provider, transport, policy, expected);
+    }
     let method = transport
         .method
         .clone()
@@ -433,6 +466,24 @@ fn run(
         .recover_key(recovery.as_ref(), &parameters, &transport.data)
         .map(Zeroizing::new)
         .map_err(|error| error.to_string())
+}
+
+/// The key width, in bytes, the `KeyInfo` reading the chain's
+/// `EncryptedKey` requires; `None` outside a `KeyInfo` or without a width.
+///
+/// # Safety
+/// `ctx` is an initialized context whose parent is null or a live
+/// `KeyInfo` context.
+unsafe fn expected_width(ctx: *mut XmlSecTransformCtx) -> Option<usize> {
+    // SAFETY: by the caller's contract.
+    let parent = unsafe {
+        (*ctx)
+            .parent_key_info_ctx
+            .cast::<XmlSecKeyInfoCtx>()
+            .as_ref()
+    }?;
+    let bits = parent.key_req.key_bits_size;
+    (bits != 0 && bits % 8 == 0).then_some(bits / 8)
 }
 
 /// `execute`: collects the input; on the last chunk transports or recovers
@@ -502,7 +553,9 @@ unsafe extern "C" fn execute(
             errors::assertion(here, c"ctx->policy != NULL");
             return -1;
         };
-        let output = match run(object.operation, algorithm, transport, pinned) {
+        // SAFETY: a non-null, initialized context.
+        let expected = unsafe { expected_width(ctx) };
+        let output = match run(object.operation, algorithm, transport, pinned, expected) {
             Ok(output) => output,
             Err(error) => {
                 errors::report(

@@ -229,6 +229,29 @@ impl RecoveredContentKey {
         }
         Ok(core::mem::take(&mut *self.bytes))
     }
+
+    /// Consume a recovery whose key leaves for a content operation that
+    /// cannot carry its validity, such as a key handed through a C
+    /// interface. A rejected RSAES-PKCS1-v1_5 recovery yields its random
+    /// substitute of the same width, and nothing tells the two apart: the
+    /// content operation fails as it fails with any wrong key
+    /// (XML Encryption 1.1 section 6.1.2).
+    /// <https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-bleichenbacher-attack>
+    ///
+    /// # Errors
+    /// Returns `KeyNotExportable` for an opaque handle, or
+    /// `AuthenticationFailed` for an invalid recovery of a mechanism whose
+    /// failure is already public.
+    pub fn into_key_or_substitute(mut self) -> Result<zeroize::Zeroizing<Vec<u8>>, ProviderError> {
+        if self.opaque.is_some() {
+            return Err(ProviderError::KeyNotExportable);
+        }
+        // Branches on the public recovery mechanism, never on padding validity.
+        if !self.implicit_rejection && !self.valid() {
+            return Err(ProviderError::AuthenticationFailed);
+        }
+        Ok(core::mem::take(&mut self.bytes))
+    }
 }
 #[cfg(all(feature = "aws-lc-fips", feature = "xmlenc"))]
 pub use aws_lc::AwsLcRsaPrivateKey;
