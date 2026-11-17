@@ -99,6 +99,27 @@ fn the_target_key_comes_back_through_an_untrusted_intermediate() {
 }
 
 #[test]
+fn a_certificate_reads_its_names_serial_and_key_identifier() {
+    let chain = chain();
+    let parsed = crate::xmldsig::parse_x509_certificate_with_resources(
+        &chain.leaf,
+        &ResourcePolicy::default(),
+    )
+    .expect("leaf metadata");
+    assert_eq!(parsed.subject_dn, "CN=target leaf");
+    assert_eq!(parsed.issuer_dn, "CN=target intermediate");
+    assert!(!parsed.serial_number.is_empty());
+    let refused = crate::xmldsig::parse_x509_certificate_with_resources(
+        &chain.leaf,
+        &ResourcePolicy {
+            max_x509_work: 0,
+            ..ResourcePolicy::default()
+        },
+    );
+    assert!(refused.is_err(), "{refused:?}");
+}
+
+#[test]
 fn only_certificates_issuing_none_of_the_others_are_leaves() {
     let chain = chain();
     let all = vec![

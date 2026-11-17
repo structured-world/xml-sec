@@ -3804,6 +3804,22 @@ pub(crate) fn parse_x509_certificate(cert_der: &[u8]) -> Result<ParsedX509Certif
     parse_x509_certificate_in(cert_der, &session)
 }
 
+/// The subject, issuer, serial number, key identifier and public key of the
+/// DER certificate `der`, read under `resources`. Reading assigns no trust.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] for invalid `resources`, a certificate that does not
+/// parse, or reading it beyond the resource limits.
+pub fn parse_x509_certificate_with_resources(
+    der: &[u8],
+    resources: &crate::policy::ResourcePolicy,
+) -> Result<ParsedX509Certificate, ParseError> {
+    resources.validate().map_err(ParseError::Policy)?;
+    let session = super::pkix::CertificateSession::new(resources);
+    parse_x509_certificate_in(der, &session)
+}
+
 pub(crate) fn parse_x509_certificate_in(
     cert_der: &[u8],
     session: &super::pkix::CertificateSession,

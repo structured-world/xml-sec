@@ -119,9 +119,10 @@ pub use mac::{HmacTag, IncrementalHmac};
 #[cfg(feature = "xmldsig-sign")]
 pub use modern::EdDsaSigningKey;
 pub use parse::{
-    KeyInfo, KeyInfoSource, KeyValueInfo, ParseError, Reference, RetrievalMethodTransforms,
-    RsaPssParameters, SignatureAlgorithm, SignatureContext, SignedInfo, X509DataInfo,
-    find_signature_node, parse_key_info, parse_key_value_child, parse_reference, parse_signed_info,
+    KeyInfo, KeyInfoSource, KeyValueInfo, ParseError, ParsedX509Certificate, Reference,
+    RetrievalMethodTransforms, RsaPssParameters, SignatureAlgorithm, SignatureContext, SignedInfo,
+    X509DataInfo, X509PublicKeyInfo, find_signature_node, parse_key_info, parse_key_value_child,
+    parse_reference, parse_signed_info, parse_x509_certificate_with_resources,
     x509_certificate_matches_selectors,
 };
 pub use pkix::CertificatePathVerifier;
