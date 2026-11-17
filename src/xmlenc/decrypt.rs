@@ -3117,19 +3117,13 @@ pub(super) fn validate_key_encryption_method_policy(
         Ok(Some(AdmittedOaep { digest, mgf_digest }))
     } else {
         let wrap = KeyWrapAlgorithm::from_uri(uri)?;
-        if policy
-            .key_wrap_algorithms
-            .as_ref()
-            .map_or(wrap.requires_explicit_permission(), |allowed| {
-                !allowed.contains(&wrap)
-            })
-        {
-            return Err(crate::policy::PolicyViolation::Algorithm {
+        // The refusal names the URI the document carries.
+        policy.check_key_wrap_algorithm(wrap).map_err(|_| {
+            crate::policy::PolicyViolation::Algorithm {
                 operation: "decryption",
                 algorithm: uri.clone(),
             }
-            .into());
-        }
+        })?;
         Ok(None)
     }
 }

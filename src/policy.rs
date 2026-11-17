@@ -1796,6 +1796,38 @@ impl EncryptionPolicy {
     ) -> Result<(), PolicyViolation> {
         check_content_algorithm(self.data_algorithms.as_ref(), algorithm, "encryption")
     }
+
+    /// Check whether keys may be wrapped with `algorithm`.
+    ///
+    /// # Errors
+    /// Returns [`PolicyViolation::Algorithm`] for a wrap the snapshot does not
+    /// admit.
+    pub fn check_key_wrap_algorithm(
+        &self,
+        algorithm: KeyWrapAlgorithm,
+    ) -> Result<(), PolicyViolation> {
+        check_key_wrap(self.key_wrap_algorithms.as_ref(), algorithm, "encryption")
+    }
+}
+
+/// Enforce the shared key-wrap permission contract: without an allowlist,
+/// only wraps that need no explicit permission are admitted.
+#[cfg(feature = "xmlenc")]
+fn check_key_wrap(
+    allowlist: Option<&BTreeSet<KeyWrapAlgorithm>>,
+    algorithm: KeyWrapAlgorithm,
+    operation: &'static str,
+) -> Result<(), PolicyViolation> {
+    let refused = allowlist.map_or(algorithm.requires_explicit_permission(), |allowed| {
+        !allowed.contains(&algorithm)
+    });
+    if refused {
+        return Err(PolicyViolation::Algorithm {
+            operation,
+            algorithm: algorithm.uri().to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Immutable policy snapshot for `XMLEnc` decryption.
@@ -1853,6 +1885,18 @@ impl DecryptionPolicy {
         algorithm: DataEncryptionAlgorithm,
     ) -> Result<(), PolicyViolation> {
         check_content_algorithm(self.data_algorithms.as_ref(), algorithm, "decryption")
+    }
+
+    /// Check whether keys wrapped with `algorithm` may be unwrapped.
+    ///
+    /// # Errors
+    /// Returns [`PolicyViolation::Algorithm`] for a wrap the snapshot does not
+    /// admit.
+    pub fn check_key_wrap_algorithm(
+        &self,
+        algorithm: KeyWrapAlgorithm,
+    ) -> Result<(), PolicyViolation> {
+        check_key_wrap(self.key_wrap_algorithms.as_ref(), algorithm, "decryption")
     }
 }
 

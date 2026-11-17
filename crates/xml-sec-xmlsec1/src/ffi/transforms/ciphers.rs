@@ -1,16 +1,17 @@
-//! The built-in provider's block cipher transform klasses: AES-CBC, AES-GCM
-//! and Camellia-CBC.
+//! The built-in provider's symmetric cipher transform klasses: the AES-CBC,
+//! AES-GCM and Camellia-CBC content ciphers and the AES and Camellia key
+//! wraps.
 //!
 //! A transform collects its binary input. On the final chunk it encrypts or
 //! decrypts it as one `XMLEnc` cipher value (the IV or nonce in front, CBC
-//! padding as `XMLEnc` defines it, the GCM tag behind) through the selected
-//! provider, after the run's policy admitted the algorithm, with the
-//! symmetric key of the klass's family.
+//! padding as `XMLEnc` defines it, the GCM tag behind), or wraps or unwraps
+//! it as a key, through the selected provider, after the run's policy
+//! admitted the algorithm, with the symmetric key of the klass's family.
 
 use std::ffi::{c_int, c_uint, c_void};
 
 use xml_sec::policy::PolicyViolation;
-use xml_sec::xmlenc::DataEncryptionAlgorithm;
+use xml_sec::xmlenc::{DataEncryptionAlgorithm, KeyWrapAlgorithm};
 use zeroize::Zeroizing;
 
 use super::super::buffer::{
@@ -33,8 +34,34 @@ const KEY_USAGE_ENCRYPT: c_uint = 0x0000_0004;
 /// `xmlSecKeyUsageDecrypt`.
 const KEY_USAGE_DECRYPT: c_uint = 0x0000_0008;
 /// The most a cipher value adds to its plaintext: a 16-octet IV and a
-/// block of CBC padding, or a 12-octet GCM nonce and a 16-octet tag.
+/// block of CBC padding, or a 12-octet GCM nonce and a 16-octet tag; a key
+/// wrap adds 8 octets.
 const CIPHER_FRAMING: usize = 32;
+
+/// What a klass of this module does.
+#[derive(Clone, Copy)]
+enum Method {
+    /// Encrypts or decrypts content.
+    Data(DataEncryptionAlgorithm),
+    /// Wraps or unwraps a key.
+    Wrap(KeyWrapAlgorithm),
+}
+
+impl Method {
+    fn key_kind(self) -> xml_sec::key_manager::SymmetricKeyKind {
+        match self {
+            Self::Data(algorithm) => algorithm.key_kind(),
+            Self::Wrap(algorithm) => algorithm.key_kind(),
+        }
+    }
+
+    fn key_len(self) -> usize {
+        match self {
+            Self::Data(algorithm) => algorithm.key_len(),
+            Self::Wrap(algorithm) => algorithm.key_len(),
+        }
+    }
+}
 
 /// The state of a cipher transform.
 struct Cipher {
@@ -68,7 +95,7 @@ const fn cipher_klass(name: &'static [u8], href: &'static [u8]) -> XmlSecTransfo
 }
 
 macro_rules! ciphers {
-    ($($(#[$meta:meta])* $klass:ident, $getter:ident, $name:ident, $href:ident, $algorithm:ident;)*) => {
+    ($($(#[$meta:meta])* $klass:ident, $getter:ident, $name:ident, $href:ident, $method:expr;)*) => {
         $(
             $(#[$meta])*
             static $klass: XmlSecTransformKlass =
@@ -81,12 +108,12 @@ macro_rules! ciphers {
             }
         )*
 
-        /// The algorithm of klass `id`, `None` for any other.
-        fn method(id: *const XmlSecTransformKlass) -> Option<DataEncryptionAlgorithm> {
+        /// What klass `id` does, `None` for any other klass.
+        fn method(id: *const XmlSecTransformKlass) -> Option<Method> {
             $(
                 $(#[$meta])*
                 if std::ptr::eq(id, &raw const $klass) {
-                    return Some(DataEncryptionAlgorithm::$algorithm);
+                    return Some($method);
                 }
             )*
             None
@@ -95,22 +122,29 @@ macro_rules! ciphers {
 }
 
 ciphers! {
-    AES128_CBC, aes128_cbc, xmlSecNameAes128Cbc, xmlSecHrefAes128Cbc, Aes128Cbc;
+    AES128_CBC, aes128_cbc, xmlSecNameAes128Cbc, xmlSecHrefAes128Cbc, Method::Data(DataEncryptionAlgorithm::Aes128Cbc);
     #[cfg(feature = "legacy-algorithms")]
-    AES192_CBC, aes192_cbc, xmlSecNameAes192Cbc, xmlSecHrefAes192Cbc, Aes192Cbc;
-    AES256_CBC, aes256_cbc, xmlSecNameAes256Cbc, xmlSecHrefAes256Cbc, Aes256Cbc;
-    AES128_GCM, aes128_gcm, xmlSecNameAes128Gcm, xmlSecHrefAes128Gcm, Aes128Gcm;
+    AES192_CBC, aes192_cbc, xmlSecNameAes192Cbc, xmlSecHrefAes192Cbc, Method::Data(DataEncryptionAlgorithm::Aes192Cbc);
+    AES256_CBC, aes256_cbc, xmlSecNameAes256Cbc, xmlSecHrefAes256Cbc, Method::Data(DataEncryptionAlgorithm::Aes256Cbc);
+    AES128_GCM, aes128_gcm, xmlSecNameAes128Gcm, xmlSecHrefAes128Gcm, Method::Data(DataEncryptionAlgorithm::Aes128Gcm);
     #[cfg(feature = "legacy-algorithms")]
-    AES192_GCM, aes192_gcm, xmlSecNameAes192Gcm, xmlSecHrefAes192Gcm, Aes192Gcm;
-    AES256_GCM, aes256_gcm, xmlSecNameAes256Gcm, xmlSecHrefAes256Gcm, Aes256Gcm;
-    CAMELLIA128_CBC, camellia128_cbc, xmlSecNameCamellia128Cbc, xmlSecHrefCamellia128Cbc, Camellia128Cbc;
-    CAMELLIA192_CBC, camellia192_cbc, xmlSecNameCamellia192Cbc, xmlSecHrefCamellia192Cbc, Camellia192Cbc;
-    CAMELLIA256_CBC, camellia256_cbc, xmlSecNameCamellia256Cbc, xmlSecHrefCamellia256Cbc, Camellia256Cbc;
+    AES192_GCM, aes192_gcm, xmlSecNameAes192Gcm, xmlSecHrefAes192Gcm, Method::Data(DataEncryptionAlgorithm::Aes192Gcm);
+    AES256_GCM, aes256_gcm, xmlSecNameAes256Gcm, xmlSecHrefAes256Gcm, Method::Data(DataEncryptionAlgorithm::Aes256Gcm);
+    CAMELLIA128_CBC, camellia128_cbc, xmlSecNameCamellia128Cbc, xmlSecHrefCamellia128Cbc, Method::Data(DataEncryptionAlgorithm::Camellia128Cbc);
+    CAMELLIA192_CBC, camellia192_cbc, xmlSecNameCamellia192Cbc, xmlSecHrefCamellia192Cbc, Method::Data(DataEncryptionAlgorithm::Camellia192Cbc);
+    CAMELLIA256_CBC, camellia256_cbc, xmlSecNameCamellia256Cbc, xmlSecHrefCamellia256Cbc, Method::Data(DataEncryptionAlgorithm::Camellia256Cbc);
+    KW_AES128, kw_aes128, xmlSecNameKWAes128, xmlSecHrefKWAes128, Method::Wrap(KeyWrapAlgorithm::AesKw128);
+    #[cfg(feature = "legacy-algorithms")]
+    KW_AES192, kw_aes192, xmlSecNameKWAes192, xmlSecHrefKWAes192, Method::Wrap(KeyWrapAlgorithm::AesKw192);
+    KW_AES256, kw_aes256, xmlSecNameKWAes256, xmlSecHrefKWAes256, Method::Wrap(KeyWrapAlgorithm::AesKw256);
+    KW_CAMELLIA128, kw_camellia128, xmlSecNameKWCamellia128, xmlSecHrefKWCamellia128, Method::Wrap(KeyWrapAlgorithm::CamelliaKw128);
+    KW_CAMELLIA192, kw_camellia192, xmlSecNameKWCamellia192, xmlSecHrefKWCamellia192, Method::Wrap(KeyWrapAlgorithm::CamelliaKw192);
+    KW_CAMELLIA256, kw_camellia256, xmlSecNameKWCamellia256, xmlSecHrefKWCamellia256, Method::Wrap(KeyWrapAlgorithm::CamelliaKw256);
 }
 
-/// The key-data klass of the family `algorithm` takes its key from.
-fn key_klass(algorithm: DataEncryptionAlgorithm) -> *const XmlSecKeyDataKlass {
-    match algorithm.key_kind() {
+/// The key-data klass of the family `method` takes its key from.
+fn key_klass(method: Method) -> *const XmlSecKeyDataKlass {
+    match method.key_kind() {
         xml_sec::key_manager::SymmetricKeyKind::Camellia => symkeys::camellia(),
         _ => symkeys::aes(),
     }
@@ -125,11 +159,7 @@ fn key_klass(algorithm: DataEncryptionAlgorithm) -> *const XmlSecKeyDataKlass {
 unsafe fn object<'a>(
     transform: *mut XmlSecTransform,
     here: Here,
-) -> Option<(
-    &'a mut XmlSecTransform,
-    DataEncryptionAlgorithm,
-    &'a mut Cipher,
-)> {
+) -> Option<(&'a mut XmlSecTransform, Method, &'a mut Cipher)> {
     // SAFETY: by the caller's contract; a valid object of these klasses has
     // the cipher layout.
     unsafe {
@@ -279,27 +309,35 @@ unsafe extern "C" fn set_key(transform: *mut XmlSecTransform, key: *mut c_void) 
     })
 }
 
-/// The run's admission of `algorithm` for `operation` under `pinned`.
+/// The run's admission of `method` for `operation` under `pinned`.
 fn admit(
     pinned: &policy::Pinned,
     operation: c_int,
-    algorithm: DataEncryptionAlgorithm,
+    method: Method,
 ) -> Result<usize, PolicyViolation> {
     if operation == OPERATION_ENCRYPT {
-        pinned.encryption.validate()?;
-        pinned.encryption.check_data_algorithm(algorithm)?;
-        Ok(pinned.encryption.resources.max_encryption_plaintext_bytes)
+        let policy = &pinned.encryption;
+        policy.validate()?;
+        match method {
+            Method::Data(algorithm) => policy.check_data_algorithm(algorithm)?,
+            Method::Wrap(algorithm) => policy.check_key_wrap_algorithm(algorithm)?,
+        }
+        Ok(policy.resources.max_encryption_plaintext_bytes)
     } else {
-        pinned.decryption.validate()?;
-        pinned.decryption.check_data_algorithm(algorithm)?;
-        Ok(pinned.decryption.resources.max_encryption_plaintext_bytes)
+        let policy = &pinned.decryption;
+        policy.validate()?;
+        match method {
+            Method::Data(algorithm) => policy.check_data_algorithm(algorithm)?,
+            Method::Wrap(algorithm) => policy.check_key_wrap_algorithm(algorithm)?,
+        }
+        Ok(policy.resources.max_encryption_plaintext_bytes)
     }
 }
 
 /// Collects the input buffer; on the `last` chunk encrypts or decrypts it.
 fn collect(
     object: &mut XmlSecTransform,
-    algorithm: DataEncryptionAlgorithm,
+    method: Method,
     cipher: &mut Cipher,
     last: bool,
     here: Here,
@@ -310,7 +348,7 @@ fn collect(
         errors::assertion(here, c"ctx->policy != NULL");
         return -1;
     };
-    let maximum = match admit(pinned, object.operation, algorithm) {
+    let maximum = match admit(pinned, object.operation, method) {
         Ok(maximum) => maximum,
         Err(violation) => {
             errors::report(
@@ -366,10 +404,14 @@ fn collect(
         return -1;
     };
     let provider = xml_sec::provider::default_provider();
-    let output = if object.operation == OPERATION_ENCRYPT {
-        provider.encrypt_data(algorithm, key, &cipher.data)
-    } else {
-        provider.decrypt_data(algorithm, key, &cipher.data)
+    let encrypting = object.operation == OPERATION_ENCRYPT;
+    let output = match method {
+        Method::Data(algorithm) if encrypting => {
+            provider.encrypt_data(algorithm, key, &cipher.data)
+        }
+        Method::Data(algorithm) => provider.decrypt_data(algorithm, key, &cipher.data),
+        Method::Wrap(algorithm) if encrypting => provider.wrap_key(algorithm, key, &cipher.data),
+        Method::Wrap(algorithm) => provider.unwrap_key(algorithm, key, &cipher.data),
     };
     let output = match output {
         Ok(output) => Zeroizing::new(output),

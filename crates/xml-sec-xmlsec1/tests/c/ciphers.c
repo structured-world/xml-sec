@@ -95,6 +95,32 @@ static void check(xmlSecTransformId id, xmlSecKeyDataId keyId, xmlSecSize keySiz
     xmlSecKeyDestroy(short_key);
 }
 
+/* A key wrap is deterministic (RFC 3394): the wrapped key is printed, then
+ * unwrapped again, and a tampered one is refused. */
+static void wrap(xmlSecTransformId id, xmlSecKeyDataId keyId, xmlSecSize kekSize) {
+    static const xmlSecByte content_key[16] = {0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+                                               0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff};
+    xmlSecByte wrapped[64];
+    xmlSecByte unwrapped[64];
+    xmlSecKeyPtr kek = key_of(keyId, 0x0f, kekSize);
+    int size;
+    int i;
+    printf("%s: href=%s usage=0x%x\n", id->name, id->href, id->usage);
+    size = run(id, xmlSecTransformOperationEncrypt, kek, content_key, sizeof(content_key), wrapped);
+    printf("  wrapped: %d ", size);
+    for (i = 0; i < size; ++i) {
+        printf("%02x", wrapped[i]);
+    }
+    printf("\n");
+    printf("  unwrapped: %d same=%d\n",
+           run(id, xmlSecTransformOperationDecrypt, kek, wrapped, (xmlSecSize)size, unwrapped),
+           memcmp(unwrapped, content_key, sizeof(content_key)) == 0);
+    wrapped[0] ^= 0x01;
+    printf("  tampered: %d\n",
+           run(id, xmlSecTransformOperationDecrypt, kek, wrapped, (xmlSecSize)size, unwrapped));
+    xmlSecKeyDestroy(kek);
+}
+
 int main(void) {
     xmlSecByte encrypted[256];
     xmlSecByte decrypted[256];
@@ -116,6 +142,9 @@ int main(void) {
     check(xmlSecTransformAes128GcmId, xmlSecKeyDataAesId, 16);
     check(xmlSecTransformAes256GcmId, xmlSecKeyDataAesId, 32);
     check(xmlSecTransformCamellia128CbcId, xmlSecKeyDataCamelliaId, 16);
+    wrap(xmlSecTransformKWAes128Id, xmlSecKeyDataAesId, 16);
+    wrap(xmlSecTransformKWAes256Id, xmlSecKeyDataAesId, 32);
+    wrap(xmlSecTransformKWCamellia128Id, xmlSecKeyDataCamelliaId, 16);
 
     /* An authenticated cipher refuses a value whose tag was changed. */
     key = key_of(xmlSecKeyDataAesId, 0x33, 16);

@@ -1383,19 +1383,7 @@ fn validate_aes_key_wrap_recipient(
     algorithm: KeyWrapAlgorithm,
     policy: &crate::policy::EncryptionPolicy,
 ) -> Result<(), XmlEncError> {
-    if policy
-        .key_wrap_algorithms
-        .as_ref()
-        .map_or(algorithm.requires_explicit_permission(), |allowed| {
-            !allowed.contains(&algorithm)
-        })
-    {
-        return Err(crate::policy::PolicyViolation::Algorithm {
-            operation: "encryption",
-            algorithm: algorithm.uri().to_string(),
-        }
-        .into());
-    }
+    policy.check_key_wrap_algorithm(algorithm)?;
     if kek.len() != algorithm.key_len() {
         return Err(XmlEncError::InvalidEncryptionConfig(format!(
             "{} requires a {}-byte key-encryption key, got {} bytes",

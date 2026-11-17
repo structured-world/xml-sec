@@ -207,6 +207,13 @@ static BUILTIN: Global<XmlSecCryptoDLFunctions> = Global::new(XmlSecCryptoDLFunc
     transform_camellia128_cbc: Some(ciphers::camellia128_cbc),
     transform_camellia192_cbc: Some(ciphers::camellia192_cbc),
     transform_camellia256_cbc: Some(ciphers::camellia256_cbc),
+    transform_kw_aes128: Some(ciphers::kw_aes128),
+    #[cfg(feature = "legacy-algorithms")]
+    transform_kw_aes192: Some(ciphers::kw_aes192),
+    transform_kw_aes256: Some(ciphers::kw_aes256),
+    transform_kw_camellia128: Some(ciphers::kw_camellia128),
+    transform_kw_camellia192: Some(ciphers::kw_camellia192),
+    transform_kw_camellia256: Some(ciphers::kw_camellia256),
     #[cfg(feature = "legacy-algorithms")]
     transform_hmac_md5: Some(hmac::hmac_md5),
     #[cfg(feature = "legacy-algorithms")]
