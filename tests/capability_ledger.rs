@@ -151,7 +151,7 @@ fn complete_surface_categories_are_stable() {
         "https://github.com/lsh123/xmlsec"
     );
     assert_eq!(ledger.generated_by, "xml-sec-capability-ledger/3");
-    assert_eq!(ledger.classifications.len(), 25);
+    assert_eq!(ledger.classifications.len(), 27);
 
     let counts = ledger
         .items
@@ -289,9 +289,78 @@ fn orphaned_or_stale_evidence_is_rejected() {
     );
 }
 
+/// Where libxmlsec1 keeps the headers of its crypto backends.
+const BACKEND_HEADERS: [&str; 6] = ["gcrypt", "gnutls", "mscng", "mscrypto", "nss", "openssl"];
+
+fn from_backend_header(item: &Item) -> bool {
+    BACKEND_HEADERS.iter().any(|backend| {
+        item.source
+            .starts_with(&format!("include/xmlsec/{backend}/"))
+    })
+}
+
+/// The libxmlsec1-compatible headers, as `(file name, text)`.
+fn compatible_headers() -> Vec<(String, String)> {
+    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("crates/xml-sec-xmlsec1/include/xmlsec");
+    let mut headers: Vec<_> = std::fs::read_dir(&directory)
+        .expect("the libxmlsec1-compatible include directory")
+        .map(|entry| entry.expect("an include directory entry").path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "h"))
+        .map(|path| {
+            let text = std::fs::read_to_string(&path).expect("a readable header");
+            let name = path
+                .file_name()
+                .expect("a header file name")
+                .to_string_lossy()
+                .into_owned();
+            (name, text)
+        })
+        .collect();
+    headers.sort();
+    headers
+}
+
+/// Every identifier of the exported declarations of `text`, each read from
+/// the line starting with the export marker through its terminating `;`, so
+/// a name on a later line of the declaration is included.
+fn exported_words(text: &str) -> BTreeSet<&str> {
+    let mut words = BTreeSet::new();
+    let mut inside = false;
+    for line in text.lines() {
+        inside = inside || line.starts_with("XMLSEC_EXPORT");
+        if !inside {
+            continue;
+        }
+        words.extend(
+            line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .filter(|word| !word.is_empty()),
+        );
+        inside = !line.contains(';');
+    }
+    words
+}
+
+/// Whether `text` declares the exported function `name`.
+fn declares(text: &str, name: &str) -> bool {
+    exported_words(text).contains(name)
+}
+
+#[test]
+fn a_declaration_split_across_lines_is_seen() {
+    // The exclusion checks must not miss a declaration whose name follows the
+    // export marker on a later line.
+    let header = "XMLSEC_EXPORT int\n    xmlSecBufferReadFile(xmlSecBufferPtr buf,\n        const char* filename);\nint xmlSecOther(void);\n";
+    assert!(declares(header, "xmlSecBufferReadFile"));
+    assert!(declares(header, "xmlSecBufferPtr"));
+    assert!(!declares(header, "xmlSecOther"));
+}
+
 #[test]
 fn c_surface_is_explicitly_incompatible() {
-    // A native Rust API must not be reported as drop-in C ABI compatibility.
+    // No C tier is claimed, so no generic C item may be reported as source or
+    // binary compatible; only the functions the library does not offer are
+    // excluded outright.
     let ledger = ledger();
     let c_kinds = [
         "header",
@@ -305,11 +374,11 @@ fn c_surface_is_explicitly_incompatible() {
         "typedef",
         "class-id",
     ];
-    for item in ledger
-        .items
-        .iter()
-        .filter(|item| c_kinds.contains(&item.kind.as_str()))
-    {
+    for item in ledger.items.iter().filter(|item| {
+        c_kinds.contains(&item.kind.as_str())
+            && !from_backend_header(item)
+            && item.classification != "not-offered-c-surface"
+    }) {
         assert_eq!(
             classification(&ledger, item).outcome,
             "binary-abi-incompatible",
@@ -767,12 +836,173 @@ fn backend_surface_distinguishes_provider_capabilities_from_unimplemented_apis()
             .all(|item| item.name.contains("Transform"))
     );
 
-    for unsupported in ["Des3", "Gost"] {
-        assert!(ledger.items.iter().any(|item| {
-            item.kind == "backend-api"
-                && item.name.contains(unsupported)
-                && classification(&ledger, item).outcome == "planned"
-        }));
+    // A backend transform getter is provider-limited exactly when the
+    // algorithm URI of the same name is claimed for the native API, so the
+    // two classifications cannot drift apart.
+    let claimed: BTreeSet<&str> = ledger
+        .items
+        .iter()
+        .filter(|item| {
+            item.kind == "algorithm-uri"
+                && matches!(
+                    classification(&ledger, item).outcome.as_str(),
+                    "behavior-compatible" | "compatibility-profile-only"
+                )
+        })
+        .map(|item| item.name.as_str())
+        .collect();
+    let algorithm = |name: &str| -> Option<String> {
+        let rest = name.strip_prefix("xmlSec")?.strip_suffix("GetKlass")?;
+        ["GCrypt", "GnuTLS", "MSCng", "MSCrypto", "Nss", "OpenSSL"]
+            .iter()
+            .find_map(|backend| rest.strip_prefix(backend)?.strip_prefix("Transform"))
+            .filter(|algorithm| !algorithm.is_empty())
+            .map(str::to_owned)
+    };
+    let mut getters = 0;
+    for item in ledger
+        .items
+        .iter()
+        .filter(|item| item.kind == "backend-api")
+    {
+        let Some(algorithm) = algorithm(&item.name) else {
+            continue;
+        };
+        getters += 1;
+        let href = format!("xmlSecHref{algorithm}");
+        let expected = if claimed.contains(href.as_str()) {
+            "provider-limited"
+        } else {
+            "intentionally-unsupported"
+        };
+        assert_eq!(
+            classification(&ledger, item).outcome,
+            expected,
+            "{} ({href})",
+            item.name
+        );
+    }
+    assert!(getters > provider_limited.len());
+
+    assert!(ledger.items.iter().any(|item| {
+        item.kind == "backend-api"
+            && item.name.contains("Gost")
+            && classification(&ledger, item).outcome == "intentionally-unsupported"
+    }));
+}
+
+#[test]
+fn backend_source_tier_is_not_claimed() {
+    // The backend-specific source tier is decided as not claimed: no backend
+    // header ships, so a backend call fails to compile rather than reaching an
+    // alias, and the ledger states that for every item of a backend header
+    // instead of leaving it a planned target.
+    let ledger = ledger();
+    let include = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("crates/xml-sec-xmlsec1/include/xmlsec");
+    for backend in BACKEND_HEADERS {
+        assert!(
+            !include.join(backend).exists(),
+            "the {backend} backend header directory must not ship"
+        );
+    }
+    let backend_items: Vec<_> = ledger
+        .items
+        .iter()
+        .filter(|item| from_backend_header(item))
+        .collect();
+    assert_eq!(backend_items.len(), 3_097);
+    for item in &backend_items {
+        let expected = if item.classification == "backend-provider-transform-surface" {
+            "provider-limited"
+        } else {
+            assert_eq!(
+                item.classification,
+                "backend-specific-surface",
+                "{}",
+                item_id(item)
+            );
+            "intentionally-unsupported"
+        };
+        assert_eq!(
+            classification(&ledger, item).outcome,
+            expected,
+            "{}",
+            item_id(item)
+        );
+    }
+    // A backend function never reaches the library's headers under its name.
+    let headers = compatible_headers();
+    let declared: BTreeSet<_> = headers
+        .iter()
+        .flat_map(|(_, text)| exported_words(text))
+        .collect();
+    for item in backend_items
+        .iter()
+        .filter(|item| item.kind == "backend-api")
+    {
+        assert!(
+            !declared.contains(item.name.as_str()),
+            "{} is declared by a libxmlsec1-compatible header",
+            item.name
+        );
+    }
+}
+
+#[test]
+fn c_layer_exclusions_are_explicit() {
+    // Functions the library does not offer are replaced by a note in its
+    // headers, so a program using one fails to compile under its name; the
+    // internal exports of libxmlsec1's crypto libraries are declared nowhere.
+    let ledger = ledger();
+    let headers = compatible_headers();
+    let not_offered: Vec<_> = ledger
+        .items
+        .iter()
+        .filter(|item| item.classification == "not-offered-c-surface")
+        .collect();
+    assert_eq!(not_offered.len(), 8);
+    for item in not_offered {
+        assert_eq!(
+            classification(&ledger, item).outcome,
+            "intentionally-unsupported"
+        );
+        let header = item
+            .source
+            .strip_prefix("include/xmlsec/")
+            .expect("a generic libxmlsec1 header");
+        let (_, text) = headers
+            .iter()
+            .find(|(name, _)| name == header)
+            .unwrap_or_else(|| panic!("{header} is shipped"));
+        assert!(!declares(text, &item.name), "{} is declared", item.name);
+        assert!(
+            text.contains(&format!("/* {} is not offered: ", item.name)),
+            "{header} has no note for {}",
+            item.name
+        );
+    }
+    let internal: Vec<_> = ledger
+        .items
+        .iter()
+        .filter(|item| item.kind == "internal-export")
+        .collect();
+    assert_eq!(internal.len(), 70);
+    let declared: BTreeSet<_> = headers
+        .iter()
+        .flat_map(|(_, text)| exported_words(text))
+        .collect();
+    for item in internal {
+        assert_eq!(item.classification, "internal-crypto-export");
+        assert_eq!(
+            classification(&ledger, item).outcome,
+            "intentionally-unsupported"
+        );
+        assert!(
+            !declared.contains(item.name.as_str()),
+            "internal export {} is declared",
+            item.name
+        );
     }
 }
 
@@ -1177,20 +1407,38 @@ fn native_cli_claims_match_process_and_upstream_runner_tests() {
 }
 
 #[test]
-fn deprecated_surface_is_explicitly_unsupported() {
-    // Deprecated aliases stay visible without adding compatibility shims prematurely.
+fn deprecated_surface_is_explicitly_classified() {
+    // Deprecated generic functions are declared like the rest of the generic
+    // surface, which claims no C tier; deprecated backend functions share the
+    // backend's classification.
     let ledger = ledger();
+    let headers = compatible_headers();
     let deprecated: Vec<_> = ledger
         .items
         .iter()
         .filter(|item| item.kind == "deprecated-api")
         .collect();
-    assert!(!deprecated.is_empty());
-    assert!(
-        deprecated
-            .iter()
-            .all(|item| classification(&ledger, item).outcome == "intentionally-unsupported")
-    );
+    assert_eq!(deprecated.len(), 15);
+    for item in deprecated {
+        if from_backend_header(item) {
+            assert_eq!(item.classification, "backend-specific-surface");
+            assert_eq!(
+                classification(&ledger, item).outcome,
+                "intentionally-unsupported"
+            );
+        } else {
+            assert_eq!(item.classification, "deprecated-generic-surface");
+            assert_eq!(
+                classification(&ledger, item).outcome,
+                "binary-abi-incompatible"
+            );
+            assert!(
+                headers.iter().any(|(_, text)| declares(text, &item.name)),
+                "{} is not declared",
+                item.name
+            );
+        }
+    }
 }
 #[cfg(all(feature = "xmldsig", feature = "xmlenc"))]
 use xml_sec as roxmltree;

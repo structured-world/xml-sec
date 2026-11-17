@@ -10,8 +10,12 @@
 //! changed through tree functions shaped like libxml2's; objects and strings
 //! handed to the caller come from the library heap and are released with
 //! `xsFree`. Functions that read a file, a URL or an external entity
-//! themselves are not offered: the caller passes the bytes. `SAFETY.md`
-//! records the invariants of the crate's single `unsafe` module.
+//! themselves are not offered: the caller passes the bytes. libxmlsec1's
+//! backend headers (`xmlsec/openssl`, `nss`, `gnutls`, `gcrypt`, `mscng`,
+//! `mscrypto`) are not shipped, since they hand out the backend's own
+//! objects: the generic crypto entry points dispatch to the built-in
+//! provider. `SAFETY.md` records the invariants of the crate's single
+//! `unsafe` module.
 
 #![warn(unreachable_pub)]
 #![deny(

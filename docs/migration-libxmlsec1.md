@@ -4,9 +4,14 @@ The comparison baseline is upstream libxmlsec1 at the commit
 `compatibility/libxmlsec1-donor-commit.txt` pins. Consult the generated
 [declaration and behavior ledgers](compatibility-ledger.md) for exact outcomes.
 Native Rust, the process CLI, C source compatibility, libxml2 DOM compatibility
-and binary ABI are independent tiers. This source tree implements no libxmlsec1
-C headers, exported C ABI, SONAME replacement or backend-specific OpenSSL/NSS/
-GnuTLS object shim. An unmodified C binary cannot load this Rust crate instead.
+and binary ABI are independent tiers. The `xml-sec-xmlsec1` library implements
+part of libxmlsec1's generic C headers over the core, but claims no C tier yet:
+the ledger counts what it declares, and an unmodified C binary cannot load it
+in place of libxmlsec1 (no SONAME replacement). No backend-specific header
+(OpenSSL, NSS, GnuTLS, GCrypt, CNG, CryptoAPI) is provided and none is planned:
+those headers hand out the backend's own objects, and the library consumes no
+C library. C code reaches the same algorithms and key loading through the
+generic `xmlSecCrypto*`, `xmlSecCryptoApp*` and klass identity entry points.
 
 ## Choose A Migration Boundary
 
