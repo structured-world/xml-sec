@@ -1770,17 +1770,18 @@ where
 
 impl EncryptionMethod {
     /// Parse the `EncryptionMethod` element `node`, its key size, OAEP and
-    /// `ChaCha` parameters included.
+    /// `ChaCha` parameters included, each value within the operation's
+    /// `max_encryption_metadata_bytes`.
     ///
     /// # Errors
-    /// Returns a node that is no `EncryptionMethod` or malformed parameters.
-    pub fn from_element(node: Node<'_, '_>) -> Result<Self, XmlEncError> {
-        parse_encryption_method(node)
+    /// Returns a node that is no `EncryptionMethod`, malformed parameters, or
+    /// a value beyond the metadata limit of `resources`.
+    pub fn from_element(
+        node: Node<'_, '_>,
+        resources: &crate::policy::ResourcePolicy,
+    ) -> Result<Self, XmlEncError> {
+        parse_encryption_method_with_limit(node, resources.max_encryption_metadata_bytes)
     }
-}
-
-fn parse_encryption_method(node: Node<'_, '_>) -> Result<EncryptionMethod, XmlEncError> {
-    parse_encryption_method_with_limit(node, crate::hard_limits::ENCRYPTION_METADATA_BYTE_CEILING)
 }
 
 fn parse_method_algorithm(
@@ -2920,8 +2921,11 @@ mod tests {
                 "<xenc:EncryptionMethod xmlns:xenc=\"{XMLENC_NS}\" Algorithm=\"http://www.w3.org/2009/xmlenc11#rsa-oaep\"><xenc:OAEPparams>{params}</xenc:OAEPparams></xenc:EncryptionMethod>"
             );
             let document = Document::parse(&xml).expect("test method must be XML");
-            let parsed = parse_encryption_method(document.root_element())
-                .expect("empty OAEPparams must decode as an empty label");
+            let parsed = EncryptionMethod::from_element(
+                document.root_element(),
+                &crate::policy::ResourcePolicy::default(),
+            )
+            .expect("empty OAEPparams must decode as an empty label");
             assert_eq!(parsed.oaep_params, Some(Vec::new()));
         }
 
@@ -2969,14 +2973,15 @@ mod tests {
                 "<xenc:EncryptionMethod xmlns:xenc=\"{XMLENC_NS}\" Algorithm=\"{algorithm}\"><xenc:KeySize>{bits}</xenc:KeySize></xenc:EncryptionMethod>"
             );
             let document = Document::parse(&xml).expect("test method must be XML");
-            let parsed = parse_encryption_method(document.root_element())
+            let resources = crate::policy::ResourcePolicy::default();
+            let parsed = EncryptionMethod::from_element(document.root_element(), &resources)
                 .expect("matching AES KeySize must parse");
             assert_eq!(parsed.key_size_bits, Some(bits));
 
             let inconsistent = xml.replace(&format!(">{bits}<"), ">192<");
             let document = Document::parse(&inconsistent).expect("test method must be XML");
             assert!(matches!(
-                parse_encryption_method(document.root_element()),
+                EncryptionMethod::from_element(document.root_element(), &resources),
                 Err(XmlEncError::InvalidStructure(_))
             ));
         }
@@ -2987,7 +2992,10 @@ mod tests {
             );
             let document = Document::parse(&xml).expect("test method must be XML");
             assert!(matches!(
-                parse_encryption_method(document.root_element()),
+                EncryptionMethod::from_element(
+                    document.root_element(),
+                    &crate::policy::ResourcePolicy::default()
+                ),
                 Err(XmlEncError::InvalidStructure(_))
             ));
         }

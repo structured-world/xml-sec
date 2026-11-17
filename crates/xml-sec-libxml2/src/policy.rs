@@ -93,8 +93,11 @@ fn compile() -> Option<Published> {
     signing.hmac = verification.hmac;
     let mut decryption = compiled.decryption()?.clone();
     // A CipherReference resolves as a signature's reference does: external
-    // URIs from the bytes the caller's input callbacks supply.
+    // URIs from the bytes the caller's input callbacks supply, same-document
+    // IDs as libxmlsec1 finds them.
     decryption.uris.references = verification.uris.references;
+    decryption.transforms.same_document_id_semantics =
+        verification.transforms.same_document_id_semantics;
     // Encryption admits what this boundary decrypts, as libxmlsec1 encrypts
     // with every cipher it decrypts with.
     let mut encryption = compiled.encryption()?.clone();

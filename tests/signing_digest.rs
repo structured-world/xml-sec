@@ -3659,6 +3659,40 @@ fn base64_line_size_lays_out_digests_of_every_dependency_level() {
     for digest in &digests {
         assert_eq!(digest.matches('\n').count(), 2, "{digest}");
     }
+
+    // The outer digest covers the Manifest as laid out: a digest taken
+    // before the Manifest's value was wrapped would not verify.
+    let first = VerifyContext::new()
+        .signature_identities(&document)
+        .expect("signatures are discoverable")[0];
+    let verified = VerifyContext::new()
+        .policy(VerificationPolicy {
+            manifest_processing: ManifestProcessing::Process,
+            ..VerificationPolicy::default()
+        })
+        .key(&VerificationKey {
+            algorithm: SignatureAlgorithm::RsaSha256,
+            public_key_bytes: rsa_spki(&key),
+            certificate_der: None,
+            name: None,
+        })
+        .signature(first)
+        .verify_document(&document)
+        .expect("the laid out signature verifies");
+    assert!(
+        matches!(verified.status, DsigStatus::Valid),
+        "{:?}",
+        verified.status
+    );
+    assert_eq!(verified.manifest_references.len(), 1);
+    assert!(
+        verified
+            .manifest_references
+            .iter()
+            .all(|reference| matches!(reference.status, DsigStatus::Valid)),
+        "{:?}",
+        verified.manifest_references
+    );
 }
 
 #[test]

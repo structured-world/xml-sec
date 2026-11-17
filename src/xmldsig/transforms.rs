@@ -1307,8 +1307,9 @@ mod chain_policy_sealed {
 }
 
 /// An operation policy snapshot that governs a reference chain: the
-/// verification policy of a verifier, the signing policy of a signer, each
-/// with its own transform permissions, XML allowances and limits.
+/// verification policy of a verifier, the signing policy of a signer, the
+/// decryption policy of a decryptor reading a `CipherReference`, each with
+/// its own transform permissions, XML allowances and limits.
 pub trait TransformChainPolicy: chain_policy_sealed::Sealed {
     #[doc(hidden)]
     fn validate_snapshot(&self) -> Result<(), crate::policy::PolicyViolation>;
@@ -1349,6 +1350,10 @@ macro_rules! impl_chain_policy {
 
 impl_chain_policy!(crate::policy::VerificationPolicy);
 impl_chain_policy!(crate::policy::SigningPolicy);
+// XML Encryption 1.1 section 3.3.1: a CipherReference's Transforms are
+// processed as a signature reference's are, under the decryptor's policy.
+#[cfg(feature = "xmlenc")]
+impl_chain_policy!(crate::policy::DecryptionPolicy);
 
 /// Execute a standalone reference chain under a trusted operation policy
 /// snapshot: a [`VerificationPolicy`](crate::policy::VerificationPolicy) for

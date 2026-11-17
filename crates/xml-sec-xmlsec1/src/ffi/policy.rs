@@ -62,6 +62,7 @@ impl Pinned {
         match side {
             Side::Verify => OperationPolicy::Verify(&self.verification),
             Side::Sign => OperationPolicy::Sign(&self.signing),
+            Side::Decrypt => OperationPolicy::Decrypt(&self.decryption),
         }
     }
 }
@@ -69,11 +70,13 @@ impl Pinned {
 /// The operation a run of a transform chain serves: signing when one of its
 /// transforms signs (a signature method, or a reference's digest method set
 /// to sign), verification otherwise, as libxmlsec1 marks each transform with
-/// its operation.
+/// its operation; decryption when an encryption context reads the resource
+/// its `CipherReference` names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Side {
     Verify,
     Sign,
+    Decrypt,
 }
 
 /// The snapshot of one side of a pinned revision.
@@ -81,6 +84,7 @@ pub(crate) enum Side {
 pub(crate) enum OperationPolicy<'a> {
     Verify(&'a VerificationPolicy),
     Sign(&'a SigningPolicy),
+    Decrypt(&'a DecryptionPolicy),
 }
 
 impl<'a> OperationPolicy<'a> {
@@ -89,14 +93,17 @@ impl<'a> OperationPolicy<'a> {
         match self {
             Self::Verify(policy) => &policy.resources,
             Self::Sign(policy) => &policy.resources,
+            Self::Decrypt(policy) => &policy.resources,
         }
     }
 
-    /// The URI classes the operation admits for a signature's references.
+    /// The URI classes the operation admits for a signature's references or
+    /// a `CipherReference`.
     pub(crate) fn references(self) -> UriTypeSet {
         match self {
             Self::Verify(policy) => policy.uris.references,
             Self::Sign(policy) => policy.uris.references,
+            Self::Decrypt(policy) => policy.uris.references,
         }
     }
 }
@@ -108,6 +115,7 @@ macro_rules! with_document_policy {
         match $operation {
             $crate::ffi::policy::OperationPolicy::Verify($policy) => $body,
             $crate::ffi::policy::OperationPolicy::Sign($policy) => $body,
+            $crate::ffi::policy::OperationPolicy::Decrypt($policy) => $body,
         }
     };
 }

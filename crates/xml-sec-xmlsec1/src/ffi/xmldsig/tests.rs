@@ -87,6 +87,199 @@ fn a_failed_signature_value_leaves_its_references_undereferenced() {
     }
 }
 
+/// How many times the detached resource was opened.
+static DETACHED_OPENS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Octets of the detached resource already served by the current open.
+static DETACHED_SENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// What the detached resource holds when first opened; a later open serves
+/// [`DETACHED_LATER`].
+const DETACHED_FIRST: &[u8] = b"the bytes that were signed";
+const DETACHED_LATER: &[u8] = b"bytes served on a later open";
+
+unsafe extern "C" fn detached_matches(_uri: *const std::ffi::c_char) -> std::ffi::c_int {
+    1
+}
+
+unsafe extern "C" fn detached_open(_uri: *const std::ffi::c_char) -> *mut std::ffi::c_void {
+    let opens = DETACHED_OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    DETACHED_SENT.store(0, std::sync::atomic::Ordering::Relaxed);
+    let content = if opens == 0 {
+        DETACHED_FIRST
+    } else {
+        DETACHED_LATER
+    };
+    content.as_ptr().cast_mut().cast()
+}
+
+unsafe extern "C" fn detached_read(
+    context: *mut std::ffi::c_void,
+    buffer: *mut std::ffi::c_char,
+    len: std::ffi::c_int,
+) -> std::ffi::c_int {
+    let served = if context.cast_const() == DETACHED_FIRST.as_ptr().cast() {
+        DETACHED_FIRST
+    } else {
+        DETACHED_LATER
+    };
+    let sent = DETACHED_SENT.load(std::sync::atomic::Ordering::Relaxed);
+    let rest = &served[sent..];
+    let count = rest
+        .len()
+        .min(usize::try_from(len).expect("a non-negative length"));
+    // SAFETY: the transform passes `len` writable bytes.
+    unsafe { std::ptr::copy_nonoverlapping(rest.as_ptr(), buffer.cast(), count) };
+    DETACHED_SENT.store(sent + count, std::sync::atomic::Ordering::Relaxed);
+    std::ffi::c_int::try_from(count).expect("at most `len` octets")
+}
+
+unsafe extern "C" fn detached_close(_context: *mut std::ffi::c_void) -> std::ffi::c_int {
+    0
+}
+
+#[test]
+fn a_stored_pre_digest_holds_the_bytes_that_were_signed() {
+    // A detached reference is read once for signing; the kept pre-digest
+    // buffer holds those bytes, not what a second read of the URI returns.
+    own_process();
+    let template = concat!(
+        "<Signature xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><SignedInfo>",
+        "<CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>",
+        "<SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#hmac-sha256\"/>",
+        "<Reference URI=\"test:detached\">",
+        "<DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>",
+        "<DigestValue/></Reference></SignedInfo><SignatureValue/></Signature>"
+    );
+    let secret = b"secret-of-thirty-two-octets-long";
+    // SAFETY: the library, a document, a key and a context set up and torn
+    // down here, on this thread alone.
+    unsafe {
+        assert_eq!(xmlSecInit(), 0);
+        assert_eq!(xmlSecCryptoDLLoadLibrary(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoAppInit(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoInit(), 0);
+        assert_eq!(
+            crate::ffi::transforms::io::xmlSecIORegisterCallbacks(
+                Some(detached_matches),
+                Some(detached_open),
+                Some(detached_read),
+                Some(detached_close),
+            ),
+            0
+        );
+        let doc = xsReadMemory(
+            template.as_ptr().cast(),
+            i32::try_from(template.len()).expect("a short document"),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        assert!(!doc.is_null());
+        let ctx = xmlSecDSigCtxCreate(std::ptr::null_mut());
+        let key = xmlSecKeyCreate();
+        assert_eq!(
+            xmlSecKeyDataBinRead(
+                symkeys::hmac(),
+                key.cast(),
+                secret.as_ptr(),
+                secret.len(),
+                (&raw mut (*ctx).key_info_read_ctx).cast(),
+            ),
+            0
+        );
+        (*ctx).sign_key = key;
+        (*ctx).enabled_reference_uris = 0xFFFF;
+        (*ctx).flags |= FLAGS_STORE_SIGNEDINFO_REFERENCES;
+        assert_eq!(xmlSecDSigCtxSign(ctx, xsDocGetRootElement(doc)), 0);
+        let reference = xmlSecPtrListGetItem(&raw mut (*ctx).signed_info_references, 0)
+            .cast::<XmlSecDSigReferenceCtx>();
+        let kept = crate::ffi::transforms::builtin::xmlSecTransformMemBufGetBuffer(
+            (*reference).pre_digest_mem_buf_method,
+        );
+        assert_eq!(
+            std::slice::from_raw_parts(
+                crate::ffi::buffer::xmlSecBufferGetData(kept),
+                crate::ffi::buffer::xmlSecBufferGetSize(kept),
+            ),
+            DETACHED_FIRST
+        );
+        assert_eq!(DETACHED_OPENS.load(std::sync::atomic::Ordering::Relaxed), 1);
+        xmlSecDSigCtxDestroy(ctx);
+        xsFreeDoc(doc);
+        assert_eq!(xmlSecCryptoShutdown(), 0);
+        assert_eq!(xmlSecCryptoAppShutdown(), 0);
+        assert_eq!(xmlSecShutdown(), 0);
+    }
+}
+
+#[test]
+fn an_ignored_manifest_reads_none_of_its_resources() {
+    // The operation's policy ignores Manifests: their references are never
+    // dereferenced, so an unreadable external one does not stop the
+    // verification of the signature itself.
+    own_process();
+    let document = TAMPERED.replace(
+        "</Signature>",
+        concat!(
+            "<Object><Manifest><Reference URI=\"unreadable:resource\">",
+            "<DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>",
+            "<DigestValue>AAAA</DigestValue></Reference></Manifest></Object></Signature>"
+        ),
+    );
+    crate::ffi::policy::republish(
+        |verification| {
+            verification.manifest_processing = xml_sec::policy::ManifestProcessing::Ignore;
+        },
+        |_| {},
+    )
+    .expect("the library policy compiles");
+    let secret = b"secret-of-thirty-two-octets-long";
+    // SAFETY: the library, a document, a key and a context set up and torn
+    // down here, on this thread alone.
+    unsafe {
+        assert_eq!(xmlSecInit(), 0);
+        assert_eq!(xmlSecCryptoDLLoadLibrary(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoAppInit(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoInit(), 0);
+        let doc = xsReadMemory(
+            document.as_ptr().cast(),
+            i32::try_from(document.len()).expect("a short document"),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        assert!(!doc.is_null());
+        let signature = xmlSecFindNode(
+            xsDocGetRootElement(doc),
+            c"Signature".as_ptr().cast(),
+            c"http://www.w3.org/2000/09/xmldsig#".as_ptr().cast(),
+        );
+        let ctx = xmlSecDSigCtxCreate(std::ptr::null_mut());
+        let key = xmlSecKeyCreate();
+        assert_eq!(
+            xmlSecKeyDataBinRead(
+                symkeys::hmac(),
+                key.cast(),
+                secret.as_ptr(),
+                secret.len(),
+                (&raw mut (*ctx).key_info_read_ctx).cast(),
+            ),
+            0
+        );
+        (*ctx).sign_key = key;
+        // The caller admits every reference URI type, so only the policy
+        // decides what is read.
+        (*ctx).enabled_reference_uris = 0xFFFF;
+        assert_eq!(xmlSecDSigCtxVerify(ctx, signature), 0);
+        assert_eq!((*ctx).status, STATUS_INVALID);
+        assert_eq!((*ctx).failure_reason, FAILURE_SIGNATURE);
+        xmlSecDSigCtxDestroy(ctx);
+        xsFreeDoc(doc);
+        assert_eq!(xmlSecCryptoShutdown(), 0);
+        assert_eq!(xmlSecCryptoAppShutdown(), 0);
+        assert_eq!(xmlSecShutdown(), 0);
+    }
+}
+
 #[test]
 fn references_beyond_the_policy_limit_are_refused_before_their_contexts_exist() {
     // An untrusted signature names more references than the operation

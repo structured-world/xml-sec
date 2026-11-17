@@ -245,8 +245,11 @@ unsafe extern "C" fn read_node(
             .map_err(|error| error.to_string())
             .and_then(|document| {
                 document.with_view(|view| {
-                    EncryptionMethod::from_element(view.document().root_element())
-                        .map_err(|error| error.to_string())
+                    EncryptionMethod::from_element(
+                        view.document().root_element(),
+                        &pinned.decryption.resources,
+                    )
+                    .map_err(|error| error.to_string())
                 })
             });
         match parsed {

@@ -30,6 +30,43 @@ fn rsa_key() -> *mut XmlSecKey {
 }
 
 #[test]
+fn oaep_parameters_beyond_the_metadata_limit_are_refused() {
+    // The operation's policy bounds encryption metadata at 64 octets: an
+    // OAEP label longer than that is refused as the core's policy-aware
+    // parser refuses it, not admitted up to the hard ceiling.
+    let label = "A".repeat(128);
+    let method = format!(
+        "<EncryptionMethod xmlns=\"http://www.w3.org/2001/04/xmlenc#\" \
+         Algorithm=\"http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p\">\
+         <OAEPparams>{label}</OAEPparams></EncryptionMethod>"
+    );
+    let mut pinned = super::super::super::policy::Pinned::current(here!("test"))
+        .expect("the library policy compiles");
+    std::sync::Arc::make_mut(&mut pinned.decryption)
+        .resources
+        .max_encryption_metadata_bytes = 64;
+    // SAFETY: a document, a context and its transform, created and released
+    // here.
+    unsafe {
+        let doc = xml_sec_libxml2::ffi::tree::xsReadMemory(
+            method.as_ptr().cast(),
+            c_int::try_from(method.len()).expect("a short document"),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        assert!(!doc.is_null());
+        let ctx = xmlSecTransformCtxCreate();
+        super::super::ctx::pin_run(ctx, &pinned);
+        let transform = xmlSecTransformCtxCreateAndAppend(ctx, rsa_oaep());
+        let node = xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc);
+        assert_eq!(read_node(transform, node, ctx), -1);
+        xmlSecTransformCtxDestroy(ctx);
+        xml_sec_libxml2::ffi::tree::xsFreeDoc(doc);
+    }
+}
+
+#[test]
 fn input_after_a_finished_transport_is_refused() {
     // A transport that has produced its output takes no more input: bytes
     // left in its input buffer would be dropped while the chain succeeds.

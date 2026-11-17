@@ -512,6 +512,28 @@ impl<'a> UriReferenceResolver<'a> {
         self
     }
 
+    /// The key under which a caller-owned external-resource map
+    /// ([`Self::with_external_resources`]) holds the resource the external
+    /// reference `uri` names from `origin`, the element that carries it:
+    /// `uri` resolved against the XML Base `origin` inherits (RFC 3986
+    /// section 5.2), dot segments removed, query and fragment kept, within
+    /// the XML Base limits of `resources`.
+    ///
+    /// # Errors
+    /// [`TransformError`] when the resolution exceeds those limits.
+    pub fn external_resource_key(
+        origin: Node<'_, '_>,
+        uri: &str,
+        resources: &crate::policy::ResourcePolicy,
+    ) -> Result<String, TransformError> {
+        let budget = XmlBaseResolutionBudget::with_limits(
+            resources.max_xml_base_components,
+            resources.max_xml_base_resolution_bytes,
+        );
+        resolve_uri_from_node_with_budget(origin, uri, &budget)
+            .map_err(map_xml_base_resolution_error)
+    }
+
     pub(crate) fn with_external_resource_limits(
         mut self,
         max_resource_bytes: usize,
