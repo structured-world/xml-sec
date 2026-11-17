@@ -1859,6 +1859,104 @@ fn verify_context_meters_repeated_external_dereferences() {
 }
 
 #[test]
+fn lazy_resources_are_fetched_one_by_one_within_the_aggregate_allowance() {
+    // Planning names each reference's resource without fetching it: the
+    // source is asked for a resource only when its Reference is digested, so
+    // the aggregate ceiling refuses the second before the third is fetched.
+    let payload = b"payload";
+    let digest = base64::engine::general_purpose::STANDARD.encode(crate::xmldsig::compute_digest(
+        DigestAlgorithm::Sha1,
+        payload,
+    ));
+    let reference = |uri: &str| {
+        format!(
+            r#"<ds:Reference URI="{uri}"><ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference>"#
+        )
+    };
+    let references = [
+        reference("urn:one"),
+        reference("urn:two"),
+        reference("urn:three"),
+    ]
+    .concat();
+    let xml = format!(
+        r#"<ds:Signature xmlns:ds="{XMLDSIG_NS}"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>{references}</ds:SignedInfo><ds:SignatureValue>AQ==</ds:SignatureValue></ds:Signature>"#
+    );
+    let fetched = core::cell::Cell::new(0_usize);
+    let fetch = |_: &str| {
+        fetched.set(fetched.get() + 1);
+        Some(payload.to_vec())
+    };
+    let resources = super::super::uri::LazyExternalResources::new(
+        ["urn:one", "urn:two", "urn:three"].map(str::to_owned),
+        &fetch,
+    );
+    let policy = crate::policy::VerificationPolicy {
+        uris: crate::policy::UriPolicy {
+            references: UriTypeSet::ALL,
+            ..crate::policy::UriPolicy::default()
+        },
+        resources: crate::policy::ResourcePolicy {
+            max_external_resource_bytes: payload.len(),
+            max_external_resource_total_bytes: payload.len(),
+            ..crate::policy::ResourcePolicy::default()
+        },
+        ..crate::policy::VerificationPolicy::default()
+    };
+
+    let error = VerifyContext::new()
+        .key(&AcceptingKey)
+        .policy(policy)
+        .lazy_external_resources(&resources)
+        .verify(&xml)
+        .expect_err("the second resource must exhaust the aggregate byte ceiling");
+
+    assert!(
+        error
+            .to_string()
+            .contains("aggregate external resource bytes")
+    );
+    assert_eq!(fetched.get(), 2, "a resource was fetched before its turn");
+}
+
+#[test]
+fn a_key_info_reference_never_fetches_from_lazy_resources() {
+    // Key material is read before the SignatureValue is checked, so it never
+    // comes from the lazy payload source: a forgery whose KeyInfoReference
+    // names a listed resource makes the source fetch nothing.
+    let xml = format!(
+        r#"<ds:Signature xmlns:ds="{XMLDSIG_NS}" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="urn:key"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AQ==</ds:SignatureValue><ds:KeyInfo><dsig11:KeyInfoReference URI="urn:key"/></ds:KeyInfo></ds:Signature>"#
+    );
+    let key_info = format!(
+        r#"<ds:KeyInfo xmlns:ds="{XMLDSIG_NS}"><ds:KeyName>listed</ds:KeyName></ds:KeyInfo>"#
+    );
+    let fetched = core::cell::Cell::new(0_usize);
+    let fetch = |_: &str| {
+        fetched.set(fetched.get() + 1);
+        Some(key_info.clone().into_bytes())
+    };
+    let resources = super::super::uri::LazyExternalResources::new(["urn:key".to_owned()], &fetch);
+    let mut policy = crate::policy::VerificationPolicy::default();
+    policy
+        .key_sources
+        .insert(crate::policy::KeySourceKind::KeyInfoReference);
+    policy.uris.key_info_references = UriTypeSet::ALL;
+    policy.uris.references = UriTypeSet::ALL;
+
+    let forged = VerifyContext::new()
+        .key(&RejectingKey)
+        .policy(policy)
+        .lazy_external_resources(&resources)
+        .verify(&xml);
+
+    assert!(
+        !matches!(forged, Ok(ref result) if result.status == DsigStatus::Valid),
+        "a forged signature verified"
+    );
+    assert_eq!(fetched.get(), 0, "key material came from the lazy source");
+}
+
+#[test]
 fn verify_context_rejects_empty_uri_when_policy_disallows_empty() {
     let xml = minimal_signature_xml("", "");
     let err = VerifyContext::new()

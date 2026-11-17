@@ -4305,7 +4305,7 @@ fn materialize_external_key_info<P: KeyInfoReferencePolicy>(
             (resource, (!fragment.is_empty()).then_some(fragment))
         });
     let bytes = resolver
-        .external_resource(resource_uri)
+        .key_material_resource(resource_uri)
         .map_err(|error| {
             SignatureVerificationPipelineError::from(ReferenceProcessingError::UriDereference(
                 error,
@@ -4826,7 +4826,7 @@ fn visit_external_encapsulation<P: KeyInfoReferencePolicy>(
             reason: "KeyInfoReference safety depth exceeded",
         });
     }
-    let bytes = match resolver.external_resource(resource) {
+    let bytes = match resolver.key_material_resource(resource) {
         Ok(Some(bytes)) => bytes,
         Err(TransformError::Policy(violation)) => {
             return Err(DsigError::Policy(violation));
@@ -5382,9 +5382,11 @@ fn materialize_raw_certificate<P: KeyInfoReferencePolicy>(
         }
         .into());
     }
-    let certificate = resolver.external_resource(&resolved_uri).map_err(|error| {
-        SignatureVerificationPipelineError::from(ReferenceProcessingError::Transform(error))
-    })?;
+    let certificate = resolver
+        .key_material_resource(&resolved_uri)
+        .map_err(|error| {
+            SignatureVerificationPipelineError::from(ReferenceProcessingError::Transform(error))
+        })?;
     let Some(certificate) = certificate else {
         outcome.deferred_error.get_or_insert_with(|| {
             SignatureVerificationPipelineError::Reference(ReferenceProcessingError::Transform(

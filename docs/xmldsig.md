@@ -594,7 +594,11 @@ their URI class with `UriTypeSet` and provide every payload through
 performs network or filesystem I/O. A verifier that fetches payloads itself can hand
 `VerifyContext::lazy_external_resources` a `LazyExternalResources` instead: the core asks its
 source for a listed URI only when it dereferences that resource, after the `SignatureValue`
-verified, so a forged signature makes the caller fetch nothing. Individual resources are limited to 8 MiB and the
+verified, so a forged signature makes the caller fetch nothing. Resources are fetched one at a
+time as their references are digested, each within what the aggregate limit leaves. Key material
+an external `KeyInfoReference` or `RetrievalMethod` names is read before the signature is
+checked, so it never comes from that source; a verifier that needs it supplies its resources with
+`VerifyContext::external_resources`. Individual resources are limited to 8 MiB and the
 complete map to 32 MiB. The same aggregate ceiling is charged again per successful dereference,
 so repeatedly referencing one map entry cannot multiply transform work or retained diagnostics
 without bound. Signing dependency analysis and actual digest execution share that aggregate
