@@ -42,10 +42,10 @@ use super::super::transforms::builtin::{
 };
 use super::super::transforms::ctx::{
     KeyedResources, ReadResources, ResourceScope, XmlSecTransformCtx, charge_key_read,
-    execute_on_bytes, external_spent, read_resource, resource_keys, seed_run,
-    xmlSecTransformCtxCreate, xmlSecTransformCtxCreateAndAppend, xmlSecTransformCtxDestroy,
-    xmlSecTransformCtxExecute, xmlSecTransformCtxNodeRead, xmlSecTransformCtxNodesListRead,
-    xmlSecTransformCtxSetUri, xmlSecTransformCtxXmlExecute,
+    execute_on_bytes, external_spent, operation_side, read_resource, resource_keys, run_spent,
+    seed_run, xmlSecTransformCtxCreate, xmlSecTransformCtxCreateAndAppend,
+    xmlSecTransformCtxDestroy, xmlSecTransformCtxExecute, xmlSecTransformCtxNodeRead,
+    xmlSecTransformCtxNodesListRead, xmlSecTransformCtxSetUri, xmlSecTransformCtxXmlExecute,
 };
 use super::super::transforms::signatures::signing_key;
 use super::super::transforms::{
@@ -655,13 +655,21 @@ unsafe fn read_key(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode, pinned: &Pinned)
             let _read_pin = SlotPin::hold_pinned(
                 &raw mut (*read).reserved0,
                 pinned.clone(),
-                external_spent(&raw mut ctx.transform_ctx),
+                run_spent(&raw mut ctx.transform_ctx),
             );
             let mngr = ctx.key_info_read_ctx.keys_mngr;
             if let Some(get_key) = mngr.as_ref().and_then(|mngr| mngr.get_key) {
                 ctx.sign_key = get_key(node, read);
             }
-            charge_key_read(&raw mut ctx.transform_ctx, (*read).reserved0);
+            let side = operation_side(ctx.operation).unwrap_or(Side::Verify);
+            if !charge_key_read(
+                &raw mut ctx.transform_ctx,
+                (*read).reserved0,
+                pinned.of(side).resources(),
+                here,
+            ) {
+                return -1;
+            }
         }
         if ctx.sign_key.is_null()
             || xmlSecKeyMatch(ctx.sign_key, std::ptr::null(), &raw mut (*read).key_req) == 0

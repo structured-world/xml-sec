@@ -25,8 +25,8 @@ use super::super::policy::{Pinned, Side, SlotPin};
 use super::super::strings;
 use super::super::transforms::builtin::xmlSecTransformBase64GetKlass;
 use super::super::transforms::ctx::{
-    ReadResources, ResourceScope, charge_key_read, execute_on_bytes, external_spent, read_resource,
-    run_budget, run_policy, xmlSecTransformCtxBinaryExecute, xmlSecTransformCtxExecute,
+    ReadResources, ResourceScope, charge_key_read, external_spent, operation_side, read_resource,
+    run_policy, run_spent, xmlSecTransformCtxBinaryExecute, xmlSecTransformCtxExecute,
 };
 use super::super::transforms::ctx::{
     ctx_node_read_for, xmlSecTransformCtxCreateAndAppend, xmlSecTransformCtxCreateAndPrepend,
@@ -516,27 +516,9 @@ pub(super) unsafe fn encrypt_or_decrypt_to_buffer(
             return std::ptr::null_mut();
         }
         if ctx.cipher_value_node.is_null() {
-            // An external CipherReference is read once, its octets kept for
-            // the operation whose key this is: the core resolves every
-            // CipherReference of the element it decrypts.
-            let read = if ctx.operation == OPERATION_DECRYPT {
-                let Some(pinned) = run_policy(transforms, here) else {
-                    return std::ptr::null_mut();
-                };
-                let Some(read) = cipher_reference_resources(ctx, node, &pinned) else {
-                    errors::internal(here, std::ptr::null(), c"xmlSecTransformCtxUriExecute");
-                    return std::ptr::null_mut();
-                };
-                read
-            } else {
-                ReadResources::default()
-            };
-            let executed = match read.first_bytes() {
-                Some(bytes) => execute_on_bytes(transforms, bytes.as_ptr(), bytes.len()),
-                None => xmlSecTransformCtxExecute(transforms, xsNodeGetDoc(node)),
-            };
-            run_budget(transforms).key_resources.append(read);
-            if executed < 0 {
+            // The chain reads a CipherReference itself, after its
+            // pre-execute callback, as libxmlsec1 does.
+            if xmlSecTransformCtxExecute(transforms, xsNodeGetDoc(node)) < 0 {
                 errors::internal(here, std::ptr::null(), c"xmlSecTransformCtxExecute");
                 return std::ptr::null_mut();
             }
@@ -758,16 +740,24 @@ unsafe fn read_method_and_key(ctx: &mut XmlSecEncCtx, add_base64: bool) -> c_int
             let Some(pinned) = run_policy(transforms, here) else {
                 return -1;
             };
+            let side = operation_side(ctx.operation).unwrap_or(Side::Decrypt);
             let _read_pin = SlotPin::hold_pinned(
                 &raw mut (*read).reserved0,
-                pinned,
-                external_spent(transforms),
+                pinned.clone(),
+                run_spent(transforms),
             );
             let mngr = ctx.key_info_read_ctx.keys_mngr;
             if let Some(get_key) = mngr.as_ref().and_then(|mngr| mngr.get_key) {
                 ctx.enc_key = get_key(ctx.key_info_node, read);
             }
-            charge_key_read(transforms, (*read).reserved0);
+            if !charge_key_read(
+                transforms,
+                (*read).reserved0,
+                pinned.of(side).resources(),
+                here,
+            ) {
+                return -1;
+            }
         }
         if ctx.enc_key.is_null()
             || xmlSecKeyMatch(ctx.enc_key, std::ptr::null(), &raw mut (*read).key_req) == 0
@@ -920,14 +910,13 @@ unsafe fn content_key(ctx: &XmlSecEncCtx) -> Option<(DataEncryptionAlgorithm, Ze
     }
 }
 
-/// The octets of the external resource the `CipherReference` of an
-/// `EncryptedData` or `EncryptedKey` names, read through the caller's input
-/// callbacks under the decryption policy of the revision `pinned` and
-/// charged to the context's chain; empty for a cipher value or a
-/// same-document reference, `None` after a report.
+/// The octets of the external resource an `EncryptedData`'s
+/// `CipherReference` names, read through the caller's input callbacks under
+/// the decryption policy of the revision `pinned`; empty for a cipher value
+/// or a same-document reference, `None` after a report.
 ///
 /// # Safety
-/// `node` is the read, live element of the context.
+/// `node` is the read, live `EncryptedData` element of the context.
 unsafe fn cipher_reference_resources(
     ctx: &mut XmlSecEncCtx,
     node: *mut XmlNode,
@@ -967,18 +956,19 @@ unsafe fn cipher_reference_resources(
             );
             return None;
         };
-        let transforms = &raw mut ctx.transform_ctx;
-        // Counted on from what the key's read spent: one allowance.
-        let mut scope = ResourceScope::new(pinned, Side::Decrypt, external_spent(transforms));
         let bytes = read_resource(
-            transforms,
+            &raw mut ctx.transform_ctx,
             uri.as_bytes(),
             reference,
             xsNodeGetDoc(node),
-            &mut scope,
-        );
-        run_budget(transforms).external_resources = scope.spent.external_resources;
-        resources.push(origin, uri, bytes?);
+            // Counted on from what the key's read spent: one allowance.
+            &mut ResourceScope::new(
+                pinned,
+                Side::Decrypt,
+                external_spent(&raw mut ctx.transform_ctx),
+            ),
+        )?;
+        resources.push(origin, uri, bytes);
     }
     Some(resources)
 }
@@ -996,16 +986,10 @@ unsafe fn run_decryption(ctx: &mut XmlSecEncCtx, node: *mut XmlNode) -> *mut Xml
         return std::ptr::null_mut();
     };
     // SAFETY: the context's read nodes.
-    let Some(mut resources) = (unsafe { cipher_reference_resources(ctx, node, &pinned) }) else {
+    let Some(resources) = (unsafe { cipher_reference_resources(ctx, node, &pinned) }) else {
         errors::internal(here, std::ptr::null(), c"xmlSecTransformCtxUriExecute");
         return std::ptr::null_mut();
     };
-    // The core resolves the CipherReference of every EncryptedKey in the
-    // element's KeyInfo too: it takes the octets the key's read read.
-    // SAFETY: the context's own transform context.
-    resources.append(std::mem::take(unsafe {
-        &mut run_budget(&raw mut ctx.transform_ctx).key_resources
-    }));
     // SAFETY: the method and key were read.
     let Some((algorithm, key)) = (unsafe { content_key(ctx) }) else {
         errors::internal(here, std::ptr::null(), c"xmlSecKeyGetValue");

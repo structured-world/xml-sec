@@ -9,7 +9,6 @@ use std::ffi::{c_char, c_void};
 use std::sync::Arc;
 
 use super::errors::{self, Here};
-use super::transforms::ctx::ReadResources;
 
 use xml_sec::policy::{
     DecryptionPolicy, EncryptionPolicy, ResourcePolicy, SigningPolicy, VerificationPolicy,
@@ -171,13 +170,11 @@ impl KeyCandidates {
 }
 
 /// What a context's reserved slot holds during an operation: its policy
-/// revision, what its runs have spent so far and the external resources its
-/// `EncryptedKey` elements read.
+/// revision and what its runs have spent so far.
 struct Operation {
     pinned: Pinned,
     spent: Cell<Spent>,
     key_candidates: Cell<KeyCandidates>,
-    key_resources: Cell<ReadResources>,
 }
 
 /// A pin in a context's reserved slot for one call: the outermost call of an
@@ -224,7 +221,6 @@ impl SlotPin {
                 pinned,
                 spent: Cell::new(spent),
                 key_candidates: Cell::default(),
-                key_resources: Cell::default(),
             };
             *slot = Box::into_raw(Box::new(operation)).cast();
         }
@@ -282,16 +278,6 @@ pub(crate) unsafe fn spent<'a>(slot: *mut c_void) -> Option<&'a Cell<Spent>> {
 pub(crate) unsafe fn key_candidates<'a>(slot: *mut c_void) -> Option<&'a Cell<KeyCandidates>> {
     // SAFETY: by the caller's contract.
     unsafe { slot.cast::<Operation>().as_ref() }.map(|operation| &operation.key_candidates)
-}
-
-/// The external resources the `EncryptedKey` elements of the read pinned in
-/// `slot` read, if one is pinned.
-///
-/// # Safety
-/// As for [`pinned`].
-pub(crate) unsafe fn key_resources<'a>(slot: *mut c_void) -> Option<&'a Cell<ReadResources>> {
-    // SAFETY: by the caller's contract.
-    unsafe { slot.cast::<Operation>().as_ref() }.map(|operation| &operation.key_resources)
 }
 
 /// Publishes the current snapshots with the edits applied, as a libxmlsec1

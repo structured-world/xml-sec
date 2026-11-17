@@ -157,6 +157,14 @@ pub enum KeyEncryptionKeySource<'a> {
 
 /// Supplies keys for an `XMLEnc` operation under its immutable policy snapshot.
 pub trait DecryptionKeyResolver {
+    /// Whether the resolver recovers keys from the `EncryptedKey` elements of
+    /// a `KeyInfo`. One that supplies the content key itself never does, so
+    /// the operation neither dereferences their `CipherReference`s nor
+    /// offers them to it.
+    fn consults_encrypted_keys(&self) -> bool {
+        true
+    }
+
     /// Resolve an experimental KEM source under the operation snapshot. Raw
     /// content-key resolvers refuse by default rather than bypassing the KEM.
     ///
@@ -603,6 +611,10 @@ impl OpaqueContentKeyResolver {
 }
 
 impl DecryptionKeyResolver for OpaqueContentKeyResolver {
+    fn consults_encrypted_keys(&self) -> bool {
+        false
+    }
+
     fn resolve_key(
         &self,
         _provider: &dyn crate::provider::CryptoProvider,
@@ -1242,7 +1254,10 @@ impl<'a> DecryptContext<'a> {
                 }
                 _ => encrypted.cipher_data.octets()?.into_owned(),
             };
-            if let Some((document, _)) = source_document {
+            // A recipient's key is read only for a resolver that consults it.
+            if let Some((document, _)) = source_document
+                && self.resolver.consults_encrypted_keys()
+            {
                 resolve_key_cipher_references(
                     &mut encrypted.to_mut().encrypted_keys,
                     document,
@@ -1417,6 +1432,10 @@ impl SymmetricKeyDecryptor {
 }
 
 impl DecryptionKeyResolver for SymmetricKeyDecryptor {
+    fn consults_encrypted_keys(&self) -> bool {
+        false
+    }
+
     fn resolve_content_keys_with_policy(
         &self,
         provider: &dyn crate::provider::CryptoProvider,
@@ -2304,7 +2323,7 @@ fn resolve_content_key_candidates(
             &mut last_error,
         )?;
     }
-    for encrypted_key in &encrypted.encrypted_keys {
+    for encrypted_key in consulted_keys(resolver, encrypted) {
         let source = KeySourceView {
             key: encrypted_key,
             document: take_key_document(&mut document, encrypted_key)?,
@@ -2325,6 +2344,19 @@ fn resolve_content_key_candidates(
         Err(last_error.unwrap_or(XmlEncError::KeyNotFound))
     } else {
         Ok(candidates)
+    }
+}
+
+/// The `EncryptedKey` elements of `encrypted` that `resolver` recovers keys
+/// from: none for a resolver supplying the content key itself.
+fn consulted_keys<'a>(
+    resolver: &dyn DecryptionKeyResolver,
+    encrypted: &'a EncryptedData,
+) -> &'a [EncryptedKey] {
+    if resolver.consults_encrypted_keys() {
+        &encrypted.encrypted_keys
+    } else {
+        &[]
     }
 }
 

@@ -188,6 +188,8 @@ fn reported<T>(run: impl FnOnce() -> T) -> (T, Vec<std::ffi::c_int>) {
 static RESOURCES: std::sync::Mutex<Vec<(&str, Vec<u8>)>> = std::sync::Mutex::new(Vec::new());
 /// Resources [`by_uri_open`] opened.
 static OPENS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Octets [`by_uri_read`] handed out.
+static READ_OCTETS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// An open resource of [`RESOURCES`] and the octets already read.
 struct Cursor {
@@ -227,6 +229,7 @@ unsafe extern "C" fn by_uri_read(
     // SAFETY: the transform passes `len` writable bytes.
     unsafe { std::ptr::copy_nonoverlapping(rest.as_ptr(), buffer.cast(), count) };
     cursor.sent += count;
+    READ_OCTETS.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
     std::ffi::c_int::try_from(count).expect("at most `len` octets")
 }
 
@@ -243,6 +246,7 @@ unsafe extern "C" fn by_uri_close(context: *mut std::ffi::c_void) -> std::ffi::c
 unsafe fn serve_by_uri(resources: Vec<(&'static str, Vec<u8>)>) {
     *RESOURCES.lock().expect("one test thread") = resources;
     OPENS.store(0, std::sync::atomic::Ordering::Relaxed);
+    READ_OCTETS.store(0, std::sync::atomic::Ordering::Relaxed);
     // SAFETY: by the caller's contract.
     let registered = unsafe {
         crate::ffi::transforms::io::xmlSecIORegisterCallbacks(
@@ -462,11 +466,12 @@ unsafe extern "C" fn kek_or_read(node: *mut XmlNode, ctx: *mut XmlSecKeyInfoCtx)
 }
 
 #[test]
-fn an_encrypted_key_in_a_key_info_hands_its_resource_to_the_decryption() {
-    // An EncryptedData whose KeyInfo carries an EncryptedKey with a
-    // CipherReference decrypts as with libxmlsec1: the key's read reads that
-    // resource once, the core is handed the octets it read, and the two
-    // reads share the operation's aggregate limit.
+fn an_encrypted_key_with_a_cipher_reference_carries_the_content_key() {
+    // An EncryptedData whose KeyInfo carries EncryptedKeys with
+    // CipherReferences decrypts as with libxmlsec1: the key's read reads the
+    // first recipient's resource once and skips the others, the core
+    // decrypts with the key it found without needing a skipped recipient's
+    // resource, and the reads share the operation's aggregate limit.
     own_process();
     let plaintext = b"under one allowance";
     // SAFETY: the library, documents, contexts, keys and a manager set up and
@@ -484,6 +489,10 @@ fn an_encrypted_key_in_a_key_info_hands_its_resource_to_the_decryption() {
             "<EncryptedKey xmlns=\"http://www.w3.org/2001/04/xmlenc#\">",
             "<EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#kw-aes128\"/>",
             "<CipherData><CipherReference URI=\"test:wrapped\"/></CipherData>",
+            "</EncryptedKey>",
+            "<EncryptedKey xmlns=\"http://www.w3.org/2001/04/xmlenc#\">",
+            "<EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#kw-aes128\"/>",
+            "<CipherData><CipherReference URI=\"test:another-recipient\"/></CipherData>",
             "</EncryptedKey>",
             "</KeyInfo>",
             "<CipherData><CipherReference URI=\"test:cipher\"/></CipherData>",
@@ -534,6 +543,219 @@ fn an_encrypted_key_in_a_key_info_hands_its_resource_to_the_decryption() {
                     "{reasons:?}"
                 );
             }
+            xmlSecEncCtxDestroy(ctx);
+        }
+        xmlSecKeysMngrDestroy(mngr);
+        xsFreeDoc(doc.cast());
+        shut_down();
+    }
+}
+
+#[test]
+fn an_encrypted_key_veto_comes_before_its_resource_is_read() {
+    // A pre-execute callback refusing an EncryptedKey's chain runs before
+    // its CipherReference is read, as libxmlsec1 runs it before pumping the
+    // resource: no octet reaches the operation.
+    own_process();
+    // SAFETY: the library, a document and a context set up and released
+    // here, on this thread alone.
+    unsafe {
+        start_up();
+        let (_, wrapped) = encrypted(crate::ffi::transforms::ciphers::kw_aes128(), &[0x5a; 16]);
+        serve_by_uri(vec![("test:wrapped", wrapped)]);
+        let doc = parsed(concat!(
+            "<EncryptedKey xmlns=\"http://www.w3.org/2001/04/xmlenc#\">",
+            "<EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#kw-aes128\"/>",
+            "<CipherData><CipherReference URI=\"test:wrapped\"/></CipherData>",
+            "</EncryptedKey>"
+        ));
+        let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
+        (*ctx).mode = MODE_ENCRYPTED_KEY;
+        (*ctx).enc_key = aes_key();
+        (*ctx).transform_ctx.enabled_uris = 0xFFFF;
+        (*ctx).transform_ctx.pre_exec_callback = Some(veto);
+        let result = xmlSecEncCtxDecryptToBuffer(
+            ctx,
+            xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc.cast()),
+        );
+        assert!(result.is_null(), "the veto refuses the chain");
+        assert_eq!(
+            READ_OCTETS.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "nothing was read"
+        );
+        xmlSecEncCtxDestroy(ctx);
+        xsFreeDoc(doc.cast());
+        shut_down();
+    }
+}
+
+#[test]
+fn a_recipient_past_the_resource_limit_ends_the_key_read() {
+    // A recipient whose CipherReference passes a resource limit spends the
+    // operation's budget: the key read ends there instead of trying the next
+    // recipient under the same allowance, as the core ends an operation whose
+    // budget is spent.
+    own_process();
+    let plaintext = b"one budget";
+    // SAFETY: the library, documents, contexts, keys and a manager set up and
+    // released here, on this thread alone.
+    unsafe {
+        start_up();
+        let (_, wrapped) = encrypted(crate::ffi::transforms::ciphers::kw_aes128(), &[0x5a; 16]);
+        let (cipher, _) = encrypted(aes128_cbc(), plaintext);
+        let limit = wrapped.len();
+        serve_by_uri(vec![
+            ("test:oversized", vec![0; limit + 1]),
+            ("test:wrapped", wrapped),
+        ]);
+        xml_sec_libxml2::policy::republish_encryption(
+            |_| {},
+            |decryption| decryption.resources.max_external_resource_bytes = limit,
+        )
+        .expect("the library policy compiles");
+        let doc = parsed(&format!(
+            "{}{}{}{}",
+            concat!(
+                "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\">",
+                "<EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#aes128-cbc\"/>",
+                "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\">",
+                "<EncryptedKey xmlns=\"http://www.w3.org/2001/04/xmlenc#\">",
+                "<EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#kw-aes128\"/>",
+                "<CipherData><CipherReference URI=\"test:oversized\"/></CipherData>",
+                "</EncryptedKey>",
+                "<EncryptedKey xmlns=\"http://www.w3.org/2001/04/xmlenc#\">",
+                "<EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#kw-aes128\"/>",
+                "<CipherData><CipherReference URI=\"test:wrapped\"/></CipherData>",
+                "</EncryptedKey>",
+                "</KeyInfo>",
+            ),
+            "<CipherData><CipherValue>",
+            cipher,
+            "</CipherValue></CipherData></EncryptedData>"
+        ));
+        let mngr = xmlSecKeysMngrCreate();
+        (*mngr).get_key = Some(kek_or_read);
+        let ctx = xmlSecEncCtxCreate(mngr);
+        let read = &raw mut (*ctx).key_info_read_ctx;
+        assert_eq!(encrypted_key::xmlSecKeyInfoCtxCreateEncCtx(read), 0);
+        (*(*read).enc_ctx.cast::<XmlSecEncCtx>())
+            .transform_ctx
+            .enabled_uris = 0xFFFF;
+        let result = xmlSecEncCtxDecryptToBuffer(
+            ctx,
+            xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc.cast()),
+        );
+        assert!(result.is_null(), "the spent budget ends the operation");
+        assert_eq!(
+            OPENS.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the next recipient was not tried"
+        );
+        xmlSecEncCtxDestroy(ctx);
+        xmlSecKeysMngrDestroy(mngr);
+        xsFreeDoc(doc.cast());
+        shut_down();
+    }
+}
+
+#[test]
+fn nested_encrypted_keys_share_the_base64_allowance() {
+    // The Base64 output limit is cumulative per operation: the CipherValues
+    // of an EncryptedKey and of the EncryptedKey in its KeyInfo decode
+    // within one allowance, not one each.
+    own_process();
+    let content_key = [0x5a_u8; 16];
+    // SAFETY: the library, documents, contexts, keys and a manager set up and
+    // released here, on this thread alone.
+    unsafe {
+        start_up();
+        let (value, wrapped) =
+            encrypted(crate::ffi::transforms::ciphers::kw_aes128(), &content_key);
+        let total = 2 * wrapped.len();
+        let doc = parsed(&format!(
+            "{}{value}{}{value}{}",
+            concat!(
+                "<EncryptedKey xmlns=\"http://www.w3.org/2001/04/xmlenc#\">",
+                "<EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#kw-aes128\"/>",
+                "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\">",
+                "<EncryptedKey xmlns=\"http://www.w3.org/2001/04/xmlenc#\">",
+                "<EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#kw-aes128\"/>",
+                "<CipherData><CipherValue>",
+            ),
+            "</CipherValue></CipherData></EncryptedKey></KeyInfo><CipherData><CipherValue>",
+            "</CipherValue></CipherData></EncryptedKey>"
+        ));
+        let mngr = xmlSecKeysMngrCreate();
+        (*mngr).get_key = Some(kek_or_read);
+        for (limit, admitted) in [(total - 1, false), (total, true)] {
+            xml_sec_libxml2::policy::republish_encryption(
+                |_| {},
+                |decryption| decryption.resources.max_base64_transform_output_bytes = limit,
+            )
+            .expect("the library policy compiles");
+            let ctx = xmlSecEncCtxCreate(mngr);
+            (*ctx).mode = MODE_ENCRYPTED_KEY;
+            let (result, reasons) = reported(|| {
+                xmlSecEncCtxDecryptToBuffer(
+                    ctx,
+                    xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc.cast()),
+                )
+            });
+            assert_eq!(
+                !result.is_null(),
+                admitted,
+                "{total} octets decoded under {limit}: {reasons:?}"
+            );
+            xmlSecEncCtxDestroy(ctx);
+        }
+        xmlSecKeysMngrDestroy(mngr);
+        xsFreeDoc(doc.cast());
+        shut_down();
+    }
+}
+
+#[test]
+fn a_key_read_past_the_operations_limit_fails_the_decryption() {
+    // What the key read spent is checked against the decryption's own
+    // aggregate limit even when the decryption reads nothing more: an
+    // EncryptedData with a CipherValue cannot hide a key read past it.
+    own_process();
+    let plaintext = b"read inline";
+    // SAFETY: the library, documents, contexts, keys and a manager set up and
+    // released here, on this thread alone.
+    unsafe {
+        start_up();
+        let (cipher, _) = encrypted(aes128_cbc(), plaintext);
+        let doc = parsed(&format!(
+            "{}{cipher}{}",
+            concat!(
+                "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\">",
+                "<EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#aes128-cbc\"/>",
+                "<CipherData><CipherValue>",
+            ),
+            "</CipherValue></CipherData></EncryptedData>"
+        ));
+        let mngr = xmlSecKeysMngrCreate();
+        (*mngr).get_key = Some(charging_lookup);
+        for (limit, admitted) in [(KEY_READ_OCTETS - 1, false), (KEY_READ_OCTETS, true)] {
+            xml_sec_libxml2::policy::republish_encryption(
+                |_| {},
+                |decryption| decryption.resources.max_external_resource_total_bytes = limit,
+            )
+            .expect("the library policy compiles");
+            let ctx = xmlSecEncCtxCreate(mngr);
+            let (result, reasons) = reported(|| {
+                xmlSecEncCtxDecryptToBuffer(
+                    ctx,
+                    xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc.cast()),
+                )
+            });
+            assert_eq!(
+                !result.is_null(),
+                admitted,
+                "a key read of {KEY_READ_OCTETS} under {limit}: {reasons:?}"
+            );
             xmlSecEncCtxDestroy(ctx);
         }
         xmlSecKeysMngrDestroy(mngr);

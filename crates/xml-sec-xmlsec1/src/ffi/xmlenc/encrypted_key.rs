@@ -455,9 +455,10 @@ pub(crate) unsafe extern "C" fn xml_read(
 /// Decrypts the `EncryptedKey` `node` into `key` with the nested context
 /// `enc` as a part of the `KeyInfo` read with `ctx`: under the read's
 /// revision and its operation's side, counting on from what the read spent
-/// of the external-resource allowance and handing back what the decryption
-/// spent, whether it succeeds or not, so one limit bounds the operation, and
-/// the resources it read.
+/// of the per-operation budgets and handing back what the decryption spent,
+/// whether it succeeds or not, so one allowance bounds the operation. A
+/// read a resource limit refused ends the `KeyInfo` read: the budget is
+/// spent, so no later recipient is tried under it.
 ///
 /// # Safety
 /// `ctx` is a reading context whose nested context is `enc`; `node` a live
@@ -473,26 +474,16 @@ unsafe fn decrypt_within_read(
         let transforms = &raw mut (*enc).transform_ctx;
         let slot = (*ctx).reserved0;
         if let Some(pinned) = policy::pinned(slot) {
-            let spent = policy::spent(slot).map_or_default(|spent| policy::Spent {
-                external_resources: spent.get().external_resources,
-                ..policy::Spent::default()
-            });
+            let spent = policy::spent(slot).map_or_default(std::cell::Cell::get);
             let side = operation_side((*enc).operation).unwrap_or(policy::Side::Verify);
             seed_run(transforms, pinned, side, None, spent);
         }
         let read = xmlSecEncCtxEncryptedKeyXmlRead(enc, node, key, ctx);
         if let Some(spent) = policy::spent(slot) {
-            spent.set(policy::Spent {
-                external_resources: run_spent(transforms).external_resources,
-                ..spent.get()
-            });
+            spent.set(run_spent(transforms));
         }
-        // What the decryption read goes up to the operation whose key this
-        // is, which hands it to the core.
-        if let Some(resources) = policy::key_resources(slot) {
-            let mut all = resources.take();
-            all.append(std::mem::take(&mut run_budget(transforms).key_resources));
-            resources.set(all);
+        if run_budget(transforms).resource_limit_reached {
+            return -1;
         }
         read
     }

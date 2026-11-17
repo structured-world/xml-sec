@@ -562,6 +562,64 @@ fn a_key_read_and_the_references_share_one_allowance() {
 }
 
 #[test]
+fn a_key_read_past_the_operations_limit_fails_the_signing() {
+    // What the key read spent is checked against the signing's own aggregate
+    // limit even when every reference is in the document: no later read
+    // would check it.
+    own_process();
+    let template = concat!(
+        "<Envelope xmlns=\"urn:envelope\"><Data Id=\"data\">payload</Data>",
+        "<Signature xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><SignedInfo>",
+        "<CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>",
+        "<SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#hmac-sha256\"/>",
+        "<Reference URI=\"#data\">",
+        "<DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>",
+        "<DigestValue/></Reference></SignedInfo><SignatureValue/>",
+        "</Signature></Envelope>"
+    );
+    // SAFETY: the library, documents, a manager and contexts set up and torn
+    // down here, on this thread alone.
+    unsafe {
+        assert_eq!(xmlSecInit(), 0);
+        assert_eq!(xmlSecCryptoDLLoadLibrary(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoAppInit(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoInit(), 0);
+        let mngr = crate::ffi::keysmngr::xmlSecKeysMngrCreate();
+        (*mngr).get_key = Some(charging_lookup);
+        for (limit, signed) in [(KEY_READ_OCTETS - 1, -1), (KEY_READ_OCTETS, 0)] {
+            crate::ffi::policy::republish(
+                |_| {},
+                |signing| signing.resources.max_external_resource_total_bytes = limit,
+            )
+            .expect("the library policy compiles");
+            let doc = xsReadMemory(
+                template.as_ptr().cast(),
+                i32::try_from(template.len()).expect("a short document"),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+            );
+            assert!(!doc.is_null());
+            let ids = [c"Id".as_ptr().cast::<u8>(), std::ptr::null()];
+            xmlSecAddIDs(doc, std::ptr::null_mut(), ids.as_ptr());
+            let signature = xmlSecFindNode(
+                xsDocGetRootElement(doc),
+                c"Signature".as_ptr().cast(),
+                c"http://www.w3.org/2000/09/xmldsig#".as_ptr().cast(),
+            );
+            let ctx = xmlSecDSigCtxCreate(mngr);
+            assert_eq!(xmlSecDSigCtxSign(ctx, signature), signed, "under {limit}");
+            xmlSecDSigCtxDestroy(ctx);
+            xsFreeDoc(doc);
+        }
+        crate::ffi::keysmngr::xmlSecKeysMngrDestroy(mngr);
+        assert_eq!(xmlSecCryptoShutdown(), 0);
+        assert_eq!(xmlSecCryptoAppShutdown(), 0);
+        assert_eq!(xmlSecShutdown(), 0);
+    }
+}
+
+#[test]
 fn an_ignored_manifest_reads_none_of_its_resources() {
     // The operation's policy ignores Manifests: their references are never
     // dereferenced, so an authentic signature signs and verifies while the

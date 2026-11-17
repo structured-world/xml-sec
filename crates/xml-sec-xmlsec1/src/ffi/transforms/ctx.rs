@@ -89,10 +89,6 @@ pub(crate) struct RunBudget {
     /// An external-resource limit refused a read of the run: the operation's
     /// budget is spent, which ends the operation rather than one reference.
     pub(crate) resource_limit_reached: bool,
-    /// The external resources the `EncryptedKey` elements of the operation's
-    /// key read, each once, which the core is handed with the operation's own
-    /// as it resolves every `CipherReference` of the element it decrypts.
-    pub(crate) key_resources: ReadResources,
     /// Octets handed to the XML parser, of `max_xml_parse_work_bytes`.
     pub(crate) xml_parse: usize,
     /// `XPath` expressions evaluated, of `max_xpath_expressions`.
@@ -214,11 +210,8 @@ pub(crate) unsafe fn seed_run(
     }
     run.side = Some(side);
     run.uris = uris;
-    run.base64_input = spent.base64_input;
-    run.base64_output = spent.base64_output;
-    run.external_resources = spent.external_resources;
-    run.xml_parse = spent.xml_parse;
-    run.xpath_expressions = spent.xpath_expressions;
+    // SAFETY: by the caller's contract.
+    unsafe { take_spent(ctx, spent) };
 }
 
 /// What the run of `ctx` has spent; nothing when no run has started.
@@ -240,25 +233,85 @@ pub(crate) unsafe fn run_spent(ctx: *mut XmlSecTransformCtx) -> policy::Spent {
 }
 
 /// Takes into the run of `ctx`, the chain of an operation, what the
-/// operation has spent of the external-resource allowance once its `KeyInfo`
-/// read is done, and the resources the read's `EncryptedKey` elements read,
-/// held in the pin in the read context's slot `read_slot`: the read counted
-/// on from what the chain had spent ([`external_spent`]), and the
-/// operation's later reads count on from its total, so the key's resources
-/// and the operation's share one allowance.
+/// operation has spent of its per-operation budgets once its `KeyInfo` read
+/// is done, held in the pin in the read context's slot `read_slot`: the read
+/// counted on from what the chain had spent ([`run_spent`]), and the
+/// operation's later work counts on from its total, so the key's work and
+/// the operation's share one allowance. The read ran under its own parts'
+/// limits, so the total is checked against the operation's `resources`;
+/// `false` after a report at `here` when it exceeds one.
 ///
 /// # Safety
 /// `ctx` is an initialized context; `read_slot` is null or a pin.
-pub(crate) unsafe fn charge_key_read(ctx: *mut XmlSecTransformCtx, read_slot: *mut c_void) {
+pub(crate) unsafe fn charge_key_read(
+    ctx: *mut XmlSecTransformCtx,
+    read_slot: *mut c_void,
+    resources: &xml_sec::policy::ResourcePolicy,
+    here: errors::Here,
+) -> bool {
     // SAFETY: by the caller's contract.
-    unsafe {
-        if let Some(spent) = policy::spent(read_slot) {
-            run_budget(ctx).external_resources = spent.get().external_resources;
-        }
-        if let Some(read) = policy::key_resources(read_slot) {
-            run_budget(ctx).key_resources.append(read.take());
+    let Some(spent) = (unsafe { policy::spent(read_slot) }).map(std::cell::Cell::get) else {
+        return true;
+    };
+    for (value, limit) in [
+        (
+            spent.external_resources,
+            Limit {
+                name: "max_external_resource_total_bytes",
+                max: resources.max_external_resource_total_bytes,
+            },
+        ),
+        (
+            spent.base64_input,
+            Limit {
+                name: "max_base64_transform_input_bytes",
+                max: resources.max_base64_transform_input_bytes,
+            },
+        ),
+        (
+            spent.base64_output,
+            Limit {
+                name: "max_base64_transform_output_bytes",
+                max: resources.max_base64_transform_output_bytes,
+            },
+        ),
+        (
+            spent.xml_parse,
+            Limit {
+                name: "max_xml_parse_work_bytes",
+                max: resources.max_xml_parse_work_bytes,
+            },
+        ),
+        (
+            spent.xpath_expressions,
+            Limit {
+                name: "max_xpath_expressions",
+                max: resources.max_xpath_expressions,
+            },
+        ),
+    ] {
+        if value > limit.max {
+            errors::limit_exceeded(here, std::ptr::null(), limit.name, limit.max);
+            return false;
         }
     }
+    // SAFETY: by the caller's contract.
+    unsafe { take_spent(ctx, spent) };
+    true
+}
+
+/// Makes `spent` what the run of `ctx` has spent.
+///
+/// # Safety
+/// `ctx` is an initialized context.
+pub(crate) unsafe fn take_spent(ctx: *mut XmlSecTransformCtx, spent: policy::Spent) {
+    // SAFETY: by the caller's contract.
+    let run = unsafe { run_budget(ctx) };
+    run.base64_input = spent.base64_input;
+    run.base64_output = spent.base64_output;
+    run.external_resources = spent.external_resources;
+    run.xml_parse = spent.xml_parse;
+    run.xpath_expressions = spent.xpath_expressions;
 }
 
 /// What the operation whose chain is `ctx` has spent of its external-resource
@@ -1744,16 +1797,6 @@ impl ReadResources {
         bytes: Vec<u8>,
     ) {
         self.read.push(ReadResource { origin, uri, bytes });
-    }
-
-    /// Takes over the resources `other` read, after these.
-    pub(crate) fn append(&mut self, mut other: Self) {
-        self.read.append(&mut other.read);
-    }
-
-    /// The octets of the first resource read, if any.
-    pub(crate) fn first_bytes(&self) -> Option<&[u8]> {
-        self.read.first().map(|resource| resource.bytes.as_slice())
     }
 
     /// The resources keyed as the core looks them up in `document`, a

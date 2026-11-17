@@ -163,6 +163,39 @@ fn cipher_reference_enveloped_transform_uses_its_actual_signature_ancestor() {
 }
 
 #[test]
+fn a_direct_key_needs_no_resource_of_a_recipient_it_does_not_use() {
+    // A resolver answering the content key directly never consults the
+    // EncryptedKeys of the KeyInfo, so the external CipherReference of a
+    // recipient it does not use is not dereferenced and needs no bytes.
+    let key = [0x31; 16];
+    let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+        .direct_key(key)
+        .encrypt_binary(b"for the direct key")
+        .unwrap();
+    let xml = encrypted.encrypted_data_xml.replacen(
+        "<xenc:CipherData>",
+        &format!(
+            "<ds:KeyInfo xmlns:ds='{DS}'><xenc:EncryptedKey><xenc:EncryptionMethod \
+             Algorithm='{ENC}kw-aes128'/><xenc:CipherData><xenc:CipherReference \
+             URI='urn:another-recipient'/></xenc:CipherData></xenc:EncryptedKey></ds:KeyInfo>\
+             <xenc:CipherData>"
+        ),
+        1,
+    );
+    let resources = BTreeMap::new();
+    let resolver = SymmetricKeyDecryptor::new(key);
+    let decrypted = DecryptContext::new(&resolver)
+        .policy(external_policy())
+        .external_resources(&resources)
+        .decrypt(&xml)
+        .expect("the direct key decrypts");
+    assert_eq!(
+        decrypted.output,
+        DecryptedContent::Bytes(b"for the direct key".to_vec())
+    );
+}
+
+#[test]
 fn external_cipher_reference_decrypts_authenticated_content() {
     // The public decrypt path consumes caller bytes directly, without creating
     // an artificial inline CipherValue or weakening GCM authentication.
