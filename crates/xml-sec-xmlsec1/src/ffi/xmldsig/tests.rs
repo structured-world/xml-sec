@@ -220,6 +220,77 @@ unsafe extern "C" fn detached_close(_context: *mut std::ffi::c_void) -> std::ffi
 }
 
 #[test]
+fn a_forged_signature_opens_none_of_its_external_references() {
+    // The SignatureValue is checked before any reference is dereferenced:
+    // a forgery naming an external URI makes the caller's callbacks open
+    // nothing, where libxmlsec1 reads every reference first.
+    own_process();
+    let document = TAMPERED.replace(
+        "</SignedInfo>",
+        concat!(
+            "<Reference URI=\"test:detached\">",
+            "<DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>",
+            "<DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</DigestValue>",
+            "</Reference></SignedInfo>"
+        ),
+    );
+    let secret = b"secret-of-thirty-two-octets-long";
+    // SAFETY: the library, a document, a key and a context set up and torn
+    // down here, on this thread alone.
+    unsafe {
+        assert_eq!(xmlSecInit(), 0);
+        assert_eq!(xmlSecCryptoDLLoadLibrary(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoAppInit(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoInit(), 0);
+        assert_eq!(
+            crate::ffi::transforms::io::xmlSecIORegisterCallbacks(
+                Some(detached_matches),
+                Some(detached_open),
+                Some(detached_read),
+                Some(detached_close),
+            ),
+            0
+        );
+        let doc = xsReadMemory(
+            document.as_ptr().cast(),
+            i32::try_from(document.len()).expect("a short document"),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        assert!(!doc.is_null());
+        let signature = xmlSecFindNode(
+            xsDocGetRootElement(doc),
+            c"Signature".as_ptr().cast(),
+            c"http://www.w3.org/2000/09/xmldsig#".as_ptr().cast(),
+        );
+        let ctx = xmlSecDSigCtxCreate(std::ptr::null_mut());
+        let key = xmlSecKeyCreate();
+        assert_eq!(
+            xmlSecKeyDataBinRead(
+                symkeys::hmac(),
+                key.cast(),
+                secret.as_ptr(),
+                secret.len(),
+                (&raw mut (*ctx).key_info_read_ctx).cast(),
+            ),
+            0
+        );
+        (*ctx).sign_key = key;
+        (*ctx).enabled_reference_uris = 0xFFFF;
+        assert_eq!(xmlSecDSigCtxVerify(ctx, signature), 0);
+        assert_eq!((*ctx).status, STATUS_INVALID);
+        assert_eq!((*ctx).failure_reason, FAILURE_SIGNATURE);
+        assert_eq!(DETACHED_OPENS.load(std::sync::atomic::Ordering::Relaxed), 0);
+        xmlSecDSigCtxDestroy(ctx);
+        xsFreeDoc(doc);
+        assert_eq!(xmlSecCryptoShutdown(), 0);
+        assert_eq!(xmlSecCryptoAppShutdown(), 0);
+        assert_eq!(xmlSecShutdown(), 0);
+    }
+}
+
+#[test]
 fn a_stored_pre_digest_holds_the_bytes_that_were_signed() {
     // A detached reference is read once for signing; the kept pre-digest
     // buffer holds those bytes, not what a second read of the URI returns.

@@ -1648,11 +1648,6 @@ struct ReadResource {
 }
 
 impl ReadResources {
-    /// Whether a resource was read under `uri` as written.
-    pub(crate) fn contains(&self, uri: &str) -> bool {
-        self.read.iter().any(|resource| resource.uri == uri)
-    }
-
     /// Records the octets `origin`'s URI `uri` named.
     pub(crate) fn push(
         &mut self,
@@ -1676,22 +1671,13 @@ impl ReadResources {
         document: &xml_sec::document::XmlDocument,
         resources: &xml_sec::policy::ResourcePolicy,
     ) -> Result<KeyedResources, String> {
-        let keys = document.with_view(|view| {
+        let keys = resource_keys(
+            document,
             self.read
                 .iter()
-                .map(|resource| {
-                    let origin = view
-                        .node_of_external(resource.origin)
-                        .ok_or("the element of an external reference is not in the document")?;
-                    xml_sec::xmldsig::uri::UriReferenceResolver::external_resource_key(
-                        origin,
-                        &resource.uri,
-                        resources,
-                    )
-                    .map_err(|error| error.to_string())
-                })
-                .collect::<Result<Vec<_>, String>>()
-        })?;
+                .map(|resource| (resource.origin, resource.uri.as_str())),
+            resources,
+        )?;
         let mut keyed = KeyedResources::default();
         for (resource, key) in self.read.into_iter().zip(keys) {
             keyed.written.push((resource.uri, key.clone()));
@@ -1700,6 +1686,33 @@ impl ReadResources {
         }
         Ok(keyed)
     }
+}
+
+/// The keys the core looks external resources up by in `document`, a
+/// tree-backed document of their tree: each URI as its element carries it,
+/// resolved from that element against the XML Base it inherits, within
+/// `resources`' limits.
+///
+/// # Errors
+/// The resolution's failure, or an element `document` does not hold.
+pub(crate) fn resource_keys<'u>(
+    document: &xml_sec::document::XmlDocument,
+    references: impl Iterator<Item = (xml_sec::document::external::ExternalNode, &'u str)>,
+    resources: &xml_sec::policy::ResourcePolicy,
+) -> Result<Vec<String>, String> {
+    document.with_view(|view| {
+        references
+            .map(|(origin, uri)| {
+                let origin = view
+                    .node_of_external(origin)
+                    .ok_or("the element of an external reference is not in the document")?;
+                xml_sec::xmldsig::uri::UriReferenceResolver::external_resource_key(
+                    origin, uri, resources,
+                )
+                .map_err(|error| error.to_string())
+            })
+            .collect()
+    })
 }
 
 /// External resources keyed as the core looks them up, with the URI each was

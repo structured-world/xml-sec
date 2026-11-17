@@ -166,6 +166,57 @@ fn reference_resolution_uses_each_elements_effective_xml_base() {
 }
 
 #[test]
+fn lazy_external_resources_are_fetched_only_after_the_signature_value_verifies() {
+    // A forged SignatureValue fails before any reference is dereferenced, so
+    // the caller's source is never asked for the URI the forgery names; an
+    // authentic one fetches the resource once, when its Reference is digested.
+    let digest = base64::engine::general_purpose::STANDARD
+        .encode(compute_digest(DigestAlgorithm::Sha256, b"payload"));
+    let xml = format!(
+        r#"<root xmlns:ds="{XMLDSIG_NS}">
+  <ds:Signature>
+    <ds:SignedInfo>
+      <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+      <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+      <ds:Reference URI="urn:payload">
+        <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+        <ds:DigestValue>{digest}</ds:DigestValue>
+      </ds:Reference>
+    </ds:SignedInfo>
+    <ds:SignatureValue>AQ==</ds:SignatureValue>
+  </ds:Signature>
+</root>"#
+    );
+    let fetched = core::cell::Cell::new(0_usize);
+    let fetch = |uri: &str| {
+        fetched.set(fetched.get() + 1);
+        (uri == "urn:payload").then(|| b"payload".to_vec())
+    };
+
+    let resources =
+        super::super::uri::LazyExternalResources::new(["urn:payload".to_owned()], &fetch);
+    let forged = VerifyContext::new()
+        .key(&RejectingKey)
+        .allowed_uri_types(UriTypeSet::ALL)
+        .lazy_external_resources(&resources)
+        .verify(&xml)
+        .expect("a forged signature value is a verification status");
+    assert!(matches!(forged.status, DsigStatus::Invalid(_)));
+    assert_eq!(fetched.get(), 0, "a forged signature fetched a resource");
+
+    let resources =
+        super::super::uri::LazyExternalResources::new(["urn:payload".to_owned()], &fetch);
+    let authentic = VerifyContext::new()
+        .key(&AcceptingKey)
+        .allowed_uri_types(UriTypeSet::ALL)
+        .lazy_external_resources(&resources)
+        .verify(&xml)
+        .expect("an authentic signature verifies");
+    assert_eq!(authentic.status, DsigStatus::Valid);
+    assert_eq!(fetched.get(), 1);
+}
+
+#[test]
 fn internal_dtd_opt_in_applies_to_detached_xml_transforms() {
     // The parse policy covers every XML document in one verification
     // pipeline, including caller-owned octets converted to a node-set.

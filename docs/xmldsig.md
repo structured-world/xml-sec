@@ -591,7 +591,10 @@ error as a rejected document; never continue an authentication flow after either
 External references are disabled by default. Verification and signing callers must both allow
 their URI class with `UriTypeSet` and provide every payload through
 `VerifyContext::external_resources` or `SignContext::external_resources`; neither operation
-performs network or filesystem I/O. Individual resources are limited to 8 MiB and the
+performs network or filesystem I/O. A verifier that fetches payloads itself can hand
+`VerifyContext::lazy_external_resources` a `LazyExternalResources` instead: the core asks its
+source for a listed URI only when it dereferences that resource, after the `SignatureValue`
+verified, so a forged signature makes the caller fetch nothing. Individual resources are limited to 8 MiB and the
 complete map to 32 MiB. The same aggregate ceiling is charged again per successful dereference,
 so repeatedly referencing one map entry cannot multiply transform work or retained diagnostics
 without bound. Signing dependency analysis and actual digest execution share that aggregate

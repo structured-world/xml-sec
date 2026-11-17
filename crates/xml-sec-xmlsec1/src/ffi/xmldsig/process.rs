@@ -20,7 +20,7 @@ use xml_sec::policy::{
 use xml_sec::xmldsig::{
     DsigStatus, FailureReason, HmacSigningKey, HmacVerificationKey, ReferenceResult, SignContext,
     SignatureAlgorithm, SignatureTemplateSelection, SigningKey, VerificationKey, VerifyContext,
-    VerifyResult, VerifyingKey,
+    VerifyResult, VerifyingKey, uri::LazyExternalResources,
 };
 use xml_sec_libxml2::ffi::tree::{xsNodeGetChildren, xsNodeGetDoc};
 
@@ -41,10 +41,10 @@ use super::super::transforms::builtin::{
     xmlSecTransformBase64GetKlass, xmlSecTransformMemBufGetBuffer, xmlSecTransformMemBufGetKlass,
 };
 use super::super::transforms::ctx::{
-    KeyedResources, ReadResources, ResourceScope, execute_on_bytes, read_resource,
-    xmlSecTransformCtxCreate, xmlSecTransformCtxCreateAndAppend, xmlSecTransformCtxDestroy,
-    xmlSecTransformCtxExecute, xmlSecTransformCtxNodeRead, xmlSecTransformCtxNodesListRead,
-    xmlSecTransformCtxSetUri, xmlSecTransformCtxXmlExecute,
+    KeyedResources, ReadResources, ResourceScope, XmlSecTransformCtx, execute_on_bytes,
+    read_resource, resource_keys, xmlSecTransformCtxCreate, xmlSecTransformCtxCreateAndAppend,
+    xmlSecTransformCtxDestroy, xmlSecTransformCtxExecute, xmlSecTransformCtxNodeRead,
+    xmlSecTransformCtxNodesListRead, xmlSecTransformCtxSetUri, xmlSecTransformCtxXmlExecute,
 };
 use super::super::transforms::signatures::signing_key;
 use super::super::transforms::{
@@ -301,29 +301,38 @@ unsafe fn run_operation(
         if run_pre_execute_callbacks(ctx) < 0 {
             return -1;
         }
-        let (side, manifests) = match &policies {
-            OperationPolicies::Sign(policy) => (Side::Sign, policy.manifest_processing),
-            OperationPolicies::Verify(policy) => (Side::Verify, policy.manifest_processing),
-        };
-        let mut scope = ResourceScope {
-            pinned,
-            side,
-            spent: Spent::default(),
+        let manifests = match &policies {
+            OperationPolicies::Sign(policy) => policy.manifest_processing,
+            OperationPolicies::Verify(policy) => policy.manifest_processing,
         };
         // The core never dereferences a Manifest's references when the
         // policy ignores Manifests, so nothing of theirs is read.
-        let processes_manifests = manifests == ManifestProcessing::Process;
-        let Some(resources) = external_resources(ctx, node, processes_manifests, &mut scope) else {
-            errors::internal(
-                here!("xmlSecDSigCtxProcessSignatureNode"),
-                std::ptr::null(),
-                c"xmlSecTransformCtxUriExecute",
-            );
+        let Some(pending) = pending_resources(ctx, manifests == ManifestProcessing::Process) else {
             return -1;
         };
         match policies {
-            OperationPolicies::Sign(policy) => run_signing(ctx, node, &policy, resources),
-            OperationPolicies::Verify(policy) => run_verification(ctx, node, policy, resources),
+            OperationPolicies::Sign(policy) => {
+                // Signing digests every reference, so each resource is read.
+                let mut scope = ResourceScope {
+                    pinned,
+                    side: Side::Sign,
+                    spent: Spent::default(),
+                };
+                let Some(resources) = read_all(pending, xsNodeGetDoc(node), &mut scope) else {
+                    errors::internal(
+                        here!("xmlSecDSigCtxProcessSignatureNode"),
+                        std::ptr::null(),
+                        c"xmlSecTransformCtxUriExecute",
+                    );
+                    return -1;
+                };
+                run_signing(ctx, node, &policy, resources)
+            }
+            // Verification reads a resource only when the core dereferences
+            // it, after the SignatureValue verified.
+            OperationPolicies::Verify(policy) => {
+                run_verification(ctx, node, pinned, policy, &pending)
+            }
         }
     }
 }
@@ -428,58 +437,103 @@ unsafe fn run_pre_execute_callbacks(ctx: &mut XmlSecDSigCtx) -> c_int {
     0
 }
 
-/// The octets of every external resource the context's `SignedInfo`
-/// references name, and its Manifest references' when `manifests`, keyed by
-/// their URI and read through the caller's input callbacks under the
-/// operation `scope`, one allowance across them all; `None` after a report.
+/// An external resource a reference of the context names, not read yet.
+struct PendingResource {
+    /// The `Reference` element, as the core's documents name it.
+    origin: ExternalNode,
+    /// The URI as the element carries it.
+    uri: String,
+    /// The `Reference` element of the caller's tree.
+    element: *mut XmlNode,
+    /// The reference's own context, whose enabled URI types gate the read.
+    prefs: *mut XmlSecTransformCtx,
+}
+
+/// The external resources the context's `SignedInfo` references name, and
+/// its Manifest references' when `manifests`, each URI once; `None` after a
+/// report.
 ///
 /// # Safety
-/// The context's reference lists hold read reference contexts; `node` is a
-/// live node of their document.
-unsafe fn external_resources(
+/// The context's reference lists hold read reference contexts.
+unsafe fn pending_resources(
     ctx: &mut XmlSecDSigCtx,
-    node: *mut XmlNode,
     manifests: bool,
-    scope: &mut ResourceScope<'_>,
-) -> Option<ReadResources> {
-    let mut resources = ReadResources::default();
-    // SAFETY: a live node.
-    let doc = unsafe { xsNodeGetDoc(node) };
+) -> Option<Vec<PendingResource>> {
+    let mut pending: Vec<PendingResource> = Vec::new();
     let lists = [
         &raw mut ctx.signed_info_references,
         &raw mut ctx.manifest_references,
     ];
     for list in &lists[..if manifests { 2 } else { 1 }] {
-        let list = *list;
         // SAFETY: the context's own lists of reference contexts.
-        for reference in unsafe { references(list) } {
+        for reference in unsafe { references(*list) } {
             // SAFETY: the reference's URI copy and its `Reference` element.
-            unsafe {
-                let Some(uri) = super::super::tree::c_text(reference.uri) else {
-                    continue;
-                };
-                if uri.is_empty() || uri.starts_with('#') || resources.contains(uri) {
-                    continue;
-                }
-                let element = reference.reserved0.cast::<XmlNode>();
-                let Some(origin) = external_of(element) else {
-                    errors::internal(
-                        here!("xmlSecTransformCtxUriExecute"),
-                        std::ptr::null(),
-                        c"node identity",
-                    );
-                    return None;
-                };
-                let bytes = read_resource(
-                    &raw mut reference.transform_ctx,
-                    uri.as_bytes(),
-                    element,
-                    doc,
-                    scope,
-                )?;
-                resources.push(origin, uri.to_owned(), bytes);
+            let Some(uri) = (unsafe { super::super::tree::c_text(reference.uri) }) else {
+                continue;
+            };
+            if uri.is_empty()
+                || uri.starts_with('#')
+                || pending.iter().any(|resource| resource.uri == uri)
+            {
+                continue;
             }
+            let element = reference.reserved0.cast::<XmlNode>();
+            let Some(origin) = external_of(element) else {
+                errors::internal(
+                    here!("xmlSecTransformCtxUriExecute"),
+                    std::ptr::null(),
+                    c"node identity",
+                );
+                return None;
+            };
+            pending.push(PendingResource {
+                origin,
+                uri: uri.to_owned(),
+                element,
+                prefs: &raw mut reference.transform_ctx,
+            });
         }
+    }
+    Some(pending)
+}
+
+/// Reads `resource` through the caller's input callbacks under `scope`.
+///
+/// # Safety
+/// `resource` names live elements and contexts of `doc`.
+unsafe fn read_pending(
+    resource: &PendingResource,
+    doc: *mut XmlDoc,
+    scope: &mut ResourceScope<'_>,
+) -> Option<Vec<u8>> {
+    // SAFETY: by the caller's contract.
+    unsafe {
+        read_resource(
+            resource.prefs,
+            resource.uri.as_bytes(),
+            resource.element,
+            doc,
+            scope,
+        )
+    }
+}
+
+/// Every resource of `pending` read under the operation `scope`, one
+/// allowance across them all, as signing digests each of them; `None` after
+/// a report.
+///
+/// # Safety
+/// As for [`read_pending`].
+unsafe fn read_all(
+    pending: Vec<PendingResource>,
+    doc: *mut XmlDoc,
+    scope: &mut ResourceScope<'_>,
+) -> Option<ReadResources> {
+    let mut resources = ReadResources::default();
+    for resource in pending {
+        // SAFETY: by the caller's contract.
+        let bytes = unsafe { read_pending(&resource, doc, scope) }?;
+        resources.push(resource.origin, resource.uri, bytes);
     }
     Some(resources)
 }
@@ -1032,16 +1086,20 @@ fn identity_in(document: &XmlDocument, external: ExternalNode) -> Option<xml_sec
 }
 
 /// Runs the core verification of the `Signature` element `node` under
-/// `policy`, with the external `resources` its references name, and
-/// reports its outcome in the contexts.
+/// `policy` of the revision `pinned`, and reports its outcome in the
+/// contexts. Each `pending` resource is read through the caller's input
+/// callbacks only when the core dereferences it, after the `SignatureValue`
+/// verified, so a forged signature makes the callbacks open nothing.
 ///
 /// # Safety
-/// `node` is a live node; the context's method and key are set.
+/// `node` is a live node; the context's method and key are set; `pending`
+/// names live elements and contexts of `node`'s document.
 unsafe fn run_verification(
     ctx: &mut XmlSecDSigCtx,
     node: *mut XmlNode,
+    pinned: &Pinned,
     policy: Arc<VerificationPolicy>,
-    resources: ReadResources,
+    pending: &[PendingResource],
 ) -> c_int {
     let here = here!("xmlSecDSigCtxVerify");
     // SAFETY: the method was read.
@@ -1071,13 +1129,39 @@ unsafe fn run_verification(
         errors::internal(here, std::ptr::null(), c"node identity");
         return -1;
     };
-    let resources = match resources.into_keyed(&document, &policy.resources) {
-        Ok(keyed) => keyed,
+    let keys = match resource_keys(
+        &document,
+        pending
+            .iter()
+            .map(|resource| (resource.origin, resource.uri.as_str())),
+        &policy.resources,
+    ) {
+        Ok(keys) => keys,
         Err(error) => {
             errors::invalid_data(here, std::ptr::null(), &error);
             return -1;
         }
     };
+    // SAFETY: a live node.
+    let doc = unsafe { xsNodeGetDoc(node) };
+    // Every read of the operation shares one allowance.
+    let spent = std::cell::Cell::new(Spent::default());
+    let fetch = |key: &str| {
+        let (resource, _) = pending
+            .iter()
+            .zip(&keys)
+            .find(|(_, resource_key)| *resource_key == key)?;
+        let mut scope = ResourceScope {
+            pinned,
+            side: Side::Verify,
+            spent: spent.get(),
+        };
+        // SAFETY: by the contract of `run_verification`.
+        let bytes = unsafe { read_pending(resource, doc, &mut scope) };
+        spent.set(scope.spent);
+        bytes
+    };
+    let resources = LazyExternalResources::new(keys.iter().cloned(), &fetch);
     let store = ctx.flags
         & (FLAGS_STORE_SIGNATURE
             | FLAGS_STORE_SIGNEDINFO_REFERENCES
@@ -1087,7 +1171,7 @@ unsafe fn run_verification(
         .shared_policy(policy)
         .key(key.as_ref())
         .signature(signature)
-        .external_resources(&resources.by_key)
+        .lazy_external_resources(&resources)
         .store_pre_digest(store)
         .verify_document(&document);
     let result = match outcome {

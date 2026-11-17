@@ -63,7 +63,10 @@ use super::transforms::{
     map_c14n_resource_policy_violation, transform_chain_uses_implicit_c14n,
 };
 use super::types::{NodeSet, TransformError, subtree_node_id_range};
-use super::uri::{ExternalResourceMapError, UriReferenceResolver, validate_external_resource_map};
+use super::uri::{
+    ExternalResourceMapError, ExternalResourceSet, LazyExternalResources, UriReferenceResolver,
+    validate_external_resource_map,
+};
 use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_bytes};
 
 mod session;
@@ -488,7 +491,7 @@ pub struct VerifyContext<'a> {
     provider: &'a dyn crate::provider::CryptoProvider,
     xml_backend: crate::XmlBackend,
     store_pre_digest: bool,
-    external_resources: Option<&'a BTreeMap<String, Vec<u8>>>,
+    external_resources: Option<ExternalResourceSet<'a>>,
     signature_selection: SignatureSelection<'a>,
     id_attributes: &'a [crate::IdAttributeRegistration],
 }
@@ -654,7 +657,28 @@ impl<'a> VerifyContext<'a> {
     /// identities: use normalized paths with dot segments removed and retain
     /// query or fragment suffixes.
     pub fn external_resources(mut self, resources: &'a BTreeMap<String, Vec<u8>>) -> Self {
-        self.external_resources = Some(resources);
+        self.external_resources = Some(ExternalResourceSet::Map(resources));
+        self
+    }
+
+    /// Provide external URI payloads on demand, in place of
+    /// [`Self::external_resources`]: a resource is fetched only when a
+    /// reference dereferences it, and every signature's `SignatureValue` is
+    /// checked before its references are, so a forged signature fetches none
+    /// of the resources it names. The same URI and policy rules apply.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use xml_sec::xmldsig::VerifyContext;
+    /// use xml_sec::xmldsig::uri::LazyExternalResources;
+    ///
+    /// let fetch = |_: &str| None;
+    /// let resources = LazyExternalResources::new(["urn:payload".to_owned()], &fetch);
+    /// let _context = VerifyContext::new().lazy_external_resources(&resources);
+    /// ```
+    pub fn lazy_external_resources(mut self, resources: &'a LazyExternalResources<'a>) -> Self {
+        self.external_resources = Some(ExternalResourceSet::Lazy(resources));
         self
     }
 
@@ -2685,7 +2709,7 @@ fn with_verified_document<'inputs, R, S: RequestStorage>(
         captured_context = {
             let mut captured = ctx.clone();
             if let Some(resources) = request.external_resources {
-                captured.external_resources = Some(resources);
+                captured.external_resources = Some(ExternalResourceSet::Map(resources));
             }
             if capture_time {
                 // Without a host clock this stays `None`; key resolution then
@@ -2722,7 +2746,7 @@ fn with_verified_document<'inputs, R, S: RequestStorage>(
                 ctx.policy.resources.max_external_resource_total_bytes,
             );
         let resolver = match ctx.external_resources {
-            Some(resources) => resolver.with_external_resources(resources),
+            Some(resources) => resolver.with_external_resource_set(resources),
             None => resolver,
         };
         for signature in view.document().descendants().filter(is_signature) {
@@ -2829,7 +2853,7 @@ fn verify_signature_view(
             ctx.policy.resources.max_external_resource_total_bytes,
         );
     let resolver = match ctx.external_resources {
-        Some(resources) => resolver.with_external_resources(resources),
+        Some(resources) => resolver.with_external_resource_set(resources),
         None => resolver,
     };
     let start_node = match ctx.signature_selection {
@@ -3275,7 +3299,10 @@ fn validate_verification_inputs(
         ctx.allowed_transform_uris(),
     )?;
     enforce_transform_allowed(ctx.allowed_transform_uris(), signed_info.c14n_method.uri())?;
-    if let Some(resources) = ctx.external_resources {
+    if let Some(resources) = ctx
+        .external_resources
+        .and_then(ExternalResourceSet::supplied)
+    {
         validate_external_resource_map(
             resources,
             ctx.policy.resources.max_external_resource_bytes,
