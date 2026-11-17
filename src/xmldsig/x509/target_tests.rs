@@ -7,6 +7,9 @@ use std::time::{Duration, SystemTime};
 use super::*;
 use crate::policy::{DsaKeyPolicy, ResourcePolicy, RsaKeyPolicy};
 
+/// The candidate paths a validation may consider.
+const PATHS: usize = 16;
+
 fn instant(time: SystemTime) -> Instant {
     crate::policy::instant_from_system_time(time).expect("representable test time")
 }
@@ -88,6 +91,7 @@ fn the_target_key_comes_back_through_an_untrusted_intermediate() {
         &[unrelated, chain.leaf.clone(), chain.intermediate.clone()],
         &[],
         &options(&anchors, SystemTime::now()),
+        PATHS,
         &ResourcePolicy::default(),
         crate::provider::default_provider(),
     )
@@ -134,11 +138,62 @@ fn an_intermediate_supplied_twice_is_one_issuer() {
         &[chain.intermediate.clone(), chain.intermediate.clone()],
         &[],
         &options(&anchors, SystemTime::now()),
+        PATHS,
         &ResourcePolicy::default(),
         crate::provider::default_provider(),
     )
     .expect("a path to the anchor");
     assert_eq!(verified.subject_public_key_info, chain.leaf_spki);
+}
+
+#[test]
+fn a_cross_signed_issuer_resolves_to_the_path_an_anchor_accepts() {
+    // Two certificates for one issuer key, cross-signed by a trusted and an
+    // untrusted root, both verify the leaf; the anchors, not the first
+    // issuer edge, pick the path.
+    let trusted_root = rcgen::CertifiedIssuer::self_signed(
+        params("trusted cross-sign root", true),
+        rcgen::KeyPair::generate().expect("root key"),
+    )
+    .expect("trusted root");
+    let untrusted_root = rcgen::CertifiedIssuer::self_signed(
+        params("untrusted cross-sign root", true),
+        rcgen::KeyPair::generate().expect("root key"),
+    )
+    .expect("untrusted root");
+    let shared = params("shared cross-sign issuer", true);
+    let shared_key = rcgen::KeyPair::generate().expect("issuer key");
+    let by_trusted = shared
+        .signed_by(&shared_key, &trusted_root)
+        .expect("trusted cross-sign");
+    let by_untrusted = shared
+        .signed_by(&shared_key, &untrusted_root)
+        .expect("untrusted cross-sign");
+    let issuer = rcgen::Issuer::from_params(&shared, &shared_key);
+    let leaf_key = rcgen::KeyPair::generate().expect("leaf key");
+    let leaf = params("cross-signed leaf", false)
+        .signed_by(&leaf_key, &issuer)
+        .expect("leaf");
+    let anchors = vec![trusted_root.der().to_vec()];
+    // The untrusted alternative is listed first.
+    let verified = verify_x509_certificate(
+        leaf.der(),
+        &[
+            by_untrusted.der().to_vec(),
+            untrusted_root.der().to_vec(),
+            by_trusted.der().to_vec(),
+        ],
+        &[],
+        &options(&anchors, SystemTime::now()),
+        PATHS,
+        &ResourcePolicy::default(),
+        crate::provider::default_provider(),
+    )
+    .expect("the path through the trusted cross-sign");
+    assert_eq!(
+        verified.subject_public_key_info,
+        rcgen::PublicKeyData::subject_public_key_info(&leaf_key)
+    );
 }
 
 #[test]
@@ -214,6 +269,7 @@ fn without_a_path_to_an_anchor_there_is_no_key() {
         &[],
         &[],
         &options(&anchors, SystemTime::now()),
+        PATHS,
         &ResourcePolicy::default(),
         crate::provider::default_provider(),
     );
@@ -224,6 +280,7 @@ fn without_a_path_to_an_anchor_there_is_no_key() {
         &[chain.intermediate.clone(), chain.root.clone()],
         &[],
         &options(&[], SystemTime::now()),
+        PATHS,
         &ResourcePolicy::default(),
         crate::provider::default_provider(),
     );
@@ -241,6 +298,7 @@ fn a_target_outside_its_validity_has_no_key() {
         std::slice::from_ref(&chain.intermediate),
         &[],
         &options(&anchors, before),
+        PATHS,
         &ResourcePolicy::default(),
         crate::provider::default_provider(),
     );
@@ -256,6 +314,7 @@ fn a_malformed_target_is_refused_as_certificate_processing() {
         &[chain.intermediate],
         &[],
         &options(&anchors, SystemTime::now()),
+        PATHS,
         &ResourcePolicy::default(),
         crate::provider::default_provider(),
     );
@@ -282,6 +341,7 @@ fn evidence_beyond_the_aggregate_byte_limit_is_refused_before_parsing() {
         std::slice::from_ref(&chain.intermediate),
         &[],
         &options(&anchors, SystemTime::now()),
+        PATHS,
         &resources,
         crate::provider::default_provider(),
     );

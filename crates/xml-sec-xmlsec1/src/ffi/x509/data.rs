@@ -12,7 +12,7 @@
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::fmt::Write as _;
 
-use xml_sec::policy::{UnknownX509CertificateSemantics, VerificationPolicy};
+use xml_sec::policy::{ResourcePolicy, UnknownX509CertificateSemantics, VerificationPolicy};
 use xml_sec::xmldsig::{KeyValueInfo, parse_x509_certificate_with_resources};
 
 use super::super::asymkeys::{self, Material};
@@ -24,7 +24,7 @@ use super::super::buffer::{
     xmlSecBufferInitialize, xmlSecBufferSetData,
 };
 use super::super::errors::{self, Here, here};
-use super::super::keyinfo::{XmlSecKeyInfoCtx, charge_candidate, read_policy};
+use super::super::keyinfo::{XmlSecKeyInfoCtx, charge_candidate, key_value_within, read_policy};
 use super::super::keys::{
     TYPE_PUBLIC, XmlSecKey, xmlSecKeyAdoptData, xmlSecKeyDestroy, xmlSecKeyGetData,
     xmlSecKeyGetValue, xmlSecKeySwap,
@@ -424,7 +424,12 @@ unsafe fn read_blob(
     buffer: *mut XmlSecBuffer,
     node: *mut XmlNode,
     flags: c_uint,
+    resources: &ResourcePolicy,
 ) -> bool {
+    // The document's bytes are bounded before they are decoded and copied.
+    if !key_value_within(here, x509_name(), node, resources) {
+        return false;
+    }
     let text = trimmed(node);
     if text.is_empty() {
         if flags & FLAGS_STOP_ON_EMPTY_NODE != 0 {
@@ -487,15 +492,16 @@ unsafe fn read_child(
     value: &mut X509DataValue,
     node: *mut XmlNode,
     flags: c_uint,
+    resources: &ResourcePolicy,
 ) -> bool {
     // SAFETY: by the caller's contract; the value's buffers are initialized.
     unsafe {
         if is(node, &xmlSecNodeX509Certificate, &xmlSecDSigNs) {
-            read_blob(here, &raw mut value.cert, node, flags)
+            read_blob(here, &raw mut value.cert, node, flags, resources)
         } else if is(node, &xmlSecNodeX509CRL, &xmlSecDSigNs) {
-            read_blob(here, &raw mut value.crl, node, flags)
+            read_blob(here, &raw mut value.crl, node, flags, resources)
         } else if is(node, &xmlSecNodeX509SKI, &xmlSecDSigNs) {
-            read_blob(here, &raw mut value.ski, node, flags)
+            read_blob(here, &raw mut value.ski, node, flags, resources)
         } else if is(node, &xmlSecNodeX509SubjectName, &xmlSecDSigNs) {
             read_string(here, &mut value.subject, node, flags)
         } else if is(node, &xmlSecNodeX509IssuerSerial, &xmlSecDSigNs) {
@@ -512,7 +518,8 @@ unsafe fn read_child(
                 return false;
             };
             value.digest_algorithm = give(here, &algorithm);
-            !value.digest_algorithm.is_null() && read_blob(here, &raw mut value.digest, node, flags)
+            !value.digest_algorithm.is_null()
+                && read_blob(here, &raw mut value.digest, node, flags, resources)
         } else if flags & FLAGS_STOP_ON_UNKNOWN_CHILD != 0 {
             errors::report(
                 here,
@@ -624,7 +631,8 @@ unsafe fn collect(
             return false;
         };
         let selectors = child.selectors();
-        let Ok(found) = find(here, store, &selectors, resources) else {
+        // SAFETY: the read's context, by the caller's contract.
+        let Ok(found) = (unsafe { find(here, store, &selectors, ctx, resources) }) else {
             return false;
         };
         // Whether a child naming no certificate is unknown is the policy's
@@ -865,7 +873,7 @@ unsafe fn read_children(
             let Some(mut child) = ChildValue::new(here) else {
                 return false;
             };
-            if !read_child(here, &mut child.value, cur, (*ctx).flags) {
+            if !read_child(here, &mut child.value, cur, (*ctx).flags, &policy.resources) {
                 return false;
             }
             let mngr = (*ctx).keys_mngr;

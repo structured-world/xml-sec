@@ -312,6 +312,155 @@ fn the_policy_decides_whether_a_crl_child_is_an_unknown_certificate() {
     );
 }
 
+/// Reads the `KeyInfo` of `xml` with `mngr` at [`AT`] under the current
+/// library policy: the read's result and whether the key got a value.
+///
+/// # Safety
+/// `mngr` is a keys manager.
+unsafe fn read_key_info(
+    mngr: *mut crate::ffi::keysmngr::XmlSecKeysMngr,
+    xml: &str,
+) -> (std::ffi::c_int, bool) {
+    // SAFETY: by the caller's contract; the objects made here are released.
+    unsafe {
+        let ctx = xmlSecKeyInfoCtxCreate(mngr);
+        (*ctx).certs_verification_time = super::time_of(AT).expect("a representable time");
+        let enabled = &raw mut (*ctx).enabled_key_data;
+        assert_eq!(xmlSecPtrListAdd(enabled, x509_data().cast_mut().cast()), 0);
+        let doc = xsReadMemory(
+            xml.as_ptr().cast(),
+            i32::try_from(xml.len()).expect("a short document"),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        let key = xmlSecKeyCreate();
+        let result = xmlSecKeyInfoNodeRead(xsDocGetRootElement(doc), key, ctx);
+        let found = !xmlSecKeyGetValue(key).is_null();
+        xmlSecKeyDestroy(key);
+        xsFreeDoc(doc);
+        xmlSecKeyInfoCtxDestroy(ctx);
+        (result, found)
+    }
+}
+
+/// Sets the read's `max_key_candidates` and `max_external_resource_bytes`.
+fn limits(candidates: usize, resource_bytes: usize) {
+    policy::republish(
+        |verification| {
+            verification.resources.max_key_candidates = candidates;
+            verification.resources.max_external_resource_bytes = resource_bytes;
+        },
+        |_| {},
+    )
+    .expect("the library policy compiles");
+}
+
+/// The default keys manager with [`ROOT`] trusted and `untrusted` loaded.
+///
+/// # Safety
+/// Callable at any time; the caller destroys the manager.
+unsafe fn default_manager(untrusted: &[&[u8]]) -> *mut crate::ffi::keysmngr::XmlSecKeysMngr {
+    // SAFETY: a manager created here.
+    unsafe {
+        let mngr = xmlSecKeysMngrCreate();
+        assert_eq!(default_keys_mngr_init(mngr.cast()), 0);
+        assert_eq!(
+            keys_mngr_cert_load_memory(
+                mngr.cast(),
+                ROOT.as_ptr(),
+                ROOT.len(),
+                FORMAT_DER,
+                TYPE_TRUSTED
+            ),
+            0
+        );
+        for der in untrusted {
+            assert_eq!(
+                keys_mngr_cert_load_memory(mngr.cast(), der.as_ptr(), der.len(), FORMAT_DER, 0),
+                0
+            );
+        }
+        mngr
+    }
+}
+
+/// [`LEAF`] in an `X509Certificate`.
+fn carried_leaf() -> String {
+    // SAFETY: the encoder returns a NUL-terminated string it allocated,
+    // copied and released here.
+    let text = unsafe {
+        let text = crate::ffi::base64::xmlSecBase64Encode(LEAF.as_ptr(), LEAF.len(), 0);
+        assert!(!text.is_null(), "the bytes encode");
+        let owned = std::ffi::CStr::from_ptr(text.cast())
+            .to_str()
+            .expect("Base64 text")
+            .to_owned();
+        xml_sec_libxml2::ffi::memory::xsFree(text.cast());
+        owned
+    };
+    format!(
+        "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><X509Data>\
+         <X509Certificate>{text}</X509Certificate></X509Data></KeyInfo>"
+    )
+}
+
+#[test]
+fn a_carried_certificate_does_not_search_the_stored_keys() {
+    // A carried certificate names no certificate to look up: the stored keys
+    // are no candidates, and an allowance of one admits the certificate.
+    const OTHER: &[u8] = include_bytes!("../../../../../tests/fixtures/keys/rsa/rsa-4096-cert.pem");
+    crate::ffi::tests::own_process();
+    limits(1, 1 << 20);
+    // SAFETY: a manager created and destroyed here.
+    unsafe {
+        let mngr = default_manager(&[]);
+        let key = key_from_certificate(here!("test"), OTHER, FORMAT_PEM);
+        assert_eq!(default_keys_mngr_adopt_key(mngr.cast(), key), 0);
+        assert_eq!(read_key_info(mngr, &carried_leaf()), (0, true));
+        xmlSecKeysMngrDestroy(mngr);
+    }
+}
+
+#[test]
+fn a_certificate_store_search_spends_the_candidate_allowance() {
+    // Each untrusted store certificate a selector lookup inspects is a key
+    // candidate of the read: the leaf, second in the store, needs two.
+    const OTHER: &[u8] = include_bytes!("../../../../../tests/fixtures/x509/delta-crl/ca.der");
+    const XML: &str = "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><X509Data>\
+        <X509SubjectName>CN=xml-sec Test Delta Leaf</X509SubjectName></X509Data></KeyInfo>";
+    crate::ffi::tests::own_process();
+    for (allowance, expected) in [(2, true), (1, false)] {
+        limits(allowance, 1 << 20);
+        // SAFETY: a manager created and destroyed here.
+        unsafe {
+            let mngr = default_manager(&[OTHER, LEAF]);
+            assert_eq!(read_key_info(mngr, XML).1, expected, "{allowance}");
+            xmlSecKeysMngrDestroy(mngr);
+        }
+    }
+}
+
+#[test]
+fn an_x509_data_blob_beyond_the_resource_limit_is_refused_before_decoding() {
+    // A key identifier larger than the per-resource limit is refused when it
+    // is read, before it is decoded and copied.
+    crate::ffi::tests::own_process();
+    let ski = "A".repeat(400);
+    let xml = format!(
+        "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><X509Data>\
+         <X509SKI>{ski}</X509SKI></X509Data></KeyInfo>"
+    );
+    limits(64, 1 << 20);
+    // SAFETY: a manager created and destroyed here.
+    unsafe {
+        let mngr = default_manager(&[]);
+        limits(64, 100);
+        assert_eq!(read_key_info(mngr, &xml).0, -1);
+        xmlSecKeysMngrDestroy(mngr);
+    }
+}
+
 #[test]
 fn a_crl_that_does_not_read_is_not_stored() {
     // A CRL the store cannot read would fail every path check it applies

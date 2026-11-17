@@ -129,6 +129,12 @@ unsafe extern "C" fn keys_store_find_key_from_x509_data(
         // SAFETY: a store of this klass, a value the KeyInfo read built and
         // its context.
         unsafe {
+            // A carried certificate or CRL names no certificate: there is
+            // nothing to search for, and no stored key is a candidate.
+            let selectors = data::selectors_of(value);
+            if selectors.is_empty() {
+                return std::ptr::null_mut();
+            }
             let keys = xmlSecSimpleKeysStoreGetKeys(inner_store(store));
             if keys.is_null() {
                 errors::internal(here, std::ptr::null(), c"xmlSecSimpleKeysStoreGetKeys");
@@ -166,7 +172,6 @@ unsafe extern "C" fn keys_store_find_key_from_x509_data(
             if let Some(shared) = shared {
                 shared.set(tally);
             }
-            let selectors = data::selectors_of(value);
             let Ok(found) = super::first_named(
                 here,
                 &selectors,

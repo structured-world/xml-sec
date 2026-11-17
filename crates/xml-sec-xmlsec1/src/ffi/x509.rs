@@ -21,7 +21,7 @@ use xml_sec::xmldsig::{
 
 use super::contain;
 use super::errors::{self, Here, here};
-use super::keyinfo::XmlSecKeyInfoCtx;
+use super::keyinfo::{XmlSecKeyInfoCtx, charge_candidate};
 use super::keysdata::{XmlSecKeyDataStore, XmlSecKeyDataStoreKlass, store_valid};
 use super::keysmngr::{XmlSecKeysMngr, xmlSecKeysMngrGetDataStore};
 use super::strings::xmlSecNameX509Store;
@@ -341,6 +341,7 @@ fn check(
         &intermediates,
         &all_crls,
         &options,
+        policy.key_trust.max_x509_candidate_paths,
         resources,
         xml_sec::provider::default_provider(),
     ) {
@@ -389,18 +390,27 @@ impl Selectors {
 /// The untrusted certificate of the store the `selectors` name, as
 /// libxmlsec1's store finds one by value; `Ok(None)` when none matches or
 /// there are no selectors.
-pub(crate) fn find(
+///
+/// # Safety
+/// `ctx` is the context of the read the search serves.
+pub(crate) unsafe fn find(
     here: Here,
     state: &StoreState,
     selectors: &Selectors,
+    ctx: *mut XmlSecKeyInfoCtx,
     resources: &ResourcePolicy,
 ) -> Result<Option<Vec<u8>>, ()> {
-    let found = first_named(
-        here,
-        selectors,
-        state.untrusted.iter().map(Vec::as_slice),
-        resources,
-    )?;
+    if selectors.is_empty() {
+        return Ok(None);
+    }
+    // Each certificate inspected is a key candidate of the read, charged to
+    // the allowance its searches share; the search stops when it is spent.
+    let candidates = state.untrusted.iter().map_while(|der| {
+        // SAFETY: by the caller's contract.
+        unsafe { charge_candidate(ctx, here, xmlSecNameX509Store.as_ptr().cast()) }
+            .then_some(der.as_slice())
+    });
+    let found = first_named(here, selectors, candidates, resources)?;
     Ok(found.map(|position| state.untrusted[position].clone()))
 }
 

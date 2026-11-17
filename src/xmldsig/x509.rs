@@ -376,20 +376,23 @@ pub fn validate_x509_crl(
 
 /// Validate a path from `target` through any of `intermediates` to an anchor
 /// of `options`, applying `crls` when `options` checks CRLs, and return the
-/// target's validated key. The path is built from `target` by issuer name,
-/// a signature deciding between issuers of the same name, as for a
-/// `KeyInfo` certificate.
+/// target's validated key. Every signature-valid path from `target` to an
+/// anchor, at most `max_candidate_paths` of them, is validated in turn until
+/// one passes, so issuers sharing a name and key (cross-signing) resolve to
+/// the path the anchors accept, as for a `KeyInfo` certificate.
 ///
 /// # Errors
 ///
 /// Returns [`X509ChainError`] for invalid `resources`, evidence beyond the
-/// external-resource byte limits, a certificate that does not parse, no path
-/// to an anchor, or any path, revocation or resource failure.
+/// external-resource byte limits, a certificate that does not parse, more
+/// candidate paths than allowed, no path to an anchor, or the failure of the
+/// first path that does not validate.
 pub fn verify_x509_certificate(
     target: &[u8],
     intermediates: &[Vec<u8>],
     crls: &[Vec<u8>],
     options: &X509ChainOptions<'_>,
+    max_candidate_paths: usize,
     resources: &crate::policy::ResourcePolicy,
     provider: &dyn crate::provider::CryptoProvider,
 ) -> Result<VerifiedX509Certificate, X509ChainError> {
@@ -406,39 +409,28 @@ pub fn verify_x509_certificate(
         resources,
         &session,
     )?;
-    // One copy of each certificate: the target listed again is no issuer of
-    // itself, and an intermediate both a document and a store supply is one
-    // issuer, not two that make the path ambiguous.
-    let mut unique: Vec<&[u8]> = Vec::with_capacity(intermediates.len() + 1);
-    unique.push(target);
-    for der in intermediates {
-        if !unique.contains(&der.as_slice()) {
-            unique.push(der);
-        }
+    // The anchors lead the pool, so a path ends at the first certificate it
+    // reaches among them. The pool holds one copy of each certificate, its
+    // comparisons charged to the session: the target listed again is no
+    // issuer of itself, and an intermediate a document and a store both
+    // supply is one issuer.
+    let mut pool = super::keys::BorrowedX509Pool::new(crls, &session);
+    for anchor in options.trusted_certs {
+        pool.insert(anchor, &session)?;
     }
-    let certificates: Vec<Vec<u8>> = unique.into_iter().map(<[u8]>::to_vec).collect();
-    let parsed_certificates = certificates
-        .iter()
-        .map(|der| {
-            super::parse::parse_x509_certificate_in(der, &session).map_err(|error| match error {
-                super::ParseError::Policy(error) => X509ChainError::Policy(error),
-                super::ParseError::Certificate(error) => X509ChainError::Processing(error),
-                error => X509ChainError::InvalidDer {
-                    kind: "certificate",
-                    message: error.to_string(),
-                },
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut info = X509DataInfo {
-        certificates,
-        crls: crls.to_vec(),
-        parsed_certificates,
-        ..X509DataInfo::default()
-    };
-    info.certificate_chain = super::parse::build_x509_certificate_chain_from(
-        &info,
-        0,
+    let trusted_prefix_len = pool.certificates.len();
+    let signing = pool.insert(target, &session)?;
+    for der in intermediates {
+        pool.insert(der, &session)?;
+    }
+    let candidates = super::parse::build_x509_certificate_paths_to_trusted_prefix(
+        &pool,
+        signing,
+        trusted_prefix_len,
+        super::parse::X509PathBounds {
+            max_depth: options.max_chain_depth,
+            max_candidate_paths,
+        },
         provider,
         options.certificate_signature_algorithms,
         &session,
@@ -451,16 +443,33 @@ pub fn verify_x509_certificate(
             X509ChainError::UnsupportedSignatureAlgorithm { oid }
         }
         X509ChainBuildError::DepthExceeded => {
-            X509ChainError::DepthExceeded(crate::hard_limits::X509_CHAIN_DEPTH_CEILING)
+            X509ChainError::DepthExceeded(options.max_chain_depth)
         }
-        // Issuers the target's name selects but whose signatures settle no
-        // single path: no path reaches an anchor.
+        // More candidate paths than allowed, or none that holds together:
+        // no path is accepted.
         X509ChainBuildError::InconsistentMetadata
         | X509ChainBuildError::Cycle
         | X509ChainBuildError::IssuerSignatureMismatch
         | X509ChainBuildError::AmbiguousIssuer => X509ChainError::UntrustedRoot,
     })?;
-    let key = verify_x509_certificate_chain_in_session(&info, options, provider, &[], &session)?;
+    let mut first_error = None;
+    let mut validated = None;
+    for candidate in candidates {
+        pool.certificate_chain = candidate;
+        match verify_x509_certificate_chain_in_session(&pool, options, provider, &[], &session) {
+            Ok(key) => {
+                validated = Some(key);
+                break;
+            }
+            Err(error) if error.is_execution_failure() => return Err(error),
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    let Some(key) = validated else {
+        return Err(first_error.unwrap_or(X509ChainError::UntrustedRoot));
+    };
     let certificate = session.read(target)?;
     let validity = certificate.tbs().validity();
     let subject_public_key_info = match key.effective_spki {
