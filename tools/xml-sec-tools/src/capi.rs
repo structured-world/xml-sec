@@ -149,6 +149,7 @@ impl Target {
                 "tests/c/hmac.c",
                 "tests/c/signatures.c",
                 "tests/c/app.c",
+                "tests/c/x509.c",
             ],
         }
     }
@@ -921,9 +922,10 @@ fn qualify_xmlsec1(
         checked(runner, &oracle_compile_step(&compiler, &program))?;
         let expected = standard_output(runner, &oracle_program_step(&theirs, prefix, &library))?;
         let actual = standard_output(runner, &program_step(&mine, &[], &library))?;
+        let kept = keep_outputs(&name, &expected, &actual);
         if let Some(difference) = first_difference(&expected, &actual) {
             return Err(format!(
-                "{}: {} prints differently from libxmlsec1: {difference}",
+                "{}: {} prints differently from libxmlsec1: {difference}{kept}",
                 target.package(),
                 source.display()
             )
@@ -936,6 +938,26 @@ fn qualify_xmlsec1(
         );
     }
     Ok(())
+}
+
+/// Keeps both outputs of the program `name` under `target/capi-xmlsec1`, so
+/// a difference, or what an agreeing program printed, can be read whole; the
+/// note naming them, or why they were not kept.
+fn keep_outputs(name: &str, expected: &str, actual: &str) -> String {
+    let directory = root().join("target/capi-xmlsec1");
+    let oracle = directory.join(format!("{name}.oracle.txt"));
+    let ours = directory.join(format!("{name}.ours.txt"));
+    let kept = std::fs::create_dir_all(&directory)
+        .and_then(|()| std::fs::write(&oracle, expected))
+        .and_then(|()| std::fs::write(&ours, actual));
+    match kept {
+        Ok(()) => format!(
+            "; outputs kept in {} and {}",
+            oracle.display(),
+            ours.display()
+        ),
+        Err(error) => format!("; the outputs could not be kept: {error}"),
+    }
 }
 
 /// The first line where `actual` differs from `expected`, described.

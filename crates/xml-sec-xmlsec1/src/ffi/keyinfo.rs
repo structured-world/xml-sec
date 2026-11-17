@@ -133,6 +133,11 @@ pub(crate) fn key_source(id: *const XmlSecKeyDataKlass) -> Option<KeySourceKind>
     if std::ptr::eq(id, super::keysdata::xmlSecKeyDataKeyInfoReferenceGetKlass()) {
         return Some(KeySourceKind::KeyInfoReference);
     }
+    // SAFETY: the klass getters return static addresses.
+    let (x509, raw) = unsafe { (super::x509::x509_data(), super::x509::raw_x509_cert()) };
+    if std::ptr::eq(id, x509) || std::ptr::eq(id, raw) {
+        return Some(KeySourceKind::X509Data);
+    }
     // A value klass reads key material the document carries, inside
     // KeyValue or where a retrieval method finds it.
     // SAFETY: a klass the caller validated.

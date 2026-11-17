@@ -236,6 +236,17 @@ unsafe fn load(
             return null;
         }
     };
+    key_with(here, material, None)
+}
+
+/// A new key whose value holds `material`, with `x509` as its X.509 data
+/// when given; null after a report at `here`.
+pub(crate) fn key_with(
+    here: Here,
+    material: Material,
+    x509: Option<super::x509::data::X509State>,
+) -> *mut c_void {
+    let null = std::ptr::null_mut();
     let data = asymkeys::adopt(material);
     if data.is_null() {
         errors::internal(here, std::ptr::null(), c"xmlSecKeyDataCreate");
@@ -254,6 +265,17 @@ unsafe fn load(
             xmlSecKeyDestroy(key);
             super::keysdata::xmlSecKeyDataDestroy(data);
             return null;
+        }
+        if let Some(state) = x509 {
+            let certificates = super::x509::data::create(here, state);
+            if certificates.is_null() || super::keys::xmlSecKeyAdoptData(key, certificates) < 0 {
+                errors::internal(here, std::ptr::null(), c"xmlSecKeyAdoptData");
+                if !certificates.is_null() {
+                    super::keysdata::xmlSecKeyDataDestroy(certificates);
+                }
+                xmlSecKeyDestroy(key);
+                return null;
+            }
         }
         key.cast()
     }
@@ -281,21 +303,107 @@ pub(crate) unsafe extern "C" fn key_load_memory(
         let Some(policy) = policy::verification_at(here) else {
             return std::ptr::null_mut();
         };
+        // SAFETY: the caller's `size` bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(data, size) };
+        if matches!(
+            format,
+            super::x509::FORMAT_CERT_PEM | super::x509::FORMAT_CERT_DER
+        ) {
+            return super::x509::load::key_from_certificate(here, bytes, format);
+        }
+        let password = Password {
+            explicit: pwd,
+            callback,
+            context,
+        };
+        // SAFETY: the caller's password sources.
+        unsafe { load(here, bytes, format, &password, &policy.resources) }
+    })
+}
+
+/// `cryptoAppPkcs12LoadMemory` of the built-in table: the private key of the
+/// PKCS#12 bundle, with the certificate of its key and the bundle's other
+/// certificates as its X.509 data.
+pub(crate) unsafe extern "C" fn pkcs12_load_memory(
+    data: *const u8,
+    size: usize,
+    pwd: *const c_char,
+    callback: *mut c_void,
+    context: *mut c_void,
+) -> *mut c_void {
+    contain(std::ptr::null_mut(), || {
+        let here = here!("xmlSecOpenSSLAppPkcs12LoadMemory");
+        if data.is_null() {
+            errors::assertion(here, c"data != NULL");
+            return std::ptr::null_mut();
+        }
+        let Some(policy) = policy::verification_at(here) else {
+            return std::ptr::null_mut();
+        };
         let password = Password {
             explicit: pwd,
             callback,
             context,
         };
         // SAFETY: the caller's `size` bytes and password sources.
-        unsafe {
-            load(
-                here,
+        let (bytes, secret) = unsafe {
+            (
                 std::slice::from_raw_parts(data, size),
-                format,
-                &password,
-                &policy.resources,
+                password.get().map(|secret| secret.bytes().to_vec()),
             )
+        };
+        let mut inventory = KeyInventory::default();
+        let imported = inventory.add_pkcs12_with_password_callback(
+            "key".to_owned(),
+            bytes,
+            || {
+                secret
+                    .as_deref()
+                    .and_then(|secret| std::str::from_utf8(secret).ok())
+                    .map(|secret| Zeroizing::new(secret.to_owned()))
+            },
+            KeyUsages::SIGN,
+            &policy.resources,
+        );
+        if let Err(error) = imported {
+            errors::internal_with(here, std::ptr::null(), c"PKCS12_parse", &error.to_string());
+            return std::ptr::null_mut();
         }
+        let Some(key) = inventory.private_keys().first() else {
+            errors::internal(here, std::ptr::null(), c"PKCS12_parse");
+            return std::ptr::null_mut();
+        };
+        let value = key.public_key_spki_der().and_then(|spki| {
+            KeyValueInfo::from_spki_der(&spki, &policy.resources)
+                .map_err(|_| KeyStoreError::Selection("unsupported private key family"))
+        });
+        let value = match value {
+            Ok(value) => value,
+            Err(error) => {
+                errors::internal_with(
+                    here,
+                    std::ptr::null(),
+                    c"xmlSecOpenSSLCreateKey",
+                    &error.to_string(),
+                );
+                return std::ptr::null_mut();
+            }
+        };
+        // The key's own certificate leads the bundle when it has one; the
+        // bundle's other certificates are the key's too, trusted for nothing.
+        let has_leaf = key.matching_certificate_chain().is_some();
+        let mut x509 = super::x509::data::X509State::default();
+        for (position, cert) in key.certificates().iter().enumerate() {
+            x509.add_cert(cert.clone(), has_leaf && position == 0);
+        }
+        key_with(
+            here,
+            Material {
+                value,
+                private: Some(Zeroizing::new(key.pkcs8_der().to_vec())),
+            },
+            Some(x509),
+        )
     })
 }
 

@@ -26,7 +26,7 @@ use super::list::{
 };
 use super::transforms::{Global, XmlSecTransformKlass, xmlSecTransformIdsRegister, zero_list};
 use super::transforms::{digests, hmac, signatures};
-use super::{app, asymkeys, symkeys};
+use super::{app, asymkeys, symkeys, x509};
 
 /// An opaque `xmlSecKeysMngrPtr`, `xmlSecKeyPtr` or `xmlSecKeyInfoCtxPtr`.
 type Opaque = *mut c_void;
@@ -184,6 +184,10 @@ functions_table! {
 static BUILTIN: Global<XmlSecCryptoDLFunctions> = Global::new(XmlSecCryptoDLFunctions {
     crypto_init: Some(builtin_crypto_init),
     crypto_shutdown: Some(builtin_crypto_shutdown),
+    crypto_keys_mngr_init: Some(x509::load::keys_mngr_init),
+    key_data_x509: Some(x509::x509_data),
+    key_data_raw_x509_cert: Some(x509::raw_x509_cert),
+    x509_store: Some(x509::x509_store),
     key_data_aes: Some(symkeys::aes),
     key_data_camellia: Some(symkeys::camellia),
     key_data_chacha20: Some(symkeys::chacha20),
@@ -249,7 +253,14 @@ static BUILTIN: Global<XmlSecCryptoDLFunctions> = Global::new(XmlSecCryptoDLFunc
     key_data_hmac: Some(symkeys::hmac),
     key_data_pbkdf2: Some(symkeys::pbkdf2),
     crypto_app_init: Some(builtin_crypto_app_init),
+    crypto_app_default_keys_mngr_init: Some(x509::load::default_keys_mngr_init),
+    crypto_app_default_keys_mngr_adopt_key: Some(x509::load::default_keys_mngr_adopt_key),
+    crypto_app_default_keys_mngr_verify_key: Some(x509::load::default_keys_mngr_verify_key),
+    crypto_app_keys_mngr_cert_load_memory: Some(x509::load::keys_mngr_cert_load_memory),
+    crypto_app_keys_mngr_crl_load_memory: Some(x509::load::keys_mngr_crl_load_memory),
     crypto_app_key_load_memory: Some(app::key_load_memory),
+    crypto_app_pkcs12_load_memory: Some(app::pkcs12_load_memory),
+    crypto_app_key_cert_load_memory: Some(x509::load::key_cert_load_memory),
     crypto_app_shutdown: Some(builtin_crypto_app_shutdown),
     ..XmlSecCryptoDLFunctions::empty()
 });
