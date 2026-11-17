@@ -124,7 +124,7 @@ pub use parse::{
     RetrievalMethodTransforms, RsaPssParameters, SignatureAlgorithm, SignatureContext, SignedInfo,
     X509DataInfo, X509PublicKeyInfo, find_signature_node, parse_key_info, parse_key_value_child,
     parse_reference, parse_signed_info, parse_x509_certificate_with_resources,
-    x509_certificate_matches_selectors,
+    x509_certificate_matches_selectors, x509_find_certificate_by_selectors,
 };
 pub use pkix::CertificatePathVerifier;
 #[cfg(feature = "xmldsig-sign")]
@@ -174,7 +174,7 @@ pub use verify::{
     process_all_references, process_reference, with_verified_request,
 };
 pub use x509::{
-    VerifiedX509Certificate, X509ChainError, X509ChainOptions, verify_x509_certificate,
-    verify_x509_certificate_chain, verify_x509_certificate_chain_with_resources,
-    x509_leaf_certificates,
+    VerifiedX509Certificate, X509ChainError, X509ChainOptions, validate_x509_crl,
+    verify_x509_certificate, verify_x509_certificate_chain,
+    verify_x509_certificate_chain_with_resources, x509_leaf_certificates,
 };

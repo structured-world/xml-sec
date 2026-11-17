@@ -12,11 +12,11 @@
 
 use std::ffi::{c_int, c_uint, c_void};
 
-use xml_sec::policy::{Instant, PolicyViolation, VerificationPolicy};
+use xml_sec::policy::{Instant, PolicyViolation, ResourcePolicy, VerificationPolicy};
 use xml_sec::xmldsig::{
     LeapSecondsList, ParsedX509Certificate, X509ChainError, X509ChainOptions, X509DataInfo,
     parse_x509_certificate_with_resources, verify_x509_certificate,
-    x509_certificate_matches_selectors, x509_leaf_certificates,
+    x509_find_certificate_by_selectors, x509_leaf_certificates,
 };
 
 use super::contain;
@@ -376,15 +376,6 @@ pub(crate) struct Selectors {
     pub(crate) digest: Option<(String, Vec<u8>)>,
 }
 
-impl Selectors {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.subject.is_none()
-            && self.issuer_serial.is_none()
-            && self.ski.is_none()
-            && self.digest.is_none()
-    }
-}
-
 /// The untrusted certificate of the store the `selectors` name, as
 /// libxmlsec1's store finds one by value; `Ok(None)` when none matches or
 /// there are no selectors.
@@ -392,35 +383,45 @@ pub(crate) fn find(
     here: Here,
     state: &StoreState,
     selectors: &Selectors,
+    resources: &ResourcePolicy,
 ) -> Result<Option<Vec<u8>>, ()> {
-    for certificate in &state.untrusted {
-        if matches(here, selectors, certificate)? {
-            return Ok(Some(certificate.clone()));
-        }
-    }
-    Ok(None)
+    let found = first_named(
+        here,
+        selectors,
+        state.untrusted.iter().map(Vec::as_slice),
+        resources,
+    )?;
+    Ok(found.map(|position| state.untrusted[position].clone()))
 }
 
-/// Whether `certificate` is the one `selectors` name; never for empty
-/// selectors.
-pub(crate) fn matches(here: Here, selectors: &Selectors, certificate: &[u8]) -> Result<bool, ()> {
-    if selectors.is_empty() {
-        return Ok(false);
-    }
+/// The position of the first of `candidates` that `selectors` name, all
+/// compared under the operation's `resources` in one session; never one
+/// for empty selectors.
+pub(crate) fn first_named<'c>(
+    here: Here,
+    selectors: &Selectors,
+    candidates: impl IntoIterator<Item = &'c [u8]>,
+    resources: &ResourcePolicy,
+) -> Result<Option<usize>, ()> {
     let mut info = X509DataInfo::default();
     info.subject_names.extend(selectors.subject.clone());
     info.issuer_serials.extend(selectors.issuer_serial.clone());
     info.skis.extend(selectors.ski.clone());
     info.digests.extend(selectors.digest.clone());
-    x509_certificate_matches_selectors(&info, certificate, xml_sec::provider::default_provider())
-        .map_err(|error| {
-            errors::internal_with(
-                here,
-                std::ptr::null(),
-                c"x509_certificate_matches_selectors",
-                &error.to_string(),
-            );
-        })
+    x509_find_certificate_by_selectors(
+        &info,
+        candidates,
+        xml_sec::provider::default_provider(),
+        resources,
+    )
+    .map_err(|error| {
+        errors::internal_with(
+            here,
+            std::ptr::null(),
+            c"x509_find_certificate_by_selectors",
+            &error.to_string(),
+        );
+    })
 }
 
 /// The DER of a certificate or CRL in `bytes` of `format` (`label` names the
@@ -436,6 +437,15 @@ pub(crate) fn der_of(
             xml_sec::key_manager::pem_block_der(bytes, label, resources)
                 .map(Some)
                 .map_err(|error| error.to_string())
+        }
+        // The per-resource limit holds before the bytes are copied, as the
+        // PEM reader holds it before decoding.
+        FORMAT_DER | FORMAT_CERT_DER if bytes.len() > resources.max_external_resource_bytes => {
+            Err(format!(
+                "{} bytes exceed max_external_resource_bytes={}",
+                bytes.len(),
+                resources.max_external_resource_bytes
+            ))
         }
         FORMAT_DER | FORMAT_CERT_DER => Ok(Some(bytes.to_vec())),
         _ => Ok(None),

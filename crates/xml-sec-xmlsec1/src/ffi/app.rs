@@ -349,7 +349,9 @@ pub(crate) unsafe extern "C" fn pkcs12_load_memory(
         let (bytes, secret) = unsafe {
             (
                 std::slice::from_raw_parts(data, size),
-                password.get().map(|secret| secret.bytes().to_vec()),
+                password
+                    .get()
+                    .map(|secret| Zeroizing::new(secret.bytes().to_vec())),
             )
         };
         let mut inventory = KeyInventory::default();

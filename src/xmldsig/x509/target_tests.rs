@@ -123,6 +123,25 @@ fn a_certificate_reads_its_names_serial_and_key_identifier() {
 }
 
 #[test]
+fn an_intermediate_supplied_twice_is_one_issuer() {
+    // A document and a store may both carry the same intermediate; its two
+    // copies are one certificate, not two issuers that make the path
+    // ambiguous.
+    let chain = chain();
+    let anchors = vec![chain.root.clone()];
+    let verified = verify_x509_certificate(
+        &chain.leaf,
+        &[chain.intermediate.clone(), chain.intermediate.clone()],
+        &[],
+        &options(&anchors, SystemTime::now()),
+        &ResourcePolicy::default(),
+        crate::provider::default_provider(),
+    )
+    .expect("a path to the anchor");
+    assert_eq!(verified.subject_public_key_info, chain.leaf_spki);
+}
+
+#[test]
 fn a_serial_number_reads_in_decimal() {
     // XMLDSig's X509SerialNumber is an xsd:integer; the DER sign octet of a
     // serial with its top bit set is no part of the value.

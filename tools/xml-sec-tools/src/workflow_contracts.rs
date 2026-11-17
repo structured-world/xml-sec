@@ -643,9 +643,12 @@ fn every_libxmlsec1_oracle_is_the_pin_unless_a_revision_is_asked() {
         let mut checkouts = 0;
         for (job, body) in jobs(&workflow) {
             let advisory = ADVISORY_JOBS.contains(&job.as_str());
+            // The ids of the steps recording the commit of each checkout.
+            let mut recorded = Vec::new();
             for checkout in body.split("repository: lsh123/xmlsec\n").skip(1) {
                 checkouts += 1;
-                let reference = checkout.lines().next().unwrap().trim();
+                let mut lines = checkout.lines().map(str::trim);
+                let reference = lines.next().unwrap();
                 if advisory {
                     assert_eq!(reference, "ref: master", "{path} {job}");
                 } else {
@@ -655,12 +658,39 @@ fn every_libxmlsec1_oracle_is_the_pin_unless_a_revision_is_asked() {
                         "{path} {job}: {reference}"
                     );
                 }
+                let directory = lines
+                    .find_map(|line| line.strip_prefix("path: "))
+                    .unwrap_or_else(|| panic!("{path} {job}: the checkout names its path"));
+                // The step right after the checkout records its commit.
+                let id = lines
+                    .find_map(|line| line.strip_prefix("id: "))
+                    .unwrap_or_else(|| panic!("{path} {job}: a step records the checkout"));
+                let record = lines.find(|line| line.starts_with("run: ")).unwrap();
+                assert_eq!(
+                    record,
+                    format!(
+                        "run: echo \"commit=$(git -C {directory} rev-parse HEAD)\" >> \"$GITHUB_OUTPUT\""
+                    ),
+                    "{path} {job}"
+                );
+                recorded.push(id.to_owned());
             }
+            // Every build gets exactly the commit a checkout of its job
+            // recorded, not another step's output.
             let installs = body.matches("-- install-xmlsec1").count();
-            let given = body
-                .matches("          XMLSEC1_REVISION: ${{ steps.")
-                .count();
-            assert_eq!(installs, given, "{path} {job}");
+            let given: Vec<&str> = body
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix("XMLSEC1_REVISION: "))
+                .collect();
+            assert_eq!(installs, given.len(), "{path} {job}");
+            for revision in given {
+                assert!(
+                    recorded
+                        .iter()
+                        .any(|id| revision == format!("${{{{ steps.{id}.outputs.commit }}}}")),
+                    "{path} {job}: {revision} is no recorded checkout commit"
+                );
+            }
         }
         assert_eq!(checkouts, expected, "{path}");
         assert!(!workflow.contains("xmlsec1-master"), "{path}");

@@ -238,7 +238,10 @@ pub fn verify_x509_certificate_chain_with_resources(
     resources.validate()?;
     let session = super::pkix::CertificateSession::new(resources);
     admit_evidence(
-        info.certificates.iter().chain(&info.crls),
+        info.certificates
+            .iter()
+            .chain(&info.crls)
+            .map(Vec::as_slice),
         options,
         resources,
         &session,
@@ -250,12 +253,12 @@ pub fn verify_x509_certificate_chain_with_resources(
 /// before any path storage or parsing: borrowed DER still consumes the
 /// supplied source-byte allowance.
 fn admit_evidence<'e>(
-    evidence: impl Iterator<Item = &'e Vec<u8>> + Clone,
+    evidence: impl Iterator<Item = &'e [u8]> + Clone,
     options: &X509ChainOptions<'e>,
     resources: &crate::policy::ResourcePolicy,
     session: &super::pkix::CertificateSession,
 ) -> Result<(), X509ChainError> {
-    let all = evidence.chain(options.trusted_certs);
+    let all = evidence.chain(options.trusted_certs.iter().map(Vec::as_slice));
     let count = all.clone().count();
     session
         .memory()
@@ -338,6 +341,39 @@ pub fn x509_leaf_certificates(
     Ok(leaves)
 }
 
+/// Checks that `der` is one X.509 CRL within the per-resource byte limit of
+/// `resources`, as a store checks a CRL before holding it. It assigns no
+/// trust: a CRL is authenticated by the path it applies to.
+///
+/// # Errors
+///
+/// Returns [`X509ChainError`] for invalid `resources`, a CRL beyond the
+/// byte limit, or bytes that do not read as a CRL.
+///
+/// # Examples
+///
+/// ```
+/// use xml_sec::policy::ResourcePolicy;
+/// use xml_sec::xmldsig::validate_x509_crl;
+///
+/// assert!(validate_x509_crl(b"not a CRL", &ResourcePolicy::default()).is_err());
+/// ```
+pub fn validate_x509_crl(
+    der: &[u8],
+    resources: &crate::policy::ResourcePolicy,
+) -> Result<(), X509ChainError> {
+    resources.validate()?;
+    if der.len() > resources.max_external_resource_bytes {
+        return Err(crate::policy::PolicyViolation::ResourceLimitExceeded {
+            resource: crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
+            maximum: resources.max_external_resource_bytes,
+        }
+        .into());
+    }
+    let session = super::pkix::CertificateSession::new(resources);
+    session.read_crl(der).map(drop)
+}
+
 /// Validate a path from `target` through any of `intermediates` to an anchor
 /// of `options`, applying `crls` when `options` checks CRLs, and return the
 /// target's validated key. The path is built from `target` by issuer name,
@@ -360,21 +396,27 @@ pub fn verify_x509_certificate(
     use super::parse::X509ChainBuildError;
     resources.validate()?;
     let session = super::pkix::CertificateSession::new(resources);
-    let mut certificates = Vec::with_capacity(intermediates.len() + 1);
-    certificates.push(target.to_vec());
-    // The target listed again among the intermediates is no issuer of itself.
-    certificates.extend(
-        intermediates
-            .iter()
-            .filter(|der| der.as_slice() != target)
-            .cloned(),
-    );
+    // Everything supplied is admitted while still borrowed, so no limit is
+    // exceeded by a copy made before the check.
     admit_evidence(
-        certificates.iter().chain(crls),
+        core::iter::once(target)
+            .chain(intermediates.iter().map(Vec::as_slice))
+            .chain(crls.iter().map(Vec::as_slice)),
         options,
         resources,
         &session,
     )?;
+    // One copy of each certificate: the target listed again is no issuer of
+    // itself, and an intermediate both a document and a store supply is one
+    // issuer, not two that make the path ambiguous.
+    let mut unique: Vec<&[u8]> = Vec::with_capacity(intermediates.len() + 1);
+    unique.push(target);
+    for der in intermediates {
+        if !unique.contains(&der.as_slice()) {
+            unique.push(der);
+        }
+    }
+    let certificates: Vec<Vec<u8>> = unique.into_iter().map(<[u8]>::to_vec).collect();
     let parsed_certificates = certificates
         .iter()
         .map(|der| {

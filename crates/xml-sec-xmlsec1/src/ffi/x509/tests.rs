@@ -2,14 +2,19 @@
 //! it a CRL that applies to a path refuses the path; with it the path is
 //! checked against the CRL.
 
+use xml_sec_libxml2::ffi::tree::{xsDocGetRootElement, xsFreeDoc, xsReadMemory};
+
 use super::load::{
-    TYPE_TRUSTED, keys_mngr_cert_load_memory, keys_mngr_crl_load_memory, keys_mngr_init,
+    TYPE_TRUSTED, default_keys_mngr_adopt_key, default_keys_mngr_init, key_from_certificate,
+    keys_mngr_cert_load_memory, keys_mngr_crl_load_memory, keys_mngr_init,
     xsKeysMngrUtcFactsLoadMemory,
 };
-use super::{FORMAT_DER, mngr_state, verify};
+use super::{FORMAT_DER, FORMAT_PEM, mngr_state, verify, x509_data};
 use crate::ffi::errors::here;
-use crate::ffi::keyinfo::{xmlSecKeyInfoCtxCreate, xmlSecKeyInfoCtxDestroy};
+use crate::ffi::keyinfo::{xmlSecKeyInfoCtxCreate, xmlSecKeyInfoCtxDestroy, xmlSecKeyInfoNodeRead};
+use crate::ffi::keys::{xmlSecKeyCreate, xmlSecKeyDestroy, xmlSecKeyGetValue};
 use crate::ffi::keysmngr::{xmlSecKeysMngrCreate, xmlSecKeysMngrDestroy};
+use crate::ffi::list::xmlSecPtrListAdd;
 use crate::ffi::policy;
 
 const ROOT: &[u8] = include_bytes!("../../../../../tests/fixtures/x509/delta-crl/ca.der");
@@ -76,6 +81,169 @@ fn an_applicable_crl_needs_the_callers_utc_history() {
             0
         );
         assert!(leaf_verifies(mngr));
+        xmlSecKeysMngrDestroy(mngr);
+    }
+}
+
+#[test]
+fn reloading_the_key_certificate_keeps_it_the_key_certificate() {
+    // libxmlsec1 holds the key's certificate by identity: loading it again
+    // moves it after the others, still the key's certificate.
+    let (leaf, intermediate) = (b"leaf".to_vec(), b"intermediate".to_vec());
+    let mut state = super::data::X509State::default();
+    state.add_cert(leaf.clone(), true);
+    state.add_cert(intermediate.clone(), false);
+    state.add_cert(leaf.clone(), false);
+    assert_eq!(state.certs, vec![intermediate.clone(), leaf.clone()]);
+    assert_eq!(state.key_cert.map(|index| &state.certs[index]), Some(&leaf));
+    // Another certificate moving keeps the key's certificate too.
+    state.add_cert(intermediate.clone(), false);
+    assert_eq!(state.key_cert.map(|index| &state.certs[index]), Some(&leaf));
+}
+
+#[test]
+fn a_store_search_by_certificate_spends_the_candidate_allowance() {
+    // Each stored key a certificate lookup inspects is a key candidate of
+    // the read: with an allowance of one, the second key is never reached.
+    const OTHER: &[u8] = include_bytes!("../../../../../tests/fixtures/keys/rsa/rsa-4096-cert.pem");
+    const WANTED: &[u8] =
+        include_bytes!("../../../../../tests/fixtures/keys/rsa/rsa-2048-cert.pem");
+    const XML: &str = "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><X509Data>\
+        <X509SubjectName>CN=Test Key rsa-2048,O=XML Security Library \
+        (http://www.aleksey.com/xmlsec),ST=California,C=US</X509SubjectName>\
+        </X509Data></KeyInfo>";
+    crate::ffi::tests::own_process();
+    let read = |max: usize| -> bool {
+        policy::republish(
+            |verification| verification.resources.max_key_candidates = max,
+            |_| {},
+        )
+        .expect("the library policy compiles");
+        // SAFETY: objects created and destroyed here; the key loader hands
+        // its keys to the manager.
+        unsafe {
+            let here = here!("test");
+            let mngr = xmlSecKeysMngrCreate();
+            assert_eq!(default_keys_mngr_init(mngr.cast()), 0);
+            for pem in [OTHER, WANTED] {
+                let key = key_from_certificate(here, pem, FORMAT_PEM);
+                assert!(!key.is_null(), "a key from the certificate");
+                assert_eq!(default_keys_mngr_adopt_key(mngr.cast(), key), 0);
+            }
+            let ctx = xmlSecKeyInfoCtxCreate(mngr);
+            let enabled = &raw mut (*ctx).enabled_key_data;
+            assert_eq!(xmlSecPtrListAdd(enabled, x509_data().cast_mut().cast()), 0);
+            let doc = xsReadMemory(
+                XML.as_ptr().cast(),
+                i32::try_from(XML.len()).expect("a short document"),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+            );
+            let key = xmlSecKeyCreate();
+            xmlSecKeyInfoNodeRead(xsDocGetRootElement(doc), key, ctx);
+            let found = !xmlSecKeyGetValue(key).is_null();
+            xmlSecKeyDestroy(key);
+            xsFreeDoc(doc);
+            xmlSecKeyInfoCtxDestroy(ctx);
+            xmlSecKeysMngrDestroy(mngr);
+            found
+        }
+    };
+    assert!(read(2), "two candidates reach the wanted key");
+    assert!(!read(1), "one candidate does not");
+}
+
+#[test]
+fn every_carried_certificate_is_a_key_candidate() {
+    // Certificates the document carries are charged like key values: an
+    // X509Data with the leaf and its root needs an allowance of two.
+    crate::ffi::tests::own_process();
+    let encode = |der: &[u8]| -> String {
+        // SAFETY: the encoder returns a NUL-terminated string it allocated,
+        // copied and released here.
+        unsafe {
+            let text = crate::ffi::base64::xmlSecBase64Encode(der.as_ptr(), der.len(), 0);
+            assert!(!text.is_null(), "the bytes encode");
+            let owned = std::ffi::CStr::from_ptr(text.cast())
+                .to_str()
+                .expect("Base64 text")
+                .to_owned();
+            xml_sec_libxml2::ffi::memory::xsFree(text.cast());
+            owned
+        }
+    };
+    let xml = format!(
+        "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><X509Data>\
+         <X509Certificate>{}</X509Certificate><X509Certificate>{}</X509Certificate>\
+         </X509Data></KeyInfo>",
+        encode(LEAF),
+        encode(ROOT)
+    );
+    let read = |max: usize| -> bool {
+        policy::republish(
+            |verification| verification.resources.max_key_candidates = max,
+            |_| {},
+        )
+        .expect("the library policy compiles");
+        // SAFETY: objects created and destroyed here.
+        unsafe {
+            let mngr = xmlSecKeysMngrCreate();
+            assert_eq!(keys_mngr_init(mngr.cast()), 0);
+            assert_eq!(
+                keys_mngr_cert_load_memory(
+                    mngr.cast(),
+                    ROOT.as_ptr(),
+                    ROOT.len(),
+                    FORMAT_DER,
+                    TYPE_TRUSTED
+                ),
+                0
+            );
+            let ctx = xmlSecKeyInfoCtxCreate(mngr);
+            (*ctx).certs_verification_time = super::time_of(AT).expect("a representable time");
+            let enabled = &raw mut (*ctx).enabled_key_data;
+            assert_eq!(xmlSecPtrListAdd(enabled, x509_data().cast_mut().cast()), 0);
+            let doc = xsReadMemory(
+                xml.as_ptr().cast(),
+                i32::try_from(xml.len()).expect("a short document"),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+            );
+            let key = xmlSecKeyCreate();
+            xmlSecKeyInfoNodeRead(xsDocGetRootElement(doc), key, ctx);
+            let found = !xmlSecKeyGetValue(key).is_null();
+            xmlSecKeyDestroy(key);
+            xsFreeDoc(doc);
+            xmlSecKeyInfoCtxDestroy(ctx);
+            xmlSecKeysMngrDestroy(mngr);
+            found
+        }
+    };
+    assert!(read(2), "two candidates admit both certificates");
+    assert!(!read(1), "one candidate does not");
+}
+
+#[test]
+fn a_crl_that_does_not_read_is_not_stored() {
+    // A CRL the store cannot read would fail every path check it applies
+    // to; it is refused at loading, and the store keeps none.
+    // SAFETY: objects created and destroyed here.
+    unsafe {
+        let mngr = xmlSecKeysMngrCreate();
+        assert_eq!(keys_mngr_init(mngr.cast()), 0);
+        let malformed = b"not a CRL";
+        assert_eq!(
+            keys_mngr_crl_load_memory(mngr.cast(), malformed.as_ptr(), malformed.len(), FORMAT_DER),
+            -1
+        );
+        assert_eq!(mngr_state(mngr).expect("a store").crls.len(), 0);
+        assert_eq!(
+            keys_mngr_crl_load_memory(mngr.cast(), CRL.as_ptr(), CRL.len(), FORMAT_DER),
+            0
+        );
+        assert_eq!(mngr_state(mngr).expect("a store").crls.len(), 1);
         xmlSecKeysMngrDestroy(mngr);
     }
 }

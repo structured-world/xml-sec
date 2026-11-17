@@ -23,7 +23,7 @@ use super::super::buffer::{
     xmlSecBufferInitialize, xmlSecBufferSetData,
 };
 use super::super::errors::{self, Here, here};
-use super::super::keyinfo::{XmlSecKeyInfoCtx, read_policy};
+use super::super::keyinfo::{XmlSecKeyInfoCtx, charge_candidate, read_policy};
 use super::super::keys::{
     TYPE_PUBLIC, XmlSecKey, xmlSecKeyAdoptData, xmlSecKeyDestroy, xmlSecKeyGetData,
     xmlSecKeyGetValue, xmlSecKeySwap,
@@ -79,14 +79,17 @@ pub(crate) struct X509State {
 
 impl X509State {
     /// Adds `cert`, the key's certificate first, a certificate already held
-    /// moving to its new place, as libxmlsec1 adds one.
+    /// moving to its new place, as libxmlsec1 adds one. libxmlsec1 holds the
+    /// key's certificate by identity, so it stays the key's certificate
+    /// wherever it moves.
     pub(crate) fn add_cert(&mut self, cert: Vec<u8>, key_cert: bool) {
+        let mut moved_key = false;
         if let Some(position) = self.certs.iter().position(|held| *held == cert) {
             self.certs.remove(position);
-            if let Some(key) = self.key_cert.as_mut()
-                && *key > position
-            {
-                *key -= 1;
+            match self.key_cert {
+                Some(key) if key == position => moved_key = true,
+                Some(key) if key > position => self.key_cert = Some(key - 1),
+                _ => {}
             }
         }
         if key_cert {
@@ -94,6 +97,9 @@ impl X509State {
             self.key_cert = Some(0);
         } else {
             self.certs.push(cert);
+            if moved_key {
+                self.key_cert = Some(self.certs.len() - 1);
+            }
         }
     }
 }
@@ -197,6 +203,11 @@ fn x509_name() -> *const c_char {
     xmlSecNameX509Data.as_ptr().cast()
 }
 
+/// The name of the raw-certificate klass, for reports.
+fn raw_name() -> *const c_char {
+    xmlSecNameRawX509Cert.as_ptr().cast()
+}
+
 unsafe extern "C" fn initialize(data: *mut XmlSecKeyData) -> c_int {
     contain(-1, || {
         // SAFETY: the registry passes key data of this klass at its size.
@@ -271,15 +282,22 @@ impl ChildValue {
         // SAFETY: zeroed buffers and null strings are an uninitialized
         // value; each buffer is initialized before use.
         let mut value: X509DataValue = unsafe { std::mem::zeroed() };
-        for buffer in [
+        let buffers = [
             &raw mut value.cert,
             &raw mut value.crl,
             &raw mut value.ski,
             &raw mut value.digest,
-        ] {
+        ];
+        for (initialized, buffer) in buffers.iter().enumerate() {
             // SAFETY: an uninitialized buffer of the value.
-            if unsafe { xmlSecBufferInitialize(buffer, 128) } < 0 {
+            if unsafe { xmlSecBufferInitialize(*buffer, 128) } < 0 {
                 errors::internal(here, std::ptr::null(), c"xmlSecBufferInitialize");
+                // The value has no owner yet: release the buffers initialized
+                // before this one.
+                for earlier in &buffers[..initialized] {
+                    // SAFETY: a buffer initialized above.
+                    unsafe { xmlSecBufferFinalize(*earlier) };
+                }
                 return None;
             }
         }
@@ -603,7 +621,7 @@ unsafe fn collect(
             errors::internal(here, x509_name(), c"xmlSecKeysMngrGetDataStore");
             return false;
         };
-        let Ok(found) = find(here, store, &child.selectors()) else {
+        let Ok(found) = find(here, store, &child.selectors(), resources) else {
             return false;
         };
         // SAFETY: a context.
@@ -619,6 +637,12 @@ unsafe fn collect(
         }
         found
     } else {
+        // Every certificate the document carries is a key candidate of the
+        // read, charged before it is parsed, as a key value is.
+        // SAFETY: by the caller's contract.
+        if !unsafe { charge_candidate(ctx, here, x509_name()) } {
+            return false;
+        }
         if let Err(error) = parse_x509_certificate_with_resources(&cert, resources) {
             errors::internal_with(
                 here,
@@ -1238,10 +1262,16 @@ unsafe extern "C" fn raw_bin_read(
         let Some(pinned) = (unsafe { read_policy(ctx, here) }) else {
             return -1;
         };
+        // The certificate is a key candidate of the read, charged before it
+        // is parsed.
+        // SAFETY: a context.
+        if !unsafe { charge_candidate(ctx, here, raw_name()) } {
+            return -1;
+        }
         // SAFETY: the caller's `size` bytes.
-        let der = unsafe { std::slice::from_raw_parts(buf, size) }.to_vec();
+        let bytes = unsafe { std::slice::from_raw_parts(buf, size) };
         if let Err(error) =
-            parse_x509_certificate_with_resources(&der, &pinned.verification.resources)
+            parse_x509_certificate_with_resources(bytes, &pinned.verification.resources)
         {
             errors::internal_with(
                 here,
@@ -1252,7 +1282,7 @@ unsafe extern "C" fn raw_bin_read(
             return -1;
         }
         let mut state = X509State::default();
-        state.add_cert(der, false);
+        state.add_cert(bytes.to_vec(), false);
         let data = create(here, state);
         if data.is_null() {
             return -1;

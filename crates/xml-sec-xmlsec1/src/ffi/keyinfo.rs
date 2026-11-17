@@ -169,7 +169,22 @@ pub(crate) unsafe fn charge_key_value(
     {
         return true;
     }
-    // SAFETY: by the caller's contract; the slot is the read's pin.
+    // SAFETY: by the caller's contract.
+    unsafe { charge_candidate(ctx, here, klass_name(id)) }
+}
+
+/// Charges one key candidate, named `object` in a report, to the read with
+/// `ctx`: false, reported at `here`, once the read's `max_key_candidates` is
+/// spent. A context outside a read charges nothing.
+///
+/// # Safety
+/// `ctx` is a context; `object` null or a NUL-terminated name.
+pub(crate) unsafe fn charge_candidate(
+    ctx: *mut XmlSecKeyInfoCtx,
+    here: errors::Here,
+    object: *const std::ffi::c_char,
+) -> bool {
+    // SAFETY: by the caller's contract; the slot is null or the read's pin.
     let (Some(pinned), Some(tally)) = (unsafe {
         (
             policy::pinned((*ctx).reserved0),
@@ -179,11 +194,10 @@ pub(crate) unsafe fn charge_key_value(
         return true;
     };
     let mut current = tally.get();
-    // SAFETY: a klass by the caller's contract.
     let charged = current.charge(
         pinned.verification.resources.max_key_candidates,
         here,
-        unsafe { klass_name(id) },
+        object,
     );
     tally.set(current);
     charged

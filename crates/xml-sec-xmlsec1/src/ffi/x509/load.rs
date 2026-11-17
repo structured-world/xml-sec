@@ -6,13 +6,17 @@
 
 use std::ffi::{c_int, c_uint, c_void};
 
-use xml_sec::xmldsig::{KeyValueInfo, LeapSecondsList, parse_x509_certificate_with_resources};
+use xml_sec::xmldsig::{
+    KeyValueInfo, LeapSecondsList, parse_x509_certificate_with_resources, validate_x509_crl,
+};
 
 use super::super::asymkeys::{self, Material};
 use super::super::errors::{self, Here, here};
 use super::super::keyinfo::{XmlSecKeyInfoCtx, read_policy};
-use super::super::keys::xmlSecKeyDuplicate;
+use std::cell::Cell;
+
 use super::super::keys::{XmlSecKey, xmlSecKeyEnsureData, xmlSecKeyGetData, xmlSecKeyGetValue};
+use super::super::keys::{xmlSecKeyDuplicate, xmlSecKeyMatch};
 use super::super::keysdata::{xmlSecKeyDataStoreCreate, xmlSecKeyDataStoreDestroy};
 use super::super::keysmngr::{
     XmlSecKeyStore, XmlSecKeyStoreKlass, XmlSecKeysMngr, xmlSecKeyStoreCreate,
@@ -109,8 +113,8 @@ unsafe extern "C" fn keys_store_find_key(
     })
 }
 
-/// `findKeyFromX509Data`: a copy of the first key whose certificate the
-/// value's selectors name.
+/// `findKeyFromX509Data`: a copy of the first key the request's
+/// requirements accept whose certificate the value's selectors name.
 unsafe extern "C" fn keys_store_find_key_from_x509_data(
     store: *mut XmlSecKeyStore,
     value: *mut c_void,
@@ -122,35 +126,63 @@ unsafe extern "C" fn keys_store_find_key_from_x509_data(
             errors::assertion(here, c"x509Data != NULL && keyInfoCtx != NULL");
             return std::ptr::null_mut();
         }
-        // SAFETY: a store of this klass and a value the KeyInfo read built.
+        // SAFETY: a store of this klass, a value the KeyInfo read built and
+        // its context.
         unsafe {
             let keys = xmlSecSimpleKeysStoreGetKeys(inner_store(store));
             if keys.is_null() {
                 errors::internal(here, std::ptr::null(), c"xmlSecSimpleKeysStoreGetKeys");
                 return std::ptr::null_mut();
             }
-            let selectors = data::selectors_of(value);
+            let Some(pinned) = read_policy(ctx, here) else {
+                return std::ptr::null_mut();
+            };
+            let max = pinned.verification.resources.max_key_candidates;
+            // Every entry inspected is a key candidate of the read, charged to
+            // the allowance all its searches share, as the simple store
+            // charges a search by name.
+            let shared = policy::key_candidates((*ctx).reserved0);
+            let mut tally = shared.map_or_default(Cell::get);
+            let mut eligible: Vec<(*mut XmlSecKey, &[u8])> = Vec::new();
             for position in 0..xmlSecPtrListGetSize(keys) {
+                if !tally.charge(max, here, (*(*store).id).name.cast()) {
+                    break;
+                }
                 let key = xmlSecPtrListGetItem(keys, position).cast::<XmlSecKey>();
+                // A key the request cannot use is passed over, so a usable
+                // key with the same certificate further on is still found.
+                if key.is_null()
+                    || xmlSecKeyMatch(key, std::ptr::null(), &raw mut (*ctx).key_req) != 1
+                {
+                    continue;
+                }
                 let Some(state) = state_of(xmlSecKeyGetData(key, data::x509_data())) else {
                     continue;
                 };
-                let Some(cert) = state.key_cert.map(|index| &state.certs[index]) else {
-                    continue;
-                };
-                match super::matches(here, &selectors, cert) {
-                    Ok(true) => {
-                        let copy = xmlSecKeyDuplicate(key);
-                        if copy.is_null() {
-                            errors::internal(here, std::ptr::null(), c"xmlSecKeyDuplicate");
-                        }
-                        return copy;
-                    }
-                    Ok(false) => {}
-                    Err(()) => return std::ptr::null_mut(),
+                if let Some(index) = state.key_cert {
+                    eligible.push((key, &state.certs[index]));
                 }
             }
-            std::ptr::null_mut()
+            if let Some(shared) = shared {
+                shared.set(tally);
+            }
+            let selectors = data::selectors_of(value);
+            let Ok(found) = super::first_named(
+                here,
+                &selectors,
+                eligible.iter().map(|(_, cert)| *cert),
+                &pinned.verification.resources,
+            ) else {
+                return std::ptr::null_mut();
+            };
+            let Some(position) = found else {
+                return std::ptr::null_mut();
+            };
+            let copy = xmlSecKeyDuplicate(eligible[position].0);
+            if copy.is_null() {
+                errors::internal(here, std::ptr::null(), c"xmlSecKeyDuplicate");
+            }
+            copy
         }
     })
 }
@@ -327,6 +359,17 @@ pub(crate) unsafe extern "C" fn keys_mngr_crl_load_memory(
                 return -1;
             }
         };
+        // A CRL that does not read would fail every later check the store
+        // applies it to; it is refused here, leaving the store as it was.
+        if let Err(error) = validate_x509_crl(&der, &policy.resources) {
+            errors::internal_with(
+                here,
+                std::ptr::null(),
+                c"xmlSecOpenSSLX509CrlLoadBIO",
+                &error.to_string(),
+            );
+            return -1;
+        }
         // SAFETY: a keys manager.
         let Some(store) = (unsafe { store_of(here, mngr) }) else {
             return -1;

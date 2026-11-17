@@ -66,6 +66,8 @@ static int utc_facts(xmlSecKeysMngrPtr mngr) {
 }
 
 static int quiet = 0;
+/* The key type the next reads require, when not 0. */
+static xmlSecKeyDataType wanted_type = 0;
 /* The reason of the first report since the last `first_report()`: the
  * cause of a failure, before the chain of reports above it, whose length
  * each implementation's layering sets. */
@@ -153,6 +155,9 @@ static void show(xmlSecKeyPtr key) {
            value != NULL ? (unsigned)xmlSecKeyDataGetSize(value) : 0u,
            xmlSecKeyGetData(key, xmlSecKeyDataX509Id) != NULL, (long)key->notValidBefore,
            (long)key->notValidAfter);
+    if (wanted_type != 0) {
+        printf("  private: %d\n", (xmlSecKeyGetType(key) & xmlSecKeyDataTypePrivate) != 0);
+    }
 }
 
 /* Reads the KeyInfo of `xml` with the keys manager `mngr`, the flags and
@@ -164,6 +169,9 @@ static void read_key_info(const char *label, xmlSecKeysMngrPtr mngr, const char 
     xmlSecKeyPtr key = xmlSecKeyCreate();
     ctx->flags = flags;
     ctx->certsVerificationTime = at;
+    if (wanted_type != 0) {
+        ctx->keyReq.keyType = wanted_type;
+    }
     printf("%s:\n", label);
     first_reason = 0;
     printf("  read: %d\n", xmlSecKeyInfoNodeRead(xsDocGetRootElement(doc), key, ctx));
@@ -210,6 +218,8 @@ int main(void) {
     static xmlSecByte bytes[16384];
     static xmlSecByte decoded[16384];
     xmlSecKeysMngrPtr mngr;
+    xmlChar *leaf_text;
+    xmlChar *crl_text;
     xmlSecKeyPtr key;
     xmlSecKeyInfoCtxPtr ctx;
     xmlSecSize size;
@@ -296,6 +306,21 @@ int main(void) {
                   "<KeyInfo xmlns='" DSIG "'><X509Data><X509SubjectName>"
                   "CN=xml-sec Test Delta Leaf</X509SubjectName></X509Data></KeyInfo>",
                   0, IN_CRL_WINDOW);
+    /* A CRL the document carries names no certificate: stopping on unknown
+     * certificates does not stop on it. */
+    size = read_file(CRL_LEAF, bytes, sizeof(bytes));
+    leaf_text = xmlSecBase64Encode(bytes, size, 0);
+    size = read_file(CRL_EMPTY, bytes, sizeof(bytes));
+    crl_text = xmlSecBase64Encode(bytes, size, 0);
+    snprintf(xml, sizeof(xml),
+             "<KeyInfo xmlns='" DSIG "'><X509Data><X509Certificate>%s</X509Certificate>"
+             "<X509CRL>%s</X509CRL></X509Data></KeyInfo>",
+             leaf_text != NULL ? (const char *)leaf_text : "",
+             crl_text != NULL ? (const char *)crl_text : "");
+    xsFree(leaf_text);
+    xsFree(crl_text);
+    read_key_info("leaf and CRL, stop on unknown", mngr, xml,
+                  XMLSEC_KEYINFO_FLAGS_X509DATA_STOP_ON_UNKNOWN_CERT, IN_CRL_WINDOW);
     xmlSecKeysMngrDestroy(mngr);
 
     /* A key from a certificate format holds its key and its certificate. */
@@ -333,6 +358,25 @@ int main(void) {
                   "CN=Test Key rsa-2048,O=XML Security Library (http://www.aleksey.com/xmlsec),"
                   "ST=California,C=US</X509SubjectName></X509Data></KeyInfo>",
                   0, 0);
+    xmlSecKeysMngrDestroy(mngr);
+
+    /* A key the request cannot use does not hide a usable one with the same
+     * certificate: a private key is found behind a public copy. */
+    mngr = manager("keys manager holding a public copy first", 0, 0);
+    size = read_file(LEAF, bytes, sizeof(bytes));
+    printf("  adopt public: %d\n",
+           xmlSecCryptoAppDefaultKeysMngrAdoptKey(
+               mngr, xmlSecCryptoAppKeyLoadMemory(bytes, size, xmlSecKeyDataFormatCertPem, NULL,
+                                                  NULL, NULL)));
+    printf("  adopt private: %d\n",
+           xmlSecCryptoAppDefaultKeysMngrAdoptKey(mngr, xmlSecKeyDuplicate(key)));
+    wanted_type = xmlSecKeyDataTypePrivate;
+    read_key_info("private key by subject", mngr,
+                  "<KeyInfo xmlns='" DSIG "'><X509Data><X509SubjectName>"
+                  "CN=Test Key rsa-2048,O=XML Security Library (http://www.aleksey.com/xmlsec),"
+                  "ST=California,C=US</X509SubjectName></X509Data></KeyInfo>",
+                  0, 0);
+    wanted_type = 0;
     xmlSecKeysMngrDestroy(mngr);
 
     mngr = manager("verify key with root", 1, 0);

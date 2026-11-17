@@ -3470,6 +3470,60 @@ pub fn x509_certificate_matches_selectors(
     )
 }
 
+/// The position of the first of `candidates` that every selector of `info`
+/// names, as a store finds the certificate a lookup-only `X509Data`
+/// identifies. All comparisons run in one session under `resources`, so they
+/// share its work allowance. `None` when no candidate matches.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] for invalid `resources`, a candidate that cannot be
+/// read, or comparisons beyond the resource limits.
+///
+/// # Examples
+///
+/// ```
+/// use xml_sec::policy::ResourcePolicy;
+/// use xml_sec::xmldsig::{X509DataInfo, x509_find_certificate_by_selectors};
+///
+/// // Without selectors no certificate is named.
+/// let found = x509_find_certificate_by_selectors(
+///     &X509DataInfo::default(),
+///     [b"not read".as_slice()],
+///     xml_sec::provider::default_provider(),
+///     &ResourcePolicy::default(),
+/// )?;
+/// assert_eq!(found, None);
+/// # Ok::<(), xml_sec::xmldsig::ParseError>(())
+/// ```
+pub fn x509_find_certificate_by_selectors<'c>(
+    info: &X509DataInfo,
+    candidates: impl IntoIterator<Item = &'c [u8]>,
+    provider: &dyn crate::provider::CryptoProvider,
+    resources: &crate::policy::ResourcePolicy,
+) -> Result<Option<usize>, ParseError> {
+    if info.subject_names.is_empty()
+        && info.issuer_serials.is_empty()
+        && info.skis.is_empty()
+        && info.digests.is_empty()
+    {
+        return Ok(None);
+    }
+    resources.validate().map_err(ParseError::Policy)?;
+    let certificates = super::pkix::CertificateSession::new(resources);
+    for (position, candidate) in candidates.into_iter().enumerate() {
+        if x509_selector_categories_match_candidates(
+            info,
+            core::iter::once(candidate),
+            provider,
+            &certificates,
+        )? {
+            return Ok(Some(position));
+        }
+    }
+    Ok(None)
+}
+
 pub(crate) fn x509_selector_categories_match_chain(
     info: &X509DataInfo,
     provider: &dyn crate::provider::CryptoProvider,
@@ -3982,17 +4036,21 @@ fn format_x509_serial_value_hex(serial: &[u8]) -> String {
 /// form `X509SerialNumber` carries (`XMLDSig` 1.1 section 4.5.4.1:
 /// `xsd:integer`).
 fn format_x509_serial_decimal(serial: &[u8]) -> String {
+    // The last decimal digit of `value`.
+    fn last_digit(value: u32) -> u8 {
+        u8::try_from(value % 10).expect("a remainder of division by 10 fits a byte")
+    }
     // Little-endian decimal digits, multiplied by 256 per input octet.
     let mut digits = vec![0_u8];
     for byte in serial {
         let mut carry = u32::from(*byte);
         for digit in &mut digits {
             let value = u32::from(*digit) * 256 + carry;
-            *digit = (value % 10) as u8;
+            *digit = last_digit(value);
             carry = value / 10;
         }
         while carry > 0 {
-            digits.push((carry % 10) as u8);
+            digits.push(last_digit(carry));
             carry /= 10;
         }
     }
