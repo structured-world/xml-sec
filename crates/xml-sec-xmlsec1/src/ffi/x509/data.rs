@@ -12,6 +12,7 @@
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::fmt::Write as _;
 
+use xml_sec::policy::{UnknownX509CertificateSemantics, VerificationPolicy};
 use xml_sec::xmldsig::{KeyValueInfo, parse_x509_certificate_with_resources};
 
 use super::super::asymkeys::{self, Material};
@@ -611,8 +612,9 @@ unsafe fn collect(
     state: &mut X509State,
     child: &ChildValue,
     ctx: *mut XmlSecKeyInfoCtx,
-    resources: &xml_sec::policy::ResourcePolicy,
+    policy: &VerificationPolicy,
 ) -> bool {
+    let resources = &policy.resources;
     let cert = ChildValue::bytes(&child.value.cert);
     let crl = ChildValue::bytes(&child.value.crl);
     let cert = if cert.is_empty() {
@@ -621,11 +623,21 @@ unsafe fn collect(
             errors::internal(here, x509_name(), c"xmlSecKeysMngrGetDataStore");
             return false;
         };
-        let Ok(found) = find(here, store, &child.selectors(), resources) else {
+        let selectors = child.selectors();
+        let Ok(found) = find(here, store, &selectors, resources) else {
             return false;
         };
+        // Whether a child naming no certificate is unknown is the policy's
+        // interpretation: libxmlsec1's header documents the flag for
+        // certificate references, its implementation applies it to every
+        // child that yields no certificate.
+        let unknown = found.is_none()
+            && match policy.key_trust.unknown_x509_certificate {
+                UnknownX509CertificateSemantics::References => !selectors.is_empty(),
+                UnknownX509CertificateSemantics::Libxmlsec1 => true,
+            };
         // SAFETY: a context.
-        if found.is_none() && unsafe { (*ctx).flags } & FLAGS_STOP_ON_UNKNOWN_CERT != 0 {
+        if unknown && unsafe { (*ctx).flags } & FLAGS_STOP_ON_UNKNOWN_CERT != 0 {
             errors::report(
                 here,
                 x509_name(),
@@ -805,8 +817,7 @@ unsafe extern "C" fn xml_read(
             return -1;
         };
         // SAFETY: a key, a live element and a context.
-        let read =
-            unsafe { read_children(here, key, node, ctx, state, &pinned.verification.resources) };
+        let read = unsafe { read_children(here, key, node, ctx, state, &pinned.verification) };
         // SAFETY: a key; the data is ours until the key adopts it.
         unsafe {
             if !read {
@@ -844,7 +855,7 @@ unsafe fn read_children(
     node: *mut XmlNode,
     ctx: *mut XmlSecKeyInfoCtx,
     state: &mut X509State,
-    resources: &xml_sec::policy::ResourcePolicy,
+    policy: &VerificationPolicy,
 ) -> bool {
     let mut key_found = false;
     // SAFETY: by the caller's contract.
@@ -871,7 +882,7 @@ unsafe fn read_children(
                     key_found = true;
                 }
             }
-            if !key_found && !mngr.is_null() && !collect(here, state, &child, ctx, resources) {
+            if !key_found && !mngr.is_null() && !collect(here, state, &child, ctx, policy) {
                 return false;
             }
             cur = xmlSecGetNextElementNode(nodes::next(cur));

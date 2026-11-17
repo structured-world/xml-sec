@@ -306,8 +306,9 @@ int main(void) {
                   "<KeyInfo xmlns='" DSIG "'><X509Data><X509SubjectName>"
                   "CN=xml-sec Test Delta Leaf</X509SubjectName></X509Data></KeyInfo>",
                   0, IN_CRL_WINDOW);
-    /* A CRL the document carries names no certificate: stopping on unknown
-     * certificates does not stop on it. */
+    /* A CRL the document carries names no certificate, yet libxmlsec1 stops
+     * on it when stopping on unknown certificates; the library's
+     * libxmlsec1-compatible policy does the same. */
     size = read_file(CRL_LEAF, bytes, sizeof(bytes));
     leaf_text = xmlSecBase64Encode(bytes, size, 0);
     size = read_file(CRL_EMPTY, bytes, sizeof(bytes));

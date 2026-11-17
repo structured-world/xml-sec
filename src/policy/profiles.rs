@@ -9,8 +9,9 @@ use super::{
 };
 use super::{
     DigestAlgorithm, KeySourceKind, KeySourcePolicy, PolicyViolation, RsaPssPermission,
-    SameDocumentIdSemantics, SignatureAlgorithm, SigningPolicy, TransformPolicy, UriPolicy,
-    UriTypeSet, VerificationPolicy, XsltStylesheetSemantics,
+    SameDocumentIdSemantics, SignatureAlgorithm, SigningPolicy, TransformPolicy,
+    UnknownX509CertificateSemantics, UriPolicy, UriTypeSet, VerificationPolicy,
+    XsltStylesheetSemantics,
 };
 use crate::provider::{CryptoProvider, ProviderCapability};
 use alloc::{borrow::ToOwned, collections::BTreeSet, string::String, sync::Arc};
@@ -438,6 +439,8 @@ fn verification_profile(
         verification.hmac.minimum_output_bits = 80;
         verification.transforms.same_document_id_semantics =
             SameDocumentIdSemantics::XmlSecBarename;
+        verification.key_trust.unknown_x509_certificate =
+            UnknownX509CertificateSemantics::Libxmlsec1;
     }
     if constraints != SignatureConstraints::General {
         verification.key_sources = KeySourcePolicy::from([

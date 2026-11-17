@@ -226,6 +226,93 @@ fn every_carried_certificate_is_a_key_candidate() {
 }
 
 #[test]
+fn the_policy_decides_whether_a_crl_child_is_an_unknown_certificate() {
+    // With XMLSEC_KEYINFO_FLAGS_X509DATA_STOP_ON_UNKNOWN_CERT, libxmlsec1
+    // stops on an X509CRL child, which names no certificate; its header
+    // documents the flag for certificate references only. The policy picks.
+    use xml_sec::policy::UnknownX509CertificateSemantics;
+    const STOP_ON_UNKNOWN_CERT: std::ffi::c_uint = 0x0000_0400;
+    crate::ffi::tests::own_process();
+    let encode = |der: &[u8]| -> String {
+        // SAFETY: the encoder returns a NUL-terminated string it allocated,
+        // copied and released here.
+        unsafe {
+            let text = crate::ffi::base64::xmlSecBase64Encode(der.as_ptr(), der.len(), 0);
+            assert!(!text.is_null(), "the bytes encode");
+            let owned = std::ffi::CStr::from_ptr(text.cast())
+                .to_str()
+                .expect("Base64 text")
+                .to_owned();
+            xml_sec_libxml2::ffi::memory::xsFree(text.cast());
+            owned
+        }
+    };
+    let xml = format!(
+        "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><X509Data>\
+         <X509Certificate>{}</X509Certificate><X509CRL>{}</X509CRL>\
+         </X509Data></KeyInfo>",
+        encode(LEAF),
+        encode(CRL)
+    );
+    let read = |semantics: UnknownX509CertificateSemantics| -> (std::ffi::c_int, bool) {
+        policy::republish(
+            |verification| verification.key_trust.unknown_x509_certificate = semantics,
+            |_| {},
+        )
+        .expect("the library policy compiles");
+        // SAFETY: objects created and destroyed here.
+        unsafe {
+            let mngr = xmlSecKeysMngrCreate();
+            assert_eq!(keys_mngr_init(mngr.cast()), 0);
+            assert_eq!(
+                keys_mngr_cert_load_memory(
+                    mngr.cast(),
+                    ROOT.as_ptr(),
+                    ROOT.len(),
+                    FORMAT_DER,
+                    TYPE_TRUSTED
+                ),
+                0
+            );
+            assert_eq!(
+                xsKeysMngrUtcFactsLoadMemory(mngr, LEAP_SECONDS.as_ptr(), LEAP_SECONDS.len()),
+                0
+            );
+            let ctx = xmlSecKeyInfoCtxCreate(mngr);
+            (*ctx).flags = STOP_ON_UNKNOWN_CERT;
+            (*ctx).certs_verification_time = super::time_of(AT).expect("a representable time");
+            let enabled = &raw mut (*ctx).enabled_key_data;
+            assert_eq!(xmlSecPtrListAdd(enabled, x509_data().cast_mut().cast()), 0);
+            let doc = xsReadMemory(
+                xml.as_ptr().cast(),
+                i32::try_from(xml.len()).expect("a short document"),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+            );
+            let key = xmlSecKeyCreate();
+            let result = xmlSecKeyInfoNodeRead(xsDocGetRootElement(doc), key, ctx);
+            let found = !xmlSecKeyGetValue(key).is_null();
+            xmlSecKeyDestroy(key);
+            xsFreeDoc(doc);
+            xmlSecKeyInfoCtxDestroy(ctx);
+            xmlSecKeysMngrDestroy(mngr);
+            (result, found)
+        }
+    };
+    assert_eq!(
+        read(UnknownX509CertificateSemantics::Libxmlsec1),
+        (-1, false),
+        "libxmlsec1 stops on the CRL"
+    );
+    assert_eq!(
+        read(UnknownX509CertificateSemantics::References),
+        (0, true),
+        "the documented flag reads past it and the leaf verifies"
+    );
+}
+
+#[test]
 fn a_crl_that_does_not_read_is_not_stored() {
     // A CRL the store cannot read would fail every path check it applies
     // to; it is refused at loading, and the store keeps none.

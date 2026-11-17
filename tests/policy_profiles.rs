@@ -507,6 +507,23 @@ fn all_named_profiles_compile_and_legacy_requires_auditable_expiry() {
             expected,
             "{profile:?}"
         );
+        // Only the libxmlsec1-compatible profile stops on any X509Data child
+        // that yields no certificate, as libxmlsec1 does; the others follow
+        // its documented flag.
+        let unknown = if profile == PolicyProfile::XmlSecCompatible {
+            xml_sec::policy::UnknownX509CertificateSemantics::Libxmlsec1
+        } else {
+            xml_sec::policy::UnknownX509CertificateSemantics::References
+        };
+        assert_eq!(
+            compiled
+                .verification()
+                .unwrap()
+                .key_trust
+                .unknown_x509_certificate,
+            unknown,
+            "{profile:?}"
+        );
     }
     assert!(PolicyCompiler::new(PolicyProfile::LegacyVerify, &RustCryptoProvider, None).is_err());
     let compiled = PolicyCompiler::new(

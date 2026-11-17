@@ -376,6 +376,16 @@ pub(crate) struct Selectors {
     pub(crate) digest: Option<(String, Vec<u8>)>,
 }
 
+impl Selectors {
+    /// Whether no selector names a certificate.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.subject.is_none()
+            && self.issuer_serial.is_none()
+            && self.ski.is_none()
+            && self.digest.is_none()
+    }
+}
+
 /// The untrusted certificate of the store the `selectors` name, as
 /// libxmlsec1's store finds one by value; `Ok(None)` when none matches or
 /// there are no selectors.

@@ -88,6 +88,14 @@ does not itself establish trust or supply a key.
 | `certificate_signature_algorithms` | `"default"`, `"AllSupported"`, or descriptor array |
 | `allowed_extended_key_usages` | Purpose array, described below |
 | `verification_time` | `"system"` or explicit timestamp below |
+| `unknown_x509_certificate` | `References`, `Libxmlsec1` |
+
+`unknown_x509_certificate` is an interpretation, composed like the transform
+semantics: it decides which `X509Data` children a lookup that stops on an
+unknown certificate refuses. `References` refuses only a child naming a
+certificate no store holds, as libxmlsec1 documents its flag; `Libxmlsec1`
+refuses any child that yields no certificate, an `X509CRL` included, as its
+implementation does. The libxmlsec1-compatible profiles select `Libxmlsec1`.
 
 An extended purpose is `ServerAuth`, `ClientAuth`, `CodeSigning`,
 `EmailProtection`, `TimeStamping`, `OcspSigning`, or an array of nonnegative
