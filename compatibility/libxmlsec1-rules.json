@@ -145,9 +145,9 @@
     {
       "id": "backend-provider-transform-surface",
       "kinds": ["backend-api"],
-      "name_regex": "^xmlSec(?:GCrypt|GnuTLS|MSCng|MSCrypto|Nss|OpenSSL)Transform(?:Aes128Cbc|Aes256Cbc|Aes128Gcm|Aes256Gcm|KWAes128|KWAes256|DsaSha1|EcdsaSha256|EcdsaSha384|HmacSha1|RsaOaep|RsaOaepEnc11|RsaSha1|RsaSha256|RsaSha384|RsaSha512|Sha1|Sha256|Sha384|Sha512)GetKlass$",
+      "name_regex": "^xmlSec(?:GCrypt|GnuTLS|MSCng|MSCrypto|Nss|OpenSSL)Transform(?:Aes128Cbc|Aes128Gcm|Aes192Cbc|Aes192Gcm|Aes256Cbc|Aes256Gcm|Des3Cbc|DsaSha1|DsaSha256|EcdsaRipemd160|EcdsaSha1|EcdsaSha224|EcdsaSha256|EcdsaSha384|EcdsaSha512|HmacMd5|HmacRipemd160|HmacSha1|HmacSha224|HmacSha256|HmacSha384|HmacSha512|KWAes128|KWAes192|KWAes256|KWDes3|Md5|Ripemd160|RsaMd5|RsaOaep|RsaOaepEnc11|RsaPkcs1|RsaPssSha1|RsaPssSha224|RsaPssSha256|RsaPssSha384|RsaPssSha512|RsaPssSha3_224|RsaPssSha3_256|RsaPssSha3_384|RsaPssSha3_512|RsaRipemd160|RsaSha1|RsaSha224|RsaSha256|RsaSha384|RsaSha512|Sha1|Sha224|Sha256|Sha384|Sha512)GetKlass$",
       "outcome": "provider-limited",
-      "rationale": "The native provider contract implements the corresponding cryptographic operation, reached from C through the generic klass identity; this backend-specific symbol is not provided, because no backend header is shipped.",
+      "rationale": "The native provider contract implements the algorithm of this transform, whose URI the native API claims; this backend-specific symbol is not provided, because no backend header is shipped. From C, the generic klass identity of a digest, signature or HMAC algorithm runs it through the provider; the cipher, key-wrap and key-transport klasses report not implemented until the encryption context is provided.",
       "evidence": "provider-contract"
     },
     {

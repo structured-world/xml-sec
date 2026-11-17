@@ -61,7 +61,7 @@ for thousands of items:
 | `source-compatible` | Existing libxmlsec1 source can use the compatibility surface without call-site changes, while binary ABI identity is not implied. Reserved until the generic source tier gate passes for the item. |
 | `behavior-compatible` | The native Rust API implements the wire behavior and has repository test coverage. |
 | `compatibility-profile-only` | The behavior exists but requires an explicit compatibility policy, normally for a legacy algorithm. |
-| `provider-limited` | The Rust provider abstraction implements the corresponding cryptographic transform, reached from C through the generic klass identity, but not the backend-specific C symbol. |
+| `provider-limited` | The Rust provider abstraction implements the corresponding cryptographic transform, whose URI the native API claims, but not the backend-specific C symbol. From C, the generic klass identity runs digest, signature and HMAC algorithms; cipher, key-wrap and key-transport klasses are not provided yet. |
 | `binary-abi-incompatible` | The item belongs to libxmlsec1's generic C source/ABI surface, for which no C tier is claimed yet; the libxmlsec1-compatible library may already declare and implement it. |
 | `intentionally-unsupported` | The item is deliberately excluded, with the reason in its classification: the backend-specific headers, the functions that read a file or take a libxml2 parser context, and the internal exports of libxmlsec1's crypto libraries. |
 | `planned` | The item is a visible parity target and is not implemented yet. |

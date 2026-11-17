@@ -321,19 +321,39 @@ fn compatible_headers() -> Vec<(String, String)> {
     headers
 }
 
-/// Every identifier on the exported declaration lines of `text`, which
-/// include each declared function's name.
+/// Every identifier of the exported declarations of `text`, each read from
+/// the line starting with the export marker through its terminating `;`, so
+/// a name on a later line of the declaration is included.
 fn exported_words(text: &str) -> BTreeSet<&str> {
-    text.lines()
-        .filter(|line| line.starts_with("XMLSEC_EXPORT"))
-        .flat_map(|line| line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')))
-        .filter(|word| !word.is_empty())
-        .collect()
+    let mut words = BTreeSet::new();
+    let mut inside = false;
+    for line in text.lines() {
+        inside = inside || line.starts_with("XMLSEC_EXPORT");
+        if !inside {
+            continue;
+        }
+        words.extend(
+            line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .filter(|word| !word.is_empty()),
+        );
+        inside = !line.contains(';');
+    }
+    words
 }
 
 /// Whether `text` declares the exported function `name`.
 fn declares(text: &str, name: &str) -> bool {
     exported_words(text).contains(name)
+}
+
+#[test]
+fn a_declaration_split_across_lines_is_seen() {
+    // The exclusion checks must not miss a declaration whose name follows the
+    // export marker on a later line.
+    let header = "XMLSEC_EXPORT int\n    xmlSecBufferReadFile(xmlSecBufferPtr buf,\n        const char* filename);\nint xmlSecOther(void);\n";
+    assert!(declares(header, "xmlSecBufferReadFile"));
+    assert!(declares(header, "xmlSecBufferPtr"));
+    assert!(!declares(header, "xmlSecOther"));
 }
 
 #[test]
@@ -816,13 +836,59 @@ fn backend_surface_distinguishes_provider_capabilities_from_unimplemented_apis()
             .all(|item| item.name.contains("Transform"))
     );
 
-    for unsupported in ["Des3", "Gost"] {
-        assert!(ledger.items.iter().any(|item| {
-            item.kind == "backend-api"
-                && item.name.contains(unsupported)
-                && classification(&ledger, item).outcome == "intentionally-unsupported"
-        }));
+    // A backend transform getter is provider-limited exactly when the
+    // algorithm URI of the same name is claimed for the native API, so the
+    // two classifications cannot drift apart.
+    let claimed: BTreeSet<&str> = ledger
+        .items
+        .iter()
+        .filter(|item| {
+            item.kind == "algorithm-uri"
+                && matches!(
+                    classification(&ledger, item).outcome.as_str(),
+                    "behavior-compatible" | "compatibility-profile-only"
+                )
+        })
+        .map(|item| item.name.as_str())
+        .collect();
+    let algorithm = |name: &str| -> Option<String> {
+        let rest = name.strip_prefix("xmlSec")?.strip_suffix("GetKlass")?;
+        ["GCrypt", "GnuTLS", "MSCng", "MSCrypto", "Nss", "OpenSSL"]
+            .iter()
+            .find_map(|backend| rest.strip_prefix(backend)?.strip_prefix("Transform"))
+            .filter(|algorithm| !algorithm.is_empty())
+            .map(str::to_owned)
+    };
+    let mut getters = 0;
+    for item in ledger
+        .items
+        .iter()
+        .filter(|item| item.kind == "backend-api")
+    {
+        let Some(algorithm) = algorithm(&item.name) else {
+            continue;
+        };
+        getters += 1;
+        let href = format!("xmlSecHref{algorithm}");
+        let expected = if claimed.contains(href.as_str()) {
+            "provider-limited"
+        } else {
+            "intentionally-unsupported"
+        };
+        assert_eq!(
+            classification(&ledger, item).outcome,
+            expected,
+            "{} ({href})",
+            item.name
+        );
     }
+    assert!(getters > provider_limited.len());
+
+    assert!(ledger.items.iter().any(|item| {
+        item.kind == "backend-api"
+            && item.name.contains("Gost")
+            && classification(&ledger, item).outcome == "intentionally-unsupported"
+    }));
 }
 
 #[test]
