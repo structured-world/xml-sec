@@ -35,6 +35,7 @@ pub(crate) mod io;
 pub(crate) mod parser;
 pub(crate) mod relationship;
 pub(crate) mod signatures;
+pub(crate) mod transport;
 pub(crate) mod xpath;
 
 #[cfg(test)]

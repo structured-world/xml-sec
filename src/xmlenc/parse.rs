@@ -1737,7 +1737,17 @@ where
     }
 }
 
-#[cfg(test)]
+impl EncryptionMethod {
+    /// Parse the `EncryptionMethod` element `node`, its key size, OAEP and
+    /// `ChaCha` parameters included.
+    ///
+    /// # Errors
+    /// Returns a node that is no `EncryptionMethod` or malformed parameters.
+    pub fn from_element(node: Node<'_, '_>) -> Result<Self, XmlEncError> {
+        parse_encryption_method(node)
+    }
+}
+
 fn parse_encryption_method(node: Node<'_, '_>) -> Result<EncryptionMethod, XmlEncError> {
     parse_encryption_method_with_limit(node, crate::hard_limits::ENCRYPTION_METADATA_BYTE_CEILING)
 }

@@ -1808,6 +1808,42 @@ impl EncryptionPolicy {
     ) -> Result<(), PolicyViolation> {
         check_key_wrap(self.key_wrap_algorithms.as_ref(), algorithm, "encryption")
     }
+
+    /// Check whether keys may be transported with `algorithm`.
+    ///
+    /// # Errors
+    /// Returns [`PolicyViolation::Algorithm`] for a transport the snapshot
+    /// does not admit.
+    pub fn check_key_transport_algorithm(
+        &self,
+        algorithm: KeyTransportAlgorithm,
+    ) -> Result<(), PolicyViolation> {
+        check_key_transport(
+            self.key_transport_algorithms.as_ref(),
+            algorithm,
+            "encryption",
+        )
+    }
+}
+
+/// Enforce the shared key-transport permission contract: without an
+/// allowlist, only transports that need no explicit permission are admitted.
+#[cfg(feature = "xmlenc")]
+fn check_key_transport(
+    allowlist: Option<&BTreeSet<KeyTransportAlgorithm>>,
+    algorithm: KeyTransportAlgorithm,
+    operation: &'static str,
+) -> Result<(), PolicyViolation> {
+    let refused = allowlist.map_or(algorithm.requires_explicit_permission(), |allowed| {
+        !allowed.contains(&algorithm)
+    });
+    if refused {
+        return Err(PolicyViolation::Algorithm {
+            operation,
+            algorithm: algorithm.uri().to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Enforce the shared key-wrap permission contract: without an allowlist,
@@ -1897,6 +1933,22 @@ impl DecryptionPolicy {
         algorithm: KeyWrapAlgorithm,
     ) -> Result<(), PolicyViolation> {
         check_key_wrap(self.key_wrap_algorithms.as_ref(), algorithm, "decryption")
+    }
+
+    /// Check whether keys transported with `algorithm` may be recovered.
+    ///
+    /// # Errors
+    /// Returns [`PolicyViolation::Algorithm`] for a transport the snapshot
+    /// does not admit.
+    pub fn check_key_transport_algorithm(
+        &self,
+        algorithm: KeyTransportAlgorithm,
+    ) -> Result<(), PolicyViolation> {
+        check_key_transport(
+            self.key_transport_algorithms.as_ref(),
+            algorithm,
+            "decryption",
+        )
     }
 }
 

@@ -121,6 +121,75 @@ static void wrap(xmlSecTransformId id, xmlSecKeyDataId keyId, xmlSecSize kekSize
     xmlSecKeyDestroy(kek);
 }
 
+#define RSA_KEY "tests/fixtures/keys/rsa/rsa-2048-key.pem"
+
+static xmlSecKeyPtr rsa_key(void) {
+    static xmlSecByte bytes[8192];
+    size_t size;
+    FILE *file = fopen(RSA_KEY, "rb");
+    if (file == NULL) {
+        return NULL;
+    }
+    size = fread(bytes, 1, sizeof(bytes), file);
+    fclose(file);
+    return xmlSecCryptoAppKeyLoadMemory(bytes, (xmlSecSize)size, xmlSecKeyDataFormatPem, NULL,
+                                        NULL, NULL);
+}
+
+/* Runs the transport read from the EncryptionMethod `xml` (or `id` when
+ * NULL) with `operation` over `data`; returns the output length or -1. */
+static int transport(xmlSecTransformId id, const char *xml, xmlSecTransformOperation operation,
+                     xmlSecKeyPtr key, const xmlSecByte *data, xmlSecSize size, xmlSecByte *out) {
+    int result = -1;
+    xmlSecTransformCtxPtr ctx = xmlSecTransformCtxCreate();
+    xmlSecTransformPtr transform;
+    xmlDocPtr doc = NULL;
+    if (xml != NULL) {
+        doc = xsReadMemory(xml, (int)strlen(xml), "method.xml", NULL, 0);
+        transform = xmlSecTransformCtxNodeRead(ctx, xsDocGetRootElement(doc),
+                                               xmlSecTransformUsageEncryptionMethod);
+    } else {
+        transform = xmlSecTransformCtxCreateAndAppend(ctx, id);
+    }
+    if (transform != NULL) {
+        transform->operation = operation;
+        if (xmlSecTransformSetKey(transform, key) == 0 &&
+            xmlSecTransformCtxBinaryExecute(ctx, data, size) == 0) {
+            result = (int)xmlSecBufferGetSize(ctx->result);
+            memcpy(out, xmlSecBufferGetData(ctx->result), (size_t)result);
+        }
+    }
+    xmlSecTransformCtxDestroy(ctx);
+    if (doc != NULL) {
+        xsFreeDoc(doc);
+    }
+    return result;
+}
+
+/* RSA-OAEP output is randomized: a transported key is recovered again, and
+ * only lengths and the round trip are printed. */
+static void oaep(const char *label, xmlSecTransformId id, const char *xml) {
+    static const xmlSecByte content_key[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    xmlSecByte transported[512];
+    xmlSecByte recovered[512];
+    xmlSecKeyPtr key = rsa_key();
+    int size;
+    int recovered_size;
+    printf("%s: href=%s usage=0x%x\n", label, id->href, id->usage);
+    size = transport(id, xml, xmlSecTransformOperationEncrypt, key, content_key,
+                     sizeof(content_key), transported);
+    printf("  transported: %d\n", size);
+    recovered_size = transport(id, xml, xmlSecTransformOperationDecrypt, key, transported,
+                               (xmlSecSize)size, recovered);
+    printf("  recovered: %d same=%d\n", recovered_size,
+           recovered_size == (int)sizeof(content_key) &&
+               memcmp(recovered, content_key, sizeof(content_key)) == 0);
+    transported[0] ^= 0x01;
+    printf("  tampered: %d\n", transport(id, xml, xmlSecTransformOperationDecrypt, key, transported,
+                                         (xmlSecSize)size, recovered));
+    xmlSecKeyDestroy(key);
+}
+
 int main(void) {
     xmlSecByte encrypted[256];
     xmlSecByte decrypted[256];
@@ -145,6 +214,15 @@ int main(void) {
     wrap(xmlSecTransformKWAes128Id, xmlSecKeyDataAesId, 16);
     wrap(xmlSecTransformKWAes256Id, xmlSecKeyDataAesId, 32);
     wrap(xmlSecTransformKWCamellia128Id, xmlSecKeyDataCamelliaId, 16);
+    oaep("rsa-oaep-mgf1p", xmlSecTransformRsaOaepId, NULL);
+    oaep("rsa-oaep sha256", xmlSecTransformRsaOaepEnc11Id,
+         "<EncryptionMethod xmlns=\"http://www.w3.org/2001/04/xmlenc#\" "
+         "Algorithm=\"http://www.w3.org/2009/xmlenc11#rsa-oaep\">"
+         "<DigestMethod xmlns=\"http://www.w3.org/2000/09/xmldsig#\" "
+         "Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>"
+         "<MGF xmlns=\"http://www.w3.org/2009/xmlenc11#\" "
+         "Algorithm=\"http://www.w3.org/2009/xmlenc11#mgf1sha256\"/>"
+         "<OAEPparams>bGFiZWw=</OAEPparams></EncryptionMethod>");
 
     /* An authenticated cipher refuses a value whose tag was changed. */
     key = key_of(xmlSecKeyDataAesId, 0x33, 16);

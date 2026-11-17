@@ -1672,11 +1672,7 @@ impl DecryptionKeyResolver for PrivateKeyDecryptor {
             return Err(XmlEncError::KeyNotFound);
         };
         validate_encrypted_key_policy(key, policy)?;
-        let width = policy.rsa_keys.validate_public_metadata(
-            "decryption",
-            self.key.rsa_modulus_bits(),
-            self.key.rsa_public_exponent(),
-        )?;
+        let width = validate_key_recovery_key(self.key.as_ref(), policy)?;
         let ciphertext = key.cipher_data.octets()?;
         if width != self.key.ciphertext_len() || ciphertext.len() != width {
             return Err(XmlEncError::InvalidWrappedKeyLength {
@@ -1783,11 +1779,7 @@ impl PrivateKeyDecryptor {
         policy.validate()?;
         let encrypted_key = encrypted_key.ok_or(XmlEncError::KeyNotFound)?;
         validate_encrypted_key_policy(encrypted_key, policy)?;
-        let width = policy.rsa_keys.validate_public_metadata(
-            "decryption",
-            self.key.rsa_modulus_bits(),
-            self.key.rsa_public_exponent(),
-        )?;
+        let width = validate_key_recovery_key(self.key.as_ref(), policy)?;
         if width != self.key.ciphertext_len() {
             return Err(crate::policy::PolicyViolation::InvalidKeyMaterial {
                 operation: "decryption",
@@ -3044,6 +3036,45 @@ fn validate_encrypted_key_policy(
     validate_key_encryption_method_policy(&encrypted_key.encryption_method, policy)
 }
 
+/// Validate an RSA recovery key against the decryption `policy` and return
+/// the width of the ciphertexts it recovers.
+///
+/// # Errors
+/// Returns the policy's refusal of the key's modulus or exponent.
+pub fn validate_key_recovery_key(
+    key: &dyn crate::provider::KeyRecoveryKey,
+    policy: &crate::policy::DecryptionPolicy,
+) -> Result<usize, XmlEncError> {
+    Ok(policy.rsa_keys.validate_public_metadata(
+        "decryption",
+        key.rsa_modulus_bits(),
+        key.rsa_public_exponent(),
+    )?)
+}
+
+/// The RSA-OAEP parameters of the key transport `method`, defaults
+/// included, once the decryption `policy` admitted the transport and its
+/// digests; `None` for an admitted RSAES-PKCS1-v1_5 transport or key wrap.
+///
+/// # Errors
+/// Returns an invalid or unsupported method, or the policy's refusal.
+pub fn admit_key_transport_method(
+    method: &super::EncryptionMethod,
+    policy: &crate::policy::DecryptionPolicy,
+) -> Result<Option<RsaOaepParameters>, XmlEncError> {
+    let Some(AdmittedOaep { digest, mgf_digest }) =
+        validate_key_encryption_method_policy(method, policy)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(RsaOaepParameters {
+        algorithm: KeyTransportAlgorithm::from_uri(&method.algorithm)?,
+        digest,
+        mgf_digest,
+        label: method.oaep_params.clone().unwrap_or_default(),
+    }))
+}
+
 /// Check a key transport or wrap method against `policy`; an RSA-OAEP
 /// transport also returns the digests it admitted.
 pub(super) fn validate_key_encryption_method_policy(
@@ -3053,19 +3084,13 @@ pub(super) fn validate_key_encryption_method_policy(
     method.validate_structure()?;
     let uri = &method.algorithm;
     if let Ok(transport) = KeyTransportAlgorithm::from_uri(uri) {
-        if policy
-            .key_transport_algorithms
-            .as_ref()
-            .map_or(transport.requires_explicit_permission(), |allowed| {
-                !allowed.contains(&transport)
-            })
-        {
-            return Err(crate::policy::PolicyViolation::Algorithm {
+        // The refusal names the URI the document carries.
+        policy
+            .check_key_transport_algorithm(transport)
+            .map_err(|_| crate::policy::PolicyViolation::Algorithm {
                 operation: "decryption",
                 algorithm: uri.clone(),
-            }
-            .into());
-        }
+            })?;
         #[cfg(feature = "legacy-algorithms")]
         if transport == KeyTransportAlgorithm::RsaPkcs1v15 {
             return Ok(None);

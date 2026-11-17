@@ -1654,6 +1654,23 @@ impl RustCryptoRsaPublicKey {
             exponent,
         }
     }
+
+    /// Decode an RSA `SubjectPublicKeyInfo`, for a caller that holds the key
+    /// as DER rather than as a parsed `RustCrypto` key.
+    ///
+    /// # Errors
+    /// Returns [`ProviderError::InvalidInput`] for DER that is no valid RSA
+    /// public key.
+    pub fn from_spki_der(spki: &[u8]) -> Result<Self, ProviderError> {
+        use crate::rsa_encoding::RsaPublicKeyEncoding as _;
+        rsa::RsaPublicKey::from_public_key_der(spki)
+            .map(Self::new)
+            .map_err(|_| {
+                ProviderError::InvalidInput(ProviderInputError::PrimitiveInitialization(
+                    "RSA public key",
+                ))
+            })
+    }
 }
 
 #[cfg(feature = "xmlenc")]

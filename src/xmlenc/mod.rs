@@ -39,10 +39,12 @@ pub use decrypt::{
     DecryptContext, DecryptionKeyResolver, DerivedKeyDecryptor, DerivedKeyInput,
     DocumentDecryptionOptions, KekDecryptor, KeyCandidateBudget, KeyEncryptionKeySource,
     OpaqueContentKeyResolver, OpaqueKekDecryptor, PrivateKeyDecryptor, SymmetricKeyDecryptor,
-    decrypt, decrypt_data, decrypt_document, decrypt_document_with_options,
+    admit_key_transport_method, decrypt, decrypt_data, decrypt_document,
+    decrypt_document_with_options, validate_key_recovery_key,
 };
 pub use encrypt::{
-    EncryptedDataBuilder, validate_key_transport_recipient, validate_rsa_recipient_key,
+    EncryptedDataBuilder, admit_oaep_parameters, validate_key_transport_recipient,
+    validate_rsa_recipient_key,
 };
 pub use key_derivation::{
     ConcatKdfField, KeyDerivationMethod, parse_key_derivation_method,

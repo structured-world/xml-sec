@@ -1330,6 +1330,20 @@ fn validate_oaep_recipient(
     parameters: &super::RsaOaepParameters,
     policy: &crate::policy::EncryptionPolicy,
 ) -> Result<(), XmlEncError> {
+    validate_key_transport_recipient(public_key, policy)?;
+    admit_oaep_parameters(parameters, policy)
+}
+
+/// Check RSA-OAEP transport `parameters` against the encryption `policy`:
+/// the transport, the OAEP digest and the mask digest.
+///
+/// # Errors
+/// Returns [`XmlEncError::InvalidEncryptionConfig`] for parameters that are
+/// no OAEP configuration, or the policy's refusal of one of them.
+pub fn admit_oaep_parameters(
+    parameters: &super::RsaOaepParameters,
+    policy: &crate::policy::EncryptionPolicy,
+) -> Result<(), XmlEncError> {
     let rejected = |algorithm: &str| -> XmlEncError {
         crate::policy::PolicyViolation::Algorithm {
             operation: "encryption",
@@ -1350,14 +1364,7 @@ fn validate_oaep_recipient(
             "OAEP mask digest has no XML Encryption identifier".into(),
         )
     })?;
-    validate_key_transport_recipient(public_key, policy)?;
-    if policy
-        .key_transport_algorithms
-        .as_ref()
-        .is_some_and(|allowed| !allowed.contains(&parameters.algorithm))
-    {
-        return Err(rejected(parameters.algorithm.uri()));
-    }
+    policy.check_key_transport_algorithm(parameters.algorithm)?;
     if parameters.digest.requires_explicit_permission()
         && !policy
             .oaep_digests
