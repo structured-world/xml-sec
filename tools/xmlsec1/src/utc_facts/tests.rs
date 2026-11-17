@@ -68,49 +68,28 @@ fn utc_files_and_later_evidence_share_aggregate_admission() {
     ));
 }
 
-fn memory(bytes: usize, work: usize) -> Memory {
-    Memory::new(Arc::new(MemoryAccount::new(bytes, work)))
-}
-
 #[test]
-fn corrections_are_relative_and_coverage_is_explicit() {
-    // The first offset is a baseline, not a correction at coverage start.
-    let facts = UtcFacts::parse(
-        b"#@ 2303683201\n2272060800 10\n2287785600 11\n2303683200 10\n",
-        &memory(4096, 4096),
-    )
+fn a_malformed_file_is_a_usage_error() {
+    // The core refuses the list; the command names the option.
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), b"2272060800 10\n").unwrap();
+    let invocation = Invocation::parse([
+        "xmlsec1".into(),
+        "verify".into(),
+        "--utc-facts".into(),
+        file.path().as_os_str().to_owned(),
+        "unused.xml".into(),
+    ])
     .unwrap();
-    assert_eq!(
-        facts.table().unwrap().transitions(),
-        &[
-            Transition::new(78_796_800, 1),
-            Transition::new(94_694_400, 0)
-        ]
+    let limits = ResourcePolicy::default();
+    let refused = UtcFacts::load(
+        &invocation,
+        &limits,
+        &mut ExternalMaterialBudget::new(limits.max_external_resource_total_bytes),
     );
-}
-
-#[test]
-fn malformed_or_incomplete_facts_never_become_a_default_table() {
-    // Missing expiry, duplicate dates, non-unit corrections and invalid
-    // numeric spellings must not silently claim a covered UTC interval.
-    for input in [
-        "2272060800 10\n",
-        "#@ 2303683201\n#@ 2303683201\n2272060800 10\n",
-        "#@ 2303683201\n2272060800 10\n2272060800 11\n",
-        "#@ 2303683201\n2272060800 10\n2287785600 12\n",
-        "#@ 2303683201\n+2272060800 10\n",
-    ] {
-        assert!(
-            UtcFacts::parse(input.as_bytes(), &memory(4096, 4096)).is_err(),
-            "{input}"
-        );
-    }
-}
-
-#[test]
-fn fact_loading_preserves_work_and_capacity_limits() {
-    // Parsing and retained transitions must both be admitted before work.
-    let input = b"#@ 2303683201\n2272060800 10\n2287785600 11\n";
-    assert!(UtcFacts::parse(input, &memory(4096, 0)).is_err());
-    assert!(UtcFacts::parse(input, &memory(0, 4096)).is_err());
+    assert!(
+        matches!(&refused, Err(CommandError::Usage(message)) if message.contains("--utc-facts")),
+        "{:?}",
+        refused.err()
+    );
 }

@@ -119,7 +119,9 @@ normalization does not override those encoded-identity requirements.
 When CRL checking is enabled, supply authenticated UTC history with
 `VerifyContext::utc_facts(LeapTable)` or `X509ChainOptions::utc_facts` for direct
 chain validation. Standalone budget-aware resolvers accept the same fact through
-`InspectedKeyCandidateBudget::new_with_utc_facts`. The core does not obtain a
+`InspectedKeyCandidateBudget::new_with_utc_facts`. `LeapSecondsList::parse`
+reads a table from the bytes of a published `leap-seconds.list` under the
+resource policy, without authenticating its source. The core does not obtain a
 table from the host, network or a built-in default. Missing facts return
 `MissingUtcFacts`; insufficient or contradictory coverage returns
 `CrlTimeUncertain`, never non-revocation. Cached complete CRLs permit the exact

@@ -1902,7 +1902,7 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
     let mut certificate_budget =
         ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
     let utc_facts = UtcFacts::load(invocation, &policy.resources, &mut certificate_budget)?;
-    let utc_table = utc_facts.as_ref().map(UtcFacts::table).transpose()?;
+    let utc_table = utc_facts.as_ref().map(UtcFacts::table);
     let xml = read_input(invocation, policy.resources.max_xml_document_bytes)?;
     let start_node_id = option_text(invocation, "node-id")?;
     let id_attributes = id_attribute_registrations(invocation)?;

@@ -93,6 +93,7 @@ pub mod transforms;
 pub mod trust;
 pub mod types;
 pub mod uri;
+pub mod utc_facts;
 pub mod verify;
 pub(crate) mod whitespace;
 pub mod x509;
@@ -152,6 +153,7 @@ pub use transforms::{
 };
 pub use trust::{KeyTrustEvidence, ResolvedVerificationKey, TrustedPublicKey, X509TrustEvidence};
 pub use types::{NodeSet, TransformData, TransformError};
+pub use utc_facts::{LeapSecondsError, LeapSecondsList};
 #[cfg(feature = "rustcrypto")]
 pub use verify::verify_signature_with_pem_key;
 pub use verify::{

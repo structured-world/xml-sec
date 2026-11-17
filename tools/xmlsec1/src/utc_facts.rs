@@ -1,30 +1,26 @@
 //! Explicit caller-supplied UTC facts. Loading authenticates no source.
 
-use std::{fs::File, io::Read, path::PathBuf, sync::Arc};
+use std::{fs::File, io::Read, path::PathBuf};
 
-use structured_asn1::memory::{Memory, MemoryAccount, MemoryError, OwnedVec};
-use structured_pkix::temporal::{LeapTable, Transition};
 use xml_sec::policy::ResourcePolicy;
+use xml_sec::xmldsig::{LeapSecondsError, LeapSecondsList};
 
 use crate::{
     Invocation,
     commands::{CommandError, ExternalMaterialBudget},
 };
 
-const NTP_UNIX_OFFSET: i64 = 2_208_988_800;
+/// The `--utc-facts` file, read by the core's `leap-seconds.list` reader.
+pub(super) struct UtcFacts(LeapSecondsList);
 
-pub(super) struct UtcFacts {
-    start: i64,
-    end: i64,
-    changes: OwnedVec<Transition>,
-}
-
-fn invalid() -> CommandError {
-    CommandError::Usage("invalid --utc-facts leap-seconds.list".into())
-}
-
-fn resource(error: MemoryError) -> CommandError {
-    CommandError::Usage(format!("--utc-facts resource limit: {error:?}"))
+fn refused(error: LeapSecondsError) -> CommandError {
+    match error {
+        LeapSecondsError::TooLarge { maximum } => {
+            CommandError::ExternalMaterialTooLarge { maximum }
+        }
+        LeapSecondsError::ResourceLimit => CommandError::Usage("--utc-facts resource limit".into()),
+        _ => CommandError::Usage("invalid --utc-facts leap-seconds.list".into()),
+    }
 }
 
 impl UtcFacts {
@@ -36,11 +32,7 @@ impl UtcFacts {
         let Some(path) = invocation.last_value("utc-facts") else {
             return Ok(None);
         };
-        let memory = Memory::new(Arc::new(MemoryAccount::new(
-            limits.max_x509_workspace_bytes,
-            limits.max_x509_work,
-        )));
-        let mut input = memory.vector();
+        let mut input = Vec::new();
         let mut file = File::open(path).map_err(|source| CommandError::Io {
             path: PathBuf::from(path),
             source,
@@ -71,89 +63,16 @@ impl UtcFacts {
                 });
             }
             budget.charge(count)?;
-            memory.charge_work(count as u64).map_err(resource)?;
-            input
-                .try_extend_from_slice(&buffer[..count])
-                .map_err(resource)?;
+            input.extend_from_slice(&buffer[..count]);
         }
-        Self::parse(&input, &memory).map(Some)
+        LeapSecondsList::parse(&input, limits)
+            .map(|list| Some(Self(list)))
+            .map_err(refused)
     }
 
-    fn parse(input: &[u8], memory: &Memory) -> Result<Self, CommandError> {
-        // Published IERS/IANA format: NTP seconds and absolute TAI-UTC;
-        // #@ is expiration, not a prediction beyond that instant.
-        // https://data.iana.org/time-zones/tzdb/leap-seconds.list
-        memory
-            .charge_work((input.len() as u64).checked_mul(8).ok_or_else(invalid)?)
-            .map_err(resource)?;
-        let text = std::str::from_utf8(input).map_err(|_| invalid())?;
-        let mut start = None;
-        let mut end = None;
-        let mut baseline = 0i32;
-        let mut changes = memory.vector();
-        for line in text.lines() {
-            let line = line.trim();
-            if let Some(expiration) = line.strip_prefix("#@") {
-                if end.is_some() {
-                    return Err(invalid());
-                }
-                let mut fields = expiration.split_whitespace();
-                end = Some(ntp(fields.next())?);
-                if fields.next().is_some() {
-                    return Err(invalid());
-                }
-                continue;
-            }
-            let data = line
-                .split('#')
-                .next()
-                .expect("split always has a first item");
-            let mut fields = data.split_whitespace();
-            let Some(time) = fields.next() else { continue };
-            let at = ntp(Some(time))?;
-            let offset: i32 = fields
-                .next()
-                .ok_or_else(invalid)?
-                .parse()
-                .map_err(|_| invalid())?;
-            if fields.next().is_some() {
-                return Err(invalid());
-            }
-            if start.is_none() {
-                start = Some(at);
-                baseline = offset;
-            } else {
-                let correction = offset.checked_sub(baseline).ok_or_else(invalid)?;
-                changes
-                    .try_push(Transition::new(at, correction))
-                    .map_err(resource)?;
-            }
-        }
-        let facts = Self {
-            start: start.ok_or_else(invalid)?,
-            end: end.ok_or_else(invalid)?,
-            changes,
-        };
-        // Charges include table validation here and the borrowed view at use.
-        facts.table()?;
-        Ok(facts)
+    pub(super) fn table(&self) -> structured_pkix::temporal::LeapTable<'_> {
+        self.0.table()
     }
-
-    pub(super) fn table(&self) -> Result<LeapTable<'_>, CommandError> {
-        LeapTable::new(self.start, self.end, &self.changes).map_err(|_| invalid())
-    }
-}
-
-fn ntp(value: Option<&str>) -> Result<i64, CommandError> {
-    let value = value.ok_or_else(invalid)?;
-    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(invalid());
-    }
-    value
-        .parse::<i64>()
-        .map_err(|_| invalid())?
-        .checked_sub(NTP_UNIX_OFFSET)
-        .ok_or_else(invalid)
 }
 
 #[cfg(test)]
