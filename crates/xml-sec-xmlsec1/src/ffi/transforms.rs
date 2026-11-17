@@ -59,6 +59,8 @@ pub(crate) const MODE_PUSH: c_int = 1;
 /// `xmlSecTransformModePop`.
 pub(crate) const MODE_POP: c_int = 2;
 
+/// `xmlSecTransformOperationNone`.
+pub(crate) const OPERATION_NONE: c_int = 0;
 /// `xmlSecTransformOperationEncode`.
 pub(crate) const OPERATION_ENCODE: c_int = 1;
 /// `xmlSecTransformOperationDecode`.

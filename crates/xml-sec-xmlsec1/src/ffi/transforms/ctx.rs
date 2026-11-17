@@ -220,6 +220,38 @@ pub(crate) unsafe fn run_spent(ctx: *mut XmlSecTransformCtx) -> policy::Spent {
     }
 }
 
+/// Charges the run of `ctx`, the chain of an operation, with what the
+/// operation's `KeyInfo` read spent of the external-resource allowance, held
+/// in the pin in the read context's slot `read_slot`: the operation's later
+/// reads count on from it, so the key's resources and the operation's share
+/// one allowance.
+///
+/// # Safety
+/// `ctx` is an initialized context; `read_slot` is null or a pin.
+pub(crate) unsafe fn charge_key_read(ctx: *mut XmlSecTransformCtx, read_slot: *mut c_void) {
+    // SAFETY: by the caller's contract.
+    unsafe {
+        if let Some(spent) = policy::spent(read_slot) {
+            // Each count stays within the policy's aggregate ceiling, a
+            // hard-limited `usize`, so their sum cannot overflow.
+            run_budget(ctx).external_resources += spent.get().external_resources;
+        }
+    }
+}
+
+/// What the operation whose chain is `ctx` has spent of its external-resource
+/// allowance, to start a read of the operation from.
+///
+/// # Safety
+/// `ctx` is an initialized context.
+pub(crate) unsafe fn external_spent(ctx: *mut XmlSecTransformCtx) -> policy::Spent {
+    policy::Spent {
+        // SAFETY: by the caller's contract.
+        external_resources: unsafe { run_spent(ctx) }.external_resources,
+        ..policy::Spent::default()
+    }
+}
+
 /// The run budget of `ctx`, created on first use.
 ///
 /// # Safety
@@ -891,6 +923,22 @@ pub(crate) unsafe extern "C" fn xmlSecTransformNodeRead(
     usage: c_uint,
     ctx: *mut XmlSecTransformCtx,
 ) -> *mut XmlSecTransform {
+    // SAFETY: by the caller's contract.
+    unsafe { node_read(node, usage, ctx, super::OPERATION_NONE) }
+}
+
+/// [`xmlSecTransformNodeRead`] of a transform that reads its node for
+/// `operation`, set before the klass reads it, as a caller that knows the
+/// operation sets it: an `xmlSecEncCtx` knows it before it reads its method.
+///
+/// # Safety
+/// As for [`xmlSecTransformNodeRead`].
+unsafe fn node_read(
+    node: *mut XmlNode,
+    usage: c_uint,
+    ctx: *mut XmlSecTransformCtx,
+    operation: c_int,
+) -> *mut XmlSecTransform {
     contain(std::ptr::null_mut(), || {
         let null = std::ptr::null_mut();
         check!(
@@ -918,11 +966,11 @@ pub(crate) unsafe extern "C" fn xmlSecTransformNodeRead(
             return null;
         };
         // SAFETY: an initialized context; the value is NUL-terminated.
-        unsafe { read_algorithm(node, href.as_ptr().cast(), usage, ctx) }
+        unsafe { read_algorithm(node, href.as_ptr().cast(), usage, ctx, operation) }
     })
 }
 
-/// The transform for algorithm `href` read from `node`.
+/// The transform for algorithm `href` read from `node` for `operation`.
 ///
 /// # Safety
 /// As for [`xmlSecTransformNodeRead`]; `href` is NUL-terminated.
@@ -931,6 +979,7 @@ unsafe fn read_algorithm(
     href: *const u8,
     usage: c_uint,
     ctx: *mut XmlSecTransformCtx,
+    operation: c_int,
 ) -> *mut XmlSecTransform {
     // SAFETY: by the caller's contract.
     unsafe {
@@ -963,6 +1012,7 @@ unsafe fn read_algorithm(
             errors::internal(here, name, c"xmlSecTransformCreate(id)");
             return std::ptr::null_mut();
         };
+        (*transform).operation = operation;
         if let Some(read_node) = klass.read_node
             && read_node(transform, node, ctx) < 0
         {
@@ -986,6 +1036,22 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxNodeRead(
     node: *mut XmlNode,
     usage: c_uint,
 ) -> *mut XmlSecTransform {
+    // SAFETY: by the caller's contract.
+    unsafe { ctx_node_read_for(ctx, node, usage, super::OPERATION_NONE) }
+}
+
+/// [`xmlSecTransformCtxNodeRead`] of a transform that reads its node for
+/// `operation`, so a klass whose parameters fall under that operation's
+/// policy reads them under it.
+///
+/// # Safety
+/// As for [`xmlSecTransformCtxNodeRead`].
+pub(crate) unsafe fn ctx_node_read_for(
+    ctx: *mut XmlSecTransformCtx,
+    node: *mut XmlNode,
+    usage: c_uint,
+    operation: c_int,
+) -> *mut XmlSecTransform {
     contain(std::ptr::null_mut(), || {
         let null = std::ptr::null_mut();
         building_or!(ctx, "xmlSecTransformCtxNodeRead", null);
@@ -998,7 +1064,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxNodeRead(
         let here = here!("xmlSecTransformCtxNodeRead");
         // SAFETY: by the caller's contract.
         unsafe {
-            let transform = xmlSecTransformNodeRead(node, usage, ctx);
+            let transform = node_read(node, usage, ctx, operation);
             if transform.is_null() {
                 let name = name_for_report(node);
                 errors::internal(here, name.as_ptr(), c"xmlSecTransformNodeRead");
@@ -1680,8 +1746,8 @@ impl ReadResources {
         )?;
         let mut keyed = KeyedResources::default();
         for (resource, key) in self.read.into_iter().zip(keys) {
-            keyed.written.push((resource.uri, key.clone()));
-            // Two spellings of one resource keep the octets read first.
+            keyed.origins.push((resource.origin, key.clone()));
+            // Two references to one resource keep the octets read first.
             keyed.by_key.entry(key).or_insert(resource.bytes);
         }
         Ok(keyed)
@@ -1715,22 +1781,25 @@ pub(crate) fn resource_keys<'u>(
     })
 }
 
-/// External resources keyed as the core looks them up, with the URI each was
-/// read under as written.
+/// External resources keyed as the core looks them up, with the element
+/// whose URI named each.
 #[derive(Default)]
 pub(crate) struct KeyedResources {
     /// The octets under each resolved key, handed to the core.
     pub(crate) by_key: std::collections::BTreeMap<String, Vec<u8>>,
-    /// Each URI as written, with its resolved key.
-    written: Vec<(String, String)>,
+    /// Each naming element, with the key its URI resolved to.
+    origins: Vec<(xml_sec::document::external::ExternalNode, String)>,
 }
 
 impl KeyedResources {
-    /// The octets read for the URI `uri` as written.
-    pub(crate) fn get_written(&self, uri: &str) -> Option<&[u8]> {
-        self.written
+    /// The octets the URI of the element `origin` named.
+    pub(crate) fn get_for(
+        &self,
+        origin: xml_sec::document::external::ExternalNode,
+    ) -> Option<&[u8]> {
+        self.origins
             .iter()
-            .find(|(written, _)| written == uri)
+            .find(|(element, _)| *element == origin)
             .and_then(|(_, key)| self.by_key.get(key))
             .map(Vec::as_slice)
     }

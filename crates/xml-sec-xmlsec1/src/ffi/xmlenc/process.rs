@@ -21,16 +21,16 @@ use super::super::errors::{self, here};
 use super::super::keyinfo::xmlSecKeyInfoNodeWrite;
 use super::super::keys::{xmlSecKeyGetValue, xmlSecKeyMatch};
 use super::super::keysdata::xmlSecKeyDataBinaryValueGetBuffer;
-use super::super::policy::{Pinned, Side, SlotPin, Spent};
+use super::super::policy::{Pinned, Side, SlotPin};
 use super::super::strings;
 use super::super::transforms::builtin::xmlSecTransformBase64GetKlass;
 use super::super::transforms::ctx::{
-    ReadResources, ResourceScope, read_resource, run_policy, xmlSecTransformCtxBinaryExecute,
-    xmlSecTransformCtxExecute,
+    ReadResources, ResourceScope, charge_key_read, external_spent, read_resource, run_policy,
+    xmlSecTransformCtxBinaryExecute, xmlSecTransformCtxExecute,
 };
 use super::super::transforms::ctx::{
-    xmlSecTransformCtxCreateAndAppend, xmlSecTransformCtxCreateAndPrepend,
-    xmlSecTransformCtxNodeRead, xmlSecTransformCtxNodesListRead, xmlSecTransformCtxSetUri,
+    ctx_node_read_for, xmlSecTransformCtxCreateAndAppend, xmlSecTransformCtxCreateAndPrepend,
+    xmlSecTransformCtxNodesListRead, xmlSecTransformCtxSetUri,
 };
 use super::super::transforms::{
     OPERATION_DECRYPT, OPERATION_ENCRYPT, USAGE_DSIG_TRANSFORM, USAGE_ENCRYPTION_METHOD,
@@ -695,10 +695,13 @@ unsafe fn read_method_and_key(ctx: &mut XmlSecEncCtx, add_base64: bool) -> c_int
     unsafe {
         let transforms = &raw mut ctx.transform_ctx;
         if !ctx.enc_method_node.is_null() {
-            ctx.enc_method = xmlSecTransformCtxNodeRead(
+            // The operation is known before the method is read, so a klass
+            // reads its parameters under that operation's policy.
+            ctx.enc_method = ctx_node_read_for(
                 transforms,
                 ctx.enc_method_node,
                 USAGE_ENCRYPTION_METHOD,
+                ctx.operation,
             );
             if ctx.enc_method.is_null() {
                 errors::internal(
@@ -738,6 +741,7 @@ unsafe fn read_method_and_key(ctx: &mut XmlSecEncCtx, add_base64: bool) -> c_int
             if let Some(get_key) = mngr.as_ref().and_then(|mngr| mngr.get_key) {
                 ctx.enc_key = get_key(ctx.key_info_node, read);
             }
+            charge_key_read(transforms, (*read).reserved0);
         }
         if ctx.enc_key.is_null()
             || xmlSecKeyMatch(ctx.enc_key, std::ptr::null(), &raw mut (*read).key_req) == 0
@@ -941,10 +945,11 @@ unsafe fn cipher_reference_resources(
             uri.as_bytes(),
             reference,
             xsNodeGetDoc(node),
+            // Counted on from what the key's read spent: one allowance.
             &mut ResourceScope {
                 pinned,
                 side: Side::Decrypt,
-                spent: Spent::default(),
+                spent: external_spent(&raw mut ctx.transform_ctx),
             },
         )?;
         resources.push(origin, uri, bytes);

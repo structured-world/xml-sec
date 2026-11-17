@@ -227,6 +227,115 @@ fn a_cipher_reference_is_found_under_the_uri_the_core_resolves() {
     }
 }
 
+/// Octets a key lookup charges as read from an external key reference.
+const KEY_READ_OCTETS: usize = 16;
+
+/// A key manager's lookup that charges [`KEY_READ_OCTETS`] to the
+/// operation's external-resource allowance, as a `KeyInfo` read dereferencing
+/// an external key reference does, and hands back the AES key.
+unsafe extern "C" fn charging_lookup(
+    _node: *mut XmlNode,
+    ctx: *mut XmlSecKeyInfoCtx,
+) -> *mut XmlSecKey {
+    // SAFETY: the read context the operation passes.
+    if let Some(spent) = unsafe { crate::ffi::policy::spent((*ctx).reserved0) } {
+        spent.set(crate::ffi::policy::Spent {
+            external_resources: KEY_READ_OCTETS,
+            ..crate::ffi::policy::Spent::default()
+        });
+    }
+    aes_key()
+}
+
+#[test]
+fn a_key_read_and_the_cipher_reference_share_one_allowance() {
+    // The KeyInfo read and the CipherReference belong to one decryption:
+    // what the key read spent counts against the CipherReference read, so
+    // the two together cannot pass the aggregate limit.
+    own_process();
+    let plaintext = b"referenced ciphertext";
+    // SAFETY: the library, documents, contexts, keys and a manager set up and
+    // released here, on this thread alone.
+    unsafe {
+        assert_eq!(xmlSecInit(), 0);
+        assert_eq!(xmlSecCryptoDLLoadLibrary(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoAppInit(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoInit(), 0);
+        assert_eq!(
+            crate::ffi::transforms::io::xmlSecIORegisterCallbacks(
+                Some(served_matches),
+                Some(served_open),
+                Some(served_read),
+                Some(served_close),
+            ),
+            0
+        );
+        let doc = xsNewDoc(c"1.0".as_ptr().cast());
+        let tmpl = xmlSecTmplEncDataCreate(
+            doc,
+            aes128_cbc(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+        xsDocSetRootElement(doc, tmpl);
+        let cipher_value = xmlSecTmplEncDataEnsureCipherValue(tmpl);
+        let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
+        (*ctx).enc_key = aes_key();
+        assert_eq!(
+            xmlSecEncCtxBinaryEncrypt(ctx, tmpl, plaintext.as_ptr(), plaintext.len()),
+            0
+        );
+        xmlSecEncCtxDestroy(ctx);
+        let text = xml_sec_libxml2::ffi::tree::xsNodeGetContent(cipher_value.cast());
+        let mut size = 0;
+        assert_eq!(
+            crate::ffi::base64::xmlSecBase64DecodeInPlace(text, &raw mut size),
+            0
+        );
+        *SERVED.lock().expect("one test thread") = std::slice::from_raw_parts(text, size).to_vec();
+        crate::ffi::free(text.cast());
+        xsFreeDoc(doc);
+        xml_sec_libxml2::policy::republish_encryption(
+            |_| {},
+            |decryption| {
+                decryption.resources.max_external_resource_bytes = size;
+                decryption.resources.max_external_resource_total_bytes = KEY_READ_OCTETS + size - 1;
+            },
+        )
+        .expect("the library policy compiles");
+
+        let referenced = concat!(
+            "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\">",
+            "<EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#aes128-cbc\"/>",
+            "<CipherData><CipherReference URI=\"test:cipher\"/></CipherData>",
+            "</EncryptedData>"
+        );
+        let doc = xml_sec_libxml2::ffi::tree::xsReadMemory(
+            referenced.as_ptr().cast(),
+            std::ffi::c_int::try_from(referenced.len()).expect("a short document"),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        assert!(!doc.is_null());
+        let mngr = xmlSecKeysMngrCreate();
+        (*mngr).get_key = Some(charging_lookup);
+        let ctx = xmlSecEncCtxCreate(mngr);
+        (*ctx).transform_ctx.enabled_uris = 0xFFFF;
+        let result =
+            xmlSecEncCtxDecryptToBuffer(ctx, xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc));
+        assert!(result.is_null(), "the two reads passed the aggregate limit");
+        xmlSecEncCtxDestroy(ctx);
+        xmlSecKeysMngrDestroy(mngr);
+        xsFreeDoc(doc);
+        assert_eq!(xmlSecCryptoShutdown(), 0);
+        assert_eq!(xmlSecCryptoAppShutdown(), 0);
+        assert_eq!(xmlSecShutdown(), 0);
+    }
+}
+
 /// A pre-execute callback that refuses every chain.
 unsafe extern "C" fn veto(
     _ctx: *mut crate::ffi::transforms::XmlSecTransformCtx,
@@ -272,6 +381,71 @@ fn a_pre_execute_veto_stops_decryption_before_the_document_changes() {
         assert_eq!(xmlSecEncCtxDecrypt(ctx, tmpl), -1);
         assert_eq!((*ctx).result_replaced, 0);
         assert_eq!(xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc), tmpl);
+        xmlSecEncCtxDestroy(ctx);
+        xsFreeDoc(doc);
+        assert_eq!(xmlSecCryptoShutdown(), 0);
+        assert_eq!(xmlSecCryptoAppShutdown(), 0);
+        assert_eq!(xmlSecShutdown(), 0);
+    }
+}
+
+#[test]
+fn encryption_reads_its_oaep_label_under_the_encryption_policy() {
+    // The context knows its operation before it reads the EncryptionMethod:
+    // an encryption reads the label under the encryption policy, so a
+    // stricter decryption limit does not refuse it.
+    own_process();
+    xml_sec_libxml2::policy::republish_encryption(
+        |_| {},
+        |decryption| decryption.resources.max_encryption_metadata_bytes = 64,
+    )
+    .expect("the library policy compiles");
+    let label = [0x4c_u8; 72];
+    let content_key = [0x42_u8; 16];
+    let pem = include_bytes!("../../../../../tests/fixtures/keys/rsa/rsa-2048-key.pem");
+    // SAFETY: the library, a document, a context and a key set up and
+    // released here, on this thread alone.
+    unsafe {
+        assert_eq!(xmlSecInit(), 0);
+        assert_eq!(xmlSecCryptoDLLoadLibrary(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoAppInit(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoInit(), 0);
+        let doc = xsNewDoc(c"1.0".as_ptr().cast());
+        let tmpl = xmlSecTmplEncDataCreate(
+            doc,
+            crate::ffi::transforms::transport::rsa_oaep(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+        xsDocSetRootElement(doc, tmpl);
+        assert!(!xmlSecTmplEncDataEnsureCipherValue(tmpl).is_null());
+        let method = crate::ffi::templates::xmlSecTmplEncDataGetEncMethodNode(tmpl);
+        assert_eq!(
+            crate::ffi::templates::xmlSecTmplTransformAddRsaOaepParam(
+                method,
+                label.as_ptr(),
+                label.len(),
+            ),
+            0
+        );
+        let key = crate::ffi::app::key_load_memory(
+            pem.as_ptr(),
+            pem.len(),
+            2,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        assert!(!key.is_null(), "the fixture loads");
+        let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
+        (*ctx).enc_key = key.cast();
+        assert_eq!(
+            xmlSecEncCtxBinaryEncrypt(ctx, tmpl, content_key.as_ptr(), content_key.len()),
+            0,
+            "the encryption policy admits the label"
+        );
         xmlSecEncCtxDestroy(ctx);
         xsFreeDoc(doc);
         assert_eq!(xmlSecCryptoShutdown(), 0);

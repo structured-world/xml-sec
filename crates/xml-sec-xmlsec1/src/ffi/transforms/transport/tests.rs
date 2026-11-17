@@ -66,6 +66,110 @@ fn oaep_parameters_beyond_the_metadata_limit_are_refused() {
     }
 }
 
+/// `read_node` of an RSA-OAEP transform of `operation` on an
+/// `EncryptionMethod` whose label is `label_len` octets, under `pinned`.
+fn read_oaep_label(
+    operation: c_int,
+    label_len: usize,
+    pinned: &super::super::super::policy::Pinned,
+) -> c_int {
+    let label = "A".repeat(label_len);
+    let method = format!(
+        "<EncryptionMethod xmlns=\"http://www.w3.org/2001/04/xmlenc#\" \
+         Algorithm=\"http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p\">\
+         <OAEPparams>{label}</OAEPparams></EncryptionMethod>"
+    );
+    // SAFETY: a document, a context and its transform, created and released
+    // here.
+    unsafe {
+        let doc = xml_sec_libxml2::ffi::tree::xsReadMemory(
+            method.as_ptr().cast(),
+            c_int::try_from(method.len()).expect("a short document"),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        assert!(!doc.is_null());
+        let ctx = xmlSecTransformCtxCreate();
+        super::super::ctx::pin_run(ctx, pinned);
+        let transform = xmlSecTransformCtxCreateAndAppend(ctx, rsa_oaep());
+        (*transform).operation = operation;
+        let node = xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc);
+        let read = read_node(transform, node, ctx);
+        xmlSecTransformCtxDestroy(ctx);
+        xml_sec_libxml2::ffi::tree::xsFreeDoc(doc);
+        read
+    }
+}
+
+#[test]
+fn encryption_reads_oaep_parameters_under_the_encryption_policy() {
+    // The two policies bound encryption metadata separately: an encrypting
+    // transform reads its label under the encryption policy, whichever way
+    // the decryption policy differs from it.
+    let mut pinned = super::super::super::policy::Pinned::current(here!("test"))
+        .expect("the library policy compiles");
+    std::sync::Arc::make_mut(&mut pinned.decryption)
+        .resources
+        .max_encryption_metadata_bytes = 64;
+    assert_eq!(read_oaep_label(OPERATION_ENCRYPT, 96, &pinned), 0);
+    assert_eq!(read_oaep_label(OPERATION_DECRYPT, 96, &pinned), -1);
+
+    let mut pinned = super::super::super::policy::Pinned::current(here!("test"))
+        .expect("the library policy compiles");
+    std::sync::Arc::make_mut(&mut pinned.encryption)
+        .resources
+        .max_encryption_metadata_bytes = 64;
+    assert_eq!(read_oaep_label(OPERATION_ENCRYPT, 96, &pinned), -1);
+    assert_eq!(read_oaep_label(OPERATION_DECRYPT, 96, &pinned), 0);
+}
+
+#[test]
+fn a_label_read_before_the_operation_is_known_is_bounded_when_encrypting() {
+    // A standalone chain reads its method before its operation is set; an
+    // encryption still refuses a label beyond the encryption policy's
+    // metadata limit when it transports the key.
+    let label = "A".repeat(96);
+    let method = format!(
+        "<EncryptionMethod xmlns=\"http://www.w3.org/2001/04/xmlenc#\" \
+         Algorithm=\"http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p\">\
+         <OAEPparams>{label}</OAEPparams></EncryptionMethod>"
+    );
+    let mut pinned = super::super::super::policy::Pinned::current(here!("test"))
+        .expect("the library policy compiles");
+    std::sync::Arc::make_mut(&mut pinned.encryption)
+        .resources
+        .max_encryption_metadata_bytes = 64;
+    let key = rsa_key();
+    // SAFETY: a document, a context, its transform and the key, created and
+    // released here.
+    unsafe {
+        let doc = xml_sec_libxml2::ffi::tree::xsReadMemory(
+            method.as_ptr().cast(),
+            c_int::try_from(method.len()).expect("a short document"),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        assert!(!doc.is_null());
+        let ctx = xmlSecTransformCtxCreate();
+        super::super::ctx::pin_run(ctx, &pinned);
+        let transform = xmlSecTransformCtxCreateAndAppend(ctx, rsa_oaep());
+        let node = xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc);
+        assert_eq!(read_node(transform, node, ctx), 0);
+        (*transform).operation = OPERATION_ENCRYPT;
+        assert_eq!(xmlSecTransformSetKey(transform, key.cast()), 0);
+        let content_key = [0x42_u8; 16];
+        assert_eq!(
+            xmlSecTransformCtxBinaryExecute(ctx, content_key.as_ptr(), content_key.len()),
+            -1
+        );
+        xmlSecTransformCtxDestroy(ctx);
+        xml_sec_libxml2::ffi::tree::xsFreeDoc(doc);
+        xmlSecKeyDestroy(key);
+    }
+}
+
 #[test]
 fn input_after_a_finished_transport_is_refused() {
     // A transport that has produced its output takes no more input: bytes

@@ -35,16 +35,17 @@ use super::super::keys::{XmlSecKey, xmlSecKeyGetValue, xmlSecKeyMatch};
 use super::super::keysdata::xmlSecKeyDataBinaryValueGetBuffer;
 use super::super::list::{xmlSecPtrListAdd, xmlSecPtrListGetItem, xmlSecPtrListGetSize};
 use super::super::nodeset::{xmlSecNodeSetDestroy, xmlSecNodeSetGetChildren};
-use super::super::policy::{Pinned, Side, SlotPin, Spent};
+use super::super::policy::{Pinned, Side, SlotPin};
 use super::super::strings;
 use super::super::transforms::builtin::{
     xmlSecTransformBase64GetKlass, xmlSecTransformMemBufGetBuffer, xmlSecTransformMemBufGetKlass,
 };
 use super::super::transforms::ctx::{
-    KeyedResources, ReadResources, ResourceScope, XmlSecTransformCtx, execute_on_bytes,
-    read_resource, resource_keys, xmlSecTransformCtxCreate, xmlSecTransformCtxCreateAndAppend,
-    xmlSecTransformCtxDestroy, xmlSecTransformCtxExecute, xmlSecTransformCtxNodeRead,
-    xmlSecTransformCtxNodesListRead, xmlSecTransformCtxSetUri, xmlSecTransformCtxXmlExecute,
+    KeyedResources, ReadResources, ResourceScope, XmlSecTransformCtx, charge_key_read,
+    execute_on_bytes, external_spent, read_resource, resource_keys, xmlSecTransformCtxCreate,
+    xmlSecTransformCtxCreateAndAppend, xmlSecTransformCtxDestroy, xmlSecTransformCtxExecute,
+    xmlSecTransformCtxNodeRead, xmlSecTransformCtxNodesListRead, xmlSecTransformCtxSetUri,
+    xmlSecTransformCtxXmlExecute,
 };
 use super::super::transforms::signatures::signing_key;
 use super::super::transforms::{
@@ -312,11 +313,12 @@ unsafe fn run_operation(
         };
         match policies {
             OperationPolicies::Sign(policy) => {
-                // Signing digests every reference, so each resource is read.
+                // Signing digests every reference, so each resource is read,
+                // counted on from what the key's read spent.
                 let mut scope = ResourceScope {
                     pinned,
                     side: Side::Sign,
-                    spent: Spent::default(),
+                    spent: external_spent(&raw mut ctx.transform_ctx),
                 };
                 let Some(resources) = read_all(pending, xsNodeGetDoc(node), &mut scope) else {
                     errors::internal(
@@ -450,8 +452,9 @@ struct PendingResource {
 }
 
 /// The external resources the context's `SignedInfo` references name, and
-/// its Manifest references' when `manifests`, each URI once; `None` after a
-/// report.
+/// its Manifest references' when `manifests`, one per reference: one URI
+/// names a different resource under a different XML Base, so references are
+/// told apart only by the key each resolves to; `None` after a report.
 ///
 /// # Safety
 /// The context's reference lists hold read reference contexts.
@@ -471,10 +474,7 @@ unsafe fn pending_resources(
             let Some(uri) = (unsafe { super::super::tree::c_text(reference.uri) }) else {
                 continue;
             };
-            if uri.is_empty()
-                || uri.starts_with('#')
-                || pending.iter().any(|resource| resource.uri == uri)
-            {
+            if uri.is_empty() || uri.starts_with('#') {
                 continue;
             }
             let element = reference.reserved0.cast::<XmlNode>();
@@ -642,6 +642,7 @@ unsafe fn read_key(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode, pinned: &Pinned)
             if let Some(get_key) = mngr.as_ref().and_then(|mngr| mngr.get_key) {
                 ctx.sign_key = get_key(node, read);
             }
+            charge_key_read(&raw mut ctx.transform_ctx, (*read).reserved0);
         }
         if ctx.sign_key.is_null()
             || xmlSecKeyMatch(ctx.sign_key, std::ptr::null(), &raw mut (*read).key_req) == 0
@@ -1144,8 +1145,9 @@ unsafe fn run_verification(
     };
     // SAFETY: a live node.
     let doc = unsafe { xsNodeGetDoc(node) };
-    // Every read of the operation shares one allowance.
-    let spent = std::cell::Cell::new(Spent::default());
+    // Every read of the operation shares one allowance, the key's included.
+    // SAFETY: the context's own transform context.
+    let spent = std::cell::Cell::new(unsafe { external_spent(&raw mut ctx.transform_ctx) });
     let fetch = |key: &str| {
         let (resource, _) = pending
             .iter()
@@ -1454,9 +1456,9 @@ unsafe fn store_signing_inputs(
                 }
                 let transforms = &raw mut reference.transform_ctx;
                 // An external reference was read once, into the bytes the
-                // core signed.
-                let external = super::super::tree::c_text(reference.uri)
-                    .and_then(|uri| resources.get_written(uri));
+                // core signed under the key its own element resolved.
+                let external = external_of(reference.reserved0.cast::<XmlNode>())
+                    .and_then(|origin| resources.get_for(origin));
                 // The callback ran once when the operation began.
                 let callback = reference.transform_ctx.pre_exec_callback.take();
                 let executed = match external {

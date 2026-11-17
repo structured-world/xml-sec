@@ -365,49 +365,60 @@ fn a_stored_pre_digest_holds_the_bytes_that_were_signed() {
     }
 }
 
-#[test]
-fn an_ignored_manifest_reads_none_of_its_resources() {
-    // The operation's policy ignores Manifests: their references are never
-    // dereferenced, so an unreadable external one does not stop the
-    // verification of the signature itself.
-    own_process();
-    let document = TAMPERED.replace(
-        "</Signature>",
-        concat!(
-            "<Object><Manifest><Reference URI=\"unreadable:resource\">",
-            "<DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>",
-            "<DigestValue>AAAA</DigestValue></Reference></Manifest></Object></Signature>"
-        ),
-    );
-    crate::ffi::policy::republish(
-        |verification| {
-            verification.manifest_processing = xml_sec::policy::ManifestProcessing::Ignore;
-        },
-        |_| {},
-    )
-    .expect("the library policy compiles");
+/// What the constant resource serves on every open.
+const CONSTANT: &[u8] = b"one payload under every base";
+/// Octets of [`CONSTANT`] already served by the current open.
+static CONSTANT_SENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// How many times the constant resource was opened.
+static CONSTANT_OPENS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+unsafe extern "C" fn constant_open(_uri: *const std::ffi::c_char) -> *mut std::ffi::c_void {
+    CONSTANT_OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    CONSTANT_SENT.store(0, std::sync::atomic::Ordering::Relaxed);
+    CONSTANT.as_ptr().cast_mut().cast()
+}
+
+unsafe extern "C" fn constant_read(
+    _context: *mut std::ffi::c_void,
+    buffer: *mut std::ffi::c_char,
+    len: std::ffi::c_int,
+) -> std::ffi::c_int {
+    let sent = CONSTANT_SENT.load(std::sync::atomic::Ordering::Relaxed);
+    let rest = &CONSTANT[sent..];
+    let count = rest
+        .len()
+        .min(usize::try_from(len).expect("a non-negative length"));
+    // SAFETY: the transform passes `len` writable bytes.
+    unsafe { std::ptr::copy_nonoverlapping(rest.as_ptr(), buffer.cast(), count) };
+    CONSTANT_SENT.store(sent + count, std::sync::atomic::Ordering::Relaxed);
+    std::ffi::c_int::try_from(count).expect("at most `len` octets")
+}
+
+/// Registers the constant resource as the input callbacks of every URI.
+///
+/// # Safety
+/// The library is initialized.
+unsafe fn serve_constant() {
+    // SAFETY: by the caller's contract.
+    let registered = unsafe {
+        crate::ffi::transforms::io::xmlSecIORegisterCallbacks(
+            Some(detached_matches),
+            Some(constant_open),
+            Some(constant_read),
+            Some(detached_close),
+        )
+    };
+    assert_eq!(registered, 0);
+}
+
+/// The HMAC key of [`TAMPERED`], read for `ctx`.
+///
+/// # Safety
+/// `ctx` is a live context.
+unsafe fn hmac_key(ctx: *mut XmlSecDSigCtx) -> *mut crate::ffi::keys::XmlSecKey {
     let secret = b"secret-of-thirty-two-octets-long";
-    // SAFETY: the library, a document, a key and a context set up and torn
-    // down here, on this thread alone.
+    // SAFETY: a key created here, read through the context's read context.
     unsafe {
-        assert_eq!(xmlSecInit(), 0);
-        assert_eq!(xmlSecCryptoDLLoadLibrary(std::ptr::null()), 0);
-        assert_eq!(xmlSecCryptoAppInit(std::ptr::null()), 0);
-        assert_eq!(xmlSecCryptoInit(), 0);
-        let doc = xsReadMemory(
-            document.as_ptr().cast(),
-            i32::try_from(document.len()).expect("a short document"),
-            std::ptr::null(),
-            std::ptr::null(),
-            0,
-        );
-        assert!(!doc.is_null());
-        let signature = xmlSecFindNode(
-            xsDocGetRootElement(doc),
-            c"Signature".as_ptr().cast(),
-            c"http://www.w3.org/2000/09/xmldsig#".as_ptr().cast(),
-        );
-        let ctx = xmlSecDSigCtxCreate(std::ptr::null_mut());
         let key = xmlSecKeyCreate();
         assert_eq!(
             xmlSecKeyDataBinRead(
@@ -419,13 +430,199 @@ fn an_ignored_manifest_reads_none_of_its_resources() {
             ),
             0
         );
-        (*ctx).sign_key = key;
+        key
+    }
+}
+
+#[test]
+fn one_uri_under_two_bases_names_two_resources() {
+    // `payload.bin` resolves against each Reference's own XML Base (RFC 3986
+    // section 5.2): the two references name two resources, each read and
+    // signed, and both verify.
+    own_process();
+    let template = concat!(
+        "<Signature xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><SignedInfo>",
+        "<CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>",
+        "<SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#hmac-sha256\"/>",
+        "<Reference xml:base=\"test:one/\" URI=\"payload.bin\">",
+        "<DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>",
+        "<DigestValue/></Reference>",
+        "<Reference xml:base=\"test:two/\" URI=\"payload.bin\">",
+        "<DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>",
+        "<DigestValue/></Reference></SignedInfo><SignatureValue/></Signature>"
+    );
+    // SAFETY: the library, a document, keys and contexts set up and torn
+    // down here, on this thread alone.
+    unsafe {
+        assert_eq!(xmlSecInit(), 0);
+        assert_eq!(xmlSecCryptoDLLoadLibrary(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoAppInit(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoInit(), 0);
+        serve_constant();
+        let doc = xsReadMemory(
+            template.as_ptr().cast(),
+            i32::try_from(template.len()).expect("a short document"),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        assert!(!doc.is_null());
+        let ctx = xmlSecDSigCtxCreate(std::ptr::null_mut());
+        (*ctx).sign_key = hmac_key(ctx);
+        (*ctx).enabled_reference_uris = 0xFFFF;
+        assert_eq!(xmlSecDSigCtxSign(ctx, xsDocGetRootElement(doc)), 0);
+        xmlSecDSigCtxDestroy(ctx);
+
+        let ctx = xmlSecDSigCtxCreate(std::ptr::null_mut());
+        (*ctx).sign_key = hmac_key(ctx);
+        (*ctx).enabled_reference_uris = 0xFFFF;
+        assert_eq!(xmlSecDSigCtxVerify(ctx, xsDocGetRootElement(doc)), 0);
+        assert_eq!((*ctx).status, STATUS_SUCCEEDED);
+        xmlSecDSigCtxDestroy(ctx);
+        xsFreeDoc(doc);
+        assert_eq!(xmlSecCryptoShutdown(), 0);
+        assert_eq!(xmlSecCryptoAppShutdown(), 0);
+        assert_eq!(xmlSecShutdown(), 0);
+    }
+}
+
+/// Octets a key lookup charges as read from an external key reference.
+const KEY_READ_OCTETS: usize = 16;
+
+/// A key manager's lookup that charges [`KEY_READ_OCTETS`] to the
+/// operation's external-resource allowance, as a `KeyInfo` read dereferencing
+/// an external key reference does, and hands back the HMAC key of
+/// [`TAMPERED`].
+unsafe extern "C" fn charging_lookup(
+    node: *mut XmlNode,
+    ctx: *mut crate::ffi::keyinfo::XmlSecKeyInfoCtx,
+) -> *mut crate::ffi::keys::XmlSecKey {
+    // SAFETY: the read context the operation passes.
+    if let Some(spent) = unsafe { crate::ffi::policy::spent((*ctx).reserved0) } {
+        spent.set(crate::ffi::policy::Spent {
+            external_resources: KEY_READ_OCTETS,
+            ..crate::ffi::policy::Spent::default()
+        });
+    }
+    // SAFETY: by this callback's contract.
+    unsafe { recording_lookup(node, ctx) }
+}
+
+#[test]
+fn a_key_read_and_the_references_share_one_allowance() {
+    // The KeyInfo read and the signature's references belong to one
+    // operation: what the key read spent counts against the references'
+    // reads, so the two together cannot pass the aggregate limit.
+    own_process();
+    let template = concat!(
+        "<Signature xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><SignedInfo>",
+        "<CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>",
+        "<SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#hmac-sha256\"/>",
+        "<Reference URI=\"test:payload\">",
+        "<DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>",
+        "<DigestValue/></Reference></SignedInfo><SignatureValue/></Signature>"
+    );
+    crate::ffi::policy::republish(
+        |_| {},
+        |signing| {
+            signing.resources.max_external_resource_bytes = CONSTANT.len();
+            signing.resources.max_external_resource_total_bytes =
+                KEY_READ_OCTETS + CONSTANT.len() - 1;
+        },
+    )
+    .expect("the library policy compiles");
+    // SAFETY: the library, a document, a manager and a context set up and
+    // torn down here, on this thread alone.
+    unsafe {
+        assert_eq!(xmlSecInit(), 0);
+        assert_eq!(xmlSecCryptoDLLoadLibrary(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoAppInit(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoInit(), 0);
+        serve_constant();
+        let doc = xsReadMemory(
+            template.as_ptr().cast(),
+            i32::try_from(template.len()).expect("a short document"),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        assert!(!doc.is_null());
+        let mngr = crate::ffi::keysmngr::xmlSecKeysMngrCreate();
+        (*mngr).get_key = Some(charging_lookup);
+        let ctx = xmlSecDSigCtxCreate(mngr);
+        (*ctx).enabled_reference_uris = 0xFFFF;
+        assert_eq!(xmlSecDSigCtxSign(ctx, xsDocGetRootElement(doc)), -1);
+        xmlSecDSigCtxDestroy(ctx);
+        crate::ffi::keysmngr::xmlSecKeysMngrDestroy(mngr);
+        xsFreeDoc(doc);
+        assert_eq!(xmlSecCryptoShutdown(), 0);
+        assert_eq!(xmlSecCryptoAppShutdown(), 0);
+        assert_eq!(xmlSecShutdown(), 0);
+    }
+}
+
+#[test]
+fn an_ignored_manifest_reads_none_of_its_resources() {
+    // The operation's policy ignores Manifests: their references are never
+    // dereferenced, so an authentic signature signs and verifies while the
+    // caller's callbacks open nothing its Manifest names.
+    own_process();
+    let template = concat!(
+        "<Envelope xmlns=\"urn:envelope\"><Data Id=\"data\">payload</Data>",
+        "<Signature xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><SignedInfo>",
+        "<CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>",
+        "<SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#hmac-sha256\"/>",
+        "<Reference URI=\"#data\">",
+        "<DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>",
+        "<DigestValue/></Reference></SignedInfo><SignatureValue/>",
+        "<Object><Manifest><Reference URI=\"test:manifest\">",
+        "<DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>",
+        "<DigestValue>AAAA</DigestValue></Reference></Manifest></Object>",
+        "</Signature></Envelope>"
+    );
+    crate::ffi::policy::republish(
+        |verification| {
+            verification.manifest_processing = xml_sec::policy::ManifestProcessing::Ignore;
+        },
+        |signing| signing.manifest_processing = xml_sec::policy::ManifestProcessing::Ignore,
+    )
+    .expect("the library policy compiles");
+    // SAFETY: the library, a document, keys and contexts set up and torn
+    // down here, on this thread alone.
+    unsafe {
+        assert_eq!(xmlSecInit(), 0);
+        assert_eq!(xmlSecCryptoDLLoadLibrary(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoAppInit(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoInit(), 0);
+        serve_constant();
+        let doc = xsReadMemory(
+            template.as_ptr().cast(),
+            i32::try_from(template.len()).expect("a short document"),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        assert!(!doc.is_null());
+        let ids = [c"Id".as_ptr().cast::<u8>(), std::ptr::null()];
+        xmlSecAddIDs(doc, std::ptr::null_mut(), ids.as_ptr());
+        let signature = xmlSecFindNode(
+            xsDocGetRootElement(doc),
+            c"Signature".as_ptr().cast(),
+            c"http://www.w3.org/2000/09/xmldsig#".as_ptr().cast(),
+        );
         // The caller admits every reference URI type, so only the policy
         // decides what is read.
+        let ctx = xmlSecDSigCtxCreate(std::ptr::null_mut());
+        (*ctx).sign_key = hmac_key(ctx);
+        (*ctx).enabled_reference_uris = 0xFFFF;
+        assert_eq!(xmlSecDSigCtxSign(ctx, signature), 0);
+        xmlSecDSigCtxDestroy(ctx);
+        let ctx = xmlSecDSigCtxCreate(std::ptr::null_mut());
+        (*ctx).sign_key = hmac_key(ctx);
         (*ctx).enabled_reference_uris = 0xFFFF;
         assert_eq!(xmlSecDSigCtxVerify(ctx, signature), 0);
-        assert_eq!((*ctx).status, STATUS_INVALID);
-        assert_eq!((*ctx).failure_reason, FAILURE_SIGNATURE);
+        assert_eq!((*ctx).status, STATUS_SUCCEEDED);
+        assert_eq!(CONSTANT_OPENS.load(std::sync::atomic::Ordering::Relaxed), 0);
         xmlSecDSigCtxDestroy(ctx);
         xsFreeDoc(doc);
         assert_eq!(xmlSecCryptoShutdown(), 0);

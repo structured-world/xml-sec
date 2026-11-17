@@ -241,17 +241,15 @@ unsafe extern "C" fn read_node(
         let Some(pinned) = (unsafe { run_policy(ctx, here) }) else {
             return -1;
         };
-        let parsed = xml_sec_libxml2::document::subtree(node, &*pinned.decryption)
-            .map_err(|error| error.to_string())
-            .and_then(|document| {
-                document.with_view(|view| {
-                    EncryptionMethod::from_element(
-                        view.document().root_element(),
-                        &pinned.decryption.resources,
-                    )
-                    .map_err(|error| error.to_string())
-                })
-            });
+        // An encryption context sets the operation before the method is read.
+        // A chain read before its operation is known, as libxmlsec1 reads a
+        // standalone one, takes the element as untrusted input; `run` checks
+        // an encryption's label against the encryption policy again.
+        let parsed = if object.operation == OPERATION_ENCRYPT {
+            parse_method(node, &*pinned.encryption, &pinned.encryption.resources)
+        } else {
+            parse_method(node, &*pinned.decryption, &pinned.decryption.resources)
+        };
         match parsed {
             Ok(method) => {
                 transport.method = Some(method);
@@ -268,6 +266,21 @@ unsafe extern "C" fn read_node(
                 -1
             }
         }
+    })
+}
+
+/// The `EncryptionMethod` element `node` as the core parses it, read under
+/// the operation's `policy` and bounded by its `resources`.
+fn parse_method(
+    node: *mut XmlNode,
+    policy: &impl xml_sec::XmlDocumentPolicy,
+    resources: &xml_sec::policy::ResourcePolicy,
+) -> Result<EncryptionMethod, String> {
+    let document =
+        xml_sec_libxml2::document::subtree(node, policy).map_err(|error| error.to_string())?;
+    document.with_view(|view| {
+        EncryptionMethod::from_element(view.document().root_element(), resources)
+            .map_err(|error| error.to_string())
     })
 }
 
