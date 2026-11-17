@@ -203,12 +203,13 @@ fn ordinary_jobs_have_one_matrix_writer_and_separate_instrumented_domains() {
 #[test]
 fn cached_native_oracles_still_pass_installer_provenance_and_capability_validation() {
     // A cache hit must not bypass validation or share profiles, and an entry
-    // belongs to the source commit it was built from: a commit upstream
-    // master moves to gets a new entry instead of a rebuild on every run.
+    // belongs to the source commit it was built from: a new pin, or a commit
+    // upstream master moves to, gets a new entry instead of a rebuild on
+    // every run.
     let workflow = read(".github/workflows/ci.yml");
-    // Coverage, the test blocks, the ledger and the XML interoperability job
-    // each build one oracle.
-    assert_eq!(count(&workflow, "profile: modern"), 4);
+    // Coverage, the test blocks, the ledger, the XML interoperability job and
+    // the upstream master job each build one oracle.
+    assert_eq!(count(&workflow, "profile: modern"), 5);
     assert!(!pattern(r"if:.*cache-hit").is_match(&workflow));
     let action = read(".github/actions/xmlsec-oracle-cache/action.yml");
     assert!(action.contains("path: ${{ inputs.prefix }}"));
@@ -218,8 +219,8 @@ fn cached_native_oracles_still_pass_installer_provenance_and_capability_validati
     let uses = pattern(
         r"uses: \./\.github/actions/xmlsec-oracle-cache\n\s+with:\n\s+profile: modern\n\s+commit: \$\{\{ steps\.[a-z-]+\.outputs[^\n]+\}\}\n\s+prefix: [^\n]+\n",
     );
-    assert_eq!(uses.find_iter(&workflow).count(), 4);
-    assert_eq!(count(&workflow, "xml-sec-tools -- install-xmlsec1\n"), 4);
+    assert_eq!(uses.find_iter(&workflow).count(), 5);
+    assert_eq!(count(&workflow, "xml-sec-tools -- install-xmlsec1\n"), 5);
 }
 
 /// Runs the runner-image action's script with `image` as `ImageOS`.
@@ -611,9 +612,59 @@ fn coverage_checkout_references_resolve_existing_pinned_oracle_revisions() {
             .any(|line| line == format!("libxslt={}", pinned.trim()))
     );
     assert!(coverage.contains("ref: ${{ steps.coverage-oracles.outputs.libxslt }}"));
-    // The libxmlsec1 oracle is upstream master, recorded by the run.
-    assert!(coverage.contains("repository: lsh123/xmlsec\n          ref: master\n"));
+    let pinned = read(crate::install_xmlsec1::PIN);
+    assert!(
+        pins.lines()
+            .any(|line| line == format!("xmlsec1={}", pinned.trim()))
+    );
+    assert!(
+        coverage
+            .contains("ref: ${{ env.XMLSEC1_REVISION || steps.coverage-oracles.outputs.xmlsec1 }}")
+    );
     assert!(!coverage.contains("libxmlsec1-1.3.13"));
+}
+
+/// Jobs outside the required aggregate: they report upstream drift and may
+/// fail without blocking a merge.
+const ADVISORY_JOBS: [&str; 1] = ["upstream-master"];
+
+#[test]
+fn every_libxmlsec1_oracle_is_the_pin_unless_a_revision_is_asked() {
+    // Only the advisory job follows upstream master; every other checkout of
+    // the oracle source is the pin or the revision XMLSEC1_REVISION names,
+    // and every build gets the commit its checkout recorded, so master
+    // moving between checkout and build cannot make them disagree.
+    // Five checkouts in CI (the advisory one included), two in fuzzing.
+    for (path, expected) in [
+        (".github/workflows/ci.yml", 5),
+        (".github/workflows/fuzz.yml", 2),
+    ] {
+        let workflow = read(path);
+        let mut checkouts = 0;
+        for (job, body) in jobs(&workflow) {
+            let advisory = ADVISORY_JOBS.contains(&job.as_str());
+            for checkout in body.split("repository: lsh123/xmlsec\n").skip(1) {
+                checkouts += 1;
+                let reference = checkout.lines().next().unwrap().trim();
+                if advisory {
+                    assert_eq!(reference, "ref: master", "{path} {job}");
+                } else {
+                    assert!(
+                        reference.starts_with("ref: ${{ env.XMLSEC1_REVISION || steps.")
+                            && reference.ends_with(".outputs.xmlsec1 }}"),
+                        "{path} {job}: {reference}"
+                    );
+                }
+            }
+            let installs = body.matches("-- install-xmlsec1").count();
+            let given = body
+                .matches("          XMLSEC1_REVISION: ${{ steps.")
+                .count();
+            assert_eq!(installs, given, "{path} {job}");
+        }
+        assert_eq!(checkouts, expected, "{path}");
+        assert!(!workflow.contains("xmlsec1-master"), "{path}");
+    }
 }
 
 #[test]
@@ -646,9 +697,16 @@ fn the_required_aggregate_reaches_every_job_and_checks_every_direct_result() {
             pending.extend(needs(body));
         }
     }
-    let all: std::collections::BTreeSet<String> =
-        jobs.iter().map(|(name, _)| name.clone()).collect();
+    // Advisory jobs are the one named exception, and they must stay outside.
+    let all: std::collections::BTreeSet<String> = jobs
+        .iter()
+        .map(|(name, _)| name.clone())
+        .filter(|name| !ADVISORY_JOBS.contains(&name.as_str()))
+        .collect();
     assert_eq!(seen, all);
+    for advisory in ADVISORY_JOBS {
+        assert!(jobs.iter().any(|(name, _)| name == advisory), "{advisory}");
+    }
     let (_, aggregate) = jobs.iter().find(|(name, _)| name == "test").unwrap();
     assert!(aggregate.contains("if: ${{ always() }}"));
     for name in needs(aggregate) {

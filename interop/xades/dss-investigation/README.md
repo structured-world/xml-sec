@@ -2,7 +2,7 @@
 
 The xml-sec side is checked by `xades check` on every commit; each run records its
 commit and resolved versions. Independent implementations: native libxmlsec1 (OpenSSL)
-built from upstream master and EU DSS 6.5.1, with Maven 3.9.12 and Homebrew OpenJDK 21.0.12.1.
+built from the pinned upstream commit and EU DSS 6.5.1, with Maven 3.9.12 and Homebrew OpenJDK 21.0.12.1.
 This contribution changes test tooling and evidence.
 
 **Finding:** the tested xml-sec binding checks agree with the normative requirements.
@@ -162,7 +162,7 @@ Only public build dependencies are downloaded; no XML is uploaded. Then use a fr
 output directory to preserve the supplied evidence:
 
 ```sh
-XMLSEC1_BIN="$PWD/.tools/xmlsec1-master/bin/xmlsec1" cargo run -p xml-sec-tools -- xades binding --output target/xades-binding-repro
+XMLSEC1_BIN="$PWD/.tools/xmlsec1/bin/xmlsec1" cargo run -p xml-sec-tools -- xades binding --output target/xades-binding-repro
 cargo run -p xml-sec-tools -- xades binding --output target/xades-binding-repro --strict-policy
 ```
 

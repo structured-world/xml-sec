@@ -530,7 +530,7 @@ fn execute(request: &Request) -> Result<(), Failure> {
     let prefix = std::env::var("XMLSEC1_PREFIX")
         .ok()
         .filter(|prefix| !prefix.is_empty())
-        .map_or_else(|| root.join(".tools/xmlsec1-master"), PathBuf::from);
+        .map_or_else(|| root.join(".tools/xmlsec1"), PathBuf::from);
     tool_step(
         &["install-xmlsec1"],
         &[("XMLSEC1_PREFIX".into(), prefix.display().to_string())],

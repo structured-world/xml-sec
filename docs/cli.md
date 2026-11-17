@@ -543,8 +543,10 @@ classification, an AES-GCM decrypt/encrypt/decrypt cycle, and AES key-store
 generation. `cargo run -p xml-sec-tools -- donor-fixtures --cli` refreshes only those
 scripts and selected vectors from the committed state of the `donors/xmlsec`
 checkout and prints the upstream commit it copied; no commit is stored. CI
-compares the snapshot with upstream master as it is when the ledger job runs, so
-an upstream change fails the job until the snapshot is regenerated and reviewed. The native CLI package tests require
+compares the snapshot with the pinned oracle commit in the ledger job and with
+upstream master's head in the advisory drift job, so an upstream change shows
+there before the pin moves, and the pin moves with a regenerated, reviewed
+snapshot. The native CLI package tests require
 no network checkout or system `xmlsec1`; separate workspace interoperability
 tests still build the pinned C implementation as an external oracle. The generated
 [compatibility ledger](compatibility-ledger.md)

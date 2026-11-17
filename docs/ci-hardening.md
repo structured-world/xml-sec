@@ -146,7 +146,8 @@ it. Each other OS has its own default-feature writer, avoiding competing partial
 writers without leaving desktop caches permanently cold. Coverage, alloc-only targets, benchmark,
 fuzz harness, ASan and FIPS use separate domains; smoke and optimized campaigns
 also remain separate. Scheduled differential qualification has its own writer.
-The native xmlsec1 installation, built from upstream master, is cached separately
+The native xmlsec1 installation, built from the pinned upstream commit (master's
+head in the advisory drift job), is cached separately
 by OS image family, architecture, installer/source revision and modern/legacy
 capability profile, so a new upstream commit gets a new entry;
 the installer still validates its source marker, version and capabilities on a

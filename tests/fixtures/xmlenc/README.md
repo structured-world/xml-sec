@@ -3,9 +3,10 @@
 These fixtures are tracked so decryption interoperability tests do not depend
 on network access or a local xmlsec1 checkout. They are imported from the tests
 of upstream [lsh123/xmlsec](https://github.com/lsh123/xmlsec/tree/master/tests)
-master with `cargo run -p xml-sec-tools -- donor-fixtures --xmlenc-corpora`;
+with `cargo run -p xml-sec-tools -- donor-fixtures --xmlenc-corpora`;
 `corpora.sha256` pins every imported byte, and reciprocal tests run against an
-oracle built from upstream master.
+oracle built from the pinned upstream commit
+(`compatibility/libxmlsec1-donor-commit.txt`).
 
 Imported donor artifacts are kept byte-for-byte, including upstream wording
 and spelling. Repository-specific clarifications belong in this wrapper rather
@@ -47,7 +48,7 @@ The complete 79-file snapshot includes 17 ciphertexts, 13 templates, public test
 credentials, and original variants. `xmlenc11_corpus` executes AES-GCM, RSA-OAEP
 digest/MGF/label combinations, AES-KW, ConcatKDF, PBKDF2, ECDH P-256/P-384/P-521
 and DH-ES through public Rust APIs and every compiled XML backend. Every original
-template executes against the native oracle built from upstream master; Rust encryption results are
+template executes against the native oracle built from the pinned upstream commit; Rust encryption results are
 also decrypted independently. Agreement wrapping composes the public, budgeted
 agreement/KDF API with the AES-KW builder and retains the template's party/KDF
 metadata. These checks do not claim CLI support for agreement or derived keys.
@@ -83,7 +84,7 @@ algorithms, Diffie-Hellman agreement, or deliberately malformed metadata.
 ## Importing Vectors
 
 Point the repository helper at the `tests` directory of an upstream xmlsec
-master checkout and pass paths under the destination corpus. A directory argument imports its
+checkout of the pinned commit and pass paths under the destination corpus. A directory argument imports its
 complete tree:
 
 ```sh

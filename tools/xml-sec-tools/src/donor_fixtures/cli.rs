@@ -1,8 +1,9 @@
 //! `donor-fixtures --cli [--check]`: the upstream runner scripts and vectors
 //! the native CLI's integration suite executes unmodified, copied from the
 //! committed state of an upstream checkout. The run prints the commit it
-//! copied or compared; none is stored, so CI checks the snapshot against
-//! upstream master as it is when the job runs.
+//! copied or compared; none is stored, so CI checks the snapshot against the
+//! checkout it makes: the pinned oracle commit in the required jobs, upstream
+//! master's head in the advisory one.
 
 use super::{beside, install, replace};
 use crate::libxslt_fixtures::differences;

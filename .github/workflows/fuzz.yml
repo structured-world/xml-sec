@@ -13,6 +13,9 @@ env:
   CARGO_INCREMENTAL: '0'
   CARGO_PROFILE_DEV_DEBUG: '0'
   CARGO_PROFILE_TEST_DEBUG: '0'
+  # The libxmlsec1 oracle is the commit compatibility/libxmlsec1-donor-commit.txt
+  # pins, or the revision the repository variable XMLSEC1_REVISION names.
+  XMLSEC1_REVISION: ${{ vars.XMLSEC1_REVISION }}
 
 jobs:
   runner:
@@ -87,19 +90,29 @@ jobs:
         uses: ./.github/actions/apt-packages
         with:
           packages: autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config
-      # The oracle is upstream master as it is when the job runs; the installer
-      # records the commit it built.
+      - name: Read the pinned libxmlsec1 revision
+        if: matrix.target == 'xmlsec_oracle'
+        id: fuzz-pin
+        run: |
+          commit="$(cat compatibility/libxmlsec1-donor-commit.txt)"
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          echo "xmlsec1=$commit" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v7
         if: matrix.target == 'xmlsec_oracle'
         with:
           repository: lsh123/xmlsec
-          ref: master
+          ref: ${{ env.XMLSEC1_REVISION || steps.fuzz-pin.outputs.xmlsec1 }}
           path: donors/xmlsec
           persist-credentials: false
+      - name: Record the oracle commit
+        if: matrix.target == 'xmlsec_oracle'
+        id: fuzz-source
+        run: echo "commit=$(git -C donors/xmlsec rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: Provision independent signature oracle
         if: matrix.target == 'xmlsec_oracle'
         env:
           XMLSEC1_PREFIX: ${{ github.workspace }}/.tools/xmlsec1-fuzz-oracle
+          XMLSEC1_REVISION: ${{ steps.fuzz-source.outputs.commit }}
           XMLSEC1_SOURCE_DIR: ${{ github.workspace }}/donors/xmlsec
         run: |
           cargo +nightly run --quiet -p xml-sec-tools -- install-xmlsec1
@@ -160,16 +173,26 @@ jobs:
         uses: ./.github/actions/apt-packages
         with:
           packages: autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config softhsm2
+      - name: Read the pinned libxmlsec1 revision
+        id: differential-pin
+        run: |
+          commit="$(cat compatibility/libxmlsec1-donor-commit.txt)"
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          echo "xmlsec1=$commit" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v7
         with:
           repository: lsh123/xmlsec
-          ref: master
+          ref: ${{ env.XMLSEC1_REVISION || steps.differential-pin.outputs.xmlsec1 }}
           path: donors/xmlsec
           persist-credentials: false
-      - name: Provision the independent oracle from master and an isolated token
+      - name: Record the oracle commit
+        id: differential-source
+        run: echo "commit=$(git -C donors/xmlsec rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Provision the independent oracle and an isolated token
         env:
           XMLSEC1_MODERN_ORACLE: '1'
           XMLSEC1_PREFIX: ${{ github.workspace }}/.tools/xmlsec1-fuzz-oracle
+          XMLSEC1_REVISION: ${{ steps.differential-source.outputs.commit }}
           XMLSEC1_SOURCE_DIR: ${{ github.workspace }}/donors/xmlsec
         run: |
           cargo run --quiet -p xml-sec-tools -- install-xmlsec1

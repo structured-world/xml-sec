@@ -487,8 +487,8 @@ fn versions(corpus: &Corpus, results: &Path) -> Result<Map<String, Value>, Strin
     }
     let oracle_version = text(&oracle.stdout).trim().to_owned();
     // The byte-dump parser reads the oracle's debug output in the format of
-    // upstream master; a new upstream version fails here until the corpus has
-    // been run against it.
+    // the pinned upstream commit; a new upstream version fails here until the
+    // corpus has been run against it.
     if oracle_version != "xmlsec1 1.3.14 (openssl)" {
         return Err(format!(
             "byte-dump parser requires qualified native xmlsec1 1.3.14 (openssl), got: {oracle_version}"

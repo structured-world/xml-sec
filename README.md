@@ -235,7 +235,7 @@ and key-management scenarios execute against the Rust `xmlsec1` binary without n
 a system libxmlsec1 installation.
 
 The generated [compatibility ledger](docs/compatibility-ledger.md) tracks the libxmlsec1 public
-surface of upstream master and its operation behavior with source and test evidence.
+surface at a pinned upstream commit and its operation behavior with source and test evidence.
 
 The [local XAdES interoperability corpus](interop/xades/README.md) compares exact Reference
 and SignedInfo bytes with native libxmlsec1 and checks independent EU DSS profile expectations.
