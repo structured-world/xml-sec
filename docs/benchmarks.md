@@ -226,8 +226,9 @@ operation inside a process.
 ### Command-line process
 
 The runner builds Bergshamra's current source (RustCrypto only) and the
-libxmlsec1 oracle from upstream master as it is when the run starts (or from
-`HEAD` of the `XMLSEC1_SOURCE_DIR` checkout when that variable is set),
+libxmlsec1 oracle from the pinned upstream commit (or the revision
+`XMLSEC1_REVISION` names, from the `XMLSEC1_SOURCE_DIR` checkout when that
+variable is set),
 independently of the product dependency graph; the evidence records the
 commit each was built from.
 It compares both xml-sec XML backends against those CLIs: single-reference
@@ -300,7 +301,7 @@ The same corpus and keys drive one in-process harness per engine:
   line from that commit, moves the library harness to the same commit, and
   records the commit in the evidence;
 - libxmlsec1 through its C API (`benchmarks/libxmlsec1-library.c`), linked
-  against the oracle build of upstream master and the OpenSSL inside it; the
+  against the oracle build of the pinned upstream commit and the OpenSSL inside it; the
   evidence records the commit the installation was built from.
 
 Each process loads keys, trust anchors and settings once, validates its first

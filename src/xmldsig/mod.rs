@@ -93,6 +93,7 @@ pub mod transforms;
 pub mod trust;
 pub mod types;
 pub mod uri;
+pub mod utc_facts;
 pub mod verify;
 pub(crate) mod whitespace;
 pub mod x509;
@@ -119,10 +120,11 @@ pub use mac::{HmacTag, IncrementalHmac};
 #[cfg(feature = "xmldsig-sign")]
 pub use modern::EdDsaSigningKey;
 pub use parse::{
-    KeyInfo, KeyInfoSource, KeyValueInfo, ParseError, Reference, RetrievalMethodTransforms,
-    RsaPssParameters, SignatureAlgorithm, SignatureContext, SignedInfo, X509DataInfo,
-    find_signature_node, parse_key_info, parse_key_value_child, parse_reference, parse_signed_info,
-    x509_certificate_matches_selectors,
+    KeyInfo, KeyInfoSource, KeyValueInfo, ParseError, ParsedX509Certificate, Reference,
+    RetrievalMethodTransforms, RsaPssParameters, SignatureAlgorithm, SignatureContext, SignedInfo,
+    X509DataInfo, X509PublicKeyInfo, find_signature_node, parse_key_info, parse_key_value_child,
+    parse_reference, parse_signed_info, parse_x509_certificate_with_resources,
+    x509_certificate_matches_selectors, x509_find_certificate_by_selectors,
 };
 pub use pkix::CertificatePathVerifier;
 #[cfg(feature = "xmldsig-sign")]
@@ -151,6 +153,7 @@ pub use transforms::{
 };
 pub use trust::{KeyTrustEvidence, ResolvedVerificationKey, TrustedPublicKey, X509TrustEvidence};
 pub use types::{NodeSet, TransformData, TransformError};
+pub use utc_facts::{LeapSecondsError, LeapSecondsList};
 #[cfg(feature = "rustcrypto")]
 pub use verify::verify_signature_with_pem_key;
 pub use verify::{
@@ -171,6 +174,7 @@ pub use verify::{
     process_all_references, process_reference, with_verified_request,
 };
 pub use x509::{
-    X509ChainError, X509ChainOptions, verify_x509_certificate_chain,
-    verify_x509_certificate_chain_with_resources,
+    VerifiedX509Certificate, X509ChainError, X509ChainOptions, validate_x509_crl,
+    verify_x509_certificate, verify_x509_certificate_chain,
+    verify_x509_certificate_chain_with_resources, x509_leaf_certificates,
 };

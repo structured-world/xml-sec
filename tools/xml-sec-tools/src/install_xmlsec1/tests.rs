@@ -1,4 +1,6 @@
-use super::{COMPATIBILITY, Install, MARKER, MODERN, configured_version, execute, version_matches};
+use super::{
+    COMPATIBILITY, Install, MARKER, MODERN, Revision, configured_version, execute, version_matches,
+};
 use crate::repo::{Run, Step};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::ExitStatusExt as _;
@@ -152,12 +154,29 @@ impl Prefix {
         self.directory.path().join("xmlsec-prefix")
     }
 
+    fn pin(&self) -> PathBuf {
+        self.directory.path().join("donor-commit.txt")
+    }
+
+    /// An installation of the pinned commit, with the pin naming [`COMMIT`].
     fn install(&self, modern: bool, source: Option<PathBuf>) -> Install {
+        std::fs::write(self.pin(), format!("{COMMIT}\n")).unwrap();
         Install {
             prefix: self.path(),
             modern,
             source,
             library_path: None,
+            revision: Revision::Pinned,
+            pin: self.pin(),
+            record_pin: false,
+        }
+    }
+
+    /// An installation of upstream master's head.
+    fn master(&self) -> Install {
+        Install {
+            revision: Revision::Master,
+            ..self.install(false, None)
         }
     }
 
@@ -210,20 +229,126 @@ fn the_version_comes_from_ac_init() {
     }
 }
 
+fn asked_master(toolchain: &Toolchain) -> bool {
+    toolchain
+        .labels
+        .iter()
+        .any(|label| label == "upstream master")
+}
+
 #[test]
-fn a_build_of_master_records_its_commit_and_version() {
-    // The marker is written only after validation, and the previous build goes.
+fn a_build_of_the_pin_records_its_commit_and_version() {
+    // Without XMLSEC1_REVISION the pinned commit is built, whatever master is;
+    // the marker is written only after validation, and the previous build goes.
     let prefix = Prefix::new(true);
     let mut toolchain = Toolchain::new(&prefix.path());
+    toolchain.master = format!("{}\trefs/heads/master\n", "b".repeat(40));
     execute(&mut toolchain, &prefix.install(false, None)).unwrap();
     assert!(!prefix.path().join("sentinel").exists());
     assert_eq!(prefix.marker(), Some(format!("{COMMIT}\n{VERSION}\n")));
     assert_eq!(prefix.debris(), Vec::<String>::new());
-    assert!(
-        toolchain
-            .labels
-            .iter()
-            .any(|label| label == "upstream master")
+    assert!(!asked_master(&toolchain));
+}
+
+#[test]
+fn a_build_of_master_builds_its_current_head() {
+    // XMLSEC1_REVISION=master builds the head upstream lists now, not the pin.
+    let prefix = Prefix::new(true);
+    let mut toolchain = Toolchain::new(&prefix.path());
+    let head = "b".repeat(40);
+    toolchain.master = format!("{head}\trefs/heads/master\n");
+    toolchain.revision = head.clone();
+    execute(&mut toolchain, &prefix.master()).unwrap();
+    assert!(asked_master(&toolchain));
+    assert_eq!(prefix.marker(), Some(format!("{head}\n{VERSION}\n")));
+}
+
+#[test]
+fn an_explicit_commit_is_built_as_asked() {
+    let prefix = Prefix::new(true);
+    let mut toolchain = Toolchain::new(&prefix.path());
+    let commit = "c".repeat(40);
+    toolchain.revision = commit.clone();
+    let install = Install {
+        revision: Revision::Commit(commit.clone()),
+        ..prefix.install(false, None)
+    };
+    execute(&mut toolchain, &install).unwrap();
+    assert!(!asked_master(&toolchain));
+    assert_eq!(prefix.marker(), Some(format!("{commit}\n{VERSION}\n")));
+}
+
+#[test]
+fn the_revision_variable_names_the_pin_master_or_one_commit() {
+    assert_eq!(Revision::parse(None), Ok(Revision::Pinned));
+    assert_eq!(Revision::parse(Some("master")), Ok(Revision::Master));
+    assert_eq!(
+        Revision::parse(Some(COMMIT)),
+        Ok(Revision::Commit(COMMIT.into()))
+    );
+    // A branch other than master, a short id or an uppercase id would build
+    // something no pin can name.
+    for value in ["main", "c5ef426d", &COMMIT.to_uppercase(), "", " master"] {
+        let error = Revision::parse(Some(value)).unwrap_err();
+        assert!(error.contains("XMLSEC1_REVISION"), "{value:?}: {error}");
+    }
+}
+
+#[test]
+fn a_missing_or_malformed_pin_is_refused_before_building() {
+    for pin in [
+        None,
+        Some(""),
+        Some("c5ef426d\n"),
+        Some(&*format!("{COMMIT}\n{COMMIT}\n")),
+    ] {
+        let prefix = Prefix::new(true);
+        let mut install = prefix.install(false, None);
+        match pin {
+            Some(text) => std::fs::write(prefix.pin(), text).unwrap(),
+            None => std::fs::remove_file(prefix.pin()).unwrap(),
+        }
+        let mut toolchain = Toolchain::new(&prefix.path());
+        install.record_pin = true;
+        let error = execute(&mut toolchain, &install).unwrap_err();
+        assert!(error.contains("donor-commit.txt"), "{pin:?}: {error}");
+        assert!(prefix.previous_kept(), "{pin:?}");
+        assert!(!toolchain.labels.iter().any(|label| label == "source init"));
+    }
+}
+
+#[test]
+fn pin_records_the_commit_only_after_its_oracle_passes() {
+    // `--pin` moves the oracle: a validated master build becomes the pin, a
+    // build that fails its checks leaves the pin where it was.
+    let head = "b".repeat(40);
+    let prefix = Prefix::new(true);
+    let mut toolchain = Toolchain::new(&prefix.path());
+    toolchain.master = format!("{head}\trefs/heads/master\n");
+    toolchain.revision = head.clone();
+    let install = Install {
+        record_pin: true,
+        ..prefix.master()
+    };
+    execute(&mut toolchain, &install).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(prefix.pin()).unwrap(),
+        format!("{head}\n")
+    );
+
+    let prefix = Prefix::new(true);
+    let mut toolchain = Toolchain::new(&prefix.path());
+    toolchain.master = format!("{head}\trefs/heads/master\n");
+    toolchain.revision = head;
+    toolchain.version = "xmlsec1 1.3.12\n".into();
+    let install = Install {
+        record_pin: true,
+        ..prefix.master()
+    };
+    assert!(execute(&mut toolchain, &install).is_err());
+    assert_eq!(
+        std::fs::read_to_string(prefix.pin()).unwrap(),
+        format!("{COMMIT}\n")
     );
 }
 
@@ -240,7 +365,7 @@ fn an_unreadable_master_listing_is_refused_before_building() {
         let mut toolchain = Toolchain::new(&prefix.path());
         toolchain.master = listing.to_owned();
         assert!(
-            execute(&mut toolchain, &prefix.install(false, None)).is_err(),
+            execute(&mut toolchain, &prefix.master()).is_err(),
             "{listing:?}"
         );
         assert!(prefix.previous_kept(), "{listing:?}");
@@ -280,9 +405,9 @@ fn an_oracle_without_the_xslt_transform_is_refused() {
 }
 
 #[test]
-fn a_fetched_revision_other_than_master_is_refused_before_building() {
-    // A fetch that brings another commit than master's listed head is not
-    // the source asked for.
+fn a_fetched_revision_other_than_the_one_asked_is_refused_before_building() {
+    // A fetch that brings another commit than the pinned one is not the
+    // source asked for.
     let prefix = Prefix::new(true);
     let mut toolchain = Toolchain::new(&prefix.path());
     toolchain.revision = "0".repeat(40);
@@ -297,14 +422,19 @@ fn a_fetched_revision_other_than_master_is_refused_before_building() {
     );
 }
 
-#[test]
-fn a_local_checkout_builds_its_head() {
-    // Linked worktrees store .git as a file; Git, not the file system shape,
-    // decides what a checkout is, and its HEAD is what is built.
-    let prefix = Prefix::new(true);
+/// A linked worktree under `prefix`'s directory: Git, not the file system
+/// shape, decides what a checkout is.
+fn worktree(prefix: &Prefix) -> PathBuf {
     let source = prefix.directory.path().join("linked-worktree");
     std::fs::create_dir_all(&source).unwrap();
     std::fs::write(source.join(".git"), "gitdir: /elsewhere\n").unwrap();
+    source
+}
+
+#[test]
+fn a_local_checkout_at_the_pin_is_exported() {
+    let prefix = Prefix::new(true);
+    let source = worktree(&prefix);
     let mut toolchain = Toolchain::new(&prefix.path());
     toolchain.master = String::new();
     execute(&mut toolchain, &prefix.install(false, Some(source))).unwrap();
@@ -316,11 +446,29 @@ fn a_local_checkout_builds_its_head() {
             .iter()
             .any(|label| label == "source export")
     );
+    assert!(!asked_master(&toolchain));
+}
+
+#[test]
+fn a_local_checkout_elsewhere_is_refused_with_the_commands_that_move_it() {
+    // A stale donor checkout would otherwise build an oracle other than the
+    // pinned one without anyone noticing.
+    let prefix = Prefix::new(true);
+    let source = worktree(&prefix);
+    let mut toolchain = Toolchain::new(&prefix.path());
+    toolchain.revision = "d".repeat(40);
+    let error = execute(&mut toolchain, &prefix.install(false, Some(source))).unwrap_err();
+    assert!(error.contains(&"d".repeat(40)), "{error}");
+    assert!(
+        error.contains(&format!("checkout --detach {COMMIT}")),
+        "{error}"
+    );
+    assert!(prefix.previous_kept());
     assert!(
         !toolchain
             .labels
             .iter()
-            .any(|label| label == "upstream master")
+            .any(|label| label == "source export")
     );
 }
 
@@ -377,8 +525,8 @@ fn built(toolchain: &Toolchain) -> bool {
 }
 
 #[test]
-fn a_cache_of_masters_current_commit_is_reused_without_building() {
-    // A cache that is still master's head and passes every check needs no
+fn a_cache_of_the_pinned_commit_is_reused_without_building() {
+    // A cache of the commit asked for that passes every check needs no
     // rebuild.
     let prefix = cached(COMMIT);
     let mut toolchain = Toolchain::new(&prefix.path());
@@ -411,8 +559,8 @@ fn a_cache_without_triple_des_is_not_reused() {
 }
 
 #[test]
-fn a_cache_of_an_earlier_master_is_rebuilt() {
-    // Master moved since the cache was built: the oracle follows it.
+fn a_cache_of_another_commit_is_rebuilt() {
+    // The pin moved since the cache was built: the oracle follows it.
     let prefix = cached(&"a".repeat(40));
     let mut toolchain = Toolchain::new(&prefix.path());
     execute(&mut toolchain, &prefix.install(false, None)).unwrap();

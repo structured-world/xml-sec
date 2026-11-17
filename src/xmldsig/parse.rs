@@ -834,10 +834,18 @@ pub struct ParsedX509Certificate {
     pub serial_number: Vec<u8>,
     /// Uppercase hexadecimal certificate serial number without separators.
     pub serial_number_hex: String,
+    /// Decimal certificate serial number, as `X509SerialNumber` carries it.
+    pub serial_number_decimal: String,
     /// Subject Key Identifier extension bytes (if present).
     pub subject_key_identifier: Option<Vec<u8>>,
     /// Parsed certificate public key material.
     pub public_key: X509PublicKeyInfo,
+    /// The certificate's `SubjectPublicKeyInfo` DER as it is encoded.
+    pub subject_public_key_info: Vec<u8>,
+    /// The start of the certificate's validity period.
+    pub not_before: crate::policy::Instant,
+    /// The end of the certificate's validity period.
+    pub not_after: crate::policy::Instant,
 }
 
 /// Public key material extracted from certificate `SubjectPublicKeyInfo`.
@@ -3462,6 +3470,60 @@ pub fn x509_certificate_matches_selectors(
     )
 }
 
+/// The position of the first of `candidates` that every selector of `info`
+/// names, as a store finds the certificate a lookup-only `X509Data`
+/// identifies. All comparisons run in one session under `resources`, so they
+/// share its work allowance. `None` when no candidate matches.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] for invalid `resources`, a candidate that cannot be
+/// read, or comparisons beyond the resource limits.
+///
+/// # Examples
+///
+/// ```
+/// use xml_sec::policy::ResourcePolicy;
+/// use xml_sec::xmldsig::{X509DataInfo, x509_find_certificate_by_selectors};
+///
+/// // Without selectors no certificate is named.
+/// let found = x509_find_certificate_by_selectors(
+///     &X509DataInfo::default(),
+///     [b"not read".as_slice()],
+///     xml_sec::provider::default_provider(),
+///     &ResourcePolicy::default(),
+/// )?;
+/// assert_eq!(found, None);
+/// # Ok::<(), xml_sec::xmldsig::ParseError>(())
+/// ```
+pub fn x509_find_certificate_by_selectors<'c>(
+    info: &X509DataInfo,
+    candidates: impl IntoIterator<Item = &'c [u8]>,
+    provider: &dyn crate::provider::CryptoProvider,
+    resources: &crate::policy::ResourcePolicy,
+) -> Result<Option<usize>, ParseError> {
+    if info.subject_names.is_empty()
+        && info.issuer_serials.is_empty()
+        && info.skis.is_empty()
+        && info.digests.is_empty()
+    {
+        return Ok(None);
+    }
+    resources.validate().map_err(ParseError::Policy)?;
+    let certificates = super::pkix::CertificateSession::new(resources);
+    for (position, candidate) in candidates.into_iter().enumerate() {
+        if x509_selector_categories_match_candidates(
+            info,
+            core::iter::once(candidate),
+            provider,
+            &certificates,
+        )? {
+            return Ok(Some(position));
+        }
+    }
+    Ok(None)
+}
+
 pub(crate) fn x509_selector_categories_match_chain(
     info: &X509DataInfo,
     provider: &dyn crate::provider::CryptoProvider,
@@ -3804,6 +3866,22 @@ pub(crate) fn parse_x509_certificate(cert_der: &[u8]) -> Result<ParsedX509Certif
     parse_x509_certificate_in(cert_der, &session)
 }
 
+/// The subject, issuer, serial number, key identifier and public key of the
+/// DER certificate `der`, read under `resources`. Reading assigns no trust.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] for invalid `resources`, a certificate that does not
+/// parse, or reading it beyond the resource limits.
+pub fn parse_x509_certificate_with_resources(
+    der: &[u8],
+    resources: &crate::policy::ResourcePolicy,
+) -> Result<ParsedX509Certificate, ParseError> {
+    resources.validate().map_err(ParseError::Policy)?;
+    let session = super::pkix::CertificateSession::new(resources);
+    parse_x509_certificate_in(der, &session)
+}
+
 pub(crate) fn parse_x509_certificate_in(
     cert_der: &[u8],
     session: &super::pkix::CertificateSession,
@@ -3824,6 +3902,28 @@ pub(crate) fn certificate_metadata(
     let issuer_dn = shared_name_text(cert.tbs().issuer(), session)?;
     let serial_number = cert.tbs().serial().as_bytes().to_vec();
     let serial_number_hex = format_x509_serial_value_hex(&serial_number);
+    // The decimal conversion is quadratic in the serial's length, and a parsed
+    // certificate's serial is not yet bounded: its work is charged first.
+    let serial_work = (serial_number.len() as u64)
+        .checked_mul(serial_number.len() as u64)
+        .ok_or_else(|| {
+            session.parse_failure(structured_pkix::Error::resource(
+                structured_asn1::memory::MemoryError::WorkExceeded,
+                "certificate.serial_number",
+                0,
+            ))
+        })?;
+    session
+        .memory()
+        .charge_work(serial_work)
+        .map_err(|reason| {
+            session.parse_failure(structured_pkix::Error::resource(
+                reason,
+                "certificate.serial_number",
+                0,
+            ))
+        })?;
+    let serial_number_decimal = format_x509_serial_decimal(&serial_number);
 
     let subject_key_identifier = cert
         .tbs()
@@ -3889,13 +3989,18 @@ pub(crate) fn certificate_metadata(
         }
     };
 
+    let validity = cert.tbs().validity();
     Ok(ParsedX509Certificate {
         subject_dn,
         issuer_dn,
         serial_number,
         serial_number_hex,
+        serial_number_decimal,
         subject_key_identifier,
         public_key,
+        subject_public_key_info: spki.as_bytes().to_vec(),
+        not_before: validity.not_before().instant(),
+        not_after: validity.not_after().instant(),
     })
 }
 
@@ -3946,6 +4051,38 @@ fn format_x509_serial_value_hex(serial: &[u8]) -> String {
         &serial[first_non_zero..]
     };
     format_x509_serial_hex(canonical)
+}
+
+/// The decimal text of the unsigned big-endian serial value `serial`, the
+/// form `X509SerialNumber` carries (`XMLDSig` 1.1 section 4.5.4.1:
+/// `xsd:integer`).
+fn format_x509_serial_decimal(serial: &[u8]) -> String {
+    // The last decimal digit of `value`.
+    fn last_digit(value: u32) -> u8 {
+        u8::try_from(value % 10).expect("a remainder of division by 10 fits a byte")
+    }
+    // Little-endian decimal digits, multiplied by 256 per input octet.
+    let mut digits = vec![0_u8];
+    for byte in serial {
+        let mut carry = u32::from(*byte);
+        for digit in &mut digits {
+            let value = u32::from(*digit) * 256 + carry;
+            *digit = last_digit(value);
+            carry = value / 10;
+        }
+        while carry > 0 {
+            digits.push(last_digit(carry));
+            carry /= 10;
+        }
+    }
+    while digits.len() > 1 && digits.last() == Some(&0) {
+        digits.pop();
+    }
+    digits
+        .iter()
+        .rev()
+        .map(|digit| char::from(b'0' + digit))
+        .collect()
 }
 
 fn x509_serial_decimal_bytes(serial: &str) -> Option<[u8; MAX_X509_SERIAL_NUMBER_BYTES]> {

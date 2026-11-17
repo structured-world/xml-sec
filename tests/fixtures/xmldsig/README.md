@@ -2,8 +2,9 @@
 
 This directory contains the XMLDSig test documents used by integration tests.
 They are checked into the repository so CI never depends on a local donor clone.
-The compatibility oracle is upstream libxmlsec1 master as it is when the tests
-run. `xml-sec-tools install-xmlsec1` records the source commit it built and
+The compatibility oracle is upstream libxmlsec1 at the commit
+`compatibility/libxmlsec1-donor-commit.txt` pins. `xml-sec-tools install-xmlsec1`
+records the source commit it built and
 verifies it and the live `xmlsec1 --version` output before reusing a cached
 installation.
 

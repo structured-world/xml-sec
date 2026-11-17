@@ -33,8 +33,8 @@ pre-digest output and digest mismatch instead of silently skipping it.
 
 ## Reproduce
 
-Provision the libxmlsec1 oracle from upstream master with
-`cargo run -p xml-sec-tools -- install-xmlsec1` (or from a checkout with
+Provision the libxmlsec1 oracle from the pinned upstream commit with
+`cargo run -p xml-sec-tools -- install-xmlsec1` (or from a checkout of it with
 `XMLSEC1_SOURCE_DIR=/path/to/checkout`); the installer records the commit it built.
 Set its reported library path. Use a checkout of the libxslt commit recorded in
 `compatibility/libxslt-1.1.45-donor-commit.txt`:

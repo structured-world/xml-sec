@@ -149,6 +149,7 @@ impl Target {
                 "tests/c/hmac.c",
                 "tests/c/signatures.c",
                 "tests/c/app.c",
+                "tests/c/x509.c",
             ],
         }
     }
@@ -811,7 +812,8 @@ pub(crate) fn declared_variables(header: &str, prefix: &str) -> BTreeSet<String>
         .collect()
 }
 
-/// Every function and variable the libxmlsec1-compatible headers declare.
+/// Every function and variable the libxmlsec1-compatible headers declare,
+/// libxmlsec1's and the library's own.
 fn xmlsec1_declarations() -> Result<BTreeSet<String>, Failure> {
     let directory = root().join(XMLSEC1_CRATE).join("include/xmlsec");
     let mut names = BTreeSet::new();
@@ -826,6 +828,8 @@ fn xmlsec1_declarations() -> Result<BTreeSet<String>, Failure> {
                 .map_err(|error| format!("read {}: {error}", path.display()))?;
             names.extend(declared_with(&text, "xmlSec"));
             names.extend(declared_variables(&text, "xmlSec"));
+            // The library's own additions (`xs_*.h`) use its `xs` prefix.
+            names.extend(declared(&text));
         }
     }
     Ok(names)
@@ -921,9 +925,10 @@ fn qualify_xmlsec1(
         checked(runner, &oracle_compile_step(&compiler, &program))?;
         let expected = standard_output(runner, &oracle_program_step(&theirs, prefix, &library))?;
         let actual = standard_output(runner, &program_step(&mine, &[], &library))?;
+        let kept = keep_outputs(&name, &expected, &actual);
         if let Some(difference) = first_difference(&expected, &actual) {
             return Err(format!(
-                "{}: {} prints differently from libxmlsec1: {difference}",
+                "{}: {} prints differently from libxmlsec1: {difference}{kept}",
                 target.package(),
                 source.display()
             )
@@ -936,6 +941,26 @@ fn qualify_xmlsec1(
         );
     }
     Ok(())
+}
+
+/// Keeps both outputs of the program `name` under `target/capi-xmlsec1`, so
+/// a difference, or what an agreeing program printed, can be read whole; the
+/// note naming them, or why they were not kept.
+fn keep_outputs(name: &str, expected: &str, actual: &str) -> String {
+    let directory = root().join("target/capi-xmlsec1");
+    let oracle = directory.join(format!("{name}.oracle.txt"));
+    let ours = directory.join(format!("{name}.ours.txt"));
+    let kept = std::fs::create_dir_all(&directory)
+        .and_then(|()| std::fs::write(&oracle, expected))
+        .and_then(|()| std::fs::write(&ours, actual));
+    match kept {
+        Ok(()) => format!(
+            "; outputs kept in {} and {}",
+            oracle.display(),
+            ours.display()
+        ),
+        Err(error) => format!("; the outputs could not be kept: {error}"),
+    }
 }
 
 /// The first line where `actual` differs from `expected`, described.

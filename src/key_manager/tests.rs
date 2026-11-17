@@ -565,6 +565,13 @@ fn pkcs12_unrelated_ca_does_not_block_private_key() {
     assert_eq!(inventory.private_keys.len(), 1);
     assert_eq!(inventory.private_keys[0].certificate_chain.len(), 1);
     assert!(!inventory.private_keys[0].has_matching_leaf);
+    // The unrelated CA stays reachable, though not as the key's chain.
+    assert!(
+        inventory.private_keys[0]
+            .matching_certificate_chain()
+            .is_none()
+    );
+    assert_eq!(inventory.private_keys[0].certificates().len(), 1);
     assert!(
         inventory
             .signing_key(
@@ -4997,4 +5004,49 @@ fn a_preset_selection_resolves_the_named_key_only_where_policy_admits_it() {
         .key_sources
         .remove(crate::policy::KeySourceKind::PresetKey);
     assert!(resolve("mac", &policy).is_err());
+}
+
+#[test]
+fn pem_block_der_returns_one_block_of_the_requested_label() {
+    let certificate = rcgen::CertificateParams::new(Vec::<String>::new())
+        .expect("certificate parameters")
+        .self_signed(&rcgen::KeyPair::generate().expect("key"))
+        .expect("certificate");
+    let pem = certificate.pem();
+    let resources = ResourcePolicy::default();
+    assert_eq!(
+        pem_block_der(pem.as_bytes(), "CERTIFICATE", &resources).expect("certificate DER"),
+        certificate.der().to_vec()
+    );
+    // Another label, two blocks and text without a frame are refused.
+    assert!(matches!(
+        pem_block_der(pem.as_bytes(), "X509 CRL", &resources),
+        Err(KeyStoreError::Selection(_))
+    ));
+    let twice = format!("{pem}{pem}");
+    assert!(matches!(
+        pem_block_der(twice.as_bytes(), "CERTIFICATE", &resources),
+        Err(KeyStoreError::Selection(_))
+    ));
+    assert!(matches!(
+        pem_block_der(b"no frame", "CERTIFICATE", &resources),
+        Err(KeyStoreError::Selection(_))
+    ));
+    // RFC 7468 section 2: explanatory text before the block, as OpenSSL's
+    // `x509 -text` output leaves it, is no part of the block.
+    let explained = format!("Certificate:\n    Data: ...\n{pem}");
+    assert_eq!(
+        pem_block_der(explained.as_bytes(), "CERTIFICATE", &resources)
+            .expect("certificate after explanatory text"),
+        certificate.der().to_vec()
+    );
+    // Input beyond the per-resource limit is refused before it is read.
+    let small = ResourcePolicy {
+        max_external_resource_bytes: pem.len() - 1,
+        ..ResourcePolicy::default()
+    };
+    assert!(matches!(
+        pem_block_der(pem.as_bytes(), "CERTIFICATE", &small),
+        Err(KeyStoreError::Policy(_))
+    ));
 }

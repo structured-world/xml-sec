@@ -1250,6 +1250,22 @@ pub enum VerificationTrustMode {
     CryptographicOnly,
 }
 
+/// Which `X509Data` children a lookup that stops on an unknown certificate
+/// refuses when they yield no certificate.
+#[cfg(feature = "xmldsig")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UnknownX509CertificateSemantics {
+    /// Only a child that names a certificate (`X509IssuerSerial`, `X509SKI`,
+    /// `X509SubjectName`, `X509Digest`) no store holds, as libxmlsec1
+    /// documents `XMLSEC_KEYINFO_FLAGS_X509DATA_STOP_ON_UNKNOWN_CERT`; an
+    /// `X509CRL` or an ignored child names none.
+    #[default]
+    References,
+    /// libxmlsec1's implementation: every child that yields no certificate,
+    /// an `X509CRL` and an ignored child included.
+    Libxmlsec1,
+}
+
 /// X.509 and key-resolution decisions for verification.
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1287,6 +1303,9 @@ pub struct KeyTrustPolicy {
     /// Verification time override; `None` selects the host clock. Builds
     /// without `std` have no clock and require this time.
     pub verification_time: Option<Instant>,
+    /// Which `X509Data` children a lookup stopping on an unknown certificate
+    /// refuses.
+    pub unknown_x509_certificate: UnknownX509CertificateSemantics,
 }
 
 #[cfg(feature = "xmldsig")]
@@ -1305,6 +1324,7 @@ impl Default for KeyTrustPolicy {
             allowed_extended_key_usages: BTreeSet::new(),
             check_crls: false,
             verification_time: None,
+            unknown_x509_certificate: UnknownX509CertificateSemantics::References,
         }
     }
 }

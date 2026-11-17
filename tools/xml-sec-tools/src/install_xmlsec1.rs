@@ -1,9 +1,12 @@
-//! `install-xmlsec1`: builds the libxmlsec1 test oracle from upstream master,
-//! as it is when the command runs, into `XMLSEC1_PREFIX`, and prints the
-//! commit and version it built. A cached build is reused only while it is of
-//! master's current commit and passes its version and transform checks again;
-//! a new build replaces the previous one only after the same checks pass, and
-//! a failure restores it.
+//! `install-xmlsec1`: builds the libxmlsec1 test oracle into `XMLSEC1_PREFIX`
+//! from the upstream commit [`PIN`] names, or from the revision
+//! `XMLSEC1_REVISION` asks for (`master`: upstream master's head when the
+//! command runs; a full commit id: that commit), and prints the commit and
+//! version it built. `--pin` records the built commit in [`PIN`], which moves
+//! the oracle once the checks against it pass. A cached build is reused only
+//! while it is of that commit and passes its version and transform checks
+//! again; a new build replaces the previous one only after the same checks
+//! pass, and a failure restores it.
 
 use crate::repo::{Failure, Run, Step, System, root};
 use std::path::{Path, PathBuf};
@@ -12,8 +15,10 @@ use std::path::{Path, PathBuf};
 mod tests;
 
 const REPOSITORY: &str = "https://github.com/lsh123/xmlsec.git";
-/// The upstream branch the oracle follows.
+/// The upstream branch `XMLSEC1_REVISION=master` builds.
 const BRANCH: &str = "refs/heads/master";
+/// The file naming the upstream commit the oracle is built from.
+pub(crate) const PIN: &str = "compatibility/libxmlsec1-donor-commit.txt";
 /// The file in the prefix naming the source commit and version installed.
 pub(crate) const MARKER: &str = ".xmlsec-source";
 /// libxmlsec1 enables `EdDSA` only with the OpenSSL 3.5 API. This isolated
@@ -56,10 +61,42 @@ pub(crate) struct Install {
     pub(crate) prefix: PathBuf,
     /// Build against a private OpenSSL with `EdDSA` and ML-KEM.
     pub(crate) modern: bool,
-    /// A local checkout whose `HEAD` is built instead of upstream master.
+    /// A local checkout, at the revision built, exported instead of fetched.
     pub(crate) source: Option<PathBuf>,
     /// The inherited dynamic library path, extended with the oracle's.
     pub(crate) library_path: Option<String>,
+    /// The upstream revision to build.
+    pub(crate) revision: Revision,
+    /// The pin file, read for [`Revision::Pinned`] and written by `--pin`.
+    pub(crate) pin: PathBuf,
+    /// Record the built commit in the pin file after it passes its checks.
+    pub(crate) record_pin: bool,
+}
+
+/// The upstream revision an installation is built from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Revision {
+    /// The commit the pin file names.
+    Pinned,
+    /// Upstream master's head when the command runs.
+    Master,
+    /// One exact commit.
+    Commit(String),
+}
+
+impl Revision {
+    /// The revision `XMLSEC1_REVISION` names: unset for the pin, `master`,
+    /// or a full commit id.
+    pub(crate) fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value {
+            None => Ok(Self::Pinned),
+            Some("master") => Ok(Self::Master),
+            Some(commit) if object_id(commit) => Ok(Self::Commit(commit.to_owned())),
+            Some(other) => Err(format!(
+                "XMLSEC1_REVISION must be master or a full commit id: {other:?}"
+            )),
+        }
+    }
 }
 
 impl Install {
@@ -231,38 +268,59 @@ fn git(label: &str, directory: &Path, args: &[&str]) -> Step {
     Step::new(label, "git", &all)
 }
 
-/// The commit to build: `HEAD` of the local checkout when one is given,
-/// upstream master's head otherwise, resolved now.
+/// The commit the pin file names.
+pub(crate) fn pinned(pin: &Path) -> Result<String, String> {
+    let text =
+        std::fs::read_to_string(pin).map_err(|error| format!("{}: {error}", pin.display()))?;
+    let commit = text.strip_suffix('\n').unwrap_or(&text);
+    if object_id(commit) {
+        Ok(commit.to_owned())
+    } else {
+        Err(format!(
+            "{} must hold one full commit id: {text:?}",
+            pin.display()
+        ))
+    }
+}
+
+/// The commit to build, resolved now. A local checkout must stand on it, so
+/// a stale checkout never builds another oracle than the one asked for.
 fn resolve(run: &mut impl Run, install: &Install) -> Result<String, String> {
-    let commit = match &install.source {
-        Some(local) => {
-            let refused = || {
-                format!(
-                    "XMLSEC1_SOURCE_DIR must be an absolute git checkout: {}",
-                    local.display()
-                )
-            };
-            if !local.is_absolute() || !local.is_dir() {
-                return Err(refused());
-            }
-            let inside = query(
-                run,
-                &git(
-                    "source repository",
-                    local,
-                    &["rev-parse", "--is-inside-work-tree"],
-                ),
-            )?;
-            if inside.as_deref() != Some("true") {
-                return Err(refused());
-            }
-            query(run, &git("source revision", local, &["rev-parse", "HEAD"]))?.unwrap_or_default()
-        }
-        None => master(run)?,
+    let commit = match &install.revision {
+        Revision::Pinned => pinned(&install.pin)?,
+        Revision::Master => master(run)?,
+        Revision::Commit(commit) => commit.clone(),
     };
-    if !object_id(&commit) {
+    let Some(local) = &install.source else {
+        return Ok(commit);
+    };
+    let refused = || {
+        format!(
+            "XMLSEC1_SOURCE_DIR must be an absolute git checkout: {}",
+            local.display()
+        )
+    };
+    if !local.is_absolute() || !local.is_dir() {
+        return Err(refused());
+    }
+    let inside = query(
+        run,
+        &git(
+            "source repository",
+            local,
+            &["rev-parse", "--is-inside-work-tree"],
+        ),
+    )?;
+    if inside.as_deref() != Some("true") {
+        return Err(refused());
+    }
+    let head =
+        query(run, &git("source revision", local, &["rev-parse", "HEAD"]))?.unwrap_or_default();
+    if head != commit {
+        let local = local.display();
         return Err(format!(
-            "xmlsec1 source revision is not a commit: {commit:?}"
+            "XMLSEC1_SOURCE_DIR is at {head:?}, the oracle is built from {commit}; \
+             run `git -C {local} fetch origin {commit}` and `git -C {local} checkout --detach {commit}`"
         ));
     }
     Ok(commit)
@@ -674,6 +732,21 @@ fn accept(
     Ok(version)
 }
 
+/// Records `commit` in the pin file when `--pin` asked for it; called only
+/// once the oracle of that commit passed its checks.
+fn record_pin(install: &Install, commit: &str) -> Result<(), String> {
+    if !install.record_pin {
+        return Ok(());
+    }
+    std::fs::write(&install.pin, format!("{commit}\n"))
+        .map_err(|error| format!("{}: {error}", install.pin.display()))?;
+    println!(
+        "pinned the libxmlsec1 oracle to {commit} in {}",
+        install.pin.display()
+    );
+    Ok(())
+}
+
 pub(crate) fn execute(run: &mut impl Run, install: &Install) -> Result<(), String> {
     let commit = resolve(run, install)?;
     let recorded = installed(&install.prefix).filter(|recorded| recorded.commit == commit);
@@ -686,7 +759,7 @@ pub(crate) fn execute(run: &mut impl Run, install: &Install) -> Result<(), Strin
                 recorded.short(),
                 install.prefix.display()
             );
-            return Ok(());
+            return record_pin(install, &commit);
         }
         eprintln!(
             "cached xmlsec1 at {} failed version validation; rebuilding",
@@ -719,21 +792,25 @@ pub(crate) fn execute(run: &mut impl Run, install: &Install) -> Result<(), Strin
         source.commit,
         install.prefix.display()
     );
-    Ok(())
+    record_pin(install, &source.commit)
 }
 
 pub(crate) fn run(mut args: impl Iterator<Item = String>) -> Result<(), Failure> {
-    if args.next().is_some() {
-        return Err("usage: install-xmlsec1 (configured by XMLSEC1_PREFIX, XMLSEC1_SOURCE_DIR, XMLSEC1_MODERN_ORACLE)".into());
-    }
+    const USAGE: &str = "usage: install-xmlsec1 [--pin] (configured by XMLSEC1_PREFIX, XMLSEC1_REVISION, XMLSEC1_SOURCE_DIR, XMLSEC1_MODERN_ORACLE)";
+    let record_pin = match (args.next().as_deref(), args.next()) {
+        (None, _) => false,
+        (Some("--pin"), None) => true,
+        _ => return Err(USAGE.into()),
+    };
     let variable = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+    let revision = Revision::parse(variable("XMLSEC1_REVISION").as_deref())?;
     let modern = match variable("XMLSEC1_MODERN_ORACLE").as_deref() {
         None | Some("0") => false,
         Some("1") => true,
         Some(_) => return Err("XMLSEC1_MODERN_ORACLE must be 0 or 1".into()),
     };
-    let prefix = variable("XMLSEC1_PREFIX")
-        .map_or_else(|| root().join(".tools/xmlsec1-master"), PathBuf::from);
+    let prefix =
+        variable("XMLSEC1_PREFIX").map_or_else(|| root().join(".tools/xmlsec1"), PathBuf::from);
     if !prefix.is_absolute() {
         return Err(format!(
             "XMLSEC1_PREFIX must be an absolute path: {}",
@@ -751,6 +828,9 @@ pub(crate) fn run(mut args: impl Iterator<Item = String>) -> Result<(), Failure>
         modern,
         source: variable("XMLSEC1_SOURCE_DIR").map(PathBuf::from),
         library_path: variable(library),
+        revision,
+        pin: root().join(PIN),
+        record_pin,
     };
     Ok(execute(&mut System, &install)?)
 }

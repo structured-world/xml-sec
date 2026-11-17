@@ -7,6 +7,8 @@ use alloc::{
 };
 
 #[cfg(test)]
+mod target_tests;
+#[cfg(test)]
 use x509_parser::x509::AlgorithmIdentifier;
 #[cfg(test)]
 use x509_parser::{
@@ -235,17 +237,29 @@ pub fn verify_x509_certificate_chain_with_resources(
 ) -> Result<(), X509ChainError> {
     resources.validate()?;
     let session = super::pkix::CertificateSession::new(resources);
-    // Borrowed DER still consumes the supplied source-byte allowance. Admit
-    // all evidence, including unused CRLs/anchors, before path storage/parsing.
-    let count = info
-        .certificates
-        .len()
-        .checked_add(info.crls.len())
-        .and_then(|count| count.checked_add(options.trusted_certs.len()))
-        .ok_or(crate::policy::PolicyViolation::ResourceLimitExceeded {
-            resource: crate::policy::resource_name::X509_WORK,
-            maximum: resources.max_x509_work,
-        })?;
+    admit_evidence(
+        info.certificates
+            .iter()
+            .chain(&info.crls)
+            .map(Vec::as_slice),
+        options,
+        resources,
+        &session,
+    )?;
+    verify_x509_certificate_chain_in_session(info, options, provider, &[], &session).map(|_| ())
+}
+
+/// Charges the evidence of one validation, the caller's anchors included,
+/// before any path storage or parsing: borrowed DER still consumes the
+/// supplied source-byte allowance.
+fn admit_evidence<'e>(
+    evidence: impl Iterator<Item = &'e [u8]> + Clone,
+    options: &X509ChainOptions<'e>,
+    resources: &crate::policy::ResourcePolicy,
+    session: &super::pkix::CertificateSession,
+) -> Result<(), X509ChainError> {
+    let all = evidence.chain(options.trusted_certs.iter().map(Vec::as_slice));
+    let count = all.clone().count();
     session
         .memory()
         .charge_work(count as u64)
@@ -257,12 +271,7 @@ pub fn verify_x509_certificate_chain_with_resources(
             ))
         })?;
     let mut remaining = resources.max_external_resource_total_bytes;
-    for bytes in info
-        .certificates
-        .iter()
-        .chain(&info.crls)
-        .chain(options.trusted_certs)
-    {
+    for bytes in all {
         if bytes.len() > resources.max_external_resource_bytes {
             return Err(crate::policy::PolicyViolation::ResourceLimitExceeded {
                 resource: crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
@@ -279,7 +288,202 @@ pub fn verify_x509_certificate_chain_with_resources(
         }
         remaining -= bytes.len();
     }
-    verify_x509_certificate_chain_in_session(info, options, provider, &[], &session).map(|_| ())
+    Ok(())
+}
+
+/// The key of a certificate whose path validated to a trust anchor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct VerifiedX509Certificate {
+    /// The target's `SubjectPublicKeyInfo` DER, carrying the parameters it
+    /// inherits from its path where it omits them (RFC 5280 6.1.4(e)).
+    pub subject_public_key_info: Vec<u8>,
+    /// The start of the target's validity period.
+    pub not_before: Instant,
+    /// The end of the target's validity period.
+    pub not_after: Instant,
+}
+
+/// The indexes of `certificates` that issue none of `certificates` and
+/// `others`: no other certificate names the subject of one of them as its
+/// issuer, so each can only end a path, not continue one. A self-issued
+/// certificate issuing nothing else is one.
+///
+/// # Errors
+///
+/// Returns [`X509ChainError`] for invalid `resources`, a certificate that does
+/// not parse or a name comparison beyond the resource limits.
+pub fn x509_leaf_certificates(
+    certificates: &[Vec<u8>],
+    others: &[Vec<u8>],
+    resources: &crate::policy::ResourcePolicy,
+) -> Result<Vec<usize>, X509ChainError> {
+    resources.validate()?;
+    let session = super::pkix::CertificateSession::new(resources);
+    let candidates = session.read_pool(certificates)?;
+    let pool = session.read_pool(others)?;
+    let mut leaves = Vec::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        let mut issues = false;
+        for other in candidates.iter().chain(pool.iter()) {
+            if other.as_bytes() == candidate.as_bytes() {
+                continue;
+            }
+            if session.source_names_equal(other.tbs().issuer(), candidate.tbs().subject())? {
+                issues = true;
+                break;
+            }
+        }
+        if !issues {
+            leaves.push(index);
+        }
+    }
+    Ok(leaves)
+}
+
+/// Checks that `der` is one X.509 CRL within the per-resource byte limit of
+/// `resources`, as a store checks a CRL before holding it. It assigns no
+/// trust: a CRL is authenticated by the path it applies to.
+///
+/// # Errors
+///
+/// Returns [`X509ChainError`] for invalid `resources`, a CRL beyond the
+/// byte limit, or bytes that do not read as a CRL.
+///
+/// # Examples
+///
+/// ```
+/// use xml_sec::policy::ResourcePolicy;
+/// use xml_sec::xmldsig::validate_x509_crl;
+///
+/// assert!(validate_x509_crl(b"not a CRL", &ResourcePolicy::default()).is_err());
+/// ```
+pub fn validate_x509_crl(
+    der: &[u8],
+    resources: &crate::policy::ResourcePolicy,
+) -> Result<(), X509ChainError> {
+    resources.validate()?;
+    if der.len() > resources.max_external_resource_bytes {
+        return Err(crate::policy::PolicyViolation::ResourceLimitExceeded {
+            resource: crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
+            maximum: resources.max_external_resource_bytes,
+        }
+        .into());
+    }
+    let session = super::pkix::CertificateSession::new(resources);
+    session.read_crl(der).map(drop)
+}
+
+/// Validate a path from `target` through any of `intermediates` to an anchor
+/// of `options`, applying `crls` when `options` checks CRLs, and return the
+/// target's validated key. Every signature-valid path from `target` to an
+/// anchor, at most `max_candidate_paths` of them, is validated in turn until
+/// one passes, so issuers sharing a name and key (cross-signing) resolve to
+/// the path the anchors accept, as for a `KeyInfo` certificate.
+///
+/// # Errors
+///
+/// Returns [`X509ChainError`] for invalid `resources`, evidence beyond the
+/// external-resource byte limits, a certificate that does not parse, more
+/// candidate paths than allowed, no path to an anchor, or the failure of the
+/// first path that does not validate.
+pub fn verify_x509_certificate(
+    target: &[u8],
+    intermediates: &[&[u8]],
+    crls: &[&[u8]],
+    options: &X509ChainOptions<'_>,
+    max_candidate_paths: usize,
+    resources: &crate::policy::ResourcePolicy,
+    provider: &dyn crate::provider::CryptoProvider,
+) -> Result<VerifiedX509Certificate, X509ChainError> {
+    use super::parse::X509ChainBuildError;
+    resources.validate()?;
+    let session = super::pkix::CertificateSession::new(resources);
+    // Everything supplied is admitted while still borrowed, so no limit is
+    // exceeded by a copy made before the check.
+    admit_evidence(
+        core::iter::once(target)
+            .chain(intermediates.iter().copied())
+            .chain(crls.iter().copied()),
+        options,
+        resources,
+        &session,
+    )?;
+    // Path validation reads CRLs from an owned list; the admitted lists are
+    // copied only now.
+    let crls: Vec<Vec<u8>> = crls.iter().map(|crl| crl.to_vec()).collect();
+    // The anchors lead the pool, so a path ends at the first certificate it
+    // reaches among them. The pool holds one copy of each certificate, its
+    // comparisons charged to the session: the target listed again is no
+    // issuer of itself, and an intermediate a document and a store both
+    // supply is one issuer.
+    let mut pool = super::keys::BorrowedX509Pool::new(&crls, &session);
+    for anchor in options.trusted_certs {
+        pool.insert(anchor, &session)?;
+    }
+    let trusted_prefix_len = pool.certificates.len();
+    let signing = pool.insert(target, &session)?;
+    for der in intermediates {
+        pool.insert(der, &session)?;
+    }
+    let candidates = super::parse::build_x509_certificate_paths_to_trusted_prefix(
+        &pool,
+        signing,
+        trusted_prefix_len,
+        super::parse::X509PathBounds {
+            max_depth: options.max_chain_depth,
+            max_candidate_paths,
+        },
+        provider,
+        options.certificate_signature_algorithms,
+        &session,
+    )
+    .map_err(|error| match error {
+        X509ChainBuildError::Certificate(error) => error,
+        X509ChainBuildError::Policy(error) => X509ChainError::Policy(error),
+        X509ChainBuildError::Provider(error) => X509ChainError::Provider(error),
+        X509ChainBuildError::UnsupportedSignatureAlgorithm { oid } => {
+            X509ChainError::UnsupportedSignatureAlgorithm { oid }
+        }
+        X509ChainBuildError::DepthExceeded => {
+            X509ChainError::DepthExceeded(options.max_chain_depth)
+        }
+        // More candidate paths than allowed, or none that holds together:
+        // no path is accepted.
+        X509ChainBuildError::InconsistentMetadata
+        | X509ChainBuildError::Cycle
+        | X509ChainBuildError::IssuerSignatureMismatch
+        | X509ChainBuildError::AmbiguousIssuer => X509ChainError::UntrustedRoot,
+    })?;
+    let mut first_error = None;
+    let mut validated = None;
+    for candidate in candidates {
+        pool.certificate_chain = candidate;
+        match verify_x509_certificate_chain_in_session(&pool, options, provider, &[], &session) {
+            Ok(key) => {
+                validated = Some(key);
+                break;
+            }
+            Err(error) if error.is_execution_failure() => return Err(error),
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    let Some(key) = validated else {
+        return Err(first_error.unwrap_or(X509ChainError::UntrustedRoot));
+    };
+    let certificate = session.read(target)?;
+    let validity = certificate.tbs().validity();
+    let subject_public_key_info = match key.effective_spki {
+        Some(spki) => spki.to_vec(),
+        None => certificate.tbs().public_key().as_bytes().to_vec(),
+    };
+    Ok(VerifiedX509Certificate {
+        subject_public_key_info,
+        not_before: validity.not_before().instant(),
+        not_after: validity.not_after().instant(),
+    })
 }
 
 pub(crate) fn verify_x509_certificate_chain_in_session(

@@ -3,6 +3,12 @@ on:
   push:
     branches: [main]
   pull_request: {}
+  workflow_dispatch:
+    inputs:
+      xmlsec1_revision:
+        description: libxmlsec1 oracle revision instead of the pin (master or a full commit id)
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -15,11 +21,14 @@ env:
   # RSA-PSS vectors always run; CI additionally requires reciprocal live checks.
   OPENSSL_BIN: openssl
   RUSTFLAGS: -Dwarnings
-  # Every libxmlsec1 oracle is built from upstream master as it is when the
-  # job runs; each job records the commit it built.
-  XMLSEC1_PREFIX: ${{ github.workspace }}/.tools/xmlsec1-master
-  XMLSEC1_BIN: ${{ github.workspace }}/.tools/xmlsec1-master/bin/xmlsec1
-  LD_LIBRARY_PATH: ${{ github.workspace }}/.tools/xmlsec1-master/lib
+  # Every libxmlsec1 oracle is built from the commit
+  # compatibility/libxmlsec1-donor-commit.txt pins. The dispatch input or the
+  # repository variable XMLSEC1_REVISION (master or a full commit id) builds
+  # another revision instead; the upstream-master job always checks master.
+  XMLSEC1_REVISION: ${{ inputs.xmlsec1_revision || vars.XMLSEC1_REVISION }}
+  XMLSEC1_PREFIX: ${{ github.workspace }}/.tools/xmlsec1
+  XMLSEC1_BIN: ${{ github.workspace }}/.tools/xmlsec1/bin/xmlsec1
+  LD_LIBRARY_PATH: ${{ github.workspace }}/.tools/xmlsec1/lib
 
 jobs:
   hardening:
@@ -51,33 +60,32 @@ jobs:
   coverage:
     name: canonical line coverage (85%)
     runs-on: ubuntu-latest
-    # The C surface and the interoperability tests use one libxmlsec1 oracle,
-    # built from upstream master as it is when the job runs.
+    # The C surface and the interoperability tests use one libxmlsec1 oracle.
     env:
       PKCS11_MODULE: /usr/lib/softhsm/libsofthsm2.so
       LIBXSLT_SOURCE_DIR: ${{ github.workspace }}/donors/libxslt
-      XMLSEC1_PREFIX: ${{ github.workspace }}/.tools/xmlsec1-master
-      XMLSEC1_BIN: ${{ github.workspace }}/.tools/xmlsec1-master/bin/xmlsec1
-      LD_LIBRARY_PATH: ${{ github.workspace }}/.tools/xmlsec1-master/lib
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: ./.github/actions/free-runner-disk
-      - name: Read pinned libxslt revision
+      - name: Read pinned oracle revisions
         id: coverage-oracles
         run: |
           commit="$(cat compatibility/libxslt-1.1.45-donor-commit.txt)"
           [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
           echo "libxslt=$commit" >> "$GITHUB_OUTPUT"
+          commit="$(cat compatibility/libxmlsec1-donor-commit.txt)"
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          echo "xmlsec1=$commit" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v7
         with:
           repository: lsh123/xmlsec
-          ref: master
+          ref: ${{ env.XMLSEC1_REVISION || steps.coverage-oracles.outputs.xmlsec1 }}
           path: donors/xmlsec
           persist-credentials: false
-      - name: Record the upstream master commit
-        id: master-source
+      - name: Record the oracle commit
+        id: coverage-source
         run: echo "commit=$(git -C donors/xmlsec rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v7
         with:
@@ -99,7 +107,7 @@ jobs:
       - uses: ./.github/actions/xmlsec-oracle-cache
         with:
           profile: modern
-          commit: ${{ steps.master-source.outputs.commit }}
+          commit: ${{ steps.coverage-source.outputs.commit }}
           prefix: ${{ env.XMLSEC1_PREFIX }}
       - name: Install oracle build dependencies and token
         uses: ./.github/actions/apt-packages
@@ -108,6 +116,7 @@ jobs:
       - name: Provision the oracle and disposable token support
         env:
           XMLSEC1_MODERN_ORACLE: "1"
+          XMLSEC1_REVISION: ${{ steps.coverage-source.outputs.commit }}
           XMLSEC1_SOURCE_DIR: ${{ github.workspace }}/donors/xmlsec
         run: |
           cargo run --quiet -p xml-sec-tools -- install-xmlsec1
@@ -256,23 +265,24 @@ jobs:
 
   capability-ledger:
     runs-on: ubuntu-latest
-    # The C surface and the CLI fixture snapshot follow upstream master as it
-    # is when the job runs.
-    env:
-      XMLSEC1_PREFIX: ${{ github.workspace }}/.tools/xmlsec1-master
-      XMLSEC1_BIN: ${{ github.workspace }}/.tools/xmlsec1-master/bin/xmlsec1
-      LD_LIBRARY_PATH: ${{ github.workspace }}/.tools/xmlsec1-master/lib
+    # The C surface and the CLI fixture snapshot follow the pinned oracle.
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Read the pinned libxmlsec1 revision
+        id: ledger-pin
+        run: |
+          commit="$(cat compatibility/libxmlsec1-donor-commit.txt)"
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          echo "xmlsec1=$commit" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v7
         with:
           repository: lsh123/xmlsec
-          ref: master
+          ref: ${{ env.XMLSEC1_REVISION || steps.ledger-pin.outputs.xmlsec1 }}
           path: donors/xmlsec
           persist-credentials: false
-      - name: Record the upstream master commit
+      - name: Record the oracle commit
         id: oracle-source
         run: echo "commit=$(git -C donors/xmlsec rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@stable
@@ -310,8 +320,9 @@ jobs:
       # The DCC corpus follows the schema PTB publishes when the job runs.
       - name: Check the DCC corpus against the current PTB schema
         run: cargo run --quiet -p xml-sec-tools -- dcc-schema
-      - name: Build the libxmlsec1 oracle from the checked-out master
+      - name: Build the libxmlsec1 oracle from the checked-out source
         env:
+          XMLSEC1_REVISION: ${{ steps.oracle-source.outputs.commit }}
           XMLSEC1_SOURCE_DIR: ${{ github.workspace }}/donors/xmlsec
           XMLSEC1_MODERN_ORACLE: "1"
         run: |
@@ -339,6 +350,70 @@ jobs:
           compatibility/libxmlsec1-abi-linux-x86_64.json
       # The compatibility library's headers are the oracle's installed ones,
       # and its programs must print what the oracle's print.
+      - name: Check the libxmlsec1-compatible headers
+        run: cargo run --quiet -p xml-sec-tools -- xmlsec1-headers --check
+      - name: Qualify the libxmlsec1-compatible library against the oracle
+        run: cargo run --quiet -p xml-sec-tools -- capi --xmlsec1
+
+  # Advisory and outside the required aggregate: the oracle-bound checks of
+  # capability-ledger against upstream master's head, so an upstream change
+  # shows here before the pin moves. To move the pin, run these checks
+  # locally with XMLSEC1_REVISION=master, adapt to what failed, and record the
+  # passing commit with `install-xmlsec1 --pin`.
+  upstream-master:
+    name: upstream master drift (advisory)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: lsh123/xmlsec
+          ref: master
+          path: donors/xmlsec
+          persist-credentials: false
+      - name: Record the upstream master commit
+        id: master-source
+        run: echo "commit=$(git -C donors/xmlsec rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-build-cache
+        with:
+          domain: ordinary
+      - name: Check native CLI upstream fixture snapshot
+        run: cargo run --quiet -p xml-sec-tools -- donor-fixtures --cli --check
+      - run: >-
+          cargo run -p xml-sec-capability-ledger -- check
+          donors/xmlsec
+          compatibility/libxmlsec1-rules.json
+          compatibility/libxmlsec1.json
+      - run: >-
+          cargo run -p xml-sec-capability-ledger -- behavior-check
+          donors/xmlsec
+          compatibility/libxmlsec1-behavior-rules.json
+          compatibility/libxmlsec1-behavior.json
+      - uses: ./.github/actions/xmlsec-oracle-cache
+        with:
+          profile: modern
+          commit: ${{ steps.master-source.outputs.commit }}
+          prefix: ${{ env.XMLSEC1_PREFIX }}
+      - name: Install oracle build dependencies
+        uses: ./.github/actions/apt-packages
+        with:
+          packages: autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config
+      - name: Build the libxmlsec1 oracle from upstream master
+        env:
+          XMLSEC1_REVISION: ${{ steps.master-source.outputs.commit }}
+          XMLSEC1_SOURCE_DIR: ${{ github.workspace }}/donors/xmlsec
+          XMLSEC1_MODERN_ORACLE: "1"
+        run: cargo run --quiet -p xml-sec-tools -- install-xmlsec1
+      - name: Check the binary ABI baseline
+        run: >-
+          cargo run -p xml-sec-capability-ledger -- abi-check
+          compatibility/libxmlsec1.json
+          compatibility/libxmlsec1-ownership-rules.json
+          "$XMLSEC1_PREFIX"
+          compatibility/libxmlsec1-abi-linux-x86_64.json
       - name: Check the libxmlsec1-compatible headers
         run: cargo run --quiet -p xml-sec-tools -- xmlsec1-headers --check
       - name: Qualify the libxmlsec1-compatible library against the oracle
@@ -419,15 +494,11 @@ jobs:
     name: test block (${{ matrix.block }})
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    # The external-oracle tests run against upstream master as it is when the
-    # job runs.
+    # The external-oracle tests run against the pinned oracle.
     env:
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
-      XMLSEC1_PREFIX: ${{ github.workspace }}/.tools/xmlsec1-master
-      XMLSEC1_BIN: ${{ github.workspace }}/.tools/xmlsec1-master/bin/xmlsec1
-      LD_LIBRARY_PATH: ${{ github.workspace }}/.tools/xmlsec1-master/lib
     strategy:
       fail-fast: false
       matrix:
@@ -442,13 +513,19 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/free-runner-disk
+      - name: Read the pinned libxmlsec1 revision
+        id: test-pin
+        run: |
+          commit="$(cat compatibility/libxmlsec1-donor-commit.txt)"
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          echo "xmlsec1=$commit" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v7
         with:
           repository: lsh123/xmlsec
-          ref: master
+          ref: ${{ env.XMLSEC1_REVISION || steps.test-pin.outputs.xmlsec1 }}
           path: donors/xmlsec
           persist-credentials: false
-      - name: Record the upstream master commit
+      - name: Record the oracle commit
         id: test-donor-revision
         run: echo "commit=$(git -C donors/xmlsec rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@stable
@@ -475,8 +552,9 @@ jobs:
         uses: ./.github/actions/apt-packages
         with:
           packages: autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config
-      - name: Build the xmlsec1 oracle from the checked-out master
+      - name: Build the xmlsec1 oracle from the checked-out source
         env:
+          XMLSEC1_REVISION: ${{ steps.test-donor-revision.outputs.commit }}
           XMLSEC1_SOURCE_DIR: ${{ github.workspace }}/donors/xmlsec
           XMLSEC1_MODERN_ORACLE: "1"
         run: |
@@ -530,12 +608,15 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Read pinned libxslt revision
+      - name: Read pinned oracle revisions
         id: xslt-oracle-revisions
         run: |
           libxslt_commit="$(cat compatibility/libxslt-1.1.45-donor-commit.txt)"
           [[ "$libxslt_commit" =~ ^[0-9a-f]{40}$ ]]
           echo "libxslt=$libxslt_commit" >> "$GITHUB_OUTPUT"
+          xmlsec1_commit="$(cat compatibility/libxmlsec1-donor-commit.txt)"
+          [[ "$xmlsec1_commit" =~ ^[0-9a-f]{40}$ ]]
+          echo "xmlsec1=$xmlsec1_commit" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v7
         with:
           repository: GNOME/libxslt
@@ -545,10 +626,10 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: lsh123/xmlsec
-          ref: master
+          ref: ${{ env.XMLSEC1_REVISION || steps.xslt-oracle-revisions.outputs.xmlsec1 }}
           path: donors/xmlsec
           persist-credentials: false
-      - name: Record the upstream master commit
+      - name: Record the oracle commit
         id: xmlsec-source
         run: echo "commit=$(git -C donors/xmlsec rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@stable
@@ -572,8 +653,9 @@ jobs:
         uses: ./.github/actions/apt-packages
         with:
           packages: autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config openjdk-21-jdk valgrind cmake zlib1g-dev liblzma-dev
-      - name: Provision the XML signature oracle from the checked-out master
+      - name: Provision the XML signature oracle from the checked-out source
         env:
+          XMLSEC1_REVISION: ${{ steps.xmlsec-source.outputs.commit }}
           XMLSEC1_SOURCE_DIR: ${{ github.workspace }}/donors/xmlsec
           XMLSEC1_MODERN_ORACLE: "1"
         # The installer keeps that OpenSSL's configuration below the prefix, which

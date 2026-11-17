@@ -780,6 +780,71 @@ fn xslt_stylesheet_semantics_comes_from_the_base_profile() {
 }
 
 #[test]
+fn unknown_x509_certificate_semantics_comes_from_the_base_profile() {
+    // Like the transform interpretations: the libxmlsec1-compatible base
+    // selects libxmlsec1's reading, a layer may only restate its base, and an
+    // unknown name is a schema error.
+    use xml_sec::policy::{PolicyViolation, UnknownX509CertificateSemantics};
+    let base = |base: &str, extra: &str| {
+        Configuration::from_str(
+            &format!("schema_version = 1\n[profiles.team]\nbase = '{base}'\n{extra}"),
+            LoadLimits::default(),
+        )
+    };
+    let semantics = |config: &Configuration| {
+        effective(config, "team")
+            .compiled()
+            .verification()
+            .unwrap()
+            .key_trust
+            .unknown_x509_certificate
+    };
+    assert_eq!(
+        semantics(&base("XmlSecCompatible", "").expect("strict config")),
+        UnknownX509CertificateSemantics::Libxmlsec1
+    );
+    assert_eq!(
+        semantics(&base("Modern", "").expect("strict config")),
+        UnknownX509CertificateSemantics::References
+    );
+    let restated = base(
+        "Modern",
+        "[profiles.team.verification.key_trust]\nunknown_x509_certificate='References'",
+    )
+    .expect("strict config");
+    assert_eq!(
+        semantics(&restated),
+        UnknownX509CertificateSemantics::References
+    );
+    let compiled = base(
+        "Modern",
+        "[profiles.team.verification.key_trust]\nunknown_x509_certificate='Libxmlsec1'",
+    )
+    .expect("strict config")
+    .compile(
+        "team",
+        default_provider(),
+        &PolicyCompileContext {
+            external_resources: false,
+            target_evidence: true,
+        },
+        None,
+    );
+    assert!(matches!(
+        compiled,
+        Err(xml_sec_config::Error::Policy(PolicyViolation::Configuration { reason }))
+            if reason.contains("incompatible interpretation semantics")
+    ));
+    assert!(matches!(
+        base(
+            "Modern",
+            "[profiles.team.verification.key_trust]\nunknown_x509_certificate='Lenient'",
+        ),
+        Err(xml_sec_config::Error::Schema(message)) if message.contains("unknown_x509_certificate")
+    ));
+}
+
+#[test]
 fn empty_digest_input_reaches_the_compiled_snapshots() {
     // Refusing to digest no data reaches the compiled snapshots, accepting it
     // is the default, and unknown names are schema errors.

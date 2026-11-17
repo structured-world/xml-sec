@@ -2,11 +2,13 @@
 
 The machine-readable ledger at
 [`compatibility/libxmlsec1.json`](../compatibility/libxmlsec1.json)
-is the compatibility baseline for libxmlsec1 as upstream master defines it. It
-records the version upstream's `configure.ac` declares, and no commit: CI
-regenerates it from master's head on every run, so an upstream change to the
-surface it records fails the check until the regenerated ledger is reviewed
-and committed. It inventories the public surface:
+is the compatibility baseline for libxmlsec1 at the upstream commit
+[`compatibility/libxmlsec1-donor-commit.txt`](../compatibility/libxmlsec1-donor-commit.txt)
+pins. It records the version upstream's `configure.ac` declares at that commit.
+The required CI jobs check it against the pinned commit; the advisory
+`upstream master drift` job checks it against master's head, so an upstream
+change to the surface it records shows there before the pin moves (see
+[moving the pin](#moving-the-pin)). It inventories the public surface:
 
 - installed headers (including configured template values), exported functions
   and variables, the functions libxmlsec1 exports for its crypto backends from
@@ -87,7 +89,7 @@ literals fail generation.
 
 The ledger records what upstream declares, never where: an item carries no
 donor line number, and a behavior anchor is the unique donor text it quotes.
-Upstream master moves on with every commit, so a comment or a reordering that
+When the pin moves, a comment or a reordering upstream that
 changes no declaration leaves the committed ledger unchanged, while a changed
 declaration, guard or anchor text is a ledger diff.
 
@@ -132,7 +134,7 @@ its rationale; any other export without a declaration, or a listed name that
 is declared or not exported, fails generation.
 
 The committed tuple is the CI build: Linux x86_64, OpenSSL backend, built by
-`xml-sec-tools install-xmlsec1` from upstream master with
+`xml-sec-tools install-xmlsec1` from the pinned commit with
 `XMLSEC1_MODERN_ORACLE=1`. Toolchain
 versions are not part of the baseline; the generator prints the compiler it
 used. CI regenerates the baseline from that build, keeps the result as the
@@ -153,7 +155,7 @@ installer records the commit and version it built beside the build.
 
 ## Regenerating
 
-Check out upstream master under `donors/xmlsec`, then run:
+Check out the pinned commit under `donors/xmlsec`, then run:
 
 ```sh
 cargo run -p xml-sec-capability-ledger -- generate \
@@ -188,7 +190,31 @@ cargo run -p xml-sec-capability-ledger -- behavior-check \
 Each command prints the version and commit it read. Extraction reads a detached
 snapshot of the checkout's `HEAD`, so tracked edits and build-generated files in
 the donor checkout cannot affect the artifact or be overwritten by generation.
-CI runs the checks from a fresh checkout of upstream master. An upstream change
-to the recorded surface requires reviewing the extracted diff, changing
+CI runs the checks from a fresh checkout of the pinned commit. An upstream
+change to the recorded surface requires reviewing the extracted diff, changing
 classification rules where capabilities changed, and updating category-count
 regression tests.
+
+<a id="moving-the-pin"></a>
+## Moving the pin
+
+`XMLSEC1_REVISION` selects the oracle revision in place of the pin: `master`
+builds upstream master's head, a full commit id builds that commit. It is read
+by `install-xmlsec1` locally, and in CI by every oracle job from the
+repository variable of that name or the `xmlsec1_revision` input of a manual
+CI run. Unset, everything uses the pin. To move it:
+
+```sh
+git -C donors/xmlsec fetch origin master
+git -C donors/xmlsec checkout --detach FETCH_HEAD
+XMLSEC1_REVISION=master XMLSEC1_MODERN_ORACLE=1 \
+  XMLSEC1_SOURCE_DIR="$PWD/donors/xmlsec" \
+  cargo run -p xml-sec-tools -- install-xmlsec1
+```
+
+then run the checks above, `xmlsec1-headers --check`, `capi --xmlsec1` and the
+oracle tests, adapt what upstream changed, and record the commit with the same
+install command plus `--pin`, which writes it to the pin file only once its
+oracle has passed the installer's checks. A local checkout must stand on the
+revision asked for; the installer refuses another and names the commands that
+move it.

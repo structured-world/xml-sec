@@ -43,14 +43,14 @@ use super::{ResolvedVerificationKey, TrustedPublicKey, X509TrustEvidence};
 
 /// Operation-local indexing borrows configured and document bytes. It never
 /// manufactures public display metadata or clones encoded certificate pools.
-struct BorrowedX509Pool<'a> {
-    certificates: structured_asn1::memory::OwnedVec<&'a [u8]>,
+pub(crate) struct BorrowedX509Pool<'a> {
+    pub(crate) certificates: structured_asn1::memory::OwnedVec<&'a [u8]>,
     crls: &'a [Vec<u8>],
-    certificate_chain: structured_asn1::memory::OwnedVec<usize>,
+    pub(crate) certificate_chain: structured_asn1::memory::OwnedVec<usize>,
 }
 
 impl<'a> BorrowedX509Pool<'a> {
-    fn new(crls: &'a [Vec<u8>], session: &super::pkix::CertificateSession) -> Self {
+    pub(crate) fn new(crls: &'a [Vec<u8>], session: &super::pkix::CertificateSession) -> Self {
         Self {
             certificates: session.memory().vector(),
             crls,
@@ -58,11 +58,13 @@ impl<'a> BorrowedX509Pool<'a> {
         }
     }
 
-    fn insert(
+    /// The pool index of `encoded`, added unless an identical certificate is
+    /// already held; every byte comparison is charged to the session's work.
+    pub(crate) fn insert(
         &mut self,
         encoded: &'a [u8],
         session: &super::pkix::CertificateSession,
-    ) -> Result<usize, KeyResolutionError> {
+    ) -> Result<usize, super::X509ChainError> {
         for (index, known) in self.certificates.iter().enumerate() {
             if known.len() != encoded.len() {
                 continue;
@@ -74,22 +76,22 @@ impl<'a> BorrowedX509Pool<'a> {
                 .memory()
                 .charge_work(encoded.len() as u64)
                 .map_err(|reason| {
-                    certificate_resolution_error(session.error(structured_pkix::Error::resource(
+                    session.error(structured_pkix::Error::resource(
                         reason,
                         "certificate.pool_identity",
                         0,
-                    )))
+                    ))
                 })?;
             if *known == encoded {
                 return Ok(index);
             }
         }
         self.certificates.try_push(encoded).map_err(|reason| {
-            certificate_resolution_error(session.error(structured_pkix::Error::resource(
+            session.error(structured_pkix::Error::resource(
                 reason,
                 "certificate.pool",
                 0,
-            )))
+            ))
         })?;
         Ok(self.certificates.len() - 1)
     }
@@ -1439,17 +1441,23 @@ impl DefaultKeyResolver {
         let mut trusted_prefix_len = 0;
         for certificate in &self.config.trusted_certs {
             budget.charge()?;
-            available.insert(certificate, &budget.certificates)?;
+            available
+                .insert(certificate, &budget.certificates)
+                .map_err(certificate_resolution_error)?;
             trusted_prefix_len = available.certificates.len();
         }
         for certificate in &self.config.lookup_certs {
             budget.charge()?;
-            available.insert(certificate, &budget.certificates)?;
+            available
+                .insert(certificate, &budget.certificates)
+                .map_err(certificate_resolution_error)?;
         }
         let mut selected_index = None;
         for (index, certificate) in info.certificates.iter().enumerate() {
             budget.charge()?;
-            let pool_index = available.insert(certificate, &budget.certificates)?;
+            let pool_index = available
+                .insert(certificate, &budget.certificates)
+                .map_err(certificate_resolution_error)?;
             if index == signing_index {
                 selected_index = Some(pool_index);
             }
@@ -1677,7 +1685,9 @@ impl DefaultKeyResolver {
         {
             budget.charge()?;
             let previous_len = available.certificates.len();
-            let pool_index = available.insert(certificate_der, &budget.certificates)?;
+            let pool_index = available
+                .insert(certificate_der, &budget.certificates)
+                .map_err(certificate_resolution_error)?;
             if pool_index < previous_len {
                 continue;
             }

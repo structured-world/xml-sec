@@ -459,6 +459,8 @@ fn key_trust(a: &KeyTrustPolicy, b: &KeyTrustPolicy) -> Result<KeyTrustPolicy, P
         ),
         check_crls: a.check_crls || b.check_crls,
         verification_time,
+        // An interpretation, not a level: layers must agree on it.
+        unknown_x509_certificate: equal(a.unknown_x509_certificate, b.unknown_x509_certificate)?,
     })
 }
 

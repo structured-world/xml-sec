@@ -116,6 +116,10 @@ pub(crate) struct XmlSecKeyDataStoreKlass {
     pub(crate) reserved1: *mut c_void,
 }
 
+// SAFETY: a klass is immutable static data: a name with static storage and
+// function pointers.
+unsafe impl Sync for XmlSecKeyDataStoreKlass {}
+
 /// A binary key-data object: the key data and its value buffer.
 #[repr(C)]
 struct XmlSecKeyDataBinary {
