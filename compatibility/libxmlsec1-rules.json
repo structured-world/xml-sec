@@ -3,7 +3,15 @@
   "evidence": {
     "c-surface-inventory": {
       "test": "capability_ledger::c_surface_is_explicitly_incompatible",
-      "description": "The Rust crate intentionally has no libxmlsec1 C ABI yet; every public C surface item remains visible rather than being implied by marketing copy."
+      "description": "No C tier gate has passed yet, so no generic C item claims source or binary compatibility, whatever part of it the libxmlsec1-compatible library already implements."
+    },
+    "c-layer-exclusions": {
+      "test": "capability_ledger::c_layer_exclusions_are_explicit",
+      "description": "The libxmlsec1-compatible headers replace every function the library does not offer by a note naming it and declare none of libxmlsec1's internal crypto-library exports."
+    },
+    "backend-tier": {
+      "test": "capability_ledger::backend_source_tier_is_not_claimed",
+      "description": "No backend header is shipped, and every backend-specific entry point is either a provider-limited transform or explicitly unsupported; none is planned or aliased."
     },
     "native-algorithm-tests": {
       "test": "capability_ledger::native_algorithm_claims_match_the_rust_api",
@@ -31,7 +39,7 @@
     },
     "provider-contract": {
       "test": "capability_ledger::backend_surface_distinguishes_provider_capabilities_from_unimplemented_apis",
-      "description": "Only backend transform classes backed by native provider operations are provider-limited; every other backend-specific C entry point remains planned."
+      "description": "Only backend transform classes backed by native provider operations are provider-limited; every other backend-specific C entry point is explicitly unsupported."
     },
     "native-cli-tests": {
       "test": "capability_ledger::native_cli_claims_match_process_and_upstream_runner_tests",
@@ -49,9 +57,9 @@
       "test": "capability_ledger::planned_surface_is_never_reported_as_supported",
       "description": "Unimplemented backend APIs, CLI, registry, format, URI, and donor-suite entries remain machine-readable planned work."
     },
-    "unsupported-legacy-surface": {
-      "test": "capability_ledger::deprecated_surface_is_explicitly_unsupported",
-      "description": "Deprecated C compatibility aliases are not reproduced before a real C compatibility layer exists."
+    "deprecated-surface": {
+      "test": "capability_ledger::deprecated_surface_is_explicitly_classified",
+      "description": "Deprecated generic functions are declared by the libxmlsec1-compatible headers like the rest of the generic C surface; deprecated backend functions follow the backend classification."
     }
   },
   "rules": [
@@ -139,28 +147,45 @@
       "kinds": ["backend-api"],
       "name_regex": "^xmlSec(?:GCrypt|GnuTLS|MSCng|MSCrypto|Nss|OpenSSL)Transform(?:Aes128Cbc|Aes256Cbc|Aes128Gcm|Aes256Gcm|KWAes128|KWAes256|DsaSha1|EcdsaSha256|EcdsaSha384|HmacSha1|RsaOaep|RsaOaepEnc11|RsaSha1|RsaSha256|RsaSha384|RsaSha512|Sha1|Sha256|Sha384|Sha512)GetKlass$",
       "outcome": "provider-limited",
-      "rationale": "The native provider contract implements the corresponding cryptographic operation, but not this libxmlsec1 backend-specific C symbol.",
+      "rationale": "The native provider contract implements the corresponding cryptographic operation, reached from C through the generic klass identity; this backend-specific symbol is not provided, because no backend header is shipped.",
       "evidence": "provider-contract"
     },
     {
-      "id": "remaining-backend-surface",
-      "kinds": ["backend-api"],
-      "outcome": "planned",
-      "rationale": "This libxmlsec1 backend-specific C capability is not represented by the current native provider contract.",
-      "evidence": "planned-surface"
+      "id": "backend-specific-surface",
+      "kinds": ["backend-api", "deprecated-api", "header", "macro", "class-id"],
+      "source_regex": "^include/xmlsec/(?:gcrypt|gnutls|mscng|mscrypto|nss|openssl)/",
+      "outcome": "intentionally-unsupported",
+      "rationale": "The backend-specific source tier is not claimed for any backend, and no backend header is shipped, so code using this item fails to compile instead of reaching an alias. Entry points that take or return the backend's own objects (EVP_PKEY, X509, BIO, CERTCertificate, gnutls and gcrypt handles, CNG and CryptoAPI handles) cannot exist in a library that consumes no C library; the others have a generic counterpart (xmlSecCrypto*, xmlSecCryptoApp*, xmlSecTransform*Id, xmlSecKeyData*Id) dispatched to the built-in provider.",
+      "evidence": "backend-tier"
     },
     {
-      "id": "deprecated-c-surface",
+      "id": "deprecated-generic-surface",
       "kinds": ["deprecated-api"],
+      "source_regex": "^include/xmlsec/[^/]+\\.h$",
+      "outcome": "binary-abi-incompatible",
+      "rationale": "The libxmlsec1-compatible headers declare this deprecated function with libxmlsec1's behavior, like the rest of the generic C surface, for which no C tier is claimed yet.",
+      "evidence": "deprecated-surface"
+    },
+    {
+      "id": "not-offered-c-surface",
+      "kinds": ["export-function"],
+      "name_regex": "^(?:xmlSecBufferReadFile|xmlSecKeyReadBinaryFile|xmlSecParseFile|xmlSecParsePrepareCtxt|xmlSecSetExternalEntityLoader|xmlSecSimpleKeysStoreLoad|xmlSecSimpleKeysStoreLoad_ex|xmlSecSimpleKeysStoreSave)$",
       "outcome": "intentionally-unsupported",
-      "rationale": "Deprecated C aliases are excluded until the compatibility layer has a concrete ABI contract.",
-      "evidence": "unsupported-legacy-surface"
+      "rationale": "The library reads and writes no file and loads no external entity, and has no libxml2 parser context: the libxmlsec1-compatible headers replace this declaration by a note, so a program using it fails to compile, and the caller reads the bytes and passes them to the memory counterpart.",
+      "evidence": "c-layer-exclusions"
+    },
+    {
+      "id": "internal-crypto-export",
+      "kinds": ["internal-export"],
+      "outcome": "intentionally-unsupported",
+      "rationale": "libxmlsec1 exports this function from an uninstalled header for its own crypto libraries, which parse keys and verify certificates outside the core's trust transition; loading one over this library is not supported, and the built-in klasses use crate-private equivalents over the core key readers.",
+      "evidence": "c-layer-exclusions"
     },
     {
       "id": "binary-c-surface",
-      "kinds": ["header", "export-function", "export-variable", "internal-export", "macro", "build-define", "enum", "struct-layout", "callback", "typedef", "class-id"],
+      "kinds": ["header", "export-function", "export-variable", "macro", "build-define", "enum", "struct-layout", "callback", "typedef", "class-id"],
       "outcome": "binary-abi-incompatible",
-      "rationale": "The current deliverable is a native Rust crate and does not claim libxmlsec1 C source or binary compatibility.",
+      "rationale": "No C tier is claimed yet: the libxmlsec1-compatible headers declare this item as libxmlsec1 does, a declared function the library does not implement yet fails at link time under its own name, and no generic source or binary ABI tier gate has passed.",
       "evidence": "c-surface-inventory"
     },
     {
