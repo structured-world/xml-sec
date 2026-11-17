@@ -184,7 +184,9 @@ static void ids(void) {
 }
 
 static void content(void) {
+    /* `p` has a plus sign, `l` exceeds a 64-bit long and `o` an unsigned 64-bit value. */
     xmlDocPtr doc = parse("<r><h> 0aFf </h><s> 42 </s><n>-5</n><g>4x</g><t>7 \n</t><e></e><w> \t</w>"
+                          "<p>+5</p><l>9223372036854775808</l><o>18446744073709551616</o>"
                           "<k><x/></k></r>");
     xmlNodePtr root = xsDocGetRootElement(doc);
     xmlNodePtr first = xsNodeGetChildren(root);
@@ -201,7 +203,7 @@ static void content(void) {
         printf("  %s: empty=%d", name_of(node), xmlSecIsEmptyNode(node));
         size = 99;
         ret = xmlSecGetNodeContentAsSize(node, 7, &size);
-        printf(" size=%d/%d\n", ret, (int)size);
+        printf(" size=%d/%llu\n", ret, (unsigned long long)size);
     }
     ret = xmlSecGetNodeContentAsHex(first, &buffer);
     printf("  hex read: %d size=%d\n", ret, (int)xmlSecBufferGetSize(&buffer));
