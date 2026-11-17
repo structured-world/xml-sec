@@ -13,7 +13,7 @@ use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::fmt::Write as _;
 
 use xml_sec::policy::{ResourcePolicy, UnknownX509CertificateSemantics, VerificationPolicy};
-use xml_sec::xmldsig::{KeyValueInfo, parse_x509_certificate_with_resources};
+use xml_sec::xmldsig::{KeyValueInfo, parse_x509_certificate_with_resources, validate_x509_crl};
 
 use super::super::asymkeys::{self, Material};
 use super::super::base64::{
@@ -678,6 +678,17 @@ unsafe fn collect(
         state.add_cert(cert, false);
     }
     if !crl.is_empty() {
+        // A CRL that does not read would fail every path it is applied to;
+        // the read fails here instead, as libxmlsec1's CRL reader does.
+        if let Err(error) = validate_x509_crl(&crl, resources) {
+            errors::internal_with(
+                here,
+                x509_name(),
+                c"xmlSecOpenSSLX509CrlDerRead",
+                &error.to_string(),
+            );
+            return false;
+        }
         state.crls.push(crl);
     }
     true

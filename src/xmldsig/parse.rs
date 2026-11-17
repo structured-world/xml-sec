@@ -3902,6 +3902,27 @@ pub(crate) fn certificate_metadata(
     let issuer_dn = shared_name_text(cert.tbs().issuer(), session)?;
     let serial_number = cert.tbs().serial().as_bytes().to_vec();
     let serial_number_hex = format_x509_serial_value_hex(&serial_number);
+    // The decimal conversion is quadratic in the serial's length, and a parsed
+    // certificate's serial is not yet bounded: its work is charged first.
+    let serial_work = (serial_number.len() as u64)
+        .checked_mul(serial_number.len() as u64)
+        .ok_or_else(|| {
+            session.parse_failure(structured_pkix::Error::resource(
+                structured_asn1::memory::MemoryError::WorkExceeded,
+                "certificate.serial_number",
+                0,
+            ))
+        })?;
+    session
+        .memory()
+        .charge_work(serial_work)
+        .map_err(|reason| {
+            session.parse_failure(structured_pkix::Error::resource(
+                reason,
+                "certificate.serial_number",
+                0,
+            ))
+        })?;
     let serial_number_decimal = format_x509_serial_decimal(&serial_number);
 
     let subject_key_identifier = cert

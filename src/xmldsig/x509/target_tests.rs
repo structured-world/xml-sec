@@ -88,7 +88,11 @@ fn the_target_key_comes_back_through_an_untrusted_intermediate() {
     let anchors = vec![chain.root.clone()];
     let verified = verify_x509_certificate(
         &chain.leaf,
-        &[unrelated, chain.leaf.clone(), chain.intermediate.clone()],
+        &[
+            unrelated.as_slice(),
+            chain.leaf.as_slice(),
+            chain.intermediate.as_slice(),
+        ],
         &[],
         &options(&anchors, SystemTime::now()),
         PATHS,
@@ -135,7 +139,7 @@ fn an_intermediate_supplied_twice_is_one_issuer() {
     let anchors = vec![chain.root.clone()];
     let verified = verify_x509_certificate(
         &chain.leaf,
-        &[chain.intermediate.clone(), chain.intermediate.clone()],
+        &[chain.intermediate.as_slice(), chain.intermediate.as_slice()],
         &[],
         &options(&anchors, SystemTime::now()),
         PATHS,
@@ -179,9 +183,9 @@ fn a_cross_signed_issuer_resolves_to_the_path_an_anchor_accepts() {
     let verified = verify_x509_certificate(
         leaf.der(),
         &[
-            by_untrusted.der().to_vec(),
-            untrusted_root.der().to_vec(),
-            by_trusted.der().to_vec(),
+            by_untrusted.der().as_ref(),
+            untrusted_root.der().as_ref(),
+            by_trusted.der().as_ref(),
         ],
         &[],
         &options(&anchors, SystemTime::now()),
@@ -277,7 +281,7 @@ fn without_a_path_to_an_anchor_there_is_no_key() {
     // No anchor at all: the complete path still ends untrusted.
     let untrusted = verify_x509_certificate(
         &chain.leaf,
-        &[chain.intermediate.clone(), chain.root.clone()],
+        &[chain.intermediate.as_slice(), chain.root.as_slice()],
         &[],
         &options(&[], SystemTime::now()),
         PATHS,
@@ -295,7 +299,7 @@ fn a_target_outside_its_validity_has_no_key() {
     let before = SystemTime::UNIX_EPOCH + Duration::from_secs(3600);
     let expired = verify_x509_certificate(
         &chain.leaf,
-        std::slice::from_ref(&chain.intermediate),
+        &[chain.intermediate.as_slice()],
         &[],
         &options(&anchors, before),
         PATHS,
@@ -311,7 +315,7 @@ fn a_malformed_target_is_refused_as_certificate_processing() {
     let anchors = vec![chain.root.clone()];
     let refused = verify_x509_certificate(
         b"not a certificate",
-        &[chain.intermediate],
+        &[chain.intermediate.as_slice()],
         &[],
         &options(&anchors, SystemTime::now()),
         PATHS,
@@ -338,7 +342,7 @@ fn evidence_beyond_the_aggregate_byte_limit_is_refused_before_parsing() {
     // The anchor is evidence too, and it no longer fits.
     let refused = verify_x509_certificate(
         &chain.leaf,
-        std::slice::from_ref(&chain.intermediate),
+        &[chain.intermediate.as_slice()],
         &[],
         &options(&anchors, SystemTime::now()),
         PATHS,

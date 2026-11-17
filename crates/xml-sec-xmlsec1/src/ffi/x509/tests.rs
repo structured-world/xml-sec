@@ -385,12 +385,12 @@ unsafe fn default_manager(untrusted: &[&[u8]]) -> *mut crate::ffi::keysmngr::Xml
     }
 }
 
-/// [`LEAF`] in an `X509Certificate`.
-fn carried_leaf() -> String {
+/// The Base64 text of `der`.
+fn base64(der: &[u8]) -> String {
     // SAFETY: the encoder returns a NUL-terminated string it allocated,
     // copied and released here.
-    let text = unsafe {
-        let text = crate::ffi::base64::xmlSecBase64Encode(LEAF.as_ptr(), LEAF.len(), 0);
+    unsafe {
+        let text = crate::ffi::base64::xmlSecBase64Encode(der.as_ptr(), der.len(), 0);
         assert!(!text.is_null(), "the bytes encode");
         let owned = std::ffi::CStr::from_ptr(text.cast())
             .to_str()
@@ -398,11 +398,53 @@ fn carried_leaf() -> String {
             .to_owned();
         xml_sec_libxml2::ffi::memory::xsFree(text.cast());
         owned
-    };
+    }
+}
+
+/// A `KeyInfo` whose `X509Data` carries [`LEAF`] and then `rest`.
+fn carrying_leaf(rest: &str) -> String {
     format!(
         "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><X509Data>\
-         <X509Certificate>{text}</X509Certificate></X509Data></KeyInfo>"
+         <X509Certificate>{}</X509Certificate>{rest}</X509Data></KeyInfo>",
+        base64(LEAF)
     )
+}
+
+/// [`LEAF`] in an `X509Certificate`.
+fn carried_leaf() -> String {
+    carrying_leaf("")
+}
+
+#[test]
+fn a_store_search_cut_short_by_the_allowance_fails_the_read() {
+    // The carried leaf spends the allowance of one; the selector that
+    // follows cannot inspect the store and must fail the read, not read as
+    // an unknown certificate and let the leaf through.
+    const OTHER: &[u8] = include_bytes!("../../../../../tests/fixtures/x509/delta-crl/ca.der");
+    crate::ffi::tests::own_process();
+    limits(1, 1 << 20);
+    let xml = carrying_leaf("<X509SubjectName>CN=Nobody</X509SubjectName>");
+    // SAFETY: a manager created and destroyed here.
+    unsafe {
+        let mngr = default_manager(&[OTHER]);
+        assert_eq!(read_key_info(mngr, &xml), (-1, false));
+        xmlSecKeysMngrDestroy(mngr);
+    }
+}
+
+#[test]
+fn a_carried_crl_that_does_not_read_fails_the_read() {
+    // A malformed CRL is refused when it is read, as libxmlsec1's CRL reader
+    // refuses it, rather than stored to fail every path later.
+    crate::ffi::tests::own_process();
+    limits(64, 1 << 20);
+    let xml = carrying_leaf(&format!("<X509CRL>{}</X509CRL>", base64(b"not a CRL")));
+    // SAFETY: a manager created and destroyed here.
+    unsafe {
+        let mngr = default_manager(&[]);
+        assert_eq!(read_key_info(mngr, &xml).0, -1);
+        xmlSecKeysMngrDestroy(mngr);
+    }
 }
 
 #[test]

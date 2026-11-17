@@ -63,6 +63,11 @@ impl UtcFacts {
                 });
             }
             budget.charge(count)?;
+            // The text is X.509 workspace while it is held: a file that
+            // cannot fit it is refused as it is read, not after.
+            if input.len() + count > limits.max_x509_workspace_bytes {
+                return Err(refused(LeapSecondsError::ResourceLimit));
+            }
             input.extend_from_slice(&buffer[..count]);
         }
         LeapSecondsList::parse(&input, limits)

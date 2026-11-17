@@ -300,10 +300,15 @@ fn check(
         );
         return Err(());
     };
-    let mut intermediates = certs.to_vec();
-    intermediates.extend(state.untrusted.iter().cloned());
-    let mut all_crls = crls.to_vec();
-    all_crls.extend(state.crls.iter().cloned());
+    // The data's and the store's certificates and CRLs are passed borrowed:
+    // validation admits them against the operation's limits before it
+    // copies anything.
+    let intermediates: Vec<&[u8]> = certs
+        .iter()
+        .chain(&state.untrusted)
+        .map(Vec::as_slice)
+        .collect();
+    let all_crls: Vec<&[u8]> = crls.iter().chain(&state.crls).map(Vec::as_slice).collect();
     let options = X509ChainOptions {
         trusted_certs: &state.trusted,
         utc_facts: state.utc_facts.as_ref().map(LeapSecondsList::table),
@@ -404,14 +409,22 @@ pub(crate) unsafe fn find(
         return Ok(None);
     }
     // Each certificate inspected is a key candidate of the read, charged to
-    // the allowance its searches share; the search stops when it is spent.
+    // the allowance its searches share; the search stops when it is spent,
+    // and a search the allowance cut short without a match fails the read
+    // (after the charge's report) rather than reading as an unknown
+    // certificate.
+    let refused = core::cell::Cell::new(false);
     let candidates = state.untrusted.iter().map_while(|der| {
         // SAFETY: by the caller's contract.
-        unsafe { charge_candidate(ctx, here, xmlSecNameX509Store.as_ptr().cast()) }
-            .then_some(der.as_slice())
+        let charged = unsafe { charge_candidate(ctx, here, xmlSecNameX509Store.as_ptr().cast()) };
+        refused.set(!charged);
+        charged.then_some(der.as_slice())
     });
-    let found = first_named(here, selectors, candidates, resources)?;
-    Ok(found.map(|position| state.untrusted[position].clone()))
+    match first_named(here, selectors, candidates, resources)? {
+        Some(position) => Ok(Some(state.untrusted[position].clone())),
+        None if refused.get() => Err(()),
+        None => Ok(None),
+    }
 }
 
 /// The position of the first of `candidates` that `selectors` name, all

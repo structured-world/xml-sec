@@ -389,8 +389,8 @@ pub fn validate_x509_crl(
 /// first path that does not validate.
 pub fn verify_x509_certificate(
     target: &[u8],
-    intermediates: &[Vec<u8>],
-    crls: &[Vec<u8>],
+    intermediates: &[&[u8]],
+    crls: &[&[u8]],
     options: &X509ChainOptions<'_>,
     max_candidate_paths: usize,
     resources: &crate::policy::ResourcePolicy,
@@ -403,18 +403,21 @@ pub fn verify_x509_certificate(
     // exceeded by a copy made before the check.
     admit_evidence(
         core::iter::once(target)
-            .chain(intermediates.iter().map(Vec::as_slice))
-            .chain(crls.iter().map(Vec::as_slice)),
+            .chain(intermediates.iter().copied())
+            .chain(crls.iter().copied()),
         options,
         resources,
         &session,
     )?;
+    // Path validation reads CRLs from an owned list; the admitted lists are
+    // copied only now.
+    let crls: Vec<Vec<u8>> = crls.iter().map(|crl| crl.to_vec()).collect();
     // The anchors lead the pool, so a path ends at the first certificate it
     // reaches among them. The pool holds one copy of each certificate, its
     // comparisons charged to the session: the target listed again is no
     // issuer of itself, and an intermediate a document and a store both
     // supply is one issuer.
-    let mut pool = super::keys::BorrowedX509Pool::new(crls, &session);
+    let mut pool = super::keys::BorrowedX509Pool::new(&crls, &session);
     for anchor in options.trusted_certs {
         pool.insert(anchor, &session)?;
     }

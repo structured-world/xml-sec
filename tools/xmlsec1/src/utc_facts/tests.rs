@@ -69,6 +69,38 @@ fn utc_files_and_later_evidence_share_aggregate_admission() {
 }
 
 #[test]
+fn a_file_beyond_the_x509_workspace_is_refused_while_read() {
+    // The held text is X.509 workspace even when it fits the external input
+    // limits.
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let mut text = b"#@ 2303683201\n2272060800 10\n".to_vec();
+    text.extend_from_slice(&b"# comment\n".repeat(100));
+    std::fs::write(file.path(), &text).unwrap();
+    let invocation = Invocation::parse([
+        "xmlsec1".into(),
+        "verify".into(),
+        "--utc-facts".into(),
+        file.path().as_os_str().to_owned(),
+        "unused.xml".into(),
+    ])
+    .unwrap();
+    let limits = ResourcePolicy {
+        max_x509_workspace_bytes: text.len() - 1,
+        ..Default::default()
+    };
+    let refused = UtcFacts::load(
+        &invocation,
+        &limits,
+        &mut ExternalMaterialBudget::new(limits.max_external_resource_total_bytes),
+    );
+    assert!(
+        matches!(&refused, Err(CommandError::Usage(message)) if message.contains("resource limit")),
+        "{:?}",
+        refused.err()
+    );
+}
+
+#[test]
 fn a_malformed_file_is_a_usage_error() {
     // The core refuses the list; the command names the option.
     let file = tempfile::NamedTempFile::new().unwrap();

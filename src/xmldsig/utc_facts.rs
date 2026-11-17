@@ -44,9 +44,9 @@ impl LeapSecondsList {
     /// NTP seconds and the absolute TAI-UTC offset, and one `#@` line with
     /// the list's expiration, beyond which it predicts nothing.
     ///
-    /// The input is bounded by `resources.max_external_resource_bytes`;
-    /// parsing and the retained transitions are charged to an account of
-    /// `max_x509_workspace_bytes` and `max_x509_work`.
+    /// The input is bounded by `resources.max_external_resource_bytes`; the
+    /// input and the retained transitions share `max_x509_workspace_bytes`,
+    /// and parsing is charged to `max_x509_work`.
     ///
     /// # Errors
     ///
@@ -71,8 +71,14 @@ impl LeapSecondsList {
                 maximum: resources.max_external_resource_bytes,
             });
         }
+        // The input stays live while the transitions are built, so it takes
+        // its share of the X.509 workspace with them.
+        let workspace = resources
+            .max_x509_workspace_bytes
+            .checked_sub(input.len())
+            .ok_or(LeapSecondsError::ResourceLimit)?;
         let memory = Memory::new(Arc::new(MemoryAccount::new(
-            resources.max_x509_workspace_bytes,
+            workspace,
             resources.max_x509_work,
         )));
         let charge = (input.len() as u64)

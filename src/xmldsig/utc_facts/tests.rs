@@ -59,6 +59,20 @@ fn fact_loading_preserves_work_and_capacity_limits() {
 }
 
 #[test]
+fn the_input_counts_against_the_x509_workspace() {
+    // A comment-heavy list holds few transitions but its whole text while it
+    // is read: the text takes its share of the workspace too.
+    let mut input = String::from("#@ 2303683201\n2272060800 10\n");
+    input.push_str(&"# a comment line\n".repeat(32));
+    let fits = input.len() + 1024;
+    assert!(LeapSecondsList::parse(input.as_bytes(), &limits(fits, 1 << 20)).is_ok());
+    assert_eq!(
+        LeapSecondsList::parse(input.as_bytes(), &limits(input.len() - 1, 1 << 20)).err(),
+        Some(LeapSecondsError::ResourceLimit)
+    );
+}
+
+#[test]
 fn a_list_beyond_the_resource_byte_limit_is_refused_before_parsing() {
     // The per-resource limit holds for a list passed as bytes too.
     let input = b"#@ 2303683201\n2272060800 10\n";
