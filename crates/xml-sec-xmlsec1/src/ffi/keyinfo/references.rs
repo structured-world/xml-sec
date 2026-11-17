@@ -274,28 +274,34 @@ unsafe fn result_document(
     }
 }
 
-/// The depth of a key reference read now in `ctx`: the levels taken by both
-/// kinds, as the policy's `max_key_info_reference_depth` bounds the nesting
-/// of key references of either kind together, plus this one. The context
-/// keeps libxmlsec1's two counters, each with its own maximum.
+/// The depth of a key reference or `EncryptedKey` read now in `ctx`: the
+/// levels taken by all three kinds, as the policy's
+/// `max_key_info_reference_depth` bounds their nesting together, plus this
+/// one. The context keeps libxmlsec1's three counters, each with its own
+/// maximum.
 ///
 /// # Safety
 /// `ctx` is a context.
-unsafe fn next_reference_depth(ctx: *const XmlSecKeyInfoCtx) -> usize {
+pub(crate) unsafe fn next_reference_depth(ctx: *const XmlSecKeyInfoCtx) -> usize {
     // SAFETY: by the caller's contract.
-    let (retrievals, references) = unsafe {
-        (
+    let levels = unsafe {
+        [
             (*ctx).cur_retrieval_method_level,
             (*ctx).cur_key_info_reference_level,
-        )
+            (*ctx).cur_encrypted_key_level,
+        ]
     };
     // A negative level a caller wrote into the public fields is past every
     // limit, so it cannot lift the policy's bound.
-    match (usize::try_from(retrievals), usize::try_from(references)) {
-        // Two `c_int` levels and one more fit in `usize`.
-        (Ok(retrievals), Ok(references)) => retrievals + references + 1,
-        _ => usize::MAX,
+    let mut depth = 1_usize;
+    for level in levels {
+        let Ok(level) = usize::try_from(level) else {
+            return usize::MAX;
+        };
+        // Three `c_int` levels and one more fit in `usize`.
+        depth += level;
     }
+    depth
 }
 
 // ----------------------------------------------------------------------------

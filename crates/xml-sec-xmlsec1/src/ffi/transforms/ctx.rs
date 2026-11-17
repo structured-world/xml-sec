@@ -86,6 +86,13 @@ pub(crate) struct RunBudget {
     pub(crate) base64_output: usize,
     /// Octets read from external resources through the input callbacks.
     pub(crate) external_resources: usize,
+    /// An external-resource limit refused a read of the run: the operation's
+    /// budget is spent, which ends the operation rather than one reference.
+    pub(crate) resource_limit_reached: bool,
+    /// The external resources the `EncryptedKey` elements of the operation's
+    /// key read, each once, which the core is handed with the operation's own
+    /// as it resolves every `CipherReference` of the element it decrypts.
+    pub(crate) key_resources: ReadResources,
     /// Octets handed to the XML parser, of `max_xml_parse_work_bytes`.
     pub(crate) xml_parse: usize,
     /// `XPath` expressions evaluated, of `max_xpath_expressions`.
@@ -98,13 +105,24 @@ pub(crate) struct RunBudget {
     /// references.
     uris: Option<UriTypeSet>,
     /// The operation the run serves, fixed with its policy revision: a
-    /// `KeyInfo` read verifies, any other run signs when one of its
-    /// transforms signs.
+    /// `KeyInfo` read verifies, any other run serves the operation one of its
+    /// transforms performs.
     side: Option<policy::Side>,
 }
 
-/// The operation the chain of `ctx` serves: signing when one of its
-/// transforms signs.
+/// The side of a transform operation that is not verification's: signing,
+/// encryption or decryption.
+pub(crate) const fn operation_side(operation: c_int) -> Option<policy::Side> {
+    match operation {
+        super::OPERATION_SIGN => Some(policy::Side::Sign),
+        super::OPERATION_ENCRYPT => Some(policy::Side::Encrypt),
+        super::OPERATION_DECRYPT => Some(policy::Side::Decrypt),
+        _ => None,
+    }
+}
+
+/// The operation the chain of `ctx` serves: the first of its transforms that
+/// signs, encrypts or decrypts names it, verification otherwise.
 ///
 /// # Safety
 /// `ctx` is an initialized context whose chain is live.
@@ -114,8 +132,8 @@ unsafe fn chain_side(ctx: *mut XmlSecTransformCtx) -> policy::Side {
     while !current.is_null() {
         // SAFETY: the chain's transforms are live.
         unsafe {
-            if (*current).operation == super::OPERATION_SIGN {
-                return policy::Side::Sign;
+            if let Some(side) = operation_side((*current).operation) {
+                return side;
             }
             current = (*current).next;
         }
@@ -160,11 +178,12 @@ pub(crate) unsafe fn run_policy(
     run.policy.clone()
 }
 
-/// Makes `pinned` the revision of the fresh run of `ctx`, so a chain an
-/// operation runs for one of its parts reads that operation's revision.
+/// Makes `pinned` the revision of the fresh run of `ctx`, leaving its side to
+/// its chain.
 ///
 /// # Safety
 /// `ctx` is an initialized context.
+#[cfg(test)]
 pub(crate) unsafe fn pin_run(ctx: *mut XmlSecTransformCtx, pinned: &policy::Pinned) {
     // SAFETY: by the caller's contract.
     let run = unsafe { run_budget(ctx) };
@@ -220,11 +239,13 @@ pub(crate) unsafe fn run_spent(ctx: *mut XmlSecTransformCtx) -> policy::Spent {
     }
 }
 
-/// Charges the run of `ctx`, the chain of an operation, with what the
-/// operation's `KeyInfo` read spent of the external-resource allowance, held
-/// in the pin in the read context's slot `read_slot`: the operation's later
-/// reads count on from it, so the key's resources and the operation's share
-/// one allowance.
+/// Takes into the run of `ctx`, the chain of an operation, what the
+/// operation has spent of the external-resource allowance once its `KeyInfo`
+/// read is done, and the resources the read's `EncryptedKey` elements read,
+/// held in the pin in the read context's slot `read_slot`: the read counted
+/// on from what the chain had spent ([`external_spent`]), and the
+/// operation's later reads count on from its total, so the key's resources
+/// and the operation's share one allowance.
 ///
 /// # Safety
 /// `ctx` is an initialized context; `read_slot` is null or a pin.
@@ -232,9 +253,10 @@ pub(crate) unsafe fn charge_key_read(ctx: *mut XmlSecTransformCtx, read_slot: *m
     // SAFETY: by the caller's contract.
     unsafe {
         if let Some(spent) = policy::spent(read_slot) {
-            // Each count stays within the policy's aggregate ceiling, a
-            // hard-limited `usize`, so their sum cannot overflow.
-            run_budget(ctx).external_resources += spent.get().external_resources;
+            run_budget(ctx).external_resources = spent.get().external_resources;
+        }
+        if let Some(read) = policy::key_resources(read_slot) {
+            run_budget(ctx).key_resources.append(read.take());
         }
     }
 }
@@ -1724,6 +1746,16 @@ impl ReadResources {
         self.read.push(ReadResource { origin, uri, bytes });
     }
 
+    /// Takes over the resources `other` read, after these.
+    pub(crate) fn append(&mut self, mut other: Self) {
+        self.read.append(&mut other.read);
+    }
+
+    /// The octets of the first resource read, if any.
+    pub(crate) fn first_bytes(&self) -> Option<&[u8]> {
+        self.read.first().map(|resource| resource.bytes.as_slice())
+    }
+
     /// The resources keyed as the core looks them up in `document`, a
     /// tree-backed document of their tree: each URI resolved from its
     /// element against the XML Base it inherits, within `resources`'
@@ -1813,6 +1845,25 @@ pub(crate) struct ResourceScope<'a> {
     pub(crate) pinned: &'a policy::Pinned,
     pub(crate) side: policy::Side,
     pub(crate) spent: policy::Spent,
+    /// Set when an external-resource limit refused a read, which the core
+    /// treats as a refusal of the whole operation, not a missing resource.
+    pub(crate) limit_reached: bool,
+}
+
+impl<'a> ResourceScope<'a> {
+    /// Reads for `side` of the revision `pinned`, counting on from `spent`.
+    pub(crate) const fn new(
+        pinned: &'a policy::Pinned,
+        side: policy::Side,
+        spent: policy::Spent,
+    ) -> Self {
+        Self {
+            pinned,
+            side,
+            spent,
+            limit_reached: false,
+        }
+    }
 }
 
 /// The octets of the external resource `uri` names (its fragment, if any,
@@ -1867,6 +1918,7 @@ pub(crate) unsafe fn read_resource(
                 }
             });
         scope.spent = run_spent(ctx);
+        scope.limit_reached |= run_budget(ctx).resource_limit_reached;
         xmlSecTransformCtxDestroy(ctx);
         bytes
     }

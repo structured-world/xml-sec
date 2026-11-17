@@ -9,6 +9,7 @@ use std::ffi::{c_char, c_void};
 use std::sync::Arc;
 
 use super::errors::{self, Here};
+use super::transforms::ctx::ReadResources;
 
 use xml_sec::policy::{
     DecryptionPolicy, EncryptionPolicy, ResourcePolicy, SigningPolicy, VerificationPolicy,
@@ -62,20 +63,22 @@ impl Pinned {
         match side {
             Side::Verify => OperationPolicy::Verify(&self.verification),
             Side::Sign => OperationPolicy::Sign(&self.signing),
+            Side::Encrypt => OperationPolicy::Encrypt(&self.encryption),
             Side::Decrypt => OperationPolicy::Decrypt(&self.decryption),
         }
     }
 }
 
-/// The operation a run of a transform chain serves: signing when one of its
-/// transforms signs (a signature method, or a reference's digest method set
-/// to sign), verification otherwise, as libxmlsec1 marks each transform with
-/// its operation; decryption when an encryption context reads the resource
-/// its `CipherReference` names.
+/// The operation a run of a transform chain serves, as libxmlsec1 marks each
+/// transform with its operation: signing when one of its transforms signs (a
+/// signature method, or a reference's digest method set to sign), encryption
+/// or decryption when its cipher, wrap or transport does, verification
+/// otherwise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Side {
     Verify,
     Sign,
+    Encrypt,
     Decrypt,
 }
 
@@ -84,6 +87,7 @@ pub(crate) enum Side {
 pub(crate) enum OperationPolicy<'a> {
     Verify(&'a VerificationPolicy),
     Sign(&'a SigningPolicy),
+    Encrypt(&'a EncryptionPolicy),
     Decrypt(&'a DecryptionPolicy),
 }
 
@@ -93,16 +97,20 @@ impl<'a> OperationPolicy<'a> {
         match self {
             Self::Verify(policy) => &policy.resources,
             Self::Sign(policy) => &policy.resources,
+            Self::Encrypt(policy) => &policy.resources,
             Self::Decrypt(policy) => &policy.resources,
         }
     }
 
     /// The URI classes the operation admits for a signature's references or
-    /// a `CipherReference`.
+    /// a `CipherReference`. An encryption reads only the resource its caller
+    /// names, never a URI of a document, so its policy has no URI classes:
+    /// the caller's choice and the context's enabled URIs decide.
     pub(crate) fn references(self) -> UriTypeSet {
         match self {
             Self::Verify(policy) => policy.uris.references,
             Self::Sign(policy) => policy.uris.references,
+            Self::Encrypt(_) => UriTypeSet::ALL,
             Self::Decrypt(policy) => policy.uris.references,
         }
     }
@@ -115,6 +123,7 @@ macro_rules! with_document_policy {
         match $operation {
             $crate::ffi::policy::OperationPolicy::Verify($policy) => $body,
             $crate::ffi::policy::OperationPolicy::Sign($policy) => $body,
+            $crate::ffi::policy::OperationPolicy::Encrypt($policy) => $body,
             $crate::ffi::policy::OperationPolicy::Decrypt($policy) => $body,
         }
     };
@@ -162,11 +171,13 @@ impl KeyCandidates {
 }
 
 /// What a context's reserved slot holds during an operation: its policy
-/// revision and what its runs have spent so far.
+/// revision, what its runs have spent so far and the external resources its
+/// `EncryptedKey` elements read.
 struct Operation {
     pinned: Pinned,
     spent: Cell<Spent>,
     key_candidates: Cell<KeyCandidates>,
+    key_resources: Cell<ReadResources>,
 }
 
 /// A pin in a context's reserved slot for one call: the outermost call of an
@@ -189,16 +200,21 @@ impl SlotPin {
             if !(*slot).is_null() {
                 return Some(Self { slot, owned: false });
             }
-            Some(Self::hold_pinned(slot, Pinned::current(here)?))
+            Some(Self::hold_pinned(
+                slot,
+                Pinned::current(here)?,
+                Spent::default(),
+            ))
         }
     }
 
     /// Pins `pinned` into `slot` unless it holds a pin, so the read sees the
-    /// revision of the operation that makes it.
+    /// revision of the operation that makes it and counts on from `spent`,
+    /// what that operation spent before it.
     ///
     /// # Safety
     /// As for [`SlotPin::hold`].
-    pub(crate) unsafe fn hold_pinned(slot: *mut *mut c_void, pinned: Pinned) -> Self {
+    pub(crate) unsafe fn hold_pinned(slot: *mut *mut c_void, pinned: Pinned, spent: Spent) -> Self {
         // SAFETY: by the caller's contract.
         unsafe {
             if !(*slot).is_null() {
@@ -206,8 +222,9 @@ impl SlotPin {
             }
             let operation = Operation {
                 pinned,
-                spent: Cell::default(),
+                spent: Cell::new(spent),
                 key_candidates: Cell::default(),
+                key_resources: Cell::default(),
             };
             *slot = Box::into_raw(Box::new(operation)).cast();
         }
@@ -265,6 +282,16 @@ pub(crate) unsafe fn spent<'a>(slot: *mut c_void) -> Option<&'a Cell<Spent>> {
 pub(crate) unsafe fn key_candidates<'a>(slot: *mut c_void) -> Option<&'a Cell<KeyCandidates>> {
     // SAFETY: by the caller's contract.
     unsafe { slot.cast::<Operation>().as_ref() }.map(|operation| &operation.key_candidates)
+}
+
+/// The external resources the `EncryptedKey` elements of the read pinned in
+/// `slot` read, if one is pinned.
+///
+/// # Safety
+/// As for [`pinned`].
+pub(crate) unsafe fn key_resources<'a>(slot: *mut c_void) -> Option<&'a Cell<ReadResources>> {
+    // SAFETY: by the caller's contract.
+    unsafe { slot.cast::<Operation>().as_ref() }.map(|operation| &operation.key_resources)
 }
 
 /// Publishes the current snapshots with the edits applied, as a libxmlsec1

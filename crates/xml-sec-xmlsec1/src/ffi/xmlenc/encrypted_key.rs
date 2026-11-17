@@ -17,18 +17,19 @@ use super::super::keyinfo::{
     MODE_READ, MODE_WRITE, XmlSecKeyInfoCtx, xmlSecKeyInfoCtxCopyUserPref,
     xmlSecKeyInfoCtxFinalize, xmlSecKeyInfoCtxInitialize,
 };
+use super::super::keyinfo::{next_reference_depth, read_policy};
 use super::super::keys::{XmlSecKey, key_valid};
 use super::super::keysdata::{
     XmlSecKeyDataKlass, xmlSecKeyDataBinRead, xmlSecKeyDataBinWrite,
     xmlSecKeyDataEncryptedKeyGetKlass,
 };
 use super::super::list::xmlSecPtrListEmpty;
-use super::super::transforms::ctx::pin_run;
+use super::super::transforms::ctx::{operation_side, run_budget, run_spent, seed_run};
 use super::super::transforms::{
     OPERATION_DECRYPT, OPERATION_ENCRYPT, OPERATION_SIGN, OPERATION_VERIFY,
 };
 use super::super::tree::{XmlNode, nodes};
-use super::super::{contain, free};
+use super::super::{contain, free, policy};
 use super::{
     MODE_ENCRYPTED_KEY, XmlSecEncCtx, process, xmlSecEncCtxCreate, xmlSecEncCtxDestroy,
     xmlSecEncCtxReset,
@@ -345,7 +346,11 @@ macro_rules! method_arguments {
 }
 
 /// Whether `ctx` may open one more `EncryptedKey` level, after libxmlsec1's
-/// report under `here`.
+/// report under `here`. Beyond the context's own maximum, the policy's
+/// `max_key_info_reference_depth` of the operation the key is decrypted or
+/// encrypted for bounds the levels of `EncryptedKey` and key references
+/// together, as the core bounds an `EncryptedKey` nested in a `KeyInfo`
+/// (XML Encryption 1.1 section 3.5.1), whatever maximum the caller set.
 ///
 /// # Safety
 /// `ctx` is an initialized context; `id` a klass.
@@ -356,6 +361,7 @@ unsafe fn level_open(
 ) -> bool {
     // SAFETY: by the caller's contract.
     unsafe {
+        let name = (*id).name.cast();
         let (current, maximum) = (
             (*ctx).cur_encrypted_key_level,
             (*ctx).max_encrypted_key_level,
@@ -363,10 +369,27 @@ unsafe fn level_open(
         if current >= maximum {
             errors::report(
                 here,
-                (*id).name.cast(),
+                name,
                 std::ptr::null(),
                 R_MAX_ENCKEY_LEVEL,
                 &format!("cur={current};max={maximum}"),
+            );
+            return false;
+        }
+        let Some(pinned) = read_policy(ctx, here) else {
+            return false;
+        };
+        let side = operation_side(map_operation((*ctx).operation)).unwrap_or(policy::Side::Verify);
+        let resources = pinned.of(side).resources();
+        if resources
+            .validate_key_info_reference_depth(next_reference_depth(ctx))
+            .is_err()
+        {
+            errors::limit_exceeded(
+                here,
+                name,
+                "EncryptedKey depth",
+                resources.max_key_info_reference_depth,
             );
             return false;
         }
@@ -420,17 +443,59 @@ pub(crate) unsafe extern "C" fn xml_read(
             // A transport recovering a key of a fixed width learns it from
             // the requirements of this context.
             (*enc).transform_ctx.parent_key_info_ctx = ctx.cast();
-            // The key is decrypted under the revision of the read it serves.
-            if let Some(pinned) = super::super::policy::pinned((*ctx).reserved0) {
-                pin_run(&raw mut (*enc).transform_ctx, pinned);
-            }
-            if xmlSecEncCtxEncryptedKeyXmlRead(enc, node, key, ctx) < 0 {
+            let read = decrypt_within_read(ctx, enc, node, key);
+            if read < 0 {
                 errors::internal(here, name, c"xmlSecEncCtxEncryptedKeyXmlRead");
-                return -1;
             }
+            read
         }
-        0
     })
+}
+
+/// Decrypts the `EncryptedKey` `node` into `key` with the nested context
+/// `enc` as a part of the `KeyInfo` read with `ctx`: under the read's
+/// revision and its operation's side, counting on from what the read spent
+/// of the external-resource allowance and handing back what the decryption
+/// spent, whether it succeeds or not, so one limit bounds the operation, and
+/// the resources it read.
+///
+/// # Safety
+/// `ctx` is a reading context whose nested context is `enc`; `node` a live
+/// node; `key` an empty key.
+unsafe fn decrypt_within_read(
+    ctx: *mut XmlSecKeyInfoCtx,
+    enc: *mut XmlSecEncCtx,
+    node: *mut XmlNode,
+    key: *mut XmlSecKey,
+) -> c_int {
+    // SAFETY: by the caller's contract; the read's pin outlives the call.
+    unsafe {
+        let transforms = &raw mut (*enc).transform_ctx;
+        let slot = (*ctx).reserved0;
+        if let Some(pinned) = policy::pinned(slot) {
+            let spent = policy::spent(slot).map_or_default(|spent| policy::Spent {
+                external_resources: spent.get().external_resources,
+                ..policy::Spent::default()
+            });
+            let side = operation_side((*enc).operation).unwrap_or(policy::Side::Verify);
+            seed_run(transforms, pinned, side, None, spent);
+        }
+        let read = xmlSecEncCtxEncryptedKeyXmlRead(enc, node, key, ctx);
+        if let Some(spent) = policy::spent(slot) {
+            spent.set(policy::Spent {
+                external_resources: run_spent(transforms).external_resources,
+                ..spent.get()
+            });
+        }
+        // What the decryption read goes up to the operation whose key this
+        // is, which hands it to the core.
+        if let Some(resources) = policy::key_resources(slot) {
+            let mut all = resources.take();
+            all.append(std::mem::take(&mut run_budget(transforms).key_resources));
+            resources.set(all);
+        }
+        read
+    }
 }
 
 /// `xmlWrite` of the `EncryptedKey` klass: `key` encrypted into the

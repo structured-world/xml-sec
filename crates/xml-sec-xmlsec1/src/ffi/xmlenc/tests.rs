@@ -143,6 +143,483 @@ unsafe extern "C" fn served_close(_context: *mut std::ffi::c_void) -> std::ffi::
     0
 }
 
+/// The reasons reported during [`reported`], in order.
+static REASONS: std::sync::Mutex<Vec<std::ffi::c_int>> = std::sync::Mutex::new(Vec::new());
+
+unsafe extern "C" fn record(
+    _file: *const std::ffi::c_char,
+    _line: std::ffi::c_int,
+    func: *const std::ffi::c_char,
+    _object: *const std::ffi::c_char,
+    _subject: *const std::ffi::c_char,
+    reason: std::ffi::c_int,
+    message: *const std::ffi::c_char,
+) {
+    let text = |text: *const std::ffi::c_char| {
+        // SAFETY: the library passes null or NUL-terminated strings.
+        unsafe { text.as_ref() }.map_or_else(String::new, |_| {
+            // SAFETY: as above.
+            unsafe { std::ffi::CStr::from_ptr(text) }
+                .to_string_lossy()
+                .into_owned()
+        })
+    };
+    // Shown with a failing assertion's output.
+    eprintln!("{}: {reason}: {}", text(func), text(message));
+    REASONS.lock().expect("one test thread").push(reason);
+}
+
+/// `run`'s result and the reasons reported while it ran.
+fn reported<T>(run: impl FnOnce() -> T) -> (T, Vec<std::ffi::c_int>) {
+    REASONS.lock().expect("one test thread").clear();
+    // SAFETY: the callback has the callback's signature.
+    unsafe {
+        crate::ffi::errors::xmlSecErrorsSetCallback(Some(
+            record as crate::ffi::errors::ErrorsCallback,
+        ));
+    }
+    let result = run();
+    // SAFETY: restores the default callback.
+    unsafe { crate::ffi::errors::xmlSecErrorsSetCallback(None) };
+    (result, REASONS.lock().expect("one test thread").clone())
+}
+
+/// The resources [`by_uri_open`] serves, each under the URI it is asked for.
+static RESOURCES: std::sync::Mutex<Vec<(&str, Vec<u8>)>> = std::sync::Mutex::new(Vec::new());
+/// Resources [`by_uri_open`] opened.
+static OPENS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// An open resource of [`RESOURCES`] and the octets already read.
+struct Cursor {
+    bytes: Vec<u8>,
+    sent: usize,
+}
+
+unsafe extern "C" fn by_uri_open(uri: *const std::ffi::c_char) -> *mut std::ffi::c_void {
+    OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: the transform passes a NUL-terminated URI.
+    let uri = unsafe { std::ffi::CStr::from_ptr(uri) }.to_string_lossy();
+    RESOURCES
+        .lock()
+        .expect("one test thread")
+        .iter()
+        .find(|(name, _)| *name == uri)
+        .map_or(std::ptr::null_mut(), |(_, bytes)| {
+            Box::into_raw(Box::new(Cursor {
+                bytes: bytes.clone(),
+                sent: 0,
+            }))
+            .cast()
+        })
+}
+
+unsafe extern "C" fn by_uri_read(
+    context: *mut std::ffi::c_void,
+    buffer: *mut std::ffi::c_char,
+    len: std::ffi::c_int,
+) -> std::ffi::c_int {
+    // SAFETY: the cursor `by_uri_open` boxed.
+    let cursor = unsafe { &mut *context.cast::<Cursor>() };
+    let rest = &cursor.bytes[cursor.sent..];
+    let count = rest
+        .len()
+        .min(usize::try_from(len).expect("a non-negative length"));
+    // SAFETY: the transform passes `len` writable bytes.
+    unsafe { std::ptr::copy_nonoverlapping(rest.as_ptr(), buffer.cast(), count) };
+    cursor.sent += count;
+    std::ffi::c_int::try_from(count).expect("at most `len` octets")
+}
+
+unsafe extern "C" fn by_uri_close(context: *mut std::ffi::c_void) -> std::ffi::c_int {
+    // SAFETY: the cursor `by_uri_open` boxed, closed once.
+    drop(unsafe { Box::from_raw(context.cast::<Cursor>()) });
+    0
+}
+
+/// Registers the callbacks that serve [`RESOURCES`].
+///
+/// # Safety
+/// The library is initialized.
+unsafe fn serve_by_uri(resources: Vec<(&'static str, Vec<u8>)>) {
+    *RESOURCES.lock().expect("one test thread") = resources;
+    OPENS.store(0, std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: by the caller's contract.
+    let registered = unsafe {
+        crate::ffi::transforms::io::xmlSecIORegisterCallbacks(
+            Some(served_matches),
+            Some(by_uri_open),
+            Some(by_uri_read),
+            Some(by_uri_close),
+        )
+    };
+    assert_eq!(registered, 0);
+}
+
+/// Initializes the library and its crypto for one test.
+///
+/// # Safety
+/// Called once, on the test's thread, before [`shut_down`].
+unsafe fn start_up() {
+    // SAFETY: by the caller's contract.
+    unsafe {
+        assert_eq!(xmlSecInit(), 0);
+        assert_eq!(xmlSecCryptoDLLoadLibrary(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoAppInit(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoInit(), 0);
+    }
+}
+
+/// Shuts down what [`start_up`] initialized.
+///
+/// # Safety
+/// After [`start_up`], with every object of the test released.
+unsafe fn shut_down() {
+    // SAFETY: by the caller's contract.
+    unsafe {
+        assert_eq!(xmlSecCryptoShutdown(), 0);
+        assert_eq!(xmlSecCryptoAppShutdown(), 0);
+        assert_eq!(xmlSecShutdown(), 0);
+    }
+}
+
+/// `plaintext` encrypted with [`aes_key`] by the method `klass`, as the
+/// Base64 text of its `CipherValue` and as raw octets.
+///
+/// # Safety
+/// The library is initialized; `klass` is a cipher, wrap or transport klass.
+unsafe fn encrypted(
+    klass: *const crate::ffi::transforms::XmlSecTransformKlass,
+    plaintext: &[u8],
+) -> (String, Vec<u8>) {
+    // SAFETY: a document, a template and a context created and released
+    // here.
+    unsafe {
+        let doc = xsNewDoc(c"1.0".as_ptr().cast());
+        let tmpl = xmlSecTmplEncDataCreate(
+            doc,
+            klass,
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+        xsDocSetRootElement(doc, tmpl);
+        let cipher_value = xmlSecTmplEncDataEnsureCipherValue(tmpl);
+        let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
+        (*ctx).enc_key = aes_key();
+        assert_eq!(
+            xmlSecEncCtxBinaryEncrypt(ctx, tmpl, plaintext.as_ptr(), plaintext.len()),
+            0
+        );
+        xmlSecEncCtxDestroy(ctx);
+        let text = xml_sec_libxml2::ffi::tree::xsNodeGetContent(cipher_value.cast());
+        let encoded = std::ffi::CStr::from_ptr(text.cast())
+            .to_string_lossy()
+            .into_owned();
+        let mut size = 0;
+        assert_eq!(
+            crate::ffi::base64::xmlSecBase64DecodeInPlace(text, &raw mut size),
+            0
+        );
+        let raw = std::slice::from_raw_parts(text, size).to_vec();
+        crate::ffi::free(text.cast());
+        xsFreeDoc(doc);
+        (encoded, raw)
+    }
+}
+
+/// `xml` parsed.
+fn parsed(xml: &str) -> *mut crate::ffi::tree::XmlDoc {
+    // SAFETY: the bytes and their length.
+    let doc = unsafe {
+        xml_sec_libxml2::ffi::tree::xsReadMemory(
+            xml.as_ptr().cast(),
+            std::ffi::c_int::try_from(xml.len()).expect("a short document"),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        )
+    };
+    assert!(!doc.is_null(), "the document parses");
+    doc.cast()
+}
+
+#[test]
+fn an_encrypted_key_reads_its_cipher_reference_under_the_decryption_policy() {
+    // An EncryptedKey is decrypted: its CipherReference is opened under the
+    // decryption policy's URI classes, not verification's, so a decryption
+    // policy refusing external references reads nothing.
+    own_process();
+    // SAFETY: the library, a document and a context set up and released
+    // here, on this thread alone.
+    unsafe {
+        start_up();
+        let (_, wrapped) = encrypted(crate::ffi::transforms::ciphers::kw_aes128(), &[0x5a; 16]);
+        serve_by_uri(vec![("test:wrapped", wrapped)]);
+        crate::ffi::policy::republish(
+            |verification| verification.uris.references = xml_sec::xmldsig::UriTypeSet::ALL,
+            |_| {},
+        )
+        .expect("the library policy compiles");
+        xml_sec_libxml2::policy::republish_encryption(
+            |_| {},
+            |decryption| decryption.uris.references = xml_sec::xmldsig::UriTypeSet::SAME_DOCUMENT,
+        )
+        .expect("the library policy compiles");
+        let doc = parsed(concat!(
+            "<EncryptedKey xmlns=\"http://www.w3.org/2001/04/xmlenc#\">",
+            "<EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#kw-aes128\"/>",
+            "<CipherData><CipherReference URI=\"test:wrapped\"/></CipherData>",
+            "</EncryptedKey>"
+        ));
+        let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
+        (*ctx).mode = MODE_ENCRYPTED_KEY;
+        (*ctx).enc_key = aes_key();
+        (*ctx).transform_ctx.enabled_uris = 0xFFFF;
+        let result = xmlSecEncCtxDecryptToBuffer(
+            ctx,
+            xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc.cast()),
+        );
+        assert!(result.is_null(), "the decryption policy refuses the URI");
+        assert_eq!(
+            OPENS.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "nothing was opened"
+        );
+        xmlSecEncCtxDestroy(ctx);
+        xsFreeDoc(doc.cast());
+        shut_down();
+    }
+}
+
+#[test]
+fn uri_encryption_reads_its_resource_under_the_encryption_policy() {
+    // The resource a caller names for encryption is read under the
+    // encryption policy's limits: a verification policy refusing external
+    // references and allowing one octet does not refuse it, and an
+    // encryption limit below its size does.
+    own_process();
+    let plaintext = b"named by the caller";
+    // SAFETY: the library, documents and contexts set up and released here,
+    // on this thread alone.
+    unsafe {
+        start_up();
+        serve_by_uri(vec![("test:plain", plaintext.to_vec())]);
+        crate::ffi::policy::republish(
+            |verification| {
+                verification.uris.references = xml_sec::xmldsig::UriTypeSet::SAME_DOCUMENT;
+                // The AES key itself is read within these limits.
+                verification.resources.max_external_resource_bytes = 16;
+                verification.resources.max_external_resource_total_bytes = 16;
+            },
+            |_| {},
+        )
+        .expect("the library policy compiles");
+        let encrypt = || {
+            let doc = xsNewDoc(c"1.0".as_ptr().cast());
+            let tmpl = xmlSecTmplEncDataCreate(
+                doc,
+                aes128_cbc(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+            );
+            xsDocSetRootElement(doc, tmpl);
+            assert!(!xmlSecTmplEncDataEnsureCipherValue(tmpl).is_null());
+            let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
+            (*ctx).enc_key = aes_key();
+            let encrypted = xmlSecEncCtxUriEncrypt(ctx, tmpl, c"test:plain".as_ptr().cast());
+            xmlSecEncCtxDestroy(ctx);
+            xsFreeDoc(doc);
+            encrypted
+        };
+        assert_eq!(encrypt(), 0, "the encryption policy admits the resource");
+        xml_sec_libxml2::policy::republish_encryption(
+            |encryption| encryption.resources.max_external_resource_bytes = plaintext.len() - 1,
+            |_| {},
+        )
+        .expect("the library policy compiles");
+        let (encrypted, reasons) = reported(encrypt);
+        assert_eq!(encrypted, -1, "the encryption limit refuses the resource");
+        assert_eq!(
+            reasons.first(),
+            Some(&crate::ffi::errors::R_INVALID_SIZE),
+            "{reasons:?}"
+        );
+        shut_down();
+    }
+}
+
+/// A key manager's lookup that hands back [`aes_key`] for an element without
+/// a `KeyInfo` and reads the `KeyInfo` of any other.
+unsafe extern "C" fn kek_or_read(node: *mut XmlNode, ctx: *mut XmlSecKeyInfoCtx) -> *mut XmlSecKey {
+    if node.is_null() {
+        return aes_key();
+    }
+    // SAFETY: the operation's node and read context.
+    unsafe { crate::ffi::keysmngr::xmlSecKeysMngrGetKey(node, ctx) }
+}
+
+#[test]
+fn an_encrypted_key_in_a_key_info_hands_its_resource_to_the_decryption() {
+    // An EncryptedData whose KeyInfo carries an EncryptedKey with a
+    // CipherReference decrypts as with libxmlsec1: the key's read reads that
+    // resource once, the core is handed the octets it read, and the two
+    // reads share the operation's aggregate limit.
+    own_process();
+    let plaintext = b"under one allowance";
+    // SAFETY: the library, documents, contexts, keys and a manager set up and
+    // released here, on this thread alone.
+    unsafe {
+        start_up();
+        let (_, wrapped) = encrypted(crate::ffi::transforms::ciphers::kw_aes128(), &[0x5a; 16]);
+        let (_, cipher) = encrypted(aes128_cbc(), plaintext);
+        let total = wrapped.len() + cipher.len();
+        serve_by_uri(vec![("test:wrapped", wrapped), ("test:cipher", cipher)]);
+        let doc = parsed(concat!(
+            "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\">",
+            "<EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#aes128-cbc\"/>",
+            "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\">",
+            "<EncryptedKey xmlns=\"http://www.w3.org/2001/04/xmlenc#\">",
+            "<EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#kw-aes128\"/>",
+            "<CipherData><CipherReference URI=\"test:wrapped\"/></CipherData>",
+            "</EncryptedKey>",
+            "</KeyInfo>",
+            "<CipherData><CipherReference URI=\"test:cipher\"/></CipherData>",
+            "</EncryptedData>"
+        ));
+        let mngr = xmlSecKeysMngrCreate();
+        (*mngr).get_key = Some(kek_or_read);
+        for (limit, admitted) in [(total - 1, false), (total, true)] {
+            xml_sec_libxml2::policy::republish_encryption(
+                |_| {},
+                |decryption| decryption.resources.max_external_resource_total_bytes = limit,
+            )
+            .expect("the library policy compiles");
+            OPENS.store(0, std::sync::atomic::Ordering::Relaxed);
+            let ctx = xmlSecEncCtxCreate(mngr);
+            (*ctx).transform_ctx.enabled_uris = 0xFFFF;
+            // The EncryptedKey's context takes the caller's URI settings.
+            let read = &raw mut (*ctx).key_info_read_ctx;
+            assert_eq!(encrypted_key::xmlSecKeyInfoCtxCreateEncCtx(read), 0);
+            (*(*read).enc_ctx.cast::<XmlSecEncCtx>())
+                .transform_ctx
+                .enabled_uris = 0xFFFF;
+            let (result, reasons) = reported(|| {
+                xmlSecEncCtxDecryptToBuffer(
+                    ctx,
+                    xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc.cast()),
+                )
+            });
+            if admitted {
+                assert!(!result.is_null(), "both reads fit in {limit}: {reasons:?}");
+                assert_eq!(
+                    std::slice::from_raw_parts(
+                        xmlSecBufferGetData(result),
+                        xmlSecBufferGetSize(result)
+                    ),
+                    plaintext
+                );
+                assert_eq!(
+                    OPENS.load(std::sync::atomic::Ordering::Relaxed),
+                    2,
+                    "each resource was read once"
+                );
+            } else {
+                assert!(result.is_null(), "the reads passed the limit {limit}");
+                assert_eq!(
+                    reasons.first(),
+                    Some(&crate::ffi::errors::R_INVALID_SIZE),
+                    "{reasons:?}"
+                );
+            }
+            xmlSecEncCtxDestroy(ctx);
+        }
+        xmlSecKeysMngrDestroy(mngr);
+        xsFreeDoc(doc.cast());
+        shut_down();
+    }
+}
+
+#[test]
+fn a_nested_encrypted_key_shares_the_operations_allowance() {
+    // The EncryptedKey in the KeyInfo of another is a part of the decryption
+    // that reads it: the octets its CipherReference reads count against the
+    // aggregate limit the outer EncryptedKey's CipherReference is read within.
+    own_process();
+    let content_key = [0x5a_u8; 16];
+    // SAFETY: the library, documents, contexts, keys and a manager set up and
+    // released here, on this thread alone.
+    unsafe {
+        start_up();
+        // Both keys are the content key wrapped under itself.
+        let (_, wrapped) = encrypted(crate::ffi::transforms::ciphers::kw_aes128(), &content_key);
+        let total = 2 * wrapped.len();
+        serve_by_uri(vec![
+            ("test:inner", wrapped.clone()),
+            ("test:outer", wrapped),
+        ]);
+        let doc = parsed(concat!(
+            "<EncryptedKey xmlns=\"http://www.w3.org/2001/04/xmlenc#\">",
+            "<EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#kw-aes128\"/>",
+            "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\">",
+            "<EncryptedKey xmlns=\"http://www.w3.org/2001/04/xmlenc#\">",
+            "<EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#kw-aes128\"/>",
+            "<CipherData><CipherReference URI=\"test:inner\"/></CipherData>",
+            "</EncryptedKey>",
+            "</KeyInfo>",
+            "<CipherData><CipherReference URI=\"test:outer\"/></CipherData>",
+            "</EncryptedKey>"
+        ));
+        let mngr = xmlSecKeysMngrCreate();
+        (*mngr).get_key = Some(kek_or_read);
+        for (limit, admitted) in [(total - 1, false), (total, true)] {
+            xml_sec_libxml2::policy::republish_encryption(
+                |_| {},
+                |decryption| decryption.resources.max_external_resource_total_bytes = limit,
+            )
+            .expect("the library policy compiles");
+            let ctx = xmlSecEncCtxCreate(mngr);
+            (*ctx).mode = MODE_ENCRYPTED_KEY;
+            (*ctx).transform_ctx.enabled_uris = 0xFFFF;
+            // The inner EncryptedKey's context takes the caller's URI settings.
+            let read = &raw mut (*ctx).key_info_read_ctx;
+            assert_eq!(encrypted_key::xmlSecKeyInfoCtxCreateEncCtx(read), 0);
+            (*(*read).enc_ctx.cast::<XmlSecEncCtx>())
+                .transform_ctx
+                .enabled_uris = 0xFFFF;
+            let (result, reasons) = reported(|| {
+                xmlSecEncCtxDecryptToBuffer(
+                    ctx,
+                    xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc.cast()),
+                )
+            });
+            if admitted {
+                assert!(!result.is_null(), "both reads fit in {limit}: {reasons:?}");
+                assert_eq!(
+                    std::slice::from_raw_parts(
+                        xmlSecBufferGetData(result),
+                        xmlSecBufferGetSize(result)
+                    ),
+                    content_key
+                );
+            } else {
+                assert!(result.is_null(), "the reads passed the limit {limit}");
+                assert_eq!(
+                    reasons.first(),
+                    Some(&crate::ffi::errors::R_INVALID_SIZE),
+                    "{reasons:?}"
+                );
+            }
+            xmlSecEncCtxDestroy(ctx);
+        }
+        xmlSecKeysMngrDestroy(mngr);
+        xsFreeDoc(doc.cast());
+        shut_down();
+    }
+}
+
 #[test]
 fn a_cipher_reference_is_found_under_the_uri_the_core_resolves() {
     // `test:dir/../cipher` resolves to `test:cipher` (RFC 3986 section
@@ -257,82 +734,62 @@ fn a_key_read_and_the_cipher_reference_share_one_allowance() {
     // SAFETY: the library, documents, contexts, keys and a manager set up and
     // released here, on this thread alone.
     unsafe {
-        assert_eq!(xmlSecInit(), 0);
-        assert_eq!(xmlSecCryptoDLLoadLibrary(std::ptr::null()), 0);
-        assert_eq!(xmlSecCryptoAppInit(std::ptr::null()), 0);
-        assert_eq!(xmlSecCryptoInit(), 0);
-        assert_eq!(
-            crate::ffi::transforms::io::xmlSecIORegisterCallbacks(
-                Some(served_matches),
-                Some(served_open),
-                Some(served_read),
-                Some(served_close),
-            ),
-            0
-        );
-        let doc = xsNewDoc(c"1.0".as_ptr().cast());
-        let tmpl = xmlSecTmplEncDataCreate(
-            doc,
-            aes128_cbc(),
-            std::ptr::null(),
-            std::ptr::null(),
-            std::ptr::null(),
-            std::ptr::null(),
-        );
-        xsDocSetRootElement(doc, tmpl);
-        let cipher_value = xmlSecTmplEncDataEnsureCipherValue(tmpl);
-        let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
-        (*ctx).enc_key = aes_key();
-        assert_eq!(
-            xmlSecEncCtxBinaryEncrypt(ctx, tmpl, plaintext.as_ptr(), plaintext.len()),
-            0
-        );
-        xmlSecEncCtxDestroy(ctx);
-        let text = xml_sec_libxml2::ffi::tree::xsNodeGetContent(cipher_value.cast());
-        let mut size = 0;
-        assert_eq!(
-            crate::ffi::base64::xmlSecBase64DecodeInPlace(text, &raw mut size),
-            0
-        );
-        *SERVED.lock().expect("one test thread") = std::slice::from_raw_parts(text, size).to_vec();
-        crate::ffi::free(text.cast());
-        xsFreeDoc(doc);
-        xml_sec_libxml2::policy::republish_encryption(
-            |_| {},
-            |decryption| {
-                decryption.resources.max_external_resource_bytes = size;
-                decryption.resources.max_external_resource_total_bytes = KEY_READ_OCTETS + size - 1;
-            },
-        )
-        .expect("the library policy compiles");
-
-        let referenced = concat!(
+        start_up();
+        let (_, cipher) = encrypted(aes128_cbc(), plaintext);
+        let size = cipher.len();
+        serve_by_uri(vec![("test:cipher", cipher)]);
+        let doc = parsed(concat!(
             "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\">",
             "<EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#aes128-cbc\"/>",
             "<CipherData><CipherReference URI=\"test:cipher\"/></CipherData>",
             "</EncryptedData>"
-        );
-        let doc = xml_sec_libxml2::ffi::tree::xsReadMemory(
-            referenced.as_ptr().cast(),
-            std::ffi::c_int::try_from(referenced.len()).expect("a short document"),
-            std::ptr::null(),
-            std::ptr::null(),
-            0,
-        );
-        assert!(!doc.is_null());
+        ));
         let mngr = xmlSecKeysMngrCreate();
         (*mngr).get_key = Some(charging_lookup);
-        let ctx = xmlSecEncCtxCreate(mngr);
-        (*ctx).transform_ctx.enabled_uris = 0xFFFF;
-        let result =
-            xmlSecEncCtxDecryptToBuffer(ctx, xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc));
-        assert!(result.is_null(), "the two reads passed the aggregate limit");
-        xmlSecEncCtxDestroy(ctx);
+        // Below the key read alone, one octet short of both reads, and both.
+        for (total, admitted) in [
+            (KEY_READ_OCTETS - 1, false),
+            (KEY_READ_OCTETS + size - 1, false),
+            (KEY_READ_OCTETS + size, true),
+        ] {
+            xml_sec_libxml2::policy::republish_encryption(
+                |_| {},
+                |decryption| {
+                    decryption.resources.max_external_resource_bytes = size;
+                    decryption.resources.max_external_resource_total_bytes = total;
+                },
+            )
+            .expect("the library policy compiles");
+            let ctx = xmlSecEncCtxCreate(mngr);
+            (*ctx).transform_ctx.enabled_uris = 0xFFFF;
+            let (result, reasons) = reported(|| {
+                xmlSecEncCtxDecryptToBuffer(
+                    ctx,
+                    xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc.cast()),
+                )
+            });
+            if admitted {
+                assert!(!result.is_null(), "both reads fit in {total}: {reasons:?}");
+                assert_eq!(
+                    std::slice::from_raw_parts(
+                        xmlSecBufferGetData(result),
+                        xmlSecBufferGetSize(result)
+                    ),
+                    plaintext
+                );
+            } else {
+                assert!(result.is_null(), "the reads passed the limit {total}");
+                assert_eq!(
+                    reasons.first(),
+                    Some(&crate::ffi::errors::R_INVALID_SIZE),
+                    "the aggregate limit refused the read: {reasons:?}"
+                );
+            }
+            xmlSecEncCtxDestroy(ctx);
+        }
         xmlSecKeysMngrDestroy(mngr);
-        xsFreeDoc(doc);
-        assert_eq!(xmlSecCryptoShutdown(), 0);
-        assert_eq!(xmlSecCryptoAppShutdown(), 0);
-        assert_eq!(xmlSecShutdown(), 0);
+        xsFreeDoc(doc.cast());
+        shut_down();
     }
 }
 

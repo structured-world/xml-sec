@@ -52,7 +52,8 @@ mod references;
 #[cfg(test)]
 mod tests;
 pub(crate) use references::{
-    reference_xml_read, reference_xml_write, retrieval_xml_read, retrieval_xml_write,
+    next_reference_depth, reference_xml_read, reference_xml_write, retrieval_xml_read,
+    retrieval_xml_write,
 };
 
 /// The policy revision a read with `ctx` runs under: the one pinned for the

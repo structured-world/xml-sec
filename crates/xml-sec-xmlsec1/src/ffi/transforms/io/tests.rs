@@ -202,13 +202,11 @@ fn reads_of_one_operation_share_its_total_allowance() {
             .resources
             .max_external_resource_total_bytes = 24;
     });
-    let mut scope = ResourceScope {
-        pinned: &pinned,
-        side: policy::Side::Verify,
-        spent: policy::Spent::default(),
-    };
+    let mut scope = ResourceScope::new(&pinned, policy::Side::Verify, policy::Spent::default());
     assert_eq!(read_for(&mut scope, 16), Some(16));
+    assert!(!scope.limit_reached);
     assert_eq!(read_for(&mut scope, 16), None);
+    assert!(scope.limit_reached, "the refusal is the limit's");
 }
 
 /// A read runs under the revision its operation pinned: a republish after
@@ -223,11 +221,7 @@ fn a_read_runs_under_its_operations_revision() {
         |_| {},
     )
     .expect("the library policy compiles");
-    let mut scope = ResourceScope {
-        pinned: &pinned,
-        side: policy::Side::Verify,
-        spent: policy::Spent::default(),
-    };
+    let mut scope = ResourceScope::new(&pinned, policy::Side::Verify, policy::Spent::default());
     assert_eq!(read_for(&mut scope, 16), Some(16));
 }
 
@@ -243,11 +237,7 @@ fn a_signing_read_admits_what_signing_admits() {
     )
     .expect("the library policy compiles");
     let pinned = pinned_with(|_| {});
-    let mut scope = ResourceScope {
-        pinned: &pinned,
-        side: policy::Side::Sign,
-        spent: policy::Spent::default(),
-    };
+    let mut scope = ResourceScope::new(&pinned, policy::Side::Sign, policy::Spent::default());
     assert_eq!(read_for(&mut scope, 16), Some(16));
 }
 
@@ -262,11 +252,8 @@ fn a_decryption_read_is_refused_before_a_callback_opens_it() {
             .uris
             .references = UriTypeSet::SAME_DOCUMENT;
     });
-    let mut scope = ResourceScope {
-        pinned: &pinned,
-        side: policy::Side::Decrypt,
-        spent: policy::Spent::default(),
-    };
+    let mut scope = ResourceScope::new(&pinned, policy::Side::Decrypt, policy::Spent::default());
     assert_eq!(read_for(&mut scope, 16), None);
     assert_eq!(OPENED.load(Ordering::Relaxed), 0);
+    assert!(!scope.limit_reached, "a URI class refusal is no limit's");
 }

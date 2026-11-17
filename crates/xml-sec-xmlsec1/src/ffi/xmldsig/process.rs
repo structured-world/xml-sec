@@ -35,17 +35,17 @@ use super::super::keys::{XmlSecKey, xmlSecKeyGetValue, xmlSecKeyMatch};
 use super::super::keysdata::xmlSecKeyDataBinaryValueGetBuffer;
 use super::super::list::{xmlSecPtrListAdd, xmlSecPtrListGetItem, xmlSecPtrListGetSize};
 use super::super::nodeset::{xmlSecNodeSetDestroy, xmlSecNodeSetGetChildren};
-use super::super::policy::{Pinned, Side, SlotPin};
+use super::super::policy::{Pinned, Side, SlotPin, Spent};
 use super::super::strings;
 use super::super::transforms::builtin::{
     xmlSecTransformBase64GetKlass, xmlSecTransformMemBufGetBuffer, xmlSecTransformMemBufGetKlass,
 };
 use super::super::transforms::ctx::{
     KeyedResources, ReadResources, ResourceScope, XmlSecTransformCtx, charge_key_read,
-    execute_on_bytes, external_spent, read_resource, resource_keys, xmlSecTransformCtxCreate,
-    xmlSecTransformCtxCreateAndAppend, xmlSecTransformCtxDestroy, xmlSecTransformCtxExecute,
-    xmlSecTransformCtxNodeRead, xmlSecTransformCtxNodesListRead, xmlSecTransformCtxSetUri,
-    xmlSecTransformCtxXmlExecute,
+    execute_on_bytes, external_spent, read_resource, resource_keys, seed_run,
+    xmlSecTransformCtxCreate, xmlSecTransformCtxCreateAndAppend, xmlSecTransformCtxDestroy,
+    xmlSecTransformCtxExecute, xmlSecTransformCtxNodeRead, xmlSecTransformCtxNodesListRead,
+    xmlSecTransformCtxSetUri, xmlSecTransformCtxXmlExecute,
 };
 use super::super::transforms::signatures::signing_key;
 use super::super::transforms::{
@@ -215,10 +215,7 @@ unsafe fn process_signature_node(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode) ->
             return -1;
         }
     };
-    let max_references = match &policies {
-        OperationPolicies::Sign(policy) => policy.resources.max_references,
-        OperationPolicies::Verify(policy) => policy.resources.max_references,
-    };
+    let (max_references, manifests) = (policies.max_references(), policies.manifests());
     // SAFETY: live nodes of the caller's tree throughout.
     unsafe {
         if !is(node, name!(xmlSecNodeSignature)) {
@@ -253,7 +250,9 @@ unsafe fn process_signature_node(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode) ->
             std::ptr::null_mut()
         };
         while is(cur, name!(xmlSecNodeObject)) {
-            if ctx.flags & FLAGS_IGNORE_MANIFESTS == 0 && read_object(ctx, cur, max_references) < 0
+            // The effective policy, the context's flag applied, decides: the
+            // core never processes an ignored Manifest, so none is read.
+            if manifests == ManifestProcessing::Process && read_object(ctx, cur, max_references) < 0
             {
                 errors::internal(here, std::ptr::null(), c"xmlSecDSigCtxProcessObjectNode");
                 return -1;
@@ -302,24 +301,21 @@ unsafe fn run_operation(
         if run_pre_execute_callbacks(ctx) < 0 {
             return -1;
         }
-        let manifests = match &policies {
-            OperationPolicies::Sign(policy) => policy.manifest_processing,
-            OperationPolicies::Verify(policy) => policy.manifest_processing,
-        };
         // The core never dereferences a Manifest's references when the
         // policy ignores Manifests, so nothing of theirs is read.
-        let Some(pending) = pending_resources(ctx, manifests == ManifestProcessing::Process) else {
+        let processed = policies.manifests() == ManifestProcessing::Process;
+        let Some(pending) = pending_resources(ctx, processed) else {
             return -1;
         };
         match policies {
             OperationPolicies::Sign(policy) => {
                 // Signing digests every reference, so each resource is read,
                 // counted on from what the key's read spent.
-                let mut scope = ResourceScope {
+                let mut scope = ResourceScope::new(
                     pinned,
-                    side: Side::Sign,
-                    spent: external_spent(&raw mut ctx.transform_ctx),
-                };
+                    Side::Sign,
+                    external_spent(&raw mut ctx.transform_ctx),
+                );
                 let Some(resources) = read_all(pending, xsNodeGetDoc(node), &mut scope) else {
                     errors::internal(
                         here!("xmlSecDSigCtxProcessSignatureNode"),
@@ -328,7 +324,7 @@ unsafe fn run_operation(
                     );
                     return -1;
                 };
-                run_signing(ctx, node, &policy, resources)
+                run_signing(ctx, node, pinned, &policy, resources)
             }
             // Verification reads a resource only when the core dereferences
             // it, after the SignatureValue verified.
@@ -343,6 +339,24 @@ unsafe fn run_operation(
 enum OperationPolicies {
     Sign(Arc<SigningPolicy>),
     Verify(Arc<VerificationPolicy>),
+}
+
+impl OperationPolicies {
+    /// The references a signature may name, its Manifests' included.
+    fn max_references(&self) -> usize {
+        match self {
+            Self::Sign(policy) => policy.resources.max_references,
+            Self::Verify(policy) => policy.resources.max_references,
+        }
+    }
+
+    /// Whether the operation processes Manifests.
+    fn manifests(&self) -> ManifestProcessing {
+        match self {
+            Self::Sign(policy) => policy.manifest_processing,
+            Self::Verify(policy) => policy.manifest_processing,
+        }
+    }
 }
 
 /// The pinned policy of the context's operation with the context's flags
@@ -636,8 +650,13 @@ unsafe fn read_key(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode, pinned: &Pinned)
         let read = &raw mut ctx.key_info_read_ctx;
         if ctx.sign_key.is_null() {
             // The KeyInfo the lookup reads is part of this operation: it runs
-            // under the revision the operation began with.
-            let _read_pin = SlotPin::hold_pinned(&raw mut (*read).reserved0, pinned.clone());
+            // under the revision the operation began with and counts on from
+            // what the operation spent.
+            let _read_pin = SlotPin::hold_pinned(
+                &raw mut (*read).reserved0,
+                pinned.clone(),
+                external_spent(&raw mut ctx.transform_ctx),
+            );
             let mngr = ctx.key_info_read_ctx.keys_mngr;
             if let Some(get_key) = mngr.as_ref().and_then(|mngr| mngr.get_key) {
                 ctx.sign_key = get_key(node, read);
@@ -1148,19 +1167,24 @@ unsafe fn run_verification(
     // Every read of the operation shares one allowance, the key's included.
     // SAFETY: the context's own transform context.
     let spent = std::cell::Cell::new(unsafe { external_spent(&raw mut ctx.transform_ctx) });
+    // A read a resource limit refused ends the operation, as the core ends
+    // it for an exhausted budget; the lookup can only answer that the
+    // resource is missing, so the refusal is kept here and nothing more is
+    // read after it.
+    let exhausted = std::cell::Cell::new(false);
     let fetch = |key: &str| {
+        if exhausted.get() {
+            return None;
+        }
         let (resource, _) = pending
             .iter()
             .zip(&keys)
             .find(|(_, resource_key)| *resource_key == key)?;
-        let mut scope = ResourceScope {
-            pinned,
-            side: Side::Verify,
-            spent: spent.get(),
-        };
+        let mut scope = ResourceScope::new(pinned, Side::Verify, spent.get());
         // SAFETY: by the contract of `run_verification`.
         let bytes = unsafe { read_pending(resource, doc, &mut scope) };
         spent.set(scope.spent);
+        exhausted.set(scope.limit_reached);
         bytes
     };
     let resources = LazyExternalResources::new(keys.iter().cloned(), &fetch);
@@ -1189,6 +1213,10 @@ unsafe fn run_verification(
             return -1;
         }
     };
+    if exhausted.get() {
+        errors::internal(here, std::ptr::null(), c"xmlSecTransformCtxUriExecute");
+        return -1;
+    }
     // SAFETY: the context's lists and buffers.
     unsafe { report_verification(ctx, &document, &result) }
 }
@@ -1334,15 +1362,16 @@ unsafe fn keep(buffer: *mut XmlSecBuffer, bytes: &[u8]) {
     }
 }
 
-/// Runs the core signing of the template `node` in place under `policy`,
-/// with the external `resources` its references name, and reports its
-/// outcome in the contexts.
+/// Runs the core signing of the template `node` in place under `policy` of
+/// the revision `pinned`, with the external `resources` its references
+/// name, and reports its outcome in the contexts.
 ///
 /// # Safety
 /// `node` is a live node; the context's method and key are set.
 unsafe fn run_signing(
     ctx: &mut XmlSecDSigCtx,
     node: *mut XmlNode,
+    pinned: &Pinned,
     policy: &Arc<SigningPolicy>,
     resources: ReadResources,
 ) -> c_int {
@@ -1419,7 +1448,7 @@ unsafe fn run_signing(
                 reference.status = STATUS_SUCCEEDED;
             }
         }
-        if store_signing_inputs(ctx, node, manifests, &resources) < 0 {
+        if store_signing_inputs(ctx, node, pinned, manifests, &resources) < 0 {
             return -1;
         }
         keep_result(ctx)
@@ -1431,13 +1460,15 @@ unsafe fn run_signing(
 /// on the signed document, whose digested data is final, or on the
 /// external `resources` the core signed, never read again; the Manifest
 /// references only when `manifests` were processed. `SignedInfo` is
-/// canonicalized by its method. Nothing runs without a storage flag.
+/// canonicalized by its method. Each chain runs as a part of the signing,
+/// under its revision `pinned`. Nothing runs without a storage flag.
 ///
 /// # Safety
 /// `node` is the signed, live `Signature` element of the context.
 unsafe fn store_signing_inputs(
     ctx: &mut XmlSecDSigCtx,
     node: *mut XmlNode,
+    pinned: &Pinned,
     manifests: bool,
     resources: &KeyedResources,
 ) -> c_int {
@@ -1455,6 +1486,7 @@ unsafe fn store_signing_inputs(
                     continue;
                 }
                 let transforms = &raw mut reference.transform_ctx;
+                seed_run(transforms, pinned, Side::Sign, None, Spent::default());
                 // An external reference was read once, into the bytes the
                 // core signed under the key its own element resolved.
                 let external = external_of(reference.reserved0.cast::<XmlNode>())
@@ -1476,7 +1508,7 @@ unsafe fn store_signing_inputs(
             return 0;
         }
         let signed_info = first_element(node);
-        let Some(canonical) = canonical_signed_info(signed_info, doc) else {
+        let Some(canonical) = canonical_signed_info(signed_info, doc, pinned) else {
             errors::internal(here, std::ptr::null(), c"xmlSecTransformCtxXmlExecute");
             return -1;
         };
@@ -1490,17 +1522,23 @@ unsafe fn store_signing_inputs(
 
 /// `SignedInfo` canonicalized by its `CanonicalizationMethod`, with the
 /// method's parameters, over its subtree with comments, as libxmlsec1 feeds
-/// it to the signature method; `None` after a report.
+/// it to the signature method, under the signing's revision `pinned`;
+/// `None` after a report.
 ///
 /// # Safety
 /// `signed_info` is a live `SignedInfo` element of `doc`.
-unsafe fn canonical_signed_info(signed_info: *mut XmlNode, doc: *mut XmlDoc) -> Option<Vec<u8>> {
+unsafe fn canonical_signed_info(
+    signed_info: *mut XmlNode,
+    doc: *mut XmlDoc,
+    pinned: &Pinned,
+) -> Option<Vec<u8>> {
     // SAFETY: a context and node set created and released here; live nodes.
     unsafe {
         let ctx = xmlSecTransformCtxCreate();
         if ctx.is_null() {
             return None;
         }
+        seed_run(ctx, pinned, Side::Sign, None, Spent::default());
         let method = first_element(signed_info);
         let nodes = xmlSecNodeSetGetChildren(doc, signed_info, 1, 0);
         let canonical = (!nodes.is_null()
