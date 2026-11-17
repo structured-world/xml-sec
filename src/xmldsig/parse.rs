@@ -3979,7 +3979,7 @@ fn format_x509_serial_value_hex(serial: &[u8]) -> String {
 }
 
 /// The decimal text of the unsigned big-endian serial value `serial`, the
-/// form `X509SerialNumber` carries (XMLDSig 1.1 section 4.5.4.1:
+/// form `X509SerialNumber` carries (`XMLDSig` 1.1 section 4.5.4.1:
 /// `xsd:integer`).
 fn format_x509_serial_decimal(serial: &[u8]) -> String {
     // Little-endian decimal digits, multiplied by 256 per input octet.

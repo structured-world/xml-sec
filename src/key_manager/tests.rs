@@ -565,6 +565,13 @@ fn pkcs12_unrelated_ca_does_not_block_private_key() {
     assert_eq!(inventory.private_keys.len(), 1);
     assert_eq!(inventory.private_keys[0].certificate_chain.len(), 1);
     assert!(!inventory.private_keys[0].has_matching_leaf);
+    // The unrelated CA stays reachable, though not as the key's chain.
+    assert!(
+        inventory.private_keys[0]
+            .matching_certificate_chain()
+            .is_none()
+    );
+    assert_eq!(inventory.private_keys[0].certificates().len(), 1);
     assert!(
         inventory
             .signing_key(
@@ -5025,6 +5032,14 @@ fn pem_block_der_returns_one_block_of_the_requested_label() {
         pem_block_der(b"no frame", "CERTIFICATE", &resources),
         Err(KeyStoreError::Selection(_))
     ));
+    // RFC 7468 section 2: explanatory text before the block, as OpenSSL's
+    // `x509 -text` output leaves it, is no part of the block.
+    let explained = format!("Certificate:\n    Data: ...\n{pem}");
+    assert_eq!(
+        pem_block_der(explained.as_bytes(), "CERTIFICATE", &resources)
+            .expect("certificate after explanatory text"),
+        certificate.der().to_vec()
+    );
     // Input beyond the per-resource limit is refused before it is read.
     let small = ResourcePolicy {
         max_external_resource_bytes: pem.len() - 1,

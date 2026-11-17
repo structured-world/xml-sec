@@ -108,7 +108,7 @@ fn a_certificate_reads_its_names_serial_and_key_identifier() {
     .expect("leaf metadata");
     assert_eq!(parsed.subject_dn, "CN=target leaf");
     assert_eq!(parsed.issuer_dn, "CN=target intermediate");
-    assert!(!parsed.serial_number.is_empty());
+    assert_ne!(parsed.serial_number, Vec::<u8>::new());
     assert_eq!(parsed.subject_public_key_info, chain.leaf_spki);
     assert_eq!(parsed.not_before.seconds(), 157_766_400);
     assert_eq!(parsed.not_after.seconds(), 67_090_118_400);
@@ -164,8 +164,8 @@ fn only_certificates_issuing_none_of_the_others_are_leaves() {
     // A store's certificate decides too: the intermediate issued the leaf.
     assert_eq!(
         x509_leaf_certificates(
-            &[chain.intermediate.clone()],
-            &[chain.leaf.clone()],
+            std::slice::from_ref(&chain.intermediate),
+            std::slice::from_ref(&chain.leaf),
             &ResourcePolicy::default()
         ),
         Ok(Vec::new())
@@ -219,7 +219,7 @@ fn a_target_outside_its_validity_has_no_key() {
     let before = SystemTime::UNIX_EPOCH + Duration::from_secs(3600);
     let expired = verify_x509_certificate(
         &chain.leaf,
-        &[chain.intermediate.clone()],
+        std::slice::from_ref(&chain.intermediate),
         &[],
         &options(&anchors, before),
         &ResourcePolicy::default(),
@@ -260,7 +260,7 @@ fn evidence_beyond_the_aggregate_byte_limit_is_refused_before_parsing() {
     // The anchor is evidence too, and it no longer fits.
     let refused = verify_x509_certificate(
         &chain.leaf,
-        &[chain.intermediate.clone()],
+        std::slice::from_ref(&chain.intermediate),
         &[],
         &options(&anchors, SystemTime::now()),
         &resources,

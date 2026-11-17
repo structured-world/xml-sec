@@ -464,6 +464,13 @@ impl StoredPrivateKey {
     pub fn matching_certificate_chain(&self) -> Option<&[Vec<u8>]> {
         self.has_matching_leaf.then_some(&self.certificate_chain)
     }
+
+    /// Every certificate imported with this key, the key's own first when
+    /// [`Self::matching_certificate_chain`] has one; none is trusted.
+    #[must_use]
+    pub fn certificates(&self) -> &[Vec<u8>] {
+        &self.certificate_chain
+    }
 }
 
 /// A named public key imported from an xmlsec key store.
@@ -3505,8 +3512,9 @@ fn preflight_dsa_pkcs8_components(info: &PrivateKeyInfoRef<'_>) -> Result<(), Ke
 }
 
 /// The DER of `bytes`, one complete PEM block labelled `label` (RFC 7468,
-/// for example `CERTIFICATE` or `X509 CRL`), within the policy's
-/// per-resource byte limit. The DER is not checked as the label's structure.
+/// for example `CERTIFICATE` or `X509 CRL`) after any explanatory text,
+/// within the policy's per-resource byte limit. The DER is not checked as
+/// the label's structure.
 ///
 /// # Errors
 /// Returns the resource limit for oversized input, or a selection error for
@@ -3516,7 +3524,20 @@ pub fn pem_block_der(
     label: &str,
     resources: &ResourcePolicy,
 ) -> Result<Vec<u8>, KeyStoreError> {
-    let block = BorrowedPem::parse(bytes, resources.max_external_resource_bytes)?;
+    if bytes.len() > resources.max_external_resource_bytes {
+        return Err(import_resource_limit(
+            crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
+            resources.max_external_resource_bytes,
+        ));
+    }
+    // RFC 7468 section 2 permits data before the encapsulation boundary;
+    // the block starts at its first BEGIN line.
+    // https://www.rfc-editor.org/rfc/rfc7468.html#section-2
+    let start = bytes
+        .windows(b"-----BEGIN ".len())
+        .position(|window| window == b"-----BEGIN ")
+        .ok_or(KeyStoreError::Selection("invalid PEM key"))?;
+    let block = BorrowedPem::parse(&bytes[start..], resources.max_external_resource_bytes)?;
     if block.label != label {
         return Err(KeyStoreError::Selection("unexpected PEM label"));
     }
