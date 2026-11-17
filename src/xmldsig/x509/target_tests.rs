@@ -109,6 +109,9 @@ fn a_certificate_reads_its_names_serial_and_key_identifier() {
     assert_eq!(parsed.subject_dn, "CN=target leaf");
     assert_eq!(parsed.issuer_dn, "CN=target intermediate");
     assert!(!parsed.serial_number.is_empty());
+    assert_eq!(parsed.subject_public_key_info, chain.leaf_spki);
+    assert_eq!(parsed.not_before.seconds(), 157_766_400);
+    assert_eq!(parsed.not_after.seconds(), 67_090_118_400);
     let refused = crate::xmldsig::parse_x509_certificate_with_resources(
         &chain.leaf,
         &ResourcePolicy {

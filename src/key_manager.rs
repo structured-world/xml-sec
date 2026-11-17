@@ -3504,6 +3504,25 @@ fn preflight_dsa_pkcs8_components(info: &PrivateKeyInfoRef<'_>) -> Result<(), Ke
         .map_err(|_| KeyStoreError::Selection("invalid or oversized DSA private key"))
 }
 
+/// The DER of `bytes`, one complete PEM block labelled `label` (RFC 7468,
+/// for example `CERTIFICATE` or `X509 CRL`), within the policy's
+/// per-resource byte limit. The DER is not checked as the label's structure.
+///
+/// # Errors
+/// Returns the resource limit for oversized input, or a selection error for
+/// text that is not one block of that label or whose Base64 is invalid.
+pub fn pem_block_der(
+    bytes: &[u8],
+    label: &str,
+    resources: &ResourcePolicy,
+) -> Result<Vec<u8>, KeyStoreError> {
+    let block = BorrowedPem::parse(bytes, resources.max_external_resource_bytes)?;
+    if block.label != label {
+        return Err(KeyStoreError::Selection("unexpected PEM label"));
+    }
+    block.decode()
+}
+
 // Borrow the frame and stream whitespace-separated Base64 into one preflighted
 // DER buffer. No normalized Base64 string or owned label/header copies are needed.
 struct BorrowedPem<'a> {

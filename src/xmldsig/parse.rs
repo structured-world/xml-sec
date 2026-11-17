@@ -838,6 +838,12 @@ pub struct ParsedX509Certificate {
     pub subject_key_identifier: Option<Vec<u8>>,
     /// Parsed certificate public key material.
     pub public_key: X509PublicKeyInfo,
+    /// The certificate's `SubjectPublicKeyInfo` DER as it is encoded.
+    pub subject_public_key_info: Vec<u8>,
+    /// The start of the certificate's validity period.
+    pub not_before: crate::policy::Instant,
+    /// The end of the certificate's validity period.
+    pub not_after: crate::policy::Instant,
 }
 
 /// Public key material extracted from certificate `SubjectPublicKeyInfo`.
@@ -3905,6 +3911,7 @@ pub(crate) fn certificate_metadata(
         }
     };
 
+    let validity = cert.tbs().validity();
     Ok(ParsedX509Certificate {
         subject_dn,
         issuer_dn,
@@ -3912,6 +3919,9 @@ pub(crate) fn certificate_metadata(
         serial_number_hex,
         subject_key_identifier,
         public_key,
+        subject_public_key_info: spki.as_bytes().to_vec(),
+        not_before: validity.not_before().instant(),
+        not_after: validity.not_after().instant(),
     })
 }
 
