@@ -192,6 +192,11 @@ fn one_document_generation_flows_through_sign_verify_encrypt_and_decrypt() {
     assert_eq!(verified.status, DsigStatus::Valid);
 }
 
+// A late-bound view lifetime, as `with_view` requires of its callback.
+fn root_of(view: xml_sec::DocumentView<'_>) -> xml_sec::NodeIdentity {
+    view.root_element()
+}
+
 /// The identities of the `EncryptedData` elements of `document`, in order.
 fn encrypted_data_identities(document: &XmlDocument) -> Vec<xml_sec::NodeIdentity> {
     document.with_view(|view| {
@@ -242,7 +247,7 @@ fn decrypt_in_document_decrypts_the_named_element_and_changes_nothing() {
 #[test]
 fn decrypt_in_document_refuses_a_node_that_is_no_encrypted_data() {
     let document = XmlDocument::parse("<root/>").expect("owned XML fixture must parse");
-    let root = document.with_view(|view| view.root_element());
+    let root = document.with_view(root_of);
     let error = DecryptContext::new(&SymmetricKeyDecryptor::new([0x5a; 16]))
         .decrypt_in_document(&document, root)
         .expect_err("the root is no EncryptedData");

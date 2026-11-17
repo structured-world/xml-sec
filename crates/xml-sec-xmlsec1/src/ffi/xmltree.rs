@@ -17,6 +17,7 @@ pub(crate) use content::{
 pub(crate) use edit::{
     xmlSecAddChild, xmlSecAddIDs, xmlSecAddNextSibling, xmlSecAddPrevSibling,
     xmlSecEnsureEmptyChild, xmlSecGetDefaultLineFeed, xmlSecReplaceContent,
+    xmlSecReplaceNodeBuffer, xmlSecReplaceNodeBufferAndReturn,
 };
 
 /// C `isspace` in the "C" locale, which libxmlsec1 trims and tests with.

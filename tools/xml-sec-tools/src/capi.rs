@@ -152,6 +152,7 @@ impl Target {
                 "tests/c/app.c",
                 "tests/c/x509.c",
                 "tests/c/xmldsig.c",
+                "tests/c/xmlenc.c",
             ],
         }
     }

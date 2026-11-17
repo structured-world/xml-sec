@@ -1,0 +1,549 @@
+//! Decryption with an encryption context.
+//!
+//! The `EncryptedData` element is read as libxmlsec1 reads it: its method
+//! through the registered klasses, its cipher data, its key through the read
+//! `KeyInfo` context. The core then decrypts exactly that element of the
+//! caller's tree under the library policy; the plaintext becomes the
+//! context's result and, when the element's `Type` asks, replaces it.
+
+use std::ffi::c_int;
+
+use xml_sec::document::external::ExternalNode;
+use xml_sec::xmlenc::{
+    DataEncryptionAlgorithm, DecryptContext, DecryptedContent, SymmetricKeyDecryptor,
+};
+use zeroize::Zeroizing;
+
+use super::super::buffer::{
+    XmlSecBuffer, xmlSecBufferGetData, xmlSecBufferGetSize, xmlSecBufferSetData,
+};
+use super::super::errors::{self, here};
+use super::super::keys::{xmlSecKeyGetValue, xmlSecKeyMatch};
+use super::super::keysdata::xmlSecKeyDataBinaryValueGetBuffer;
+use super::super::policy::Pinned;
+use super::super::strings;
+use super::super::transforms::builtin::xmlSecTransformBase64GetKlass;
+use super::super::transforms::ctx::{
+    xmlSecTransformCtxCreateAndAppend, xmlSecTransformCtxCreateAndPrepend,
+    xmlSecTransformCtxNodeRead, xmlSecTransformCtxNodesListRead, xmlSecTransformCtxSetUri,
+};
+use super::super::transforms::{
+    OPERATION_DECRYPT, OPERATION_ENCRYPT, USAGE_DSIG_TRANSFORM, USAGE_ENCRYPTION_METHOD,
+    xmlSecTransformSetKey, xmlSecTransformSetKeyReq,
+};
+use super::super::tree::{XmlNode, c_text, give, nodes};
+use super::super::xmltree::{
+    xmlSecAddIDs, xmlSecCheckNodeName, xmlSecGetNextElementNode, xmlSecGetNodeContentAndTrim,
+    xmlSecReplaceNodeBuffer, xmlSecReplaceNodeBufferAndReturn,
+};
+use super::{
+    FAILURE_KEY_NOT_FOUND, FAILURE_UNKNOWN, FLAGS_RETURN_REPLACED_NODE, MODE_ENCRYPTED_DATA,
+    MODE_ENCRYPTED_KEY, XmlSecEncCtx,
+};
+use xml_sec_libxml2::ffi::tree::{xsNodeGetChildren, xsNodeGetDoc};
+
+/// A name of libxmlsec1's strings.
+macro_rules! name {
+    ($name:ident) => {
+        strings::$name.as_ptr()
+    };
+}
+
+/// Whether `node` is the element `name` of the namespace `ns`.
+///
+/// # Safety
+/// `node` is null or a live node.
+unsafe fn is(node: *mut XmlNode, name: *const u8, ns: *const u8) -> bool {
+    // SAFETY: by the caller's contract.
+    !node.is_null() && unsafe { xmlSecCheckNodeName(node, name, ns) } != 0
+}
+
+/// The first element child of `node`.
+///
+/// # Safety
+/// `node` is a live node.
+unsafe fn first_element(node: *mut XmlNode) -> *mut XmlNode {
+    // SAFETY: by the caller's contract.
+    unsafe { xmlSecGetNextElementNode(xsNodeGetChildren(node)) }
+}
+
+/// The next element sibling of `node`.
+///
+/// # Safety
+/// `node` is a live node.
+unsafe fn next_element(node: *mut XmlNode) -> *mut XmlNode {
+    // SAFETY: by the caller's contract.
+    unsafe { xmlSecGetNextElementNode(nodes::next(node)) }
+}
+
+/// The C copy of the attribute `name` of `node`, null when absent.
+fn attribute(node: *mut XmlNode, name: &str) -> *mut u8 {
+    give(nodes::property(node, name).as_deref())
+}
+
+/// Registers the `Id` attributes of `node`'s subtree as IDs, as libxmlsec1
+/// registers those of an encryption element.
+///
+/// # Safety
+/// `node` is a live node.
+unsafe fn add_ids(node: *mut XmlNode) {
+    let ids = [name!(xmlSecAttrId), std::ptr::null()];
+    // SAFETY: a live node of its document and a null-terminated list.
+    unsafe { xmlSecAddIDs(xsNodeGetDoc(node), node, ids.as_ptr()) };
+}
+
+/// `xmlSecEncCtxDecrypt` past its preconditions.
+///
+/// # Safety
+/// `node` is a live node.
+pub(super) unsafe fn decrypt(ctx: &mut XmlSecEncCtx, node: *mut XmlNode) -> c_int {
+    let here = here!("xmlSecEncCtxDecrypt");
+    ctx.operation = OPERATION_DECRYPT;
+    // SAFETY: a live node.
+    let buffer = unsafe { decrypt_to_buffer(ctx, node) };
+    if buffer.is_null() {
+        errors::internal(here, std::ptr::null(), c"xmlSecEncCtxDecryptToBuffer");
+        return -1;
+    }
+    // SAFETY: the context's result buffer.
+    let (data, size) = unsafe { (xmlSecBufferGetData(buffer), xmlSecBufferGetSize(buffer)) };
+    let empty = [0_u8; 1];
+    let (data, size) = if data.is_null() {
+        (empty.as_ptr(), 0)
+    } else {
+        (data.cast_const(), size)
+    };
+    // An EncryptedData without a Type stays for the caller, who reads the
+    // result as bytes.
+    // SAFETY: the context's attribute string.
+    let replace = matches!(
+        unsafe { c_text(ctx.type_) },
+        Some(
+            "http://www.w3.org/2001/04/xmlenc#Element" | "http://www.w3.org/2001/04/xmlenc#Content"
+        )
+    );
+    if !replace {
+        return 0;
+    }
+    // SAFETY: the node and the result's bytes; the replaced list is the
+    // context's.
+    let replaced = unsafe {
+        if ctx.flags & FLAGS_RETURN_REPLACED_NODE != 0 {
+            xmlSecReplaceNodeBufferAndReturn(node, data, size, &raw mut ctx.replaced_node_list)
+        } else {
+            xmlSecReplaceNodeBuffer(node, data, size)
+        }
+    };
+    if replaced < 0 {
+        let object = super::super::tree::name_for_report(node);
+        errors::internal(here, object.as_ptr(), c"xmlSecReplaceNodeBuffer");
+        return -1;
+    }
+    ctx.result_replaced = 1;
+    0
+}
+
+/// `xmlSecEncCtxDecryptToBuffer` past its first precondition.
+///
+/// # Safety
+/// `node` is null or a live node.
+pub(super) unsafe fn decrypt_to_buffer(
+    ctx: &mut XmlSecEncCtx,
+    node: *mut XmlNode,
+) -> *mut XmlSecBuffer {
+    let here = here!("xmlSecEncCtxDecryptToBuffer");
+    ctx.operation = OPERATION_DECRYPT;
+    if !ctx.result.is_null() {
+        errors::assertion(here, c"encCtx->result == NULL");
+        return std::ptr::null_mut();
+    }
+    if node.is_null() {
+        errors::assertion(here, c"node != NULL");
+        return std::ptr::null_mut();
+    }
+    // SAFETY: a live node.
+    unsafe {
+        add_ids(node);
+        if read_enc_data(ctx, node, false) < 0 {
+            errors::internal(here, std::ptr::null(), c"xmlSecEncCtxEncDataNodeRead");
+            return std::ptr::null_mut();
+        }
+        run_decryption(ctx, node)
+    }
+}
+
+/// libxmlsec1's `xmlSecEncCtxEncDataNodeRead`: the attributes, the method,
+/// the cipher data and the key of the `EncryptedData` or `EncryptedKey`
+/// element `node`, with a Base64 encoder after the method when an
+/// encryption writes a `CipherValue` and `add_base64` asks.
+///
+/// # Safety
+/// `node` is a live node.
+unsafe fn read_enc_data(ctx: &mut XmlSecEncCtx, node: *mut XmlNode, add_base64: bool) -> c_int {
+    let here = here!("xmlSecEncCtxEncDataNodeRead");
+    let enc_ns = name!(xmlSecEncNs);
+    for (holds, expression) in [
+        (
+            ctx.operation == OPERATION_ENCRYPT || ctx.operation == OPERATION_DECRYPT,
+            c"(encCtx->operation == xmlSecTransformOperationEncrypt) || (encCtx->operation == xmlSecTransformOperationDecrypt)",
+        ),
+        (ctx.enc_data_node.is_null(), c"encCtx->encDataNode == NULL"),
+        (ctx.id.is_null(), c"encCtx->id == NULL"),
+        (ctx.type_.is_null(), c"encCtx->type == NULL"),
+        (ctx.enc_method_node.is_null(), c"encCtx->encMethodNode == NULL"),
+        (ctx.key_info_node.is_null(), c"encCtx->keyInfoNode == NULL"),
+        (ctx.enc_method.is_null(), c"encCtx->encMethod == NULL"),
+    ] {
+        if !holds {
+            errors::assertion(here, expression);
+            return -1;
+        }
+    }
+    ctx.enc_data_node = node;
+    // SAFETY: live nodes of the caller's tree and the context's own members.
+    unsafe {
+        let (expected, label) = match ctx.mode {
+            MODE_ENCRYPTED_KEY => (name!(xmlSecNodeEncryptedKey), "EncryptedKey"),
+            _ => (name!(xmlSecNodeEncryptedData), "EncryptedData"),
+        };
+        if ctx.mode != MODE_ENCRYPTED_DATA && ctx.mode != MODE_ENCRYPTED_KEY {
+            errors::unsupported_enum(here, std::ptr::null(), "mode", ctx.mode);
+            return -1;
+        }
+        if !is(node, expected, enc_ns) {
+            errors::invalid_node(here, node, label, std::ptr::null());
+            return -1;
+        }
+        ctx.id = attribute(node, "Id");
+        ctx.type_ = attribute(node, "Type");
+        ctx.mime_type = attribute(node, "MimeType");
+        ctx.encoding = attribute(node, "Encoding");
+        if ctx.mode == MODE_ENCRYPTED_KEY {
+            ctx.recipient = attribute(node, "Recipient");
+        }
+        let mut cur = first_element(node);
+        if is(cur, name!(xmlSecNodeEncryptionMethod), enc_ns) {
+            ctx.enc_method_node = cur;
+            cur = next_element(cur);
+        }
+        if is(cur, name!(xmlSecNodeKeyInfo), name!(xmlSecDSigNs)) {
+            ctx.key_info_node = cur;
+            cur = next_element(cur);
+        }
+        if !is(cur, name!(xmlSecNodeCipherData), enc_ns) {
+            errors::invalid_node(here, cur, "CipherData", std::ptr::null());
+            return -1;
+        }
+        if read_cipher_data(ctx, cur) < 0 {
+            errors::internal(here, std::ptr::null(), c"xmlSecEncCtxCipherDataNodeRead");
+            return -1;
+        }
+        cur = next_element(cur);
+        if is(cur, name!(xmlSecNodeEncryptionProperties), enc_ns) {
+            cur = next_element(cur);
+        }
+        if ctx.mode == MODE_ENCRYPTED_KEY {
+            if is(cur, name!(xmlSecNodeReferenceList), enc_ns) {
+                cur = next_element(cur);
+            }
+            if is(cur, name!(xmlSecNodeCarriedKeyName), enc_ns) {
+                ctx.carried_key_name = xmlSecGetNodeContentAndTrim(cur);
+                if ctx.carried_key_name.is_null() {
+                    errors::invalid_node_content(here, cur, std::ptr::null(), "empty");
+                    return -1;
+                }
+                cur = next_element(cur);
+            }
+        }
+        if !cur.is_null() {
+            errors::unexpected_node(here, cur, std::ptr::null());
+            return -1;
+        }
+        read_method_and_key(ctx, add_base64)
+    }
+}
+
+/// The method and key half of libxmlsec1's `xmlSecEncCtxEncDataNodeRead`:
+/// the method from `EncryptionMethod` or the context's default, the key it
+/// requires through the read `KeyInfo` context, and the Base64 encoder of
+/// an encryption that writes a `CipherValue`.
+///
+/// # Safety
+/// The context's element nodes were read.
+unsafe fn read_method_and_key(ctx: &mut XmlSecEncCtx, add_base64: bool) -> c_int {
+    let here = here!("xmlSecEncCtxEncDataNodeRead");
+    // SAFETY: the context's nodes and its own members.
+    unsafe {
+        let transforms = &raw mut ctx.transform_ctx;
+        if !ctx.enc_method_node.is_null() {
+            ctx.enc_method = xmlSecTransformCtxNodeRead(
+                transforms,
+                ctx.enc_method_node,
+                USAGE_ENCRYPTION_METHOD,
+            );
+            if ctx.enc_method.is_null() {
+                errors::internal(
+                    here,
+                    c"EncryptionMethod".as_ptr(),
+                    c"xmlSecTransformCtxNodeRead",
+                );
+                return -1;
+            }
+        } else if !ctx.def_enc_method_id.is_null() {
+            ctx.enc_method = xmlSecTransformCtxCreateAndAppend(transforms, ctx.def_enc_method_id);
+            if ctx.enc_method.is_null() {
+                errors::internal(here, std::ptr::null(), c"xmlSecTransformCtxCreateAndAppend");
+                return -1;
+            }
+        } else {
+            errors::invalid_data(here, std::ptr::null(), "encryption method not specified");
+            return -1;
+        }
+        (*ctx.enc_method).operation = ctx.operation;
+        ctx.key_info_read_ctx.operation = ctx.operation;
+        ctx.key_info_write_ctx.operation = ctx.operation;
+        let method_name = (*(*ctx.enc_method).id).name.cast();
+        if xmlSecTransformSetKeyReq(
+            ctx.enc_method,
+            (&raw mut ctx.key_info_read_ctx.key_req).cast(),
+        ) < 0
+        {
+            errors::internal(here, method_name, c"xmlSecTransformSetKeyReq");
+            return -1;
+        }
+        let read = &raw mut ctx.key_info_read_ctx;
+        if ctx.enc_key.is_null() {
+            let mngr = ctx.key_info_read_ctx.keys_mngr;
+            if let Some(get_key) = mngr.as_ref().and_then(|mngr| mngr.get_key) {
+                ctx.enc_key = get_key(ctx.key_info_node, read);
+            }
+        }
+        if ctx.enc_key.is_null()
+            || xmlSecKeyMatch(ctx.enc_key, std::ptr::null(), &raw mut (*read).key_req) == 0
+        {
+            let method = c_text((*(*ctx.enc_method).id).name).unwrap_or("NULL");
+            errors::other(
+                here,
+                errors::R_KEY_NOT_FOUND,
+                std::ptr::null(),
+                Some(&format!("encMethod={method}")),
+            );
+            if ctx.failure_reason == FAILURE_UNKNOWN {
+                ctx.failure_reason = FAILURE_KEY_NOT_FOUND;
+            }
+            return -1;
+        }
+        if xmlSecTransformSetKey(ctx.enc_method, ctx.enc_key.cast()) < 0 {
+            errors::internal(here, method_name, c"xmlSecTransformSetKey");
+            return -1;
+        }
+        if add_base64 && ctx.operation == OPERATION_ENCRYPT && !ctx.cipher_value_node.is_null() {
+            let encode =
+                xmlSecTransformCtxCreateAndAppend(transforms, xmlSecTransformBase64GetKlass());
+            if encode.is_null() {
+                errors::internal(here, std::ptr::null(), c"xmlSecTransformCtxCreateAndAppend");
+                return -1;
+            }
+            (*encode).operation = super::super::transforms::OPERATION_ENCODE;
+            ctx.result_base64_encoded = 1;
+        }
+    }
+    0
+}
+
+/// libxmlsec1's `xmlSecEncCtxCipherDataNodeRead`: a `CipherValue`, decoded
+/// from Base64 when decrypting, or a `CipherReference` read when decrypting.
+///
+/// # Safety
+/// `node` is a live node.
+unsafe fn read_cipher_data(ctx: &mut XmlSecEncCtx, node: *mut XmlNode) -> c_int {
+    let here = here!("xmlSecEncCtxCipherDataNodeRead");
+    let enc_ns = name!(xmlSecEncNs);
+    let transforms = &raw mut ctx.transform_ctx;
+    // SAFETY: live nodes and the context's own transform context.
+    unsafe {
+        let mut cur = first_element(node);
+        if is(cur, name!(xmlSecNodeCipherValue), enc_ns) {
+            if ctx.operation == OPERATION_DECRYPT
+                && xmlSecTransformCtxCreateAndPrepend(transforms, xmlSecTransformBase64GetKlass())
+                    .is_null()
+            {
+                errors::internal(
+                    here,
+                    std::ptr::null(),
+                    c"xmlSecTransformCtxCreateAndPrepend",
+                );
+                return -1;
+            }
+            ctx.cipher_value_node = cur;
+            cur = next_element(cur);
+        } else if is(cur, name!(xmlSecNodeCipherReference), enc_ns) {
+            if ctx.operation == OPERATION_DECRYPT && read_cipher_reference(ctx, cur) < 0 {
+                errors::internal(
+                    here,
+                    c"CipherReference".as_ptr(),
+                    c"xmlSecEncCtxCipherReferenceNodeRead",
+                );
+                return -1;
+            }
+            cur = next_element(cur);
+        } else if cur.is_null() {
+            errors::invalid_data(
+                here,
+                std::ptr::null(),
+                "CipherData node must contain either a CipherValue or a CipherReference node",
+            );
+            return -1;
+        }
+        if !cur.is_null() {
+            errors::unexpected_node(here, cur, std::ptr::null());
+            return -1;
+        }
+    }
+    0
+}
+
+/// libxmlsec1's `xmlSecEncCtxCipherReferenceNodeRead`: the start URI and
+/// the transforms of a `CipherReference`.
+///
+/// # Safety
+/// `node` is a live node.
+unsafe fn read_cipher_reference(ctx: &mut XmlSecEncCtx, node: *mut XmlNode) -> c_int {
+    let here = here!("xmlSecEncCtxCipherReferenceNodeRead");
+    let transforms = &raw mut ctx.transform_ctx;
+    let uri = attribute(node, "URI");
+    // SAFETY: live nodes, the context's own transform context and the
+    // copy freed here.
+    unsafe {
+        let set = xmlSecTransformCtxSetUri(transforms, uri, node);
+        let text = c_text(uri).unwrap_or("NULL").to_owned();
+        super::super::free(uri.cast());
+        if set < 0 {
+            errors::internal_with(
+                here,
+                std::ptr::null(),
+                c"xmlSecTransformCtxSetUri",
+                &format!("uri={text}"),
+            );
+            return -1;
+        }
+        let mut cur = first_element(node);
+        if is(cur, name!(xmlSecNodeTransforms), name!(xmlSecEncNs)) {
+            if xmlSecTransformCtxNodesListRead(transforms, cur, USAGE_DSIG_TRANSFORM) < 0 {
+                errors::internal(
+                    here,
+                    c"Transforms".as_ptr(),
+                    c"xmlSecTransformCtxNodesListRead",
+                );
+                return -1;
+            }
+            cur = next_element(cur);
+        }
+        if !cur.is_null() {
+            errors::unexpected_node(here, cur, std::ptr::null());
+            return -1;
+        }
+    }
+    0
+}
+
+/// The content key of the context's key for its method, with the family the
+/// core's resolver needs.
+///
+/// # Safety
+/// The context's method and key are set.
+unsafe fn content_key(ctx: &XmlSecEncCtx) -> Option<(DataEncryptionAlgorithm, Zeroizing<Vec<u8>>)> {
+    // SAFETY: the method's klass and the key's value outlive the call.
+    unsafe {
+        let href = c_text((*(*ctx.enc_method).id).href)?;
+        let algorithm = DataEncryptionAlgorithm::from_uri(href).ok()?;
+        let buffer = xmlSecKeyDataBinaryValueGetBuffer(xmlSecKeyGetValue(ctx.enc_key));
+        let data = xmlSecBufferGetData(buffer);
+        let size = xmlSecBufferGetSize(buffer);
+        if data.is_null() || size < algorithm.key_len() {
+            return None;
+        }
+        // libxmlsec1 takes the leading bytes of a longer key.
+        let bytes = std::slice::from_raw_parts(data, algorithm.key_len()).to_vec();
+        Some((algorithm, Zeroizing::new(bytes)))
+    }
+}
+
+/// Runs the core decryption of the `EncryptedData` element `node` and makes
+/// the plaintext the context's result, a buffer of its method.
+///
+/// # Safety
+/// `node` is a live node; the context's method and key are set.
+unsafe fn run_decryption(ctx: &mut XmlSecEncCtx, node: *mut XmlNode) -> *mut XmlSecBuffer {
+    let here = here!("xmlSecEncCtxDecryptToBuffer");
+    let Some(pinned) = Pinned::current(here) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: the method and key were read.
+    let Some((algorithm, key)) = (unsafe { content_key(ctx) }) else {
+        errors::internal(here, std::ptr::null(), c"xmlSecKeyGetValue");
+        return std::ptr::null_mut();
+    };
+    let Some(external) = nodes::tree_node(node).map(|(_, tree_node)| ExternalNode::from(tree_node))
+    else {
+        errors::internal(here, std::ptr::null(), c"node identity");
+        return std::ptr::null_mut();
+    };
+    let policy = std::sync::Arc::clone(&pinned.decryption);
+    let (document, _) = match xml_sec_libxml2::document::snapshot(node, &*policy) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            errors::xml_failed_with(
+                here,
+                std::ptr::null(),
+                c"xmlSecEncCtxDecryptToBuffer",
+                &error.to_string(),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+    let Some(target) = document.with_view(|view| {
+        let found = view.node_of_external(external)?;
+        view.identity_of(found).ok()
+    }) else {
+        errors::internal(here, std::ptr::null(), c"node identity");
+        return std::ptr::null_mut();
+    };
+    let resolver = SymmetricKeyDecryptor::with_kind(key.to_vec(), algorithm.key_kind());
+    let decrypted = DecryptContext::new(&resolver)
+        .shared_policy(policy)
+        .decrypt_in_document(&document, target);
+    let plaintext = match decrypted.map(|audited| audited.output) {
+        Ok(DecryptedContent::Xml(text)) => Zeroizing::new(text.into_bytes()),
+        Ok(DecryptedContent::Bytes(bytes)) => Zeroizing::new(bytes),
+        Err(error) => {
+            // libxmlsec1 checks the padding itself and reports it as invalid
+            // data; the crypto library reports the rest.
+            let reason = if matches!(error, xml_sec::xmlenc::XmlEncError::InvalidPadding) {
+                errors::R_INVALID_DATA
+            } else {
+                errors::R_CRYPTO_FAILED
+            };
+            errors::report(
+                here,
+                std::ptr::null(),
+                std::ptr::null(),
+                reason,
+                &error.to_string(),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+    // The method's output buffer holds the plaintext, owned by the chain as
+    // libxmlsec1's result is owned by the chain's last transform.
+    // SAFETY: the context's method.
+    unsafe {
+        let buffer = &raw mut (*ctx.enc_method).out_buf;
+        if xmlSecBufferSetData(buffer, plaintext.as_ptr(), plaintext.len()) < 0 {
+            errors::internal(here, std::ptr::null(), c"xmlSecBufferSetData");
+            return std::ptr::null_mut();
+        }
+        ctx.result = buffer;
+        buffer
+    }
+}
