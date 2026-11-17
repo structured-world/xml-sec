@@ -2,7 +2,8 @@
  * crypto library: the default keys manager with its X.509 store, trusted
  * and untrusted certificates and CRLs loaded from memory, a KeyInfo whose
  * X509Data carries or names the signer's certificate read with and without
- * a path to a trusted certificate, the verification flags and time, a key
+ * a path to a trusted certificate, the verification flags and time, CRLs
+ * checked with the caller's UTC history, a key
  * loaded from a certificate, a key's certificates written into X509Data
  * templates, keys from PKCS#12 and the keys manager's key verification.
  * The program reads the files and passes their bytes. Built against the
@@ -23,10 +24,18 @@
 #include <xmlsec/keysdata.h>
 #include <xmlsec/keyinfo.h>
 #include <xmlsec/keysmngr.h>
+#ifndef XS_ORACLE
+#include <xmlsec/xs_x509.h>
+#endif
 
 #define ROOT "tests/fixtures/keys/cacert.pem"
 #define INTERMEDIATE "tests/fixtures/keys/ca2cert.pem"
 #define LEAF "tests/fixtures/keys/rsa/rsa-2048-cert.pem"
+/* A root whose keyUsage permits cRLSign, the leaf it issued and its CRL,
+ * which lists no certificate. */
+#define CRL_ROOT "tests/fixtures/x509/delta-crl/ca.der"
+#define CRL_LEAF "tests/fixtures/x509/delta-crl/leaf.der"
+#define CRL_EMPTY "tests/fixtures/x509/delta-crl/complete.crl"
 #define LEAF_KEY "tests/fixtures/keys/rsa/rsa-2048-key.pem"
 #define CRL "tests/fixtures/keys/rsa/rsa-2048-cert-revoked-crl.pem"
 #define PKCS12 "tests/fixtures/keys/pkcs12/rsa-key-unrelated-ca.p12.b64"
@@ -38,6 +47,23 @@
 #define IN_CRL_WINDOW 1773964800
 /* 2001-09-09T01:46:40Z: before every certificate here. */
 #define BEFORE_ISSUE 1000000000
+
+/* A leap-seconds.list covering 2017-01-01 (TAI-UTC 37 s) to 2100-01-01,
+ * the caller's UTC history for CRL checks. */
+#define LEAP_SECONDS "#@ 6311433600\n3692217600 37\n"
+
+/* Gives the X.509 store of `mngr` its UTC history for CRL checks: this
+ * library takes the caller's list, where libxmlsec1 reads the system clock
+ * and needs no such step. */
+static int utc_facts(xmlSecKeysMngrPtr mngr) {
+#ifdef XS_ORACLE
+    (void)mngr;
+    return 0;
+#else
+    return xsKeysMngrUtcFactsLoadMemory(mngr, (const xmlSecByte *)LEAP_SECONDS,
+                                        (xmlSecSize)strlen(LEAP_SECONDS));
+#endif
+}
 
 static int quiet = 0;
 /* The reason of the first report since the last `first_report()`: the
@@ -237,14 +263,39 @@ int main(void) {
                   XMLSEC_KEYINFO_FLAGS_X509DATA_STOP_ON_UNKNOWN_CERT, 0);
     xmlSecKeysMngrDestroy(mngr);
 
-    /* A CRL revoking the signer: no key, whichever reason each reports. */
+    /* A CRL revoking the signer: no key. Its issuer, the intermediate, has
+     * no keyUsage; libxmlsec1 reports the revocation, this library refuses
+     * the CRL issuer first (RFC 10007 section 4 requires keyUsage with
+     * cRLSign), so the reason is not compared. */
     mngr = manager("root, intermediate and CRL", 1, 1);
     size = read_file(CRL, bytes, sizeof(bytes));
     printf("  crl: %d\n",
            xmlSecCryptoAppKeysMngrCrlLoadMemory(mngr, bytes, size, xmlSecKeyDataFormatPem));
+    printf("  utc facts: %d\n", utc_facts(mngr));
     quiet = 1;
     read_key_info("revoked leaf", mngr, carrying(xml, sizeof(xml), leaf, NULL), 0, IN_CRL_WINDOW);
     quiet = 0;
+    xmlSecKeysMngrDestroy(mngr);
+
+    /* A CRL that lists no certificate, checked with the caller's UTC
+     * history: the certificate its issuer signed supplies its key. */
+    mngr = xmlSecKeysMngrCreate();
+    printf("CRL listing nothing: init=%d\n", xmlSecCryptoAppDefaultKeysMngrInit(mngr));
+    size = read_file(CRL_ROOT, bytes, sizeof(bytes));
+    printf("  trusted root: %d\n",
+           xmlSecCryptoAppKeysMngrCertLoadMemory(mngr, bytes, size, xmlSecKeyDataFormatDer,
+                                                 xmlSecKeyDataTypeTrusted));
+    size = read_file(CRL_LEAF, bytes, sizeof(bytes));
+    printf("  untrusted leaf: %d\n",
+           xmlSecCryptoAppKeysMngrCertLoadMemory(mngr, bytes, size, xmlSecKeyDataFormatDer, 0));
+    size = read_file(CRL_EMPTY, bytes, sizeof(bytes));
+    printf("  crl: %d\n",
+           xmlSecCryptoAppKeysMngrCrlLoadMemory(mngr, bytes, size, xmlSecKeyDataFormatDer));
+    printf("  utc facts: %d\n", utc_facts(mngr));
+    read_key_info("leaf the CRL does not list", mngr,
+                  "<KeyInfo xmlns='" DSIG "'><X509Data><X509SubjectName>"
+                  "CN=xml-sec Test Delta Leaf</X509SubjectName></X509Data></KeyInfo>",
+                  0, IN_CRL_WINDOW);
     xmlSecKeysMngrDestroy(mngr);
 
     /* A key from a certificate format holds its key and its certificate. */

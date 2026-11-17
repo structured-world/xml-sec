@@ -6,7 +6,7 @@
 
 use std::ffi::{c_int, c_uint, c_void};
 
-use xml_sec::xmldsig::{KeyValueInfo, parse_x509_certificate_with_resources};
+use xml_sec::xmldsig::{KeyValueInfo, LeapSecondsList, parse_x509_certificate_with_resources};
 
 use super::super::asymkeys::{self, Material};
 use super::super::errors::{self, Here, here};
@@ -26,7 +26,7 @@ use super::data::{self, X509State, state_of};
 use super::{StoreState, certificate, der_of, mngr_state, x509_store};
 
 /// `xmlSecKeyDataTypeTrusted`.
-const TYPE_TRUSTED: c_uint = 0x0100;
+pub(crate) const TYPE_TRUSTED: c_uint = 0x0100;
 
 /// The default keys manager's key store: a simple keys store holding the
 /// keys, which also finds a key whose certificate an `X509Data` names, as
@@ -332,6 +332,60 @@ pub(crate) unsafe extern "C" fn keys_mngr_crl_load_memory(
             return -1;
         };
         store.crls.push(der);
+        0
+    })
+}
+
+/// `xsKeysMngrUtcFactsLoadMemory`: the UTC history the X.509 store of
+/// `mngr` checks CRLs with, from the `dataSize` bytes of a
+/// `leap-seconds.list` at `data`; it replaces any list loaded before.
+/// libxmlsec1 reads the system clock instead, which this library does not:
+/// without a list, a CRL that applies to a path refuses it. Returns 0, or -1
+/// after a report.
+///
+/// # Safety
+/// `mngr` is a keys manager and `data` holds `size` bytes.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn xsKeysMngrUtcFactsLoadMemory(
+    mngr: *mut XmlSecKeysMngr,
+    data: *const u8,
+    size: usize,
+) -> c_int {
+    contain(-1, || {
+        let here = here!("xsKeysMngrUtcFactsLoadMemory");
+        for (failed, expression) in [
+            (mngr.is_null(), c"mngr != NULL"),
+            (data.is_null(), c"data != NULL"),
+            (size == 0, c"dataSize > 0"),
+        ] {
+            if failed {
+                errors::assertion(here, expression);
+                return -1;
+            }
+        }
+        let Some(policy) = policy::verification_at(here) else {
+            return -1;
+        };
+        // SAFETY: the caller's `size` bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(data, size) };
+        let list = match LeapSecondsList::parse(bytes, &policy.resources) {
+            Ok(list) => list,
+            Err(error) => {
+                errors::report(
+                    here,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    errors::R_INVALID_DATA,
+                    &error.to_string(),
+                );
+                return -1;
+            }
+        };
+        // SAFETY: a keys manager.
+        let Some(store) = (unsafe { store_of(here, mngr) }) else {
+            return -1;
+        };
+        store.utc_facts = Some(list);
         0
     })
 }

@@ -14,7 +14,7 @@ use std::ffi::{c_int, c_uint, c_void};
 
 use xml_sec::policy::{Instant, PolicyViolation, VerificationPolicy};
 use xml_sec::xmldsig::{
-    ParsedX509Certificate, X509ChainError, X509ChainOptions, X509DataInfo,
+    LeapSecondsList, ParsedX509Certificate, X509ChainError, X509ChainOptions, X509DataInfo,
     parse_x509_certificate_with_resources, verify_x509_certificate,
     x509_certificate_matches_selectors, x509_leaf_certificates,
 };
@@ -28,6 +28,8 @@ use super::strings::xmlSecNameX509Store;
 
 pub(crate) mod data;
 pub(crate) mod load;
+#[cfg(test)]
+mod tests;
 
 pub(crate) use data::{raw_x509_cert, x509_data};
 
@@ -58,6 +60,10 @@ pub(crate) struct StoreState {
     pub(crate) untrusted: Vec<Vec<u8>>,
     /// CRLs applied to every path the store validates.
     pub(crate) crls: Vec<Vec<u8>>,
+    /// The UTC history the caller supplied for CRL checking
+    /// (`xsKeysMngrUtcFactsLoadMemory`); without it an applicable CRL
+    /// refuses the path.
+    pub(crate) utc_facts: Option<LeapSecondsList>,
 }
 
 /// An X.509 store object: the data store and its state.
@@ -300,7 +306,7 @@ fn check(
     all_crls.extend(state.crls.iter().cloned());
     let options = X509ChainOptions {
         trusted_certs: &state.trusted,
-        utc_facts: None,
+        utc_facts: state.utc_facts.as_ref().map(LeapSecondsList::table),
         verification_time: at,
         max_chain_depth: chain_depth(ctx, policy),
         // CRLs the caller supplies only ever refuse a path.

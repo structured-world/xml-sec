@@ -812,7 +812,8 @@ pub(crate) fn declared_variables(header: &str, prefix: &str) -> BTreeSet<String>
         .collect()
 }
 
-/// Every function and variable the libxmlsec1-compatible headers declare.
+/// Every function and variable the libxmlsec1-compatible headers declare,
+/// libxmlsec1's and the library's own.
 fn xmlsec1_declarations() -> Result<BTreeSet<String>, Failure> {
     let directory = root().join(XMLSEC1_CRATE).join("include/xmlsec");
     let mut names = BTreeSet::new();
@@ -827,6 +828,8 @@ fn xmlsec1_declarations() -> Result<BTreeSet<String>, Failure> {
                 .map_err(|error| format!("read {}: {error}", path.display()))?;
             names.extend(declared_with(&text, "xmlSec"));
             names.extend(declared_variables(&text, "xmlSec"));
+            // The library's own additions (`xs_*.h`) use its `xs` prefix.
+            names.extend(declared(&text));
         }
     }
     Ok(names)
