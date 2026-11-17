@@ -361,6 +361,30 @@ pub(crate) unsafe extern "C" fn xmlSecEncCtxXmlEncrypt(
     })
 }
 
+/// `xmlSecEncCtxUriEncrypt`: encrypts the resource `uri` names, read
+/// through the caller's input callbacks, into the template `tmpl`.
+///
+/// # Safety
+/// `ctx` is null or an initialized context; `tmpl` null or a live node;
+/// `uri` null or NUL-terminated.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn xmlSecEncCtxUriEncrypt(
+    ctx: *mut XmlSecEncCtx,
+    tmpl: *mut XmlNode,
+    uri: *const u8,
+) -> c_int {
+    contain(-1, || {
+        check!(
+            !ctx.is_null(),
+            "xmlSecEncCtxUriEncrypt",
+            c"encCtx != NULL",
+            -1
+        );
+        // SAFETY: by the caller's contract.
+        unsafe { process::uri_encrypt(&mut *ctx, tmpl, uri) }
+    })
+}
+
 /// `xmlSecEncCtxDecrypt`: decrypts the `EncryptedData` element `node` and
 /// replaces it with the plaintext when its `Type` is `Element` or
 /// `Content`; one without a `Type` is left for the caller, who reads the

@@ -16,6 +16,7 @@
 #include <xmlsec/app.h>
 #include <xmlsec/base64.h>
 #include <xmlsec/dl.h>
+#include <xmlsec/io.h>
 #include <xmlsec/keys.h>
 #include <xmlsec/keysmngr.h>
 #include <xmlsec/templates.h>
@@ -172,6 +173,57 @@ static void binary_round_trip(void) {
     xsFreeDoc(doc);
 }
 
+static const char resource[] = "resource bytes read through the caller's callbacks";
+static size_t resource_position;
+
+static int match_resource(const char *uri) {
+    return strncmp(uri, "example:", 8) == 0;
+}
+
+static void *open_resource(const char *uri) {
+    (void)uri;
+    resource_position = 0;
+    return &resource_position;
+}
+
+static int read_resource(void *context, char *buffer, int len) {
+    size_t left = sizeof(resource) - 1 - resource_position;
+    size_t count = left < (size_t)len ? left : (size_t)len;
+    (void)context;
+    memcpy(buffer, resource + resource_position, count);
+    resource_position += count;
+    return (int)count;
+}
+
+static int close_resource(void *context) {
+    (void)context;
+    return 0;
+}
+
+/* Encrypts the resource a URI names, read through the caller's callbacks,
+ * and decrypts it to a buffer again. */
+static void uri_round_trip(void) {
+    xmlDocPtr doc = xsNewDoc(BAD_CAST "1.0");
+    xmlNodePtr tmpl = xmlSecTmplEncDataCreate(doc, xmlSecTransformAes128CbcId, NULL, NULL, NULL, NULL);
+    xmlSecEncCtxPtr ctx = xmlSecEncCtxCreate(NULL);
+    xmlSecBufferPtr result;
+    xsDocSetRootElement(doc, tmpl);
+    xmlSecTmplEncDataEnsureCipherValue(tmpl);
+    printf("uri\n");
+    printf("  register: %d\n", xmlSecIORegisterCallbacks(match_resource, open_resource,
+                                                         read_resource, close_resource));
+    ctx->encKey = aes_key(0x66);
+    printf("  encrypt: %d\n", xmlSecEncCtxUriEncrypt(ctx, tmpl, BAD_CAST "example:resource"));
+    xmlSecEncCtxDestroy(ctx);
+    ctx = xmlSecEncCtxCreate(NULL);
+    ctx->encKey = aes_key(0x66);
+    result = xmlSecEncCtxDecryptToBuffer(ctx, tmpl);
+    printf("  decrypted: %.*s\n", result != NULL ? (int)xmlSecBufferGetSize(result) : 0,
+           result != NULL ? (const char *)xmlSecBufferGetData(result) : "");
+    xmlSecEncCtxDestroy(ctx);
+    xsFreeDoc(doc);
+}
+
 int main(void) {
     xmlDocPtr doc;
     xmlSecEncCtxPtr ctx;
@@ -197,6 +249,7 @@ int main(void) {
     round_trip("encrypt content", xmlSecTypeEncContent);
     round_trip("encrypt without a type", NULL);
     binary_round_trip();
+    uri_round_trip();
 
     /* No key: the keys manager has none. */
     key = aes_key(0x11);

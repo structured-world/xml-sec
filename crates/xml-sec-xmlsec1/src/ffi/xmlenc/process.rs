@@ -24,7 +24,7 @@ use super::super::keysdata::xmlSecKeyDataBinaryValueGetBuffer;
 use super::super::policy::Pinned;
 use super::super::strings;
 use super::super::transforms::builtin::xmlSecTransformBase64GetKlass;
-use super::super::transforms::ctx::xmlSecTransformCtxBinaryExecute;
+use super::super::transforms::ctx::{xmlSecTransformCtxBinaryExecute, xmlSecTransformCtxExecute};
 use super::super::transforms::ctx::{
     xmlSecTransformCtxCreateAndAppend, xmlSecTransformCtxCreateAndPrepend,
     xmlSecTransformCtxNodeRead, xmlSecTransformCtxNodesListRead, xmlSecTransformCtxSetUri,
@@ -263,6 +263,74 @@ pub(super) unsafe fn xml_encrypt(
             return -1;
         }
         ctx.result_replaced = 1;
+    }
+    0
+}
+
+/// `xmlSecTransformUriTypeLocal | xmlSecTransformUriTypeRemote`.
+const URI_TYPES_EXTERNAL: std::ffi::c_uint = 0x0004 | 0x0008;
+
+/// `xmlSecEncCtxUriEncrypt` past its first precondition: the resource `uri`
+/// names, read through the caller's input callbacks, encrypted into the
+/// template `tmpl`.
+///
+/// # Safety
+/// `tmpl` is null or a live node; `uri` null or NUL-terminated.
+pub(super) unsafe fn uri_encrypt(
+    ctx: &mut XmlSecEncCtx,
+    tmpl: *mut XmlNode,
+    uri: *const u8,
+) -> c_int {
+    let here = here!("xmlSecEncCtxUriEncrypt");
+    for (holds, expression) in [
+        (ctx.result.is_null(), c"encCtx->result == NULL"),
+        (!tmpl.is_null(), c"tmpl != NULL"),
+        (!uri.is_null(), c"uri != NULL"),
+    ] {
+        if !holds {
+            errors::assertion(here, expression);
+            return -1;
+        }
+    }
+    ctx.operation = OPERATION_ENCRYPT;
+    let transforms = &raw mut ctx.transform_ctx;
+    // SAFETY: a live node, the caller's string and the context's own
+    // transform context.
+    unsafe {
+        add_ids(tmpl);
+        // The caller names the resource, so local and remote URIs are
+        // enabled for it; the policy still decides what is read.
+        let saved = ctx.transform_ctx.enabled_uris;
+        ctx.transform_ctx.enabled_uris |= URI_TYPES_EXTERNAL;
+        let set = xmlSecTransformCtxSetUri(transforms, uri, tmpl);
+        ctx.transform_ctx.enabled_uris = saved;
+        if set < 0 {
+            let text = c_text(uri).unwrap_or("NULL");
+            errors::internal_with(
+                here,
+                std::ptr::null(),
+                c"xmlSecTransformCtxSetUri",
+                &format!("uri={text}"),
+            );
+            return -1;
+        }
+        if read_enc_data(ctx, tmpl, true) < 0 {
+            errors::internal(here, std::ptr::null(), c"xmlSecEncCtxEncDataNodeRead");
+            return -1;
+        }
+        if xmlSecTransformCtxExecute(transforms, xsNodeGetDoc(tmpl)) < 0 {
+            errors::internal(here, std::ptr::null(), c"xmlSecTransformCtxExecute");
+            return -1;
+        }
+        ctx.result = ctx.transform_ctx.result;
+        if ctx.result.is_null() {
+            errors::assertion(here, c"encCtx->result != NULL");
+            return -1;
+        }
+        if write_enc_data(ctx) < 0 {
+            errors::internal(here, std::ptr::null(), c"xmlSecEncCtxEncDataNodeWrite");
+            return -1;
+        }
     }
     0
 }
