@@ -287,6 +287,11 @@ static void qnames(void) {
     printf("  mask nodes read: %d",
            xmlSecQName2BitMaskNodesRead(bits, &cur, BAD_CAST "m", BAD_CAST "urn:d", 1, &mask));
     printf(" -> %u next=%s\n", mask, name_of(cur));
+    /* Without stopOnUnknown an unknown value is skipped, not a failure. */
+    cur = xsNodeGetNext(xsNodeGetNext(xsNodeGetNext(first)));
+    printf("  mask nodes skip unknown: %d",
+           xmlSecQName2BitMaskNodesRead(bits, &cur, BAD_CAST "m", BAD_CAST "urn:d", 0, &mask));
+    printf(" -> %u next=%s\n", mask, name_of(cur));
     printf("  mask info: %s\n", (const char *)xmlSecQName2BitMaskGetInfo(bits, 4)->qnameLocalPart);
     printf("  mask get: %d", xmlSecQName2BitMaskGetBitMask(bits, BAD_CAST "write", BAD_CAST "urn:a", &mask));
     printf(" -> %u\n", mask);

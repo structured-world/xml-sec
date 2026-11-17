@@ -3171,6 +3171,24 @@ impl<'a> DocumentView<'a> {
             .find(|node| self.external_node_of(*node) == Some(external))
     }
 
+    /// The identity of `node`, a node of this view's tree.
+    ///
+    /// Request data such as an expected coverage target names elements by
+    /// identity; this reaches an element that carries no ID, located by
+    /// walking [`Self::document`].
+    ///
+    /// # Errors
+    /// [`XmlDocumentError::ForeignIdentity`] when `node` belongs to another tree.
+    pub fn identity_of(self, node: Node<'_, '_>) -> Result<NodeIdentity, XmlDocumentError> {
+        if !core::ptr::eq(
+            core::ptr::from_ref(node.document()).cast::<()>(),
+            core::ptr::from_ref(&self.parsed.document).cast::<()>(),
+        ) {
+            return Err(XmlDocumentError::ForeignIdentity);
+        }
+        Ok(self.node_identity(node))
+    }
+
     pub(crate) fn node_identity(self, node: Node<'_, '_>) -> NodeIdentity {
         NodeIdentity {
             document: self.identity,
@@ -5608,6 +5626,9 @@ mod carry_tests;
 
 #[cfg(test)]
 mod insertion_tests;
+
+#[cfg(test)]
+mod identity_of_tests;
 
 // `xmlenc` enables `xmldsig` through `xmldsig-sign`, so every build of this
 // module has the verification policy its tests use.

@@ -63,6 +63,24 @@ static void walk(const char *label, xmlSecNodeSetPtr nset) {
     printf("\n");
 }
 
+/* Prints members until the budget in `data` runs out, then interrupts. */
+static int print_until(xmlSecNodeSetPtr nset, xmlNodePtr cur, xmlNodePtr parent, void *data) {
+    int *budget = (int *)data;
+    if (*budget == 0) {
+        return -1;
+    }
+    --*budget;
+    return print_member(nset, cur, parent, NULL);
+}
+
+/* A walk the callback interrupts after `budget` members: libxmlsec1 stops
+ * there without an error, on the listed-nodes path and over the document. */
+static void interrupted(const char *label, xmlSecNodeSetPtr nset, int budget) {
+    printf("%s:", label);
+    printf(" ret=%d", xmlSecNodeSetWalk(nset, print_until, &budget));
+    printf("\n");
+}
+
 /* Membership of every node of the document, checked directly. */
 static int check_member(xmlNodePtr cur, void *data) {
     xmlSecNodeSetPtr nset = (xmlSecNodeSetPtr)data;
@@ -151,6 +169,9 @@ int main(void) {
         walk(types[type], nset);
         xmlSecNodeSetDestroy(nset);
     }
+    nset = xmlSecNodeSetCreate(doc, mixed_nodes(doc), xmlSecNodeSetTree);
+    interrupted("tree interrupted", nset, 2);
+    xmlSecNodeSetDestroy(nset);
 
     /* Subtrees from GetChildren with and without comments and inverted. */
     nset = xmlSecNodeSetGetChildren(doc, find(doc, "second", "urn:default"), 0, 0);
@@ -163,6 +184,7 @@ int main(void) {
     nset = xmlSecNodeSetGetChildren(doc, NULL, 0, 0);
     contains("document without comments", doc, nset);
     walk("document without comments", nset);
+    interrupted("document interrupted", nset, 3);
 
     /* Operations: the enveloped-signature shape and a union back. */
     other = xmlSecNodeSetGetChildren(doc, find(doc, "first", "urn:a"), 1, 1);

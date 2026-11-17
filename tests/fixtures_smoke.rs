@@ -261,7 +261,8 @@ fn fixture_file_count_matches_expected() {
         // Five published DSTU 4145 signatures add one signed original and
         // their provenance note. Upstream's signature-context vectors add
         // both placements for twelve methods and three documents with two contexts.
-        ("xmldsig", 427),
+        // The PTB calibration certificate adds its unsigned and signed forms.
+        ("xmldsig", 429),
         ("saml", 2),
         // Complete Merlin, Phaos and Aleksey snapshots, plus shared XDH keys.
         // Agreement recipes additionally need all 66 EC and 12 DHX key files.

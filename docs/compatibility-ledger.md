@@ -77,21 +77,25 @@ nothing fails generation, as does an extracted item without a rule or evidence
 reference. Declaration extraction is comment-, literal-, and nesting-aware;
 multiline macro bodies and typedef aliases therefore participate in donor-drift
 checks rather than only their first physical line. Definitions in separate
-preprocessor branches remain separate line-addressed entries, and configured
-header templates are rendered from the donor's `configure.ac` version contract.
-The schema derives item identity from `kind`, `name`, `source`, and `line`; it
-does not duplicate that tuple in a serialized ID. C lexical normalization
-removes comments and collapses formatting trivia while preserving exact bytes
-inside string and character literals. Unterminated comments or literals fail
-generation.
+preprocessor branches remain separate entries, and configured header templates
+are rendered from the donor's `configure.ac` version contract. The schema
+derives item identity from `kind`, `name`, `source`, `detail`, and
+`conditions`; it does not duplicate that tuple in a serialized ID. C lexical
+normalization removes comments and collapses formatting trivia while preserving
+exact bytes inside string and character literals. Unterminated comments or
+literals fail generation.
 
-The top-level `availability` table stores source/line spans instead of repeating
-the same condition array on each item. A span records the complete active
-directive history, including prior `#if` branches before `#elif` or `#else`, so
-changing platform or feature availability produces a generated ledger diff even
-when declaration text is unchanged. An item outside these spans is
-unconditional. Malformed, overlapping, or unbalanced donor condition data fails
-generation.
+The ledger records what upstream declares, never where: an item carries no
+donor line number, and a behavior anchor is the unique donor text it quotes.
+Upstream master moves on with every commit, so a comment or a reordering that
+changes no declaration leaves the committed ledger unchanged, while a changed
+declaration, guard or anchor text is a ledger diff.
+
+An item's `conditions` record the complete active directive history, including
+prior `#if` branches before `#elif` or `#else`, so changing platform or feature
+availability produces a generated ledger diff even when declaration text is
+unchanged. An item without `conditions` is unconditional. Malformed or
+unbalanced donor condition data fails generation.
 
 ## Binary ABI baseline
 

@@ -1,0 +1,161 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<dcc:digitalCalibrationCertificate xmlns:dcc="https://ptb.de/dcc" xmlns:si="https://ptb.de/si" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="https://ptb.de/dcc https://ptb.de/dcc/v3.3.0/dcc.xsd http://www.w3.org/2000/09/xmldsig# https://www.ptb.de/dcc/d-sig/xmldsig-core-schema.xsd" schemaVersion="3.3.0">
+  <dcc:administrativeData>
+    <dcc:dccSoftware>
+      <dcc:software>
+        <dcc:name>
+          <dcc:content>xml-sec test corpus</dcc:content>
+        </dcc:name>
+        <dcc:release>1.0</dcc:release>
+      </dcc:software>
+    </dcc:dccSoftware>
+    <dcc:coreData>
+      <dcc:countryCodeISO3166_1>DE</dcc:countryCodeISO3166_1>
+      <dcc:usedLangCodeISO639_1>en</dcc:usedLangCodeISO639_1>
+      <dcc:mandatoryLangCodeISO639_1>en</dcc:mandatoryLangCodeISO639_1>
+      <dcc:uniqueIdentifier>XMLSEC-DCC-2026-0001</dcc:uniqueIdentifier>
+      <dcc:beginPerformanceDate>2026-03-02</dcc:beginPerformanceDate>
+      <dcc:endPerformanceDate>2026-03-03</dcc:endPerformanceDate>
+      <dcc:performanceLocation>laboratory</dcc:performanceLocation>
+      <dcc:issueDate>2026-03-04</dcc:issueDate>
+    </dcc:coreData>
+    <dcc:items>
+      <dcc:item>
+        <dcc:name>
+          <dcc:content>Platinum resistance thermometer</dcc:content>
+        </dcc:name>
+        <dcc:identifications>
+          <dcc:identification>
+            <dcc:issuer>manufacturer</dcc:issuer>
+            <dcc:value>PRT-4711</dcc:value>
+          </dcc:identification>
+        </dcc:identifications>
+      </dcc:item>
+    </dcc:items>
+    <dcc:calibrationLaboratory>
+      <dcc:contact>
+        <dcc:name>
+          <dcc:content>Example Calibration Laboratory</dcc:content>
+        </dcc:name>
+        <dcc:location>
+          <dcc:city>Braunschweig</dcc:city>
+          <dcc:countryCode>DE</dcc:countryCode>
+        </dcc:location>
+      </dcc:contact>
+    </dcc:calibrationLaboratory>
+    <dcc:respPersons>
+      <dcc:respPerson>
+        <dcc:person>
+          <dcc:name>
+            <dcc:content>Example Signer</dcc:content>
+          </dcc:name>
+        </dcc:person>
+        <dcc:mainSigner>true</dcc:mainSigner>
+      </dcc:respPerson>
+    </dcc:respPersons>
+    <dcc:customer>
+      <dcc:name>
+        <dcc:content>Example Customer</dcc:content>
+      </dcc:name>
+      <dcc:location>
+        <dcc:city>Hamburg</dcc:city>
+        <dcc:countryCode>DE</dcc:countryCode>
+      </dcc:location>
+    </dcc:customer>
+  </dcc:administrativeData>
+  <dcc:measurementResults>
+    <dcc:measurementResult id="result-1">
+      <dcc:name>
+        <dcc:content>Temperature at the triple point of water</dcc:content>
+      </dcc:name>
+      <dcc:results>
+        <dcc:result>
+          <dcc:name>
+            <dcc:content>Measured temperature</dcc:content>
+          </dcc:name>
+          <dcc:data>
+            <dcc:quantity>
+              <si:real>
+                <si:value>273.16</si:value>
+                <si:unit>\kelvin</si:unit>
+              </si:real>
+            </dcc:quantity>
+          </dcc:data>
+        </dcc:result>
+      </dcc:results>
+    </dcc:measurementResult>
+    <dcc:measurementResult id="result-2">
+      <dcc:name>
+        <dcc:content>Temperature at the freezing point of tin</dcc:content>
+      </dcc:name>
+      <dcc:results>
+        <dcc:result>
+          <dcc:name>
+            <dcc:content>Measured temperature</dcc:content>
+          </dcc:name>
+          <dcc:data>
+            <dcc:quantity>
+              <si:real>
+                <si:value>505.078</si:value>
+                <si:unit>\kelvin</si:unit>
+              </si:real>
+            </dcc:quantity>
+          </dcc:data>
+        </dcc:result>
+      </dcc:results>
+    </dcc:measurementResult>
+  </dcc:measurementResults>
+  <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+    <ds:SignedInfo>
+      <ds:CanonicalizationMethod Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"/>
+      <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+      <ds:Reference URI="">
+        <ds:Transforms>
+          <ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/>
+        </ds:Transforms>
+        <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+        <ds:DigestValue>4pT31YokENICVqaH8zBIv75Vp+OZkeu+awaSh9vjoYI=</ds:DigestValue>
+      </ds:Reference>
+    </ds:SignedInfo>
+    <ds:SignatureValue>QIEmb+Mb7eWCnpUBfQptOen1VpVTQjCwqb1piXHuVlAIilrgBrYk2dyRE3av24oB
+A9hWcsq2fx+/0R5AnL5wUsRJ+2k18jTqPQtZHkOVXxPHb8bJnYQ6Lfa1bq0gTHq2
+joulNG00fPj4Zrn0XVSvrz9vFUwGfFaE62mchBNscmWlwr4YZ5k2YHopIbqmx1kf
+jWDVUGrm7pvxI2QTZGeIuU84iViE2e1hGAxccE6mQDNVq8xDm8m0Xss03wIueLB1
+UDXooMNR//2tek+PNFzhdzXXy9jHTzDn2zoYusvUjt1wNnVp9aKUrS0flqgZmQAk
+GtgDPdpZ5g8TsLeHMZosWA==</ds:SignatureValue>
+    <ds:KeyInfo>
+      <ds:X509Data>
+<ds:X509Certificate>
+MIIFFjCCA/6gAwIBAgIUdzXuSH9oYtrxs5VtlhzLD6bzT1MwDQYJKoZIhvcNAQEL
+BQAwgbYxCzAJBgNVBAYTAlVTMRMwEQYDVQQIEwpDYWxpZm9ybmlhMT0wOwYDVQQK
+EzRYTUwgU2VjdXJpdHkgTGlicmFyeSAoaHR0cDovL3d3dy5hbGVrc2V5LmNvbS94
+bWxzZWMpMRgwFgYDVQQLEw9TZWNvbmQgbGV2ZWwgQ0ExFjAUBgNVBAMTDUFsZWtz
+ZXkgU2FuaW4xITAfBgkqhkiG9w0BCQEWEnhtbHNlY0BhbGVrc2V5LmNvbTAgFw0y
+NjAzMDgyMjE0MTZaGA8yMTI2MDIxMjIyMTQxNlowfTELMAkGA1UEBhMCVVMxEzAR
+BgNVBAgTCkNhbGlmb3JuaWExPTA7BgNVBAoTNFhNTCBTZWN1cml0eSBMaWJyYXJ5
+IChodHRwOi8vd3d3LmFsZWtzZXkuY29tL3htbHNlYykxGjAYBgNVBAMTEVRlc3Qg
+S2V5IHJzYS0yMDQ4MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA3iVn
+hDXlgGiWvV2f21bCP4NAeTkwouWvN9K94SNeV01xzuvPg2GRb+ozF0/YbQ8jj7UD
+euIgcLoBrC/jSMtp7gJp6zj3oHhX97NZVv5SBUmBOJRbB8efy3apTvTvWlzJQhO4
+WVXBRDqmA0dGHPRRuMB6l125wy+WBMWxO6BzUooe9m0OpQXjKokJKFcl9Zd4ht3E
+qXW8cuHgiyrtYzXTcO63W9+J6dFOi1DTYhKMkK53jMsModlleEUdqUHgTbxK0TBS
+YMa2sB1rGfcVq+QanOlsRHXAXiZM/BE6uPqlFq+g5osSZbHfH2qC/0G/wKKlWzIx
+0YPjQSBq/MbroodKLQIDAQABo4IBUDCCAUwwDAYDVR0TBAUwAwEB/zAsBglghkgB
+hvhCAQ0EHxYdT3BlblNTTCBHZW5lcmF0ZWQgQ2VydGlmaWNhdGUwHQYDVR0OBBYE
+FG3Dlzf57FZfBmrUW3Cqz28yG8NGMIHuBgNVHSMEgeYwgeOAFNF9F6xFQoqO+bAX
+JdU8cpidiDoloYG0pIGxMIGuMQswCQYDVQQGEwJVUzETMBEGA1UECBMKQ2FsaWZv
+cm5pYTE9MDsGA1UEChM0WE1MIFNlY3VyaXR5IExpYnJhcnkgKGh0dHA6Ly93d3cu
+YWxla3NleS5jb20veG1sc2VjKTEQMA4GA1UECxMHUm9vdCBDQTEWMBQGA1UEAxMN
+QWxla3NleSBTYW5pbjEhMB8GCSqGSIb3DQEJARYSeG1sc2VjQGFsZWtzZXkuY29t
+ghR3Ne5If2hi2vGzlW2WHMsPpvNPTzANBgkqhkiG9w0BAQsFAAOCAQEATAu+Gt18
+Kg0CW8kT+l92sfsNysxS/eYJD3iNyku0oE72jmWVsOvS9phHDF0q01tv8SsIjio6
+sUQXoQ+C+YDAI3g9M5imN5l41TGZF1yRS0i5VucZpnmMcWtNWEpkJd5mB6l4VRDK
+IarRS3UuA2cmZdtfRNsXAnG7sCLiiQB5wWF0Gbe6oAb0Y+hURG7D2vnIAimi2lcH
+LgCD9eXbGfMNhNYnN+hbTNZuwvbJIDWMLu5VWpOdeX+Axm5MXI7lNPMRda75uPRQ
+O52QICz4Cz3lbq4SEhiF4CQ5h/FRj6Yc8m+ZY3/5khICap0dUjAmmezcVwMJlxXr
+hwvZjgian+dyQw==
+</ds:X509Certificate>
+</ds:X509Data>
+    </ds:KeyInfo>
+  </ds:Signature>
+</dcc:digitalCalibrationCertificate>
