@@ -173,4 +173,5 @@ pub use verify::{
 pub use x509::{
     VerifiedX509Certificate, X509ChainError, X509ChainOptions, verify_x509_certificate,
     verify_x509_certificate_chain, verify_x509_certificate_chain_with_resources,
+    x509_leaf_certificates,
 };

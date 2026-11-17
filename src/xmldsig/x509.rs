@@ -295,6 +295,47 @@ pub struct VerifiedX509Certificate {
     /// The target's `SubjectPublicKeyInfo` DER, carrying the parameters it
     /// inherits from its path where it omits them (RFC 5280 6.1.4(e)).
     pub subject_public_key_info: Vec<u8>,
+    /// The start of the target's validity period.
+    pub not_before: Instant,
+    /// The end of the target's validity period.
+    pub not_after: Instant,
+}
+
+/// The indexes of `certificates` that issue none of `certificates` and
+/// `others`: no other certificate names the subject of one of them as its
+/// issuer, so each can only end a path, not continue one. A self-issued
+/// certificate issuing nothing else is one.
+///
+/// # Errors
+///
+/// Returns [`X509ChainError`] for invalid `resources`, a certificate that does
+/// not parse or a name comparison beyond the resource limits.
+pub fn x509_leaf_certificates(
+    certificates: &[Vec<u8>],
+    others: &[Vec<u8>],
+    resources: &crate::policy::ResourcePolicy,
+) -> Result<Vec<usize>, X509ChainError> {
+    resources.validate()?;
+    let session = super::pkix::CertificateSession::new(resources);
+    let candidates = session.read_pool(certificates)?;
+    let pool = session.read_pool(others)?;
+    let mut leaves = Vec::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        let mut issues = false;
+        for other in candidates.iter().chain(pool.iter()) {
+            if other.as_bytes() == candidate.as_bytes() {
+                continue;
+            }
+            if session.source_names_equal(other.tbs().issuer(), candidate.tbs().subject())? {
+                issues = true;
+                break;
+            }
+        }
+        if !issues {
+            leaves.push(index);
+        }
+    }
+    Ok(leaves)
 }
 
 /// Validate a path from `target` through any of `intermediates` to an anchor
@@ -378,12 +419,16 @@ pub fn verify_x509_certificate(
         | X509ChainBuildError::AmbiguousIssuer => X509ChainError::UntrustedRoot,
     })?;
     let key = verify_x509_certificate_chain_in_session(&info, options, provider, &[], &session)?;
+    let certificate = session.read(target)?;
+    let validity = certificate.tbs().validity();
     let subject_public_key_info = match key.effective_spki {
         Some(spki) => spki.to_vec(),
-        None => session.read(target)?.tbs().public_key().as_bytes().to_vec(),
+        None => certificate.tbs().public_key().as_bytes().to_vec(),
     };
     Ok(VerifiedX509Certificate {
         subject_public_key_info,
+        not_before: validity.not_before().instant(),
+        not_after: validity.not_after().instant(),
     })
 }
 

@@ -93,6 +93,45 @@ fn the_target_key_comes_back_through_an_untrusted_intermediate() {
     )
     .expect("a path to the anchor");
     assert_eq!(verified.subject_public_key_info, chain.leaf_spki);
+    // rcgen's default validity: 1975-01-01 to 4096-01-01.
+    assert_eq!(verified.not_before.seconds(), 157_766_400);
+    assert_eq!(verified.not_after.seconds(), 67_090_118_400);
+}
+
+#[test]
+fn only_certificates_issuing_none_of_the_others_are_leaves() {
+    let chain = chain();
+    let all = vec![
+        chain.intermediate.clone(),
+        chain.leaf.clone(),
+        chain.root.clone(),
+    ];
+    assert_eq!(
+        x509_leaf_certificates(&all, &[], &ResourcePolicy::default()),
+        Ok(vec![1])
+    );
+    // A store's certificate decides too: the intermediate issued the leaf.
+    assert_eq!(
+        x509_leaf_certificates(
+            &[chain.intermediate.clone()],
+            &[chain.leaf.clone()],
+            &ResourcePolicy::default()
+        ),
+        Ok(Vec::new())
+    );
+    // A self-signed root alone issues nothing else.
+    assert_eq!(
+        x509_leaf_certificates(&[chain.root], &[], &ResourcePolicy::default()),
+        Ok(vec![0])
+    );
+    assert!(
+        x509_leaf_certificates(
+            &[b"not a certificate".to_vec()],
+            &[],
+            &ResourcePolicy::default()
+        )
+        .is_err()
+    );
 }
 
 #[test]
