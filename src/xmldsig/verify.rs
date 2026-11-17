@@ -469,6 +469,8 @@ pub enum SignatureSelection<'a> {
     FirstDocumentSignature,
     /// Select the first descendant `Signature` below the element with this ID.
     FirstSignatureUnderId(&'a str),
+    /// Select exactly this `Signature` element of the verified document.
+    Exact(NodeIdentity),
 }
 
 /// Verification builder/configuration.
@@ -664,6 +666,16 @@ impl<'a> VerifyContext<'a> {
     /// default remains fail-closed and requires a unique document signature.
     pub fn first_document_signature(mut self) -> Self {
         self.signature_selection = SignatureSelection::FirstDocumentSignature;
+        self
+    }
+
+    /// Verify exactly the `Signature` element `signature`, an identity of the
+    /// document passed to [`Self::verify_document`] or [`Self::verify_parsed`].
+    ///
+    /// This is the caller-selected operation node of libxmlsec1's
+    /// `xmlSecDSigCtxVerify`; other signatures of the document are ignored.
+    pub fn signature(mut self, signature: NodeIdentity) -> Self {
+        self.signature_selection = SignatureSelection::Exact(signature);
         self
     }
 
@@ -2818,6 +2830,15 @@ fn verify_signature_view(
                 SignatureVerificationPipelineError::SelectedNodeUnavailable { id: id.to_owned() }
             })?
         }
+        SignatureSelection::Exact(identity) => {
+            let node = view.resolve_node(identity)?;
+            if !node.has_tag_name((XMLDSIG_NS, "Signature")) {
+                return Err(SignatureVerificationPipelineError::InvalidStructure {
+                    reason: "the selected node is not a Signature element",
+                });
+            }
+            return verify_signature_node(view, ctx, ctx.key, operation, &resolver, node, &());
+        }
         SignatureSelection::UniqueDocumentSignature
         | SignatureSelection::FirstDocumentSignature => doc.root(),
     };
@@ -2838,7 +2859,8 @@ fn verify_signature_view(
         (
             Some(node),
             SignatureSelection::FirstDocumentSignature
-            | SignatureSelection::FirstSignatureUnderId(_),
+            | SignatureSelection::FirstSignatureUnderId(_)
+            | SignatureSelection::Exact(_),
         ) => node,
         (Some(node), SignatureSelection::UniqueDocumentSignature)
             if signatures.next().is_none() =>

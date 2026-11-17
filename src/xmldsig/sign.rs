@@ -1637,15 +1637,10 @@ pub enum SignatureTemplateSelection {
     /// Select the last descendant template, matching append-then-sign workflows.
     #[default]
     LastDescendant,
-}
-
-impl SignatureTemplateSelection {
-    const fn target(self) -> SigningSignatureTarget {
-        match self {
-            Self::FirstDescendant => SigningSignatureTarget::First,
-            Self::LastDescendant => SigningSignatureTarget::Last,
-        }
-    }
+    /// Select exactly this `Signature` template of the signed document, as
+    /// libxmlsec1's `xmlSecDSigCtxSign` signs its caller's template node; a
+    /// start node does not apply.
+    Exact(crate::NodeIdentity),
 }
 
 /// `XMLDSig` signing context.
@@ -1906,7 +1901,7 @@ impl<'a> SignContext<'a> {
     ) -> Result<(O::Output, crate::policy::PolicyAudit), SigningError> {
         let target_signature = document.with_view(|view| {
             signing_signature_index(
-                view.document(),
+                view,
                 self.start_node_id,
                 self.id_attributes,
                 self.template_selection,
@@ -5377,17 +5372,33 @@ fn find_signing_signature_node<'a>(
 }
 
 fn signing_signature_index(
-    doc: &Document<'_>,
+    view: crate::document::DocumentView<'_>,
     start_node_id: Option<&str>,
     id_attributes: &[crate::IdAttributeRegistration],
     selection: SignatureTemplateSelection,
 ) -> Result<usize, SigningDigestError> {
+    let doc = view.document();
+    let target = match selection {
+        SignatureTemplateSelection::FirstDescendant => SigningSignatureTarget::First,
+        SignatureTemplateSelection::LastDescendant => SigningSignatureTarget::Last,
+        SignatureTemplateSelection::Exact(identity) => {
+            let node = view
+                .resolve_node(identity)
+                .map_err(|error| SigningDigestError::InvalidStructure(error.to_string()))?;
+            if !node.has_tag_name((XMLDSIG_NS, "Signature")) {
+                return Err(SigningDigestError::InvalidStructure(
+                    "the selected node is not a Signature element".to_owned(),
+                ));
+            }
+            return signature_index(doc, node);
+        }
+    };
     let selected = if let Some(id) = start_node_id {
         let start = signing_start_node(doc, id, id_attributes)?;
         let mut signatures = start
             .descendants()
             .filter(|node| node.has_tag_name((XMLDSIG_NS, "Signature")));
-        match selection.target() {
+        match target {
             SigningSignatureTarget::First => signatures.next(),
             SigningSignatureTarget::Last => signatures.next_back(),
             SigningSignatureTarget::Index(_) => unreachable!("public selection is not indexed"),
@@ -5398,7 +5409,7 @@ fn signing_signature_index(
             ))
         })?
     } else {
-        find_signing_signature_node(doc, selection.target())?
+        find_signing_signature_node(doc, target)?
     };
     signature_index(doc, selected)
 }

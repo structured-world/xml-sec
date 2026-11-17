@@ -22,9 +22,9 @@ use xml_sec::xmldsig::verify::process_all_references;
 use xml_sec::xmldsig::{
     DEFAULT_IMPLICIT_C14N_URI, DefaultKeyResolver, DigestAlgorithm, DsigStatus,
     EcdsaP256SigningKey, EcdsaP384SigningKey, KeyInfoWriter, KeyValueInfoWriter, ReferenceBuilder,
-    RsaSigningKey, SignContext, SignatureAlgorithm, SignatureBuilder, SigningDigestError,
-    SigningError, SigningKey, SigningKeyError, SigningPublicKeyInfo, Transform, TransformError,
-    VerificationKey, VerifyContext, X509CertificateKeyInfoWriter, XPathExpression,
+    RsaSigningKey, SignContext, SignatureAlgorithm, SignatureBuilder, SignatureTemplateSelection,
+    SigningDigestError, SigningError, SigningKey, SigningKeyError, SigningPublicKeyInfo, Transform,
+    TransformError, VerificationKey, VerifyContext, X509CertificateKeyInfoWriter, XPathExpression,
     compute_reference_digest_values, fill_reference_digest_values, parse_key_info,
     validate_signing_key, verify_signature_with_pem_key,
 };
@@ -3538,6 +3538,64 @@ fn sign_with_builder_targets_appended_signature_when_existing_key_info_is_presen
     assert_eq!(second_signed.matches("<X509Certificate>").count(), 2);
     assert!(!second_signed.contains("<DigestValue></DigestValue>"));
     assert!(!second_signed.contains("<SignatureValue></SignatureValue>"));
+}
+
+/// Two templates of one document, for `#first` and `#second`.
+const TWO_TEMPLATES: &str = r##"<root><payload Id="first"/><payload Id="second"/><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#first"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#second"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature></root>"##;
+
+/// The `SignatureValue` texts of the document's signatures, in order.
+fn signature_values(document: &XmlDocument) -> Vec<Option<String>> {
+    document.with_view(|view| {
+        view.document()
+            .descendants()
+            .filter(|node| {
+                node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "SignatureValue"))
+            })
+            .map(|node| node.text().map(str::to_owned))
+            .collect()
+    })
+}
+
+#[test]
+fn exact_template_selection_signs_only_the_named_template() {
+    // libxmlsec1 signs the template node its caller passes; the other
+    // template keeps its empty values, whichever position it has.
+    let key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let mut document = XmlDocument::parse(TWO_TEMPLATES).expect("templates must parse");
+    let first = VerifyContext::new()
+        .signature_identities(&document)
+        .expect("templates are discoverable")[0];
+    SignContext::new(&key)
+        .signature_template_selection(SignatureTemplateSelection::Exact(first))
+        .sign_document(&mut document)
+        .expect("the first template signs");
+    let values = signature_values(&document);
+    assert!(values[0].is_some(), "{values:?}");
+    assert_eq!(values[1], None);
+}
+
+#[test]
+fn exact_template_selection_refuses_a_node_that_is_no_signature() {
+    let key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let mut document = XmlDocument::parse(TWO_TEMPLATES).expect("templates must parse");
+    let root = document
+        .with_view(|view| view.identity_of(view.document().root_element()))
+        .expect("the root has an identity");
+    let error = SignContext::new(&key)
+        .signature_template_selection(SignatureTemplateSelection::Exact(root))
+        .sign_document(&mut document)
+        .expect_err("the root element is no template");
+    assert!(
+        error
+            .to_string()
+            .contains("the selected node is not a Signature element"),
+        "{error}"
+    );
+    assert_eq!(signature_values(&document), vec![None, None]);
 }
 
 #[test]

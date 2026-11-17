@@ -6109,6 +6109,92 @@ fn pipeline_start_node_limits_signature_cardinality_to_its_subtree() {
     ));
 }
 
+/// Two incomplete signatures that fail on different elements, so the error
+/// tells which one an exact selection verified.
+const TWO_SIGNATURES: &str = r#"
+<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+  <ds:Signature><ds:SignedInfo/></ds:Signature>
+  <ds:Signature/>
+</root>
+"#;
+
+#[test]
+fn exact_selection_verifies_only_the_named_signature() {
+    // An exact selection is libxmlsec1's caller-chosen Signature node: the
+    // other Signature neither counts toward cardinality nor is verified.
+    let document = XmlDocument::parse(TWO_SIGNATURES).unwrap();
+    let signatures = VerifyContext::new()
+        .signature_identities(&document)
+        .unwrap();
+    assert_eq!(signatures.len(), 2);
+
+    let first = VerifyContext::new()
+        .signature(signatures[0])
+        .verify_document(&document)
+        .expect_err("the first Signature has no SignatureValue");
+    assert!(
+        matches!(
+            first,
+            SignatureVerificationPipelineError::MissingElement {
+                element: "SignatureValue"
+            }
+        ),
+        "{first:?}"
+    );
+    let second = VerifyContext::new()
+        .signature(signatures[1])
+        .verify_document(&document)
+        .expect_err("the second Signature has no SignedInfo");
+    assert!(
+        matches!(
+            second,
+            SignatureVerificationPipelineError::MissingElement {
+                element: "SignedInfo"
+            }
+        ),
+        "{second:?}"
+    );
+}
+
+#[test]
+fn exact_selection_refuses_a_node_that_is_no_signature() {
+    let document = XmlDocument::parse(TWO_SIGNATURES).unwrap();
+    let root = document
+        .with_view(|view| view.identity_of(view.document().root_element()))
+        .unwrap();
+    let error = VerifyContext::new()
+        .signature(root)
+        .verify_document(&document)
+        .expect_err("the root element is no Signature");
+    assert!(
+        matches!(
+            error,
+            SignatureVerificationPipelineError::InvalidStructure {
+                reason: "the selected node is not a Signature element"
+            }
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn exact_selection_refuses_an_identity_of_another_document() {
+    let document = XmlDocument::parse(TWO_SIGNATURES).unwrap();
+    let other = XmlDocument::parse(TWO_SIGNATURES).unwrap();
+    let foreign = VerifyContext::new().signature_identities(&other).unwrap()[0];
+    let error = VerifyContext::new()
+        .signature(foreign)
+        .verify_document(&document)
+        .expect_err("an identity of another document selects nothing here");
+    assert!(
+        matches!(
+            error,
+            SignatureVerificationPipelineError::Document(XmlDocumentError::ForeignIdentity)
+        ),
+        "{error:?}"
+    );
+}
+
 #[test]
 fn pipeline_reports_keyinfo_parse_error() {
     let xml = r#"
