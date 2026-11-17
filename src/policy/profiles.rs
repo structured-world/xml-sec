@@ -8,10 +8,10 @@ use super::{
     KeyWrapAlgorithm, OaepDigestAlgorithm,
 };
 use super::{
-    DigestAlgorithm, KeySourceKind, KeySourcePolicy, PolicyViolation, RequestSelections,
-    RsaPssPermission, SameDocumentIdSemantics, SignatureAlgorithm, SigningPolicy, TransformPolicy,
-    UnknownX509CertificateSemantics, UriPolicy, UriTypeSet, VerificationPolicy,
-    XsltStylesheetSemantics,
+    DigestAlgorithm, GeneratedCanonicalization, KeySourceKind, KeySourcePolicy, PolicyViolation,
+    RequestSelections, RsaPssPermission, SameDocumentIdSemantics, SignatureAlgorithm,
+    SigningPolicy, TransformPolicy, UnknownX509CertificateSemantics, UriPolicy, UriTypeSet,
+    VerificationPolicy, XsltStylesheetSemantics,
 };
 use crate::provider::{CryptoProvider, ProviderCapability};
 use alloc::{borrow::ToOwned, collections::BTreeSet, string::String, sync::Arc};
@@ -470,9 +470,11 @@ fn verification_profile(
 fn profile_transforms(compatibility: bool) -> TransformPolicy {
     if compatibility {
         // Signers and verifiers in this profile must agree with libxmlsec1 on the
-        // digested output of XSLT transforms.
+        // digested output of XSLT transforms, and its signing writes the
+        // donor's templates, leaving a node set's conversion implicit.
         TransformPolicy {
             xslt_stylesheet_semantics: XsltStylesheetSemantics::Libxmlsec1,
+            generated_canonicalization: GeneratedCanonicalization::Implicit,
             ..TransformPolicy::default()
         }
     } else {

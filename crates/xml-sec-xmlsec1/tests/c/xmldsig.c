@@ -85,7 +85,9 @@ static void print_buffer(const char *label, xmlSecBufferPtr buffer) {
            (const char *)xmlSecBufferGetData(buffer));
 }
 
-/* The payload with an enveloped template signing #data with `method`. */
+/* The payload with an enveloped template signing #data with `method`, as the
+ * donor's sign1 example: the chain ends in a node set, which both libraries
+ * leave to the implicit Canonical XML 1.0 conversion and write nothing for. */
 static xmlDocPtr signed_template(xmlSecTransformId method) {
     static const xmlChar *ids[] = {BAD_CAST "Id", NULL};
     xmlDocPtr doc = xsReadMemory(payload, (int)strlen(payload), "doc.xml", NULL, 0);
@@ -95,7 +97,6 @@ static xmlDocPtr signed_template(xmlSecTransformId method) {
     xmlNodePtr reference = xmlSecTmplSignatureAddReference(signature, xmlSecTransformSha256Id,
                                                            NULL, BAD_CAST "#data", NULL);
     xmlSecTmplReferenceAddTransform(reference, xmlSecTransformEnvelopedId);
-    xmlSecTmplReferenceAddTransform(reference, xmlSecTransformExclC14NId);
     xmlSecAddChildNode(xsDocGetRootElement(doc), signature);
     return doc;
 }
@@ -289,17 +290,13 @@ static void manifest(void) {
     xmlNodePtr list;
     xmlSecDSigCtxPtr ctx = xmlSecDSigCtxCreate(NULL);
     xmlSecAddChildNode(xsDocGetRootElement(doc), signature);
-    /* Each chain ends in a canonicalization, so neither library adds one. */
-    xmlSecTmplReferenceAddTransform(
-        xmlSecTmplSignatureAddReference(signature, xmlSecTransformSha256Id, NULL,
-                                        BAD_CAST "#manifest",
-                                        BAD_CAST "http://www.w3.org/2000/09/xmldsig#Manifest"),
-        xmlSecTransformExclC14NId);
+    /* Each chain ends in a node set, which neither library writes a
+     * conversion for. */
+    xmlSecTmplSignatureAddReference(signature, xmlSecTransformSha256Id, NULL, BAD_CAST "#manifest",
+                                    BAD_CAST "http://www.w3.org/2000/09/xmldsig#Manifest");
     object = xmlSecTmplSignatureAddObject(signature, NULL, NULL, NULL);
     list = xmlSecTmplObjectAddManifest(object, BAD_CAST "manifest");
-    xmlSecTmplReferenceAddTransform(
-        xmlSecTmplManifestAddReference(list, xmlSecTransformSha256Id, NULL, BAD_CAST "#data", NULL),
-        xmlSecTransformExclC14NId);
+    xmlSecTmplManifestAddReference(list, xmlSecTransformSha256Id, NULL, BAD_CAST "#data", NULL);
     xmlSecAddIDs(doc, NULL, ids);
     printf("manifest\n");
     ctx->signKey = hmac_key();

@@ -271,6 +271,10 @@ fn transforms(
         } else {
             EmptyDigestInput::Accept
         },
+        generated_canonicalization: equal(
+            a.generated_canonicalization,
+            b.generated_canonicalization,
+        )?,
     })
 }
 fn manifests(a: ManifestProcessing, b: ManifestProcessing) -> ManifestProcessing {

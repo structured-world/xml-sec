@@ -1185,6 +1185,22 @@ pub enum EmptyDigestInput {
     Refuse,
 }
 
+/// How signing completes a `Reference` whose transform chain ends in a node
+/// set. Verification reads both forms: the node set's conversion to octets
+/// with Canonical XML 1.0 is mandatory (`XMLDSig` 1.1 section 4.4.3.2).
+#[cfg(feature = "xmldsig")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GeneratedCanonicalization {
+    /// Write an explicit C14N 1.1 `Transform`, so the conversion is part of
+    /// what `SignedInfo` authenticates (`XMLDSig` 1.1 section 3.1.1
+    /// recommends not relying on the implicit one when generating).
+    #[default]
+    ExplicitC14n11,
+    /// Write nothing and leave the node set to the implicit Canonical XML 1.0
+    /// conversion, as libxmlsec1 signs a template.
+    Implicit,
+}
+
 /// `XMLDSig` transform and canonicalization decisions shared by signing and verification.
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1201,6 +1217,8 @@ pub struct TransformPolicy {
     pub xslt_stylesheet_semantics: XsltStylesheetSemantics,
     /// Whether a Reference whose transforms produce no octets is digested.
     pub empty_digest_input: EmptyDigestInput,
+    /// How signing completes a Reference whose chain ends in a node set.
+    pub generated_canonicalization: GeneratedCanonicalization,
 }
 
 /// URI-class decisions shared by `XMLDSig` reference and key retrieval processing.

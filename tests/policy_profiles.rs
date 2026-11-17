@@ -557,6 +557,23 @@ fn all_named_profiles_compile_and_legacy_requires_auditable_expiry() {
             expected,
             "{profile:?}"
         );
+        // Only the libxmlsec1-compatible profile signs a node set as libxmlsec1
+        // does, leaving its conversion implicit, so it writes the donor's
+        // templates and digests.
+        let generated = if profile == PolicyProfile::XmlSecCompatible {
+            xml_sec::policy::GeneratedCanonicalization::Implicit
+        } else {
+            xml_sec::policy::GeneratedCanonicalization::ExplicitC14n11
+        };
+        assert_eq!(
+            compiled
+                .signing()
+                .unwrap()
+                .transforms
+                .generated_canonicalization,
+            generated,
+            "{profile:?}"
+        );
         // Only the libxmlsec1-compatible profile stops on any X509Data child
         // that yields no certificate, as libxmlsec1 does; the others follow
         // its documented flag.

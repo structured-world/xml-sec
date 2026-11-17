@@ -12,8 +12,8 @@ use base64::Engine as _;
 use xml_sec::XmlDocument;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize};
 use xml_sec::policy::{
-    EcdsaSignatureValueEncoding, HmacPolicy, ManifestProcessing, PolicyDecision, SigningPolicy,
-    UriRole, VerificationPolicy,
+    EcdsaSignatureValueEncoding, GeneratedCanonicalization, HmacPolicy, ManifestProcessing,
+    PolicyDecision, SigningPolicy, UriRole, VerificationPolicy,
 };
 use xml_sec::xmldsig::mutation::append_signature_to_root;
 use xml_sec::xmldsig::parse::{find_signature_node, parse_signed_info};
@@ -1161,6 +1161,52 @@ fn computed_digest_matches_materialized_c14n11_digest() {
     assert_eq!(computed.len(), 1);
     assert_eq!(computed[0].digest_value, written);
     assert_reference_digests_verify(&filled);
+}
+
+#[test]
+fn implicit_generated_canonicalization_leaves_the_node_set_to_c14n_1_0() {
+    // A signing policy that leaves the conversion implicit writes no
+    // Transform into a Reference whose chain ends in a node set, as
+    // libxmlsec1 signs a template, and digests the node set with Canonical
+    // XML 1.0 (XMLDSig 1.1 section 4.4.3.2). C14N 1.0 inherits xml:id onto
+    // the subtree apex where 1.1 does not, so a 1.1 digest would not verify.
+    let template =
+        template_with_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("#payload"))
+            .replacen(
+                concat!(
+                    "<Transforms><Transform Algorithm=\"",
+                    "http://www.w3.org/2006/12/xml-c14n11\"/></Transforms>"
+                ),
+                "",
+                1,
+            );
+    let xml = append_signature_to_root(
+        "<root xml:id=\"ancestor\"><payload ID=\"payload\">one</payload></root>",
+        &template,
+    )
+    .expect("append signature");
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let public_key = "tests/fixtures/keys/rsa/rsa-2048-pubkey.pem";
+    let c14n11 = "http://www.w3.org/2006/12/xml-c14n11";
+
+    let mut policy = SigningPolicy::default();
+    policy.transforms.generated_canonicalization = GeneratedCanonicalization::Implicit;
+    let implicit = SignContext::new(&private_key)
+        .policy(policy)
+        .sign_template(&xml)
+        .expect("an implicit conversion signs")
+        .output;
+    assert!(!implicit.contains(c14n11), "no Transform was written");
+    assert_signed_template_verifies(&implicit, public_key);
+
+    let explicit = SignContext::new(&private_key)
+        .sign_template(&xml)
+        .expect("the default policy signs")
+        .output;
+    assert!(explicit.contains(c14n11), "the default writes C14N 1.1");
+    assert_signed_template_verifies(&explicit, public_key);
 }
 
 #[test]

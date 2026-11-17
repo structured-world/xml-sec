@@ -10,14 +10,14 @@ use xml_sec::xmlenc::{
 use xml_sec::{
     policy::{
         CertificateSignatureAlgorithms, CompiledPolicies, DetachedDigestAttestation, DsaKeyPolicy,
-        EcdsaSignatureValueEncoding, EmptyDigestInput, ExtendedKeyPurpose, HmacPolicy, Instant,
-        KemContentAuthentication, KeyAgreementAlgorithm, KeyDerivationAlgorithm,
-        KeyEstablishmentPolicy, KeySourceKind, KeySourcePolicy, KeyTrustPolicy, ManifestProcessing,
-        OpcRelationshipEdition, PolicySet, PolicyValidity, RequestSelections, ResourcePolicy,
-        RsaKeyPolicy, RsaPssPermission, SameDocumentIdSemantics, SignatureConstraints,
-        SigningPolicy, TimestampTokenEncoding, TransformPolicy, UnknownX509CertificateSemantics,
-        UriPolicy, VerificationPolicy, VerificationTrustMode, XmlInputPolicy,
-        XsltStylesheetSemantics,
+        EcdsaSignatureValueEncoding, EmptyDigestInput, ExtendedKeyPurpose,
+        GeneratedCanonicalization, HmacPolicy, Instant, KemContentAuthentication,
+        KeyAgreementAlgorithm, KeyDerivationAlgorithm, KeyEstablishmentPolicy, KeySourceKind,
+        KeySourcePolicy, KeyTrustPolicy, ManifestProcessing, OpcRelationshipEdition, PolicySet,
+        PolicyValidity, RequestSelections, ResourcePolicy, RsaKeyPolicy, RsaPssPermission,
+        SameDocumentIdSemantics, SignatureConstraints, SigningPolicy, TimestampTokenEncoding,
+        TransformPolicy, UnknownX509CertificateSemantics, UriPolicy, VerificationPolicy,
+        VerificationTrustMode, XmlInputPolicy, XsltStylesheetSemantics,
     },
     provider::{KeyEncapsulationAlgorithm, X509SignatureAlgorithm},
     xmldsig::{
@@ -286,6 +286,14 @@ fn transforms(p: &mut TransformPolicy, v: &Value) -> Result<(), Error> {
                     key,
                     EmptyDigestInput::Accept,
                     EmptyDigestInput::Refuse
+                );
+            }
+            "generated_canonicalization" => {
+                p.generated_canonicalization = choice!(
+                    value,
+                    key,
+                    GeneratedCanonicalization::ExplicitC14n11,
+                    GeneratedCanonicalization::Implicit
                 );
             }
             _ => return Err(invalid(key)),
@@ -874,6 +882,10 @@ fn transform_snapshot(p: &TransformPolicy) -> Value {
             named(p.xslt_stylesheet_semantics),
         ),
         ("empty_digest_input".into(), named(p.empty_digest_input)),
+        (
+            "generated_canonicalization".into(),
+            named(p.generated_canonicalization),
+        ),
     ]))
 }
 fn establishment_snapshot(p: &KeyEstablishmentPolicy) -> Value {

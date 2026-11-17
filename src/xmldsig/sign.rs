@@ -5145,7 +5145,12 @@ fn second_edition_c14n11_edits(
                 .into());
             }
             let initial_binary = !structure.uri.is_empty() && !structure.uri.starts_with('#');
-            if generation_chain_produces_binary(initial_binary, &transform_uris) {
+            // An implicit conversion leaves a node set to Canonical XML 1.0,
+            // which digesting applies (XMLDSig 1.1 section 4.4.3.2).
+            if generation_chain_produces_binary(initial_binary, &transform_uris)
+                || policy.transforms.generated_canonicalization
+                    == crate::policy::GeneratedCanonicalization::Implicit
+            {
                 continue;
             }
             if transform_uris.len() >= policy.resources.max_transforms_per_reference {

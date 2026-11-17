@@ -65,9 +65,14 @@ not create a resolver, resource map or network access.
 | `opc_relationship_edition` | `Ecma2012`, `Ecma2021` |
 | `xslt_stylesheet_semantics` | `Specification`, `Libxmlsec1` |
 | `empty_digest_input` | `Accept`, `Refuse` |
+| `generated_canonicalization` | `ExplicitC14n11`, `Implicit` |
 
 These interpretation choices are not ordered security levels. Restrictive
 composition rejects incompatible modes rather than selecting the last value.
+`generated_canonicalization` applies to signing: `ExplicitC14n11` writes a
+C14N 1.1 `Transform` into a Reference whose chain ends in a node set,
+`Implicit` writes nothing and leaves the node set to the Canonical XML 1.0
+conversion every verifier applies; `XmlSecCompatible` selects `Implicit`.
 `empty_digest_input` is the exception: it is a restriction, so a layer that
 refuses to digest a Reference whose transforms produce no octets keeps
 refusing it whatever another layer says.
