@@ -359,7 +359,7 @@ unsafe fn read_key(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode) -> c_int {
     // SAFETY: the context's method, its read context and the caller's node.
     unsafe {
         let name = (*(*method).id).name.cast();
-        if xmlSecTransformSetKeyReq(method, (&raw mut ctx.key_info_read_ctx.key_req).cast()) < 0 {
+        if xmlSecTransformSetKeyReq(method, &raw mut ctx.key_info_read_ctx.key_req) < 0 {
             errors::internal(here, name, c"xmlSecTransformSetKeyReq");
             return -1;
         }

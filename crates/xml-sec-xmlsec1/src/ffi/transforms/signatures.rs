@@ -302,7 +302,7 @@ unsafe extern "C" fn set_key_req(transform: *mut XmlSecTransform, req: *mut XmlS
             errors::assertion(here, c"keyReq != NULL");
             return -1;
         };
-        req.key_id = family.klass().cast();
+        req.key_id = family.klass();
         (req.key_type, req.key_usage) = if object.operation == OPERATION_SIGN {
             (TYPE_PRIVATE, KEY_USAGE_SIGN)
         } else {

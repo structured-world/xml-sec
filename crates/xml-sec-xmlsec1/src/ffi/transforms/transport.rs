@@ -278,7 +278,7 @@ unsafe extern "C" fn set_key_req(transform: *mut XmlSecTransform, req: *mut XmlS
             errors::assertion(here, c"keyReq != NULL");
             return -1;
         };
-        req.key_id = asymkeys::rsa().cast();
+        req.key_id = asymkeys::rsa();
         (req.key_type, req.key_usage) = if object.operation == OPERATION_ENCRYPT {
             (TYPE_PUBLIC, KEY_USAGE_ENCRYPT)
         } else {

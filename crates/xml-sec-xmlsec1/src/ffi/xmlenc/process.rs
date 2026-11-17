@@ -705,11 +705,7 @@ unsafe fn read_method_and_key(ctx: &mut XmlSecEncCtx, add_base64: bool) -> c_int
         ctx.key_info_read_ctx.operation = ctx.operation;
         ctx.key_info_write_ctx.operation = ctx.operation;
         let method_name = (*(*ctx.enc_method).id).name.cast();
-        if xmlSecTransformSetKeyReq(
-            ctx.enc_method,
-            (&raw mut ctx.key_info_read_ctx.key_req).cast(),
-        ) < 0
-        {
+        if xmlSecTransformSetKeyReq(ctx.enc_method, &raw mut ctx.key_info_read_ctx.key_req) < 0 {
             errors::internal(here, method_name, c"xmlSecTransformSetKeyReq");
             return -1;
         }

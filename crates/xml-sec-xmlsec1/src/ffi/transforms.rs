@@ -96,17 +96,7 @@ pub(crate) const FLAGS_USER_SPECIFIED: usize = 0x0001;
 /// `xmlSecKeyUsageAny`.
 const KEY_USAGE_ANY: c_uint = 0xFFFF_FFFF;
 
-/// `xmlSecKeyReq`, written by [`xmlSecTransformSetKeyReq`].
-#[repr(C)]
-pub(crate) struct XmlSecKeyReq {
-    pub(crate) key_id: *const c_void,
-    pub(crate) key_type: c_uint,
-    pub(crate) key_usage: c_uint,
-    pub(crate) key_bits_size: usize,
-    pub(crate) key_use_with_list: XmlSecPtrList,
-    pub(crate) reserved1: *mut c_void,
-    pub(crate) reserved2: *mut c_void,
-}
+pub(crate) use super::keys::XmlSecKeyReq;
 
 pub(crate) type InitializeMethod = Option<unsafe extern "C" fn(*mut XmlSecTransform) -> c_int>;
 pub(crate) type FinalizeMethod = Option<unsafe extern "C" fn(*mut XmlSecTransform)>;

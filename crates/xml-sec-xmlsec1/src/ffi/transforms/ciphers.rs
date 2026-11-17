@@ -254,7 +254,7 @@ unsafe extern "C" fn set_key_req(transform: *mut XmlSecTransform, req: *mut XmlS
             errors::assertion(here, c"keyReq != NULL");
             return -1;
         };
-        req.key_id = key_klass(algorithm).cast();
+        req.key_id = key_klass(algorithm);
         req.key_type = TYPE_SYMMETRIC;
         req.key_usage = if object.operation == OPERATION_ENCRYPT {
             KEY_USAGE_ENCRYPT
