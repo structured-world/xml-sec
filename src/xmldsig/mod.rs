@@ -171,6 +171,6 @@ pub use verify::{
     process_all_references, process_reference, with_verified_request,
 };
 pub use x509::{
-    X509ChainError, X509ChainOptions, verify_x509_certificate_chain,
-    verify_x509_certificate_chain_with_resources,
+    VerifiedX509Certificate, X509ChainError, X509ChainOptions, verify_x509_certificate,
+    verify_x509_certificate_chain, verify_x509_certificate_chain_with_resources,
 };
