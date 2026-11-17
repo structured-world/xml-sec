@@ -192,6 +192,66 @@ fn one_document_generation_flows_through_sign_verify_encrypt_and_decrypt() {
     assert_eq!(verified.status, DsigStatus::Valid);
 }
 
+/// The identities of the `EncryptedData` elements of `document`, in order.
+fn encrypted_data_identities(document: &XmlDocument) -> Vec<xml_sec::NodeIdentity> {
+    document.with_view(|view| {
+        view.document()
+            .descendants()
+            .filter(|node| {
+                node.has_tag_name(("http://www.w3.org/2001/04/xmlenc#", "EncryptedData"))
+            })
+            .map(|node| view.identity_of(node).expect("a node of the view"))
+            .collect()
+    })
+}
+
+#[test]
+fn decrypt_in_document_decrypts_the_named_element_and_changes_nothing() {
+    // libxmlsec1 decrypts the EncryptedData its caller passes to a buffer;
+    // the caller decides what the plaintext replaces.
+    let mut document =
+        XmlDocument::parse("<root><a ID=\"first\">one</a><b ID=\"second\">two</b></root>")
+            .expect("owned XML fixture must parse");
+    let content_key = [0x5a; 16];
+    for id in ["first", "second"] {
+        EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .direct_key(content_key)
+            .encrypt_owned_document(
+                &mut document,
+                DocumentEncryptionOptions {
+                    element_id: Some(id),
+                },
+            )
+            .expect("the element encrypts in place");
+    }
+    let before = document.as_xml().to_owned();
+    let generation = document.generation();
+    let targets = encrypted_data_identities(&document);
+    assert_eq!(targets.len(), 2);
+    let decrypted = DecryptContext::new(&SymmetricKeyDecryptor::new(content_key))
+        .decrypt_in_document(&document, targets[1])
+        .expect("the second EncryptedData decrypts");
+    let xml_sec::xmlenc::DecryptedContent::Xml(plaintext) = decrypted.output else {
+        panic!("an Element EncryptedData decrypts to XML");
+    };
+    assert_eq!(plaintext, "<b ID=\"second\">two</b>");
+    assert_eq!(document.as_xml(), before);
+    assert_eq!(document.generation(), generation);
+}
+
+#[test]
+fn decrypt_in_document_refuses_a_node_that_is_no_encrypted_data() {
+    let document = XmlDocument::parse("<root/>").expect("owned XML fixture must parse");
+    let root = document.with_view(|view| view.root_element());
+    let error = DecryptContext::new(&SymmetricKeyDecryptor::new([0x5a; 16]))
+        .decrypt_in_document(&document, root)
+        .expect_err("the root is no EncryptedData");
+    assert!(
+        matches!(error, xml_sec::xmlenc::XmlEncError::EncryptedDataNotFound),
+        "{error:?}"
+    );
+}
+
 #[test]
 fn c14n_and_xpath_axis_identities_share_the_retained_view() {
     // Attribute and namespace identities must retain their exact owner while

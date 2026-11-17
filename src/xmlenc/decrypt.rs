@@ -955,6 +955,47 @@ impl<'a> DecryptContext<'a> {
         .map(|processed| self.audited(processed))
     }
 
+    /// Decrypt exactly the `EncryptedData` element `encrypted_data` of
+    /// `document`, leaving the document unchanged.
+    ///
+    /// This is the caller-selected node of libxmlsec1's
+    /// `xmlSecEncCtxDecryptToBuffer`: the caller decides what the plaintext
+    /// replaces.
+    ///
+    /// # Errors
+    /// Returns an error for an identity of another document or generation, a
+    /// node that is no `EncryptedData`, invalid encryption metadata,
+    /// policy/resource refusal, unavailable keys, provider failure or failed
+    /// content authentication.
+    pub fn decrypt_in_document(
+        &self,
+        document: &XmlDocument,
+        encrypted_data: crate::NodeIdentity,
+    ) -> Result<Audited<DecryptedContent>, XmlEncError> {
+        self.policy.resources.validate()?;
+        document.validate_operation_policy(self.policy.xml, &self.policy.resources)?;
+        let budgets = DecryptionOperationBudgets::from_policy(&self.policy);
+        let document_binding = Some((document.identity(), document.generation()));
+        document
+            .with_view(|view| {
+                let node = view.resolve_node(encrypted_data)?;
+                if !node.has_tag_name((XMLENC_NS, "EncryptedData")) {
+                    return Err(XmlEncError::EncryptedDataNotFound);
+                }
+                self.process_decryption_input(
+                    DecryptionInput::Document {
+                        document: view.document(),
+                        node: node.id(),
+                    },
+                    document_binding,
+                    false,
+                    budgets,
+                    |content, _| Ok(content),
+                )
+            })
+            .map(|processed| self.audited(processed))
+    }
+
     /// A finished operation's output with its audit.
     fn audited<T>(&self, processed: ProcessedDecryption<T>) -> Audited<T> {
         Audited::new(
