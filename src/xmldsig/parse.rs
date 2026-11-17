@@ -834,6 +834,8 @@ pub struct ParsedX509Certificate {
     pub serial_number: Vec<u8>,
     /// Uppercase hexadecimal certificate serial number without separators.
     pub serial_number_hex: String,
+    /// Decimal certificate serial number, as `X509SerialNumber` carries it.
+    pub serial_number_decimal: String,
     /// Subject Key Identifier extension bytes (if present).
     pub subject_key_identifier: Option<Vec<u8>>,
     /// Parsed certificate public key material.
@@ -3846,6 +3848,7 @@ pub(crate) fn certificate_metadata(
     let issuer_dn = shared_name_text(cert.tbs().issuer(), session)?;
     let serial_number = cert.tbs().serial().as_bytes().to_vec();
     let serial_number_hex = format_x509_serial_value_hex(&serial_number);
+    let serial_number_decimal = format_x509_serial_decimal(&serial_number);
 
     let subject_key_identifier = cert
         .tbs()
@@ -3917,6 +3920,7 @@ pub(crate) fn certificate_metadata(
         issuer_dn,
         serial_number,
         serial_number_hex,
+        serial_number_decimal,
         subject_key_identifier,
         public_key,
         subject_public_key_info: spki.as_bytes().to_vec(),
@@ -3972,6 +3976,34 @@ fn format_x509_serial_value_hex(serial: &[u8]) -> String {
         &serial[first_non_zero..]
     };
     format_x509_serial_hex(canonical)
+}
+
+/// The decimal text of the unsigned big-endian serial value `serial`, the
+/// form `X509SerialNumber` carries (XMLDSig 1.1 section 4.5.4.1:
+/// `xsd:integer`).
+fn format_x509_serial_decimal(serial: &[u8]) -> String {
+    // Little-endian decimal digits, multiplied by 256 per input octet.
+    let mut digits = vec![0_u8];
+    for byte in serial {
+        let mut carry = u32::from(*byte);
+        for digit in &mut digits {
+            let value = u32::from(*digit) * 256 + carry;
+            *digit = (value % 10) as u8;
+            carry = value / 10;
+        }
+        while carry > 0 {
+            digits.push((carry % 10) as u8);
+            carry /= 10;
+        }
+    }
+    while digits.len() > 1 && digits.last() == Some(&0) {
+        digits.pop();
+    }
+    digits
+        .iter()
+        .rev()
+        .map(|digit| char::from(b'0' + digit))
+        .collect()
 }
 
 fn x509_serial_decimal_bytes(serial: &str) -> Option<[u8; MAX_X509_SERIAL_NUMBER_BYTES]> {

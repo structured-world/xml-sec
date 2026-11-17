@@ -123,6 +123,33 @@ fn a_certificate_reads_its_names_serial_and_key_identifier() {
 }
 
 #[test]
+fn a_serial_number_reads_in_decimal() {
+    // XMLDSig's X509SerialNumber is an xsd:integer; the DER sign octet of a
+    // serial with its top bit set is no part of the value.
+    for (serial, decimal) in [
+        (vec![0x01, 0x02], "258"),
+        (vec![0x7f], "127"),
+        (vec![0x80], "128"),
+        (
+            vec![0xff; 19],
+            "5708990770823839524233143877797980545530986495",
+        ),
+    ] {
+        let mut params = params("serial", false);
+        params.serial_number = Some(rcgen::SerialNumber::from(serial.clone()));
+        let certificate = params
+            .self_signed(&rcgen::KeyPair::generate().expect("key"))
+            .expect("certificate");
+        let parsed = crate::xmldsig::parse_x509_certificate_with_resources(
+            certificate.der(),
+            &ResourcePolicy::default(),
+        )
+        .expect("metadata");
+        assert_eq!(parsed.serial_number_decimal, decimal, "{serial:02x?}");
+    }
+}
+
+#[test]
 fn only_certificates_issuing_none_of_the_others_are_leaves() {
     let chain = chain();
     let all = vec![
