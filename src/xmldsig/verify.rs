@@ -558,6 +558,14 @@ impl<'a> VerifyContext<'a> {
         self
     }
 
+    /// Enforce a shared immutable policy snapshot without copying it, as an
+    /// application that publishes one snapshot to many operations does.
+    pub fn shared_policy(mut self, policy: Arc<crate::policy::VerificationPolicy>) -> Self {
+        self.policy = policy;
+        self.identity = None;
+        self
+    }
+
     /// Enforce a published snapshot as is and report its identity.
     pub(crate) fn snapshot(
         mut self,

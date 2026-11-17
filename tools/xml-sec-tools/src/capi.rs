@@ -150,6 +150,7 @@ impl Target {
                 "tests/c/signatures.c",
                 "tests/c/app.c",
                 "tests/c/x509.c",
+                "tests/c/xmldsig.c",
             ],
         }
     }

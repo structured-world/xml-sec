@@ -554,7 +554,7 @@ fn collect(
 
 /// The signing key of the PKCS#8 key `private` for `algorithm`, admitted
 /// under the run's signing `policy`: its family, strength and usage.
-fn signing_key(
+pub(crate) fn signing_key(
     policy: &SigningPolicy,
     algorithm: SignatureAlgorithm,
     private: &[u8],

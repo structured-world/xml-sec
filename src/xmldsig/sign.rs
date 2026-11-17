@@ -1652,6 +1652,7 @@ pub struct SignContext<'a> {
     id_attributes: &'a [crate::IdAttributeRegistration],
     external_resources: Option<&'a BTreeMap<String, Vec<u8>>>,
     template_selection: SignatureTemplateSelection,
+    base64_line_size: Option<core::num::NonZeroUsize>,
     // Shared with the compiled snapshot it came from.
     policy: Arc<crate::policy::SigningPolicy>,
     identity: Option<Arc<crate::policy::PolicyIdentity>>,
@@ -1670,6 +1671,7 @@ impl<'a> SignContext<'a> {
             id_attributes: &[],
             external_resources: None,
             template_selection: SignatureTemplateSelection::default(),
+            base64_line_size: None,
             policy: Arc::new(crate::policy::SigningPolicy::default()),
             identity: None,
             provider: crate::provider::default_provider(),
@@ -1689,6 +1691,7 @@ impl<'a> SignContext<'a> {
             id_attributes: &[],
             external_resources: None,
             template_selection: SignatureTemplateSelection::default(),
+            base64_line_size: None,
             policy: Arc::new(crate::policy::SigningPolicy::default()),
             identity: None,
             provider: crate::provider::default_provider(),
@@ -1700,6 +1703,15 @@ impl<'a> SignContext<'a> {
     #[must_use]
     pub fn policy(mut self, policy: crate::policy::SigningPolicy) -> Self {
         self.policy = Arc::new(policy);
+        self.identity = None;
+        self
+    }
+
+    /// Enforce a shared immutable policy snapshot without copying it, as an
+    /// application that publishes one snapshot to many operations does.
+    #[must_use]
+    pub fn shared_policy(mut self, policy: Arc<crate::policy::SigningPolicy>) -> Self {
+        self.policy = policy;
         self.identity = None;
         self
     }
@@ -1759,6 +1771,15 @@ impl<'a> SignContext<'a> {
     #[must_use]
     pub fn signature_template_selection(mut self, selection: SignatureTemplateSelection) -> Self {
         self.template_selection = selection;
+        self
+    }
+
+    /// Write the `DigestValue` and `SignatureValue` Base64 text in lines of
+    /// `size` characters, as libxmlsec1 lays them out; `None`, the default,
+    /// writes each value on one line. The layout changes no value.
+    #[must_use]
+    pub fn base64_line_size(mut self, size: Option<core::num::NonZeroUsize>) -> Self {
+        self.base64_line_size = size;
         self
     }
 
@@ -2692,6 +2713,15 @@ impl<'a> SignContext<'a> {
         self.policy
             .resources
             .validate_xml_document_len(document.content_len())?;
+        // The digest values are part of SignedInfo, so their lines are laid
+        // out before it is canonicalized.
+        let pending_digests = match self.base64_line_size {
+            Some(size) => pending_digests
+                .into_iter()
+                .map(|(node, value)| (node, wrap_base64(&value, size)))
+                .collect(),
+            None => pending_digests,
+        };
         let (algorithm, hmac_output_length_bits, canonical_signed_info, signature_context) =
             operation.run_with_budgets(plan_nodes.canonicalization, |budgets| {
                 let result = canonicalize_signed_info(
@@ -2739,7 +2769,11 @@ impl<'a> SignContext<'a> {
                 signature_value,
                 self.policy.ecdsa_signature_value_encoding,
             )?;
-            Ok::<_, SigningError>(base64::engine::general_purpose::STANDARD.encode(signature_value))
+            let encoded = base64::engine::general_purpose::STANDARD.encode(signature_value);
+            Ok::<_, SigningError>(match self.base64_line_size {
+                Some(size) => wrap_base64(&encoded, size),
+                None => encoded,
+            })
         })?;
         let mut replacement = pending_digests;
         replacement.push((signature_value_node, signature_b64));
@@ -5369,6 +5403,23 @@ fn find_signing_signature_node<'a>(
     .ok_or(SigningDigestError::MissingElement {
         element: "Signature",
     })
+}
+
+/// `encoded` Base64 text in lines of `size` characters separated by line
+/// feeds, without a final one: RFC 2045 section 6.8 lets an encoder break
+/// lines, and the decoder ignores the breaks (`XMLDSig` 1.1 section 6.2).
+fn wrap_base64(encoded: &str, size: core::num::NonZeroUsize) -> String {
+    let size = size.get();
+    // Base64 text is ASCII, so every byte is one character; one line feed
+    // per line bounds the separators.
+    let mut wrapped = String::with_capacity(encoded.len() + encoded.len().div_ceil(size));
+    for (index, line) in encoded.as_bytes().chunks(size).enumerate() {
+        if index > 0 {
+            wrapped.push('\n');
+        }
+        wrapped.push_str(core::str::from_utf8(line).expect("Base64 text is ASCII"));
+    }
+    wrapped
 }
 
 fn signing_signature_index(

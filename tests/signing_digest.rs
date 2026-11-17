@@ -3577,6 +3577,59 @@ fn exact_template_selection_signs_only_the_named_template() {
 }
 
 #[test]
+fn base64_line_size_lays_out_values_that_still_verify() {
+    // libxmlsec1 writes values in lines of its Base64 line size; the digest
+    // value is laid out before SignedInfo is canonicalized, so the signature
+    // covers the text as written.
+    let key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let mut document = XmlDocument::parse(TWO_TEMPLATES).expect("templates must parse");
+    let first = VerifyContext::new()
+        .signature_identities(&document)
+        .expect("templates are discoverable")[0];
+    SignContext::new(&key)
+        .signature_template_selection(SignatureTemplateSelection::Exact(first))
+        .base64_line_size(std::num::NonZeroUsize::new(16))
+        .sign_document(&mut document)
+        .expect("the first template signs");
+    let value = signature_values(&document)[0]
+        .clone()
+        .expect("a signature value");
+    let lines: Vec<&str> = value.split('\n').collect();
+    assert_eq!(lines.len(), 344_usize.div_ceil(16), "{value}");
+    assert!(lines[..lines.len() - 1].iter().all(|line| line.len() == 16));
+    assert!(!value.ends_with('\n'));
+    let digest = document.with_view(|view| {
+        view.document()
+            .descendants()
+            .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "DigestValue")))
+            .and_then(|node| node.text().map(str::to_owned))
+    });
+    assert_eq!(digest.map(|digest| digest.matches('\n').count()), Some(2));
+
+    // Signing committed a new generation.
+    let first = VerifyContext::new()
+        .signature_identities(&document)
+        .expect("signatures are discoverable")[0];
+    let verified = VerifyContext::new()
+        .key(&VerificationKey {
+            algorithm: SignatureAlgorithm::RsaSha256,
+            public_key_bytes: rsa_spki(&key),
+            certificate_der: None,
+            name: None,
+        })
+        .signature(first)
+        .verify_document(&document)
+        .expect("the laid out signature verifies");
+    assert!(
+        matches!(verified.status, DsigStatus::Valid),
+        "{:?}",
+        verified.status
+    );
+}
+
+#[test]
 fn exact_template_selection_refuses_a_node_that_is_no_signature() {
     let key =
         RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
