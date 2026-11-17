@@ -214,6 +214,19 @@ int main(void) {
     wrap(xmlSecTransformKWAes128Id, xmlSecKeyDataAesId, 16);
     wrap(xmlSecTransformKWAes256Id, xmlSecKeyDataAesId, 32);
     wrap(xmlSecTransformKWCamellia128Id, xmlSecKeyDataCamelliaId, 16);
+    {
+        /* RSA 1.5 output is randomized; only its width is compared. */
+        static const xmlSecByte content_key[16] = {1, 2, 3, 4, 5, 6, 7, 8,
+                                                   9, 10, 11, 12, 13, 14, 15, 16};
+        xmlSecByte transported[512];
+        xmlSecKeyPtr key = rsa_key();
+        printf("rsa-1_5: href=%s usage=0x%x\n", xmlSecTransformRsaPkcs1Id->href,
+               xmlSecTransformRsaPkcs1Id->usage);
+        printf("  transported: %d\n",
+               transport(xmlSecTransformRsaPkcs1Id, NULL, xmlSecTransformOperationEncrypt, key,
+                         content_key, sizeof(content_key), transported));
+        xmlSecKeyDestroy(key);
+    }
     oaep("rsa-oaep-mgf1p", xmlSecTransformRsaOaepId, NULL);
     oaep("rsa-oaep sha256", xmlSecTransformRsaOaepEnc11Id,
          "<EncryptionMethod xmlns=\"http://www.w3.org/2001/04/xmlenc#\" "

@@ -1,5 +1,6 @@
-//! The built-in provider's RSA-OAEP key transport klasses: `rsa-oaep-mgf1p`
-//! and the XML Encryption 1.1 `rsa-oaep`.
+//! The built-in provider's RSA key transport klasses: `rsa-oaep-mgf1p`, the
+//! XML Encryption 1.1 `rsa-oaep` and, with historical algorithms compiled in,
+//! `rsa-1_5`.
 //!
 //! Reading its `EncryptionMethod` the transform takes the OAEP digest, mask
 //! digest and label the core parses there. It collects its input and, on the
@@ -94,8 +95,22 @@ pub(crate) extern "C" fn rsa_oaep_enc11() -> *const XmlSecTransformKlass {
     &raw const RSA_OAEP_ENC11
 }
 
+#[cfg(feature = "legacy-algorithms")]
+static RSA_PKCS1: XmlSecTransformKlass =
+    transport_klass(&strings::xmlSecNameRsaPkcs1, &strings::xmlSecHrefRsaPkcs1);
+
+/// The built-in table's historical `rsa-1_5` klass.
+#[cfg(feature = "legacy-algorithms")]
+pub(crate) extern "C" fn rsa_pkcs1() -> *const XmlSecTransformKlass {
+    &raw const RSA_PKCS1
+}
+
 /// The transport algorithm of klass `id`, `None` for any other.
 fn method(id: *const XmlSecTransformKlass) -> Option<KeyTransportAlgorithm> {
+    #[cfg(feature = "legacy-algorithms")]
+    if std::ptr::eq(id, &raw const RSA_PKCS1) {
+        return Some(KeyTransportAlgorithm::RsaPkcs1v15);
+    }
     if std::ptr::eq(id, &raw const RSA_OAEP) {
         Some(KeyTransportAlgorithm::RsaOaepMgf1p)
     } else if std::ptr::eq(id, &raw const RSA_OAEP_ENC11) {
@@ -367,6 +382,17 @@ fn run(
             .map_err(|error| error.to_string())?;
         validate_key_transport_recipient(&public, &pinned.encryption)
             .map_err(|error| error.to_string())?;
+        #[cfg(feature = "legacy-algorithms")]
+        if algorithm == KeyTransportAlgorithm::RsaPkcs1v15 {
+            pinned
+                .encryption
+                .check_key_transport_algorithm(algorithm)
+                .map_err(|error| error.to_string())?;
+            return provider
+                .transport_pkcs1v15(&public, &transport.data)
+                .map(Zeroizing::new)
+                .map_err(|error| error.to_string());
+        }
         let parameters =
             parameters(algorithm, transport.method.as_ref()).map_err(|error| error.to_string())?;
         admit_oaep_parameters(&parameters, &pinned.encryption)
@@ -375,6 +401,12 @@ fn run(
             .transport_key(&public, &parameters, &transport.data)
             .map(Zeroizing::new)
             .map_err(|error| error.to_string());
+    }
+    // Departure: RSAES-PKCS1-v1_5 recovery reveals no padding validity, so it
+    // needs the expected key width, which only the EncryptedKey that carries
+    // the transport knows; a standalone chain is refused.
+    if algorithm.requires_explicit_permission() {
+        return Err("RSAES-PKCS1-v1_5 recovery runs only through the encryption context".into());
     }
     let policy = &pinned.decryption;
     policy.validate().map_err(|error| error.to_string())?;
