@@ -35,7 +35,7 @@ use super::super::keys::{XmlSecKey, xmlSecKeyGetValue, xmlSecKeyMatch};
 use super::super::keysdata::xmlSecKeyDataBinaryValueGetBuffer;
 use super::super::list::{xmlSecPtrListAdd, xmlSecPtrListGetItem, xmlSecPtrListGetSize};
 use super::super::nodeset::{xmlSecNodeSetDestroy, xmlSecNodeSetGetChildren};
-use super::super::policy::{Pinned, Side, Spent};
+use super::super::policy::{Pinned, Side, SlotPin, Spent};
 use super::super::strings;
 use super::super::transforms::builtin::{
     xmlSecTransformBase64GetKlass, xmlSecTransformMemBufGetBuffer, xmlSecTransformMemBufGetKlass,
@@ -272,7 +272,7 @@ unsafe fn process_signature_node(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode) ->
             );
             return -1;
         };
-        if read_key(ctx, key_info) < 0 {
+        if read_key(ctx, key_info, &pinned) < 0 {
             errors::internal(here, std::ptr::null(), c"xmlSecDSigCtxProcessKeyInfoNode");
             return -1;
         }
@@ -564,11 +564,12 @@ unsafe fn read_signed_info(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode) -> Optio
 }
 
 /// libxmlsec1's `xmlSecDSigCtxProcessKeyInfoNode`: the key the signature
-/// method requires, set on it, and written to `KeyInfo` when signing.
+/// method requires, looked up under the operation's revision `pinned`, set on
+/// the method, and written to `KeyInfo` when signing.
 ///
 /// # Safety
 /// `node` is null or a live node.
-unsafe fn read_key(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode) -> c_int {
+unsafe fn read_key(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode, pinned: &Pinned) -> c_int {
     let here = here!("xmlSecDSigCtxProcessKeyInfoNode");
     let method = ctx.sign_method;
     // SAFETY: the context's method, its read context and the caller's node.
@@ -580,6 +581,9 @@ unsafe fn read_key(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode) -> c_int {
         }
         let read = &raw mut ctx.key_info_read_ctx;
         if ctx.sign_key.is_null() {
+            // The KeyInfo the lookup reads is part of this operation: it runs
+            // under the revision the operation began with.
+            let _read_pin = SlotPin::hold_pinned(&raw mut (*read).reserved0, pinned.clone());
             let mngr = ctx.key_info_read_ctx.keys_mngr;
             if let Some(get_key) = mngr.as_ref().and_then(|mngr| mngr.get_key) {
                 ctx.sign_key = get_key(node, read);

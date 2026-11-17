@@ -1,5 +1,7 @@
 use super::*;
 
+use std::sync::Arc;
+
 use xml_sec_libxml2::ffi::tree::{xsDocGetRootElement, xsFreeDoc, xsReadMemory};
 
 use crate::ffi::crypto::{
@@ -80,6 +82,87 @@ fn a_failed_signature_value_leaves_its_references_undereferenced() {
             .cast::<XmlSecDSigReferenceCtx>();
         assert_eq!((*reference).status, STATUS_UNKNOWN);
         xmlSecDSigCtxDestroy(ctx);
+        xsFreeDoc(doc);
+        assert_eq!(xmlSecCryptoShutdown(), 0);
+        assert_eq!(xmlSecCryptoAppShutdown(), 0);
+        assert_eq!(xmlSecShutdown(), 0);
+    }
+}
+
+/// The verification snapshot the key lookup found pinned in its read
+/// context, by address; zero when none was pinned.
+static LOOKUP_PIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A key manager's lookup that records the revision pinned for it and hands
+/// back the HMAC key of [`TAMPERED`].
+unsafe extern "C" fn recording_lookup(
+    _node: *mut XmlNode,
+    ctx: *mut crate::ffi::keyinfo::XmlSecKeyInfoCtx,
+) -> *mut crate::ffi::keys::XmlSecKey {
+    // SAFETY: the read context the operation passes.
+    let pinned = unsafe { crate::ffi::policy::pinned((*ctx).reserved0) };
+    LOOKUP_PIN.store(
+        pinned.map_or(0, |pinned| Arc::as_ptr(&pinned.verification).addr()),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let secret = b"secret-of-thirty-two-octets-long";
+    // SAFETY: a key and a read context created here; the HMAC klass reads
+    // the key.
+    unsafe {
+        let read = crate::ffi::keyinfo::xmlSecKeyInfoCtxCreate(std::ptr::null_mut());
+        let key = xmlSecKeyCreate();
+        assert_eq!(
+            xmlSecKeyDataBinRead(
+                symkeys::hmac(),
+                key.cast(),
+                secret.as_ptr(),
+                secret.len(),
+                read.cast(),
+            ),
+            0
+        );
+        crate::ffi::keyinfo::xmlSecKeyInfoCtxDestroy(read);
+        key
+    }
+}
+
+#[test]
+fn the_signature_key_is_looked_up_under_the_operations_revision() {
+    // The key manager's lookup reads KeyInfo for the operation: it finds the
+    // revision the operation pinned at its start, not whatever revision is
+    // current when the lookup runs.
+    own_process();
+    let entry = crate::ffi::policy::verification().expect("the library policy compiles");
+    // SAFETY: the library, a document, a manager and a context set up and
+    // torn down here, on this thread alone.
+    unsafe {
+        assert_eq!(xmlSecInit(), 0);
+        assert_eq!(xmlSecCryptoDLLoadLibrary(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoAppInit(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoInit(), 0);
+        let doc = xsReadMemory(
+            TAMPERED.as_ptr().cast(),
+            i32::try_from(TAMPERED.len()).expect("a short document"),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        assert!(!doc.is_null());
+        let signature = xmlSecFindNode(
+            xsDocGetRootElement(doc),
+            c"Signature".as_ptr().cast(),
+            c"http://www.w3.org/2000/09/xmldsig#".as_ptr().cast(),
+        );
+        let mngr = crate::ffi::keysmngr::xmlSecKeysMngrCreate();
+        (*mngr).get_key = Some(recording_lookup);
+        let ctx = xmlSecDSigCtxCreate(mngr);
+        assert_eq!(xmlSecDSigCtxVerify(ctx, signature), 0);
+        assert_eq!(
+            LOOKUP_PIN.load(std::sync::atomic::Ordering::Relaxed),
+            Arc::as_ptr(&entry).addr()
+        );
+        xmlSecDSigCtxDestroy(ctx);
+        crate::ffi::keysmngr::xmlSecKeysMngrDestroy(mngr);
         xsFreeDoc(doc);
         assert_eq!(xmlSecCryptoShutdown(), 0);
         assert_eq!(xmlSecCryptoAppShutdown(), 0);
