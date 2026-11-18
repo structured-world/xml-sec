@@ -351,7 +351,9 @@ macro_rules! method_arguments {
 /// `max_key_info_reference_depth` of the operation the key is decrypted or
 /// encrypted for bounds the levels of `EncryptedKey` and key references
 /// together, as the core bounds an `EncryptedKey` nested in a `KeyInfo`
-/// (XML Encryption 1.1 section 3.5.1), whatever maximum the caller set.
+/// (XML Encryption 1.1 section 3.5.1), whatever maximum the caller set. A
+/// key that `recovers` is bounded by the decryption policy it is recovered
+/// under, whatever operation reads it.
 ///
 /// # Safety
 /// `ctx` is an initialized context; `id` a klass.
@@ -359,6 +361,7 @@ unsafe fn level_open(
     ctx: *mut XmlSecKeyInfoCtx,
     id: *const XmlSecKeyDataKlass,
     here: errors::Here,
+    recovers: bool,
 ) -> bool {
     // SAFETY: by the caller's contract.
     unsafe {
@@ -380,7 +383,11 @@ unsafe fn level_open(
         let Some(pinned) = read_policy(ctx, here) else {
             return false;
         };
-        let side = operation_side(map_operation((*ctx).operation)).unwrap_or(policy::Side::Verify);
+        let side = if recovers {
+            policy::Side::Decrypt
+        } else {
+            operation_side(map_operation((*ctx).operation)).unwrap_or(policy::Side::Verify)
+        };
         let resources = pinned.of(side).resources();
         if resources
             .validate_key_info_reference_depth(next_reference_depth(ctx))
@@ -432,7 +439,15 @@ pub(crate) unsafe extern "C" fn xml_read(
         let here = here!("xmlSecKeyDataEncryptedKeyXmlRead");
         // SAFETY: a klass, a key, a live node and a context.
         unsafe {
-            if !level_open(ctx, id, here) {
+            // An EncryptedKey that carries its ciphertext is a transported
+            // key to recover whatever operation reads it (a signer reusing
+            // the session key a request carried). libxmlsec1 follows the
+            // outer operation, which wraps the ciphertext text on the
+            // signing side; only an empty template, whose key the signing
+            // or encrypting side generates, keeps that direction. The
+            // direction is chosen first, so its policy bounds the depth.
+            let recovers = carries_ciphertext(node);
+            if !level_open(ctx, id, here, recovers) {
                 return -1;
             }
             let name = (*id).name.cast();
@@ -441,13 +456,7 @@ pub(crate) unsafe extern "C" fn xml_read(
                 return -1;
             }
             let enc = (*ctx).enc_ctx.cast::<XmlSecEncCtx>();
-            // An EncryptedKey that carries its ciphertext is a transported
-            // key to recover whatever operation reads it (a signer reusing
-            // the session key a request carried). libxmlsec1 follows the
-            // outer operation, which wraps the ciphertext text on the
-            // signing side; only an empty template, whose key the signing
-            // or encrypting side generates, keeps that direction.
-            if carries_ciphertext(node) {
+            if recovers {
                 (*enc).operation = OPERATION_DECRYPT;
                 (*enc).key_info_read_ctx.operation = OPERATION_DECRYPT;
             }
@@ -501,7 +510,7 @@ unsafe fn carries_ciphertext(node: *mut XmlNode) -> bool {
 /// # Safety
 /// `ctx` is a `KeyInfo` context whose nested context is `enc`; `work` runs
 /// `enc` for it.
-unsafe fn within_key_info(
+pub(super) unsafe fn within_key_info(
     ctx: *mut XmlSecKeyInfoCtx,
     enc: *mut XmlSecEncCtx,
     work: impl FnOnce() -> c_int,
@@ -510,17 +519,23 @@ unsafe fn within_key_info(
     unsafe {
         let transforms = &raw mut (*enc).transform_ctx;
         let slot = (*ctx).reserved0;
+        let before = policy::spent(slot).map_or_default(std::cell::Cell::get);
         if let Some(pinned) = policy::pinned(slot) {
-            let spent = policy::spent(slot).map_or_default(std::cell::Cell::get);
             let side = operation_side((*enc).operation).unwrap_or(policy::Side::Verify);
-            seed_run(transforms, pinned, side, None, spent);
+            seed_run(transforms, pinned, side, None, before);
         }
         if let Some(candidates) = policy::key_candidates(slot) {
             run_budget(transforms).key_candidates = candidates.get();
         }
         let done = work();
         if let Some(spent) = policy::spent(slot) {
-            spent.set(run_spent(transforms));
+            let mut after = run_spent(transforms);
+            // A recovery's validity belongs to the key it yields: a failed
+            // recipient's, nested recoveries included, goes with it.
+            if done < 0 {
+                after.recovery = before.recovery;
+            }
+            spent.set(after);
         }
         if let Some(candidates) = policy::key_candidates(slot) {
             candidates.set(run_budget(transforms).key_candidates);
@@ -563,7 +578,7 @@ pub(crate) unsafe extern "C" fn xml_write(
                 errors::assertion(here, c"xmlSecKeyIsValid(key)");
                 return -1;
             }
-            if !level_open(ctx, id, here) {
+            if !level_open(ctx, id, here, false) {
                 return -1;
             }
             let name = (*id).name.cast();

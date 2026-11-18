@@ -1245,14 +1245,15 @@ impl<'a> DecryptContext<'a> {
             document: plan_nodes.document,
             ciphertext: plan_nodes.ciphertext,
         };
+        let recipients = Recipients::of_resolver(self.resolver);
         let reference_context = super::CipherReferenceContext::new(
             operation.policy(),
             self.external_resources,
             self.xml_backend,
             self.id_attributes,
         )?
-        .with_operation(&reference_gate);
-        let recipients = Recipients::of_resolver(self.resolver);
+        .with_operation(&reference_gate)
+        .declining_recipients(recipients == Recipients::Skipped);
         let parsed = operation.run(plan_nodes.ciphertext, || {
             // The graph gates parser work as well as cryptographic callbacks.
             // Typed inputs stay borrowed; XML inputs consume the same operation

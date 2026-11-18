@@ -1992,18 +1992,38 @@ impl EncryptionPolicy {
     }
 }
 
-/// Enforce the shared key-transport permission contract: without an
-/// allowlist, only transports that need no explicit permission are admitted.
+/// The shared key-transport permission contract: without an allowlist, only
+/// transports that need no explicit permission are admitted. Composition and
+/// enforcement both decide by it.
+#[cfg(feature = "xmlenc")]
+pub(crate) fn key_transport_allowed(
+    allowlist: Option<&BTreeSet<KeyTransportAlgorithm>>,
+    algorithm: KeyTransportAlgorithm,
+) -> bool {
+    allowlist.map_or(!algorithm.requires_explicit_permission(), |allowed| {
+        allowed.contains(&algorithm)
+    })
+}
+
+/// The shared key-wrap permission contract, as [`key_transport_allowed`].
+#[cfg(feature = "xmlenc")]
+pub(crate) fn key_wrap_allowed(
+    allowlist: Option<&BTreeSet<KeyWrapAlgorithm>>,
+    algorithm: KeyWrapAlgorithm,
+) -> bool {
+    allowlist.map_or(!algorithm.requires_explicit_permission(), |allowed| {
+        allowed.contains(&algorithm)
+    })
+}
+
+/// Enforce [`key_transport_allowed`].
 #[cfg(feature = "xmlenc")]
 fn check_key_transport(
     allowlist: Option<&BTreeSet<KeyTransportAlgorithm>>,
     algorithm: KeyTransportAlgorithm,
     operation: &'static str,
 ) -> Result<(), PolicyViolation> {
-    let refused = allowlist.map_or(algorithm.requires_explicit_permission(), |allowed| {
-        !allowed.contains(&algorithm)
-    });
-    if refused {
+    if !key_transport_allowed(allowlist, algorithm) {
         return Err(PolicyViolation::Algorithm {
             operation,
             algorithm: algorithm.uri().to_owned(),
@@ -2012,18 +2032,14 @@ fn check_key_transport(
     Ok(())
 }
 
-/// Enforce the shared key-wrap permission contract: without an allowlist,
-/// only wraps that need no explicit permission are admitted.
+/// Enforce [`key_wrap_allowed`].
 #[cfg(feature = "xmlenc")]
 fn check_key_wrap(
     allowlist: Option<&BTreeSet<KeyWrapAlgorithm>>,
     algorithm: KeyWrapAlgorithm,
     operation: &'static str,
 ) -> Result<(), PolicyViolation> {
-    let refused = allowlist.map_or(algorithm.requires_explicit_permission(), |allowed| {
-        !allowed.contains(&algorithm)
-    });
-    if refused {
+    if !key_wrap_allowed(allowlist, algorithm) {
         return Err(PolicyViolation::Algorithm {
             operation,
             algorithm: algorithm.uri().to_owned(),

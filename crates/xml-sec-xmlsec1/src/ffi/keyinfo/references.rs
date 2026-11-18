@@ -295,11 +295,15 @@ pub(crate) unsafe fn next_reference_depth(ctx: *const XmlSecKeyInfoCtx) -> usize
     // limit, so it cannot lift the policy's bound.
     let mut depth = 1_usize;
     for level in levels {
-        let Ok(level) = usize::try_from(level) else {
+        // A sum past `usize` (three `c_int` levels on a 32-bit target) is
+        // past every limit too.
+        let Some(next) = usize::try_from(level)
+            .ok()
+            .and_then(|level| depth.checked_add(level))
+        else {
             return usize::MAX;
         };
-        // Three `c_int` levels and one more fit in `usize`.
-        depth += level;
+        depth = next;
     }
     depth
 }

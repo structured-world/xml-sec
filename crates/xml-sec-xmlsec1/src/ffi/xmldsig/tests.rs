@@ -719,39 +719,47 @@ fn a_key_read_and_the_references_share_one_allowance() {
         "<DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>",
         "<DigestValue/></Reference></SignedInfo><SignatureValue/></Signature>"
     );
-    crate::ffi::policy::republish(
-        |_| {},
-        |signing| {
-            signing.resources.max_external_resource_bytes = CONSTANT.len();
-            signing.resources.max_external_resource_total_bytes =
-                KEY_READ_OCTETS + CONSTANT.len() - 1;
-        },
-    )
-    .expect("the library policy compiles");
-    // SAFETY: the library, a document, a manager and a context set up and
-    // torn down here, on this thread alone.
+    let total = KEY_READ_OCTETS + CONSTANT.len();
+    // SAFETY: the library, documents, a manager and contexts set up and torn
+    // down here, on this thread alone.
     unsafe {
         assert_eq!(xmlSecInit(), 0);
         assert_eq!(xmlSecCryptoDLLoadLibrary(std::ptr::null()), 0);
         assert_eq!(xmlSecCryptoAppInit(std::ptr::null()), 0);
         assert_eq!(xmlSecCryptoInit(), 0);
         serve_constant();
-        let doc = xsReadMemory(
-            template.as_ptr().cast(),
-            i32::try_from(template.len()).expect("a short document"),
-            std::ptr::null(),
-            std::ptr::null(),
-            0,
-        );
-        assert!(!doc.is_null());
         let mngr = crate::ffi::keysmngr::xmlSecKeysMngrCreate();
         (*mngr).get_key = Some(charging_lookup);
-        let ctx = xmlSecDSigCtxCreate(mngr);
-        (*ctx).enabled_reference_uris = 0xFFFF;
-        assert_eq!(xmlSecDSigCtxSign(ctx, xsDocGetRootElement(doc)), -1);
-        xmlSecDSigCtxDestroy(ctx);
+        // One octet short fails; the exact total signs, so the refusal is the
+        // shared allowance and nothing is counted twice.
+        for (limit, signed) in [(total - 1, -1), (total, 0)] {
+            crate::ffi::policy::republish(
+                |_| {},
+                |signing| {
+                    signing.resources.max_external_resource_bytes = CONSTANT.len();
+                    signing.resources.max_external_resource_total_bytes = limit;
+                },
+            )
+            .expect("the library policy compiles");
+            let doc = xsReadMemory(
+                template.as_ptr().cast(),
+                i32::try_from(template.len()).expect("a short document"),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+            );
+            assert!(!doc.is_null());
+            let ctx = xmlSecDSigCtxCreate(mngr);
+            (*ctx).enabled_reference_uris = 0xFFFF;
+            assert_eq!(
+                xmlSecDSigCtxSign(ctx, xsDocGetRootElement(doc)),
+                signed,
+                "{total} octets under {limit}"
+            );
+            xmlSecDSigCtxDestroy(ctx);
+            xsFreeDoc(doc);
+        }
         crate::ffi::keysmngr::xmlSecKeysMngrDestroy(mngr);
-        xsFreeDoc(doc);
         assert_eq!(xmlSecCryptoShutdown(), 0);
         assert_eq!(xmlSecCryptoAppShutdown(), 0);
         assert_eq!(xmlSecShutdown(), 0);

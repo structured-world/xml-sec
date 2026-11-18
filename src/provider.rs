@@ -265,9 +265,12 @@ impl RecoveredContentKey {
         mut self,
     ) -> Result<(zeroize::Zeroizing<Vec<u8>>, RecoveryValidity), ProviderError> {
         let validity = RecoveryValidity(self.valid);
-        // The validity travels with the key; the rejection check is the
-        // one `into_key_or_substitute` makes on the public mechanism.
-        self.valid = subtle::Choice::from(1);
+        // An implicitly rejected recovery's validity travels with the key;
+        // any other mechanism keeps it, so the check on the public mechanism
+        // in `into_key_or_substitute` still fails it at once.
+        if self.implicit_rejection {
+            self.valid = subtle::Choice::from(1);
+        }
         self.into_key_or_substitute().map(|key| (key, validity))
     }
 }
@@ -3408,6 +3411,26 @@ mod tests {
                 assert_eq!(a.same_candidate(&b), left == right);
             }
         }
+    }
+
+    #[cfg(feature = "xmlenc")]
+    #[test]
+    fn a_failed_public_recovery_fails_when_its_validity_is_carried() {
+        // Only an implicitly rejected recovery hides its failure behind a
+        // substitute; any other mechanism's failure is already public, so
+        // handing the key out with its validity fails at once, as handing
+        // it out without its validity does.
+        let mut key = RecoveredContentKey::confirmed(vec![0x52; 16]);
+        key.valid = subtle::Choice::from(0);
+        assert!(matches!(
+            key.into_key_with_validity(),
+            Err(ProviderError::AuthenticationFailed)
+        ));
+        let (bytes, validity) = RecoveredContentKey::confirmed(vec![0x52; 16])
+            .into_key_with_validity()
+            .expect("a confirmed key is handed out");
+        assert_eq!(*bytes, vec![0x52; 16]);
+        assert!(validity.is_valid());
     }
 
     #[cfg(all(feature = "legacy-algorithms", feature = "xmlenc"))]

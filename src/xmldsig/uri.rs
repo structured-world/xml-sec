@@ -80,9 +80,20 @@ fn invalid_fragment() -> TransformError {
     TransformError::InvalidFragment
 }
 
+/// Whether an external `uri` selects part of its resource. An external
+/// resource is octets: a non-empty fragment would select part of it, which
+/// `XMLDSig` 1.1 section 4.4.3.2 leaves optional, so it is refused rather than
+/// silently covering the whole resource. An empty fragment names the whole
+/// resource (RFC 3986 section 4.1).
+fn selects_external_fragment(uri: &str) -> bool {
+    uri.split_once('#')
+        .is_some_and(|(_, fragment)| !fragment.is_empty())
+}
+
 pub(crate) enum UriFailureKind {
     MissingId,
     Unsupported,
+    ExternalFragment,
 }
 
 pub(crate) trait UriScratch: Scratch {
@@ -94,6 +105,9 @@ impl UriScratch for Native {
         match kind {
             UriFailureKind::MissingId => TransformError::ElementNotFound(parts.concat()),
             UriFailureKind::Unsupported => TransformError::UnsupportedUri(parts.concat()),
+            UriFailureKind::ExternalFragment => {
+                TransformError::ExternalResourceFragment(parts.concat())
+            }
         }
     }
 }
@@ -107,6 +121,9 @@ impl<W: structured_asn1::memory::Work> UriScratch for Accounted<'_, W> {
                 }
                 UriFailureKind::Unsupported => {
                     TransformError::AccountedUnsupportedUri(text.into_owned())
+                }
+                UriFailureKind::ExternalFragment => {
+                    TransformError::AccountedExternalResourceFragment(text.into_owned())
                 }
             },
             Err(cause) => cause.into(),
@@ -315,6 +332,9 @@ struct ExternalResourceBudget {
     remaining_total: Cell<usize>,
     per_resource: usize,
     total: usize,
+    /// The aggregate allowance refused a resource: the operation's budget is
+    /// spent, so no later resource is fetched.
+    refused: Cell<bool>,
 }
 
 pub(crate) enum ExternalResourceMapError {
@@ -417,7 +437,21 @@ impl ExternalResourceBudget {
             remaining_total: Cell::new(max_total_bytes),
             per_resource: max_resource_bytes,
             total: max_total_bytes,
+            refused: Cell::new(false),
         }
+    }
+
+    /// Refuses a lookup before its bytes are fetched once the aggregate
+    /// allowance refused one.
+    fn admit(&self) -> Result<(), TransformError> {
+        if self.refused.get() {
+            return Err(transform_resource_limit(
+                crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                self.total,
+                self.total,
+            ));
+        }
+        Ok(())
     }
 
     fn charge(&self, bytes: usize) -> Result<(), TransformError> {
@@ -431,6 +465,7 @@ impl ExternalResourceBudget {
         let remaining = self.remaining_total.get();
         let Some(next) = remaining.checked_sub(bytes) else {
             self.remaining_total.set(0);
+            self.refused.set(true);
             return Err(transform_resource_limit(
                 crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
                 self.total,
@@ -716,16 +751,10 @@ impl<'a> UriReferenceResolver<'a> {
     /// The caller-supplied resource for `uri` with its stored key, charged to
     /// the external-resource budget.
     fn charged_resource(&self, uri: &str) -> Result<Option<(&'a str, &'a [u8])>, TransformError> {
-        // An external resource is octets: a non-empty fragment would select
-        // part of it, which XMLDSig 1.1 section 4.4.3.2 leaves optional, so it
-        // is refused rather than silently covering the whole resource. An
-        // empty fragment names the whole resource (RFC 3986 section 4.1).
-        if uri
-            .split_once('#')
-            .is_some_and(|(_, fragment)| !fragment.is_empty())
-        {
-            return Err(TransformError::ExternalResourceFragment(uri.to_owned()));
+        if selects_external_fragment(uri) {
+            return Err(Native.diagnostic(UriFailureKind::ExternalFragment, &[uri]));
         }
+        self.external_resource_budget.admit()?;
         let Some((uri, bytes)) = self
             .external_resources
             .and_then(|resources| resources.get_key_value(uri))
@@ -757,6 +786,7 @@ impl<'a> UriReferenceResolver<'a> {
         &self,
         uri: &str,
     ) -> Result<Option<&'a [u8]>, TransformError> {
+        self.external_resource_budget.admit()?;
         let Some(bytes) = self
             .external_resources
             .and_then(|resources| resources.key_material(uri))
@@ -894,6 +924,10 @@ impl<'a> UriReferenceResolver<'a> {
         scratch
             .charge(resolved.len())
             .map_err(map_xml_base_execution_error)?;
+        if selects_external_fragment(resolved) {
+            // The diagnostic stays charged to the replay's scratch.
+            return Err(scratch.diagnostic(UriFailureKind::ExternalFragment, &[resolved]));
+        }
         self.external_resource_input(resolved)
     }
 
@@ -1847,6 +1881,70 @@ mod tests {
             Err(TransformError::InvalidFragment)
         ));
         assert_eq!(work.used(), 0);
+    }
+
+    #[test]
+    fn no_resource_is_fetched_once_the_aggregate_limit_refused_one() {
+        // The aggregate allowance is the operation's: once a resource passes
+        // it, every later lookup is refused before the caller is asked for
+        // bytes, whichever signature of a batch makes it.
+        let fetched = core::cell::Cell::new(0_usize);
+        let fetch = |_: &str| {
+            fetched.set(fetched.get() + 1);
+            Some(vec![0; 8])
+        };
+        let resources =
+            LazyExternalResources::new(["urn:first".to_owned(), "urn:second".to_owned()], &fetch);
+        let doc = Document::parse("<root/>").unwrap();
+        let resolver = UriReferenceResolver::new(&doc)
+            .with_lazy_external_resources(&resources)
+            .with_external_resource_limits(8, 4);
+        assert!(resolver.dereference("urn:first").is_err());
+        assert_eq!(fetched.get(), 1);
+        assert!(matches!(
+            resolver.dereference("urn:second"),
+            Err(TransformError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit { .. }
+            ))
+        ));
+        assert_eq!(fetched.get(), 1, "nothing is fetched past the refusal");
+    }
+
+    #[test]
+    fn external_fragment_diagnostic_obeys_current_capacity() {
+        // The refused URI is attacker-controlled text too: the diagnostic is
+        // charged to the query as the resolution was, so it fails when the
+        // query cannot retain it rather than escaping as an uncharged String.
+        use crate::c14n::scratch::Accounted;
+        use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
+        let doc = Document::parse("<root/>").unwrap();
+        let resolver = UriReferenceResolver::new(&doc);
+        let uri = format!("urn:doc#{}", "x".repeat(600));
+        let work = Memory::new(std::sync::Arc::new(MemoryAccount::new(1024, 1 << 22)));
+        assert!(matches!(
+            resolver.replay_input_from_with_budget(
+                &uri,
+                doc.root_element(),
+                &NodeSetMaterializationBudget::default(),
+                &XmlBaseResolutionBudget::default(),
+                &Accounted(&work),
+            ),
+            Err(TransformError::C14n(
+                crate::c14n::C14nError::SharedExecution(MemoryError::LimitExceeded)
+            ))
+        ));
+        assert_eq!(work.used(), 0);
+        let work = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 16, 1 << 22)));
+        assert!(matches!(
+            resolver.replay_input_from_with_budget(
+                &uri,
+                doc.root_element(),
+                &NodeSetMaterializationBudget::default(),
+                &XmlBaseResolutionBudget::default(),
+                &Accounted(&work),
+            ),
+            Err(TransformError::AccountedExternalResourceFragment(_))
+        ));
     }
 
     #[test]

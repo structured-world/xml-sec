@@ -232,16 +232,20 @@ pub(super) unsafe fn xml_encrypt(
         let text = if element {
             nodes::dump(node)
         } else {
-            let mut text = String::new();
+            // A child that cannot be written fails the whole content, never
+            // a prefix of it.
+            let mut text = Some(String::new());
             let mut child = xsNodeGetChildren(node);
-            while !child.is_null() {
+            while !child.is_null()
+                && let Some(written) = text.as_mut()
+            {
                 match nodes::dump(child) {
-                    Some(dumped) => text.push_str(&dumped),
-                    None => break,
+                    Some(dumped) => written.push_str(&dumped),
+                    None => text = None,
                 }
                 child = nodes::next(child);
             }
-            Some(text)
+            text
         };
         let Some(text) = text else {
             errors::xml_failed(here, std::ptr::null(), c"xmlNodeDumpOutput");

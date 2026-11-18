@@ -214,6 +214,27 @@ fn lazy_external_resources_are_fetched_only_after_the_signature_value_verifies()
         .expect("an authentic signature verifies");
     assert_eq!(authentic.status, DsigStatus::Valid);
     assert_eq!(fetched.get(), 1);
+    assert_eq!(
+        authentic.signed_info_references[0].external_payload,
+        Some(super::ExternalPayload::Resident)
+    );
+
+    // A listed resource its source does not supply is unavailable, and no
+    // bytes are claimed resident for it.
+    let nothing = |_: &str| None;
+    let resources =
+        super::super::uri::LazyExternalResources::new(["urn:payload".to_owned()], &nothing);
+    let unavailable = VerifyContext::new()
+        .key(&AcceptingKey)
+        .allowed_uri_types(UriTypeSet::ALL)
+        .lazy_external_resources(&resources)
+        .verify(&xml)
+        .expect("an unavailable payload is a verification status");
+    assert_eq!(
+        unavailable.signed_info_references[0].status,
+        DsigStatus::Invalid(FailureReason::ReferenceUnavailable { ref_index: 0 })
+    );
+    assert_eq!(unavailable.signed_info_references[0].external_payload, None);
 }
 
 #[test]
@@ -4780,6 +4801,40 @@ fn unavailable_detached_payload_does_not_hide_a_valid_signature() {
     assert_eq!(
         result.signed_info_references[1].status,
         DsigStatus::Invalid(FailureReason::ReferenceUnavailable { ref_index: 1 })
+    );
+}
+
+#[test]
+fn an_external_fragment_fails_only_its_own_reference() {
+    // A fragment of an external resource is refused, but the refusal belongs
+    // to that Reference: verification reports it and processes the others,
+    // as it does for any other URI its Reference cannot use.
+    let xml = signature_with_target_content("AQ==", "payload").replacen(
+        "</ds:SignedInfo>",
+        &format!(
+            "{}{}</ds:SignedInfo>",
+            sha1_reference("urn:doc#part", "AAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+            sha1_reference("urn:later", "AAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+        ),
+        1,
+    );
+    let result = VerifyContext::new()
+        .key(&AcceptingKey)
+        .policy(external_reference_policy())
+        .verify(&xml)
+        .expect("a refused fragment is a verification status");
+    let statuses: Vec<_> = result
+        .signed_info_references
+        .iter()
+        .map(|reference| reference.status)
+        .collect();
+    assert_eq!(
+        statuses,
+        [
+            DsigStatus::Valid,
+            DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { ref_index: 1 }),
+            DsigStatus::Invalid(FailureReason::ReferenceUnavailable { ref_index: 2 }),
+        ]
     );
 }
 

@@ -460,6 +460,11 @@ pub enum TransformError {
     #[error("fragment of an external resource is not supported: {0}")]
     ExternalResourceFragment(String),
 
+    /// [`Self::ExternalResourceFragment`] whose diagnostic retains its
+    /// current-query capacity charge.
+    #[error("fragment of an external resource is not supported: {0}")]
+    AccountedExternalResourceFragment(structured_asn1::memory::OwnedText),
+
     /// Malformed same-document syntax, requiring no diagnostic allocation.
     #[error("unsupported URI: invalid same-document fragment")]
     InvalidFragment,

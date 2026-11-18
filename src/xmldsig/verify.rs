@@ -665,7 +665,10 @@ impl<'a> VerifyContext<'a> {
     /// [`Self::external_resources`]: a resource is fetched only when a
     /// reference dereferences it, and every signature's `SignatureValue` is
     /// checked before its references are, so a forged signature fetches none
-    /// of the resources it names. The same URI and policy rules apply.
+    /// of the resources it names. The same URI and policy rules apply. The
+    /// two sources are alternatives: the one set last is used. External key
+    /// material is never read from this source, so a verifier that needs it
+    /// supplies every resource through [`Self::external_resources`].
     ///
     /// # Examples
     ///
@@ -1424,6 +1427,14 @@ fn bind_external_evidence(
     let OperationResourceIdentity::BorrowedExternal { uri, .. } = observed else {
         return;
     };
+    // A listed resource its source did not supply has no bytes to describe;
+    // a fetched one is resident, whether its digest matched or not.
+    if matches!(
+        result.status,
+        DsigStatus::Invalid(FailureReason::ReferenceUnavailable { .. })
+    ) {
+        return;
+    }
     // Without transforms a valid SHA-256 DigestValue was just compared against
     // the digest of exactly these bytes, so it is their fingerprint.
     let digested = (result.status == DsigStatus::Valid
@@ -2031,6 +2042,8 @@ fn is_reference_local_transform_error(error: &TransformError) -> bool {
             | TransformError::AccountedElementNotFound(_)
             | TransformError::UnsupportedUri(_)
             | TransformError::AccountedUnsupportedUri(_)
+            | TransformError::ExternalResourceFragment(_)
+            | TransformError::AccountedExternalResourceFragment(_)
             | TransformError::InvalidFragment
             | TransformError::UnsupportedTransform(_)
             | TransformError::AccountedUnsupportedTransform(_)

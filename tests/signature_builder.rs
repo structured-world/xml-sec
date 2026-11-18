@@ -462,6 +462,45 @@ fn accepts_repeated_inherited_prefix_within_each_xpath_budget() {
 }
 
 #[test]
+fn an_implicit_generated_canonicalization_writes_no_c14n_transform() {
+    // A policy that leaves a node set's conversion implicit builds the
+    // template libxmlsec1 writes: an enveloped reference keeps exactly its
+    // own transform, while the default policy appends C14N 1.1.
+    let build = |policy: &SigningPolicy| {
+        SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+            .add_reference(
+                ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                    .uri("")
+                    .transform(Transform::Enveloped),
+            )
+            .build_template_with_policy(policy)
+            .expect("valid template")
+    };
+    let transforms = |xml: &str| {
+        roxmltree::Document::parse(xml)
+            .expect("builder must emit valid XML")
+            .descendants()
+            .filter(|node| node.has_tag_name((DSIG_NS, "Transform")))
+            .map(|node| node.attribute("Algorithm").unwrap_or("").to_owned())
+            .collect::<Vec<_>>()
+    };
+    let mut implicit = SigningPolicy::default();
+    implicit.transforms.generated_canonicalization =
+        xml_sec::policy::GeneratedCanonicalization::Implicit;
+    assert_eq!(
+        transforms(&build(&implicit)),
+        ["http://www.w3.org/2000/09/xmldsig#enveloped-signature"]
+    );
+    assert_eq!(
+        transforms(&build(&SigningPolicy::default())),
+        [
+            "http://www.w3.org/2000/09/xmldsig#enveloped-signature",
+            "http://www.w3.org/2006/12/xml-c14n11"
+        ]
+    );
+}
+
+#[test]
 fn policy_aware_builder_uses_the_callers_resource_snapshot() {
     // The high-level signing path must not silently validate against defaults
     // before applying its caller-selected immutable policy.

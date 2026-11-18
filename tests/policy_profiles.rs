@@ -299,6 +299,56 @@ fn denying_certificate_signatures_keeps_trusted_preset_keys_usable() {
     assert_eq!(result.status, xml_sec::xmldsig::DsigStatus::Valid);
 }
 
+#[test]
+fn the_compatible_profile_signs_the_ids_it_verifies() {
+    // libxmlsec1 looks a bare-name fragment up the same way for signing and
+    // verification, so its profile signs a reference to an ID that is not an
+    // NCName, which its verification resolves.
+    let compiled = compiler(PolicyProfile::XmlSecCompatible)
+        .compile(&context())
+        .unwrap();
+    let key = HmacSigningKey::new(vec![0x53; 32]).unwrap();
+    let verifier = HmacVerificationKey::new(vec![0x53; 32]).unwrap();
+    let xml = SignContext::new(&key)
+        .policy(compiled.signing().unwrap().clone())
+        .sign_template(&template("urn:test", "123"))
+        .unwrap()
+        .output;
+    let result = VerifyContext::new()
+        .key(&verifier)
+        .policy(compiled.verification().unwrap().clone())
+        .verify(&xml)
+        .unwrap();
+    assert_eq!(result.status, xml_sec::xmldsig::DsigStatus::Valid);
+}
+
+#[test]
+fn only_signing_layers_must_agree_on_the_generated_canonicalization() {
+    // Verification never generates a canonicalization, so a layer that
+    // differs from its base only there composes; a signing layer that
+    // differs would change the signed output and is refused.
+    let compatibility = || compiler(PolicyProfile::XmlSecCompatible);
+    let mut layer = compatibility().policies().clone();
+    layer
+        .verification
+        .as_mut()
+        .unwrap()
+        .transforms
+        .generated_canonicalization = xml_sec::policy::GeneratedCanonicalization::ExplicitC14n11;
+    assert!(compatibility().restrict(&layer).is_ok());
+    let mut layer = compatibility().policies().clone();
+    layer
+        .signing
+        .as_mut()
+        .unwrap()
+        .transforms
+        .generated_canonicalization = xml_sec::policy::GeneratedCanonicalization::ExplicitC14n11;
+    assert!(matches!(
+        compatibility().restrict(&layer),
+        Err(PolicyViolation::Configuration { .. })
+    ));
+}
+
 #[cfg(feature = "xmlenc")]
 #[test]
 fn compiler_checks_every_permitted_oaep_tuple() {

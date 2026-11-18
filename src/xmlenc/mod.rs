@@ -68,7 +68,7 @@ pub use types::{
 
 /// The longest RSA key-transport ciphertext any operation admits: the width
 /// of the largest RSA modulus the library accepts. A transport collecting
-/// its input refuses more before any key or policy is consulted.
+/// its input refuses more before it copies the excess or runs RSA.
 pub const KEY_TRANSPORT_CIPHERTEXT_CEILING: usize =
     crate::hard_limits::RSA_MODULUS_BIT_CEILING.div_ceil(8);
 

@@ -781,6 +781,105 @@ fn a_wrapped_key_is_recovered_on_the_signing_side() {
 }
 
 #[test]
+fn a_failed_recipient_leaves_no_rejected_recovery_behind() {
+    // Work counts are shared by every recipient a key read tries, but a
+    // recovery's validity belongs to the key it yields: a recipient that
+    // fails (a wrap unlocked by a rejected PKCS #1 v1.5 recovery) does not
+    // fail the decryption a later recipient's key serves.
+    own_process();
+    let (_, rejected) = xml_sec::provider::RecoveredContentKey::recovery(
+        zeroize::Zeroizing::new(vec![0; 16]),
+        subtle::Choice::from(0),
+    )
+    .into_key_with_validity()
+    .expect("an exportable recovery");
+    // SAFETY: the library and contexts set up and released here, on this
+    // thread alone.
+    unsafe {
+        start_up();
+        for (done, valid) in [(-1, true), (0, false)] {
+            let read = crate::ffi::keyinfo::xmlSecKeyInfoCtxCreate(std::ptr::null_mut());
+            (*read).operation = crate::ffi::transforms::OPERATION_DECRYPT;
+            let pin = crate::ffi::policy::SlotPin::hold(
+                &raw mut (*read).reserved0,
+                crate::ffi::errors::here!("test"),
+            )
+            .expect("a revision is published");
+            assert_eq!(super::encrypted_key::xmlSecKeyInfoCtxCreateEncCtx(read), 0);
+            let enc = (*read).enc_ctx.cast::<XmlSecEncCtx>();
+            super::encrypted_key::within_key_info(read, enc, || {
+                crate::ffi::transforms::ctx::run_budget(&raw mut (*enc).transform_ctx).recovery =
+                    rejected;
+                done
+            });
+            let spent = crate::ffi::policy::spent((*read).reserved0)
+                .expect("the read is pinned")
+                .get();
+            assert_eq!(
+                spent.recovery.is_valid(),
+                valid,
+                "a recipient returning {done}"
+            );
+            drop(pin);
+            crate::ffi::keyinfo::xmlSecKeyInfoCtxDestroy(read);
+        }
+        shut_down();
+    }
+}
+
+#[test]
+fn a_recovered_key_is_bounded_by_the_decryption_depth() {
+    // A carried EncryptedKey is recovered under the decryption policy even
+    // on the signing side, so that policy's key reference depth bounds it,
+    // not the depth of the operation that reads it.
+    own_process();
+    let secret = [0x7e_u8; 32];
+    xml_sec_libxml2::policy::republish_encryption(
+        |_| {},
+        |decryption| decryption.resources.max_key_info_reference_depth = 0,
+    )
+    .expect("the library policy compiles");
+    // SAFETY: the library, a document, keys, a manager and a context set up
+    // and released here, on this thread alone.
+    unsafe {
+        start_up();
+        let (wrapped, _) = encrypted(crate::ffi::transforms::ciphers::kw_aes128(), &secret);
+        let doc = parsed(&format!(
+            "{}{wrapped}{}",
+            concat!(
+                "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\">",
+                "<EncryptedKey xmlns=\"http://www.w3.org/2001/04/xmlenc#\">",
+                "<EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#kw-aes128\"/>",
+                "<CipherData><CipherValue>",
+            ),
+            "</CipherValue></CipherData></EncryptedKey></KeyInfo>"
+        ));
+        let mngr = xmlSecKeysMngrCreate();
+        (*mngr).get_key = Some(kek_or_read);
+        let read = crate::ffi::keyinfo::xmlSecKeyInfoCtxCreate(mngr);
+        (*read).operation = crate::ffi::transforms::OPERATION_SIGN;
+        (*read).key_req.key_id = symkeys::hmac();
+        let key = xmlSecKeyCreate();
+        let (_, reasons) = reported(|| {
+            crate::ffi::keyinfo::xmlSecKeyInfoNodeRead(
+                xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc.cast()),
+                key,
+                read,
+            )
+        });
+        assert!(
+            crate::ffi::keys::xmlSecKeyGetValue(key).is_null(),
+            "no key past the decryption depth: {reasons:?}"
+        );
+        crate::ffi::keys::xmlSecKeyDestroy(key);
+        crate::ffi::keyinfo::xmlSecKeyInfoCtxDestroy(read);
+        xmlSecKeysMngrDestroy(mngr);
+        xsFreeDoc(doc.cast());
+        shut_down();
+    }
+}
+
+#[test]
 fn a_nested_recipient_past_the_resource_limit_ends_the_key_read() {
     // The EncryptedKey in a recipient's KeyInfo is a part of the same key
     // read: its CipherReference passing a resource limit spends the

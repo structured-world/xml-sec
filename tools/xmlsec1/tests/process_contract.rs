@@ -2753,9 +2753,18 @@ fn signing_leaves_a_node_set_conversion_implicit_as_xmlsec1_does() {
             .arg(&template),
     );
     let xml = fs::read_to_string(&signed).unwrap();
-    assert!(
-        !xml.contains("http://www.w3.org/2006/12/xml-c14n11"),
-        "no C14N 1.1 Transform was written: {xml}"
+    // The Reference keeps exactly its own chain: no canonicalization of any
+    // version was appended.
+    let document = roxmltree::Document::parse(&xml).unwrap();
+    let transforms: Vec<_> = document
+        .descendants()
+        .filter(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "Transform")))
+        .filter_map(|node| node.attribute("Algorithm"))
+        .collect();
+    assert_eq!(
+        transforms,
+        ["http://www.w3.org/2000/09/xmldsig#enveloped-signature"],
+        "{xml}"
     );
     run_success(
         Command::new(binary())

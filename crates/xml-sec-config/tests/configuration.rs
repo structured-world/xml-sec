@@ -960,12 +960,15 @@ fn generated_canonicalization_is_a_signing_setting_only() {
             "{table}"
         );
     }
-    let output = effective(
-        &config("[profiles.team.decryption]\nenabled=true").expect("strict config"),
-        "team",
-    )
-    .to_toml()
-    .expect("effective output");
+    // Without XML Encryption there is no decryption table to enable.
+    let extra = if cfg!(feature = "xmlenc") {
+        "[profiles.team.decryption]\nenabled=true"
+    } else {
+        ""
+    };
+    let output = effective(&config(extra).expect("strict config"), "team")
+        .to_toml()
+        .expect("effective output");
     assert_eq!(
         output.matches("generated_canonicalization").count(),
         1,
@@ -1013,11 +1016,15 @@ fn request_selections_reach_the_compiled_snapshots() {
          same_document_id_semantics=['XmlSecVisa3d']\n\
          ecdsa_signature_value_encodings=[]\nmanifest_processing=[]",
     );
+    // Every set is narrowed to exactly what the layer lists.
     assert_eq!(
-        narrowed.same_document_id_semantics,
-        BTreeSet::from([SameDocumentIdSemantics::XmlSecVisa3d])
+        narrowed,
+        RequestSelections {
+            same_document_id_semantics: BTreeSet::from([SameDocumentIdSemantics::XmlSecVisa3d]),
+            ecdsa_signature_value_encodings: BTreeSet::new(),
+            manifest_processing: BTreeSet::new(),
+        }
     );
-    assert!(narrowed.ecdsa_signature_value_encodings.is_empty());
     assert!(matches!(
         config(
             "Modern",
