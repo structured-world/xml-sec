@@ -97,12 +97,14 @@ impl KeptInputs {
     }
 
     /// Whether anything is kept.
+    #[cfg(feature = "xmldsig-sign")]
     pub(crate) const fn any(self) -> bool {
         self.signed_info || self.signed_info_references || self.manifest_references
     }
 
     /// Whether a reference of `SignedInfo`, or of a `Manifest` otherwise,
     /// keeps its bytes.
+    #[cfg(feature = "xmldsig-sign")]
     pub(crate) const fn reference(self, in_signed_info: bool) -> bool {
         if in_signed_info {
             self.signed_info_references
