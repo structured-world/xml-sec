@@ -11457,7 +11457,7 @@
  pub mod xml;
  
 -pub use xml::{serialize, serialize_with_options, SerializeOptions};
-+pub use xml::{SerializeOptions, serialize, serialize_with_options};
++pub use xml::{SerializeOptions, serialize, serialize_subtree, serialize_with_options};
 --- a/xmloxide/src/serial/xml.rs
 +++ b/xmloxide/src/serial/xml.rs
 @@ -2,13 +2,15 @@
@@ -11496,7 +11496,37 @@
  /// use xmloxide::Document;
  /// use xmloxide::serial::{serialize_with_options, SerializeOptions};
  ///
-@@ -154,7 +156,6 @@
+@@ -137,6 +139,29 @@
+     output
+ }
+ 
++/// Serializes the node `id` and its subtree as libxml2's `xmlNodeDumpOutput`
++/// writes it unformatted: no XML declaration, and only the namespace
++/// declarations the nodes themselves carry. The document node is written as
++/// the whole document, declaration included, as `xmlNodeDumpOutput` writes it
++/// through `xmlDocContentDumpOutput`.
++#[must_use]
++pub fn serialize_subtree(doc: &Document, id: NodeId) -> String {
++    if id == doc.root() {
++        return serialize(doc);
++    }
++    let mut output = String::new();
++    serialize_node(
++        doc,
++        id,
++        &mut output,
++        doc.encoding.is_none(),
++        &SerializeOptions::default(),
++        0,
++        false,
++    );
++    output
++}
++
+ /// Returns `true` if the element contains only other elements (and optional
+ /// whitespace text), meaning it's safe to add indentation.
+ fn is_element_only(doc: &Document, id: NodeId) -> bool {
+@@ -154,7 +179,6 @@
      has_element_child
  }
  
@@ -11504,7 +11534,7 @@
  fn serialize_node(
      doc: &Document,
      id: NodeId,
-@@ -166,93 +167,23 @@
+@@ -166,93 +190,23 @@
  ) {
      let indent = options.indent;
      match &doc.node(id).kind {
@@ -11610,7 +11640,7 @@
              out.push_str("]]>");
          }
          NodeKind::Comment { content } => {
-@@ -313,7 +244,7 @@
+@@ -313,7 +267,7 @@
                  }
                  _ => {}
              }
@@ -11619,7 +11649,7 @@
                  out.push_str(" [");
                  out.push_str(subset);
                  out.push_str("]>");
-@@ -327,17 +258,118 @@
+@@ -327,17 +281,118 @@
      }
  }
  
@@ -11741,7 +11771,7 @@
  /// - `\t` and `\n` are passed through
  /// - Control characters below 0x20 (other than `\t`, `\n`, `\r`) are hex-encoded
  /// - Non-ASCII characters are passed through as raw UTF-8
-@@ -347,7 +379,7 @@
+@@ -347,7 +402,7 @@
              '&' => out.push_str("&amp;"),
              '<' => out.push_str("&lt;"),
              '>' => out.push_str("&gt;"),
@@ -11750,7 +11780,7 @@
              '\t' | '\n' => out.push(ch),
              c if (c as u32) < 0x20 => write_hex_char_ref(out, c),
              c if reencode_non_ascii && (c as u32) >= 0x80 => write_hex_char_ref(out, c),
-@@ -372,7 +404,7 @@
+@@ -372,7 +427,7 @@
          let b = bytes[i];
          if b == b'&' {
              // Check if this starts a valid reference
@@ -11759,7 +11789,7 @@
                  let ref_str = &text[i..=ref_end];
                  if ref_str.starts_with("&#") {
                      // Character reference — decode to char, then escape normally
-@@ -468,7 +500,8 @@
+@@ -468,7 +523,8 @@
  }
  
  /// Finds the end of an entity/character reference in attribute raw value.
@@ -11769,7 +11799,7 @@
      if start >= bytes.len() || bytes[start] != b'&' {
          return None;
      }
-@@ -501,23 +534,20 @@
+@@ -501,23 +557,20 @@
          }
          Some(i)
      } else {
@@ -11804,7 +11834,7 @@
      }
  }
  
-@@ -549,7 +579,38 @@
+@@ -549,7 +602,38 @@
  #[allow(clippy::unwrap_used)]
  mod tests {
      use super::*;
@@ -11844,7 +11874,7 @@
  
      #[test]
      fn test_serialize_empty_element() {
-@@ -765,4 +826,19 @@
+@@ -765,4 +849,19 @@
          let xml2 = serialize_with_options(&doc, &SerializeOptions::default());
          assert_eq!(xml1, xml2);
      }

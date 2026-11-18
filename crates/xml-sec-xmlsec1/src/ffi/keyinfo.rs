@@ -39,6 +39,9 @@ use super::transforms::{
     },
 };
 use super::tree::{XmlNode, nodes, xmlStrEqual};
+use super::xmlenc::{
+    xmlSecEncCtxDebugDump, xmlSecEncCtxDebugXmlDump, xmlSecEncCtxDestroy, xmlSecEncCtxReset,
+};
 use super::xmltree::{
     xmlSecAddChild, xmlSecGetNextElementNode, xmlSecGetNodeContentAndTrim, xmlSecGetNodeNsHref,
     xmlSecIsEmptyNode, xmlSecNodeEncodeAndSetContent,
@@ -49,7 +52,8 @@ mod references;
 #[cfg(test)]
 mod tests;
 pub(crate) use references::{
-    reference_xml_read, reference_xml_write, retrieval_xml_read, retrieval_xml_write,
+    next_reference_depth, reference_xml_read, reference_xml_write, retrieval_xml_read,
+    retrieval_xml_write,
 };
 
 /// The policy revision a read with `ctx` runs under: the one pinned for the
@@ -597,6 +601,9 @@ pub(crate) unsafe extern "C" fn xmlSecKeyInfoCtxFinalize(ctx: *mut XmlSecKeyInfo
         // SAFETY: an initialized context.
         unsafe {
             let context = &mut *ctx;
+            if !context.enc_ctx.is_null() {
+                xmlSecEncCtxDestroy(context.enc_ctx.cast());
+            }
             xmlSecPtrListFinalize(&raw mut context.enabled_key_data);
             xmlSecTransformCtxFinalize(&raw mut context.retrieval_method_ctx);
             xmlSecTransformCtxFinalize(&raw mut context.key_info_reference_ctx);
@@ -630,6 +637,9 @@ pub(crate) unsafe extern "C" fn xmlSecKeyInfoCtxReset(ctx: *mut XmlSecKeyInfoCtx
             context.cur_retrieval_method_level = 0;
             xmlSecTransformCtxReset(&raw mut context.key_info_reference_ctx);
             context.cur_key_info_reference_level = 0;
+            if !context.enc_ctx.is_null() {
+                xmlSecEncCtxReset(context.enc_ctx.cast());
+            }
             context.cur_encrypted_key_level = 0;
             // xmlSecTransformOperationNone.
             context.operation = 0;
@@ -777,6 +787,9 @@ pub(crate) unsafe extern "C" fn xmlSecKeyInfoCtxDebugDump(
                     context.cur_encrypted_key_level, context.max_encrypted_key_level
                 ),
             );
+            if !context.enc_ctx.is_null() {
+                xmlSecEncCtxDebugDump(context.enc_ctx.cast(), output);
+            }
             xmlSecKeyReqDebugDump(&raw mut context.key_req, output);
         }
     });
@@ -857,6 +870,9 @@ pub(crate) unsafe extern "C" fn xmlSecKeyInfoCtxDebugXmlDump(
                     )
                 ),
             );
+            if !context.enc_ctx.is_null() {
+                xmlSecEncCtxDebugXmlDump(context.enc_ctx.cast(), output);
+            }
             xmlSecKeyReqDebugXmlDump(&raw mut context.key_req, output);
             match context.mode {
                 MODE_READ => write_stream(output, "</KeyInfoReadContext>\n"),

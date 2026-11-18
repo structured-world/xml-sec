@@ -163,6 +163,103 @@ fn cipher_reference_enveloped_transform_uses_its_actual_signature_ancestor() {
 }
 
 #[test]
+fn a_direct_key_needs_no_resource_of_a_recipient_it_does_not_use() {
+    // A resolver answering the content key directly never consults the
+    // EncryptedKeys of the KeyInfo, so the external CipherReference of a
+    // recipient it does not use is not dereferenced and needs no bytes.
+    let key = [0x31; 16];
+    let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+        .direct_key(key)
+        .encrypt_binary(b"for the direct key")
+        .unwrap();
+    let xml = encrypted.encrypted_data_xml.replacen(
+        "<xenc:CipherData>",
+        &format!(
+            "<ds:KeyInfo xmlns:ds='{DS}'><xenc:EncryptedKey><xenc:EncryptionMethod \
+             Algorithm='{ENC}kw-aes128'/><xenc:CipherData><xenc:CipherReference \
+             URI='urn:another-recipient'/></xenc:CipherData></xenc:EncryptedKey></ds:KeyInfo>\
+             <xenc:CipherData>"
+        ),
+        1,
+    );
+    assert!(
+        xml.contains("URI='urn:another-recipient'"),
+        "the fixture carries the unused recipient: {xml}"
+    );
+    let resources = BTreeMap::new();
+    let resolver = SymmetricKeyDecryptor::new(key);
+    let decrypted = DecryptContext::new(&resolver)
+        .policy(external_policy())
+        .external_resources(&resources)
+        .decrypt(&xml)
+        .expect("the direct key decrypts");
+    assert_eq!(
+        decrypted.output,
+        DecryptedContent::Bytes(b"for the direct key".to_vec())
+    );
+}
+
+/// A resolver that declines the recipients the first time it is asked and
+/// takes them every later time, counting the questions; it holds no key.
+struct ChangingResolver {
+    asked: std::cell::Cell<usize>,
+}
+
+impl xml_sec::xmlenc::DecryptionKeyResolver for ChangingResolver {
+    fn consults_encrypted_keys(&self) -> bool {
+        let asked = self.asked.get();
+        self.asked.set(asked + 1);
+        asked > 0
+    }
+
+    fn resolve_key(
+        &self,
+        _provider: &dyn xml_sec::provider::CryptoProvider,
+        _algorithm: DataEncryptionAlgorithm,
+        _encrypted_key: Option<&xml_sec::xmlenc::EncryptedKey>,
+    ) -> Result<Vec<u8>, XmlEncError> {
+        Err(XmlEncError::KeyNotFound)
+    }
+}
+
+#[test]
+fn one_decryption_decides_once_whether_it_consults_recipients() {
+    // Whether the resolver's recipients are read is one decision of the
+    // operation: the stage resolving their CipherReferences and the stage
+    // reading their keys follow the same answer, so a recipient whose
+    // reference was never resolved is never read as a key source.
+    let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+        .direct_key([0x31; 16])
+        .encrypt_binary(b"no key here")
+        .unwrap();
+    let xml = encrypted.encrypted_data_xml.replacen(
+        "<xenc:CipherData>",
+        &format!(
+            "<ds:KeyInfo xmlns:ds='{DS}'><xenc:EncryptedKey><xenc:EncryptionMethod \
+             Algorithm='{ENC}kw-aes128'/><xenc:CipherData><xenc:CipherReference \
+             URI='urn:unresolved-recipient'/></xenc:CipherData></xenc:EncryptedKey></ds:KeyInfo>\
+             <xenc:CipherData>"
+        ),
+        1,
+    );
+    assert!(
+        xml.contains("URI='urn:unresolved-recipient'"),
+        "the fixture carries the recipient: {xml}"
+    );
+    let resources = BTreeMap::new();
+    let resolver = ChangingResolver {
+        asked: std::cell::Cell::new(0),
+    };
+    let error = DecryptContext::new(&resolver)
+        .policy(external_policy())
+        .external_resources(&resources)
+        .decrypt(&xml)
+        .expect_err("the resolver holds no key");
+    assert_eq!(resolver.asked.get(), 1, "asked once: {error:?}");
+    assert!(matches!(error, XmlEncError::KeyNotFound), "{error:?}");
+}
+
+#[test]
 fn external_cipher_reference_decrypts_authenticated_content() {
     // The public decrypt path consumes caller bytes directly, without creating
     // an artificial inline CipherValue or weakening GCM authentication.

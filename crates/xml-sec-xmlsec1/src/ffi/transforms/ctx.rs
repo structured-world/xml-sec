@@ -86,6 +86,12 @@ pub(crate) struct RunBudget {
     pub(crate) base64_output: usize,
     /// Octets read from external resources through the input callbacks.
     pub(crate) external_resources: usize,
+    /// An external-resource limit refused a read of the run: the operation's
+    /// budget is spent, which ends the operation rather than one reference.
+    pub(crate) resource_limit_reached: bool,
+    /// The key candidates the operation's `KeyInfo` work has inspected, of
+    /// `max_key_candidates`, carried from one `KeyInfo` read to the next.
+    pub(crate) key_candidates: policy::KeyCandidates,
     /// Octets handed to the XML parser, of `max_xml_parse_work_bytes`.
     pub(crate) xml_parse: usize,
     /// `XPath` expressions evaluated, of `max_xpath_expressions`.
@@ -98,13 +104,24 @@ pub(crate) struct RunBudget {
     /// references.
     uris: Option<UriTypeSet>,
     /// The operation the run serves, fixed with its policy revision: a
-    /// `KeyInfo` read verifies, any other run signs when one of its
-    /// transforms signs.
+    /// `KeyInfo` read verifies, any other run serves the operation one of its
+    /// transforms performs.
     side: Option<policy::Side>,
 }
 
-/// The operation the chain of `ctx` serves: signing when one of its
-/// transforms signs.
+/// The side of a transform operation that is not verification's: signing,
+/// encryption or decryption.
+pub(crate) const fn operation_side(operation: c_int) -> Option<policy::Side> {
+    match operation {
+        super::OPERATION_SIGN => Some(policy::Side::Sign),
+        super::OPERATION_ENCRYPT => Some(policy::Side::Encrypt),
+        super::OPERATION_DECRYPT => Some(policy::Side::Decrypt),
+        _ => None,
+    }
+}
+
+/// The operation the chain of `ctx` serves: the first of its transforms that
+/// signs, encrypts or decrypts names it, verification otherwise.
 ///
 /// # Safety
 /// `ctx` is an initialized context whose chain is live.
@@ -114,8 +131,8 @@ unsafe fn chain_side(ctx: *mut XmlSecTransformCtx) -> policy::Side {
     while !current.is_null() {
         // SAFETY: the chain's transforms are live.
         unsafe {
-            if (*current).operation == super::OPERATION_SIGN {
-                return policy::Side::Sign;
+            if let Some(side) = operation_side((*current).operation) {
+                return side;
             }
             current = (*current).next;
         }
@@ -160,17 +177,33 @@ pub(crate) unsafe fn run_policy(
     run.policy.clone()
 }
 
-/// Starts the fresh run of `ctx` under `pinned` with `spent` already charged,
-/// so a chain a `KeyInfo` read runs reads the revision of that read, opens
-/// its URI under the classes `uris` the read admits for that key reference,
-/// and charges the budgets that read has drawn on.
+/// Makes `pinned` the revision of the fresh run of `ctx`, leaving its side to
+/// its chain.
+///
+/// # Safety
+/// `ctx` is an initialized context.
+#[cfg(test)]
+pub(crate) unsafe fn pin_run(ctx: *mut XmlSecTransformCtx, pinned: &policy::Pinned) {
+    // SAFETY: by the caller's contract.
+    let run = unsafe { run_budget(ctx) };
+    if run.policy.is_none() {
+        run.policy = Some(pinned.clone());
+    }
+}
+
+/// Starts the fresh run of `ctx` for a part of an operation: under its
+/// revision `pinned` and `side` whatever the chain's transforms say, with
+/// `spent` already charged. A chain a `KeyInfo` read runs opens its URI
+/// under the classes `uris` the read admits for that key reference; with
+/// `None` the run opens the classes of `side`'s references.
 ///
 /// # Safety
 /// `ctx` is an initialized context.
 pub(crate) unsafe fn seed_run(
     ctx: *mut XmlSecTransformCtx,
     pinned: &policy::Pinned,
-    uris: UriTypeSet,
+    side: policy::Side,
+    uris: Option<UriTypeSet>,
     spent: policy::Spent,
 ) {
     // SAFETY: by the caller's contract.
@@ -178,14 +211,10 @@ pub(crate) unsafe fn seed_run(
     if run.policy.is_none() {
         run.policy = Some(pinned.clone());
     }
-    // A key read verifies whatever the chain's transforms say.
-    run.side = Some(policy::Side::Verify);
-    run.uris = Some(uris);
-    run.base64_input = spent.base64_input;
-    run.base64_output = spent.base64_output;
-    run.external_resources = spent.external_resources;
-    run.xml_parse = spent.xml_parse;
-    run.xpath_expressions = spent.xpath_expressions;
+    run.side = Some(side);
+    run.uris = uris;
+    // SAFETY: by the caller's contract.
+    unsafe { take_spent(ctx, spent) };
 }
 
 /// What the run of `ctx` has spent; nothing when no run has started.
@@ -201,8 +230,163 @@ pub(crate) unsafe fn run_spent(ctx: *mut XmlSecTransformCtx) -> policy::Spent {
             external_resources: run.external_resources,
             xml_parse: run.xml_parse,
             xpath_expressions: run.xpath_expressions,
+            limit_reached: run.resource_limit_reached,
         },
         None => policy::Spent::default(),
+    }
+}
+
+/// Takes into the run of `ctx`, the chain of an operation, what the
+/// operation has spent of its per-operation budgets and key candidates once
+/// its `KeyInfo` read or write is done, held in the pin in that `KeyInfo` context's slot
+/// `key_info_slot`: the `KeyInfo` work counted on from what the chain had
+/// spent ([`run_spent`]), and the operation's later work counts on from its
+/// total, so the key's work and the operation's share one allowance. The
+/// `KeyInfo` work ran under its own parts' limits, so the total is checked
+/// against the operation's `resources`; `false` after a report at `here`
+/// when it exceeds one.
+///
+/// # Safety
+/// `ctx` is an initialized context; `key_info_slot` is null or a pin.
+pub(crate) unsafe fn charge_key_info(
+    ctx: *mut XmlSecTransformCtx,
+    key_info_slot: *mut c_void,
+    resources: &xml_sec::policy::ResourcePolicy,
+    here: errors::Here,
+) -> bool {
+    // SAFETY: by the caller's contract.
+    if let Some(candidates) = unsafe { policy::key_candidates(key_info_slot) } {
+        // SAFETY: by the caller's contract.
+        unsafe { run_budget(ctx) }.key_candidates = candidates.get();
+    }
+    // SAFETY: by the caller's contract.
+    let Some(spent) = (unsafe { policy::spent(key_info_slot) }).map(std::cell::Cell::get) else {
+        return true;
+    };
+    for (value, limit) in [
+        (
+            spent.external_resources,
+            Limit {
+                name: "max_external_resource_total_bytes",
+                max: resources.max_external_resource_total_bytes,
+            },
+        ),
+        (
+            spent.base64_input,
+            Limit {
+                name: "max_base64_transform_input_bytes",
+                max: resources.max_base64_transform_input_bytes,
+            },
+        ),
+        (
+            spent.base64_output,
+            Limit {
+                name: "max_base64_transform_output_bytes",
+                max: resources.max_base64_transform_output_bytes,
+            },
+        ),
+        (
+            spent.xml_parse,
+            Limit {
+                name: "max_xml_parse_work_bytes",
+                max: resources.max_xml_parse_work_bytes,
+            },
+        ),
+        (
+            spent.xpath_expressions,
+            Limit {
+                name: "max_xpath_expressions",
+                max: resources.max_xpath_expressions,
+            },
+        ),
+    ] {
+        if value > limit.max {
+            errors::limit_exceeded(here, std::ptr::null(), limit.name, limit.max);
+            return false;
+        }
+    }
+    // SAFETY: by the caller's contract.
+    unsafe { take_spent(ctx, spent) };
+    true
+}
+
+/// Takes what the run of `ctx` has spent of the per-operation budgets off
+/// the operation's `resources`, the policy a core operation is handed: the
+/// core counts its own work from zero, so the allowance it receives is what
+/// the operation's earlier parts (its `KeyInfo` read) left. `false` after a
+/// report at `here` when one is already spent past its limit.
+///
+/// # Safety
+/// `ctx` is an initialized context.
+pub(crate) unsafe fn leave_unspent(
+    ctx: *mut XmlSecTransformCtx,
+    resources: &mut xml_sec::policy::ResourcePolicy,
+    here: errors::Here,
+) -> bool {
+    // SAFETY: by the caller's contract.
+    let spent = unsafe { run_spent(ctx) };
+    for (limit, name, value) in [
+        (
+            &mut resources.max_external_resource_total_bytes,
+            "max_external_resource_total_bytes",
+            spent.external_resources,
+        ),
+        (
+            &mut resources.max_base64_transform_input_bytes,
+            "max_base64_transform_input_bytes",
+            spent.base64_input,
+        ),
+        (
+            &mut resources.max_base64_transform_output_bytes,
+            "max_base64_transform_output_bytes",
+            spent.base64_output,
+        ),
+        (
+            &mut resources.max_xml_parse_work_bytes,
+            "max_xml_parse_work_bytes",
+            spent.xml_parse,
+        ),
+        (
+            &mut resources.max_xpath_expressions,
+            "max_xpath_expressions",
+            spent.xpath_expressions,
+        ),
+    ] {
+        let Some(left) = limit.checked_sub(value) else {
+            errors::limit_exceeded(here, std::ptr::null(), name, *limit);
+            return false;
+        };
+        *limit = left;
+    }
+    true
+}
+
+/// Makes `spent` what the run of `ctx` has spent.
+///
+/// # Safety
+/// `ctx` is an initialized context.
+pub(crate) unsafe fn take_spent(ctx: *mut XmlSecTransformCtx, spent: policy::Spent) {
+    // SAFETY: by the caller's contract.
+    let run = unsafe { run_budget(ctx) };
+    run.base64_input = spent.base64_input;
+    run.base64_output = spent.base64_output;
+    run.external_resources = spent.external_resources;
+    run.xml_parse = spent.xml_parse;
+    run.xpath_expressions = spent.xpath_expressions;
+    // A refusal is never taken back by what a part hands over.
+    run.resource_limit_reached |= spent.limit_reached;
+}
+
+/// What the operation whose chain is `ctx` has spent of its external-resource
+/// allowance, to start a read of the operation from.
+///
+/// # Safety
+/// `ctx` is an initialized context.
+pub(crate) unsafe fn external_spent(ctx: *mut XmlSecTransformCtx) -> policy::Spent {
+    policy::Spent {
+        // SAFETY: by the caller's contract.
+        external_resources: unsafe { run_spent(ctx) }.external_resources,
+        ..policy::Spent::default()
     }
 }
 
@@ -877,6 +1061,22 @@ pub(crate) unsafe extern "C" fn xmlSecTransformNodeRead(
     usage: c_uint,
     ctx: *mut XmlSecTransformCtx,
 ) -> *mut XmlSecTransform {
+    // SAFETY: by the caller's contract.
+    unsafe { node_read(node, usage, ctx, super::OPERATION_NONE) }
+}
+
+/// [`xmlSecTransformNodeRead`] of a transform that reads its node for
+/// `operation`, set before the klass reads it, as a caller that knows the
+/// operation sets it: an `xmlSecEncCtx` knows it before it reads its method.
+///
+/// # Safety
+/// As for [`xmlSecTransformNodeRead`].
+unsafe fn node_read(
+    node: *mut XmlNode,
+    usage: c_uint,
+    ctx: *mut XmlSecTransformCtx,
+    operation: c_int,
+) -> *mut XmlSecTransform {
     contain(std::ptr::null_mut(), || {
         let null = std::ptr::null_mut();
         check!(
@@ -904,11 +1104,11 @@ pub(crate) unsafe extern "C" fn xmlSecTransformNodeRead(
             return null;
         };
         // SAFETY: an initialized context; the value is NUL-terminated.
-        unsafe { read_algorithm(node, href.as_ptr().cast(), usage, ctx) }
+        unsafe { read_algorithm(node, href.as_ptr().cast(), usage, ctx, operation) }
     })
 }
 
-/// The transform for algorithm `href` read from `node`.
+/// The transform for algorithm `href` read from `node` for `operation`.
 ///
 /// # Safety
 /// As for [`xmlSecTransformNodeRead`]; `href` is NUL-terminated.
@@ -917,6 +1117,7 @@ unsafe fn read_algorithm(
     href: *const u8,
     usage: c_uint,
     ctx: *mut XmlSecTransformCtx,
+    operation: c_int,
 ) -> *mut XmlSecTransform {
     // SAFETY: by the caller's contract.
     unsafe {
@@ -949,6 +1150,7 @@ unsafe fn read_algorithm(
             errors::internal(here, name, c"xmlSecTransformCreate(id)");
             return std::ptr::null_mut();
         };
+        (*transform).operation = operation;
         if let Some(read_node) = klass.read_node
             && read_node(transform, node, ctx) < 0
         {
@@ -972,6 +1174,22 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxNodeRead(
     node: *mut XmlNode,
     usage: c_uint,
 ) -> *mut XmlSecTransform {
+    // SAFETY: by the caller's contract.
+    unsafe { ctx_node_read_for(ctx, node, usage, super::OPERATION_NONE) }
+}
+
+/// [`xmlSecTransformCtxNodeRead`] of a transform that reads its node for
+/// `operation`, so a klass whose parameters fall under that operation's
+/// policy reads them under it.
+///
+/// # Safety
+/// As for [`xmlSecTransformCtxNodeRead`].
+pub(crate) unsafe fn ctx_node_read_for(
+    ctx: *mut XmlSecTransformCtx,
+    node: *mut XmlNode,
+    usage: c_uint,
+    operation: c_int,
+) -> *mut XmlSecTransform {
     contain(std::ptr::null_mut(), || {
         let null = std::ptr::null_mut();
         building_or!(ctx, "xmlSecTransformCtxNodeRead", null);
@@ -984,7 +1202,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxNodeRead(
         let here = here!("xmlSecTransformCtxNodeRead");
         // SAFETY: by the caller's contract.
         unsafe {
-            let transform = xmlSecTransformNodeRead(node, usage, ctx);
+            let transform = node_read(node, usage, ctx, operation);
             if transform.is_null() {
                 let name = name_for_report(node);
                 errors::internal(here, name.as_ptr(), c"xmlSecTransformNodeRead");
@@ -1390,30 +1608,46 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxBinaryExecute(
             c"ctx->uri == NULL",
             -1
         );
-        let here = here!("xmlSecTransformCtxBinaryExecute");
         // SAFETY: by the caller's contract.
-        unsafe {
-            if xmlSecTransformCtxPrepare(ctx, DATA_BIN) < 0 {
-                errors::internal(
-                    here,
-                    std::ptr::null(),
-                    c"xmlSecTransformCtxPrepare(TypeBin)",
-                );
-                return -1;
-            }
-            if xmlSecTransformPushBin((*ctx).first, data, size, 1, ctx) < 0 {
-                errors::internal_with(
-                    here,
-                    std::ptr::null(),
-                    c"xmlSecTransformPushBin",
-                    &format!("dataSize={size}"),
-                );
-                return -1;
-            }
-            (*ctx).status = STATUS_FINISHED;
-        }
-        0
+        unsafe { execute_on_bytes(ctx, data, size) }
     })
+}
+
+/// Runs the fresh chain of `ctx` on `size` bytes, as
+/// `xmlSecTransformCtxBinaryExecute` does; a chain whose URI names those
+/// bytes runs on them as they were read, without opening the URI again.
+///
+/// # Safety
+/// `ctx` is an initialized, fresh context; `data` is null or readable for
+/// `size` bytes.
+pub(crate) unsafe fn execute_on_bytes(
+    ctx: *mut XmlSecTransformCtx,
+    data: *const u8,
+    size: usize,
+) -> c_int {
+    let here = here!("xmlSecTransformCtxBinaryExecute");
+    // SAFETY: by the caller's contract.
+    unsafe {
+        if xmlSecTransformCtxPrepare(ctx, DATA_BIN) < 0 {
+            errors::internal(
+                here,
+                std::ptr::null(),
+                c"xmlSecTransformCtxPrepare(TypeBin)",
+            );
+            return -1;
+        }
+        if xmlSecTransformPushBin((*ctx).first, data, size, 1, ctx) < 0 {
+            errors::internal_with(
+                here,
+                std::ptr::null(),
+                c"xmlSecTransformPushBin",
+                &format!("dataSize={size}"),
+            );
+            return -1;
+        }
+        (*ctx).status = STATUS_FINISHED;
+    }
+    0
 }
 
 /// `xmlSecTransformCtxUriExecute`: runs the chain on the resource `uri`
@@ -1599,6 +1833,201 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxExecute(
             result
         }
     })
+}
+
+/// The external resources one operation read, each under the URI its
+/// element carries, as the caller's input callbacks were asked for it.
+#[derive(Default)]
+pub(crate) struct ReadResources {
+    read: Vec<ReadResource>,
+}
+
+/// One resource of [`ReadResources`].
+struct ReadResource {
+    /// The element whose URI named the resource.
+    origin: xml_sec::document::external::ExternalNode,
+    /// The URI as the element carries it.
+    uri: String,
+    bytes: Vec<u8>,
+}
+
+impl ReadResources {
+    /// Records the octets `origin`'s URI `uri` named.
+    pub(crate) fn push(
+        &mut self,
+        origin: xml_sec::document::external::ExternalNode,
+        uri: String,
+        bytes: Vec<u8>,
+    ) {
+        self.read.push(ReadResource { origin, uri, bytes });
+    }
+
+    /// The resources keyed as the core looks them up in `document`, a
+    /// tree-backed document of their tree: each URI resolved from its
+    /// element against the XML Base it inherits, within `resources`'
+    /// limits. The callbacks were handed the URI as written, as libxmlsec1
+    /// hands it; the core resolves before it looks a resource up.
+    ///
+    /// # Errors
+    /// The resolution's failure, or an element `document` does not hold.
+    pub(crate) fn into_keyed(
+        self,
+        document: &xml_sec::document::XmlDocument,
+        resources: &xml_sec::policy::ResourcePolicy,
+    ) -> Result<KeyedResources, String> {
+        let keys = resource_keys(
+            document,
+            self.read
+                .iter()
+                .map(|resource| (resource.origin, resource.uri.as_str())),
+            resources,
+        )?;
+        let mut keyed = KeyedResources::default();
+        for (resource, key) in self.read.into_iter().zip(keys) {
+            keyed.origins.push((resource.origin, key.clone()));
+            // Two references to one resource keep the octets read first.
+            keyed.by_key.entry(key).or_insert(resource.bytes);
+        }
+        Ok(keyed)
+    }
+}
+
+/// The keys the core looks external resources up by in `document`, a
+/// tree-backed document of their tree: each URI as its element carries it,
+/// resolved from that element against the XML Base it inherits, within
+/// `resources`' limits.
+///
+/// # Errors
+/// The resolution's failure, or an element `document` does not hold.
+pub(crate) fn resource_keys<'u>(
+    document: &xml_sec::document::XmlDocument,
+    references: impl Iterator<Item = (xml_sec::document::external::ExternalNode, &'u str)>,
+    resources: &xml_sec::policy::ResourcePolicy,
+) -> Result<Vec<String>, String> {
+    document.with_view(|view| {
+        references
+            .map(|(origin, uri)| {
+                let origin = view
+                    .node_of_external(origin)
+                    .ok_or("the element of an external reference is not in the document")?;
+                xml_sec::xmldsig::uri::UriReferenceResolver::external_resource_key(
+                    origin, uri, resources,
+                )
+                .map_err(|error| error.to_string())
+            })
+            .collect()
+    })
+}
+
+/// External resources keyed as the core looks them up, with the element
+/// whose URI named each.
+#[derive(Default)]
+pub(crate) struct KeyedResources {
+    /// The octets under each resolved key, handed to the core.
+    pub(crate) by_key: std::collections::BTreeMap<String, Vec<u8>>,
+    /// Each naming element, with the key its URI resolved to.
+    origins: Vec<(xml_sec::document::external::ExternalNode, String)>,
+}
+
+impl KeyedResources {
+    /// The octets the URI of the element `origin` named.
+    pub(crate) fn get_for(
+        &self,
+        origin: xml_sec::document::external::ExternalNode,
+    ) -> Option<&[u8]> {
+        self.origins
+            .iter()
+            .find(|(element, _)| *element == origin)
+            .and_then(|(_, key)| self.by_key.get(key))
+            .map(Vec::as_slice)
+    }
+}
+
+/// The operation an external resource is read for: its pinned revision, the
+/// side whose URI classes and limits govern the read, and what its earlier
+/// reads spent, so every read of one operation shares one external-resource
+/// allowance.
+pub(crate) struct ResourceScope<'a> {
+    pub(crate) pinned: &'a policy::Pinned,
+    pub(crate) side: policy::Side,
+    pub(crate) spent: policy::Spent,
+    /// Set when an external-resource limit refused a read, which the core
+    /// treats as a refusal of the whole operation, not a missing resource.
+    pub(crate) limit_reached: bool,
+}
+
+impl<'a> ResourceScope<'a> {
+    /// Reads for `side` of the revision `pinned`, counting on from `spent`.
+    pub(crate) const fn new(
+        pinned: &'a policy::Pinned,
+        side: policy::Side,
+        spent: policy::Spent,
+    ) -> Self {
+        Self {
+            pinned,
+            side,
+            spent,
+            limit_reached: false,
+        }
+    }
+}
+
+/// The octets of the external resource `uri` names (its fragment, if any,
+/// left to the reader of the octets), read through the caller's input
+/// callbacks as a chain with no transform reads it: under the URI classes
+/// `prefs` enables and those of the operation `scope` describes, within what
+/// is left of its external-resource budgets, which the read charges. A core
+/// operation is handed these octets, as it performs no I/O itself. `None`
+/// after a report.
+///
+/// # Safety
+/// `prefs` is an initialized context; `here` a live node of `doc`.
+pub(crate) unsafe fn read_resource(
+    prefs: *mut XmlSecTransformCtx,
+    uri: &[u8],
+    here: *mut XmlNode,
+    doc: *mut XmlDoc,
+    scope: &mut ResourceScope<'_>,
+) -> Option<Vec<u8>> {
+    let location = here!("xmlSecTransformCtxUriExecute");
+    let base = uri.split(|&byte| byte == b'#').next().unwrap_or(uri);
+    let Ok(base) = std::ffi::CString::new(base) else {
+        errors::invalid_data(location, std::ptr::null(), "a URI holding a NUL octet");
+        return None;
+    };
+    // SAFETY: a context created and destroyed here; the caller's live node
+    // and document.
+    unsafe {
+        let ctx = xmlSecTransformCtxCreate();
+        if ctx.is_null() {
+            errors::internal(location, std::ptr::null(), c"xmlSecTransformCtxCreate");
+            return None;
+        }
+        (*ctx).enabled_uris = (*prefs).enabled_uris;
+        // The read is a part of its operation: that operation's revision and
+        // side admit the URI and bound the octets, counted on from what its
+        // earlier reads spent.
+        seed_run(ctx, scope.pinned, scope.side, None, scope.spent);
+        let bytes = (xmlSecTransformCtxSetUri(ctx, base.as_ptr().cast(), here) == 0
+            && xmlSecTransformCtxExecute(ctx, doc) == 0)
+            .then(|| {
+                let result = (*ctx).result;
+                let data = super::super::buffer::xmlSecBufferGetData(result);
+                if data.is_null() {
+                    Vec::new()
+                } else {
+                    std::slice::from_raw_parts(
+                        data,
+                        super::super::buffer::xmlSecBufferGetSize(result),
+                    )
+                    .to_vec()
+                }
+            });
+        scope.spent = run_spent(ctx);
+        scope.limit_reached |= run_budget(ctx).resource_limit_reached;
+        xmlSecTransformCtxDestroy(ctx);
+        bytes
+    }
 }
 
 /// The C string or `NULL` for display.

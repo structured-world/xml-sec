@@ -27,6 +27,22 @@ fn own_process() {
 }
 
 #[test]
+fn a_cipher_reference_resolves_ids_as_a_signature_reference_does() {
+    // A CipherReference URI `#123` names an element whose registered ID is
+    // not an NCName, as libxmlsec1 accepts it in a signature's reference; the
+    // decryption snapshot carries the same ID semantics.
+    let snapshots = super::snapshots().expect("the library policy compiles");
+    assert_eq!(
+        snapshots.decryption.transforms.same_document_id_semantics,
+        snapshots.verification.transforms.same_document_id_semantics
+    );
+    assert_ne!(
+        snapshots.verification.transforms.same_document_id_semantics,
+        xml_sec::policy::SameDocumentIdSemantics::Specification
+    );
+}
+
+#[test]
 fn an_edit_may_read_the_current_snapshots() {
     own_process();
     // An edit that consults the published policy runs without the snapshot

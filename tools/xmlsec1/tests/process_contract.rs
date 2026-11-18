@@ -2729,6 +2729,43 @@ fn signs_verifies_and_rejects_tampering_through_process_api() {
 }
 
 #[test]
+fn signing_leaves_a_node_set_conversion_implicit_as_xmlsec1_does() {
+    // A Reference whose chain ends in a node set, as in xmlsec1's own sign1
+    // example, is signed as xmlsec1 signs it: no C14N 1.1 Transform is
+    // written, the node set is digested with Canonical XML 1.0 (XMLDSig 1.1
+    // section 4.4.3.2), and the signature verifies.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("template.xml");
+    fs::write(
+        &template,
+        r#"<root><payload>payload</payload><Signature xmlns="http://www.w3.org/2000/09/xmldsig#"><SignedInfo><CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><Reference URI=""><Transforms><Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/></Transforms><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue/></Reference></SignedInfo><SignatureValue/></Signature></root>"#,
+    )
+    .unwrap();
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-2048-key.pem");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    let signed = temp.path().join("signed.xml");
+    run_success(
+        Command::new(binary())
+            .args(["sign", "--privkey-pem"])
+            .arg(&private_key)
+            .args(["--output"])
+            .arg(&signed)
+            .arg(&template),
+    );
+    let xml = fs::read_to_string(&signed).unwrap();
+    assert!(
+        !xml.contains("http://www.w3.org/2006/12/xml-c14n11"),
+        "no C14N 1.1 Transform was written: {xml}"
+    );
+    run_success(
+        Command::new(binary())
+            .args(["verify", "--pubkey-pem"])
+            .arg(&public_key)
+            .arg(&signed),
+    );
+}
+
+#[test]
 fn cli_asn1_signature_mode_requires_the_explicit_donor_flag() {
     // The compatibility option controls both emitted and accepted framing;
     // standards-default verification must not auto-detect DER.

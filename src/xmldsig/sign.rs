@@ -1629,7 +1629,7 @@ impl SigningKey for EcdsaP521SigningKey {
     }
 }
 
-/// Select which existing `XMLDSig` template [`SignContext::sign_template`] signs.
+/// Select which existing `XMLDSig` template a [`SignContext`] signs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SignatureTemplateSelection {
     /// Select the first descendant template in document order.
@@ -1637,15 +1637,13 @@ pub enum SignatureTemplateSelection {
     /// Select the last descendant template, matching append-then-sign workflows.
     #[default]
     LastDescendant,
-}
-
-impl SignatureTemplateSelection {
-    const fn target(self) -> SigningSignatureTarget {
-        match self {
-            Self::FirstDescendant => SigningSignatureTarget::First,
-            Self::LastDescendant => SigningSignatureTarget::Last,
-        }
-    }
+    /// Select exactly this `Signature` template of the document that supplied
+    /// the identity, as libxmlsec1's `xmlSecDSigCtxSign` signs its caller's
+    /// template node; a start node does not apply. Sign that document with
+    /// [`SignContext::sign_document`] or [`SignContext::sign_template_document`]:
+    /// [`SignContext::sign_template`] parses its input into a new document,
+    /// which holds no node of this identity.
+    Exact(crate::NodeIdentity),
 }
 
 /// `XMLDSig` signing context.
@@ -1657,6 +1655,7 @@ pub struct SignContext<'a> {
     id_attributes: &'a [crate::IdAttributeRegistration],
     external_resources: Option<&'a BTreeMap<String, Vec<u8>>>,
     template_selection: SignatureTemplateSelection,
+    base64_line_size: Option<core::num::NonZeroUsize>,
     // Shared with the compiled snapshot it came from.
     policy: Arc<crate::policy::SigningPolicy>,
     identity: Option<Arc<crate::policy::PolicyIdentity>>,
@@ -1675,6 +1674,7 @@ impl<'a> SignContext<'a> {
             id_attributes: &[],
             external_resources: None,
             template_selection: SignatureTemplateSelection::default(),
+            base64_line_size: None,
             policy: Arc::new(crate::policy::SigningPolicy::default()),
             identity: None,
             provider: crate::provider::default_provider(),
@@ -1694,6 +1694,7 @@ impl<'a> SignContext<'a> {
             id_attributes: &[],
             external_resources: None,
             template_selection: SignatureTemplateSelection::default(),
+            base64_line_size: None,
             policy: Arc::new(crate::policy::SigningPolicy::default()),
             identity: None,
             provider: crate::provider::default_provider(),
@@ -1705,6 +1706,15 @@ impl<'a> SignContext<'a> {
     #[must_use]
     pub fn policy(mut self, policy: crate::policy::SigningPolicy) -> Self {
         self.policy = Arc::new(policy);
+        self.identity = None;
+        self
+    }
+
+    /// Enforce a shared immutable policy snapshot without copying it, as an
+    /// application that publishes one snapshot to many operations does.
+    #[must_use]
+    pub fn shared_policy(mut self, policy: Arc<crate::policy::SigningPolicy>) -> Self {
+        self.policy = policy;
         self.identity = None;
         self
     }
@@ -1764,6 +1774,15 @@ impl<'a> SignContext<'a> {
     #[must_use]
     pub fn signature_template_selection(mut self, selection: SignatureTemplateSelection) -> Self {
         self.template_selection = selection;
+        self
+    }
+
+    /// Write the `DigestValue` and `SignatureValue` Base64 text in lines of
+    /// `size` characters, as libxmlsec1 lays them out; `None`, the default,
+    /// writes each value on one line. The layout changes no value.
+    #[must_use]
+    pub fn base64_line_size(mut self, size: Option<core::num::NonZeroUsize>) -> Self {
+        self.base64_line_size = size;
         self
     }
 
@@ -1906,7 +1925,7 @@ impl<'a> SignContext<'a> {
     ) -> Result<(O::Output, crate::policy::PolicyAudit), SigningError> {
         let target_signature = document.with_view(|view| {
             signing_signature_index(
-                view.document(),
+                view,
                 self.start_node_id,
                 self.id_attributes,
                 self.template_selection,
@@ -2633,6 +2652,15 @@ impl<'a> SignContext<'a> {
         )?;
         let encoded_signature_len =
             padded_base64_len_for_xml(projected_signature_len, &self.policy)?;
+        // A laid out value carries one line feed between lines (`wrap_base64`):
+        // `(len - 1) / size` of them for a non-empty value. The value is at
+        // most half the address space, as a Base64 length the policy bounds.
+        let encoded_signature_len = match self.base64_line_size {
+            Some(size) if encoded_signature_len > 0 => {
+                encoded_signature_len + (encoded_signature_len - 1) / size
+            }
+            _ => encoded_signature_len,
+        };
         let signature_value_node = document.with_view(|view| {
             let signature = find_signing_signature_node(
                 view.document(),
@@ -2697,6 +2725,15 @@ impl<'a> SignContext<'a> {
         self.policy
             .resources
             .validate_xml_document_len(document.content_len())?;
+        // The digest values are part of SignedInfo, so their lines are laid
+        // out before it is canonicalized.
+        let pending_digests = match self.base64_line_size {
+            Some(size) => pending_digests
+                .into_iter()
+                .map(|(node, value)| (node, wrap_base64(&value, size)))
+                .collect(),
+            None => pending_digests,
+        };
         let (algorithm, hmac_output_length_bits, canonical_signed_info, signature_context) =
             operation.run_with_budgets(plan_nodes.canonicalization, |budgets| {
                 let result = canonicalize_signed_info(
@@ -2744,7 +2781,11 @@ impl<'a> SignContext<'a> {
                 signature_value,
                 self.policy.ecdsa_signature_value_encoding,
             )?;
-            Ok::<_, SigningError>(base64::engine::general_purpose::STANDARD.encode(signature_value))
+            let encoded = base64::engine::general_purpose::STANDARD.encode(signature_value);
+            Ok::<_, SigningError>(match self.base64_line_size {
+                Some(size) => wrap_base64(&encoded, size),
+                None => encoded,
+            })
         })?;
         let mut replacement = pending_digests;
         replacement.push((signature_value_node, signature_b64));
@@ -2847,8 +2888,8 @@ impl<'a> SignContext<'a> {
             transform_options,
             &mut operation,
             request,
-            Some(setup_gate),
-            true,
+            (Some(setup_gate), true),
+            self.base64_line_size,
             analyzed,
         )?;
         let output = self.finish_signing_template::<O>(
@@ -4068,8 +4109,8 @@ fn fill_reference_digest_values_in_dependency_order_with_operation(
         transform_options,
         operation,
         request,
-        setup_gate,
-        defer_digests,
+        (setup_gate, defer_digests),
+        None,
         analyzed,
     )
 }
@@ -4119,13 +4160,16 @@ fn digests_can_defer(
         })
 }
 
+/// Fills every `Reference` digest level by level; with `line_size`, a value
+/// committed at a level is laid out in lines before a later level digests
+/// it. Deferred digests return unwrapped and are laid out by the caller.
 fn fill_analyzed_reference_digest_values(
     document: &mut XmlDocument,
     transform_options: TransformOptions<'_>,
     operation: &mut SigningExecution<'_>,
     request: SigningReferenceRequest<'_, '_>,
-    setup_gate: Option<OperationNodeId>,
-    defer_digests: bool,
+    (setup_gate, defer_digests): (Option<OperationNodeId>, bool),
+    line_size: Option<core::num::NonZeroUsize>,
     analyzed: AnalyzedReferences,
 ) -> Result<(SigningPlanNodes, Vec<(crate::NodeIdentity, String)>), SigningDigestError> {
     let can_defer = defer_digests && digests_can_defer(document, &analyzed);
@@ -4160,7 +4204,7 @@ fn fill_analyzed_reference_digest_values(
             &node_level,
             document,
             |document, budgets| {
-                let replacements = document.with_view(|view| {
+                let mut replacements = document.with_view(|view| {
                     reparsed_level_digests(
                         view,
                         budgets,
@@ -4169,6 +4213,11 @@ fn fill_analyzed_reference_digest_values(
                         level_request,
                     )
                 })?;
+                if let Some(size) = line_size {
+                    for (_, value) in &mut replacements {
+                        *value = wrap_base64(value, size);
+                    }
+                }
                 document
                     .replace_base64_contents_with_budget(
                         &replacements,
@@ -5099,7 +5148,12 @@ fn second_edition_c14n11_edits(
                 .into());
             }
             let initial_binary = !structure.uri.is_empty() && !structure.uri.starts_with('#');
-            if generation_chain_produces_binary(initial_binary, &transform_uris) {
+            // An implicit conversion leaves a node set to Canonical XML 1.0,
+            // which digesting applies (XMLDSig 1.1 section 4.4.3.2).
+            if generation_chain_produces_binary(initial_binary, &transform_uris)
+                || policy.transforms.generated_canonicalization
+                    == crate::policy::GeneratedCanonicalization::Implicit
+            {
                 continue;
             }
             if transform_uris.len() >= policy.resources.max_transforms_per_reference {
@@ -5376,18 +5430,51 @@ fn find_signing_signature_node<'a>(
     })
 }
 
+/// `encoded` Base64 text in lines of `size` characters separated by line
+/// feeds, without a final one: RFC 2045 section 6.8 lets an encoder break
+/// lines, and the decoder ignores the breaks (`XMLDSig` 1.1 section 6.2).
+fn wrap_base64(encoded: &str, size: core::num::NonZeroUsize) -> String {
+    let size = size.get();
+    // Base64 text is ASCII, so every byte is one character; one line feed
+    // per line bounds the separators.
+    let mut wrapped = String::with_capacity(encoded.len() + encoded.len().div_ceil(size));
+    for (index, line) in encoded.as_bytes().chunks(size).enumerate() {
+        if index > 0 {
+            wrapped.push('\n');
+        }
+        wrapped.push_str(core::str::from_utf8(line).expect("Base64 text is ASCII"));
+    }
+    wrapped
+}
+
 fn signing_signature_index(
-    doc: &Document<'_>,
+    view: crate::document::DocumentView<'_>,
     start_node_id: Option<&str>,
     id_attributes: &[crate::IdAttributeRegistration],
     selection: SignatureTemplateSelection,
 ) -> Result<usize, SigningDigestError> {
+    let doc = view.document();
+    let target = match selection {
+        SignatureTemplateSelection::FirstDescendant => SigningSignatureTarget::First,
+        SignatureTemplateSelection::LastDescendant => SigningSignatureTarget::Last,
+        SignatureTemplateSelection::Exact(identity) => {
+            let node = view
+                .resolve_node(identity)
+                .map_err(|error| SigningDigestError::InvalidStructure(error.to_string()))?;
+            if !node.has_tag_name((XMLDSIG_NS, "Signature")) {
+                return Err(SigningDigestError::InvalidStructure(
+                    "the selected node is not a Signature element".to_owned(),
+                ));
+            }
+            return signature_index(doc, node);
+        }
+    };
     let selected = if let Some(id) = start_node_id {
         let start = signing_start_node(doc, id, id_attributes)?;
         let mut signatures = start
             .descendants()
             .filter(|node| node.has_tag_name((XMLDSIG_NS, "Signature")));
-        match selection.target() {
+        match target {
             SigningSignatureTarget::First => signatures.next(),
             SigningSignatureTarget::Last => signatures.next_back(),
             SigningSignatureTarget::Index(_) => unreachable!("public selection is not indexed"),
@@ -5398,7 +5485,7 @@ fn signing_signature_index(
             ))
         })?
     } else {
-        find_signing_signature_node(doc, selection.target())?
+        find_signing_signature_node(doc, target)?
     };
     signature_index(doc, selected)
 }

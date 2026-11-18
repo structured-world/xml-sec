@@ -505,8 +505,16 @@ unsafe extern "C" fn input_uri_pop_bin(
         name: "max_external_resource_total_bytes",
         max: resources.max_external_resource_total_bytes,
     };
-    // Both counters stay within their limits: every charge below is checked.
-    let allowance = (per_resource.max - state.read).min(per_run.max - budget.external_resources);
+    // This resource's count stays within its limit, every charge below being
+    // checked; the run may start past the aggregate one, having taken what an
+    // earlier part of its operation (a key read) spent under that part's own
+    // limits.
+    let Some(left) = per_run.max.checked_sub(budget.external_resources) else {
+        errors::limit_exceeded(here, name, per_run.name, per_run.max);
+        budget.resource_limit_reached = true;
+        return -1;
+    };
+    let allowance = (per_resource.max - state.read).min(left);
     let wanted = allowance
         .checked_add(1)
         .map_or(max_size, |room| room.min(max_size));
@@ -532,6 +540,7 @@ unsafe extern "C" fn input_uri_pop_bin(
     if charge(&mut state.read, got, per_resource, here, name).is_none()
         || charge(&mut budget.external_resources, got, per_run, here, name).is_none()
     {
+        budget.resource_limit_reached = true;
         return -1;
     }
     // SAFETY: `size` is writable.

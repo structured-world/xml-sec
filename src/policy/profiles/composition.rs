@@ -271,6 +271,10 @@ fn transforms(
         } else {
             EmptyDigestInput::Accept
         },
+        generated_canonicalization: equal(
+            a.generated_canonicalization,
+            b.generated_canonicalization,
+        )?,
     })
 }
 fn manifests(a: ManifestProcessing, b: ManifestProcessing) -> ManifestProcessing {
@@ -509,6 +513,8 @@ fn verification(
         uris: uris(a.uris, b.uris),
         transforms: transforms(&a.transforms, &b.transforms)?,
         manifest_processing: manifests(a.manifest_processing, b.manifest_processing),
+        // A request may select only what every layer lets it select.
+        request_selections: a.request_selections.intersection(&b.request_selections),
         detached_digest_attestation: attestation(
             a.detached_digest_attestation,
             b.detached_digest_attestation,
@@ -583,6 +589,8 @@ fn signing(a: &SigningPolicy, b: &SigningPolicy) -> Result<SigningPolicy, Policy
         uris: uris(a.uris, b.uris),
         transforms: transforms(&a.transforms, &b.transforms)?,
         manifest_processing: manifests(a.manifest_processing, b.manifest_processing),
+        // A request may select only what every layer lets it select.
+        request_selections: a.request_selections.intersection(&b.request_selections),
         xml: xml(a.xml, b.xml),
         resources: resources(&a.resources, &b.resources),
     })

@@ -582,6 +582,17 @@ impl OwnedTree {
         xmloxide::serial::serialize(&self.document)
     }
 
+    /// The node `node` and its subtree as XML text, as libxml2's
+    /// `xmlNodeDumpOutput` writes it unformatted: only the namespace
+    /// declarations the nodes carry, no XML declaration.
+    ///
+    /// # Errors
+    /// [`TreeError::StaleNode`] for a node this tree does not hold.
+    pub fn serialize_node(&self, node: TreeNode) -> Result<String, TreeError> {
+        let id = self.live(node)?;
+        Ok(xmloxide::serial::serialize_subtree(&self.document, id))
+    }
+
     /// The node standing for the whole document.
     #[must_use]
     pub fn document_node(&self) -> TreeNode {
@@ -690,6 +701,45 @@ impl OwnedTree {
         fragment: &str,
         policy: &impl XmlDocumentPolicy,
     ) -> Result<Option<TreeNode>, XmlDocumentError> {
+        let max_depth = policy.resource_policy().max_xml_depth;
+        self.parse_wrapped_in_context(context, fragment, max_depth, |parts| {
+            Self::parse_parts_with_policy(parts, policy)
+        })
+    }
+
+    /// [`Self::parse_in_context`] as one parse of an operation that has
+    /// `spent` octets of `policy`'s `max_xml_parse_work_bytes`, charged as
+    /// [`Self::parse_parts_within`] charges it.
+    ///
+    /// # Errors
+    /// As for [`Self::parse_in_context`], or the policy's
+    /// `max_xml_parse_work_bytes` violation when the operation's work would
+    /// pass it.
+    #[cfg(feature = "xmldsig")]
+    pub fn parse_in_context_within(
+        &mut self,
+        context: TreeNode,
+        fragment: &str,
+        policy: &impl XmlDocumentPolicy,
+        spent: &mut usize,
+    ) -> Result<Option<TreeNode>, XmlDocumentError> {
+        let max_depth = policy.resource_policy().max_xml_depth;
+        self.parse_wrapped_in_context(context, fragment, max_depth, |parts| {
+            Self::parse_parts_within(parts, policy, spent)
+        })
+    }
+
+    /// Parses `fragment` with `parse` inside an element declaring the
+    /// bindings in scope at `context` and imports its nodes, refusing a
+    /// fragment whose elements would lie deeper than `max_depth` below the
+    /// document node once linked at `context`.
+    fn parse_wrapped_in_context(
+        &mut self,
+        context: TreeNode,
+        fragment: &str,
+        max_depth: usize,
+        parse: impl FnOnce(&[&[u8]]) -> Result<Self, XmlDocumentError>,
+    ) -> Result<Option<TreeNode>, XmlDocumentError> {
         let id = self
             .live(context)
             .map_err(|_| XmlDocumentError::MissingNode)?;
@@ -720,13 +770,25 @@ impl OwnedTree {
         // joined, so an oversized fragment is refused without a copy. A
         // fragment closing the wrapper early leaves a second document
         // element or stray content, which the parse refuses.
-        let parsed = Self::parse_parts_with_policy(
-            &[wrapped.as_bytes(), fragment.as_bytes(), b"</w>"],
-            policy,
-        )?;
+        let parsed = parse(&[wrapped.as_bytes(), fragment.as_bytes(), b"</w>"])?;
         let Some(element) = parsed.document.root_element() else {
             return Ok(None);
         };
+        // The wrapper stands at depth one, so the parse kept the fragment
+        // within `max_depth - 1` levels: a context at depth one or less
+        // cannot put it past the limit, a deeper one is measured.
+        let context_depth = self.element_depth(id);
+        if context_depth > 1 {
+            let actual = parsed.levels_below(element) + context_depth;
+            if actual > max_depth {
+                return Err(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_DEPTH,
+                    maximum: max_depth,
+                    actual,
+                }
+                .into());
+            }
+        }
         let tops: Vec<NodeId> = parsed
             .document
             .children(element)
@@ -736,6 +798,37 @@ impl OwnedTree {
             self.register_imported_ids(top);
         }
         Ok(self.hold(&tops))
+    }
+
+    /// The elements on the path from `id` up to the document node, `id`
+    /// included: the depth of an element, zero for the document node.
+    fn element_depth(&self, id: NodeId) -> usize {
+        let mut depth = 0;
+        let mut current = Some(id);
+        while let Some(node) = current {
+            if matches!(self.document.node(node).kind, NodeKind::Element { .. }) {
+                // At most the number of nodes in the tree.
+                depth += 1;
+            }
+            current = self.document.parent(node);
+        }
+        depth
+    }
+
+    /// The levels of elements below `element`: zero when it has no element
+    /// child.
+    fn levels_below(&self, element: NodeId) -> usize {
+        let mut deepest = 0;
+        let mut pending: Vec<(NodeId, usize)> = Vec::new();
+        pending.extend(self.document.children(element).map(|child| (child, 1)));
+        while let Some((node, level)) = pending.pop() {
+            if matches!(self.document.node(node).kind, NodeKind::Element { .. }) {
+                deepest = deepest.max(level);
+                // Within the depth the parse admitted.
+                pending.extend(self.document.children(node).map(|child| (child, level + 1)));
+            }
+        }
+        deepest
     }
 
     /// A copy of `node` of `source` and its subtree in this tree, unlinked,

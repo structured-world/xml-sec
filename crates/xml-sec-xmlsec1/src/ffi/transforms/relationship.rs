@@ -198,10 +198,31 @@ unsafe fn render(
     let Some((pinned, side)) = scope else {
         return -1;
     };
-    policy::with_document_policy!(pinned.of(side), |policy| {
-        // SAFETY: by the caller's contract.
-        unsafe { render_under(selectors, selected, out, policy, here) }
-    })
+    match pinned.of(side) {
+        policy::OperationPolicy::Verify(policy) => {
+            // SAFETY: by the caller's contract.
+            unsafe { render_under(selectors, selected, out, policy, here) }
+        }
+        policy::OperationPolicy::Sign(policy) => {
+            // SAFETY: by the caller's contract.
+            unsafe { render_under(selectors, selected, out, policy, here) }
+        }
+        policy::OperationPolicy::Decrypt(policy) => {
+            // SAFETY: by the caller's contract.
+            unsafe { render_under(selectors, selected, out, policy, here) }
+        }
+        // An encryption transforms no document, so its policy permits no
+        // document transform.
+        policy::OperationPolicy::Encrypt(_) => {
+            errors::internal_with(
+                here,
+                name(),
+                c"xmlSecTransformRelationshipProcessNodeList",
+                "the encryption policy permits no document transform",
+            );
+            -1
+        }
+    }
 }
 
 /// [`render`] under the operation policy `policy`.

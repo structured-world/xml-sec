@@ -1314,8 +1314,8 @@ static ENCRYPTED_KEY: XmlSecKeyDataKlass = key_info_child(
     xmlSecHrefEncryptedKey.as_ptr(),
     xmlSecNodeEncryptedKey.as_ptr(),
     xmlSecEncNs.as_ptr(),
-    None,
-    None,
+    Some(super::xmlenc::encrypted_key::xml_read),
+    Some(super::xmlenc::encrypted_key::xml_write),
 );
 static DERIVED_KEY: XmlSecKeyDataKlass = key_info_child(
     xmlSecNameDerivedKey.as_ptr(),

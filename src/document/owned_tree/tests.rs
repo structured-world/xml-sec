@@ -9,6 +9,34 @@ fn parsed(xml: &str) -> OwnedTree {
     OwnedTree::parse_with_policy(xml, &VerificationPolicy::default()).expect("the document parses")
 }
 
+#[test]
+fn a_node_serializes_with_only_the_declarations_it_carries() {
+    // libxml2's xmlNodeDumpOutput writes a node as it is: a prefix bound on
+    // an ancestor is not redeclared, and no XML declaration is written.
+    let tree = parsed("<r xmlns:p=\"urn:p\"><p:a x=\"1\">t<b xmlns=\"urn:b\"/></p:a></r>");
+    let root = tree.root_element().expect("a root element");
+    let a = children(&tree, root)[0];
+    assert_eq!(
+        tree.serialize_node(a).expect("a live node"),
+        "<p:a x=\"1\">t<b xmlns=\"urn:b\"/></p:a>"
+    );
+    let text = children(&tree, a)[0];
+    assert_eq!(tree.serialize_node(text).expect("a live node"), "t");
+}
+
+#[test]
+fn the_document_node_serializes_as_the_whole_document() {
+    // libxml2's xmlNodeDumpOutput writes a document node through
+    // xmlDocContentDumpOutput: the declaration and every child, as
+    // xmlDocDumpMemory writes the document.
+    let tree = parsed("<r><c/></r>");
+    assert_eq!(
+        tree.serialize_node(tree.document_node())
+            .expect("a live node"),
+        tree.serialize()
+    );
+}
+
 fn children(tree: &OwnedTree, node: TreeNode) -> Vec<TreeNode> {
     let mut found = Vec::new();
     let mut current = tree.first_child(node).expect("a live node");
@@ -821,6 +849,37 @@ fn a_fragment_parses_in_the_document_context() {
         tree.parse_in_context(document, "<p:x/>", &VerificationPolicy::default())
             .is_err(),
         "the document binds no prefix"
+    );
+}
+
+#[test]
+fn a_fragment_is_as_deep_as_the_context_it_is_parsed_in() {
+    // The fragment's elements lie below its context: a fragment within the
+    // depth limit on its own is refused when its context is deep enough to
+    // put them past it, and one that stays within it is accepted.
+    let mut tree = parsed("<a><b><c/></b></a>");
+    let a = tree.root_element().expect("a root element");
+    let b = children(&tree, a)[0];
+    let c = children(&tree, b)[0];
+    let mut policy = VerificationPolicy::default();
+    policy.resources.max_xml_depth = 4;
+    assert!(
+        tree.parse_in_context(c, "<d/>", &policy)
+            .expect("the fourth level is within the limit")
+            .is_some()
+    );
+    assert!(matches!(
+        tree.parse_in_context(c, "<d><e/></d>", &policy),
+        Err(XmlDocumentError::Policy(PolicyViolation::ResourceLimit {
+            resource: resource_name::XML_DEPTH,
+            maximum: 4,
+            actual: 5,
+        }))
+    ));
+    assert!(
+        tree.parse_in_context(c, "text only", &policy)
+            .expect("text adds no level")
+            .is_some()
     );
 }
 

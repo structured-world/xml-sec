@@ -160,6 +160,156 @@ pub(crate) fn validate_signing_reference_request(
     Ok(())
 }
 
+/// External resources a caller supplies on demand: the operation asks
+/// `source` for the octets under one of the caller's `keys` only when it
+/// dereferences that resource, and at most once. A verification that fails
+/// on its `SignatureValue` dereferences no reference, so a forged signature
+/// makes the caller fetch nothing it names.
+///
+/// Keys are the resolved URI identities
+/// [`UriReferenceResolver::external_resource_key`] yields; a key the caller
+/// did not list, or one `source` answers with `None`, is unavailable, as a
+/// key absent from a resource map is. The octets are bounded by the
+/// operation's external-resource limits when they are used, so a resource is
+/// fetched only once the ones before it fit. Key material a `KeyInfo` names
+/// (an external `KeyInfoReference` or `RetrievalMethod`) is read before the
+/// `SignatureValue` is checked and so never comes from this source; a
+/// verifier that needs it supplies a resource map instead.
+///
+/// # Examples
+///
+/// ```
+/// use xml_sec::xmldsig::uri::LazyExternalResources;
+///
+/// let fetch = |uri: &str| (uri == "urn:payload").then(|| b"payload".to_vec());
+/// let resources = LazyExternalResources::new(["urn:payload".to_owned()], &fetch);
+/// assert_eq!(resources.len(), 1);
+/// ```
+pub struct LazyExternalResources<'s> {
+    slots: BTreeMap<String, core::cell::OnceCell<Option<Vec<u8>>>>,
+    source: &'s dyn Fn(&str) -> Option<Vec<u8>>,
+}
+
+impl<'s> LazyExternalResources<'s> {
+    /// Resources under `keys`, each fetched from `source` when first used.
+    #[must_use]
+    pub fn new(
+        keys: impl IntoIterator<Item = String>,
+        source: &'s dyn Fn(&str) -> Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            slots: keys
+                .into_iter()
+                .map(|key| (key, core::cell::OnceCell::new()))
+                .collect(),
+            source,
+        }
+    }
+
+    /// How many resources the caller listed.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Whether the caller listed no resource.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// The listed key `uri` and its octets, fetched on first use.
+    fn get_key_value(&self, uri: &str) -> Option<(&str, &[u8])> {
+        let (key, slot) = self.slots.get_key_value(uri)?;
+        let bytes = slot.get_or_init(|| (self.source)(key)).as_deref()?;
+        Some((key.as_str(), bytes))
+    }
+
+    /// The address of the listed key `uri`'s slot, which names the resource
+    /// for the whole operation without fetching it: the set stays borrowed
+    /// and unchanged while the operation runs.
+    fn slot_address(&self, uri: &str) -> Option<usize> {
+        self.slots
+            .get(uri)
+            .map(|slot| core::ptr::from_ref(slot).addr())
+    }
+
+    /// The octets of `uri` if an earlier use fetched them; never fetches.
+    fn fetched(&self, uri: &str) -> Option<&[u8]> {
+        self.slots.get(uri)?.get()?.as_deref()
+    }
+}
+
+/// The external resources of an operation: bytes the caller supplied up
+/// front, or a [`LazyExternalResources`] that fetches them when used.
+#[derive(Clone, Copy)]
+pub(crate) enum ExternalResourceSet<'a> {
+    Map(&'a BTreeMap<String, Vec<u8>>),
+    Lazy(&'a LazyExternalResources<'a>),
+}
+
+impl<'a> ExternalResourceSet<'a> {
+    /// The key `uri` and its octets; a lazy resource is fetched here.
+    fn get_key_value(self, uri: &str) -> Option<(&'a str, &'a [u8])> {
+        match self {
+            Self::Map(resources) => resources
+                .get_key_value(uri)
+                .map(|(key, bytes)| (key.as_str(), bytes.as_slice())),
+            Self::Lazy(resources) => resources.get_key_value(uri),
+        }
+    }
+
+    /// The octets of `uri` already at hand: supplied up front, or fetched by
+    /// an earlier dereference; never fetches.
+    fn at_hand(self, uri: &str) -> Option<&'a [u8]> {
+        match self {
+            Self::Map(resources) => resources.get(uri).map(Vec::as_slice),
+            Self::Lazy(resources) => resources.fetched(uri),
+        }
+    }
+
+    /// The octets of `uri` when the caller supplied them up front. Key
+    /// material is read before the `SignatureValue` is checked, so it never
+    /// comes from a lazy set, whose source is asked only for authenticated
+    /// references.
+    fn key_material(self, uri: &str) -> Option<&'a [u8]> {
+        match self {
+            Self::Map(resources) => resources.get(uri).map(Vec::as_slice),
+            Self::Lazy(_) => None,
+        }
+    }
+
+    /// Where `uri`'s resource lives and how long it is, for an identity
+    /// that never reads or fetches its bytes; the length of a lazy resource
+    /// is unknown until it is fetched.
+    fn location(self, uri: &str) -> Option<(usize, usize)> {
+        match self {
+            Self::Map(resources) => resources
+                .get(uri)
+                .map(|bytes| (bytes.as_ptr().addr(), bytes.len())),
+            Self::Lazy(resources) => resources.slot_address(uri).map(|address| (address, 0)),
+        }
+    }
+
+    /// The address of the caller's set, which stays borrowed for the whole
+    /// operation and so identifies its bytes without reading them.
+    fn address(self) -> usize {
+        match self {
+            Self::Map(resources) => core::ptr::from_ref(resources).addr(),
+            Self::Lazy(resources) => core::ptr::from_ref(resources).addr(),
+        }
+    }
+
+    /// The bytes supplied up front, validated before any is used; a lazy
+    /// set is bounded as each resource is used.
+    pub(crate) fn supplied(self) -> Option<&'a BTreeMap<String, Vec<u8>>> {
+        match self {
+            Self::Map(resources) => Some(resources),
+            Self::Lazy(_) => None,
+        }
+    }
+}
+
 /// External resource byte limits: one resource, and all of them together.
 struct ExternalResourceBudget {
     remaining_total: Cell<usize>,
@@ -246,7 +396,7 @@ impl<'a> ExternalResourceContext<'a> {
     {
         let mut resolver = UriReferenceResolver::with_id_registrations(doc, registrations)
             .with_same_document_id_semantics(same_document_id_semantics);
-        resolver.external_resources = self.resources;
+        resolver.external_resources = self.resources.map(ExternalResourceSet::Map);
         resolver.external_resource_budget = Rc::clone(&self.budget);
         resolver
     }
@@ -319,7 +469,7 @@ pub struct UriReferenceResolver<'a> {
     resource_identity: Option<String>,
     id_registrations: Vec<crate::IdAttributeRegistration>,
     id_index: ResolverIdIndex<'a>,
-    external_resources: Option<&'a BTreeMap<String, Vec<u8>>>,
+    external_resources: Option<ExternalResourceSet<'a>>,
     external_resource_budget: Rc<ExternalResourceBudget>,
     same_document_id_semantics: SameDocumentIdSemantics,
 }
@@ -508,8 +658,47 @@ impl<'a> UriReferenceResolver<'a> {
     /// query and fragment suffixes are retained.
     #[must_use]
     pub fn with_external_resources(mut self, resources: &'a BTreeMap<String, Vec<u8>>) -> Self {
+        self.external_resources = Some(ExternalResourceSet::Map(resources));
+        self
+    }
+
+    /// Attach caller-supplied external resources fetched only when a
+    /// reference is dereferenced; see [`LazyExternalResources`].
+    #[must_use]
+    pub fn with_lazy_external_resources(
+        mut self,
+        resources: &'a LazyExternalResources<'a>,
+    ) -> Self {
+        self.external_resources = Some(ExternalResourceSet::Lazy(resources));
+        self
+    }
+
+    /// Attach the operation's external resources, supplied or lazy.
+    pub(crate) fn with_external_resource_set(mut self, resources: ExternalResourceSet<'a>) -> Self {
         self.external_resources = Some(resources);
         self
+    }
+
+    /// The key under which a caller-owned external-resource map
+    /// ([`Self::with_external_resources`]) holds the resource the external
+    /// reference `uri` names from `origin`, the element that carries it:
+    /// `uri` resolved against the XML Base `origin` inherits (RFC 3986
+    /// section 5.2), dot segments removed, query and fragment kept, within
+    /// the XML Base limits of `resources`.
+    ///
+    /// # Errors
+    /// [`TransformError`] when the resolution exceeds those limits.
+    pub fn external_resource_key(
+        origin: Node<'_, '_>,
+        uri: &str,
+        resources: &crate::policy::ResourcePolicy,
+    ) -> Result<String, TransformError> {
+        let budget = XmlBaseResolutionBudget::with_limits(
+            resources.max_xml_base_components,
+            resources.max_xml_base_resolution_bytes,
+        );
+        resolve_uri_from_node_with_budget(origin, uri, &budget)
+            .map_err(map_xml_base_resolution_error)
     }
 
     pub(crate) fn with_external_resource_limits(
@@ -524,21 +713,9 @@ impl<'a> UriReferenceResolver<'a> {
         self
     }
 
-    pub(crate) fn external_resource(&self, uri: &str) -> Result<Option<&'a [u8]>, TransformError> {
-        let Some(bytes) = self
-            .external_resources
-            .and_then(|resources| resources.get(uri))
-        else {
-            return Ok(None);
-        };
-        self.external_resource_budget.charge(bytes.len())?;
-        Ok(Some(bytes))
-    }
-
-    fn external_resource_input(
-        &self,
-        uri: &str,
-    ) -> Result<Option<ReferenceInput<'a>>, TransformError> {
+    /// The caller-supplied resource for `uri` with its stored key, charged to
+    /// the external-resource budget.
+    fn charged_resource(&self, uri: &str) -> Result<Option<(&'a str, &'a [u8])>, TransformError> {
         let Some((uri, bytes)) = self
             .external_resources
             .and_then(|resources| resources.get_key_value(uri))
@@ -546,41 +723,74 @@ impl<'a> UriReferenceResolver<'a> {
             return Ok(None);
         };
         self.external_resource_budget.charge(bytes.len())?;
-        Ok(Some(ReferenceInput::Binary { bytes, uri }))
+        Ok(Some((uri, bytes)))
     }
 
+    #[cfg(feature = "xmlenc")]
+    pub(crate) fn external_resource(&self, uri: &str) -> Result<Option<&'a [u8]>, TransformError> {
+        Ok(self.charged_resource(uri)?.map(|(_, bytes)| bytes))
+    }
+
+    fn external_resource_input(
+        &self,
+        uri: &str,
+    ) -> Result<Option<ReferenceInput<'a>>, TransformError> {
+        Ok(self
+            .charged_resource(uri)?
+            .map(|(uri, bytes)| ReferenceInput::Binary { bytes, uri }))
+    }
+
+    /// The external resource `uri` names as key material (an external
+    /// `KeyInfoReference` or `RetrievalMethod`), charged like any external
+    /// resource; only bytes supplied up front are key material.
+    pub(crate) fn key_material_resource(
+        &self,
+        uri: &str,
+    ) -> Result<Option<&'a [u8]>, TransformError> {
+        let Some(bytes) = self
+            .external_resources
+            .and_then(|resources| resources.key_material(uri))
+        else {
+            return Ok(None);
+        };
+        self.external_resource_budget.charge(bytes.len())?;
+        Ok(Some(bytes))
+    }
+
+    /// The identity of the resource `uri` names, planned without reading or
+    /// fetching it: a lazy resource is fetched, and charged, only when its
+    /// reference is dereferenced.
     pub(crate) fn external_resource_identity(
         &self,
         uri: &str,
     ) -> Option<crate::operation::OperationResourceIdentity> {
         self.external_resources
-            .and_then(|resources| resources.get(uri))
-            .map(
-                |bytes| crate::operation::OperationResourceIdentity::BorrowedExternal {
+            .and_then(|resources| resources.location(uri))
+            .map(|(address, length)| {
+                crate::operation::OperationResourceIdentity::BorrowedExternal {
                     uri: uri.to_owned(),
-                    address: bytes.as_ptr().addr(),
-                    length: bytes.len(),
-                },
-            )
+                    address,
+                    length,
+                }
+            })
     }
 
-    /// SHA-256 identity of the bytes mapped to `uri`.
+    /// SHA-256 identity of the bytes mapped to `uri`, when they are at hand;
+    /// a lazy resource no reference dereferenced has none.
     pub(crate) fn external_resource_fingerprint(&self, uri: &str) -> Option<[u8; 32]> {
         use sha2::Digest as _;
 
         self.external_resources
-            .and_then(|resources| resources.get(uri))
+            .and_then(|resources| resources.at_hand(uri))
             .map(|bytes| sha2::Sha256::digest(bytes).into())
     }
 
     pub(crate) fn external_resource_set_identity(
         &self,
     ) -> crate::operation::OperationResourceIdentity {
-        // The map stays immutably borrowed for the whole operation, so its
-        // address identifies its bytes without reading them.
         crate::operation::OperationResourceIdentity::BorrowedResourceSet(
             self.external_resources
-                .map_or(0, |resources| core::ptr::from_ref(resources).addr()),
+                .map_or(0, ExternalResourceSet::address),
         )
     }
 
