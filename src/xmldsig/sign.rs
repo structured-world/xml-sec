@@ -2221,7 +2221,7 @@ impl<'a> SignContext<'a> {
         // Validate reference inputs and build the normalization candidate only after
         // independent key output has passed its own byte boundary. The execution pass
         // revalidates the resulting document defensively after controlled mutations.
-        let generated = second_edition_c14n11_edits(
+        let generated = generated_c14n_edits(
             document,
             target_signature,
             &self.policy,
@@ -2280,7 +2280,7 @@ impl<'a> SignContext<'a> {
             operation.extend();
             return Ok(mutation);
         }
-        let candidate = c14n11_candidate(document, generated);
+        let candidate = generated_c14n_candidate(document, generated);
         operation.run_document_transition(mutation, document, |document, budgets| {
             document
                 .replace_serialized_with_settings(
@@ -3428,7 +3428,7 @@ struct SigningReferenceRequest<'a, 'resources> {
     provider: &'a dyn crate::provider::CryptoProvider,
 }
 
-/// The Second Edition transform one `Reference` gains.
+/// The generated canonicalization transform one `Reference` gains.
 struct GeneratedC14n {
     digest_value: NodeId,
     digest_method: NodeId,
@@ -3707,12 +3707,8 @@ fn prepare_reference_digest_input<'a>(
         let references = parse_signing_references(signed_info)?;
         validate_signing_references(&references, references.len(), policy, false)
     })?;
-    let materialized = materialize_second_edition_c14n11_candidate(
-        &document,
-        target_signature,
-        effective_policy,
-        false,
-    )?;
+    let materialized =
+        materialize_generated_c14n_candidate(&document, target_signature, effective_policy, false)?;
     Ok((
         materialized.map_or(Cow::Borrowed(xml), Cow::Owned),
         target_signature,
@@ -3790,9 +3786,8 @@ fn collect_signing_reference_inputs(
 fn append_generated_c14n(references: &mut [SigningReference], generated: &[NodeId]) {
     for reference in references {
         if generated.contains(&reference.digest_value_node_id) {
-            let algorithm =
-                crate::c14n::C14nAlgorithm::from_uri(SECOND_EDITION_GENERATION_C14N_URI)
-                    .expect("Canonical XML 1.1 is an implemented canonicalization");
+            let algorithm = crate::c14n::C14nAlgorithm::from_uri(GENERATED_C14N_URI)
+                .expect("the generated canonicalization is an implemented one");
             reference.transforms.push(Transform::C14n(algorithm));
         }
     }
@@ -4936,8 +4931,9 @@ fn compute_signing_reference_digests_retaining(
 /// This is the signing counterpart to verification reference processing: it
 /// dereferences each `<Reference>`, applies transforms, computes the digest,
 /// and writes the base64 digest into the matching `<DigestValue>` in document
-/// order. As required for Second Edition generation, any reference chain that
-/// still produces a node-set is first made explicit with Canonical XML 1.1.
+/// order. Any reference chain that still produces a node-set is first made
+/// explicit with Exclusive C14N, as `XMLDSig` 1.1 section 3.1.1 recommends
+/// over relying on the implicit conversion.
 ///
 /// # Errors
 /// Returns XML/template, URI/transform, algorithm-policy, resource, digest
@@ -5082,7 +5078,17 @@ fn canonicalize_signed_info(
     })
 }
 
-const SECOND_EDITION_GENERATION_C14N_URI: &str = "http://www.w3.org/2006/12/xml-c14n11";
+/// The canonicalization signing writes into a `Reference` whose chain ends
+/// in a node set: Exclusive C14N, which every major `XMLDSig` implementation
+/// verifies and which does not import ancestors' `xml:*` attributes into a
+/// subset as Canonical XML 1.0 does (Exclusive XML Canonicalization 1.0
+/// section 1.1).
+/// <https://www.w3.org/TR/xml-exc-c14n/>
+const GENERATED_C14N_URI: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
+
+/// The mode of [`GENERATED_C14N_URI`], for writers that build the transform
+/// rather than its markup.
+pub(crate) const GENERATED_C14N_MODE: crate::c14n::C14nMode = crate::c14n::C14nMode::Exclusive1_0;
 
 /// Canonicalize `SignedInfo` as if each pending digest already filled its empty
 /// `DigestValue`. C14N writes an empty element as a start tag followed by its
@@ -5252,13 +5258,13 @@ fn view_is_tree_backed(view: crate::document::DocumentView<'_>) -> bool {
     }
 }
 
-fn c14n11_edit_for_reference(
+fn generated_c14n_edit_for_reference(
     xml: &str,
     reference: Node<'_, '_>,
     structure: &SigningReferenceStructure<'_>,
 ) -> Result<SourceEdit, SigningDigestError> {
     let edit = if let Some(transforms_node) = structure.transforms_node {
-        c14n11_edit_for_transforms(xml, transforms_node)?
+        generated_c14n_edit_for_transforms(xml, transforms_node)?
     } else {
         let prefix = reference.prefix().unwrap_or_default();
         let qualifier = xml_qualifier(prefix);
@@ -5266,26 +5272,26 @@ fn c14n11_edit_for_reference(
             range: structure.digest_method_node.range().start
                 ..structure.digest_method_node.range().start,
             replacement: format!(
-                "<{qualifier}Transforms><{qualifier}Transform Algorithm=\"{SECOND_EDITION_GENERATION_C14N_URI}\"/></{qualifier}Transforms>"
+                "<{qualifier}Transforms><{qualifier}Transform Algorithm=\"{GENERATED_C14N_URI}\"/></{qualifier}Transforms>"
             ),
         }
     };
     Ok(edit)
 }
 
-fn materialize_second_edition_c14n11_candidate(
+fn materialize_generated_c14n_candidate(
     document: &XmlDocument,
     target_signature: usize,
     policy: &crate::policy::SigningPolicy,
     has_external_resources: bool,
 ) -> Result<Option<String>, SigningDigestError> {
     let generated =
-        second_edition_c14n11_edits(document, target_signature, policy, has_external_resources)?;
-    Ok((!generated.is_empty()).then(|| c14n11_candidate(document, generated)))
+        generated_c14n_edits(document, target_signature, policy, has_external_resources)?;
+    Ok((!generated.is_empty()).then(|| generated_c14n_candidate(document, generated)))
 }
 
 /// The serialization with every generated transform in place.
-fn c14n11_candidate(document: &XmlDocument, generated: Vec<GeneratedC14n>) -> String {
+fn generated_c14n_candidate(document: &XmlDocument, generated: Vec<GeneratedC14n>) -> String {
     let mut candidate = document.as_xml().to_owned();
     let mut edits = generated
         .into_iter()
@@ -5298,8 +5304,8 @@ fn c14n11_candidate(document: &XmlDocument, generated: Vec<GeneratedC14n>) -> St
     candidate
 }
 
-/// The Second Edition transform each `Reference` still needs, as source edits.
-fn second_edition_c14n11_edits(
+/// The generated canonicalization each `Reference` still needs, as source edits.
+fn generated_c14n_edits(
     document: &XmlDocument,
     target_signature: usize,
     policy: &crate::policy::SigningPolicy,
@@ -5367,11 +5373,11 @@ fn second_edition_c14n11_edits(
                 .transforms
                 .allowed_algorithms
                 .as_ref()
-                .is_some_and(|allowed| !allowed.contains(SECOND_EDITION_GENERATION_C14N_URI))
+                .is_some_and(|allowed| !allowed.contains(GENERATED_C14N_URI))
             {
                 return Err(crate::policy::PolicyViolation::Algorithm {
                     operation: "signing transform",
-                    algorithm: SECOND_EDITION_GENERATION_C14N_URI.to_owned(),
+                    algorithm: GENERATED_C14N_URI.to_owned(),
                 }
                 .into());
             }
@@ -5384,7 +5390,7 @@ fn second_edition_c14n11_edits(
                     replacement: String::new(),
                 }
             } else {
-                c14n11_edit_for_reference(view.xml(), reference_node, &structure)?
+                generated_c14n_edit_for_reference(view.xml(), reference_node, &structure)?
             };
             edits.push(generated_c14n(
                 signed_info,
@@ -5440,9 +5446,8 @@ fn generated_c14n(
 ) -> GeneratedC14n {
     let owner = structure.transforms_node.unwrap_or(reference);
     let qualifier = xml_qualifier(owner.prefix().unwrap_or_default());
-    let transform = format!(
-        "<{qualifier}Transform Algorithm=\"{SECOND_EDITION_GENERATION_C14N_URI}\"></{qualifier}Transform>"
-    );
+    let transform =
+        format!("<{qualifier}Transform Algorithm=\"{GENERATED_C14N_URI}\"></{qualifier}Transform>");
     let appends = structure.transforms_node.is_some();
     let canonical_in_place = structure.transforms_node.is_none_or(|transforms| {
         core::iter::successors(transforms.next_sibling(), |node| node.next_sibling())
@@ -5468,7 +5473,7 @@ fn generated_c14n(
     }
 }
 
-fn c14n11_edit_for_transforms(
+fn generated_c14n_edit_for_transforms(
     xml: &str,
     transforms_node: Node<'_, '_>,
 ) -> Result<SourceEdit, SigningDigestError> {
@@ -5478,8 +5483,7 @@ fn c14n11_edit_for_transforms(
     })?;
     let prefix = transforms_node.prefix().unwrap_or_default();
     let qualifier = xml_qualifier(prefix);
-    let transform =
-        format!("<{qualifier}Transform Algorithm=\"{SECOND_EDITION_GENERATION_C14N_URI}\"/>");
+    let transform = format!("<{qualifier}Transform Algorithm=\"{GENERATED_C14N_URI}\"/>");
     if source.trim_end().ends_with("/>") {
         let trimmed = source.trim_end();
         let opening = trimmed.strip_suffix("/>").ok_or_else(|| {

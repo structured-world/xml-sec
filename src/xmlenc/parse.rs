@@ -1250,6 +1250,10 @@ fn parse_processed_key_reference(
             let context = child_budget
                 .references
                 .expect("processed reference context");
+            // A recipient the decryption does not read needs no ciphertext.
+            if context.recipients_declined() {
+                return Ok(RetrievedKey::Encrypted(key));
+            }
             let parse = child_budget
                 .xml_parse
                 .expect("processed reference parse budget");
@@ -1529,6 +1533,11 @@ fn preflight_encrypted_key_sources(
     budget: &KeySourceParseBudget<'_, '_, '_>,
 ) -> Result<(), XmlEncError> {
     if let Some(references) = budget.references {
+        // A recipient the decryption does not read needs neither its method
+        // nor its CipherReference admitted.
+        if references.recipients_declined() {
+            return Ok(());
+        }
         // Unused recipients remain skippable; only indirect work requires
         // validating the key method at this stage.
         if key_info_node.is_some_and(|info| {

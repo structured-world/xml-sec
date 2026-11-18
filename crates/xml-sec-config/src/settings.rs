@@ -301,7 +301,7 @@ fn transforms(p: &mut TransformPolicy, v: &Value, of: TransformTable) -> Result<
                 p.generated_canonicalization = choice!(
                     value,
                     key,
-                    GeneratedCanonicalization::ExplicitC14n11,
+                    GeneratedCanonicalization::ExplicitExclusiveC14n,
                     GeneratedCanonicalization::Implicit
                 );
             }

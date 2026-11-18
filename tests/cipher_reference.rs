@@ -199,6 +199,80 @@ fn a_direct_key_needs_no_resource_of_a_recipient_it_does_not_use() {
     );
 }
 
+#[test]
+fn a_direct_key_is_not_refused_for_an_unused_recipients_uri_class() {
+    // A recipient the decryption does not read is not preflighted either:
+    // its CipherReference names a URI class the policy refuses, which
+    // matters only to a decryption that reads it.
+    let key = [0x31; 16];
+    let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+        .direct_key(key)
+        .encrypt_binary(b"for the direct key")
+        .unwrap();
+    let xml = encrypted.encrypted_data_xml.replacen(
+        "<xenc:CipherData>",
+        &format!(
+            "<ds:KeyInfo xmlns:ds='{DS}'><xenc:EncryptedKey><xenc:EncryptionMethod \
+             Algorithm='{ENC}kw-aes128'/><xenc:CipherData><xenc:CipherReference \
+             URI='urn:another-recipient'/></xenc:CipherData></xenc:EncryptedKey></ds:KeyInfo>\
+             <xenc:CipherData>"
+        ),
+        1,
+    );
+    // The default policy admits same-document references alone.
+    let resolver = SymmetricKeyDecryptor::new(key);
+    let decrypted = DecryptContext::new(&resolver)
+        .policy(DecryptionPolicy::default())
+        .decrypt(&xml)
+        .expect("the direct key decrypts");
+    assert_eq!(
+        decrypted.output,
+        DecryptedContent::Bytes(b"for the direct key".to_vec())
+    );
+}
+
+#[test]
+fn a_direct_key_needs_no_resource_of_a_retrieved_recipient() {
+    // A recipient reached through a RetrievalMethod is a recipient too: a
+    // resolver answering the content key directly reads none, so the
+    // retrieved EncryptedKey's CipherReference is not dereferenced either.
+    let key = [0x31; 16];
+    let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+        .direct_key(key)
+        .encrypt_binary(b"for the direct key")
+        .unwrap();
+    let xml = encrypted.encrypted_data_xml.replacen(
+        "<xenc:CipherData>",
+        &format!(
+            "<ds:KeyInfo xmlns:ds='{DS}'><ds:RetrievalMethod URI='urn:recipient' \
+             Type='{ENC}EncryptedKey'/></ds:KeyInfo><xenc:CipherData>"
+        ),
+        1,
+    );
+    // The retrieved key's XML is supplied; the ciphertext it names is not.
+    let resources = BTreeMap::from([(
+        "urn:recipient".to_owned(),
+        format!(
+            "<xenc:EncryptedKey xmlns:xenc='{ENC}'><xenc:EncryptionMethod \
+             Algorithm='{ENC}kw-aes128'/><xenc:CipherData><xenc:CipherReference \
+             URI='urn:another-recipient'/></xenc:CipherData></xenc:EncryptedKey>"
+        )
+        .into_bytes(),
+    )]);
+    let mut policy = external_policy();
+    policy.uris.retrieval_methods = UriTypeSet::ALL;
+    let resolver = SymmetricKeyDecryptor::new(key);
+    let decrypted = DecryptContext::new(&resolver)
+        .policy(policy)
+        .external_resources(&resources)
+        .decrypt(&xml)
+        .expect("the direct key decrypts");
+    assert_eq!(
+        decrypted.output,
+        DecryptedContent::Bytes(b"for the direct key".to_vec())
+    );
+}
+
 /// A resolver that declines the recipients the first time it is asked and
 /// takes them every later time, counting the questions; it holds no key.
 struct ChangingResolver {

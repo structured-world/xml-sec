@@ -333,6 +333,33 @@ pub(crate) fn read_spki_public_key(
     session: &crate::xmldsig::pkix::CertificateSession,
     bytes: &[u8],
 ) -> Result<Option<RsaPublicKey>, structured_pkix::Error> {
+    read_spki_rsa_key(session, bytes, true)
+}
+
+/// The software RSA key of an SPKI for key transport: only an unrestricted
+/// `rsaEncryption` key, as `id-RSASSA-PSS` names a key for RSASSA-PSS
+/// signatures alone (RFC 4055 section 1.2); `None` otherwise.
+/// <https://www.rfc-editor.org/rfc/rfc4055#section-1.2>
+#[cfg(feature = "xmlenc")]
+pub(crate) fn read_transport_spki_public_key(bytes: &[u8]) -> Option<RsaPublicKey> {
+    // A bare decoder belongs to no operation: it reads under its own
+    // standalone hard-ceiling account.
+    read_spki_rsa_key(
+        &crate::xmldsig::pkix::CertificateSession::standalone(),
+        bytes,
+        false,
+    )
+    .ok()
+    .flatten()
+}
+
+/// [`read_spki_public_key`], admitting the `id-RSASSA-PSS` identifier only
+/// when `signing_only` keys are wanted too.
+fn read_spki_rsa_key(
+    session: &crate::xmldsig::pkix::CertificateSession,
+    bytes: &[u8],
+    signing_only: bool,
+) -> Result<Option<RsaPublicKey>, structured_pkix::Error> {
     // The shared PKIX reader owns SPKI and RSAPublicKey syntax.
     let Some(key) = session.admitted_rsa_public_key(bytes, |identifier, _| {
         let algorithm = identifier.algorithm();
@@ -346,7 +373,9 @@ pub(crate) fn read_spki_public_key(
         Ok(if algorithm == structured_pkix::oid::RSA_ENCRYPTION {
             identifier.has_null_parameter()
         } else {
-            algorithm == structured_pkix::oid::RSASSA_PSS && identifier.has_no_parameters()
+            signing_only
+                && algorithm == structured_pkix::oid::RSASSA_PSS
+                && identifier.has_no_parameters()
         })
     })?
     else {

@@ -1191,11 +1191,14 @@ pub enum EmptyDigestInput {
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum GeneratedCanonicalization {
-    /// Write an explicit C14N 1.1 `Transform`, so the conversion is part of
-    /// what `SignedInfo` authenticates (`XMLDSig` 1.1 section 3.1.1
-    /// recommends not relying on the implicit one when generating).
+    /// Write an explicit Exclusive C14N `Transform`, so the conversion is part
+    /// of what `SignedInfo` authenticates (`XMLDSig` 1.1 section 3.1.1
+    /// recommends not relying on the implicit one when generating; it asks
+    /// for Canonical XML 1.1 only where inclusive canonicalization is
+    /// desired). Exclusive C14N keeps a signed subset independent of its
+    /// ancestors' namespaces and `xml:*` attributes (section 7.3).
     #[default]
-    ExplicitC14n11,
+    ExplicitExclusiveC14n,
     /// Write nothing and leave the node set to the implicit Canonical XML 1.0
     /// conversion, as libxmlsec1 signs a template.
     Implicit,

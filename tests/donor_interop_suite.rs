@@ -830,9 +830,11 @@ fn second_edition_external_reference_detects_tampering() {
 }
 
 #[test]
-fn second_edition_template_materializes_c14n11_and_signs_detached_xml() {
-    // Second Edition generation must not rely on implicit C14N 1.0: the
-    // generated SignedInfo records C14N 1.1 as an explicit Reference transform.
+fn second_edition_template_materializes_its_canonicalization_and_signs_detached_xml() {
+    // Generation must not rely on implicit C14N 1.0 (XMLDSig 1.1 section
+    // 3.1.1): the generated SignedInfo records Exclusive C14N as an explicit
+    // Reference transform and signs exactly as a template stating it does.
+    // The vector's own C14N 1.1 digest is covered by the verification corpus.
     let templates = sorted_files(XMLDSIG2ED_DIR, "tmpl");
     assert_eq!(
         templates.len(),
@@ -869,13 +871,25 @@ fn second_edition_template_materializes_c14n11_and_signs_detached_xml() {
             .sign_template(&template)
             .unwrap_or_else(|error| panic!("{backend:?} detached signing failed: {error}"))
             .output;
+        let exclusive = r#"<Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#;
         assert!(
-            signed.contains(r#"<Transform Algorithm="http://www.w3.org/2006/12/xml-c14n11"/>"#),
-            "{backend:?} generation must materialize the C14N 1.1 conversion"
+            signed.contains(exclusive),
+            "{backend:?} generation must materialize the conversion"
         );
-        assert!(
-            signed.contains("t7d2cL8Ink8A5i3cS9/bu9MBBU8="),
-            "{backend:?} generated digest must match the W3C vector"
+        let stated = SignContext::new(&key)
+            .policy(signing_policy.clone())
+            .xml_backend(backend)
+            .external_resources(&resources)
+            .sign_template(&template.replacen(
+                "      </Transforms>",
+                &format!("      {exclusive}</Transforms>"),
+                1,
+            ))
+            .unwrap_or_else(|error| panic!("{backend:?} stated signing failed: {error}"))
+            .output;
+        assert_eq!(
+            signed, stated,
+            "{backend:?} generated and stated chains differ"
         );
         let result = VerifyContext::new()
             .key(&verification_key)

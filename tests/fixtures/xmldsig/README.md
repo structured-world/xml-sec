@@ -61,8 +61,9 @@ backend; the two XSLT-dependent signatures assert the exact unsupported
 transform URI until the separate XSLT engine is available.
 
 `defCan-1.tmpl` is signed end to end with caller-owned detached bytes. Signing
-materializes the Second Edition C14N 1.1 node-set conversion as an explicit
-`Transform`, reproduces the W3C digest, and verifies the result. Negative tests
+materializes the node-set conversion as an explicit Exclusive C14N `Transform`,
+signs exactly as a template stating it, and verifies the result; the vector's
+C14N 1.1 digest is reproduced by the verification corpus. Negative tests
 cover payload tampering, URI-policy denial, absent request bytes, aggregate
 resource exhaustion, and atomic failure of reusable owned documents.
 

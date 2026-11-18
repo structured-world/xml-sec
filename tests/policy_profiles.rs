@@ -648,16 +648,16 @@ fn all_named_profiles_compile_and_legacy_requires_auditable_expiry() {
             expected,
             "{profile:?}"
         );
-        // Every profile makes a node set's conversion explicit when signing,
-        // the libxmlsec1-compatible one included; implicit conversion is left
-        // to the libxmlsec1 boundaries.
+        // Every profile signs a node set with an explicit Exclusive C14N, the
+        // libxmlsec1-compatible one included; implicit conversion is left to
+        // the libxmlsec1 boundaries.
         assert_eq!(
             compiled
                 .signing()
                 .unwrap()
                 .transforms
                 .generated_canonicalization,
-            xml_sec::policy::GeneratedCanonicalization::ExplicitC14n11,
+            xml_sec::policy::GeneratedCanonicalization::ExplicitExclusiveC14n,
             "{profile:?}"
         );
         // Only the libxmlsec1-compatible profile stops on any X509Data child

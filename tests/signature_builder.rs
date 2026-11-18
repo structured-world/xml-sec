@@ -230,19 +230,21 @@ fn rejects_transform_chains_that_execution_cannot_accept() {
 }
 
 #[test]
-fn rejects_node_set_reference_when_generation_c14n11_is_disallowed() {
-    // Second Edition generation serializes inclusive C14N 1.1 explicitly, so
-    // builder policy must authorize that emitted transform.
+fn rejects_node_set_reference_when_the_generated_canonicalization_is_disallowed() {
+    // Generation serializes Exclusive C14N explicitly, so builder policy must
+    // authorize that emitted transform; allowing SignedInfo's inclusive
+    // canonicalization does not.
+    let inclusive = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
     let mut policy = SigningPolicy::default();
     policy.transforms.allowed_algorithms = Some(
         [
-            exclusive_c14n().uri().to_owned(),
+            inclusive.uri().to_owned(),
             xml_sec::xmldsig::ENVELOPED_SIGNATURE_URI.to_owned(),
         ]
         .into_iter()
         .collect(),
     );
-    let error = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+    let error = SignatureBuilder::new(inclusive, SignatureAlgorithm::RsaSha256)
         .add_reference(
             ReferenceBuilder::new(DigestAlgorithm::Sha256).transform(Transform::Enveloped),
         )
@@ -254,7 +256,7 @@ fn rejects_node_set_reference_when_generation_c14n11_is_disallowed() {
         SignatureBuilderError::Policy(PolicyViolation::Algorithm {
             operation: "signing transform",
             algorithm,
-        }) if algorithm == "http://www.w3.org/2006/12/xml-c14n11"
+        }) if algorithm == "http://www.w3.org/2001/10/xml-exc-c14n#"
     ));
 }
 
@@ -458,6 +460,45 @@ fn accepts_repeated_inherited_prefix_within_each_xpath_budget() {
             )
             .count(),
         17 * 64
+    );
+}
+
+#[test]
+fn an_implicit_generated_canonicalization_writes_no_c14n_transform() {
+    // A policy that leaves a node set's conversion implicit builds the
+    // template libxmlsec1 writes: an enveloped reference keeps exactly its
+    // own transform, while the default policy appends Exclusive C14N.
+    let build = |policy: &SigningPolicy| {
+        SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+            .add_reference(
+                ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                    .uri("")
+                    .transform(Transform::Enveloped),
+            )
+            .build_template_with_policy(policy)
+            .expect("valid template")
+    };
+    let transforms = |xml: &str| {
+        roxmltree::Document::parse(xml)
+            .expect("builder must emit valid XML")
+            .descendants()
+            .filter(|node| node.has_tag_name((DSIG_NS, "Transform")))
+            .map(|node| node.attribute("Algorithm").unwrap_or("").to_owned())
+            .collect::<Vec<_>>()
+    };
+    let mut implicit = SigningPolicy::default();
+    implicit.transforms.generated_canonicalization =
+        xml_sec::policy::GeneratedCanonicalization::Implicit;
+    assert_eq!(
+        transforms(&build(&implicit)),
+        ["http://www.w3.org/2000/09/xmldsig#enveloped-signature"]
+    );
+    assert_eq!(
+        transforms(&build(&SigningPolicy::default())),
+        [
+            "http://www.w3.org/2000/09/xmldsig#enveloped-signature",
+            "http://www.w3.org/2001/10/xml-exc-c14n#"
+        ]
     );
 }
 
@@ -669,9 +710,12 @@ fn serializes_and_reparses_general_xpath_filter2_parameters() {
         Transform::C14n(generated_c14n),
     ] = parsed.as_slice()
     else {
-        panic!("expected XPath Filter 2.0 followed by generated C14N 1.1");
+        panic!("expected XPath Filter 2.0 followed by the generated canonicalization");
     };
-    assert_eq!(generated_c14n.uri(), "http://www.w3.org/2006/12/xml-c14n11");
+    assert_eq!(
+        generated_c14n.uri(),
+        "http://www.w3.org/2001/10/xml-exc-c14n#"
+    );
 
     assert_eq!(parsed_filters.len(), 2);
     assert_eq!(

@@ -30,6 +30,13 @@ use xml_sec::xmldsig::{
 };
 
 const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
+const EXCLUSIVE_C14N_URI: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
+
+/// The `Transforms` a builder template gains for a Reference whose chain
+/// ends in a node set.
+fn generated_transforms() -> String {
+    format!("<Transforms><Transform Algorithm=\"{EXCLUSIVE_C14N_URI}\"/></Transforms>")
+}
 
 // A late-bound view lifetime, as `with_view` requires of its callback.
 fn view_node_count(view: xml_sec::DocumentView<'_>) -> usize {
@@ -1087,28 +1094,25 @@ fn preserves_multiple_reference_digest_order() {
             .descendants()
             .filter(|node| {
                 node.has_tag_name((XMLDSIG_NS, "Transform"))
-                    && node.attribute("Algorithm") == Some("http://www.w3.org/2006/12/xml-c14n11")
+                    && node.attribute("Algorithm") == Some(EXCLUSIVE_C14N_URI)
             })
             .count();
         assert_eq!(
             generated, 1,
-            "each node-set Reference must contain exactly one generated C14N 1.1 transform"
+            "each node-set Reference must contain exactly one generated Exclusive C14N transform"
         );
     }
     assert_reference_digests_verify(&filled);
 }
 
 #[test]
-fn generated_c14n11_preserves_self_closing_transforms_namespace() {
+fn generated_c14n_preserves_self_closing_transforms_namespace() {
     // Expanding a self-closing Transforms element must retain namespace
     // declarations from its original start tag.
     let template =
         template_with_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("#payload"))
             .replacen(
-                concat!(
-                    "<Transforms><Transform Algorithm=\"",
-                    "http://www.w3.org/2006/12/xml-c14n11\"/></Transforms>"
-                ),
+                &generated_transforms(),
                 r#"<t:Transforms xmlns:t="http://www.w3.org/2000/09/xmldsig#"/>"#,
                 1,
             );
@@ -1130,19 +1134,13 @@ fn generated_c14n11_preserves_self_closing_transforms_namespace() {
 }
 
 #[test]
-fn computed_digest_matches_materialized_c14n11_digest() {
-    // C14N 1.0 inherits xml:id onto a subtree apex while C14N 1.1 does not, so
-    // this template detects divergence between compute and fill preparation.
+fn computed_digest_matches_materialized_c14n_digest() {
+    // C14N 1.0 inherits xml:id onto a subtree apex while Exclusive C14N does
+    // not, so this template detects divergence between compute and fill
+    // preparation.
     let template =
         template_with_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("#payload"))
-            .replacen(
-                concat!(
-                    "<Transforms><Transform Algorithm=\"",
-                    "http://www.w3.org/2006/12/xml-c14n11\"/></Transforms>"
-                ),
-                "",
-                1,
-            );
+            .replacen(&generated_transforms(), "", 1);
     let xml = append_signature_to_root(
         "<root xml:id=\"ancestor\"><payload ID=\"payload\">one</payload></root>",
         &template,
@@ -1169,17 +1167,11 @@ fn implicit_generated_canonicalization_leaves_the_node_set_to_c14n_1_0() {
     // Transform into a Reference whose chain ends in a node set, as
     // libxmlsec1 signs a template, and digests the node set with Canonical
     // XML 1.0 (XMLDSig 1.1 section 4.4.3.2). C14N 1.0 inherits xml:id onto
-    // the subtree apex where 1.1 does not, so a 1.1 digest would not verify.
+    // the subtree apex where Exclusive C14N does not, so an exclusive digest
+    // would not verify.
     let template =
         template_with_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("#payload"))
-            .replacen(
-                concat!(
-                    "<Transforms><Transform Algorithm=\"",
-                    "http://www.w3.org/2006/12/xml-c14n11\"/></Transforms>"
-                ),
-                "",
-                1,
-            );
+            .replacen(&generated_transforms(), "", 1);
     let xml = append_signature_to_root(
         "<root xml:id=\"ancestor\"><payload ID=\"payload\">one</payload></root>",
         &template,
@@ -1189,7 +1181,7 @@ fn implicit_generated_canonicalization_leaves_the_node_set_to_c14n_1_0() {
         RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
             .expect("RSA private key fixture must parse");
     let public_key = "tests/fixtures/keys/rsa/rsa-2048-pubkey.pem";
-    let c14n11 = "http://www.w3.org/2006/12/xml-c14n11";
+    let generated = format!("Transform Algorithm=\"{EXCLUSIVE_C14N_URI}\"");
 
     let mut policy = SigningPolicy::default();
     policy.transforms.generated_canonicalization = GeneratedCanonicalization::Implicit;
@@ -1198,14 +1190,17 @@ fn implicit_generated_canonicalization_leaves_the_node_set_to_c14n_1_0() {
         .sign_template(&xml)
         .expect("an implicit conversion signs")
         .output;
-    assert!(!implicit.contains(c14n11), "no Transform was written");
+    assert!(!implicit.contains(&generated), "no Transform was written");
     assert_signed_template_verifies(&implicit, public_key);
 
     let explicit = SignContext::new(&private_key)
         .sign_template(&xml)
         .expect("the default policy signs")
         .output;
-    assert!(explicit.contains(c14n11), "the default writes C14N 1.1");
+    assert!(
+        explicit.contains(&generated),
+        "the default writes Exclusive C14N"
+    );
     assert_signed_template_verifies(&explicit, public_key);
 }
 
@@ -2382,8 +2377,11 @@ fn signing_policy_covers_implicit_and_signed_info_canonicalization() {
     let private_key =
         RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
             .expect("RSA private key fixture must parse");
+    // A Reference without Transforms, signed with the implicit conversion,
+    // so Canonical XML 1.0 runs although no element names it.
     let template =
-        template_with_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("#payload"));
+        template_with_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("#payload"))
+            .replacen(&generated_transforms(), "", 1);
     let xml = append_signature_to_root(
         "<root><payload ID=\"payload\">x</payload></root>",
         &template,
@@ -2393,6 +2391,7 @@ fn signing_policy_covers_implicit_and_signed_info_canonicalization() {
     let implicit_disallowed = SigningPolicy {
         transforms: xml_sec::policy::TransformPolicy {
             allowed_algorithms: Some(BTreeSet::from([exclusive_c14n().uri().to_owned()])),
+            generated_canonicalization: GeneratedCanonicalization::Implicit,
             ..xml_sec::policy::TransformPolicy::default()
         },
         ..SigningPolicy::default()
@@ -2571,11 +2570,7 @@ fn an_unrecognized_transform_does_not_carry_document_text_into_the_audit() {
     let verified = VerifyContext::new()
         .key(&verification_key)
         .process_manifests(true)
-        .allowed_transforms([
-            "http://www.w3.org/2001/10/xml-exc-c14n#",
-            "http://www.w3.org/2006/12/xml-c14n11",
-            DEFAULT_IMPLICIT_C14N_URI,
-        ])
+        .allowed_transforms([EXCLUSIVE_C14N_URI, DEFAULT_IMPLICIT_C14N_URI])
         .verify(&tampered)
         .expect("a refused Manifest Reference is that Reference's own result");
     assert!(
@@ -2626,12 +2621,9 @@ fn verification_audits_a_manifest_reference_its_policy_refuses() {
     let verified = VerifyContext::new()
         .key(&verification_key)
         .process_manifests(true)
-        // Signing materializes C14N 1.1 where a generated chain ends as a node set.
-        .allowed_transforms([
-            "http://www.w3.org/2001/10/xml-exc-c14n#",
-            "http://www.w3.org/2006/12/xml-c14n11",
-            DEFAULT_IMPLICIT_C14N_URI,
-        ])
+        // Signing materializes Exclusive C14N where a generated chain ends as
+        // a node set.
+        .allowed_transforms([EXCLUSIVE_C14N_URI, DEFAULT_IMPLICIT_C14N_URI])
         .verify(&signed)
         .expect("a refused Manifest Reference is that Reference's own result");
     assert_eq!(verified.status, DsigStatus::Valid);

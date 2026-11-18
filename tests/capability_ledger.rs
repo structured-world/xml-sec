@@ -1234,7 +1234,9 @@ fn xmldsig_second_edition_family_is_exhaustively_classified() {
     assert!(
         suite.contains("complete_second_edition_verification_corpus_is_classified_and_executed")
     );
-    assert!(suite.contains("second_edition_template_materializes_c14n11_and_signs_detached_xml"));
+    assert!(suite.contains(
+        "second_edition_template_materializes_its_canonicalization_and_signs_detached_xml"
+    ));
 }
 
 /// Every runtime command is a complete, behavior-compatible donor entry.

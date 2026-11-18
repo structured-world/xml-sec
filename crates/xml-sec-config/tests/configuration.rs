@@ -898,9 +898,10 @@ fn empty_digest_input_reaches_the_compiled_snapshots() {
 #[test]
 fn generated_canonicalization_reaches_the_compiled_snapshots() {
     // How signing completes a node-set chain reaches the compiled signing
-    // snapshot: explicit in every profile, the libxmlsec1-compatible one
-    // included. It is an interpretation, so a layer restates its base's and
-    // cannot change it; unknown names are schema errors.
+    // snapshot: explicit Exclusive C14N in every profile, the
+    // libxmlsec1-compatible one included. It is an interpretation, so a layer
+    // restates its base's and cannot change it; unknown names are schema
+    // errors.
     use xml_sec::policy::GeneratedCanonicalization;
     let config = |base: &str, extra: &str| {
         Configuration::from_str(
@@ -918,18 +919,18 @@ fn generated_canonicalization_reaches_the_compiled_snapshots() {
     };
     let implicit = "[profiles.team.signing.transforms]\ngenerated_canonicalization='Implicit'";
     let explicit =
-        "[profiles.team.signing.transforms]\ngenerated_canonicalization='ExplicitC14n11'";
+        "[profiles.team.signing.transforms]\ngenerated_canonicalization='ExplicitExclusiveC14n'";
     assert_eq!(
         decision("Modern", ""),
-        GeneratedCanonicalization::ExplicitC14n11
+        GeneratedCanonicalization::ExplicitExclusiveC14n
     );
     assert_eq!(
         decision("XmlSecCompatible", ""),
-        GeneratedCanonicalization::ExplicitC14n11
+        GeneratedCanonicalization::ExplicitExclusiveC14n
     );
     assert_eq!(
         decision("XmlSecCompatible", explicit),
-        GeneratedCanonicalization::ExplicitC14n11
+        GeneratedCanonicalization::ExplicitExclusiveC14n
     );
     let changed = config("XmlSecCompatible", implicit).expect("strict config");
     assert!(matches!(
