@@ -89,6 +89,9 @@ pub(crate) struct RunBudget {
     /// An external-resource limit refused a read of the run: the operation's
     /// budget is spent, which ends the operation rather than one reference.
     pub(crate) resource_limit_reached: bool,
+    /// The key candidates the operation's `KeyInfo` work has inspected, of
+    /// `max_key_candidates`, carried from one `KeyInfo` read to the next.
+    pub(crate) key_candidates: policy::KeyCandidates,
     /// Octets handed to the XML parser, of `max_xml_parse_work_bytes`.
     pub(crate) xml_parse: usize,
     /// `XPath` expressions evaluated, of `max_xpath_expressions`.
@@ -233,8 +236,8 @@ pub(crate) unsafe fn run_spent(ctx: *mut XmlSecTransformCtx) -> policy::Spent {
 }
 
 /// Takes into the run of `ctx`, the chain of an operation, what the
-/// operation has spent of its per-operation budgets once its `KeyInfo` read
-/// or write is done, held in the pin in that `KeyInfo` context's slot
+/// operation has spent of its per-operation budgets and key candidates once
+/// its `KeyInfo` read or write is done, held in the pin in that `KeyInfo` context's slot
 /// `key_info_slot`: the `KeyInfo` work counted on from what the chain had
 /// spent ([`run_spent`]), and the operation's later work counts on from its
 /// total, so the key's work and the operation's share one allowance. The
@@ -250,6 +253,11 @@ pub(crate) unsafe fn charge_key_info(
     resources: &xml_sec::policy::ResourcePolicy,
     here: errors::Here,
 ) -> bool {
+    // SAFETY: by the caller's contract.
+    if let Some(candidates) = unsafe { policy::key_candidates(key_info_slot) } {
+        // SAFETY: by the caller's contract.
+        unsafe { run_budget(ctx) }.key_candidates = candidates.get();
+    }
     // SAFETY: by the caller's contract.
     let Some(spent) = (unsafe { policy::spent(key_info_slot) }).map(std::cell::Cell::get) else {
         return true;

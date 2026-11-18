@@ -201,17 +201,23 @@ impl SlotPin {
                 slot,
                 Pinned::current(here)?,
                 Spent::default(),
+                KeyCandidates::default(),
             ))
         }
     }
 
     /// Pins `pinned` into `slot` unless it holds a pin, so the read sees the
-    /// revision of the operation that makes it and counts on from `spent`,
-    /// what that operation spent before it.
+    /// revision of the operation that makes it and counts on from `spent`
+    /// and `candidates`, what that operation spent before it.
     ///
     /// # Safety
     /// As for [`SlotPin::hold`].
-    pub(crate) unsafe fn hold_pinned(slot: *mut *mut c_void, pinned: Pinned, spent: Spent) -> Self {
+    pub(crate) unsafe fn hold_pinned(
+        slot: *mut *mut c_void,
+        pinned: Pinned,
+        spent: Spent,
+        candidates: KeyCandidates,
+    ) -> Self {
         // SAFETY: by the caller's contract.
         unsafe {
             if !(*slot).is_null() {
@@ -220,7 +226,7 @@ impl SlotPin {
             let operation = Operation {
                 pinned,
                 spent: Cell::new(spent),
-                key_candidates: Cell::default(),
+                key_candidates: Cell::new(candidates),
             };
             *slot = Box::into_raw(Box::new(operation)).cast();
         }

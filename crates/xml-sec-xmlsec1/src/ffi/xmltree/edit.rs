@@ -637,37 +637,78 @@ pub(crate) unsafe extern "C" fn xmlSecReplaceNodeBufferAndReturn(
         // SAFETY: handles are validated by each call; `buffer` holds `len`
         // bytes and `replaced` is writable by the caller's contract.
         unsafe {
-            let mut results: *mut XmlNode = std::ptr::null_mut();
-            let parsed = xsParseInNodeContext(
-                parent,
-                buffer.cast(),
-                len,
-                xmlSecParserGetDefaultOptions(),
-                &raw mut results,
-            );
-            // XML_ERR_OK.
-            if parsed != 0 {
-                errors::xml_failed(here, std::ptr::null(), c"xmlParseInNodeContext");
-                return -1;
-            }
-            // The parsed run takes the place of `node` in one tree edit, which
-            // also hands the IDs `node` held to the run; a run the tree
-            // refuses to link is freed and `node` stays in place.
-            if results.is_null() {
-                xsUnlinkNode(node);
-            } else if !nodes::replace_with_run(node, results) {
-                xsFreeNodeList(results);
-                errors::xml_failed(here, std::ptr::null(), c"xmlAddPrevSibling");
-                return -1;
-            }
-            if replaced.is_null() {
-                xsFreeNode(node);
-            } else {
-                replaced.write(node);
-            }
+            replace_with_parsed(node, replaced, here, |parent| {
+                let mut results: *mut XmlNode = std::ptr::null_mut();
+                let parsed = xsParseInNodeContext(
+                    parent,
+                    buffer.cast(),
+                    len,
+                    xmlSecParserGetDefaultOptions(),
+                    &raw mut results,
+                );
+                // XML_ERR_OK.
+                (parsed == 0).then_some(results)
+            })
         }
-        0
     })
+}
+
+/// [`xmlSecReplaceNodeBufferAndReturn`] for an operation: `bytes` are
+/// parsed under `policy`, the snapshot the operation runs under, rather than
+/// the current library policy.
+///
+/// # Safety
+/// `node` is a live node with a parent; `replaced` is null or writable.
+pub(crate) unsafe fn replace_node_buffer_under(
+    node: *mut XmlNode,
+    bytes: &[u8],
+    replaced: *mut *mut XmlNode,
+    policy: &impl xml_sec::XmlDocumentPolicy,
+) -> c_int {
+    let here = here!("xmlSecReplaceNodeBufferAndReturn");
+    // SAFETY: by the caller's contract.
+    unsafe {
+        replace_with_parsed(node, replaced, here, |parent| {
+            xml_sec_libxml2::nodes::parse_in_context_under(parent, bytes, policy).ok()
+        })
+    }
+}
+
+/// Replaces `node` with the run `parse` gives in the context of its parent,
+/// `None` when it refuses the bytes; the unlinked `node` goes to `replaced`,
+/// or is freed when it is null.
+///
+/// # Safety
+/// `node` is a live node with a parent; `replaced` is null or writable.
+unsafe fn replace_with_parsed(
+    node: *mut XmlNode,
+    replaced: *mut *mut XmlNode,
+    here: errors::Here,
+    parse: impl FnOnce(*mut XmlNode) -> Option<*mut XmlNode>,
+) -> c_int {
+    // SAFETY: handles are validated by each call; by the caller's contract.
+    unsafe {
+        let Some(results) = parse(nodes::parent(node)) else {
+            errors::xml_failed(here, std::ptr::null(), c"xmlParseInNodeContext");
+            return -1;
+        };
+        // The parsed run takes the place of `node` in one tree edit, which
+        // also hands the IDs `node` held to the run; a run the tree refuses
+        // to link is freed and `node` stays in place.
+        if results.is_null() {
+            xsUnlinkNode(node);
+        } else if !nodes::replace_with_run(node, results) {
+            xsFreeNodeList(results);
+            errors::xml_failed(here, std::ptr::null(), c"xmlAddPrevSibling");
+            return -1;
+        }
+        if replaced.is_null() {
+            xsFreeNode(node);
+        } else {
+            replaced.write(node);
+        }
+    }
+    0
 }
 
 /// The document and ID attribute names [`add_ids`] registers.

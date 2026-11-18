@@ -458,7 +458,9 @@ pub(crate) unsafe extern "C" fn xml_read(
 /// nested context `enc`, as a part of the `KeyInfo` read or write with
 /// `ctx`: under its revision and the side of the nested operation, counting
 /// on from what the `KeyInfo` operation spent of the per-operation budgets
-/// and handing back what `work` spent, whether it succeeds or not, so one
+/// and key candidates and handing back what `work` spent, whether it
+/// succeeds or not, so a failed recipient leaves the next no fresh
+/// allowance and one
 /// allowance bounds the operation. A resource limit `work` reached ends the
 /// `KeyInfo` operation: the budget is spent, so no later recipient is tried
 /// under it.
@@ -480,9 +482,15 @@ unsafe fn within_key_info(
             let side = operation_side((*enc).operation).unwrap_or(policy::Side::Verify);
             seed_run(transforms, pinned, side, None, spent);
         }
+        if let Some(candidates) = policy::key_candidates(slot) {
+            run_budget(transforms).key_candidates = candidates.get();
+        }
         let done = work();
         if let Some(spent) = policy::spent(slot) {
             spent.set(run_spent(transforms));
+        }
+        if let Some(candidates) = policy::key_candidates(slot) {
+            candidates.set(run_budget(transforms).key_candidates);
         }
         if run_budget(transforms).resource_limit_reached {
             return -1;

@@ -15,10 +15,9 @@ pub(crate) use content::{
     xmlSecPrintXmlString,
 };
 pub(crate) use edit::{
-    xmlSecAddChild, xmlSecAddIDs, xmlSecAddNextSibling, xmlSecAddPrevSibling,
-    xmlSecEnsureEmptyChild, xmlSecGetDefaultLineFeed, xmlSecReplaceContent,
-    xmlSecReplaceContentAndReturn, xmlSecReplaceNodeAndReturn, xmlSecReplaceNodeBuffer,
-    xmlSecReplaceNodeBufferAndReturn,
+    replace_node_buffer_under, xmlSecAddChild, xmlSecAddIDs, xmlSecAddNextSibling,
+    xmlSecAddPrevSibling, xmlSecEnsureEmptyChild, xmlSecGetDefaultLineFeed, xmlSecReplaceContent,
+    xmlSecReplaceContentAndReturn, xmlSecReplaceNodeAndReturn,
 };
 
 /// C `isspace` in the "C" locale, which libxmlsec1 trims and tests with.

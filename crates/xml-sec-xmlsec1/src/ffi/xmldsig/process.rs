@@ -43,7 +43,7 @@ use super::super::transforms::builtin::{
 use super::super::transforms::ctx::{
     KeyedResources, ReadResources, ResourceScope, XmlSecTransformCtx, charge_key_info,
     execute_on_bytes, external_spent, leave_unspent, operation_side, read_resource, resource_keys,
-    run_spent, seed_run, xmlSecTransformCtxCreate, xmlSecTransformCtxCreateAndAppend,
+    run_budget, run_spent, seed_run, xmlSecTransformCtxCreate, xmlSecTransformCtxCreateAndAppend,
     xmlSecTransformCtxDestroy, xmlSecTransformCtxExecute, xmlSecTransformCtxNodeRead,
     xmlSecTransformCtxNodesListRead, xmlSecTransformCtxSetUri, xmlSecTransformCtxXmlExecute,
 };
@@ -683,6 +683,7 @@ unsafe fn read_key(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode, pinned: &Pinned)
                 &raw mut (*read).reserved0,
                 pinned.clone(),
                 run_spent(&raw mut ctx.transform_ctx),
+                run_budget(&raw mut ctx.transform_ctx).key_candidates,
             );
             let mngr = ctx.key_info_read_ctx.keys_mngr;
             if let Some(get_key) = mngr.as_ref().and_then(|mngr| mngr.get_key) {
@@ -715,6 +716,7 @@ unsafe fn read_key(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode, pinned: &Pinned)
                 &raw mut (*write).reserved0,
                 pinned.clone(),
                 run_spent(&raw mut ctx.transform_ctx),
+                run_budget(&raw mut ctx.transform_ctx).key_candidates,
             );
             if xmlSecKeyInfoNodeWrite(node, ctx.sign_key, write) < 0
                 || !charge_key_info(

@@ -26,7 +26,7 @@ use super::super::strings;
 use super::super::transforms::builtin::xmlSecTransformBase64GetKlass;
 use super::super::transforms::ctx::{
     ReadResources, ResourceScope, charge_key_info, external_spent, leave_unspent, operation_side,
-    read_resource, run_policy, run_spent, xmlSecTransformCtxBinaryExecute,
+    read_resource, run_budget, run_policy, run_spent, xmlSecTransformCtxBinaryExecute,
     xmlSecTransformCtxExecute,
 };
 use super::super::transforms::ctx::{
@@ -39,9 +39,8 @@ use super::super::transforms::{
 };
 use super::super::tree::{XmlNode, c_text, give, nodes};
 use super::super::xmltree::{
-    xmlSecAddIDs, xmlSecCheckNodeName, xmlSecGetNextElementNode, xmlSecGetNodeContentAndTrim,
-    xmlSecReplaceContentAndReturn, xmlSecReplaceNodeAndReturn, xmlSecReplaceNodeBuffer,
-    xmlSecReplaceNodeBufferAndReturn,
+    replace_node_buffer_under, xmlSecAddIDs, xmlSecCheckNodeName, xmlSecGetNextElementNode,
+    xmlSecGetNodeContentAndTrim, xmlSecReplaceContentAndReturn, xmlSecReplaceNodeAndReturn,
 };
 use super::{
     FAILURE_KEY_NOT_FOUND, FAILURE_UNKNOWN, FLAGS_RETURN_REPLACED_NODE, MODE_ENCRYPTED_DATA,
@@ -402,6 +401,7 @@ unsafe fn write_key_info(ctx: &mut XmlSecEncCtx, here: errors::Here) -> c_int {
             &raw mut (*write).reserved0,
             pinned.clone(),
             run_spent(transforms),
+            run_budget(transforms).key_candidates,
         );
         if xmlSecKeyInfoNodeWrite(ctx.key_info_node, ctx.enc_key, write) < 0
             || !charge_key_info(
@@ -450,14 +450,31 @@ pub(super) unsafe fn decrypt(ctx: &mut XmlSecEncCtx, node: *mut XmlNode) -> c_in
     if !replace {
         return 0;
     }
-    // SAFETY: the node and the result's bytes; the replaced list is the
-    // context's.
+    // The plaintext is parsed as a part of the decryption: under its
+    // revision's decryption policy, within what the operation left.
+    let transforms = &raw mut ctx.transform_ctx;
+    // SAFETY: the context's own transform context.
+    let Some(pinned) = (unsafe { run_policy(transforms, here) }) else {
+        return -1;
+    };
+    let mut policy = pinned.decryption.as_ref().clone();
+    // SAFETY: the context's own transform context.
+    if !unsafe { leave_unspent(transforms, &mut policy.resources, here) } {
+        return -1;
+    }
+    let destination = if ctx.flags & FLAGS_RETURN_REPLACED_NODE != 0 {
+        &raw mut ctx.replaced_node_list
+    } else {
+        std::ptr::null_mut()
+    };
+    // SAFETY: the node, the result's bytes and the context's replaced list.
     let replaced = unsafe {
-        if ctx.flags & FLAGS_RETURN_REPLACED_NODE != 0 {
-            xmlSecReplaceNodeBufferAndReturn(node, data, size, &raw mut ctx.replaced_node_list)
-        } else {
-            xmlSecReplaceNodeBuffer(node, data, size)
-        }
+        replace_node_buffer_under(
+            node,
+            std::slice::from_raw_parts(data, size),
+            destination,
+            &policy,
+        )
     };
     if replaced < 0 {
         let object = super::super::tree::name_for_report(node);
@@ -777,6 +794,7 @@ unsafe fn read_method_and_key(ctx: &mut XmlSecEncCtx, add_base64: bool) -> c_int
                 &raw mut (*read).reserved0,
                 pinned.clone(),
                 run_spent(transforms),
+                run_budget(transforms).key_candidates,
             );
             let mngr = ctx.key_info_read_ctx.keys_mngr;
             if let Some(get_key) = mngr.as_ref().and_then(|mngr| mngr.get_key) {

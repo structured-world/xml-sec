@@ -20,7 +20,11 @@ use crate::ffi::transforms::ciphers::aes128_cbc;
 
 /// An AES key of sixteen `0x5a` octets.
 fn aes_key() -> *mut XmlSecKey {
-    let bytes = [0x5a_u8; 16];
+    aes_key_of([0x5a; 16])
+}
+
+/// An AES key of `bytes`.
+fn aes_key_of(bytes: [u8; 16]) -> *mut XmlSecKey {
     // SAFETY: a key and a read context created here; the AES klass reads
     // the key.
     unsafe {
@@ -873,6 +877,153 @@ fn an_encrypted_key_method_is_admitted_as_a_key_wrap() {
             !recovered(),
             "no key is recovered without a key-wrap permission"
         );
+        xsFreeDoc(doc.cast());
+        shut_down();
+    }
+}
+
+#[test]
+fn decrypted_xml_is_parsed_under_the_decryption_policy() {
+    // The plaintext an Element EncryptedData is replaced with is parsed
+    // under the decryption's own XML limits, not the verification policy's:
+    // a decryption allowing less depth refuses a deeper plaintext and leaves
+    // the document as it was.
+    own_process();
+    let plaintext = b"<a><b><c><d><e><f><g><h><i><j/></i></h></g></f></e></d></c></b></a>";
+    // SAFETY: the library, a document and contexts set up and released
+    // here, on this thread alone.
+    unsafe {
+        start_up();
+        let doc = xsNewDoc(c"1.0".as_ptr().cast());
+        let tmpl = xmlSecTmplEncDataCreate(
+            doc,
+            aes128_cbc(),
+            std::ptr::null(),
+            c"http://www.w3.org/2001/04/xmlenc#Element".as_ptr().cast(),
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+        xsDocSetRootElement(doc, tmpl);
+        assert!(!xmlSecTmplEncDataEnsureCipherValue(tmpl).is_null());
+        let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
+        (*ctx).enc_key = aes_key();
+        assert_eq!(
+            xmlSecEncCtxBinaryEncrypt(ctx, tmpl, plaintext.as_ptr(), plaintext.len()),
+            0
+        );
+        xmlSecEncCtxDestroy(ctx);
+        xml_sec_libxml2::policy::republish_encryption(
+            |_| {},
+            |decryption| decryption.resources.max_xml_depth = 4,
+        )
+        .expect("the library policy compiles");
+        let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
+        (*ctx).enc_key = aes_key();
+        assert_eq!(
+            xmlSecEncCtxDecrypt(ctx, tmpl),
+            -1,
+            "the plaintext is too deep"
+        );
+        assert_eq!(
+            xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc),
+            tmpl,
+            "the EncryptedData stays"
+        );
+        xmlSecEncCtxDestroy(ctx);
+        xsFreeDoc(doc);
+        shut_down();
+    }
+}
+
+/// Wrapping keys [`inspecting_lookup`] handed out so far.
+static INSPECTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A key manager's lookup that, for an `EncryptedKey` without a `KeyInfo`,
+/// inspects one stored wrapping key as a key-store search does, charging the
+/// read's candidate allowance: a wrong key first, [`aes_key`] after; any
+/// other `KeyInfo` it reads.
+unsafe extern "C" fn inspecting_lookup(
+    node: *mut XmlNode,
+    ctx: *mut XmlSecKeyInfoCtx,
+) -> *mut XmlSecKey {
+    if !node.is_null() {
+        // SAFETY: the operation's node and read context.
+        return unsafe { crate::ffi::keysmngr::xmlSecKeysMngrGetKey(node, ctx) };
+    }
+    // SAFETY: the read context the operation passes.
+    let charged = unsafe {
+        crate::ffi::keyinfo::charge_candidate(
+            ctx,
+            crate::ffi::errors::here!("inspecting_lookup"),
+            std::ptr::null(),
+        )
+    };
+    if !charged {
+        return std::ptr::null_mut();
+    }
+    if INSPECTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+        aes_key_of([0x11; 16])
+    } else {
+        aes_key()
+    }
+}
+
+#[test]
+fn encrypted_key_recipients_share_the_candidate_allowance() {
+    // The key candidates every recipient's lookup inspects belong to one
+    // KeyInfo read: a recipient whose key fails does not hand the next one a
+    // fresh allowance.
+    own_process();
+    let plaintext = b"one candidate allowance";
+    // SAFETY: the library, documents, contexts, keys and a manager set up and
+    // released here, on this thread alone.
+    unsafe {
+        start_up();
+        let (wrapped, _) = encrypted(crate::ffi::transforms::ciphers::kw_aes128(), &[0x5a; 16]);
+        let (cipher, _) = encrypted(aes128_cbc(), plaintext);
+        let recipient = format!(
+            "{}{wrapped}{}",
+            concat!(
+                "<EncryptedKey xmlns=\"http://www.w3.org/2001/04/xmlenc#\">",
+                "<EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#kw-aes128\"/>",
+                "<CipherData><CipherValue>",
+            ),
+            "</CipherValue></CipherData></EncryptedKey>"
+        );
+        let doc = parsed(&format!(
+            "{}{recipient}{recipient}{}{cipher}{}",
+            concat!(
+                "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\">",
+                "<EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#aes128-cbc\"/>",
+                "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\">",
+            ),
+            "</KeyInfo><CipherData><CipherValue>",
+            "</CipherValue></CipherData></EncryptedData>"
+        ));
+        let mngr = xmlSecKeysMngrCreate();
+        (*mngr).get_key = Some(inspecting_lookup);
+        for (limit, admitted) in [(1, false), (2, true)] {
+            crate::ffi::policy::republish(
+                |verification| verification.resources.max_key_candidates = limit,
+                |_| {},
+            )
+            .expect("the library policy compiles");
+            INSPECTED.store(0, std::sync::atomic::Ordering::Relaxed);
+            let ctx = xmlSecEncCtxCreate(mngr);
+            let (result, reasons) = reported(|| {
+                xmlSecEncCtxDecryptToBuffer(
+                    ctx,
+                    xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc.cast()),
+                )
+            });
+            assert_eq!(
+                !result.is_null(),
+                admitted,
+                "two inspected keys under {limit}: {reasons:?}"
+            );
+            xmlSecEncCtxDestroy(ctx);
+        }
+        xmlSecKeysMngrDestroy(mngr);
         xsFreeDoc(doc.cast());
         shut_down();
     }

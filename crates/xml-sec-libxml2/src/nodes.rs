@@ -769,15 +769,34 @@ pub enum FragmentError {
 /// UTF-8, an unavailable policy, or the core's refusal of the fragment,
 /// which is also this thread's [`crate::document::last_error`].
 pub fn parse_in_context(node: *const Node, bytes: &[u8]) -> Result<*mut Node, FragmentError> {
-    parse_fragment(node, bytes).inspect_err(crate::document::record_error)
+    let policy = crate::policy::library().ok_or(FragmentError::Policy);
+    policy
+        .and_then(|policy| parse_fragment(node, bytes, &*policy))
+        .inspect_err(crate::document::record_error)
 }
 
-fn parse_fragment(node: *const Node, bytes: &[u8]) -> Result<*mut Node, FragmentError> {
+/// [`parse_in_context`] under `policy`, the snapshot of the operation the
+/// fragment is part of, rather than the current library policy.
+///
+/// # Errors
+/// As for [`parse_in_context`], an unavailable policy aside.
+pub fn parse_in_context_under(
+    node: *const Node,
+    bytes: &[u8],
+    policy: &impl xml_sec::XmlDocumentPolicy,
+) -> Result<*mut Node, FragmentError> {
+    parse_fragment(node, bytes, policy).inspect_err(crate::document::record_error)
+}
+
+fn parse_fragment(
+    node: *const Node,
+    bytes: &[u8],
+    policy: &impl xml_sec::XmlDocumentPolicy,
+) -> Result<*mut Node, FragmentError> {
     let (document, context) = handles::node(handle_of(node))?;
     let fragment = std::str::from_utf8(bytes).map_err(|_| FragmentError::Encoding)?;
-    let policy = crate::policy::library().ok_or(FragmentError::Policy)?;
     let first = handles::update_document(document, |tree| {
-        tree.parse_in_context(context, fragment, &*policy)
+        tree.parse_in_context(context, fragment, policy)
     })??;
     Ok(first.map_or(std::ptr::null_mut(), |first| node_pointer(document, first)))
 }
