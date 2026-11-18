@@ -378,7 +378,8 @@ pub(crate) unsafe fn take_spent(ctx: *mut XmlSecTransformCtx, spent: policy::Spe
     run.xml_parse = spent.xml_parse;
     run.xpath_expressions = spent.xpath_expressions;
     // A refusal is never taken back by what a part hands over, nor is an
-    // invalid recovery.
+    // invalid recovery: `spent` carries only the recovery of the key the
+    // part yields, a failed recipient's being dropped where it is tried.
     run.resource_limit_reached |= spent.limit_reached;
     run.recovery = run.recovery.and(spent.recovery);
 }
