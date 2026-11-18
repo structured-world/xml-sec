@@ -234,23 +234,24 @@ pub(crate) unsafe fn run_spent(ctx: *mut XmlSecTransformCtx) -> policy::Spent {
 
 /// Takes into the run of `ctx`, the chain of an operation, what the
 /// operation has spent of its per-operation budgets once its `KeyInfo` read
-/// is done, held in the pin in the read context's slot `read_slot`: the read
-/// counted on from what the chain had spent ([`run_spent`]), and the
-/// operation's later work counts on from its total, so the key's work and
-/// the operation's share one allowance. The read ran under its own parts'
-/// limits, so the total is checked against the operation's `resources`;
-/// `false` after a report at `here` when it exceeds one.
+/// or write is done, held in the pin in that `KeyInfo` context's slot
+/// `key_info_slot`: the `KeyInfo` work counted on from what the chain had
+/// spent ([`run_spent`]), and the operation's later work counts on from its
+/// total, so the key's work and the operation's share one allowance. The
+/// `KeyInfo` work ran under its own parts' limits, so the total is checked
+/// against the operation's `resources`; `false` after a report at `here`
+/// when it exceeds one.
 ///
 /// # Safety
-/// `ctx` is an initialized context; `read_slot` is null or a pin.
-pub(crate) unsafe fn charge_key_read(
+/// `ctx` is an initialized context; `key_info_slot` is null or a pin.
+pub(crate) unsafe fn charge_key_info(
     ctx: *mut XmlSecTransformCtx,
-    read_slot: *mut c_void,
+    key_info_slot: *mut c_void,
     resources: &xml_sec::policy::ResourcePolicy,
     here: errors::Here,
 ) -> bool {
     // SAFETY: by the caller's contract.
-    let Some(spent) = (unsafe { policy::spent(read_slot) }).map(std::cell::Cell::get) else {
+    let Some(spent) = (unsafe { policy::spent(key_info_slot) }).map(std::cell::Cell::get) else {
         return true;
     };
     for (value, limit) in [
@@ -297,6 +298,57 @@ pub(crate) unsafe fn charge_key_read(
     }
     // SAFETY: by the caller's contract.
     unsafe { take_spent(ctx, spent) };
+    true
+}
+
+/// Takes what the run of `ctx` has spent of the per-operation budgets off
+/// the operation's `resources`, the policy a core operation is handed: the
+/// core counts its own work from zero, so the allowance it receives is what
+/// the operation's earlier parts (its `KeyInfo` read) left. `false` after a
+/// report at `here` when one is already spent past its limit.
+///
+/// # Safety
+/// `ctx` is an initialized context.
+pub(crate) unsafe fn leave_unspent(
+    ctx: *mut XmlSecTransformCtx,
+    resources: &mut xml_sec::policy::ResourcePolicy,
+    here: errors::Here,
+) -> bool {
+    // SAFETY: by the caller's contract.
+    let spent = unsafe { run_spent(ctx) };
+    for (limit, name, value) in [
+        (
+            &mut resources.max_external_resource_total_bytes,
+            "max_external_resource_total_bytes",
+            spent.external_resources,
+        ),
+        (
+            &mut resources.max_base64_transform_input_bytes,
+            "max_base64_transform_input_bytes",
+            spent.base64_input,
+        ),
+        (
+            &mut resources.max_base64_transform_output_bytes,
+            "max_base64_transform_output_bytes",
+            spent.base64_output,
+        ),
+        (
+            &mut resources.max_xml_parse_work_bytes,
+            "max_xml_parse_work_bytes",
+            spent.xml_parse,
+        ),
+        (
+            &mut resources.max_xpath_expressions,
+            "max_xpath_expressions",
+            spent.xpath_expressions,
+        ),
+    ] {
+        let Some(left) = limit.checked_sub(value) else {
+            errors::limit_exceeded(here, std::ptr::null(), name, *limit);
+            return false;
+        };
+        *limit = left;
+    }
     true
 }
 

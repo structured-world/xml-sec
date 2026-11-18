@@ -619,6 +619,87 @@ fn a_key_read_past_the_operations_limit_fails_the_signing() {
     }
 }
 
+/// Octets a key lookup charges as decoded by a Base64 transform of its read.
+const KEY_READ_DECODED: usize = 16;
+
+/// A key manager's lookup that charges [`KEY_READ_DECODED`] to the
+/// operation's Base64 output allowance, as a `KeyInfo` read decoding an
+/// `EncryptedKey` does, and hands back the HMAC key of [`TAMPERED`].
+unsafe extern "C" fn decoding_lookup(
+    node: *mut XmlNode,
+    ctx: *mut crate::ffi::keyinfo::XmlSecKeyInfoCtx,
+) -> *mut crate::ffi::keys::XmlSecKey {
+    // SAFETY: the read context the operation passes.
+    if let Some(spent) = unsafe { crate::ffi::policy::spent((*ctx).reserved0) } {
+        spent.set(crate::ffi::policy::Spent {
+            base64_output: KEY_READ_DECODED,
+            ..spent.get()
+        });
+    }
+    // SAFETY: by this callback's contract.
+    unsafe { recording_lookup(node, ctx) }
+}
+
+#[test]
+fn a_key_read_and_the_signing_share_one_base64_allowance() {
+    // The Base64 output limit is cumulative per operation: what the key read
+    // decoded counts against the Base64 transform the core runs for a
+    // reference, rather than the core starting a fresh allowance.
+    own_process();
+    // `MDEyMzQ1Njc4OWFiY2RlZg==` decodes to sixteen octets.
+    let template = concat!(
+        "<Signature xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><SignedInfo>",
+        "<CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>",
+        "<SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#hmac-sha256\"/>",
+        "<Reference URI=\"#encoded\"><Transforms>",
+        "<Transform Algorithm=\"http://www.w3.org/2000/09/xmldsig#base64\"/></Transforms>",
+        "<DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>",
+        "<DigestValue/></Reference></SignedInfo><SignatureValue/>",
+        "<Object Id=\"encoded\">MDEyMzQ1Njc4OWFiY2RlZg==</Object></Signature>"
+    );
+    let decoded = 16;
+    // SAFETY: the library, documents, a manager and contexts set up and torn
+    // down here, on this thread alone.
+    unsafe {
+        assert_eq!(xmlSecInit(), 0);
+        assert_eq!(xmlSecCryptoDLLoadLibrary(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoAppInit(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoInit(), 0);
+        let mngr = crate::ffi::keysmngr::xmlSecKeysMngrCreate();
+        (*mngr).get_key = Some(decoding_lookup);
+        let total = KEY_READ_DECODED + decoded;
+        for (limit, signed) in [(total - 1, -1), (total, 0)] {
+            crate::ffi::policy::republish(
+                |_| {},
+                |signing| signing.resources.max_base64_transform_output_bytes = limit,
+            )
+            .expect("the library policy compiles");
+            let doc = xsReadMemory(
+                template.as_ptr().cast(),
+                i32::try_from(template.len()).expect("a short document"),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+            );
+            assert!(!doc.is_null());
+            let ids = [c"Id".as_ptr().cast::<u8>(), std::ptr::null()];
+            xmlSecAddIDs(doc, std::ptr::null_mut(), ids.as_ptr());
+            let ctx = xmlSecDSigCtxCreate(mngr);
+            assert_eq!(
+                xmlSecDSigCtxSign(ctx, xsDocGetRootElement(doc)),
+                signed,
+                "{total} octets decoded under {limit}"
+            );
+            xmlSecDSigCtxDestroy(ctx);
+            xsFreeDoc(doc);
+        }
+        crate::ffi::keysmngr::xmlSecKeysMngrDestroy(mngr);
+        assert_eq!(xmlSecCryptoShutdown(), 0);
+        assert_eq!(xmlSecCryptoAppShutdown(), 0);
+        assert_eq!(xmlSecShutdown(), 0);
+    }
+}
+
 #[test]
 fn an_ignored_manifest_reads_none_of_its_resources() {
     // The operation's policy ignores Manifests: their references are never

@@ -443,7 +443,9 @@ pub(crate) unsafe extern "C" fn xml_read(
             // A transport recovering a key of a fixed width learns it from
             // the requirements of this context.
             (*enc).transform_ctx.parent_key_info_ctx = ctx.cast();
-            let read = decrypt_within_read(ctx, enc, node, key);
+            let read = within_key_info(ctx, enc, || {
+                xmlSecEncCtxEncryptedKeyXmlRead(enc, node, key, ctx)
+            });
             if read < 0 {
                 errors::internal(here, name, c"xmlSecEncCtxEncryptedKeyXmlRead");
             }
@@ -452,24 +454,24 @@ pub(crate) unsafe extern "C" fn xml_read(
     })
 }
 
-/// Decrypts the `EncryptedKey` `node` into `key` with the nested context
-/// `enc` as a part of the `KeyInfo` read with `ctx`: under the read's
-/// revision and its operation's side, counting on from what the read spent
-/// of the per-operation budgets and handing back what the decryption spent,
-/// whether it succeeds or not, so one allowance bounds the operation. A
-/// read a resource limit refused ends the `KeyInfo` read: the budget is
-/// spent, so no later recipient is tried under it.
+/// Runs `work`, the decryption or encryption of an `EncryptedKey` with the
+/// nested context `enc`, as a part of the `KeyInfo` read or write with
+/// `ctx`: under its revision and the side of the nested operation, counting
+/// on from what the `KeyInfo` operation spent of the per-operation budgets
+/// and handing back what `work` spent, whether it succeeds or not, so one
+/// allowance bounds the operation. A resource limit `work` reached ends the
+/// `KeyInfo` operation: the budget is spent, so no later recipient is tried
+/// under it.
 ///
 /// # Safety
-/// `ctx` is a reading context whose nested context is `enc`; `node` a live
-/// node; `key` an empty key.
-unsafe fn decrypt_within_read(
+/// `ctx` is a `KeyInfo` context whose nested context is `enc`; `work` runs
+/// `enc` for it.
+unsafe fn within_key_info(
     ctx: *mut XmlSecKeyInfoCtx,
     enc: *mut XmlSecEncCtx,
-    node: *mut XmlNode,
-    key: *mut XmlSecKey,
+    work: impl FnOnce() -> c_int,
 ) -> c_int {
-    // SAFETY: by the caller's contract; the read's pin outlives the call.
+    // SAFETY: by the caller's contract; the pin outlives the call.
     unsafe {
         let transforms = &raw mut (*enc).transform_ctx;
         let slot = (*ctx).reserved0;
@@ -478,14 +480,14 @@ unsafe fn decrypt_within_read(
             let side = operation_side((*enc).operation).unwrap_or(policy::Side::Verify);
             seed_run(transforms, pinned, side, None, spent);
         }
-        let read = xmlSecEncCtxEncryptedKeyXmlRead(enc, node, key, ctx);
+        let done = work();
         if let Some(spent) = policy::spent(slot) {
             spent.set(run_spent(transforms));
         }
         if run_budget(transforms).resource_limit_reached {
             return -1;
         }
-        read
+        done
     }
 }
 
@@ -529,7 +531,10 @@ pub(crate) unsafe extern "C" fn xml_write(
                 return -1;
             }
             let enc = (*ctx).enc_ctx.cast::<XmlSecEncCtx>();
-            if xmlSecEncCtxEncryptedKeyXmlWrite(enc, node, key, ctx) < 0 {
+            let written = within_key_info(ctx, enc, || {
+                xmlSecEncCtxEncryptedKeyXmlWrite(enc, node, key, ctx)
+            });
+            if written < 0 {
                 errors::internal(here, name, c"xmlSecEncCtxEncryptedKeyXmlWrite");
                 return -1;
             }

@@ -41,9 +41,9 @@ use super::super::transforms::builtin::{
     xmlSecTransformBase64GetKlass, xmlSecTransformMemBufGetBuffer, xmlSecTransformMemBufGetKlass,
 };
 use super::super::transforms::ctx::{
-    KeyedResources, ReadResources, ResourceScope, XmlSecTransformCtx, charge_key_read,
-    execute_on_bytes, external_spent, operation_side, read_resource, resource_keys, run_spent,
-    seed_run, xmlSecTransformCtxCreate, xmlSecTransformCtxCreateAndAppend,
+    KeyedResources, ReadResources, ResourceScope, XmlSecTransformCtx, charge_key_info,
+    execute_on_bytes, external_spent, leave_unspent, operation_side, read_resource, resource_keys,
+    run_spent, seed_run, xmlSecTransformCtxCreate, xmlSecTransformCtxCreateAndAppend,
     xmlSecTransformCtxDestroy, xmlSecTransformCtxExecute, xmlSecTransformCtxNodeRead,
     xmlSecTransformCtxNodesListRead, xmlSecTransformCtxSetUri, xmlSecTransformCtxXmlExecute,
 };
@@ -294,11 +294,19 @@ unsafe fn run_operation(
     ctx: &mut XmlSecDSigCtx,
     node: *mut XmlNode,
     pinned: &Pinned,
-    policies: OperationPolicies,
+    mut policies: OperationPolicies,
 ) -> c_int {
     // SAFETY: the context's read reference contexts and a live node.
     unsafe {
         if run_pre_execute_callbacks(ctx) < 0 {
+            return -1;
+        }
+        // The core's run is the rest of the operation the key read began.
+        if !leave_unspent(
+            &raw mut ctx.transform_ctx,
+            policies.resources_mut(),
+            here!("xmlSecDSigCtxProcessSignatureNode"),
+        ) {
             return -1;
         }
         // The core never dereferences a Manifest's references when the
@@ -355,6 +363,14 @@ impl OperationPolicies {
         match self {
             Self::Sign(policy) => policy.manifest_processing,
             Self::Verify(policy) => policy.manifest_processing,
+        }
+    }
+
+    /// The operation's resource ceilings, its own copy to narrow.
+    fn resources_mut(&mut self) -> &mut xml_sec::policy::ResourcePolicy {
+        match self {
+            Self::Sign(policy) => &mut Arc::make_mut(policy).resources,
+            Self::Verify(policy) => &mut Arc::make_mut(policy).resources,
         }
     }
 }
@@ -631,9 +647,20 @@ unsafe fn read_signed_info(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode) -> Optio
     }
 }
 
+/// The resource ceilings of the context's operation in the revision `pinned`.
+fn operation_resources<'p>(
+    ctx: &XmlSecDSigCtx,
+    pinned: &'p Pinned,
+) -> &'p xml_sec::policy::ResourcePolicy {
+    pinned
+        .of(operation_side(ctx.operation).unwrap_or(Side::Verify))
+        .resources()
+}
+
 /// libxmlsec1's `xmlSecDSigCtxProcessKeyInfoNode`: the key the signature
 /// method requires, looked up under the operation's revision `pinned`, set on
-/// the method, and written to `KeyInfo` when signing.
+/// the method, and written to `KeyInfo` when signing, each as a part of the
+/// operation.
 ///
 /// # Safety
 /// `node` is null or a live node.
@@ -661,11 +688,10 @@ unsafe fn read_key(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode, pinned: &Pinned)
             if let Some(get_key) = mngr.as_ref().and_then(|mngr| mngr.get_key) {
                 ctx.sign_key = get_key(node, read);
             }
-            let side = operation_side(ctx.operation).unwrap_or(Side::Verify);
-            if !charge_key_read(
+            if !charge_key_info(
                 &raw mut ctx.transform_ctx,
                 (*read).reserved0,
-                pinned.of(side).resources(),
+                operation_resources(ctx, pinned),
                 here,
             ) {
                 return -1;
@@ -682,12 +708,25 @@ unsafe fn read_key(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode, pinned: &Pinned)
             errors::internal(here, name, c"xmlSecTransformSetKey");
             return -1;
         }
-        if !node.is_null()
-            && ctx.operation == OPERATION_SIGN
-            && xmlSecKeyInfoNodeWrite(node, ctx.sign_key, &raw mut ctx.key_info_write_ctx) < 0
-        {
-            errors::internal(here, std::ptr::null(), c"xmlSecKeyInfoNodeWrite");
-            return -1;
+        if !node.is_null() && ctx.operation == OPERATION_SIGN {
+            // The KeyInfo signing writes is part of this operation too.
+            let write = &raw mut ctx.key_info_write_ctx;
+            let _write_pin = SlotPin::hold_pinned(
+                &raw mut (*write).reserved0,
+                pinned.clone(),
+                run_spent(&raw mut ctx.transform_ctx),
+            );
+            if xmlSecKeyInfoNodeWrite(node, ctx.sign_key, write) < 0
+                || !charge_key_info(
+                    &raw mut ctx.transform_ctx,
+                    (*write).reserved0,
+                    operation_resources(ctx, pinned),
+                    here,
+                )
+            {
+                errors::internal(here, std::ptr::null(), c"xmlSecKeyInfoNodeWrite");
+                return -1;
+            }
         }
     }
     0

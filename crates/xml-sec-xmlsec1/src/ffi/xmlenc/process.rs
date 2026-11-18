@@ -25,8 +25,9 @@ use super::super::policy::{Pinned, Side, SlotPin};
 use super::super::strings;
 use super::super::transforms::builtin::xmlSecTransformBase64GetKlass;
 use super::super::transforms::ctx::{
-    ReadResources, ResourceScope, charge_key_read, external_spent, operation_side, read_resource,
-    run_policy, run_spent, xmlSecTransformCtxBinaryExecute, xmlSecTransformCtxExecute,
+    ReadResources, ResourceScope, charge_key_info, external_spent, leave_unspent, operation_side,
+    read_resource, run_policy, run_spent, xmlSecTransformCtxBinaryExecute,
+    xmlSecTransformCtxExecute,
 };
 use super::super::transforms::ctx::{
     ctx_node_read_for, xmlSecTransformCtxCreateAndAppend, xmlSecTransformCtxCreateAndPrepend,
@@ -374,14 +375,42 @@ unsafe fn write_enc_data(ctx: &mut XmlSecEncCtx) -> c_int {
             }
             ctx.result_replaced = 1;
         }
-        if !ctx.key_info_node.is_null()
-            && xmlSecKeyInfoNodeWrite(
-                ctx.key_info_node,
-                ctx.enc_key,
-                &raw mut ctx.key_info_write_ctx,
-            ) < 0
-        {
+        if !ctx.key_info_node.is_null() && write_key_info(ctx, here) < 0 {
             errors::internal(here, std::ptr::null(), c"xmlSecKeyInfoNodeWrite");
+            return -1;
+        }
+    }
+    0
+}
+
+/// Writes the context's key into its `KeyInfo` as a part of the operation:
+/// under its revision, counting on from what it spent, and within its
+/// limits, as its key read runs.
+///
+/// # Safety
+/// The context's `KeyInfo` node and key are set.
+unsafe fn write_key_info(ctx: &mut XmlSecEncCtx, here: errors::Here) -> c_int {
+    let transforms = &raw mut ctx.transform_ctx;
+    let write = &raw mut ctx.key_info_write_ctx;
+    // SAFETY: the context's own transform and write contexts and nodes.
+    unsafe {
+        let Some(pinned) = run_policy(transforms, here) else {
+            return -1;
+        };
+        let side = operation_side(ctx.operation).unwrap_or(Side::Encrypt);
+        let _write_pin = SlotPin::hold_pinned(
+            &raw mut (*write).reserved0,
+            pinned.clone(),
+            run_spent(transforms),
+        );
+        if xmlSecKeyInfoNodeWrite(ctx.key_info_node, ctx.enc_key, write) < 0
+            || !charge_key_info(
+                transforms,
+                (*write).reserved0,
+                pinned.of(side).resources(),
+                here,
+            )
+        {
             return -1;
         }
     }
@@ -728,6 +757,9 @@ unsafe fn read_method_and_key(ctx: &mut XmlSecEncCtx, add_base64: bool) -> c_int
         ctx.key_info_read_ctx.operation = ctx.operation;
         ctx.key_info_write_ctx.operation = ctx.operation;
         let method_name = (*(*ctx.enc_method).id).name.cast();
+        if ctx.mode == MODE_ENCRYPTED_KEY && !admit_key_method(ctx, here) {
+            return -1;
+        }
         if xmlSecTransformSetKeyReq(ctx.enc_method, &raw mut ctx.key_info_read_ctx.key_req) < 0 {
             errors::internal(here, method_name, c"xmlSecTransformSetKeyReq");
             return -1;
@@ -750,7 +782,7 @@ unsafe fn read_method_and_key(ctx: &mut XmlSecEncCtx, add_base64: bool) -> c_int
             if let Some(get_key) = mngr.as_ref().and_then(|mngr| mngr.get_key) {
                 ctx.enc_key = get_key(ctx.key_info_node, read);
             }
-            if !charge_key_read(
+            if !charge_key_info(
                 transforms,
                 (*read).reserved0,
                 pinned.of(side).resources(),
@@ -790,6 +822,63 @@ unsafe fn read_method_and_key(ctx: &mut XmlSecEncCtx, add_base64: bool) -> c_int
         }
     }
     0
+}
+
+/// Whether the operation's policy admits the method of the context's
+/// `EncryptedKey` as what it is there, a key transport or a key wrap (XML
+/// Encryption 1.1 sections 5.4 and 5.6), as the core admits an
+/// `EncryptedKey`'s method: a block cipher wraps a key only as far as the
+/// key-wrap permissions allow, whatever content it may decrypt. Refused
+/// after a report at `here`.
+///
+/// # Safety
+/// The context's method was read.
+unsafe fn admit_key_method(ctx: &mut XmlSecEncCtx, here: errors::Here) -> bool {
+    use xml_sec::xmlenc::{KeyTransportAlgorithm, KeyWrapAlgorithm};
+    // SAFETY: the method's klass and the context's own transform context.
+    let (href, name, pinned) = unsafe {
+        let klass = (*ctx.enc_method).id;
+        let Some(pinned) = run_policy(&raw mut ctx.transform_ctx, here) else {
+            return false;
+        };
+        (
+            c_text((*klass).href).unwrap_or(""),
+            (*klass).name.cast(),
+            pinned,
+        )
+    };
+    let encrypting = ctx.operation == OPERATION_ENCRYPT;
+    let admitted = if let Ok(transport) = KeyTransportAlgorithm::from_uri(href) {
+        if encrypting {
+            pinned.encryption.check_key_transport_algorithm(transport)
+        } else {
+            pinned.decryption.check_key_transport_algorithm(transport)
+        }
+    } else if let Ok(wrap) = KeyWrapAlgorithm::from_uri(href) {
+        if encrypting {
+            pinned.encryption.check_key_wrap_algorithm(wrap)
+        } else {
+            pinned.decryption.check_key_wrap_algorithm(wrap)
+        }
+    } else {
+        errors::invalid_data(
+            here,
+            name,
+            "an EncryptedKey's method is neither a key transport nor a key wrap",
+        );
+        return false;
+    };
+    if let Err(violation) = admitted {
+        errors::report(
+            here,
+            name,
+            std::ptr::null(),
+            errors::R_TRANSFORM_DISABLED,
+            &violation.to_string(),
+        );
+        return false;
+    }
+    true
 }
 
 /// libxmlsec1's `xmlSecEncCtxCipherDataNodeRead`: a `CipherValue`, decoded
@@ -1000,7 +1089,18 @@ unsafe fn run_decryption(ctx: &mut XmlSecEncCtx, node: *mut XmlNode) -> *mut Xml
         errors::internal(here, std::ptr::null(), c"node identity");
         return std::ptr::null_mut();
     };
-    let policy = std::sync::Arc::clone(&pinned.decryption);
+    // The core's run is the rest of the operation the key read began.
+    let mut policy = std::sync::Arc::clone(&pinned.decryption);
+    // SAFETY: the context's own transform context.
+    if !unsafe {
+        leave_unspent(
+            &raw mut ctx.transform_ctx,
+            &mut std::sync::Arc::make_mut(&mut policy).resources,
+            here,
+        )
+    } {
+        return std::ptr::null_mut();
+    }
     let (document, _) = match xml_sec_libxml2::document::snapshot(node, &*policy) {
         Ok(snapshot) => snapshot,
         Err(error) => {

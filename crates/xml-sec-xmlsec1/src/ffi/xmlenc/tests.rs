@@ -764,6 +764,110 @@ fn a_key_read_past_the_operations_limit_fails_the_decryption() {
     }
 }
 
+/// A key manager's lookup that republishes an encryption policy admitting
+/// no key wrap while it answers, then hands back [`aes_key`].
+unsafe extern "C" fn wrap_refusing_lookup(
+    _node: *mut XmlNode,
+    _ctx: *mut XmlSecKeyInfoCtx,
+) -> *mut XmlSecKey {
+    xml_sec_libxml2::policy::republish_encryption(
+        |encryption| encryption.key_wrap_algorithms = Some(std::collections::BTreeSet::new()),
+        |_| {},
+    )
+    .expect("the library policy compiles");
+    aes_key()
+}
+
+#[test]
+fn an_encrypted_key_is_written_under_the_operations_revision() {
+    // The EncryptedKey an encryption writes into its KeyInfo is a part of
+    // that encryption: a republish while its key is looked up takes effect
+    // for later operations, not for the wrap this one writes.
+    own_process();
+    // SAFETY: the library, a document, a context, keys and a manager set up
+    // and released here, on this thread alone.
+    unsafe {
+        start_up();
+        let doc = xsNewDoc(c"1.0".as_ptr().cast());
+        let tmpl = xmlSecTmplEncDataCreate(
+            doc,
+            aes128_cbc(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+        xsDocSetRootElement(doc, tmpl);
+        assert!(!xmlSecTmplEncDataEnsureCipherValue(tmpl).is_null());
+        let key_info =
+            crate::ffi::templates::xmlSecTmplEncDataEnsureKeyInfo(tmpl, std::ptr::null());
+        let encrypted_key = crate::ffi::templates::xmlSecTmplKeyInfoAddEncryptedKey(
+            key_info,
+            crate::ffi::transforms::ciphers::kw_aes128(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+        assert!(!xmlSecTmplEncDataEnsureCipherValue(encrypted_key).is_null());
+        let mngr = xmlSecKeysMngrCreate();
+        (*mngr).get_key = Some(wrap_refusing_lookup);
+        let ctx = xmlSecEncCtxCreate(mngr);
+        let content = b"wrapped under the first revision";
+        let (encrypted, reasons) =
+            reported(|| xmlSecEncCtxBinaryEncrypt(ctx, tmpl, content.as_ptr(), content.len()));
+        assert_eq!(encrypted, 0, "the wrap kept its revision: {reasons:?}");
+        xmlSecEncCtxDestroy(ctx);
+        xmlSecKeysMngrDestroy(mngr);
+        xsFreeDoc(doc);
+        shut_down();
+    }
+}
+
+#[test]
+fn an_encrypted_key_method_is_admitted_as_a_key_wrap() {
+    // An EncryptedKey's method carries a key, so the policy admits it as a
+    // key transport or key wrap, as the core does: permission to decrypt
+    // content with a block cipher never authorizes recovering a key with it.
+    own_process();
+    xml_sec_libxml2::policy::republish_encryption(
+        |_| {},
+        |decryption| {
+            decryption.key_wrap_algorithms = Some(std::collections::BTreeSet::new());
+            decryption.key_transport_algorithms = Some(std::collections::BTreeSet::new());
+        },
+    )
+    .expect("the library policy compiles");
+    // SAFETY: the library, a document and a context set up and released
+    // here, on this thread alone.
+    unsafe {
+        start_up();
+        let (value, _) = encrypted(aes128_cbc(), &[0x5a; 16]);
+        let doc = parsed(&format!(
+            "{}{value}{}",
+            concat!(
+                "<EncryptedKey xmlns=\"http://www.w3.org/2001/04/xmlenc#\">",
+                "<EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#aes128-cbc\"/>",
+                "<CipherData><CipherValue>",
+            ),
+            "</CipherValue></CipherData></EncryptedKey>"
+        ));
+        let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
+        (*ctx).mode = MODE_ENCRYPTED_KEY;
+        (*ctx).enc_key = aes_key();
+        let result = xmlSecEncCtxDecryptToBuffer(
+            ctx,
+            xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc.cast()),
+        );
+        assert!(
+            result.is_null(),
+            "no key is recovered with a content cipher"
+        );
+        xmlSecEncCtxDestroy(ctx);
+        xsFreeDoc(doc.cast());
+        shut_down();
+    }
+}
+
 #[test]
 fn a_nested_encrypted_key_shares_the_operations_allowance() {
     // The EncryptedKey in the KeyInfo of another is a part of the decryption
