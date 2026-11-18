@@ -1216,6 +1216,81 @@ fn decrypted_xml_is_parsed_within_the_decryptions_parse_work() {
     }
 }
 
+#[test]
+fn the_plaintext_parse_counts_on_from_the_cores_parse_work() {
+    // A CipherReference whose transforms parse an external document spends
+    // parse work inside the core's decryption; replacing the element with
+    // its plaintext parses more within the same max_xml_parse_work_bytes.
+    // The smallest allowance a decryption to a buffer fits in leaves nothing
+    // for the replacement.
+    own_process();
+    let plaintext = b"<plaintext><of>the decryption</of></plaintext>";
+    // SAFETY: the library, documents and contexts set up and released here,
+    // on this thread alone.
+    unsafe {
+        start_up();
+        let (cipher, _) = encrypted(aes128_cbc(), plaintext);
+        let resource = format!("<d><!--{}-->{cipher}</d>", "padding ".repeat(64));
+        serve_by_uri(vec![("test:doc", resource.into_bytes())]);
+        let document = concat!(
+            "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\"",
+            " Type=\"http://www.w3.org/2001/04/xmlenc#Element\">",
+            "<EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#aes128-cbc\"/>",
+            "<CipherData><CipherReference URI=\"test:doc\"><Transforms>",
+            "<ds:Transform xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"",
+            " Algorithm=\"http://www.w3.org/TR/1999/REC-xpath-19991116\">",
+            "<ds:XPath>self::text()</ds:XPath></ds:Transform>",
+            "<ds:Transform xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"",
+            " Algorithm=\"http://www.w3.org/2000/09/xmldsig#base64\"/>",
+            "</Transforms></CipherReference></CipherData></EncryptedData>"
+        );
+        // Whether the decryption under `limit` succeeds, replacing the
+        // element when `replace`.
+        let decrypts = |limit: usize, replace: bool| {
+            xml_sec_libxml2::policy::republish_encryption(
+                |_| {},
+                |decryption| decryption.resources.max_xml_parse_work_bytes = limit,
+            )
+            .expect("the library policy compiles");
+            let doc = parsed(document);
+            let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
+            (*ctx).enc_key = aes_key();
+            (*ctx).transform_ctx.enabled_uris = 0xFFFF;
+            let root = xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc.cast());
+            let done = if replace {
+                xmlSecEncCtxDecrypt(ctx, root) == 0
+            } else {
+                !xmlSecEncCtxDecryptToBuffer(ctx, root).is_null()
+            };
+            xmlSecEncCtxDestroy(ctx);
+            xsFreeDoc(doc.cast());
+            done
+        };
+        let (mut low, mut high) = (0, 1 << 20);
+        assert!(
+            decrypts(high, false),
+            "the decryption fits a generous limit"
+        );
+        while low + 1 < high {
+            let middle = low + (high - low) / 2;
+            if decrypts(middle, false) {
+                high = middle;
+            } else {
+                low = middle;
+            }
+        }
+        assert!(
+            !decrypts(high, true),
+            "the plaintext parse is past the {high} octets the core's work fits in"
+        );
+        assert!(
+            decrypts(high + 4 * plaintext.len() + 64, true),
+            "with room for the plaintext the replacement succeeds"
+        );
+        shut_down();
+    }
+}
+
 /// Wrapping keys [`inspecting_lookup`] handed out so far.
 static INSPECTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 

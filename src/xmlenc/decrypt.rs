@@ -1004,28 +1004,55 @@ impl<'a> DecryptContext<'a> {
         document: &XmlDocument,
         encrypted_data: crate::NodeIdentity,
     ) -> Result<Audited<DecryptedContent>, XmlEncError> {
+        self.process_in_document(document, encrypted_data)
+            .map(|processed| self.audited(processed))
+    }
+
+    /// [`Self::decrypt_in_document`] for a caller whose operation goes on
+    /// parsing XML within the same `max_xml_parse_work_bytes`, such as
+    /// replacing the element with its plaintext: also the parse work this
+    /// decryption spent, which the caller counts on from.
+    ///
+    /// # Errors
+    /// As for [`Self::decrypt_in_document`].
+    pub fn decrypt_in_document_counting_parse_work(
+        &self,
+        document: &XmlDocument,
+        encrypted_data: crate::NodeIdentity,
+    ) -> Result<(Audited<DecryptedContent>, usize), XmlEncError> {
+        self.process_in_document(document, encrypted_data)
+            .map(|processed| {
+                let spent = processed.operation.budgets().xml_parse.consumed();
+                (self.audited(processed), spent)
+            })
+    }
+
+    /// The decryption of [`Self::decrypt_in_document`], before its audit.
+    fn process_in_document(
+        &self,
+        document: &XmlDocument,
+        encrypted_data: crate::NodeIdentity,
+    ) -> Result<ProcessedDecryption<DecryptedContent>, XmlEncError> {
         self.policy.resources.validate()?;
         document.validate_operation_policy(self.policy.xml, &self.policy.resources)?;
         let budgets = DecryptionOperationBudgets::from_policy(&self.policy);
         let document_binding = Some((document.identity(), document.generation()));
-        document
-            .with_view(|view| {
-                let node = view.resolve_node(encrypted_data)?;
-                if !node.has_tag_name((XMLENC_NS, "EncryptedData")) {
-                    return Err(XmlEncError::EncryptedDataNotFound);
-                }
-                self.process_decryption_input(
-                    DecryptionInput::Document {
-                        document: view.document(),
-                        node: node.id(),
-                    },
-                    document_binding,
-                    false,
-                    budgets,
-                    |content, _| Ok(content),
-                )
-            })
-            .map(|processed| self.audited(processed))
+        document.with_view(|view| {
+            let node = view.resolve_node(encrypted_data)?;
+            if !node.has_tag_name((XMLENC_NS, "EncryptedData")) {
+                return Err(XmlEncError::EncryptedDataNotFound);
+            }
+            self.process_decryption_input(
+                DecryptionInput::Document {
+                    document: view.document(),
+                    node: node.id(),
+                },
+                document_binding,
+                false,
+                budgets,
+                |content, _| Ok(content),
+            )
+        })
     }
 
     /// A finished operation's output with its audit.

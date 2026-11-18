@@ -1152,7 +1152,18 @@ unsafe fn run_decryption(ctx: &mut XmlSecEncCtx, node: *mut XmlNode) -> *mut Xml
     if ctx.enc_method_node.is_null() {
         context = context.default_encryption_method(algorithm);
     }
-    let decrypted = context.decrypt_in_document(&document, target);
+    // The parse work the core spent (a CipherReference's transforms parsing
+    // a resource) is the operation's: the plaintext parse that may follow
+    // counts on from it. The core ran within what the operation left, so
+    // the sum stays within the policy's maximum.
+    let decrypted = context
+        .decrypt_in_document_counting_parse_work(&document, target)
+        .map(|(audited, spent)| {
+            // SAFETY: the context's own transform context.
+            let run = unsafe { run_budget(&raw mut ctx.transform_ctx) };
+            run.xml_parse += spent;
+            audited
+        });
     // A key recovered by RSAES-PKCS1-v1_5 may be the random substitute of
     // a rejected recovery: its validity is consulted only now, after the
     // content work, so the outcome reveals nothing of the padding (XML
