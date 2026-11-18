@@ -1890,7 +1890,6 @@ impl ReadResources {
         )?;
         let mut keyed = KeyedResources::default();
         for (resource, key) in self.read.into_iter().zip(keys) {
-            keyed.origins.push((resource.origin, key.clone()));
             // Two references to one resource keep the octets read first.
             keyed.by_key.entry(key).or_insert(resource.bytes);
         }
@@ -1925,28 +1924,11 @@ pub(crate) fn resource_keys<'u>(
     })
 }
 
-/// External resources keyed as the core looks them up, with the element
-/// whose URI named each.
+/// External resources keyed as the core looks them up.
 #[derive(Default)]
 pub(crate) struct KeyedResources {
     /// The octets under each resolved key, handed to the core.
     pub(crate) by_key: std::collections::BTreeMap<String, Vec<u8>>,
-    /// Each naming element, with the key its URI resolved to.
-    origins: Vec<(xml_sec::document::external::ExternalNode, String)>,
-}
-
-impl KeyedResources {
-    /// The octets the URI of the element `origin` named.
-    pub(crate) fn get_for(
-        &self,
-        origin: xml_sec::document::external::ExternalNode,
-    ) -> Option<&[u8]> {
-        self.origins
-            .iter()
-            .find(|(element, _)| *element == origin)
-            .and_then(|(_, key)| self.by_key.get(key))
-            .map(Vec::as_slice)
-    }
 }
 
 /// The operation an external resource is read for: its pinned revision, the

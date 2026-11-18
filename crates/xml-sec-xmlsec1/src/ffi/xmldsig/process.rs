@@ -34,19 +34,16 @@ use super::super::keyinfo::xmlSecKeyInfoNodeWrite;
 use super::super::keys::{XmlSecKey, xmlSecKeyGetValue, xmlSecKeyMatch};
 use super::super::keysdata::xmlSecKeyDataBinaryValueGetBuffer;
 use super::super::list::{xmlSecPtrListAdd, xmlSecPtrListGetItem, xmlSecPtrListGetSize};
-use super::super::nodeset::{xmlSecNodeSetDestroy, xmlSecNodeSetGetChildren};
-use super::super::policy::{Pinned, Side, SlotPin, Spent};
+use super::super::policy::{Pinned, Side, SlotPin};
 use super::super::strings;
 use super::super::transforms::builtin::{
     xmlSecTransformBase64GetKlass, xmlSecTransformMemBufGetBuffer, xmlSecTransformMemBufGetKlass,
 };
 use super::super::transforms::ctx::{
-    KeyedResources, ReadResources, ResourceScope, XmlSecTransformCtx, charge_key_info,
-    execute_on_bytes, external_spent, leave_unspent, operation_side, read_resource, resource_keys,
-    run_budget, run_pre_execute, run_spent, seed_run, xmlSecTransformCtxCreate,
-    xmlSecTransformCtxCreateAndAppend, xmlSecTransformCtxDestroy, xmlSecTransformCtxExecute,
+    ReadResources, ResourceScope, XmlSecTransformCtx, charge_key_info, external_spent,
+    leave_unspent, operation_side, read_resource, resource_keys, run_budget, run_pre_execute,
+    run_spent, xmlSecTransformCtxCreateAndAppend, xmlSecTransformCtxExecute,
     xmlSecTransformCtxNodeRead, xmlSecTransformCtxNodesListRead, xmlSecTransformCtxSetUri,
-    xmlSecTransformCtxXmlExecute,
 };
 use super::super::transforms::signatures::signing_key;
 use super::super::transforms::{
@@ -333,7 +330,7 @@ unsafe fn run_operation(
                     );
                     return -1;
                 };
-                run_signing(ctx, node, pinned, &policy, resources)
+                run_signing(ctx, node, &policy, resources)
             }
             // Verification reads a resource only when the core dereferences
             // it, after the SignatureValue verified.
@@ -1408,16 +1405,15 @@ unsafe fn keep(buffer: *mut XmlSecBuffer, bytes: &[u8]) {
     }
 }
 
-/// Runs the core signing of the template `node` in place under `policy` of
-/// the revision `pinned`, with the external `resources` its references
-/// name, and reports its outcome in the contexts.
+/// Runs the core signing of the template `node` in place under `policy`,
+/// with the external `resources` its references name, and reports its
+/// outcome in the contexts.
 ///
 /// # Safety
 /// `node` is a live node; the context's method and key are set.
 unsafe fn run_signing(
     ctx: &mut XmlSecDSigCtx,
     node: *mut XmlNode,
-    pinned: &Pinned,
     policy: &Arc<SigningPolicy>,
     resources: ReadResources,
 ) -> c_int {
@@ -1444,24 +1440,36 @@ unsafe fn run_signing(
         usize::try_from(unsafe { super::super::base64::xmlSecBase64GetDefaultLineSize() })
             .ok()
             .and_then(std::num::NonZeroUsize::new);
+    let manifests = policy.manifest_processing == ManifestProcessing::Process;
+    // SAFETY: the context's own reference contexts.
+    let keep_inputs =
+        unsafe { stores_pre_digest(ctx, manifests) } || !ctx.pre_sign_mem_buf_method.is_null();
     let signed = xml_sec_libxml2::document::with_document(node, &**policy, |document, _| {
         let Some(template) = identity_in(document, external) else {
             return Err("the template is not in its document".to_owned());
         };
         let resources = resources.into_keyed(document, &policy.resources)?;
-        SignContext::new(key.as_ref())
+        let context = SignContext::new(key.as_ref())
             .shared_policy(Arc::clone(policy))
             .external_resources(&resources.by_key)
             // libxmlsec1 writes the values through Base64 transforms of the
             // default line size.
             .base64_line_size(line_size)
-            .signature_template_selection(SignatureTemplateSelection::Exact(template))
-            .sign_document(document)
-            .map(|_| resources)
-            .map_err(|error| error.to_string())
+            .signature_template_selection(SignatureTemplateSelection::Exact(template));
+        // The storage flags keep the bytes the core digested and signed, as
+        // libxmlsec1 keeps them from its one run of each chain: nothing runs
+        // again, and the work stays within the operation's own budgets.
+        if keep_inputs {
+            context
+                .sign_document_keeping_inputs(document)
+                .map(|(_, inputs)| Some(inputs))
+        } else {
+            context.sign_document(document).map(|_| None)
+        }
+        .map_err(|error| error.to_string())
     });
-    let resources = match signed {
-        Ok(Ok(resources)) => resources,
+    let inputs = match signed {
+        Ok(Ok(inputs)) => inputs,
         Ok(Err(error)) => {
             errors::report(
                 here,
@@ -1488,122 +1496,70 @@ unsafe fn run_signing(
             reference.status = STATUS_SUCCEEDED;
         }
         // The core wrote the Manifest digests it processes.
-        let manifests = policy.manifest_processing == ManifestProcessing::Process;
         if manifests {
             for reference in references(&raw mut ctx.manifest_references) {
                 reference.status = STATUS_SUCCEEDED;
             }
         }
-        if store_signing_inputs(ctx, node, pinned, manifests, &resources) < 0 {
-            return -1;
+        if let Some(inputs) = inputs {
+            // The core keeps the references in the order these lists were
+            // read in: SignedInfo's, then the Objects' Manifests'.
+            keep_pre_digests(
+                &raw mut ctx.signed_info_references,
+                &inputs.signed_info_references,
+            );
+            if manifests {
+                keep_pre_digests(
+                    &raw mut ctx.manifest_references,
+                    &inputs.manifest_references,
+                );
+            }
+            if let Some(signed_info) = inputs.signed_info
+                && !ctx.pre_sign_mem_buf_method.is_null()
+            {
+                keep(
+                    xmlSecTransformMemBufGetBuffer(ctx.pre_sign_mem_buf_method),
+                    &signed_info,
+                );
+            }
         }
         keep_result(ctx)
     }
 }
 
-/// Fills the buffers the storage flags asked for with the bytes signing
-/// used, as libxmlsec1 keeps them: each stored reference's chain runs again
-/// on the signed document, whose digested data is final, or on the
-/// external `resources` the core signed, never read again; the Manifest
-/// references only when `manifests` were processed. `SignedInfo` is
-/// canonicalized by its method. Each chain runs as a part of the signing,
-/// under its revision `pinned`. Nothing runs without a storage flag.
+/// Whether a storage flag keeps the pre-digest bytes of a reference: one of
+/// `SignedInfo`'s, or of a Manifest when `manifests` are processed.
 ///
 /// # Safety
-/// `node` is the signed, live `Signature` element of the context.
-unsafe fn store_signing_inputs(
-    ctx: &mut XmlSecDSigCtx,
-    node: *mut XmlNode,
-    pinned: &Pinned,
-    manifests: bool,
-    resources: &KeyedResources,
-) -> c_int {
-    let here = here!("xmlSecDSigCtxSign");
-    // SAFETY: a live node and the context's own reference contexts.
-    unsafe {
-        let doc = xsNodeGetDoc(node);
-        let lists = [
-            &raw mut ctx.signed_info_references,
-            &raw mut ctx.manifest_references,
-        ];
-        for list in &lists[..if manifests { 2 } else { 1 }] {
-            for reference in references(*list) {
-                if reference.pre_digest_mem_buf_method.is_null() {
-                    continue;
-                }
-                let transforms = &raw mut reference.transform_ctx;
-                seed_run(transforms, pinned, Side::Sign, None, Spent::default());
-                // An external reference was read once, into the bytes the
-                // core signed under the key its own element resolved.
-                let external = external_of(reference.reserved0.cast::<XmlNode>())
-                    .and_then(|origin| resources.get_for(origin));
-                // The callback ran once when the operation began.
-                let callback = reference.transform_ctx.pre_exec_callback.take();
-                let executed = match external {
-                    Some(bytes) => execute_on_bytes(transforms, bytes.as_ptr(), bytes.len()),
-                    None => xmlSecTransformCtxExecute(transforms, doc),
-                };
-                reference.transform_ctx.pre_exec_callback = callback;
-                if executed < 0 {
-                    errors::internal(here, std::ptr::null(), c"xmlSecTransformCtxExecute");
-                    return -1;
-                }
-            }
-        }
-        if ctx.pre_sign_mem_buf_method.is_null() {
-            return 0;
-        }
-        let signed_info = first_element(node);
-        let Some(canonical) = canonical_signed_info(signed_info, doc, pinned) else {
-            errors::internal(here, std::ptr::null(), c"xmlSecTransformCtxXmlExecute");
-            return -1;
-        };
-        keep(
-            xmlSecTransformMemBufGetBuffer(ctx.pre_sign_mem_buf_method),
-            &canonical,
-        );
-    }
-    0
+/// The context's lists hold read reference contexts.
+unsafe fn stores_pre_digest(ctx: &mut XmlSecDSigCtx, manifests: bool) -> bool {
+    let stores = |list| {
+        // SAFETY: by the caller's contract.
+        unsafe { references(list) }.any(|reference| !reference.pre_digest_mem_buf_method.is_null())
+    };
+    stores(&raw mut ctx.signed_info_references)
+        || (manifests && stores(&raw mut ctx.manifest_references))
 }
 
-/// `SignedInfo` canonicalized by its `CanonicalizationMethod`, with the
-/// method's parameters, over its subtree with comments, as libxmlsec1 feeds
-/// it to the signature method, under the signing's revision `pinned`;
-/// `None` after a report.
+/// Fills the pre-digest buffer of each reference context of `list` that has
+/// one with the bytes the core kept at its position in `kept`.
 ///
 /// # Safety
-/// `signed_info` is a live `SignedInfo` element of `doc`.
-unsafe fn canonical_signed_info(
-    signed_info: *mut XmlNode,
-    doc: *mut XmlDoc,
-    pinned: &Pinned,
-) -> Option<Vec<u8>> {
-    // SAFETY: a context and node set created and released here; live nodes.
-    unsafe {
-        let ctx = xmlSecTransformCtxCreate();
-        if ctx.is_null() {
-            return None;
+/// `list` holds read reference contexts with live buffers.
+unsafe fn keep_pre_digests(list: *mut super::XmlSecPtrList, kept: &[Vec<u8>]) {
+    for (index, bytes) in kept.iter().enumerate() {
+        // SAFETY: by the caller's contract.
+        unsafe {
+            let reference = xmlSecPtrListGetItem(list, index).cast::<XmlSecDSigReferenceCtx>();
+            if let Some(reference) = reference.as_ref()
+                && !reference.pre_digest_mem_buf_method.is_null()
+            {
+                keep(
+                    xmlSecTransformMemBufGetBuffer(reference.pre_digest_mem_buf_method),
+                    bytes,
+                );
+            }
         }
-        seed_run(ctx, pinned, Side::Sign, None, Spent::default());
-        let method = first_element(signed_info);
-        let nodes = xmlSecNodeSetGetChildren(doc, signed_info, 1, 0);
-        let canonical = (!nodes.is_null()
-            && !xmlSecTransformCtxNodeRead(ctx, method, USAGE_C14N_METHOD).is_null()
-            && xmlSecTransformCtxXmlExecute(ctx, nodes) == 0)
-            .then(|| {
-                let result = (*ctx).result;
-                let data = xmlSecBufferGetData(result);
-                if data.is_null() {
-                    Vec::new()
-                } else {
-                    std::slice::from_raw_parts(data, xmlSecBufferGetSize(result)).to_vec()
-                }
-            });
-        if !nodes.is_null() {
-            xmlSecNodeSetDestroy(nodes);
-        }
-        xmlSecTransformCtxDestroy(ctx);
-        canonical
     }
 }
 

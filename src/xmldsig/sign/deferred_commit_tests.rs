@@ -174,6 +174,54 @@ fn text_projection_matches_the_committed_document() {
 }
 
 #[test]
+fn kept_signing_inputs_are_the_bytes_the_operation_digested_and_signed() {
+    // A caller keeping the signing inputs gets them from the one run that
+    // produced the signature, on every digest path: each Reference's kept
+    // bytes hash to the DigestValue written for it, and the kept SignedInfo
+    // is the one the key signed. Nothing is recomputed outside the operation.
+    for (name, xml, policy) in cases() {
+        let key = RecordingSigningKey::default();
+        let context = SignContext::new(&key).policy(policy);
+        let mut document = XmlDocument::parse(xml.as_str()).expect("fixture must parse");
+        let (_, inputs) = context
+            .sign_document_keeping_inputs(&mut document)
+            .unwrap_or_else(|error| panic!("{name}: signing failed: {error:?}"));
+        assert_eq!(
+            inputs.signed_info.as_deref(),
+            Some(key.recorded().as_slice()),
+            "{name}"
+        );
+        // Every fixture's SignedInfo precedes its Manifests, so the
+        // DigestValues in document order follow the reported order.
+        let written = document.with_view(|view| {
+            view.document()
+                .descendants()
+                .filter(|node| node.has_tag_name((DS, "DigestValue")))
+                .map(|node| node.text().unwrap_or("").to_owned())
+                .collect::<Vec<_>>()
+        });
+        let kept = inputs
+            .signed_info_references
+            .iter()
+            .chain(&inputs.manifest_references)
+            .collect::<Vec<_>>();
+        assert_eq!(kept.len(), written.len(), "{name}");
+        for (bytes, value) in kept.into_iter().zip(&written) {
+            assert!(!bytes.is_empty(), "{name}: every Reference kept its bytes");
+            let digest = crate::xmldsig::digest::compute_digest(
+                crate::xmldsig::DigestAlgorithm::Sha256,
+                bytes,
+            );
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD.encode(digest),
+                *value,
+                "{name}"
+            );
+        }
+    }
+}
+
+#[test]
 fn a_customized_snapshot_no_longer_claims_the_published_identity() {
     // The identity names the published settings; once a builder changes them,
     // an audit carrying that identity would misattribute the decision.

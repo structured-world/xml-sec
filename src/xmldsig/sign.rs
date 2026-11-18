@@ -1903,19 +1903,46 @@ impl<'a> SignContext<'a> {
         &self,
         document: &mut XmlDocument,
     ) -> Result<crate::policy::PolicyAudit, SigningError> {
+        self.sign_document_storing(document, None)
+            .map(|(audit, _)| audit)
+    }
+
+    /// [`Self::sign_document`], also returning the bytes each `Reference`
+    /// digested and the canonical `SignedInfo` that was signed, kept as the
+    /// operation produced them and charged to its own budgets, as libxmlsec1's
+    /// storage flags keep them.
+    ///
+    /// # Errors
+    /// As for [`Self::sign_document`].
+    pub fn sign_document_keeping_inputs(
+        &self,
+        document: &mut XmlDocument,
+    ) -> Result<(crate::policy::PolicyAudit, SigningInputs), SigningError> {
+        self.sign_document_storing(document, Some(SigningInputs::default()))
+            .map(|(audit, inputs)| (audit, inputs.unwrap_or_default()))
+    }
+
+    /// Signs `document`, keeping the signing inputs when `stored` asks.
+    fn sign_document_storing(
+        &self,
+        document: &mut XmlDocument,
+        stored: Option<SigningInputs>,
+    ) -> Result<(crate::policy::PolicyAudit, Option<SigningInputs>), SigningError> {
         self.validate_owned_document_input(document)?;
         let mut budgets = SigningOperationBudgets::from_resources_with_backend(
             &self.policy.resources,
             self.xml_backend,
         );
+        budgets.stored = stored;
         budgets
             .transforms
             .xml_parse_work()
             .admit(document.content_len())?;
-        document.transaction(|document| {
+        let audit = document.transaction(|document| {
             self.sign_document_in_place::<CommitDocument>(document, &mut budgets)
                 .map(|((), audit)| audit)
-        })
+        })?;
+        Ok((audit, budgets.stored))
     }
 
     fn sign_document_in_place<O: SignedOutput>(
@@ -2748,6 +2775,10 @@ impl<'a> SignContext<'a> {
                     .transforms
                     .charge_c14n_output(result.2.len())
                     .map_err(SigningDigestError::Transform)?;
+                // Copied only for a caller that keeps the signing inputs.
+                if let Some(stored) = budgets.stored.as_mut() {
+                    stored.signed_info = Some(result.2.clone());
+                }
                 Ok::<_, SigningError>(result)
             })?;
         self.policy.check_signature_algorithm(algorithm)?;
@@ -3316,6 +3347,39 @@ struct SigningOperationBudgets {
     key_establishment: crate::key_establishment::KeyEstablishmentUsage,
     transforms: TransformExecutionBudget,
     xpath_parse: XPathSignatureParseBudget,
+    /// The signing inputs kept for the caller, when it asked for them.
+    stored: Option<SigningInputs>,
+}
+
+/// The inputs a signing operation digested and signed, as
+/// [`SignContext::sign_document_keeping_inputs`] keeps them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SigningInputs {
+    /// For each `SignedInfo` `Reference`, in document order, the bytes its
+    /// transforms fed the digest.
+    pub signed_info_references: Vec<Vec<u8>>,
+    /// The same for each `Reference` of the `Manifest`s in the signature's
+    /// `Object`s, in document order, when the policy processes them.
+    pub manifest_references: Vec<Vec<u8>>,
+    /// The canonical `SignedInfo` the signature covers.
+    pub signed_info: Option<Vec<u8>>,
+}
+
+impl SigningInputs {
+    /// Keeps `bytes` for the `Reference` at `index` of the `SignedInfo`
+    /// references followed by the `Manifest` ones, `signed_info` of them
+    /// from `SignedInfo`.
+    fn keep(&mut self, (index, signed_info): (usize, usize), bytes: Vec<u8>) {
+        let (list, position) = match index.checked_sub(signed_info) {
+            Some(position) => (&mut self.manifest_references, position),
+            None => (&mut self.signed_info_references, index),
+        };
+        if list.len() <= position {
+            list.resize_with(position + 1, Vec::new);
+        }
+        list[position] = bytes;
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -3451,6 +3515,7 @@ impl SigningOperationBudgets {
             key_establishment: crate::key_establishment::KeyEstablishmentUsage::default(),
             transforms,
             xpath_parse,
+            stored: None,
         }
     }
 
@@ -3466,6 +3531,7 @@ impl SigningOperationBudgets {
             key_establishment: crate::key_establishment::KeyEstablishmentUsage::default(),
             transforms,
             xpath_parse,
+            stored: None,
         }
     }
 }
@@ -3555,10 +3621,7 @@ fn compute_prepared_reference_digest_values_with_options(
     compute_signing_reference_digests(
         &doc,
         signature,
-        references
-            .into_iter()
-            .map(|reference| (reference, None))
-            .collect(),
+        references,
         transform_options,
         provider,
         execution_budget,
@@ -3838,6 +3901,7 @@ fn current_generation_levels(
             (
                 request.uri_resolution(policy.transforms.same_document_id_semantics),
                 request.provider,
+                budgets.stored.is_some(),
             ),
         )
     })
@@ -3932,6 +3996,7 @@ fn analyze_signing_placeholder_generation(
         (
             request.uri_resolution(policy.transforms.same_document_id_semantics),
             request.provider,
+            budgets.stored.is_some(),
         ),
     )
     .map(|plan| SigningDependencyPlan {
@@ -3948,12 +4013,13 @@ struct LevelDigestRequest<'a, 'resources> {
     uri_resolution: SigningUriResolution<'a, 'resources>,
 }
 
-/// The digest dependency analysis proved final for the `Reference` at `index`.
+/// The digest dependency analysis proved final for the `Reference` at `index`,
+/// taken: every `Reference` is digested at one level.
 fn analyzed_digest(
-    analyzed: &[Option<String>],
+    analyzed: &mut [Option<AnalyzedDigest>],
     index: usize,
-) -> Result<Option<String>, SigningDigestError> {
-    analyzed.get(index).cloned().ok_or_else(|| {
+) -> Result<Option<AnalyzedDigest>, SigningDigestError> {
+    analyzed.get_mut(index).map(Option::take).ok_or_else(|| {
         SigningDigestError::InvalidStructure(
             "compiled signing Reference index is unavailable".into(),
         )
@@ -3965,7 +4031,7 @@ fn analyzed_digest(
 fn reparsed_level_digests(
     view: crate::document::DocumentView<'_>,
     budgets: &mut SigningOperationBudgets,
-    (level, analyzed): (&[usize], &[Option<String>]),
+    (level, analyzed): (&[usize], &mut [Option<AnalyzedDigest>]),
     references: &SigningReferenceInputs,
     request: LevelDigestRequest<'_, '_>,
 ) -> Result<Vec<(crate::NodeIdentity, String)>, SigningDigestError> {
@@ -4012,16 +4078,37 @@ fn reparsed_level_digests(
         destinations.push(view.node_identity_by_id(reference.digest_value_node_id));
         level_references.push((reference.clone(), analyzed_digest(analyzed, *index)?));
     }
-    let computed = compute_signing_reference_digests(
+    let computed = compute_signing_reference_digests_retaining(
         current_doc,
         current_signature,
         level_references,
-        request.transform_options,
-        request.provider,
-        &budgets.transforms,
+        (
+            request.transform_options,
+            request.provider,
+            &budgets.transforms,
+        ),
         request.uri_resolution,
+        budgets.stored.is_some(),
     )?;
-    if computed.len() != destinations.len() {
+    keep_level_digests(
+        &mut budgets.stored,
+        (level, signed_info_references.len()),
+        destinations,
+        computed,
+    )
+}
+
+/// The digests of a level with their `DigestValue` identities, the bytes
+/// each covered kept in `stored` when the caller keeps the signing inputs,
+/// at the level's positions among the references, `signed_info` of them
+/// from `SignedInfo`.
+fn keep_level_digests(
+    stored: &mut Option<SigningInputs>,
+    (level, signed_info): (&[usize], usize),
+    destinations: Vec<crate::NodeIdentity>,
+    computed: Vec<RetainedDigest>,
+) -> Result<Vec<(crate::NodeIdentity, String)>, SigningDigestError> {
+    if computed.len() != destinations.len() || level.len() != destinations.len() {
         return Err(SigningDigestError::InvalidStructure(
             "signing Reference set changed while computing digests".into(),
         ));
@@ -4029,7 +4116,13 @@ fn reparsed_level_digests(
     Ok(destinations
         .into_iter()
         .zip(computed)
-        .map(|(target, digest)| (target, digest.digest_value))
+        .zip(level)
+        .map(|((target, digest), index)| {
+            if let (Some(stored), Some(bytes)) = (stored.as_mut(), digest.pre_digest) {
+                stored.keep((*index, signed_info), bytes);
+            }
+            (target, digest.computed.digest_value)
+        })
         .collect())
 }
 
@@ -4039,7 +4132,7 @@ fn compute_deferred_reference_digests(
     operation: &mut SigningExecution<'_>,
     node_level: &[OperationNodeId],
     document: &XmlDocument,
-    (level, analyzed): (&[usize], &[Option<String>]),
+    (level, analyzed): (&[usize], &mut [Option<AnalyzedDigest>]),
     references: &SigningReferenceInputs,
     request: LevelDigestRequest<'_, '_>,
 ) -> Result<Vec<(crate::NodeIdentity, String)>, SigningDigestError> {
@@ -4071,25 +4164,24 @@ fn compute_deferred_reference_digests(
                 .iter()
                 .map(|(reference, _)| view.node_identity_by_id(reference.digest_value_node_id))
                 .collect::<Vec<_>>();
-            let computed = compute_signing_reference_digests(
+            let computed = compute_signing_reference_digests_retaining(
                 current_doc,
                 signature,
                 level_references,
-                request.transform_options,
-                request.provider,
-                &budgets.transforms,
+                (
+                    request.transform_options,
+                    request.provider,
+                    &budgets.transforms,
+                ),
                 request.uri_resolution,
+                budgets.stored.is_some(),
             )?;
-            if computed.len() != destinations.len() {
-                return Err(SigningDigestError::InvalidStructure(
-                    "signing Reference set changed while computing digests".into(),
-                ));
-            }
-            Ok(destinations
-                .into_iter()
-                .zip(computed)
-                .map(|(target, digest)| (target, digest.digest_value))
-                .collect())
+            keep_level_digests(
+                &mut budgets.stored,
+                (level, references.signed_info.len()),
+                destinations,
+                computed,
+            )
         })
     })
 }
@@ -4173,7 +4265,7 @@ fn fill_analyzed_reference_digest_values(
     analyzed: AnalyzedReferences,
 ) -> Result<(SigningPlanNodes, Vec<(crate::NodeIdentity, String)>), SigningDigestError> {
     let can_defer = defer_digests && digests_can_defer(document, &analyzed);
-    let (references, dependency_plan) = analyzed;
+    let (references, mut dependency_plan) = analyzed;
     // A shared handle, so the budgets can be borrowed mutably beside it.
     let policy = Arc::clone(operation.policy());
     let (node_levels, plan_nodes) =
@@ -4192,13 +4284,13 @@ fn fill_analyzed_reference_digest_values(
             operation,
             node_level,
             document,
-            (level, &dependency_plan.digests),
+            (level, &mut dependency_plan.digests),
             &references,
             level_request,
         )?;
         return Ok((plan_nodes, pending));
     }
-    let analyzed = dependency_plan.digests;
+    let mut analyzed = dependency_plan.digests;
     for (level, node_level) in dependency_plan.levels.into_iter().zip(node_levels) {
         operation.run_document_transition_batch_with_budgets(
             &node_level,
@@ -4208,7 +4300,7 @@ fn fill_analyzed_reference_digest_values(
                     reparsed_level_digests(
                         view,
                         budgets,
-                        (&level, &analyzed),
+                        (&level, &mut analyzed),
                         &references,
                         level_request,
                     )
@@ -4276,7 +4368,15 @@ struct SigningDependencyPlan {
     splice_unread: bool,
     /// Per `Reference`, the digest its analysis proved final: its output reads
     /// no value signing fills, so the digest pass would compute the same bytes.
-    digests: Vec<Option<String>>,
+    digests: Vec<Option<AnalyzedDigest>>,
+}
+
+/// A digest the dependency analysis proved final.
+struct AnalyzedDigest {
+    /// The Base64 digest value.
+    value: String,
+    /// The bytes it covered, when the operation keeps the signing inputs.
+    pre_digest: Option<Vec<u8>>,
 }
 
 /// Every node whose content signing changes or adds, with the index of what
@@ -4335,9 +4435,10 @@ fn reference_dependency_levels(
     generated: &[NodeId],
     transform_options: TransformOptions<'_>,
     execution_budget: &TransformExecutionBudget,
-    (uri_resolution, provider): (
+    (uri_resolution, provider, retain): (
         SigningUriResolution<'_, '_>,
         &dyn crate::provider::CryptoProvider,
+        bool,
     ),
 ) -> Result<SigningDependencyPlan, SigningDigestError> {
     let resolver = uri_resolution.external_resources.bind(
@@ -4369,16 +4470,17 @@ fn reference_dependency_levels(
                 Some(super::transforms::DigestRequest {
                     provider,
                     algorithm: reference.digest_method,
-                    retain_pre_digest: false,
+                    // A final digest is not computed again, so the bytes a
+                    // kept signing input needs are retained here.
+                    retain_pre_digest: retain,
                     empty_input: transform_options.empty_digest_decision(),
                 }),
             )
             .map_err(map_reference_digest_error)?;
-            digests.push(
-                output
-                    .digest
-                    .map(|digest| base64::engine::general_purpose::STANDARD.encode(digest)),
-            );
+            digests.push(output.digest.map(|digest| AnalyzedDigest {
+                value: base64::engine::general_purpose::STANDARD.encode(digest.digest),
+                pre_digest: digest.pre_digest,
+            }));
             Ok(output.dependencies)
         })
         .collect::<Result<Vec<_>, SigningDigestError>>()?;
@@ -4669,17 +4771,51 @@ struct SigningUriResolution<'a, 'resources> {
     external_resources: &'a ExternalResourceContext<'resources>,
 }
 
-/// Digest each `Reference`, taking the value its dependency analysis already
-/// proved final where there is one.
+/// Digest each `Reference` of a template.
 fn compute_signing_reference_digests(
     doc: &Document<'_>,
     signature: Node<'_, '_>,
-    references: Vec<(SigningReference, Option<String>)>,
+    references: Vec<SigningReference>,
     transform_options: TransformOptions<'_>,
     provider: &dyn crate::provider::CryptoProvider,
     execution_budget: &TransformExecutionBudget,
     uri_resolution: SigningUriResolution<'_, '_>,
 ) -> Result<Vec<ComputedReferenceDigest>, SigningDigestError> {
+    compute_signing_reference_digests_retaining(
+        doc,
+        signature,
+        references
+            .into_iter()
+            .map(|reference| (reference, None))
+            .collect(),
+        (transform_options, provider, execution_budget),
+        uri_resolution,
+        false,
+    )
+    .map(|computed| computed.into_iter().map(|digest| digest.computed).collect())
+}
+
+/// A `Reference` digest with the bytes it covered, when they were retained.
+struct RetainedDigest {
+    computed: ComputedReferenceDigest,
+    pre_digest: Option<Vec<u8>>,
+}
+
+/// Digest each `Reference`, taking the value its dependency analysis already
+/// proved final where there is one, with the bytes each digest covered when
+/// `retain`: the analysis retained them for a value it proved final.
+fn compute_signing_reference_digests_retaining(
+    doc: &Document<'_>,
+    signature: Node<'_, '_>,
+    references: Vec<(SigningReference, Option<AnalyzedDigest>)>,
+    (transform_options, provider, execution_budget): (
+        TransformOptions<'_>,
+        &dyn crate::provider::CryptoProvider,
+        &TransformExecutionBudget,
+    ),
+    uri_resolution: SigningUriResolution<'_, '_>,
+    retain: bool,
+) -> Result<Vec<RetainedDigest>, SigningDigestError> {
     let resolver = uri_resolution.external_resources.bind(
         doc,
         uri_resolution.id_attributes,
@@ -4689,12 +4825,15 @@ fn compute_signing_reference_digests(
         .into_iter()
         .enumerate()
         .map(|(index, (reference, analyzed))| {
-            if let Some(digest_value) = analyzed {
-                return Ok(ComputedReferenceDigest {
-                    index,
-                    uri: reference.uri,
-                    digest_method: reference.digest_method,
-                    digest_value,
+            if let Some(analyzed) = analyzed {
+                return Ok(RetainedDigest {
+                    computed: ComputedReferenceDigest {
+                        index,
+                        uri: reference.uri,
+                        digest_method: reference.digest_method,
+                        digest_value: analyzed.value,
+                    },
+                    pre_digest: analyzed.pre_digest,
                 });
             }
             let origin = signing_reference_origin(doc, &reference)?;
@@ -4715,18 +4854,20 @@ fn compute_signing_reference_digests(
                 super::transforms::DigestRequest {
                     provider,
                     algorithm: reference.digest_method,
-                    retain_pre_digest: false,
+                    retain_pre_digest: retain,
                     empty_input: transform_options.empty_digest_decision(),
                 },
             )
-            .map_err(map_reference_digest_error)?
-            .digest;
-            let digest_value = base64::engine::general_purpose::STANDARD.encode(digest);
-            Ok(ComputedReferenceDigest {
-                index,
-                uri: reference.uri,
-                digest_method: reference.digest_method,
-                digest_value,
+            .map_err(map_reference_digest_error)?;
+            let digest_value = base64::engine::general_purpose::STANDARD.encode(digest.digest);
+            Ok(RetainedDigest {
+                computed: ComputedReferenceDigest {
+                    index,
+                    uri: reference.uri,
+                    digest_method: reference.digest_method,
+                    digest_value,
+                },
+                pre_digest: digest.pre_digest,
             })
         })
         .collect()

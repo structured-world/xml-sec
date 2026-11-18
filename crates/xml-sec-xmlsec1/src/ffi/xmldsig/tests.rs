@@ -365,6 +365,93 @@ fn a_stored_pre_digest_holds_the_bytes_that_were_signed() {
     }
 }
 
+#[test]
+fn stored_buffers_come_from_the_signing_and_spend_nothing_beyond_it() {
+    // The Base64 output limit is cumulative for one operation. With the
+    // storage flags set, the pre-digest bytes and the canonical SignedInfo
+    // come from the core's one run under that limit, decoded to exactly
+    // its size here; the reference's own chain does not run again on a
+    // fresh allowance and decode them a second time.
+    own_process();
+    // `MDEyMzQ1Njc4OWFiY2RlZg==` decodes to sixteen octets.
+    let template = concat!(
+        "<Signature xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><SignedInfo>",
+        "<CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>",
+        "<SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#hmac-sha256\"/>",
+        "<Reference URI=\"#encoded\"><Transforms>",
+        "<Transform Algorithm=\"http://www.w3.org/2000/09/xmldsig#base64\"/></Transforms>",
+        "<DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>",
+        "<DigestValue/></Reference></SignedInfo><SignatureValue/>",
+        "<Object Id=\"encoded\">MDEyMzQ1Njc4OWFiY2RlZg==</Object></Signature>"
+    );
+    let secret = b"secret-of-thirty-two-octets-long";
+    crate::ffi::policy::republish(
+        |_| {},
+        |signing| signing.resources.max_base64_transform_output_bytes = 16,
+    )
+    .expect("the library policy compiles");
+    // SAFETY: the library, a document, a key and a context set up and torn
+    // down here, on this thread alone.
+    unsafe {
+        assert_eq!(xmlSecInit(), 0);
+        assert_eq!(xmlSecCryptoDLLoadLibrary(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoAppInit(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoInit(), 0);
+        let doc = xsReadMemory(
+            template.as_ptr().cast(),
+            i32::try_from(template.len()).expect("a short document"),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        assert!(!doc.is_null());
+        let ids = [c"Id".as_ptr().cast::<u8>(), std::ptr::null()];
+        xmlSecAddIDs(doc, std::ptr::null_mut(), ids.as_ptr());
+        let ctx = xmlSecDSigCtxCreate(std::ptr::null_mut());
+        let key = xmlSecKeyCreate();
+        assert_eq!(
+            xmlSecKeyDataBinRead(
+                symkeys::hmac(),
+                key.cast(),
+                secret.as_ptr(),
+                secret.len(),
+                (&raw mut (*ctx).key_info_read_ctx).cast(),
+            ),
+            0
+        );
+        (*ctx).sign_key = key;
+        (*ctx).flags |= FLAGS_STORE_SIGNATURE | FLAGS_STORE_SIGNEDINFO_REFERENCES;
+        assert_eq!(xmlSecDSigCtxSign(ctx, xsDocGetRootElement(doc)), 0);
+        let reference = xmlSecPtrListGetItem(&raw mut (*ctx).signed_info_references, 0)
+            .cast::<XmlSecDSigReferenceCtx>();
+        let kept = crate::ffi::transforms::builtin::xmlSecTransformMemBufGetBuffer(
+            (*reference).pre_digest_mem_buf_method,
+        );
+        assert_eq!(
+            std::slice::from_raw_parts(
+                crate::ffi::buffer::xmlSecBufferGetData(kept),
+                crate::ffi::buffer::xmlSecBufferGetSize(kept),
+            ),
+            b"0123456789abcdef"
+        );
+        let signed_info = crate::ffi::transforms::builtin::xmlSecTransformMemBufGetBuffer(
+            (*ctx).pre_sign_mem_buf_method,
+        );
+        assert!(crate::ffi::buffer::xmlSecBufferGetSize(signed_info) > 16);
+        // Nothing was decoded outside the operation's own count.
+        assert_eq!(
+            crate::ffi::transforms::ctx::run_spent(&raw mut (*reference).transform_ctx)
+                .base64_output,
+            0
+        );
+        xmlSecDSigCtxDestroy(ctx);
+        xsFreeDoc(doc);
+        assert_eq!(xmlSecCryptoShutdown(), 0);
+        assert_eq!(xmlSecCryptoAppShutdown(), 0);
+        assert_eq!(xmlSecShutdown(), 0);
+    }
+}
+
 /// A pre-execute callback that appends a Base64 decoder to the chain.
 unsafe extern "C" fn appending(
     ctx: *mut crate::ffi::transforms::XmlSecTransformCtx,

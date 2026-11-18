@@ -132,7 +132,7 @@ pub use sign::{
     ComputedReferenceDigest, DerEncodedKeyValueInfoWriter, DsaSigningKey, EcdsaP256SigningKey,
     EcdsaP384SigningKey, EcdsaP521SigningKey, HmacSigningKey, KeyInfoWriteError, KeyInfoWriter,
     KeyValueInfoWriter, RsaSigningKey, SignContext, SignatureTemplateSelection, SigningDigestError,
-    SigningError, X509CertificateKeyInfoWriter, X509DigestKeyInfoWriter,
+    SigningError, SigningInputs, X509CertificateKeyInfoWriter, X509DigestKeyInfoWriter,
     compute_reference_digest_values, fill_reference_digest_values, validate_signing_key,
 };
 pub use signature::SignatureVerificationError;

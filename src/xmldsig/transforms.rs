@@ -1584,8 +1584,9 @@ pub(crate) fn enveloped_signature_for_reference<'a, E, I: Instruction>(
 pub(crate) struct TransformDependencyOutput {
     pub(crate) dependencies: Set<usize>,
     /// The output's digest, present when the execution proved the output
-    /// independent of every tracked field, so a later execution would repeat it.
-    pub(crate) digest: Option<super::DigestOutput>,
+    /// independent of every tracked field, so a later execution would repeat
+    /// it; with the bytes it covered when the request retains them.
+    pub(crate) digest: Option<ReferenceDigest>,
 }
 
 struct TransformChainOutput<T> {
@@ -1930,7 +1931,7 @@ impl TransformTerminal<Native> for CollectTerminal {
 struct AnalysisTerminal<'p>(Option<DigestRequest<'p>>);
 #[cfg(feature = "xmldsig-sign")]
 impl TransformTerminal<Native> for AnalysisTerminal<'_> {
-    type Output = Option<super::DigestOutput>;
+    type Output = Option<ReferenceDigest>;
     type Error = ReferenceDigestError;
 
     fn settle(&mut self, independent: bool) {
@@ -1951,11 +1952,7 @@ impl TransformTerminal<Native> for AnalysisTerminal<'_> {
         budget: &TransformExecutionBudget,
     ) -> Result<Self::Output, ReferenceDigestError> {
         self.0
-            .map(|request| {
-                DigestTerminal(request)
-                    .finish(data, explicit, budget)
-                    .map(|digest| digest.digest)
-            })
+            .map(|request| DigestTerminal(request).finish(data, explicit, budget))
             .transpose()
     }
 
@@ -1966,11 +1963,7 @@ impl TransformTerminal<Native> for AnalysisTerminal<'_> {
         scratch: &Native,
     ) -> Result<Self::Output, ReferenceDigestError> {
         self.0
-            .map(|request| {
-                DigestTerminal(request)
-                    .finish_base64(data, budget, scratch)
-                    .map(|digest| digest.digest)
-            })
+            .map(|request| DigestTerminal(request).finish_base64(data, budget, scratch))
             .transpose()
     }
 }
