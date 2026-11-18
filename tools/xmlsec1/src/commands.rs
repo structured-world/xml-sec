@@ -1041,6 +1041,9 @@ fn xmlsec_compatibility_signing_policy(invocation: &Invocation) -> SigningPolicy
             opc_relationship_edition: xml_sec::policy::OpcRelationshipEdition::Ecma2012,
             same_document_id_semantics: same_document_id_semantics(invocation),
             xslt_stylesheet_semantics: XMLSEC_COMPATIBILITY_XSLT_STYLESHEETS,
+            // xmlsec1 writes no conversion for a node set and digests it
+            // with Canonical XML 1.0 (XMLDSig 1.1 section 4.4.3.2).
+            generated_canonicalization: xml_sec::policy::GeneratedCanonicalization::Implicit,
             ..TransformPolicy::default()
         },
         hmac: HmacPolicy {
