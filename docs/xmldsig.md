@@ -132,8 +132,9 @@ still produces a node set. The mutation is operation-gated, policy-checked, boun
 in the canonicalized `<SignedInfo>` rather than being an invisible signing option. A signing policy
 whose `transforms.generated_canonicalization` is
 [`GeneratedCanonicalization::Implicit`](crate::policy::GeneratedCanonicalization::Implicit) writes
-nothing and digests the node set with C14N 1.0, as libxmlsec1 signs a template; the
-`XmlSecCompatible` profile selects it, so donor templates sign to the donor's documents. The declared
+nothing and digests the node set with C14N 1.0, as libxmlsec1 signs a template; the libxmlsec1 C
+library and the `xmlsec1` command select it, so donor templates sign to the donor's documents. The
+`XmlSecCompatible` profile verifies such documents but signs as every other profile does. The declared
 canonicalization method for `<SignedInfo>` is governed by the same policy. Reference output and
 `<SignedInfo>` serialization consume one bounded canonicalization budget, so policy rejection
 occurs during rendering rather than after an oversized buffer has already been allocated.

@@ -300,17 +300,39 @@ fn denying_certificate_signatures_keeps_trusted_preset_keys_usable() {
 }
 
 #[test]
-fn the_compatible_profile_signs_the_ids_it_verifies() {
-    // libxmlsec1 looks a bare-name fragment up the same way for signing and
-    // verification, so its profile signs a reference to an ID that is not an
-    // NCName, which its verification resolves.
+fn the_compatible_profile_verifies_ids_its_signing_refuses() {
+    // The profile accepts what libxmlsec1 signs: its verification resolves a
+    // bare-name fragment that is not an NCName. Its own signing keeps to the
+    // specification's ID form; only a policy built for libxmlsec1's
+    // boundary, as the C library builds it, signs with libxmlsec1's lookup.
+    use xml_sec::policy::SameDocumentIdSemantics;
     let compiled = compiler(PolicyProfile::XmlSecCompatible)
         .compile(&context())
         .unwrap();
     let key = HmacSigningKey::new(vec![0x53; 32]).unwrap();
     let verifier = HmacVerificationKey::new(vec![0x53; 32]).unwrap();
+    let mut signing = compiled.signing().unwrap().clone();
+    assert_eq!(
+        signing.transforms.same_document_id_semantics,
+        SameDocumentIdSemantics::Specification
+    );
+    assert!(
+        SignContext::new(&key)
+            .policy(signing.clone())
+            .sign_template(&template("urn:test", "123"))
+            .is_err(),
+        "a bare name that is not an NCName is no ID by the specification"
+    );
+    assert_eq!(
+        signing.select_same_document_id_semantics(SameDocumentIdSemantics::XmlSecBarename),
+        Err(PolicyViolation::RequestSelection {
+            setting: "same_document_id_semantics"
+        }),
+        "a request does not reach libxmlsec1's lookup for signing"
+    );
+    signing.transforms.same_document_id_semantics = SameDocumentIdSemantics::XmlSecBarename;
     let xml = SignContext::new(&key)
-        .policy(compiled.signing().unwrap().clone())
+        .policy(signing)
         .sign_template(&template("urn:test", "123"))
         .unwrap()
         .output;
@@ -334,7 +356,7 @@ fn only_signing_layers_must_agree_on_the_generated_canonicalization() {
         .as_mut()
         .unwrap()
         .transforms
-        .generated_canonicalization = xml_sec::policy::GeneratedCanonicalization::ExplicitC14n11;
+        .generated_canonicalization = xml_sec::policy::GeneratedCanonicalization::Implicit;
     assert!(compatibility().restrict(&layer).is_ok());
     let mut layer = compatibility().policies().clone();
     layer
@@ -342,7 +364,7 @@ fn only_signing_layers_must_agree_on_the_generated_canonicalization() {
         .as_mut()
         .unwrap()
         .transforms
-        .generated_canonicalization = xml_sec::policy::GeneratedCanonicalization::ExplicitC14n11;
+        .generated_canonicalization = xml_sec::policy::GeneratedCanonicalization::Implicit;
     assert!(matches!(
         compatibility().restrict(&layer),
         Err(PolicyViolation::Configuration { .. })
@@ -607,21 +629,16 @@ fn all_named_profiles_compile_and_legacy_requires_auditable_expiry() {
             expected,
             "{profile:?}"
         );
-        // Only the libxmlsec1-compatible profile signs a node set as libxmlsec1
-        // does, leaving its conversion implicit, so it writes the donor's
-        // templates and digests.
-        let generated = if profile == PolicyProfile::XmlSecCompatible {
-            xml_sec::policy::GeneratedCanonicalization::Implicit
-        } else {
-            xml_sec::policy::GeneratedCanonicalization::ExplicitC14n11
-        };
+        // Every profile makes a node set's conversion explicit when signing,
+        // the libxmlsec1-compatible one included; implicit conversion is left
+        // to the libxmlsec1 boundaries.
         assert_eq!(
             compiled
                 .signing()
                 .unwrap()
                 .transforms
                 .generated_canonicalization,
-            generated,
+            xml_sec::policy::GeneratedCanonicalization::ExplicitC14n11,
             "{profile:?}"
         );
         // Only the libxmlsec1-compatible profile stops on any X509Data child

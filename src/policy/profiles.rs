@@ -8,10 +8,10 @@ use super::{
     KeyWrapAlgorithm, OaepDigestAlgorithm,
 };
 use super::{
-    DigestAlgorithm, GeneratedCanonicalization, KeySourceKind, KeySourcePolicy, PolicyViolation,
-    RequestSelections, RsaPssPermission, SameDocumentIdSemantics, SignatureAlgorithm,
-    SigningPolicy, TransformPolicy, UnknownX509CertificateSemantics, UriPolicy, UriTypeSet,
-    VerificationPolicy, XsltStylesheetSemantics,
+    DigestAlgorithm, KeySourceKind, KeySourcePolicy, PolicyViolation, RequestSelections,
+    RsaPssPermission, SameDocumentIdSemantics, SignatureAlgorithm, SigningPolicy, TransformPolicy,
+    UnknownX509CertificateSemantics, UriPolicy, UriTypeSet, VerificationPolicy,
+    XsltStylesheetSemantics,
 };
 use crate::provider::{CryptoProvider, ProviderCapability};
 use alloc::{borrow::ToOwned, collections::BTreeSet, string::String, sync::Arc};
@@ -437,6 +437,11 @@ fn verification_profile(
         verification.key_trust.rsa_keys.minimum_modulus_bits = 1024;
         verification.key_trust.dsa_keys.minimum_modulus_bits = 1024;
         verification.hmac.minimum_output_bits = 80;
+        // Verification resolves a bare-name fragment as libxmlsec1 does, so it
+        // accepts the documents libxmlsec1 signs; signing keeps to the
+        // specification's ID form, which libxmlsec1 verifies as well.
+        verification.transforms.same_document_id_semantics =
+            SameDocumentIdSemantics::XmlSecBarename;
         verification.key_trust.unknown_x509_certificate =
             UnknownX509CertificateSemantics::Libxmlsec1;
         // libxmlsec1's context flags select these for one operation.
@@ -468,14 +473,11 @@ fn verification_profile(
 fn profile_transforms(compatibility: bool) -> TransformPolicy {
     if compatibility {
         // Signers and verifiers in this profile must agree with libxmlsec1 on the
-        // digested output of XSLT transforms, and its signing writes the
-        // donor's templates, leaving a node set's conversion implicit. Both
-        // directions look a bare-name fragment up as libxmlsec1 does, so the
-        // profile signs every reference its verification resolves.
+        // digested output of XSLT transforms. Signing otherwise writes what
+        // the specification recommends; byte-for-byte libxmlsec1 templates
+        // are the business of the C library and the xmlsec1 command.
         TransformPolicy {
             xslt_stylesheet_semantics: XsltStylesheetSemantics::Libxmlsec1,
-            same_document_id_semantics: SameDocumentIdSemantics::XmlSecBarename,
-            generated_canonicalization: GeneratedCanonicalization::Implicit,
             ..TransformPolicy::default()
         }
     } else {

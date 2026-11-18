@@ -13,8 +13,8 @@
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use xml_sec::policy::{
-    DecryptionPolicy, EncryptionPolicy, ManifestProcessing, PolicyCompileContext, PolicyCompiler,
-    PolicyProfile, SigningPolicy, VerificationPolicy,
+    DecryptionPolicy, EncryptionPolicy, GeneratedCanonicalization, ManifestProcessing,
+    PolicyCompileContext, PolicyCompiler, PolicyProfile, SigningPolicy, VerificationPolicy,
 };
 use xml_sec::provider::ProviderCapability;
 use xml_sec::xmldsig::UriTypeSet;
@@ -91,6 +91,12 @@ fn compile() -> Option<Published> {
         .clone_from(&verification.digest_algorithms);
     signing.parameterized_rsa_pss = verification.parameterized_rsa_pss;
     signing.hmac = verification.hmac;
+    // libxmlsec1 signs a template as written: a node set is left to the
+    // implicit Canonical XML 1.0 conversion (XMLDSig 1.1 section 4.4.3.2), and
+    // a bare-name fragment is looked up as its verification looks it up.
+    signing.transforms.generated_canonicalization = GeneratedCanonicalization::Implicit;
+    signing.transforms.same_document_id_semantics =
+        verification.transforms.same_document_id_semantics;
     let mut decryption = compiled.decryption()?.clone();
     // A CipherReference resolves as a signature's reference does: external
     // URIs from the bytes the caller's input callbacks supply, same-document

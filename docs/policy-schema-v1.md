@@ -71,10 +71,11 @@ These interpretation choices are not ordered security levels. Restrictive
 composition rejects incompatible modes rather than selecting the last value.
 `generated_canonicalization` belongs to the `signing.transforms` table alone,
 since only signing generates a transform; the other tables refuse it as a
-schema error. `ExplicitC14n11` writes a
-C14N 1.1 `Transform` into a Reference whose chain ends in a node set,
+schema error. `ExplicitC14n11`, which every named profile selects, writes a
+C14N 1.1 `Transform` into a Reference whose chain ends in a node set;
 `Implicit` writes nothing and leaves the node set to the Canonical XML 1.0
-conversion every verifier applies; `XmlSecCompatible` selects `Implicit`.
+conversion every verifier applies, as libxmlsec1 signs. A layer restates its
+base's choice, so `Implicit` is reached only through a policy built in code.
 `empty_digest_input` is the exception: it is a restriction, so a layer that
 refuses to digest a Reference whose transforms produce no octets keeps
 refusing it whatever another layer says.
