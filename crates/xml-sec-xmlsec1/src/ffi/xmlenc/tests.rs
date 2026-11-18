@@ -826,18 +826,11 @@ fn an_encrypted_key_is_written_under_the_operations_revision() {
 #[test]
 fn an_encrypted_key_method_is_admitted_as_a_key_wrap() {
     // An EncryptedKey's method carries a key, so the policy admits it as a
-    // key transport or key wrap, as the core does: permission to decrypt
-    // content with a block cipher never authorizes recovering a key with it.
+    // key transport or key wrap, as the core does: the libxmlsec1-compatible
+    // library profile lists the CBC key wraps libxmlsec1 accepts, and a
+    // policy listing none refuses the key whatever content it may decrypt.
     own_process();
-    xml_sec_libxml2::policy::republish_encryption(
-        |_| {},
-        |decryption| {
-            decryption.key_wrap_algorithms = Some(std::collections::BTreeSet::new());
-            decryption.key_transport_algorithms = Some(std::collections::BTreeSet::new());
-        },
-    )
-    .expect("the library policy compiles");
-    // SAFETY: the library, a document and a context set up and released
+    // SAFETY: the library, a document and contexts set up and released
     // here, on this thread alone.
     unsafe {
         start_up();
@@ -851,18 +844,35 @@ fn an_encrypted_key_method_is_admitted_as_a_key_wrap() {
             ),
             "</CipherValue></CipherData></EncryptedKey>"
         ));
-        let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
-        (*ctx).mode = MODE_ENCRYPTED_KEY;
-        (*ctx).enc_key = aes_key();
-        let result = xmlSecEncCtxDecryptToBuffer(
-            ctx,
-            xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc.cast()),
-        );
+        let recovered = || {
+            let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
+            (*ctx).mode = MODE_ENCRYPTED_KEY;
+            (*ctx).enc_key = aes_key();
+            let result = xmlSecEncCtxDecryptToBuffer(
+                ctx,
+                xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc.cast()),
+            );
+            let recovered = !result.is_null()
+                && std::slice::from_raw_parts(
+                    xmlSecBufferGetData(result),
+                    xmlSecBufferGetSize(result),
+                ) == [0x5a; 16];
+            xmlSecEncCtxDestroy(ctx);
+            recovered
+        };
+        assert!(recovered(), "the compatible profile admits a CBC key wrap");
+        xml_sec_libxml2::policy::republish_encryption(
+            |_| {},
+            |decryption| {
+                decryption.key_wrap_algorithms = Some(std::collections::BTreeSet::new());
+                decryption.key_transport_algorithms = Some(std::collections::BTreeSet::new());
+            },
+        )
+        .expect("the library policy compiles");
         assert!(
-            result.is_null(),
-            "no key is recovered with a content cipher"
+            !recovered(),
+            "no key is recovered without a key-wrap permission"
         );
-        xmlSecEncCtxDestroy(ctx);
         xsFreeDoc(doc.cast());
         shut_down();
     }
