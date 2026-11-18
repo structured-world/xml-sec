@@ -52,7 +52,9 @@ use super::super::transforms::{
     xmlSecTransformSetKeyReq, xmlSecTransformVerifyNodeContent,
 };
 use super::super::tree::{XmlDoc, XmlNode, give, nodes};
-use super::super::xmltree::{xmlSecAddIDs, xmlSecCheckNodeName, xmlSecGetNextElementNode};
+use super::super::xmltree::{
+    xmlSecAddIDs, xmlSecCheckNodeName, xmlSecFindChild, xmlSecGetNextElementNode,
+};
 use super::{
     FAILURE_KEY_NOT_FOUND, FAILURE_REFERENCE, FAILURE_SIGNATURE, FAILURE_UNKNOWN,
     FLAGS_ALLOW_EMPTY_INPUT_DSIG, FLAGS_IGNORE_MANIFESTS, FLAGS_STORE_MANIFEST_REFERENCES,
@@ -1385,6 +1387,35 @@ unsafe fn apply_reference(reference: &mut XmlSecDSigReferenceCtx, outcome: &Refe
             );
         }
     }
+    // A verified reference leaves no result: libxmlsec1's digest transform
+    // checks the value and outputs nothing.
+}
+
+/// Makes `bytes` the reference's `result`, as libxmlsec1 leaves the output
+/// of its chain there: held by a memory buffer transform appended to the
+/// reference's own chain, so the reference context owns and frees it.
+///
+/// # Safety
+/// The reference's transform context is initialized.
+unsafe fn keep_reference_result(reference: &mut XmlSecDSigReferenceCtx, bytes: &[u8]) {
+    // SAFETY: by the caller's contract.
+    unsafe {
+        let holder = xmlSecTransformCtxCreateAndAppend(
+            &raw mut reference.transform_ctx,
+            xmlSecTransformMemBufGetKlass(),
+        );
+        if holder.is_null() {
+            errors::internal(
+                here!("xmlSecDSigCtxProcessSignatureNode"),
+                std::ptr::null(),
+                c"xmlSecTransformCtxCreateAndAppend",
+            );
+            return;
+        }
+        let buffer = xmlSecTransformMemBufGetBuffer(holder);
+        keep(buffer, bytes);
+        reference.result = buffer;
+    }
 }
 
 /// Puts `bytes` into the kept `buffer`.
@@ -1493,12 +1524,12 @@ unsafe fn run_signing(
     // SAFETY: the context's own lists and its signature value element.
     unsafe {
         for reference in references(&raw mut ctx.signed_info_references) {
-            reference.status = STATUS_SUCCEEDED;
+            signed_reference(reference);
         }
         // The core wrote the Manifest digests it processes.
         if manifests {
             for reference in references(&raw mut ctx.manifest_references) {
-                reference.status = STATUS_SUCCEEDED;
+                signed_reference(reference);
             }
         }
         if let Some(inputs) = inputs {
@@ -1524,6 +1555,27 @@ unsafe fn run_signing(
             }
         }
         keep_result(ctx)
+    }
+}
+
+/// Marks a reference the core signed: succeeded, with the Base64 digest it
+/// wrote into the `DigestValue` as its `result`, as libxmlsec1's Base64
+/// encoding chain leaves it.
+///
+/// # Safety
+/// The reference context was read from a live `Reference` element.
+unsafe fn signed_reference(reference: &mut XmlSecDSigReferenceCtx) {
+    reference.status = STATUS_SUCCEEDED;
+    // SAFETY: by the caller's contract.
+    unsafe {
+        let digest_value = xmlSecFindChild(
+            reference.reserved0.cast::<XmlNode>(),
+            name!(xmlSecNodeDigestValue),
+            name!(xmlSecDSigNs),
+        );
+        if let Some(written) = nodes::content(digest_value) {
+            keep_reference_result(reference, written.as_bytes());
+        }
     }
 }
 

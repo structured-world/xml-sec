@@ -115,6 +115,18 @@ static void references(xmlSecDSigCtxPtr ctx) {
                xmlSecDSigCtxGetStatusString(reference->status), (int)reference->origin,
                reference->digestMethod != NULL ? (const char *)reference->digestMethod->id->name
                                                : "(null)");
+        /* The digest the operation left: its Base64 text after signing,
+         * the computed digest after verifying. */
+        printf("    result:");
+        if (reference->result == NULL || xmlSecBufferGetData(reference->result) == NULL) {
+            printf(" none");
+        } else {
+            xmlSecSize j;
+            for (j = 0; j < xmlSecBufferGetSize(reference->result); ++j) {
+                printf("%02x", xmlSecBufferGetData(reference->result)[j]);
+            }
+        }
+        printf("\n");
     }
 }
 

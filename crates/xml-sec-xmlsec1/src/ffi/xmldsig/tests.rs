@@ -632,6 +632,88 @@ unsafe fn hmac_key(ctx: *mut XmlSecDSigCtx) -> *mut crate::ffi::keys::XmlSecKey 
 }
 
 #[test]
+fn a_reference_context_holds_its_digest_after_the_operation() {
+    // As libxmlsec1 leaves them: after signing a reference's result is the
+    // Base64 digest written into its DigestValue; after verifying there is
+    // none, as libxmlsec1's checking digest transform outputs nothing.
+    own_process();
+    let template = concat!(
+        "<Envelope xmlns=\"urn:envelope\"><Data Id=\"data\">payload</Data>",
+        "<Signature xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><SignedInfo>",
+        "<CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>",
+        "<SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#hmac-sha256\"/>",
+        "<Reference URI=\"#data\">",
+        "<DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>",
+        "<DigestValue/></Reference></SignedInfo><SignatureValue/>",
+        "</Signature></Envelope>"
+    );
+    let result_of = |ctx: *mut XmlSecDSigCtx| {
+        // SAFETY: the context's first SignedInfo reference and its buffer.
+        unsafe {
+            let reference = xmlSecPtrListGetItem(&raw mut (*ctx).signed_info_references, 0)
+                .cast::<XmlSecDSigReferenceCtx>();
+            let result = (*reference).result;
+            assert!(!result.is_null(), "the reference holds its digest");
+            std::slice::from_raw_parts(
+                crate::ffi::buffer::xmlSecBufferGetData(result),
+                crate::ffi::buffer::xmlSecBufferGetSize(result),
+            )
+            .to_vec()
+        }
+    };
+    // SAFETY: the library, a document, keys and contexts set up and torn
+    // down here, on this thread alone.
+    unsafe {
+        assert_eq!(xmlSecInit(), 0);
+        assert_eq!(xmlSecCryptoDLLoadLibrary(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoAppInit(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoInit(), 0);
+        let doc = xsReadMemory(
+            template.as_ptr().cast(),
+            i32::try_from(template.len()).expect("a short document"),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        assert!(!doc.is_null());
+        let ids = [c"Id".as_ptr().cast::<u8>(), std::ptr::null()];
+        xmlSecAddIDs(doc, std::ptr::null_mut(), ids.as_ptr());
+        let signature = xmlSecFindNode(
+            xsDocGetRootElement(doc),
+            c"Signature".as_ptr().cast(),
+            c"http://www.w3.org/2000/09/xmldsig#".as_ptr().cast(),
+        );
+        let ctx = xmlSecDSigCtxCreate(std::ptr::null_mut());
+        (*ctx).sign_key = hmac_key(ctx);
+        assert_eq!(xmlSecDSigCtxSign(ctx, signature), 0);
+        let digest_value = xmlSecFindNode(
+            signature,
+            c"DigestValue".as_ptr().cast(),
+            c"http://www.w3.org/2000/09/xmldsig#".as_ptr().cast(),
+        );
+        let written = crate::ffi::tree::nodes::content(digest_value).expect("a written digest");
+        assert_eq!(result_of(ctx), written.as_bytes());
+        xmlSecDSigCtxDestroy(ctx);
+
+        let ctx = xmlSecDSigCtxCreate(std::ptr::null_mut());
+        (*ctx).sign_key = hmac_key(ctx);
+        assert_eq!(xmlSecDSigCtxVerify(ctx, signature), 0);
+        assert_eq!((*ctx).status, STATUS_SUCCEEDED);
+        let reference = xmlSecPtrListGetItem(&raw mut (*ctx).signed_info_references, 0)
+            .cast::<XmlSecDSigReferenceCtx>();
+        assert!(
+            (*reference).result.is_null(),
+            "a verified reference has no result"
+        );
+        xmlSecDSigCtxDestroy(ctx);
+        xsFreeDoc(doc);
+        assert_eq!(xmlSecCryptoShutdown(), 0);
+        assert_eq!(xmlSecCryptoAppShutdown(), 0);
+        assert_eq!(xmlSecShutdown(), 0);
+    }
+}
+
+#[test]
 fn one_uri_under_two_bases_names_two_resources() {
     // `payload.bin` resolves against each Reference's own XML Base (RFC 3986
     // section 5.2): the two references name two resources, each read and
