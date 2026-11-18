@@ -50,7 +50,7 @@ Each operation exposes its applicable typed policy fields, with the same names:
 
 | Table | Settings |
 | --- | --- |
-| verification/signing | `signature_algorithms`, `digest_algorithms`, `parameterized_rsa_pss`, `signature_constraints`, `ecdsa_signature_value_encoding`, `manifest_processing`, `hmac`, `uris`, `transforms`, `key_establishment`, `xml`, `resources`, `validity` |
+| verification/signing | `signature_algorithms`, `digest_algorithms`, `parameterized_rsa_pss`, `signature_constraints`, `ecdsa_signature_value_encoding`, `manifest_processing`, `request_selections`, `hmac`, `uris`, `transforms`, `key_establishment`, `xml`, `resources`, `validity` |
 | verification | `key_trust`, `key_sources` |
 | signing | `rsa_keys`, `dsa_keys` |
 | encryption/decryption | `data_algorithms`, `key_transport_algorithms`, `key_wrap_algorithms`, `oaep_digests`, `rsa_keys`, `key_establishment`, `xml`, `resources`, `validity` |

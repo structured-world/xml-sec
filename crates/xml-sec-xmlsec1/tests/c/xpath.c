@@ -51,6 +51,10 @@ static const char document[] =
     "</ds:Transform>" EXC_C14N "</g5>"
     /* an XPath transform without its XPath element */
     "<g6>" TRANSFORM(XPATH_ALG) "<ds:Other/></ds:Transform></g6>"
+    /* a Filter 2.0 expression that evaluates to a number, not a node set */
+    "<g7>" TRANSFORM(XPATH2_ALG)
+    "<f:XPath xmlns:f='" XPATH2_ALG "' Filter='intersect'>count(//t:item)</f:XPath>"
+    "</ds:Transform>" EXC_C14N "</g7>"
     "</ds:Signature>"
     "</root>";
 
@@ -106,6 +110,7 @@ int main(void) {
     group(doc, "g4");
     group(doc, "g5");
     group(doc, "g6");
+    group(doc, "g7");
 
     uri(doc, "#xpointer(id('k'))", 0);
     uri(doc, "#k", 0);

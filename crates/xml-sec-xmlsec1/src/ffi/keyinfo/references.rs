@@ -156,8 +156,15 @@ unsafe fn dereference(
         xmlSecTransformCtxReset(context);
         // The chain runs under the read's revision, not a later one, opens
         // the URI under the classes admitted for this key reference, and
-        // charges what the read's earlier references spent.
-        seed_run(context, pinned, admitted, spent.map_or_default(Cell::get));
+        // charges what the read's earlier references spent. A key read
+        // verifies whatever the chain's transforms say.
+        seed_run(
+            context,
+            pinned,
+            policy::Side::Verify,
+            Some(admitted),
+            spent.map_or_default(Cell::get),
+        );
         if xmlSecTransformCtxSetUri(context, uri, node) < 0 {
             let shown = if uri.is_null() {
                 "NULL".to_owned()
@@ -241,9 +248,9 @@ unsafe fn result_document(
             errors::size_to_int_impossible(here, size);
             return std::ptr::null_mut();
         }
-        // libxmlsec1 parses with its options and XML_PARSE_RECOVER; the
-        // parser recovers from nothing, so malformed retrieved XML is
-        // refused. It parses under the read's revision.
+        // libxmlsec1 parses with its default options, which recover from
+        // nothing, so malformed retrieved XML is refused. It parses under
+        // the read's revision.
         let mut total = spent.map_or_default(Cell::get);
         let doc = crate::ffi::parser::parse_within(
             std::slice::from_raw_parts(data, size),
@@ -267,28 +274,56 @@ unsafe fn result_document(
     }
 }
 
-/// The depth of a key reference read now in `ctx`: the levels taken by both
-/// kinds, as the policy's `max_key_info_reference_depth` bounds the nesting
-/// of key references of either kind together, plus this one. The context
-/// keeps libxmlsec1's two counters, each with its own maximum.
+/// The resources whose `max_key_info_reference_depth` bounds the key
+/// references read in `ctx`: the policy of the operation the key is read
+/// for, as an `EncryptedKey` nested with them is bounded, so one depth
+/// governs all three kinds on every path.
 ///
 /// # Safety
 /// `ctx` is a context.
-unsafe fn next_reference_depth(ctx: *const XmlSecKeyInfoCtx) -> usize {
+unsafe fn depth_resources(
+    pinned: &policy::Pinned,
+    ctx: *const XmlSecKeyInfoCtx,
+) -> &xml_sec::policy::ResourcePolicy {
     // SAFETY: by the caller's contract.
-    let (retrievals, references) = unsafe {
-        (
+    let operation = unsafe { (*ctx).operation };
+    let side =
+        super::super::transforms::ctx::operation_side(operation).unwrap_or(policy::Side::Verify);
+    pinned.of(side).resources()
+}
+
+/// The depth of a key reference or `EncryptedKey` read now in `ctx`: the
+/// levels taken by all three kinds, as the policy's
+/// `max_key_info_reference_depth` bounds their nesting together, plus this
+/// one. The context keeps libxmlsec1's three counters, each with its own
+/// maximum.
+///
+/// # Safety
+/// `ctx` is a context.
+pub(crate) unsafe fn next_reference_depth(ctx: *const XmlSecKeyInfoCtx) -> usize {
+    // SAFETY: by the caller's contract.
+    let levels = unsafe {
+        [
             (*ctx).cur_retrieval_method_level,
             (*ctx).cur_key_info_reference_level,
-        )
+            (*ctx).cur_encrypted_key_level,
+        ]
     };
     // A negative level a caller wrote into the public fields is past every
     // limit, so it cannot lift the policy's bound.
-    match (usize::try_from(retrievals), usize::try_from(references)) {
-        // Two `c_int` levels and one more fit in `usize`.
-        (Ok(retrievals), Ok(references)) => retrievals + references + 1,
-        _ => usize::MAX,
+    let mut depth = 1_usize;
+    for level in levels {
+        // A sum past `usize` (three `c_int` levels on a 32-bit target) is
+        // past every limit too.
+        let Some(next) = usize::try_from(level)
+            .ok()
+            .and_then(|level| depth.checked_add(level))
+        else {
+            return usize::MAX;
+        };
+        depth = next;
     }
+    depth
 }
 
 // ----------------------------------------------------------------------------
@@ -344,7 +379,7 @@ pub(crate) unsafe extern "C" fn retrieval_xml_read(
             let Some(pinned) = read_policy(ctx, here) else {
                 return -1;
             };
-            let resources = &pinned.verification.resources;
+            let resources = depth_resources(&pinned, ctx);
             if resources
                 .validate_key_info_reference_depth(next_reference_depth(ctx))
                 .is_err()
@@ -587,7 +622,7 @@ pub(crate) unsafe extern "C" fn reference_xml_read(
             let Some(pinned) = read_policy(ctx, here) else {
                 return -1;
             };
-            let resources = &pinned.verification.resources;
+            let resources = depth_resources(&pinned, ctx);
             if resources
                 .validate_key_info_reference_depth(next_reference_depth(ctx))
                 .is_err()
