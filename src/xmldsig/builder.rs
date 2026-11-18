@@ -477,12 +477,7 @@ impl SignatureBuilder {
         )?;
         self.write_signature_method(writer, prefix)?;
         for reference in &self.references {
-            write_reference(
-                writer,
-                prefix,
-                reference,
-                policy.transforms.generated_canonicalization,
-            )?;
+            write_reference(writer, prefix, reference)?;
         }
         write_end(writer, prefix, "SignedInfo")?;
         writer.empty(
@@ -896,10 +891,7 @@ impl SignatureBuilder {
                     .validate_xml_document_len(*stylesheet_bytes)?;
             }
         }
-        let generated_transforms = reference_transforms_for_generation(
-            reference,
-            policy.transforms.generated_canonicalization,
-        );
+        let generated_transforms = reference_transforms_for_generation(reference);
         super::transforms::validate_relationship_chain(
             &generated_transforms,
             policy.transforms.opc_relationship_edition,
@@ -1057,7 +1049,6 @@ fn write_reference<W: Write>(
     writer: &mut Writer<W>,
     prefix: Option<&str>,
     reference: &ReferenceBuilder,
-    generated: crate::policy::GeneratedCanonicalization,
 ) -> Result<(), std::io::Error> {
     let name = qualified_name(prefix, "Reference");
     let mut attributes = Vec::new();
@@ -1070,7 +1061,7 @@ fn write_reference<W: Write>(
     attributes.push(("URI", reference.uri.as_str()));
     writer.start(&name, attributes)?;
 
-    let generated_transforms = reference_transforms_for_generation(reference, generated);
+    let generated_transforms = reference_transforms_for_generation(reference);
     if !generated_transforms.is_empty() {
         write_start(writer, prefix, "Transforms")?;
         for transform in &generated_transforms {
@@ -1141,18 +1132,10 @@ fn write_object<W: Write>(
     writer.end(&name)
 }
 
-/// The transforms a generated `Reference` carries: a chain ending in a node
-/// set gains an explicit C14N 1.1 transform unless `generated` leaves the
-/// conversion implicit (`XMLDSig` 1.1 section 4.4.3.2).
-fn reference_transforms_for_generation(
-    reference: &ReferenceBuilder,
-    generated: crate::policy::GeneratedCanonicalization,
-) -> Vec<Transform> {
+fn reference_transforms_for_generation(reference: &ReferenceBuilder) -> Vec<Transform> {
     let mut transforms = reference.transforms.clone();
     let initial_binary = !reference.uri.is_empty() && !reference.uri.starts_with('#');
-    if generated != crate::policy::GeneratedCanonicalization::Implicit
-        && !transform_chain_produces_binary(initial_binary, &transforms)
-    {
+    if !transform_chain_produces_binary(initial_binary, &transforms) {
         transforms.push(Transform::C14n(C14nAlgorithm::new(
             C14nMode::Inclusive1_1,
             false,
