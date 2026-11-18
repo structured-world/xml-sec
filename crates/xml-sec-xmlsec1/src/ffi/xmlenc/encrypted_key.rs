@@ -29,6 +29,7 @@ use super::super::transforms::{
     OPERATION_DECRYPT, OPERATION_ENCRYPT, OPERATION_SIGN, OPERATION_VERIFY,
 };
 use super::super::tree::{XmlNode, nodes};
+use super::super::xmltree::{trimmed_content, xmlSecFindChild};
 use super::super::{contain, free, policy};
 use super::{
     MODE_ENCRYPTED_KEY, XmlSecEncCtx, process, xmlSecEncCtxCreate, xmlSecEncCtxDestroy,
@@ -440,6 +441,16 @@ pub(crate) unsafe extern "C" fn xml_read(
                 return -1;
             }
             let enc = (*ctx).enc_ctx.cast::<XmlSecEncCtx>();
+            // An EncryptedKey that carries its ciphertext is a transported
+            // key to recover whatever operation reads it (a signer reusing
+            // the session key a request carried). libxmlsec1 follows the
+            // outer operation, which wraps the ciphertext text on the
+            // signing side; only an empty template, whose key the signing
+            // or encrypting side generates, keeps that direction.
+            if carries_ciphertext(node) {
+                (*enc).operation = OPERATION_DECRYPT;
+                (*enc).key_info_read_ctx.operation = OPERATION_DECRYPT;
+            }
             // A transport recovering a key of a fixed width learns it from
             // the requirements of this context.
             (*enc).transform_ctx.parent_key_info_ctx = ctx.cast();
@@ -452,6 +463,28 @@ pub(crate) unsafe extern "C" fn xml_read(
             read
         }
     })
+}
+
+/// Whether the `EncryptedKey` `node` already carries its ciphertext: a
+/// `CipherReference`, or a `CipherValue` with content. An empty
+/// `CipherValue` is a template the signing or encrypting side fills.
+///
+/// # Safety
+/// `node` is a live node.
+unsafe fn carries_ciphertext(node: *mut XmlNode) -> bool {
+    let ns = c"http://www.w3.org/2001/04/xmlenc#".as_ptr().cast();
+    // SAFETY: a live node; the names are NUL-terminated.
+    unsafe {
+        let data = xmlSecFindChild(node, c"CipherData".as_ptr().cast(), ns);
+        if data.is_null() {
+            return false;
+        }
+        if !xmlSecFindChild(data, c"CipherReference".as_ptr().cast(), ns).is_null() {
+            return true;
+        }
+        let value = xmlSecFindChild(data, c"CipherValue".as_ptr().cast(), ns);
+        !value.is_null() && trimmed_content(value).is_some_and(|text| !text.is_empty())
+    }
 }
 
 /// Runs `work`, the decryption or encryption of an `EncryptedKey` with the

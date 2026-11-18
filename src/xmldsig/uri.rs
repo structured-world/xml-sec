@@ -716,6 +716,16 @@ impl<'a> UriReferenceResolver<'a> {
     /// The caller-supplied resource for `uri` with its stored key, charged to
     /// the external-resource budget.
     fn charged_resource(&self, uri: &str) -> Result<Option<(&'a str, &'a [u8])>, TransformError> {
+        // An external resource is octets: a non-empty fragment would select
+        // part of it, which XMLDSig 1.1 section 4.4.3.2 leaves optional, so it
+        // is refused rather than silently covering the whole resource. An
+        // empty fragment names the whole resource (RFC 3986 section 4.1).
+        if uri
+            .split_once('#')
+            .is_some_and(|(_, fragment)| !fragment.is_empty())
+        {
+            return Err(TransformError::ExternalResourceFragment(uri.to_owned()));
+        }
         let Some((uri, bytes)) = self
             .external_resources
             .and_then(|resources| resources.get_key_value(uri))
@@ -2026,6 +2036,42 @@ mod tests {
             .expect("the normalized resource key must resolve without xml:base");
 
         assert_eq!(data.into_binary().unwrap(), b"payload");
+    }
+
+    #[test]
+    fn a_fragment_of_an_external_resource_is_refused() {
+        // An external resource is octets: a reference selecting part of one
+        // is refused rather than covering the whole resource, even when the
+        // caller supplied bytes under the full URI (XMLDSig 1.1 section
+        // 4.4.3.2 leaves external fragments optional).
+        let xml = r#"<root><reference URI="https://example.test/data.xml#chapter1"/></root>"#;
+        let doc = Document::parse(xml).unwrap();
+        let reference = doc
+            .descendants()
+            .find(|node| node.has_tag_name("reference"))
+            .unwrap();
+        let resources = BTreeMap::from([(
+            "https://example.test/data.xml#chapter1".to_owned(),
+            b"<doc><chapter id='chapter1'/></doc>".to_vec(),
+        )]);
+        let budget = NodeSetMaterializationBudget::default();
+        let xml_base_budget = XmlBaseResolutionBudget::default();
+        let resolver = UriReferenceResolver::new(&doc).with_external_resources(&resources);
+
+        let error = resolver
+            .dereference_from_with_budget(
+                reference.attribute("URI").unwrap(),
+                reference,
+                &budget,
+                &xml_base_budget,
+            )
+            .expect_err("a fragment of an external resource is not selected");
+
+        assert!(
+            matches!(&error, TransformError::ExternalResourceFragment(uri)
+                if uri == "https://example.test/data.xml#chapter1"),
+            "{error:?}"
+        );
     }
 
     #[test]

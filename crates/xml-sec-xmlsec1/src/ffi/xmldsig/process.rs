@@ -43,9 +43,10 @@ use super::super::transforms::builtin::{
 use super::super::transforms::ctx::{
     KeyedResources, ReadResources, ResourceScope, XmlSecTransformCtx, charge_key_info,
     execute_on_bytes, external_spent, leave_unspent, operation_side, read_resource, resource_keys,
-    run_budget, run_spent, seed_run, xmlSecTransformCtxCreate, xmlSecTransformCtxCreateAndAppend,
-    xmlSecTransformCtxDestroy, xmlSecTransformCtxExecute, xmlSecTransformCtxNodeRead,
-    xmlSecTransformCtxNodesListRead, xmlSecTransformCtxSetUri, xmlSecTransformCtxXmlExecute,
+    run_budget, run_pre_execute, run_spent, seed_run, xmlSecTransformCtxCreate,
+    xmlSecTransformCtxCreateAndAppend, xmlSecTransformCtxDestroy, xmlSecTransformCtxExecute,
+    xmlSecTransformCtxNodeRead, xmlSecTransformCtxNodesListRead, xmlSecTransformCtxSetUri,
+    xmlSecTransformCtxXmlExecute,
 };
 use super::super::transforms::signatures::signing_key;
 use super::super::transforms::{
@@ -442,12 +443,8 @@ unsafe fn references<'a>(
 unsafe fn run_pre_execute_callbacks(ctx: &mut XmlSecDSigCtx) -> c_int {
     let here = here!("xmlSecTransformCtxPrepare");
     // The context's own chain is the one libxmlsec1 prepares for SignedInfo.
-    let signed_info = &raw mut ctx.transform_ctx;
-    if let Some(callback) = ctx.transform_ctx.pre_exec_callback
-        // SAFETY: the caller's callback with the context's chain.
-        && unsafe { callback(signed_info) } < 0
-    {
-        errors::internal(here, std::ptr::null(), c"ctx->preExecCallback");
+    // SAFETY: the caller's callback with the context's chain.
+    if !unsafe { run_pre_execute(&raw mut ctx.transform_ctx, here) } {
         return -1;
     }
     for list in [
@@ -456,12 +453,8 @@ unsafe fn run_pre_execute_callbacks(ctx: &mut XmlSecDSigCtx) -> c_int {
     ] {
         // SAFETY: the context's own lists of reference contexts.
         for reference in unsafe { references(list) } {
-            let transforms = &raw mut reference.transform_ctx;
-            if let Some(callback) = reference.transform_ctx.pre_exec_callback
-                // SAFETY: the caller's callback with the reference's context.
-                && unsafe { callback(transforms) } < 0
-            {
-                errors::internal(here, std::ptr::null(), c"ctx->preExecCallback");
+            // SAFETY: the caller's callback with the reference's context.
+            if !unsafe { run_pre_execute(&raw mut reference.transform_ctx, here) } {
                 return -1;
             }
         }

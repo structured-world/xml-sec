@@ -26,8 +26,8 @@ use super::super::strings;
 use super::super::transforms::builtin::xmlSecTransformBase64GetKlass;
 use super::super::transforms::ctx::{
     ReadResources, ResourceScope, charge_key_info, external_spent, leave_unspent, operation_side,
-    read_resource, run_budget, run_policy, run_spent, xmlSecTransformCtxBinaryExecute,
-    xmlSecTransformCtxExecute,
+    read_resource, run_budget, run_policy, run_pre_execute, run_spent,
+    xmlSecTransformCtxBinaryExecute, xmlSecTransformCtxExecute,
 };
 use super::super::transforms::ctx::{
     ctx_node_read_for, xmlSecTransformCtxCreateAndAppend, xmlSecTransformCtxCreateAndPrepend,
@@ -515,16 +515,12 @@ pub(super) unsafe fn decrypt_to_buffer(
         }
         // libxmlsec1 runs the callback when it prepares the decryption chain:
         // before any resource is read or anything decrypted, a negative
-        // return refuses the operation.
-        let transforms = &raw mut ctx.transform_ctx;
-        if let Some(callback) = ctx.transform_ctx.pre_exec_callback
-            && callback(transforms) < 0
-        {
-            errors::internal(
-                here!("xmlSecTransformCtxPrepare"),
-                std::ptr::null(),
-                c"ctx->preExecCallback",
-            );
+        // return, or a change to the chain the core does not run, refuses
+        // the operation.
+        if !run_pre_execute(
+            &raw mut ctx.transform_ctx,
+            here!("xmlSecTransformCtxPrepare"),
+        ) {
             return std::ptr::null_mut();
         }
         run_decryption(ctx, node)

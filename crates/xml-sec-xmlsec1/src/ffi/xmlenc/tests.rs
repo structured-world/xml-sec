@@ -678,6 +678,59 @@ fn a_recipient_past_the_resource_limit_ends_the_key_read() {
 }
 
 #[test]
+fn a_wrapped_key_is_recovered_on_the_signing_side() {
+    // An EncryptedKey that already carries its ciphertext is a transported
+    // key to recover, whatever operation reads it: a signer reusing the
+    // session key a request carried gets that key, not the wrap of its
+    // ciphertext text.
+    own_process();
+    let secret = [0x7e_u8; 32];
+    // SAFETY: the library, a document, keys, a manager and a context set up
+    // and released here, on this thread alone.
+    unsafe {
+        start_up();
+        let (wrapped, _) = encrypted(crate::ffi::transforms::ciphers::kw_aes128(), &secret);
+        let doc = parsed(&format!(
+            "{}{wrapped}{}",
+            concat!(
+                "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\">",
+                "<EncryptedKey xmlns=\"http://www.w3.org/2001/04/xmlenc#\">",
+                "<EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#kw-aes128\"/>",
+                "<CipherData><CipherValue>",
+            ),
+            "</CipherValue></CipherData></EncryptedKey></KeyInfo>"
+        ));
+        let mngr = xmlSecKeysMngrCreate();
+        (*mngr).get_key = Some(kek_or_read);
+        let read = crate::ffi::keyinfo::xmlSecKeyInfoCtxCreate(mngr);
+        (*read).operation = crate::ffi::transforms::OPERATION_SIGN;
+        (*read).key_req.key_id = symkeys::hmac();
+        let key = xmlSecKeyCreate();
+        let (status, reasons) = reported(|| {
+            crate::ffi::keyinfo::xmlSecKeyInfoNodeRead(
+                xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc.cast()),
+                key,
+                read,
+            )
+        });
+        assert_eq!(status, 0, "{reasons:?}");
+        let value = crate::ffi::keys::xmlSecKeyGetValue(key);
+        assert!(!value.is_null(), "a key was recovered: {reasons:?}");
+        let buffer = crate::ffi::keysdata::xmlSecKeyDataBinaryValueGetBuffer(value);
+        assert_eq!(
+            std::slice::from_raw_parts(xmlSecBufferGetData(buffer), xmlSecBufferGetSize(buffer)),
+            secret,
+            "the transported key, not the wrap of its ciphertext"
+        );
+        crate::ffi::keys::xmlSecKeyDestroy(key);
+        crate::ffi::keyinfo::xmlSecKeyInfoCtxDestroy(read);
+        xmlSecKeysMngrDestroy(mngr);
+        xsFreeDoc(doc.cast());
+        shut_down();
+    }
+}
+
+#[test]
 fn a_nested_recipient_past_the_resource_limit_ends_the_key_read() {
     // The EncryptedKey in a recipient's KeyInfo is a part of the same key
     // read: its CipherReference passing a resource limit spends the

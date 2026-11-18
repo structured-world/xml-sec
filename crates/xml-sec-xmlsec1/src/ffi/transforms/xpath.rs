@@ -775,6 +775,9 @@ unsafe extern "C" fn execute(
         )
     };
     if super::ctx::charge(spent, count, limit, here, name).is_none() {
+        // The operation's budget is spent: its other parts end too.
+        // SAFETY: an initialized context.
+        unsafe { super::ctx::run_budget(ctx) }.resource_limit_reached = true;
         return -1;
     }
     // SAFETY: an expression transform read from a live element.

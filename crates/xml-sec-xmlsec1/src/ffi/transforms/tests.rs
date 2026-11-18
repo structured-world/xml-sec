@@ -371,6 +371,32 @@ fn base64_output_is_bounded_per_run() {
     assert_eq!(run(&[OPERATION_ENCODE, OPERATION_DECODE], &raw), -1);
 }
 
+/// A Base64 limit refusing work spends the operation's budget: the run is
+/// marked so the work it is part of (a key read trying recipients in turn)
+/// ends rather than trying more under the same allowance.
+#[test]
+fn a_base64_limit_refusal_ends_the_operation() {
+    let limit = crate::ffi::policy::verification()
+        .expect("the library policy compiles")
+        .resources
+        .max_base64_transform_output_bytes;
+    // SAFETY: the context and its transform are used while live.
+    unsafe {
+        let ctx = xmlSecTransformCtxCreate();
+        assert!(!xmlSecTransformCtxCreateAndAppend(ctx, base64()).is_null());
+        let input = b"AAAA".repeat(limit / 3 + 1);
+        assert_eq!(
+            xmlSecTransformCtxBinaryExecute(ctx, input.as_ptr(), input.len()),
+            -1
+        );
+        assert!(
+            super::ctx::run_budget(ctx).resource_limit_reached,
+            "the refusal ends the operation"
+        );
+        xmlSecTransformCtxDestroy(ctx);
+    }
+}
+
 /// Base64 input of one run is bounded by the policy even when it decodes
 /// to nothing.
 #[test]

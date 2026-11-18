@@ -365,6 +365,116 @@ fn a_stored_pre_digest_holds_the_bytes_that_were_signed() {
     }
 }
 
+/// A pre-execute callback that appends a Base64 decoder to the chain.
+unsafe extern "C" fn appending(
+    ctx: *mut crate::ffi::transforms::XmlSecTransformCtx,
+) -> std::ffi::c_int {
+    // SAFETY: the operation's live chain.
+    let added = unsafe {
+        crate::ffi::transforms::ctx::xmlSecTransformCtxCreateAndAppend(
+            ctx,
+            crate::ffi::transforms::builtin::base64(),
+        )
+    };
+    if added.is_null() { -1 } else { 0 }
+}
+
+#[test]
+fn a_chain_changed_by_a_pre_execute_callback_fails_the_operation() {
+    // The core runs a Reference's transforms from the document, so a
+    // callback inserting a transform into the C chain would be lost: the
+    // operation fails instead of signing data the chain no longer describes.
+    own_process();
+    let template = concat!(
+        "<Signature xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><SignedInfo>",
+        "<CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>",
+        "<SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#hmac-sha256\"/>",
+        "<Reference URI=\"#o\">",
+        "<DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>",
+        "<DigestValue/></Reference></SignedInfo><SignatureValue/>",
+        "<Object Id=\"o\">c2lnbmVk</Object></Signature>"
+    );
+    // SAFETY: the library, a document, a key and a context set up and torn
+    // down here, on this thread alone.
+    unsafe {
+        assert_eq!(xmlSecInit(), 0);
+        assert_eq!(xmlSecCryptoDLLoadLibrary(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoAppInit(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoInit(), 0);
+        for (callback, signed) in [(None, true), (Some(appending as _), false)] {
+            let doc = xsReadMemory(
+                template.as_ptr().cast(),
+                i32::try_from(template.len()).expect("a short document"),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+            );
+            assert!(!doc.is_null());
+            let ctx = xmlSecDSigCtxCreate(std::ptr::null_mut());
+            (*ctx).sign_key = hmac_key(ctx);
+            (*ctx).reference_pre_execute_callback = callback;
+            assert_eq!(
+                xmlSecDSigCtxSign(ctx, xsDocGetRootElement(doc)) == 0,
+                signed,
+                "callback changing the chain: {}",
+                !signed
+            );
+            xmlSecDSigCtxDestroy(ctx);
+            xsFreeDoc(doc);
+        }
+        assert_eq!(xmlSecCryptoShutdown(), 0);
+        assert_eq!(xmlSecCryptoAppShutdown(), 0);
+        assert_eq!(xmlSecShutdown(), 0);
+    }
+}
+
+#[test]
+fn a_fragment_of_an_external_reference_is_refused_before_it_is_read() {
+    // An external resource reaches the core as octets, which select no
+    // fragment: a Reference naming part of one fails the operation instead
+    // of signing the whole resource, and nothing is read for it.
+    own_process();
+    let template = concat!(
+        "<Signature xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><SignedInfo>",
+        "<CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>",
+        "<SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#hmac-sha256\"/>",
+        "<Reference URI=\"test:detached#chapter1\">",
+        "<DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>",
+        "<DigestValue/></Reference></SignedInfo><SignatureValue/></Signature>"
+    );
+    // SAFETY: the library, a document, a key and a context set up and torn
+    // down here, on this thread alone.
+    unsafe {
+        assert_eq!(xmlSecInit(), 0);
+        assert_eq!(xmlSecCryptoDLLoadLibrary(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoAppInit(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoInit(), 0);
+        serve_constant();
+        let doc = xsReadMemory(
+            template.as_ptr().cast(),
+            i32::try_from(template.len()).expect("a short document"),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        assert!(!doc.is_null());
+        let ctx = xmlSecDSigCtxCreate(std::ptr::null_mut());
+        (*ctx).sign_key = hmac_key(ctx);
+        (*ctx).enabled_reference_uris = 0xFFFF;
+        assert_eq!(xmlSecDSigCtxSign(ctx, xsDocGetRootElement(doc)), -1);
+        assert_eq!(
+            CONSTANT_OPENS.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "nothing was read for the fragment"
+        );
+        xmlSecDSigCtxDestroy(ctx);
+        xsFreeDoc(doc);
+        assert_eq!(xmlSecCryptoShutdown(), 0);
+        assert_eq!(xmlSecCryptoAppShutdown(), 0);
+        assert_eq!(xmlSecShutdown(), 0);
+    }
+}
+
 /// What the constant resource serves on every open.
 const CONSTANT: &[u8] = b"one payload under every base";
 /// Octets of [`CONSTANT`] already served by the current open.

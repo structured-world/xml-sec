@@ -1972,9 +1972,80 @@ impl<'a> ResourceScope<'a> {
     }
 }
 
-/// The octets of the external resource `uri` names (its fragment, if any,
-/// left to the reader of the octets), read through the caller's input
-/// callbacks as a chain with no transform reads it: under the URI classes
+/// What a pre-execute callback can change of a chain: its transforms in
+/// order, with their klasses and operations, and its URI selection.
+#[derive(PartialEq, Eq)]
+struct ChainShape {
+    transforms: Vec<(*const XmlSecTransform, *const XmlSecTransformKlass, c_int)>,
+    uri: Option<Vec<u8>>,
+    xptr_expr: Option<Vec<u8>>,
+}
+
+impl ChainShape {
+    /// The shape of the chain of `ctx`.
+    ///
+    /// # Safety
+    /// `ctx` is an initialized context.
+    unsafe fn of(ctx: *mut XmlSecTransformCtx) -> Self {
+        let text = |text: *mut u8| {
+            // SAFETY: null or a NUL-terminated string of the context.
+            (!text.is_null()).then(|| {
+                unsafe { std::ffi::CStr::from_ptr(text.cast()) }
+                    .to_bytes()
+                    .to_vec()
+            })
+        };
+        let mut transforms = Vec::new();
+        // SAFETY: by the caller's contract; the chain's links are live.
+        unsafe {
+            let mut transform = (*ctx).first;
+            while let Some(current) = transform.as_ref() {
+                transforms.push((transform.cast_const(), current.id, current.operation));
+                transform = current.next;
+            }
+            Self {
+                transforms,
+                uri: text((*ctx).uri),
+                xptr_expr: text((*ctx).xptr_expr),
+            }
+        }
+    }
+}
+
+/// Runs the pre-execute callback of `ctx`, a chain whose operation the core
+/// runs from the document: a negative return refuses the operation, and so
+/// does a callback that changed the chain, a change the core would not see
+/// (libxmlsec1 lets the callback edit the chain it then runs itself).
+/// `false` after a report at `here`.
+///
+/// # Safety
+/// `ctx` is an initialized context whose callback is callable with it.
+pub(crate) unsafe fn run_pre_execute(ctx: *mut XmlSecTransformCtx, here: errors::Here) -> bool {
+    // SAFETY: by the caller's contract.
+    unsafe {
+        let Some(callback) = (*ctx).pre_exec_callback else {
+            return true;
+        };
+        let before = ChainShape::of(ctx);
+        if callback(ctx) < 0 {
+            errors::internal(here, std::ptr::null(), c"ctx->preExecCallback");
+            return false;
+        }
+        if ChainShape::of(ctx) != before {
+            errors::not_implemented(
+                here,
+                "a pre-execute callback changed a chain the operation runs from the document",
+            );
+            return false;
+        }
+    }
+    true
+}
+
+/// The octets of the external resource `uri` names, read through the
+/// caller's input callbacks as a chain with no transform reads it, the
+/// whole resource for an empty fragment and refused before any read for a
+/// fragment selecting part of it, which octets cannot: under the URI classes
 /// `prefs` enables and those of the operation `scope` describes, within what
 /// is left of its external-resource budgets, which the read charges. A core
 /// operation is handed these octets, as it performs no I/O itself. `None`
@@ -1990,7 +2061,23 @@ pub(crate) unsafe fn read_resource(
     scope: &mut ResourceScope<'_>,
 ) -> Option<Vec<u8>> {
     let location = here!("xmlSecTransformCtxUriExecute");
-    let base = uri.split(|&byte| byte == b'#').next().unwrap_or(uri);
+    let mut parts = uri.splitn(2, |&byte| byte == b'#');
+    let base = parts.next().unwrap_or(uri);
+    // XMLDSig 1.1 section 4.4.3.2 leaves fragments of external resources
+    // optional; the core refuses them, so nothing is read for one.
+    if parts.next().is_some_and(|fragment| !fragment.is_empty()) {
+        errors::report(
+            location,
+            std::ptr::null(),
+            std::ptr::null(),
+            errors::R_INVALID_URI_TYPE,
+            &format!(
+                "fragment of an external resource is not supported: uri={}",
+                String::from_utf8_lossy(uri)
+            ),
+        );
+        return None;
+    }
     let Ok(base) = std::ffi::CString::new(base) else {
         errors::invalid_data(location, std::ptr::null(), "a URI holding a NUL octet");
         return None;
