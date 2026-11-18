@@ -1153,6 +1153,25 @@ unsafe fn run_decryption(ctx: &mut XmlSecEncCtx, node: *mut XmlNode) -> *mut Xml
         context = context.default_encryption_method(algorithm);
     }
     let decrypted = context.decrypt_in_document(&document, target);
+    // A key recovered by RSAES-PKCS1-v1_5 may be the random substitute of
+    // a rejected recovery: its validity is consulted only now, after the
+    // content work, so the outcome reveals nothing of the padding (XML
+    // Encryption 1.1 section 6.1.2).
+    // SAFETY: the context's own transform context.
+    if decrypted.is_ok()
+        && !unsafe { run_budget(&raw mut ctx.transform_ctx) }
+            .recovery
+            .is_valid()
+    {
+        errors::report(
+            here,
+            std::ptr::null(),
+            std::ptr::null(),
+            errors::R_CRYPTO_FAILED,
+            "content decryption failed",
+        );
+        return std::ptr::null_mut();
+    }
     let plaintext = match decrypted.map(|audited| audited.output) {
         Ok(DecryptedContent::Xml(text)) => Zeroizing::new(text.into_bytes()),
         Ok(DecryptedContent::Bytes(bytes)) => Zeroizing::new(bytes),

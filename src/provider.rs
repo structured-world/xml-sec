@@ -252,6 +252,67 @@ impl RecoveredContentKey {
         }
         Ok(core::mem::take(&mut self.bytes))
     }
+
+    /// [`Self::into_key_or_substitute`] with the recovery's validity, for a
+    /// key that leaves through an interface that cannot carry it but whose
+    /// content operation can consult it once its content work is done
+    /// (XML Encryption 1.1 section 6.1.2).
+    /// <https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-bleichenbacher-attack>
+    ///
+    /// # Errors
+    /// As for [`Self::into_key_or_substitute`].
+    pub fn into_key_with_validity(
+        mut self,
+    ) -> Result<(zeroize::Zeroizing<Vec<u8>>, RecoveryValidity), ProviderError> {
+        let validity = RecoveryValidity(self.valid);
+        // The validity travels with the key; the rejection check is the
+        // one `into_key_or_substitute` makes on the public mechanism.
+        self.valid = subtle::Choice::from(1);
+        self.into_key_or_substitute().map(|key| (key, validity))
+    }
+}
+
+/// Whether a key recovery was valid, kept apart from its key so the content
+/// operation the key serves consults it only after its content work. Debug
+/// output never shows it.
+#[cfg(feature = "xmlenc")]
+#[derive(Clone, Copy)]
+pub struct RecoveryValidity(subtle::Choice);
+
+#[cfg(feature = "xmlenc")]
+impl RecoveryValidity {
+    /// The validity of keys whose recovery cannot be rejected implicitly.
+    #[must_use]
+    pub fn accepted() -> Self {
+        Self(subtle::Choice::from(1))
+    }
+
+    /// The validity of keys recovered by `self` and by `other` together.
+    #[must_use]
+    pub fn and(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    /// Whether every recovery was valid. Consult only once the content work
+    /// the keys served is done.
+    #[must_use]
+    pub fn is_valid(self) -> bool {
+        bool::from(self.0)
+    }
+}
+
+#[cfg(feature = "xmlenc")]
+impl Default for RecoveryValidity {
+    fn default() -> Self {
+        Self::accepted()
+    }
+}
+
+#[cfg(feature = "xmlenc")]
+impl core::fmt::Debug for RecoveryValidity {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RecoveryValidity").finish_non_exhaustive()
+    }
 }
 #[cfg(all(feature = "aws-lc-fips", feature = "xmlenc"))]
 pub use aws_lc::AwsLcRsaPrivateKey;

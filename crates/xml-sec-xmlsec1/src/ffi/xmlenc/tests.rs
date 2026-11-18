@@ -677,6 +677,56 @@ fn a_recipient_past_the_resource_limit_ends_the_key_read() {
     }
 }
 
+#[cfg(feature = "legacy-algorithms")]
+#[test]
+fn a_rejected_key_recovery_fails_the_decryption_after_its_content_work() {
+    // A key recovered by RSAES-PKCS1-v1_5 may be the random substitute of a
+    // rejected recovery; even when content decryption succeeds with it, the
+    // operation fails once its content work is done.
+    own_process();
+    let plaintext = b"decrypted with a substitute";
+    // SAFETY: the library, a document, contexts and keys set up and
+    // released here, on this thread alone.
+    unsafe {
+        start_up();
+        let (cipher, _) = encrypted(aes128_cbc(), plaintext);
+        let doc = parsed(&format!(
+            "{}{cipher}{}",
+            concat!(
+                "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\">",
+                "<EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#aes128-cbc\"/>",
+                "<CipherData><CipherValue>",
+            ),
+            "</CipherValue></CipherData></EncryptedData>"
+        ));
+        let (_, rejected) = xml_sec::provider::RecoveredContentKey::recovery(
+            zeroize::Zeroizing::new(vec![0; 16]),
+            subtle::Choice::from(0),
+        )
+        .into_key_with_validity()
+        .expect("an exportable recovery");
+        for (validity, decrypts) in [
+            (xml_sec::provider::RecoveryValidity::accepted(), true),
+            (rejected, false),
+        ] {
+            let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
+            (*ctx).enc_key = aes_key();
+            crate::ffi::transforms::ctx::run_budget(&raw mut (*ctx).transform_ctx).recovery =
+                validity;
+            let (result, reasons) = reported(|| {
+                xmlSecEncCtxDecryptToBuffer(
+                    ctx,
+                    xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc.cast()),
+                )
+            });
+            assert_eq!(!result.is_null(), decrypts, "{reasons:?}");
+            xmlSecEncCtxDestroy(ctx);
+        }
+        xsFreeDoc(doc.cast());
+        shut_down();
+    }
+}
+
 #[test]
 fn a_wrapped_key_is_recovered_on_the_signing_side() {
     // An EncryptedKey that already carries its ciphertext is a transported

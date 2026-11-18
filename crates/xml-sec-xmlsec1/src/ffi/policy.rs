@@ -145,6 +145,9 @@ pub(crate) struct Spent {
     /// A resource limit refused work of the operation: its budget is spent,
     /// so the operation ends wherever its parts hand it back.
     pub(crate) limit_reached: bool,
+    /// Whether the keys the operation recovered were recovered validly,
+    /// consulted only once its content work is done.
+    pub(crate) recovery: xml_sec::provider::RecoveryValidity,
 }
 
 /// The key candidates one `KeyInfo` read has inspected of the policy's

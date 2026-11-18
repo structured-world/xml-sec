@@ -89,6 +89,9 @@ pub(crate) struct RunBudget {
     /// An external-resource limit refused a read of the run: the operation's
     /// budget is spent, which ends the operation rather than one reference.
     pub(crate) resource_limit_reached: bool,
+    /// Whether the keys the run's transports recovered were recovered
+    /// validly, consulted only once the operation's content work is done.
+    pub(crate) recovery: xml_sec::provider::RecoveryValidity,
     /// The key candidates the operation's `KeyInfo` work has inspected, of
     /// `max_key_candidates`, carried from one `KeyInfo` read to the next.
     pub(crate) key_candidates: policy::KeyCandidates,
@@ -231,6 +234,7 @@ pub(crate) unsafe fn run_spent(ctx: *mut XmlSecTransformCtx) -> policy::Spent {
             xml_parse: run.xml_parse,
             xpath_expressions: run.xpath_expressions,
             limit_reached: run.resource_limit_reached,
+            recovery: run.recovery,
         },
         None => policy::Spent::default(),
     }
@@ -373,8 +377,10 @@ pub(crate) unsafe fn take_spent(ctx: *mut XmlSecTransformCtx, spent: policy::Spe
     run.external_resources = spent.external_resources;
     run.xml_parse = spent.xml_parse;
     run.xpath_expressions = spent.xpath_expressions;
-    // A refusal is never taken back by what a part hands over.
+    // A refusal is never taken back by what a part hands over, nor is an
+    // invalid recovery.
     run.resource_limit_reached |= spent.limit_reached;
+    run.recovery = run.recovery.and(spent.recovery);
 }
 
 /// What the operation whose chain is `ctx` has spent of its external-resource

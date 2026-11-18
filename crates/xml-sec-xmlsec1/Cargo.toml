@@ -28,6 +28,8 @@ zeroize = "1"
 legacy-algorithms = ["xml-sec/legacy-algorithms"]
 
 [dev-dependencies]
+# A rejected key recovery's constant-time validity, built by tests.
+subtle = "2"
 tempfile = "3"
 
 [lints]

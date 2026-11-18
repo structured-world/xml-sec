@@ -11,7 +11,7 @@
 use std::ffi::{c_int, c_uint, c_void};
 use std::sync::Arc;
 
-use xml_sec::provider::{CryptoProvider, RustCryptoRsaPublicKey};
+use xml_sec::provider::{CryptoProvider, RecoveryValidity, RustCryptoRsaPublicKey};
 use xml_sec::xmlenc::{
     EncryptionMethod, KEY_TRANSPORT_CIPHERTEXT_CEILING, KeyTransportAlgorithm, OaepDigestAlgorithm,
     RsaOaepParameters, XmlEncError, admit_key_transport_method, admit_oaep_parameters,
@@ -402,7 +402,7 @@ fn recover_pkcs1v15(
     provider: &dyn CryptoProvider,
     transport: &Transport,
     policy: &xml_sec::policy::DecryptionPolicy,
-) -> Result<Zeroizing<Vec<u8>>, String> {
+) -> Result<(Zeroizing<Vec<u8>>, RecoveryValidity), String> {
     let expected = transport.expected.ok_or(
         "RSAES-PKCS1-v1_5 recovery needs the key width the EncryptedKey's consumer requires",
     )?;
@@ -416,17 +416,20 @@ fn recover_pkcs1v15(
     validate_key_recovery_key(recovery.as_ref(), policy).map_err(|error| error.to_string())?;
     provider
         .recover_pkcs1v15(recovery.as_ref(), &transport.data, expected)
-        .and_then(xml_sec::provider::RecoveredContentKey::into_key_or_substitute)
+        .and_then(xml_sec::provider::RecoveredContentKey::into_key_with_validity)
         .map_err(|error| error.to_string())
 }
 
-/// Transports or recovers the collected key under the run's policy.
+/// Transports or recovers the collected key under the run's policy, with
+/// the validity of a recovery that rejects implicitly.
 fn run(
     operation: c_int,
     algorithm: KeyTransportAlgorithm,
     transport: &Transport,
     pinned: &policy::Pinned,
-) -> Result<Zeroizing<Vec<u8>>, String> {
+) -> Result<(Zeroizing<Vec<u8>>, RecoveryValidity), String> {
+    // Every transport but a PKCS #1 v1.5 recovery fails openly.
+    let accepted = |key| (key, RecoveryValidity::accepted());
     let spki = transport.spki.as_deref().ok_or("no key")?;
     let public = RustCryptoRsaPublicKey::from_spki_der(spki).map_err(|error| error.to_string())?;
     let provider: &dyn CryptoProvider = xml_sec::provider::default_provider();
@@ -445,7 +448,7 @@ fn run(
                 .map_err(|error| error.to_string())?;
             return provider
                 .transport_pkcs1v15(&public, &transport.data)
-                .map(Zeroizing::new)
+                .map(|key| accepted(Zeroizing::new(key)))
                 .map_err(|error| error.to_string());
         }
         let parameters =
@@ -454,7 +457,7 @@ fn run(
             .map_err(|error| error.to_string())?;
         return provider
             .transport_key(&public, &parameters, &transport.data)
-            .map(Zeroizing::new)
+            .map(|key| accepted(Zeroizing::new(key)))
             .map_err(|error| error.to_string());
     }
     let policy = &pinned.decryption;
@@ -484,7 +487,7 @@ fn run(
     validate_key_recovery_key(recovery.as_ref(), policy).map_err(|error| error.to_string())?;
     provider
         .recover_key(recovery.as_ref(), &parameters, &transport.data)
-        .map(Zeroizing::new)
+        .map(|key| accepted(Zeroizing::new(key)))
         .map_err(|error| error.to_string())
 }
 
@@ -590,7 +593,15 @@ unsafe extern "C" fn execute(
             return -1;
         };
         let output = match run(object.operation, algorithm, transport, pinned) {
-            Ok(output) => output,
+            Ok((output, validity)) => {
+                // The validity travels with the operation's spending, so the
+                // content operation the key serves consults it once its
+                // content work is done (XML Encryption 1.1 section 6.1.2).
+                // SAFETY: a non-null, initialized context.
+                let run = unsafe { super::ctx::run_budget(ctx) };
+                run.recovery = run.recovery.and(validity);
+                output
+            }
             Err(error) => {
                 errors::report(
                     here,
