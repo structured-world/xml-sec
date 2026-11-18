@@ -248,9 +248,9 @@ unsafe fn result_document(
             errors::size_to_int_impossible(here, size);
             return std::ptr::null_mut();
         }
-        // libxmlsec1 parses with its options and XML_PARSE_RECOVER; the
-        // parser recovers from nothing, so malformed retrieved XML is
-        // refused. It parses under the read's revision.
+        // libxmlsec1 parses with its default options, which recover from
+        // nothing, so malformed retrieved XML is refused. It parses under
+        // the read's revision.
         let mut total = spent.map_or_default(Cell::get);
         let doc = crate::ffi::parser::parse_within(
             std::slice::from_raw_parts(data, size),

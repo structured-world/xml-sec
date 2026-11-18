@@ -41,11 +41,6 @@ use super::{contain, free};
 #[cfg(test)]
 mod tests;
 
-/// libxml2's `XML_PARSE_PEDANTIC`.
-const XML_PARSE_PEDANTIC: c_int = 1 << 7;
-/// libxml2's `XML_PARSE_NODICT`.
-const XML_PARSE_NODICT: c_int = 1 << 12;
-
 /// A static name or namespace of the library.
 fn name(text: &'static [u8]) -> *const u8 {
     text.as_ptr()
@@ -2205,7 +2200,7 @@ pub(crate) unsafe extern "C" fn xmlSecTmplTransformAddXsltStylesheet(
                 len,
                 std::ptr::null(),
                 std::ptr::null(),
-                xmlSecParserGetDefaultOptions() | XML_PARSE_PEDANTIC | XML_PARSE_NODICT,
+                xmlSecParserGetDefaultOptions(),
             );
             if doc.is_null() {
                 errors::xml_failed(here, std::ptr::null(), c"xmlReadMemory");

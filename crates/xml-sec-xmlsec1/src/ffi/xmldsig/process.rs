@@ -1019,7 +1019,7 @@ pub(super) unsafe fn reference_node(
         reference.result = reference.transform_ctx.result;
         if operation == OPERATION_SIGN {
             let Some(value) = buffer_text(reference.result) else {
-                errors::internal(here, std::ptr::null(), c"xmlSecTransformCtxExecute");
+                errors::other(here, errors::R_INVALID_RESULT, std::ptr::null(), None);
                 return -1;
             };
             if nodes::set_content(read.digest_value, &value).is_err() {
