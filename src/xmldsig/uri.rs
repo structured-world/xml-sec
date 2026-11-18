@@ -179,7 +179,10 @@ pub(crate) fn validate_signing_reference_request(
 
 /// External resources a caller supplies on demand: the operation asks
 /// `source` for the octets under one of the caller's `keys` only when it
-/// dereferences that resource, and at most once. A verification that fails
+/// dereferences that resource, and keeps them once fetched. A resource
+/// longer than the operation can take is refused without being kept, and
+/// that refusal ends the operation: no later resource is fetched. A
+/// verification that fails
 /// on its `SignatureValue` dereferences no reference, so a forged signature
 /// makes the caller fetch nothing it names.
 ///
@@ -198,21 +201,24 @@ pub(crate) fn validate_signing_reference_request(
 /// ```
 /// use xml_sec::xmldsig::uri::LazyExternalResources;
 ///
-/// let fetch = |uri: &str| (uri == "urn:payload").then(|| b"payload".to_vec());
+/// let fetch = |uri: &str, _most: usize| (uri == "urn:payload").then(|| b"payload".to_vec());
 /// let resources = LazyExternalResources::new(["urn:payload".to_owned()], &fetch);
 /// assert_eq!(resources.len(), 1);
 /// ```
 pub struct LazyExternalResources<'s> {
     slots: BTreeMap<String, core::cell::OnceCell<Option<Vec<u8>>>>,
-    source: &'s dyn Fn(&str) -> Option<Vec<u8>>,
+    source: &'s dyn Fn(&str, usize) -> Option<Vec<u8>>,
 }
 
 impl<'s> LazyExternalResources<'s> {
     /// Resources under `keys`, each fetched from `source` when first used.
+    /// `source` is told the most octets the operation can still take of the
+    /// resource: it may stop reading one octet past them, as a longer
+    /// resource is refused whatever its length and its octets are not kept.
     #[must_use]
     pub fn new(
         keys: impl IntoIterator<Item = String>,
-        source: &'s dyn Fn(&str) -> Option<Vec<u8>>,
+        source: &'s dyn Fn(&str, usize) -> Option<Vec<u8>>,
     ) -> Self {
         Self {
             slots: keys
@@ -235,11 +241,26 @@ impl<'s> LazyExternalResources<'s> {
         self.slots.is_empty()
     }
 
-    /// The listed key `uri` and its octets, fetched on first use.
-    fn get_key_value(&self, uri: &str) -> Option<(&str, &[u8])> {
-        let (key, slot) = self.slots.get_key_value(uri)?;
-        let bytes = slot.get_or_init(|| (self.source)(key)).as_deref()?;
-        Some((key.as_str(), bytes))
+    /// The listed key `uri` and its octets, fetched on first use for an
+    /// operation that can take `most` of them; `Err` with the length of a
+    /// resource longer than that, whose octets are dropped, never kept.
+    fn get_key_value(&self, uri: &str, most: usize) -> Result<Option<(&str, &[u8])>, usize> {
+        let Some((key, slot)) = self.slots.get_key_value(uri) else {
+            return Ok(None);
+        };
+        if slot.get().is_none() {
+            let fetched = (self.source)(key, most);
+            if let Some(bytes) = &fetched
+                && bytes.len() > most
+            {
+                return Err(bytes.len());
+            }
+            slot.get_or_init(|| fetched);
+        }
+        Ok(slot
+            .get()
+            .and_then(|bytes| bytes.as_deref())
+            .map(|bytes| (key.as_str(), bytes)))
     }
 
     /// The address of the listed key `uri`'s slot, which names the resource
@@ -266,13 +287,14 @@ pub(crate) enum ExternalResourceSet<'a> {
 }
 
 impl<'a> ExternalResourceSet<'a> {
-    /// The key `uri` and its octets; a lazy resource is fetched here.
-    fn get_key_value(self, uri: &str) -> Option<(&'a str, &'a [u8])> {
+    /// The key `uri` and its octets; a lazy resource is fetched here for an
+    /// operation that can take `most` of them.
+    fn get_key_value(self, uri: &str, most: usize) -> Result<Option<(&'a str, &'a [u8])>, usize> {
         match self {
-            Self::Map(resources) => resources
+            Self::Map(resources) => Ok(resources
                 .get_key_value(uri)
-                .map(|(key, bytes)| (key.as_str(), bytes.as_slice())),
-            Self::Lazy(resources) => resources.get_key_value(uri),
+                .map(|(key, bytes)| (key.as_str(), bytes.as_slice()))),
+            Self::Lazy(resources) => resources.get_key_value(uri, most),
         }
     }
 
@@ -332,10 +354,10 @@ struct ExternalResourceBudget {
     remaining_total: Cell<usize>,
     per_resource: usize,
     total: usize,
-    /// The total that passed the aggregate allowance, once it refused a
-    /// resource: the operation's budget is spent, so no later resource is
-    /// fetched.
-    refused: Cell<Option<usize>>,
+    /// The first limit that refused a resource, as `(resource, maximum,
+    /// actual)`: a refusal ends the operation, so no later resource is
+    /// fetched and every later lookup reports it.
+    refused: Cell<Option<(&'static str, usize, usize)>>,
 }
 
 pub(crate) enum ExternalResourceMapError {
@@ -442,43 +464,51 @@ impl ExternalResourceBudget {
         }
     }
 
-    /// Refuses a lookup before its bytes are fetched once the aggregate
-    /// allowance refused one.
+    /// Refuses a lookup before its bytes are fetched once a limit refused
+    /// one; nothing is measured again, the first refusal is reported.
     fn admit(&self) -> Result<(), TransformError> {
-        if let Some(actual) = self.refused.get() {
-            // Nothing is measured again: the refusal reports the total that
-            // passed the allowance.
-            return Err(transform_resource_limit(
-                crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
-                self.total,
-                actual,
-            ));
+        if let Some((resource, maximum, actual)) = self.refused.get() {
+            return Err(transform_resource_limit(resource, maximum, actual));
         }
         Ok(())
     }
 
-    fn charge(&self, bytes: usize) -> Result<(), TransformError> {
-        if bytes > self.per_resource {
-            return Err(transform_resource_limit(
+    /// The most octets one more resource can have within both limits.
+    fn allowance(&self) -> usize {
+        self.per_resource.min(self.remaining_total.get())
+    }
+
+    /// Records the refusal of a resource of `bytes` octets past the
+    /// [`Self::allowance`], which ends the operation's fetching.
+    fn refuse(&self, bytes: usize) -> TransformError {
+        let refusal = if bytes > self.per_resource {
+            (
                 crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
                 self.per_resource,
                 bytes,
-            ));
-        }
-        let remaining = self.remaining_total.get();
-        let Some(next) = remaining.checked_sub(bytes) else {
-            // `bytes` exceeds `remaining` here; the reported total is a
-            // diagnostic, capped at the largest value it can name.
-            let actual = self.total.saturating_add(bytes - remaining);
-            self.remaining_total.set(0);
-            self.refused.set(Some(actual));
-            return Err(transform_resource_limit(
+            )
+        } else {
+            // `bytes` exceeds what remains of the total here; the reported
+            // total is a diagnostic, capped at the largest value it can name.
+            let remaining = self.remaining_total.get();
+            (
                 crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
                 self.total,
-                actual,
-            ));
+                self.total.saturating_add(bytes - remaining),
+            )
         };
-        self.remaining_total.set(next);
+        self.remaining_total.set(0);
+        self.refused.set(Some(refusal));
+        let (resource, maximum, actual) = refusal;
+        transform_resource_limit(resource, maximum, actual)
+    }
+
+    fn charge(&self, bytes: usize) -> Result<(), TransformError> {
+        if bytes > self.allowance() {
+            return Err(self.refuse(bytes));
+        }
+        // Within the allowance, so within what remains of the total.
+        self.remaining_total.set(self.remaining_total.get() - bytes);
         Ok(())
     }
 }
@@ -761,10 +791,14 @@ impl<'a> UriReferenceResolver<'a> {
             return Err(Native.diagnostic(UriFailureKind::ExternalFragment, &[uri]));
         }
         self.external_resource_budget.admit()?;
-        let Some((uri, bytes)) = self
-            .external_resources
-            .and_then(|resources| resources.get_key_value(uri))
-        else {
+        let most = self.external_resource_budget.allowance();
+        let found = match self.external_resources {
+            Some(resources) => resources
+                .get_key_value(uri, most)
+                .map_err(|length| self.external_resource_budget.refuse(length))?,
+            None => None,
+        };
+        let Some((uri, bytes)) = found else {
             return Ok(None);
         };
         self.external_resource_budget.charge(bytes.len())?;
@@ -1925,7 +1959,7 @@ mod tests {
         // it, every later lookup is refused before the caller is asked for
         // bytes, whichever signature of a batch makes it.
         let fetched = core::cell::Cell::new(0_usize);
-        let fetch = |_: &str| {
+        let fetch = |_: &str, _: usize| {
             fetched.set(fetched.get() + 1);
             Some(vec![0; 8])
         };

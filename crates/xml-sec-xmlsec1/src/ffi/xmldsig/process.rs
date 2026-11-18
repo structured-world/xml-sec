@@ -1227,7 +1227,9 @@ unsafe fn run_verification(
     // resource is missing, so the refusal is kept here and nothing more is
     // read after it.
     let exhausted = std::cell::Cell::new(false);
-    let fetch = |key: &str| {
+    // The read stops at the same policy's limits chunk by chunk, so the most
+    // the core can take needs no separate bound here.
+    let fetch = |key: &str, _most: usize| {
         if exhausted.get() {
             return None;
         }

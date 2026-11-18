@@ -676,7 +676,7 @@ impl<'a> VerifyContext<'a> {
     /// use xml_sec::xmldsig::VerifyContext;
     /// use xml_sec::xmldsig::uri::LazyExternalResources;
     ///
-    /// let fetch = |_: &str| None;
+    /// let fetch = |_: &str, _: usize| None;
     /// let resources = LazyExternalResources::new(["urn:payload".to_owned()], &fetch);
     /// let _context = VerifyContext::new().lazy_external_resources(&resources);
     /// ```

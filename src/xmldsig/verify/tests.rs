@@ -188,7 +188,7 @@ fn lazy_external_resources_are_fetched_only_after_the_signature_value_verifies()
 </root>"#
     );
     let fetched = core::cell::Cell::new(0_usize);
-    let fetch = |uri: &str| {
+    let fetch = |uri: &str, _: usize| {
         fetched.set(fetched.get() + 1);
         (uri == "urn:payload").then(|| b"payload".to_vec())
     };
@@ -221,7 +221,7 @@ fn lazy_external_resources_are_fetched_only_after_the_signature_value_verifies()
 
     // A listed resource its source does not supply is unavailable, and no
     // bytes are claimed resident for it.
-    let nothing = |_: &str| None;
+    let nothing = |_: &str, _: usize| None;
     let resources =
         super::super::uri::LazyExternalResources::new(["urn:payload".to_owned()], &nothing);
     let unavailable = VerifyContext::new()
@@ -1904,7 +1904,7 @@ fn lazy_resources_are_fetched_one_by_one_within_the_aggregate_allowance() {
         r#"<ds:Signature xmlns:ds="{XMLDSIG_NS}"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>{references}</ds:SignedInfo><ds:SignatureValue>AQ==</ds:SignatureValue></ds:Signature>"#
     );
     let fetched = core::cell::RefCell::new(Vec::new());
-    let fetch = |uri: &str| {
+    let fetch = |uri: &str, _: usize| {
         fetched.borrow_mut().push(uri.to_owned());
         Some(payload.to_vec())
     };
@@ -1945,6 +1945,81 @@ fn lazy_resources_are_fetched_one_by_one_within_the_aggregate_allowance() {
 }
 
 #[test]
+fn a_lazy_resource_past_its_limit_is_neither_kept_nor_followed_by_more_work() {
+    // The source is told the most octets the operation can take; a resource
+    // past them is refused, its octets are not kept, and the refusal ends
+    // the operation's fetching: the next listed resource is never asked
+    // for. An operation with room for it fetches it again, as nothing of
+    // the refused one was kept.
+    let payload = [0x41_u8; 16];
+    let digest = base64::engine::general_purpose::STANDARD.encode(crate::xmldsig::compute_digest(
+        DigestAlgorithm::Sha1,
+        &payload,
+    ));
+    let reference = |uri: &str| {
+        format!(
+            r#"<ds:Reference URI="{uri}"><ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference>"#
+        )
+    };
+    let references = [reference("urn:one"), reference("urn:two")].concat();
+    let xml = format!(
+        r#"<ds:Signature xmlns:ds="{XMLDSIG_NS}"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>{references}</ds:SignedInfo><ds:SignatureValue>AQ==</ds:SignatureValue></ds:Signature>"#
+    );
+    let asked = core::cell::RefCell::new(Vec::new());
+    let fetch = |uri: &str, most: usize| {
+        asked.borrow_mut().push((uri.to_owned(), most));
+        Some(payload.to_vec())
+    };
+    let resources = super::super::uri::LazyExternalResources::new(
+        ["urn:one", "urn:two"].map(str::to_owned),
+        &fetch,
+    );
+    let policy = |per_resource: usize| crate::policy::VerificationPolicy {
+        uris: crate::policy::UriPolicy {
+            references: UriTypeSet::ALL,
+            ..crate::policy::UriPolicy::default()
+        },
+        resources: crate::policy::ResourcePolicy {
+            max_external_resource_bytes: per_resource,
+            ..crate::policy::ResourcePolicy::default()
+        },
+        ..crate::policy::VerificationPolicy::default()
+    };
+    let refused = VerifyContext::new()
+        .key(&AcceptingKey)
+        .policy(policy(8))
+        .lazy_external_resources(&resources)
+        .verify(&xml);
+    assert!(
+        matches!(
+            refused,
+            Err(SignatureVerificationPipelineError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit { .. }
+            ))
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(*asked.borrow(), [("urn:one".to_owned(), 8)]);
+
+    let verified = VerifyContext::new()
+        .key(&AcceptingKey)
+        .policy(policy(64))
+        .lazy_external_resources(&resources)
+        .verify(&xml)
+        .expect("both resources fit");
+    assert_eq!(verified.status, DsigStatus::Valid);
+    assert_eq!(
+        asked
+            .borrow()
+            .iter()
+            .map(|(uri, _)| uri.as_str())
+            .collect::<Vec<_>>(),
+        ["urn:one", "urn:one", "urn:two"],
+        "the refused octets were not kept"
+    );
+}
+
+#[test]
 fn a_key_info_reference_never_fetches_from_lazy_resources() {
     // Key material is read before the SignatureValue is checked, so it never
     // comes from the lazy payload source: a forgery whose KeyInfoReference
@@ -1956,7 +2031,7 @@ fn a_key_info_reference_never_fetches_from_lazy_resources() {
         r#"<ds:KeyInfo xmlns:ds="{XMLDSIG_NS}"><ds:KeyName>listed</ds:KeyName></ds:KeyInfo>"#
     );
     let fetched = core::cell::Cell::new(0_usize);
-    let fetch = |_: &str| {
+    let fetch = |_: &str, _: usize| {
         fetched.set(fetched.get() + 1);
         Some(key_info.clone().into_bytes())
     };
@@ -2824,7 +2899,7 @@ fn only_a_reference_that_obtained_its_bytes_has_resident_evidence() {
             1,
         )
     });
-    let fetch = |_: &str| Some(payload.to_vec());
+    let fetch = |_: &str, _: usize| Some(payload.to_vec());
     let resources = super::super::uri::LazyExternalResources::new(["urn:one".to_owned()], &fetch);
     let result = VerifyContext::new()
         .key(&AcceptingKey)
