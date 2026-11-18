@@ -1250,10 +1250,6 @@ fn parse_processed_key_reference(
             let context = child_budget
                 .references
                 .expect("processed reference context");
-            // A recipient the decryption does not read needs no ciphertext.
-            if context.recipients_declined() {
-                return Ok(RetrievedKey::Encrypted(key));
-            }
             let parse = child_budget
                 .xml_parse
                 .expect("processed reference parse budget");
