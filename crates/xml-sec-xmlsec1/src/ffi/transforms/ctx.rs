@@ -1994,8 +1994,8 @@ impl ChainShape {
     /// `ctx` is an initialized context.
     unsafe fn of(ctx: *mut XmlSecTransformCtx) -> Self {
         let text = |text: *mut u8| {
-            // SAFETY: null or a NUL-terminated string of the context.
             (!text.is_null()).then(|| {
+                // SAFETY: a NUL-terminated string of the context.
                 unsafe { std::ffi::CStr::from_ptr(text.cast()) }
                     .to_bytes()
                     .to_vec()

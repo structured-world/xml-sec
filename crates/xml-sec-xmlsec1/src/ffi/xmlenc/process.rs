@@ -1078,6 +1078,35 @@ unsafe fn cipher_reference_resources(
     Some(resources)
 }
 
+/// Takes the core's decryption into the operation whose chain is
+/// `transforms`: the parse work it spent (a `CipherReference`'s transforms
+/// parsing a resource) joins the operation's, so a plaintext parse counts on
+/// from it; the core ran within what the operation left, so the sum stays
+/// within the policy's maximum. A key recovered by RSAES-PKCS1-v1_5 may be
+/// the random substitute of a rejected recovery, whose validity is consulted
+/// only now, after the content work, so the outcome reveals nothing of the
+/// padding (XML Encryption 1.1 section 6.1.2): `None` for a rejected one.
+///
+/// # Safety
+/// `transforms` is an initialized context.
+unsafe fn settle_decryption(
+    transforms: *mut super::super::transforms::ctx::XmlSecTransformCtx,
+    decrypted: Result<
+        (xml_sec::policy::Audited<DecryptedContent>, usize),
+        xml_sec::xmlenc::XmlEncError,
+    >,
+) -> Option<Result<xml_sec::policy::Audited<DecryptedContent>, xml_sec::xmlenc::XmlEncError>> {
+    // SAFETY: by the caller's contract.
+    let run = unsafe { run_budget(transforms) };
+    match decrypted {
+        Ok((audited, spent)) => {
+            run.xml_parse += spent;
+            run.recovery.is_valid().then_some(Ok(audited))
+        }
+        Err(error) => Some(Err(error)),
+    }
+}
+
 /// Runs the core decryption of the `EncryptedData` element `node` and makes
 /// the plaintext the context's result, a buffer of its method.
 ///
@@ -1152,28 +1181,10 @@ unsafe fn run_decryption(ctx: &mut XmlSecEncCtx, node: *mut XmlNode) -> *mut Xml
     if ctx.enc_method_node.is_null() {
         context = context.default_encryption_method(algorithm);
     }
-    // The parse work the core spent (a CipherReference's transforms parsing
-    // a resource) is the operation's: the plaintext parse that may follow
-    // counts on from it. The core ran within what the operation left, so
-    // the sum stays within the policy's maximum.
-    let decrypted = context
-        .decrypt_in_document_counting_parse_work(&document, target)
-        .map(|(audited, spent)| {
-            // SAFETY: the context's own transform context.
-            let run = unsafe { run_budget(&raw mut ctx.transform_ctx) };
-            run.xml_parse += spent;
-            audited
-        });
-    // A key recovered by RSAES-PKCS1-v1_5 may be the random substitute of
-    // a rejected recovery: its validity is consulted only now, after the
-    // content work, so the outcome reveals nothing of the padding (XML
-    // Encryption 1.1 section 6.1.2).
+    let decrypted = context.decrypt_in_document_counting_parse_work(&document, target);
     // SAFETY: the context's own transform context.
-    if decrypted.is_ok()
-        && !unsafe { run_budget(&raw mut ctx.transform_ctx) }
-            .recovery
-            .is_valid()
-    {
+    let Some(decrypted) = (unsafe { settle_decryption(&raw mut ctx.transform_ctx, decrypted) })
+    else {
         errors::report(
             here,
             std::ptr::null(),
@@ -1182,7 +1193,7 @@ unsafe fn run_decryption(ctx: &mut XmlSecEncCtx, node: *mut XmlNode) -> *mut Xml
             "content decryption failed",
         );
         return std::ptr::null_mut();
-    }
+    };
     let plaintext = match decrypted.map(|audited| audited.output) {
         Ok(DecryptedContent::Xml(text)) => Zeroizing::new(text.into_bytes()),
         Ok(DecryptedContent::Bytes(bytes)) => Zeroizing::new(bytes),
