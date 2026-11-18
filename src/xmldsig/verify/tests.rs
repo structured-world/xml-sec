@@ -166,6 +166,78 @@ fn reference_resolution_uses_each_elements_effective_xml_base() {
 }
 
 #[test]
+fn lazy_external_resources_are_fetched_only_after_the_signature_value_verifies() {
+    // A forged SignatureValue fails before any reference is dereferenced, so
+    // the caller's source is never asked for the URI the forgery names; an
+    // authentic one fetches the resource once, when its Reference is digested.
+    let digest = base64::engine::general_purpose::STANDARD
+        .encode(compute_digest(DigestAlgorithm::Sha256, b"payload"));
+    let xml = format!(
+        r#"<root xmlns:ds="{XMLDSIG_NS}">
+  <ds:Signature>
+    <ds:SignedInfo>
+      <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+      <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+      <ds:Reference URI="urn:payload">
+        <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+        <ds:DigestValue>{digest}</ds:DigestValue>
+      </ds:Reference>
+    </ds:SignedInfo>
+    <ds:SignatureValue>AQ==</ds:SignatureValue>
+  </ds:Signature>
+</root>"#
+    );
+    let fetched = core::cell::Cell::new(0_usize);
+    let fetch = |uri: &str| {
+        fetched.set(fetched.get() + 1);
+        (uri == "urn:payload").then(|| b"payload".to_vec())
+    };
+
+    let resources =
+        super::super::uri::LazyExternalResources::new(["urn:payload".to_owned()], &fetch);
+    let forged = VerifyContext::new()
+        .key(&RejectingKey)
+        .allowed_uri_types(UriTypeSet::ALL)
+        .lazy_external_resources(&resources)
+        .verify(&xml)
+        .expect("a forged signature value is a verification status");
+    assert!(matches!(forged.status, DsigStatus::Invalid(_)));
+    assert_eq!(fetched.get(), 0, "a forged signature fetched a resource");
+
+    let resources =
+        super::super::uri::LazyExternalResources::new(["urn:payload".to_owned()], &fetch);
+    let authentic = VerifyContext::new()
+        .key(&AcceptingKey)
+        .allowed_uri_types(UriTypeSet::ALL)
+        .lazy_external_resources(&resources)
+        .verify(&xml)
+        .expect("an authentic signature verifies");
+    assert_eq!(authentic.status, DsigStatus::Valid);
+    assert_eq!(fetched.get(), 1);
+    assert_eq!(
+        authentic.signed_info_references[0].external_payload,
+        Some(super::ExternalPayload::Resident)
+    );
+
+    // A listed resource its source does not supply is unavailable, and no
+    // bytes are claimed resident for it.
+    let nothing = |_: &str| None;
+    let resources =
+        super::super::uri::LazyExternalResources::new(["urn:payload".to_owned()], &nothing);
+    let unavailable = VerifyContext::new()
+        .key(&AcceptingKey)
+        .allowed_uri_types(UriTypeSet::ALL)
+        .lazy_external_resources(&resources)
+        .verify(&xml)
+        .expect("an unavailable payload is a verification status");
+    assert_eq!(
+        unavailable.signed_info_references[0].status,
+        DsigStatus::Invalid(FailureReason::ReferenceUnavailable { ref_index: 0 })
+    );
+    assert_eq!(unavailable.signed_info_references[0].external_payload, None);
+}
+
+#[test]
 fn internal_dtd_opt_in_applies_to_detached_xml_transforms() {
     // The parse policy covers every XML document in one verification
     // pipeline, including caller-owned octets converted to a node-set.
@@ -1805,6 +1877,104 @@ fn verify_context_meters_repeated_external_dereferences() {
             .to_string()
             .contains("aggregate external resource bytes")
     );
+}
+
+#[test]
+fn lazy_resources_are_fetched_one_by_one_within_the_aggregate_allowance() {
+    // Planning names each reference's resource without fetching it: the
+    // source is asked for a resource only when its Reference is digested, so
+    // the aggregate ceiling refuses the second before the third is fetched.
+    let payload = b"payload";
+    let digest = base64::engine::general_purpose::STANDARD.encode(crate::xmldsig::compute_digest(
+        DigestAlgorithm::Sha1,
+        payload,
+    ));
+    let reference = |uri: &str| {
+        format!(
+            r#"<ds:Reference URI="{uri}"><ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference>"#
+        )
+    };
+    let references = [
+        reference("urn:one"),
+        reference("urn:two"),
+        reference("urn:three"),
+    ]
+    .concat();
+    let xml = format!(
+        r#"<ds:Signature xmlns:ds="{XMLDSIG_NS}"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>{references}</ds:SignedInfo><ds:SignatureValue>AQ==</ds:SignatureValue></ds:Signature>"#
+    );
+    let fetched = core::cell::Cell::new(0_usize);
+    let fetch = |_: &str| {
+        fetched.set(fetched.get() + 1);
+        Some(payload.to_vec())
+    };
+    let resources = super::super::uri::LazyExternalResources::new(
+        ["urn:one", "urn:two", "urn:three"].map(str::to_owned),
+        &fetch,
+    );
+    let policy = crate::policy::VerificationPolicy {
+        uris: crate::policy::UriPolicy {
+            references: UriTypeSet::ALL,
+            ..crate::policy::UriPolicy::default()
+        },
+        resources: crate::policy::ResourcePolicy {
+            max_external_resource_bytes: payload.len(),
+            max_external_resource_total_bytes: payload.len(),
+            ..crate::policy::ResourcePolicy::default()
+        },
+        ..crate::policy::VerificationPolicy::default()
+    };
+
+    let error = VerifyContext::new()
+        .key(&AcceptingKey)
+        .policy(policy)
+        .lazy_external_resources(&resources)
+        .verify(&xml)
+        .expect_err("the second resource must exhaust the aggregate byte ceiling");
+
+    assert!(
+        error
+            .to_string()
+            .contains("aggregate external resource bytes")
+    );
+    assert_eq!(fetched.get(), 2, "a resource was fetched before its turn");
+}
+
+#[test]
+fn a_key_info_reference_never_fetches_from_lazy_resources() {
+    // Key material is read before the SignatureValue is checked, so it never
+    // comes from the lazy payload source: a forgery whose KeyInfoReference
+    // names a listed resource makes the source fetch nothing.
+    let xml = format!(
+        r#"<ds:Signature xmlns:ds="{XMLDSIG_NS}" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="urn:key"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AQ==</ds:SignatureValue><ds:KeyInfo><dsig11:KeyInfoReference URI="urn:key"/></ds:KeyInfo></ds:Signature>"#
+    );
+    let key_info = format!(
+        r#"<ds:KeyInfo xmlns:ds="{XMLDSIG_NS}"><ds:KeyName>listed</ds:KeyName></ds:KeyInfo>"#
+    );
+    let fetched = core::cell::Cell::new(0_usize);
+    let fetch = |_: &str| {
+        fetched.set(fetched.get() + 1);
+        Some(key_info.clone().into_bytes())
+    };
+    let resources = super::super::uri::LazyExternalResources::new(["urn:key".to_owned()], &fetch);
+    let mut policy = crate::policy::VerificationPolicy::default();
+    policy
+        .key_sources
+        .insert(crate::policy::KeySourceKind::KeyInfoReference);
+    policy.uris.key_info_references = UriTypeSet::ALL;
+    policy.uris.references = UriTypeSet::ALL;
+
+    let forged = VerifyContext::new()
+        .key(&RejectingKey)
+        .policy(policy)
+        .lazy_external_resources(&resources)
+        .verify(&xml);
+
+    assert!(
+        !matches!(forged, Ok(ref result) if result.status == DsigStatus::Valid),
+        "a forged signature verified"
+    );
+    assert_eq!(fetched.get(), 0, "key material came from the lazy source");
 }
 
 #[test]
@@ -4635,6 +4805,40 @@ fn unavailable_detached_payload_does_not_hide_a_valid_signature() {
 }
 
 #[test]
+fn an_external_fragment_fails_only_its_own_reference() {
+    // A fragment of an external resource is refused, but the refusal belongs
+    // to that Reference: verification reports it and processes the others,
+    // as it does for any other URI its Reference cannot use.
+    let xml = signature_with_target_content("AQ==", "payload").replacen(
+        "</ds:SignedInfo>",
+        &format!(
+            "{}{}</ds:SignedInfo>",
+            sha1_reference("urn:doc#part", "AAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+            sha1_reference("urn:later", "AAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+        ),
+        1,
+    );
+    let result = VerifyContext::new()
+        .key(&AcceptingKey)
+        .policy(external_reference_policy())
+        .verify(&xml)
+        .expect("a refused fragment is a verification status");
+    let statuses: Vec<_> = result
+        .signed_info_references
+        .iter()
+        .map(|reference| reference.status)
+        .collect();
+    assert_eq!(
+        statuses,
+        [
+            DsigStatus::Valid,
+            DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { ref_index: 1 }),
+            DsigStatus::Invalid(FailureReason::ReferenceUnavailable { ref_index: 2 }),
+        ]
+    );
+}
+
+#[test]
 fn reference_failure_does_not_unlock_manifest_processing() {
     // Manifest content is processed only after core validation succeeds;
     // per-reference reporting must not let a failed SignedInfo Reference
@@ -6107,6 +6311,92 @@ fn pipeline_start_node_limits_signature_cardinality_to_its_subtree() {
             element: "SignedInfo"
         }
     ));
+}
+
+/// Two incomplete signatures that fail on different elements, so the error
+/// tells which one an exact selection verified.
+const TWO_SIGNATURES: &str = r#"
+<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+  <ds:Signature><ds:SignedInfo/></ds:Signature>
+  <ds:Signature/>
+</root>
+"#;
+
+#[test]
+fn exact_selection_verifies_only_the_named_signature() {
+    // An exact selection is libxmlsec1's caller-chosen Signature node: the
+    // other Signature neither counts toward cardinality nor is verified.
+    let document = XmlDocument::parse(TWO_SIGNATURES).unwrap();
+    let signatures = VerifyContext::new()
+        .signature_identities(&document)
+        .unwrap();
+    assert_eq!(signatures.len(), 2);
+
+    let first = VerifyContext::new()
+        .signature(signatures[0])
+        .verify_document(&document)
+        .expect_err("the first Signature has no SignatureValue");
+    assert!(
+        matches!(
+            first,
+            SignatureVerificationPipelineError::MissingElement {
+                element: "SignatureValue"
+            }
+        ),
+        "{first:?}"
+    );
+    let second = VerifyContext::new()
+        .signature(signatures[1])
+        .verify_document(&document)
+        .expect_err("the second Signature has no SignedInfo");
+    assert!(
+        matches!(
+            second,
+            SignatureVerificationPipelineError::MissingElement {
+                element: "SignedInfo"
+            }
+        ),
+        "{second:?}"
+    );
+}
+
+#[test]
+fn exact_selection_refuses_a_node_that_is_no_signature() {
+    let document = XmlDocument::parse(TWO_SIGNATURES).unwrap();
+    let root = document
+        .with_view(|view| view.identity_of(view.document().root_element()))
+        .unwrap();
+    let error = VerifyContext::new()
+        .signature(root)
+        .verify_document(&document)
+        .expect_err("the root element is no Signature");
+    assert!(
+        matches!(
+            error,
+            SignatureVerificationPipelineError::InvalidStructure {
+                reason: "the selected node is not a Signature element"
+            }
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn exact_selection_refuses_an_identity_of_another_document() {
+    let document = XmlDocument::parse(TWO_SIGNATURES).unwrap();
+    let other = XmlDocument::parse(TWO_SIGNATURES).unwrap();
+    let foreign = VerifyContext::new().signature_identities(&other).unwrap()[0];
+    let error = VerifyContext::new()
+        .signature(foreign)
+        .verify_document(&document)
+        .expect_err("an identity of another document selects nothing here");
+    assert!(
+        matches!(
+            error,
+            SignatureVerificationPipelineError::Document(XmlDocumentError::ForeignIdentity)
+        ),
+        "{error:?}"
+    );
 }
 
 #[test]

@@ -139,6 +139,29 @@ pub fn serialize_with_options(doc: &Document, options: &SerializeOptions) -> Str
     output
 }
 
+/// Serializes the node `id` and its subtree as libxml2's `xmlNodeDumpOutput`
+/// writes it unformatted: no XML declaration, and only the namespace
+/// declarations the nodes themselves carry. The document node is written as
+/// the whole document, declaration included, as `xmlNodeDumpOutput` writes it
+/// through `xmlDocContentDumpOutput`.
+#[must_use]
+pub fn serialize_subtree(doc: &Document, id: NodeId) -> String {
+    if id == doc.root() {
+        return serialize(doc);
+    }
+    let mut output = String::new();
+    serialize_node(
+        doc,
+        id,
+        &mut output,
+        doc.encoding.is_none(),
+        &SerializeOptions::default(),
+        0,
+        false,
+    );
+    output
+}
+
 /// Returns `true` if the element contains only other elements (and optional
 /// whitespace text), meaning it's safe to add indentation.
 fn is_element_only(doc: &Document, id: NodeId) -> bool {

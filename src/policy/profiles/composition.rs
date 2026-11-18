@@ -8,8 +8,7 @@ use crate::policy::{
 };
 #[cfg(feature = "xmlenc")]
 use crate::policy::{
-    DecryptionPolicy, EncryptionPolicy, KeyTransportAlgorithm, KeyWrapAlgorithm,
-    OaepDigestAlgorithm, check_content_algorithm,
+    DecryptionPolicy, EncryptionPolicy, OaepDigestAlgorithm, check_content_algorithm,
 };
 use crate::xmldsig::UriTypeSet;
 use alloc::collections::BTreeSet;
@@ -271,6 +270,21 @@ fn transforms(
         } else {
             EmptyDigestInput::Accept
         },
+        // Only signing generates a canonicalization; [`signing_transforms`]
+        // requires the layers to agree on it.
+        generated_canonicalization: a.generated_canonicalization,
+    })
+}
+fn signing_transforms(
+    a: &TransformPolicy,
+    b: &TransformPolicy,
+) -> Result<TransformPolicy, PolicyViolation> {
+    Ok(TransformPolicy {
+        generated_canonicalization: equal(
+            a.generated_canonicalization,
+            b.generated_canonicalization,
+        )?,
+        ..transforms(a, b)?
     })
 }
 fn manifests(a: ManifestProcessing, b: ManifestProcessing) -> ManifestProcessing {
@@ -509,6 +523,8 @@ fn verification(
         uris: uris(a.uris, b.uris),
         transforms: transforms(&a.transforms, &b.transforms)?,
         manifest_processing: manifests(a.manifest_processing, b.manifest_processing),
+        // A request may select only what every layer lets it select.
+        request_selections: a.request_selections.intersection(&b.request_selections),
         detached_digest_attestation: attestation(
             a.detached_digest_attestation,
             b.detached_digest_attestation,
@@ -581,8 +597,10 @@ fn signing(a: &SigningPolicy, b: &SigningPolicy) -> Result<SigningPolicy, Policy
         rsa_keys: rsa(a.rsa_keys, b.rsa_keys),
         dsa_keys: dsa(a.dsa_keys, b.dsa_keys),
         uris: uris(a.uris, b.uris),
-        transforms: transforms(&a.transforms, &b.transforms)?,
+        transforms: signing_transforms(&a.transforms, &b.transforms)?,
         manifest_processing: manifests(a.manifest_processing, b.manifest_processing),
+        // A request may select only what every layer lets it select.
+        request_selections: a.request_selections.intersection(&b.request_selections),
         xml: xml(a.xml, b.xml),
         resources: resources(&a.resources, &b.resources),
     })
@@ -667,20 +685,7 @@ fn decryption(
 }
 
 #[cfg(feature = "xmlenc")]
-fn transport_allowed(
-    set: Option<&BTreeSet<KeyTransportAlgorithm>>,
-    value: KeyTransportAlgorithm,
-) -> bool {
-    set.map_or(!value.requires_explicit_permission(), |s| {
-        s.contains(&value)
-    })
-}
-#[cfg(feature = "xmlenc")]
-fn wrap_allowed(set: Option<&BTreeSet<KeyWrapAlgorithm>>, value: KeyWrapAlgorithm) -> bool {
-    set.map_or(!value.requires_explicit_permission(), |s| {
-        s.contains(&value)
-    })
-}
+use crate::policy::{key_transport_allowed as transport_allowed, key_wrap_allowed as wrap_allowed};
 #[cfg(feature = "xmlenc")]
 fn oaep_allowed(set: Option<&BTreeSet<OaepDigestAlgorithm>>, value: OaepDigestAlgorithm) -> bool {
     set.map_or(!value.requires_explicit_permission(), |s| {

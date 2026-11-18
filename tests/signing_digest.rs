@@ -12,8 +12,8 @@ use base64::Engine as _;
 use xml_sec::XmlDocument;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize};
 use xml_sec::policy::{
-    EcdsaSignatureValueEncoding, HmacPolicy, ManifestProcessing, PolicyDecision, SigningPolicy,
-    UriRole, VerificationPolicy,
+    EcdsaSignatureValueEncoding, GeneratedCanonicalization, HmacPolicy, ManifestProcessing,
+    PolicyDecision, SigningPolicy, UriRole, VerificationPolicy,
 };
 use xml_sec::xmldsig::mutation::append_signature_to_root;
 use xml_sec::xmldsig::parse::{find_signature_node, parse_signed_info};
@@ -22,9 +22,9 @@ use xml_sec::xmldsig::verify::process_all_references;
 use xml_sec::xmldsig::{
     DEFAULT_IMPLICIT_C14N_URI, DefaultKeyResolver, DigestAlgorithm, DsigStatus,
     EcdsaP256SigningKey, EcdsaP384SigningKey, KeyInfoWriter, KeyValueInfoWriter, ReferenceBuilder,
-    RsaSigningKey, SignContext, SignatureAlgorithm, SignatureBuilder, SigningDigestError,
-    SigningError, SigningKey, SigningKeyError, SigningPublicKeyInfo, Transform, TransformError,
-    VerificationKey, VerifyContext, X509CertificateKeyInfoWriter, XPathExpression,
+    RsaSigningKey, SignContext, SignatureAlgorithm, SignatureBuilder, SignatureTemplateSelection,
+    SigningDigestError, SigningError, SigningKey, SigningKeyError, SigningPublicKeyInfo, Transform,
+    TransformError, VerificationKey, VerifyContext, X509CertificateKeyInfoWriter, XPathExpression,
     compute_reference_digest_values, fill_reference_digest_values, parse_key_info,
     validate_signing_key, verify_signature_with_pem_key,
 };
@@ -1161,6 +1161,52 @@ fn computed_digest_matches_materialized_c14n11_digest() {
     assert_eq!(computed.len(), 1);
     assert_eq!(computed[0].digest_value, written);
     assert_reference_digests_verify(&filled);
+}
+
+#[test]
+fn implicit_generated_canonicalization_leaves_the_node_set_to_c14n_1_0() {
+    // A signing policy that leaves the conversion implicit writes no
+    // Transform into a Reference whose chain ends in a node set, as
+    // libxmlsec1 signs a template, and digests the node set with Canonical
+    // XML 1.0 (XMLDSig 1.1 section 4.4.3.2). C14N 1.0 inherits xml:id onto
+    // the subtree apex where 1.1 does not, so a 1.1 digest would not verify.
+    let template =
+        template_with_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("#payload"))
+            .replacen(
+                concat!(
+                    "<Transforms><Transform Algorithm=\"",
+                    "http://www.w3.org/2006/12/xml-c14n11\"/></Transforms>"
+                ),
+                "",
+                1,
+            );
+    let xml = append_signature_to_root(
+        "<root xml:id=\"ancestor\"><payload ID=\"payload\">one</payload></root>",
+        &template,
+    )
+    .expect("append signature");
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let public_key = "tests/fixtures/keys/rsa/rsa-2048-pubkey.pem";
+    let c14n11 = "http://www.w3.org/2006/12/xml-c14n11";
+
+    let mut policy = SigningPolicy::default();
+    policy.transforms.generated_canonicalization = GeneratedCanonicalization::Implicit;
+    let implicit = SignContext::new(&private_key)
+        .policy(policy)
+        .sign_template(&xml)
+        .expect("an implicit conversion signs")
+        .output;
+    assert!(!implicit.contains(c14n11), "no Transform was written");
+    assert_signed_template_verifies(&implicit, public_key);
+
+    let explicit = SignContext::new(&private_key)
+        .sign_template(&xml)
+        .expect("the default policy signs")
+        .output;
+    assert!(explicit.contains(c14n11), "the default writes C14N 1.1");
+    assert_signed_template_verifies(&explicit, public_key);
 }
 
 #[test]
@@ -3538,6 +3584,260 @@ fn sign_with_builder_targets_appended_signature_when_existing_key_info_is_presen
     assert_eq!(second_signed.matches("<X509Certificate>").count(), 2);
     assert!(!second_signed.contains("<DigestValue></DigestValue>"));
     assert!(!second_signed.contains("<SignatureValue></SignatureValue>"));
+}
+
+/// Two templates of one document, for `#first` and `#second`.
+const TWO_TEMPLATES: &str = r##"<root><payload Id="first"/><payload Id="second"/><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#first"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#second"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature></root>"##;
+
+/// The `SignatureValue` texts of the document's signatures, in order.
+fn signature_values(document: &XmlDocument) -> Vec<Option<String>> {
+    document.with_view(|view| {
+        view.document()
+            .descendants()
+            .filter(|node| {
+                node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "SignatureValue"))
+            })
+            .map(|node| node.text().map(str::to_owned))
+            .collect()
+    })
+}
+
+#[test]
+fn exact_template_selection_signs_only_the_named_template() {
+    // libxmlsec1 signs the template node its caller passes; the other
+    // template keeps its empty values, whichever position it has.
+    let key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let mut document = XmlDocument::parse(TWO_TEMPLATES).expect("templates must parse");
+    let first = VerifyContext::new()
+        .signature_identities(&document)
+        .expect("templates are discoverable")[0];
+    SignContext::new(&key)
+        .signature_template_selection(SignatureTemplateSelection::Exact(first))
+        .sign_document(&mut document)
+        .expect("the first template signs");
+    let values = signature_values(&document);
+    assert!(values[0].is_some(), "{values:?}");
+    assert_eq!(values[1], None);
+}
+
+#[test]
+fn base64_line_size_lays_out_values_that_still_verify() {
+    // libxmlsec1 writes values in lines of its Base64 line size; the digest
+    // value is laid out before SignedInfo is canonicalized, so the signature
+    // covers the text as written.
+    let key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let mut document = XmlDocument::parse(TWO_TEMPLATES).expect("templates must parse");
+    let first = VerifyContext::new()
+        .signature_identities(&document)
+        .expect("templates are discoverable")[0];
+    SignContext::new(&key)
+        .signature_template_selection(SignatureTemplateSelection::Exact(first))
+        .base64_line_size(std::num::NonZeroUsize::new(16))
+        .sign_document(&mut document)
+        .expect("the first template signs");
+    let value = signature_values(&document)[0]
+        .clone()
+        .expect("a signature value");
+    let lines: Vec<&str> = value.split('\n').collect();
+    assert_eq!(lines.len(), 344_usize.div_ceil(16), "{value}");
+    assert!(lines[..lines.len() - 1].iter().all(|line| line.len() == 16));
+    assert!(!value.ends_with('\n'));
+    let digest = document.with_view(|view| {
+        view.document()
+            .descendants()
+            .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "DigestValue")))
+            .and_then(|node| node.text().map(str::to_owned))
+    });
+    assert_eq!(digest.map(|digest| digest.matches('\n').count()), Some(2));
+
+    // Signing committed a new generation.
+    let first = VerifyContext::new()
+        .signature_identities(&document)
+        .expect("signatures are discoverable")[0];
+    let verified = VerifyContext::new()
+        .key(&VerificationKey {
+            algorithm: SignatureAlgorithm::RsaSha256,
+            public_key_bytes: rsa_spki(&key),
+            certificate_der: None,
+            name: None,
+        })
+        .signature(first)
+        .verify_document(&document)
+        .expect("the laid out signature verifies");
+    assert!(
+        matches!(verified.status, DsigStatus::Valid),
+        "{:?}",
+        verified.status
+    );
+}
+
+#[test]
+fn base64_line_size_lays_out_digests_of_every_dependency_level() {
+    // A SignedInfo Reference over a Manifest digests the Manifest after its
+    // own Reference's digest is written, a level earlier; that earlier
+    // value is laid out in lines as well, before the later digest covers it.
+    let key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let template = r##"<root><payload Id="payload">p</payload><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#manifest"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/><ds:Object><ds:Manifest Id="manifest"><ds:Reference URI="#payload"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:Manifest></ds:Object></ds:Signature></root>"##;
+    let mut document = XmlDocument::parse(template).expect("the template parses");
+    SignContext::new(&key)
+        .policy(SigningPolicy {
+            manifest_processing: ManifestProcessing::Process,
+            ..SigningPolicy::default()
+        })
+        .base64_line_size(std::num::NonZeroUsize::new(16))
+        .sign_document(&mut document)
+        .expect("the template signs");
+    let digests: Vec<String> = document.with_view(|view| {
+        view.document()
+            .descendants()
+            .filter(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "DigestValue")))
+            .filter_map(|node| node.text().map(str::to_owned))
+            .collect()
+    });
+    assert_eq!(digests.len(), 2);
+    // A SHA-256 value is 44 characters: three lines of at most 16.
+    for digest in &digests {
+        assert_eq!(digest.matches('\n').count(), 2, "{digest}");
+    }
+
+    // The outer digest covers the Manifest as laid out: a digest taken
+    // before the Manifest's value was wrapped would not verify.
+    let first = VerifyContext::new()
+        .signature_identities(&document)
+        .expect("signatures are discoverable")[0];
+    let verified = VerifyContext::new()
+        .policy(VerificationPolicy {
+            manifest_processing: ManifestProcessing::Process,
+            ..VerificationPolicy::default()
+        })
+        .key(&VerificationKey {
+            algorithm: SignatureAlgorithm::RsaSha256,
+            public_key_bytes: rsa_spki(&key),
+            certificate_der: None,
+            name: None,
+        })
+        .signature(first)
+        .verify_document(&document)
+        .expect("the laid out signature verifies");
+    assert!(
+        matches!(verified.status, DsigStatus::Valid),
+        "{:?}",
+        verified.status
+    );
+    assert_eq!(verified.manifest_references.len(), 1);
+    assert!(
+        verified
+            .manifest_references
+            .iter()
+            .all(|reference| matches!(reference.status, DsigStatus::Valid)),
+        "{:?}",
+        verified.manifest_references
+    );
+}
+
+#[test]
+fn base64_line_size_counts_signature_line_feeds_before_signing() {
+    // The document limit is decided once, before the private key is used:
+    // the projection includes the line feeds the SignatureValue will carry.
+    let key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let line_size = std::num::NonZeroUsize::new(16);
+    let mut signed = XmlDocument::parse(TWO_TEMPLATES).expect("templates must parse");
+    let first = VerifyContext::new()
+        .signature_identities(&signed)
+        .expect("templates are discoverable")[0];
+    SignContext::new(&key)
+        .signature_template_selection(SignatureTemplateSelection::Exact(first))
+        .base64_line_size(line_size)
+        .sign_document(&mut signed)
+        .expect("the first template signs");
+    let mut policy = SigningPolicy::default();
+    policy.resources.max_xml_document_bytes = signed.content_len() - 1;
+    let mut document = XmlDocument::parse(TWO_TEMPLATES).expect("templates must parse");
+    let first = VerifyContext::new()
+        .signature_identities(&document)
+        .expect("templates are discoverable")[0];
+    let counted = CountingKey {
+        key,
+        signatures: std::cell::Cell::new(0),
+    };
+    let error = SignContext::new(&counted)
+        .policy(policy)
+        .signature_template_selection(SignatureTemplateSelection::Exact(first))
+        .base64_line_size(line_size)
+        .sign_document(&mut document)
+        .expect_err("the laid out signature exceeds the document limit");
+    assert!(
+        matches!(
+            error,
+            SigningError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit { .. })
+        ),
+        "{error:?}"
+    );
+    assert_eq!(counted.signatures.get(), 0, "the private key was used");
+}
+
+/// A signing key that counts the signatures it makes.
+struct CountingKey {
+    key: RsaSigningKey,
+    signatures: std::cell::Cell<usize>,
+}
+
+impl xml_sec::xmldsig::SigningKey for CountingKey {
+    fn sign(
+        &self,
+        algorithm: SignatureAlgorithm,
+        canonical_signed_info: &[u8],
+    ) -> Result<Vec<u8>, xml_sec::xmldsig::SigningKeyError> {
+        self.signatures.set(self.signatures.get() + 1);
+        self.key.sign(algorithm, canonical_signed_info)
+    }
+
+    fn sign_with_provider(
+        &self,
+        provider: &dyn xml_sec::provider::CryptoProvider,
+        algorithm: SignatureAlgorithm,
+        canonical_signed_info: &[u8],
+    ) -> Result<Vec<u8>, xml_sec::xmldsig::SigningKeyError> {
+        self.signatures.set(self.signatures.get() + 1);
+        self.key
+            .sign_with_provider(provider, algorithm, canonical_signed_info)
+    }
+
+    fn public_key_info(
+        &self,
+    ) -> Result<xml_sec::xmldsig::SigningPublicKeyInfo, xml_sec::xmldsig::SigningKeyError> {
+        self.key.public_key_info()
+    }
+}
+
+#[test]
+fn exact_template_selection_refuses_a_node_that_is_no_signature() {
+    let key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let mut document = XmlDocument::parse(TWO_TEMPLATES).expect("templates must parse");
+    let root = document
+        .with_view(|view| view.identity_of(view.document().root_element()))
+        .expect("the root has an identity");
+    let error = SignContext::new(&key)
+        .signature_template_selection(SignatureTemplateSelection::Exact(root))
+        .sign_document(&mut document)
+        .expect_err("the root element is no template");
+    assert!(
+        error
+            .to_string()
+            .contains("the selected node is not a Signature element"),
+        "{error}"
+    );
+    assert_eq!(signature_values(&document), vec![None, None]);
 }
 
 #[test]

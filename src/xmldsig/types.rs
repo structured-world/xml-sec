@@ -454,6 +454,17 @@ pub enum TransformError {
     #[error("external resource not supplied: {0}")]
     ExternalResourceUnavailable(String),
 
+    /// The URI selects a fragment of an external resource, which is octets
+    /// here: the selection is refused rather than covering the whole
+    /// resource (`XMLDSig` 1.1 section 4.4.3.2 leaves it optional).
+    #[error("fragment of an external resource is not supported: {0}")]
+    ExternalResourceFragment(String),
+
+    /// [`Self::ExternalResourceFragment`] whose diagnostic retains its
+    /// current-query capacity charge.
+    #[error("fragment of an external resource is not supported: {0}")]
+    AccountedExternalResourceFragment(structured_asn1::memory::OwnedText),
+
     /// Malformed same-document syntax, requiring no diagnostic allocation.
     #[error("unsupported URI: invalid same-document fragment")]
     InvalidFragment,

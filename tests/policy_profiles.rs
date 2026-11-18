@@ -40,6 +40,56 @@ fn seconds_later(time: Instant, seconds: i64) -> Instant {
 }
 
 #[test]
+fn a_request_selects_only_what_its_policy_lists() {
+    // A caller's compatibility option never reaches a mode the deployment did
+    // not admit: the libxmlsec1 profile lists libxmlsec1's selections, the
+    // modern one none, so the same selection succeeds in one and is refused
+    // with a typed violation in the other.
+    use xml_sec::policy::{
+        EcdsaSignatureValueEncoding, ManifestProcessing, RequestSelections, SameDocumentIdSemantics,
+    };
+    let compat = compiler(PolicyProfile::XmlSecCompatible)
+        .compile(&context())
+        .unwrap();
+    let mut verification = compat.verification().unwrap().clone();
+    assert_eq!(
+        verification.request_selections,
+        RequestSelections::libxmlsec1()
+    );
+    verification
+        .select_same_document_id_semantics(SameDocumentIdSemantics::XmlSecVisa3d)
+        .unwrap();
+    assert_eq!(
+        verification.transforms.same_document_id_semantics,
+        SameDocumentIdSemantics::XmlSecVisa3d
+    );
+    let mut signing = compat.signing().unwrap().clone();
+    signing
+        .select_ecdsa_signature_value_encoding(EcdsaSignatureValueEncoding::XmlSecAsn1Der)
+        .unwrap();
+    signing
+        .select_manifest_processing(ManifestProcessing::Process)
+        .unwrap();
+    assert_eq!(signing.manifest_processing, ManifestProcessing::Process);
+
+    let modern = compiler(PolicyProfile::Modern).compile(&context()).unwrap();
+    let mut verification = modern.verification().unwrap().clone();
+    assert_eq!(
+        verification.select_same_document_id_semantics(SameDocumentIdSemantics::XmlSecVisa3d),
+        Err(PolicyViolation::RequestSelection {
+            setting: "same_document_id_semantics"
+        })
+    );
+    // The policy's own value is always selectable.
+    let current = verification.manifest_processing;
+    assert_eq!(verification.select_manifest_processing(current), Ok(()));
+
+    // A layer that lists nothing leaves a composed policy with nothing.
+    let narrowed = RequestSelections::libxmlsec1().intersection(&RequestSelections::default());
+    assert_eq!(narrowed, RequestSelections::default());
+}
+
+#[test]
 fn profiles_keep_parameterized_pss_permissions() {
     // An explicit preset allowlist must not erase its supported PSS family.
     use xml_sec::policy::RsaPssPermission;
@@ -247,6 +297,56 @@ fn denying_certificate_signatures_keeps_trusted_preset_keys_usable() {
         .verify(&xml)
         .unwrap();
     assert_eq!(result.status, xml_sec::xmldsig::DsigStatus::Valid);
+}
+
+#[test]
+fn the_compatible_profile_signs_the_ids_it_verifies() {
+    // libxmlsec1 looks a bare-name fragment up the same way for signing and
+    // verification, so its profile signs a reference to an ID that is not an
+    // NCName, which its verification resolves.
+    let compiled = compiler(PolicyProfile::XmlSecCompatible)
+        .compile(&context())
+        .unwrap();
+    let key = HmacSigningKey::new(vec![0x53; 32]).unwrap();
+    let verifier = HmacVerificationKey::new(vec![0x53; 32]).unwrap();
+    let xml = SignContext::new(&key)
+        .policy(compiled.signing().unwrap().clone())
+        .sign_template(&template("urn:test", "123"))
+        .unwrap()
+        .output;
+    let result = VerifyContext::new()
+        .key(&verifier)
+        .policy(compiled.verification().unwrap().clone())
+        .verify(&xml)
+        .unwrap();
+    assert_eq!(result.status, xml_sec::xmldsig::DsigStatus::Valid);
+}
+
+#[test]
+fn only_signing_layers_must_agree_on_the_generated_canonicalization() {
+    // Verification never generates a canonicalization, so a layer that
+    // differs from its base only there composes; a signing layer that
+    // differs would change the signed output and is refused.
+    let compatibility = || compiler(PolicyProfile::XmlSecCompatible);
+    let mut layer = compatibility().policies().clone();
+    layer
+        .verification
+        .as_mut()
+        .unwrap()
+        .transforms
+        .generated_canonicalization = xml_sec::policy::GeneratedCanonicalization::ExplicitC14n11;
+    assert!(compatibility().restrict(&layer).is_ok());
+    let mut layer = compatibility().policies().clone();
+    layer
+        .signing
+        .as_mut()
+        .unwrap()
+        .transforms
+        .generated_canonicalization = xml_sec::policy::GeneratedCanonicalization::ExplicitC14n11;
+    assert!(matches!(
+        compatibility().restrict(&layer),
+        Err(PolicyViolation::Configuration { .. })
+    ));
 }
 
 #[cfg(feature = "xmlenc")]
@@ -505,6 +605,23 @@ fn all_named_profiles_compile_and_legacy_requires_auditable_expiry() {
                 .transforms
                 .xslt_stylesheet_semantics,
             expected,
+            "{profile:?}"
+        );
+        // Only the libxmlsec1-compatible profile signs a node set as libxmlsec1
+        // does, leaving its conversion implicit, so it writes the donor's
+        // templates and digests.
+        let generated = if profile == PolicyProfile::XmlSecCompatible {
+            xml_sec::policy::GeneratedCanonicalization::Implicit
+        } else {
+            xml_sec::policy::GeneratedCanonicalization::ExplicitC14n11
+        };
+        assert_eq!(
+            compiled
+                .signing()
+                .unwrap()
+                .transforms
+                .generated_canonicalization,
+            generated,
             "{profile:?}"
         );
         // Only the libxmlsec1-compatible profile stops on any X509Data child

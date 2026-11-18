@@ -63,7 +63,10 @@ use super::transforms::{
     map_c14n_resource_policy_violation, transform_chain_uses_implicit_c14n,
 };
 use super::types::{NodeSet, TransformError, subtree_node_id_range};
-use super::uri::{ExternalResourceMapError, UriReferenceResolver, validate_external_resource_map};
+use super::uri::{
+    ExternalResourceMapError, ExternalResourceSet, LazyExternalResources, UriReferenceResolver,
+    validate_external_resource_map,
+};
 use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_bytes};
 
 mod session;
@@ -469,6 +472,8 @@ pub enum SignatureSelection<'a> {
     FirstDocumentSignature,
     /// Select the first descendant `Signature` below the element with this ID.
     FirstSignatureUnderId(&'a str),
+    /// Select exactly this `Signature` element of the verified document.
+    Exact(NodeIdentity),
 }
 
 /// Verification builder/configuration.
@@ -486,7 +491,7 @@ pub struct VerifyContext<'a> {
     provider: &'a dyn crate::provider::CryptoProvider,
     xml_backend: crate::XmlBackend,
     store_pre_digest: bool,
-    external_resources: Option<&'a BTreeMap<String, Vec<u8>>>,
+    external_resources: Option<ExternalResourceSet<'a>>,
     signature_selection: SignatureSelection<'a>,
     id_attributes: &'a [crate::IdAttributeRegistration],
 }
@@ -552,6 +557,14 @@ impl<'a> VerifyContext<'a> {
     /// Replace the complete immutable verification policy snapshot.
     pub fn policy(mut self, policy: crate::policy::VerificationPolicy) -> Self {
         self.policy = Arc::new(policy);
+        self.identity = None;
+        self
+    }
+
+    /// Enforce a shared immutable policy snapshot without copying it, as an
+    /// application that publishes one snapshot to many operations does.
+    pub fn shared_policy(mut self, policy: Arc<crate::policy::VerificationPolicy>) -> Self {
+        self.policy = policy;
         self.identity = None;
         self
     }
@@ -644,7 +657,31 @@ impl<'a> VerifyContext<'a> {
     /// identities: use normalized paths with dot segments removed and retain
     /// query or fragment suffixes.
     pub fn external_resources(mut self, resources: &'a BTreeMap<String, Vec<u8>>) -> Self {
-        self.external_resources = Some(resources);
+        self.external_resources = Some(ExternalResourceSet::Map(resources));
+        self
+    }
+
+    /// Provide external URI payloads on demand, in place of
+    /// [`Self::external_resources`]: a resource is fetched only when a
+    /// reference dereferences it, and every signature's `SignatureValue` is
+    /// checked before its references are, so a forged signature fetches none
+    /// of the resources it names. The same URI and policy rules apply. The
+    /// two sources are alternatives: the one set last is used. External key
+    /// material is never read from this source, so a verifier that needs it
+    /// supplies every resource through [`Self::external_resources`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use xml_sec::xmldsig::VerifyContext;
+    /// use xml_sec::xmldsig::uri::LazyExternalResources;
+    ///
+    /// let fetch = |_: &str| None;
+    /// let resources = LazyExternalResources::new(["urn:payload".to_owned()], &fetch);
+    /// let _context = VerifyContext::new().lazy_external_resources(&resources);
+    /// ```
+    pub fn lazy_external_resources(mut self, resources: &'a LazyExternalResources<'a>) -> Self {
+        self.external_resources = Some(ExternalResourceSet::Lazy(resources));
         self
     }
 
@@ -664,6 +701,16 @@ impl<'a> VerifyContext<'a> {
     /// default remains fail-closed and requires a unique document signature.
     pub fn first_document_signature(mut self) -> Self {
         self.signature_selection = SignatureSelection::FirstDocumentSignature;
+        self
+    }
+
+    /// Verify exactly the `Signature` element `signature`, an identity of the
+    /// document passed to [`Self::verify_document`] or [`Self::verify_parsed`].
+    ///
+    /// This is the caller-selected operation node of libxmlsec1's
+    /// `xmlSecDSigCtxVerify`; other signatures of the document are ignored.
+    pub fn signature(mut self, signature: NodeIdentity) -> Self {
+        self.signature_selection = SignatureSelection::Exact(signature);
         self
     }
 
@@ -1380,6 +1427,14 @@ fn bind_external_evidence(
     let OperationResourceIdentity::BorrowedExternal { uri, .. } = observed else {
         return;
     };
+    // A listed resource its source did not supply has no bytes to describe;
+    // a fetched one is resident, whether its digest matched or not.
+    if matches!(
+        result.status,
+        DsigStatus::Invalid(FailureReason::ReferenceUnavailable { .. })
+    ) {
+        return;
+    }
     // Without transforms a valid SHA-256 DigestValue was just compared against
     // the digest of exactly these bytes, so it is their fingerprint.
     let digested = (result.status == DsigStatus::Valid
@@ -1987,6 +2042,8 @@ fn is_reference_local_transform_error(error: &TransformError) -> bool {
             | TransformError::AccountedElementNotFound(_)
             | TransformError::UnsupportedUri(_)
             | TransformError::AccountedUnsupportedUri(_)
+            | TransformError::ExternalResourceFragment(_)
+            | TransformError::AccountedExternalResourceFragment(_)
             | TransformError::InvalidFragment
             | TransformError::UnsupportedTransform(_)
             | TransformError::AccountedUnsupportedTransform(_)
@@ -2665,7 +2722,7 @@ fn with_verified_document<'inputs, R, S: RequestStorage>(
         captured_context = {
             let mut captured = ctx.clone();
             if let Some(resources) = request.external_resources {
-                captured.external_resources = Some(resources);
+                captured.external_resources = Some(ExternalResourceSet::Map(resources));
             }
             if capture_time {
                 // Without a host clock this stays `None`; key resolution then
@@ -2702,7 +2759,7 @@ fn with_verified_document<'inputs, R, S: RequestStorage>(
                 ctx.policy.resources.max_external_resource_total_bytes,
             );
         let resolver = match ctx.external_resources {
-            Some(resources) => resolver.with_external_resources(resources),
+            Some(resources) => resolver.with_external_resource_set(resources),
             None => resolver,
         };
         for signature in view.document().descendants().filter(is_signature) {
@@ -2809,7 +2866,7 @@ fn verify_signature_view(
             ctx.policy.resources.max_external_resource_total_bytes,
         );
     let resolver = match ctx.external_resources {
-        Some(resources) => resolver.with_external_resources(resources),
+        Some(resources) => resolver.with_external_resource_set(resources),
         None => resolver,
     };
     let start_node = match ctx.signature_selection {
@@ -2817,6 +2874,15 @@ fn verify_signature_view(
             resolver.node_for_id(id).ok_or_else(|| {
                 SignatureVerificationPipelineError::SelectedNodeUnavailable { id: id.to_owned() }
             })?
+        }
+        SignatureSelection::Exact(identity) => {
+            let node = view.resolve_node(identity)?;
+            if !node.has_tag_name((XMLDSIG_NS, "Signature")) {
+                return Err(SignatureVerificationPipelineError::InvalidStructure {
+                    reason: "the selected node is not a Signature element",
+                });
+            }
+            return verify_signature_node(view, ctx, ctx.key, operation, &resolver, node, &());
         }
         SignatureSelection::UniqueDocumentSignature
         | SignatureSelection::FirstDocumentSignature => doc.root(),
@@ -2838,7 +2904,8 @@ fn verify_signature_view(
         (
             Some(node),
             SignatureSelection::FirstDocumentSignature
-            | SignatureSelection::FirstSignatureUnderId(_),
+            | SignatureSelection::FirstSignatureUnderId(_)
+            | SignatureSelection::Exact(_),
         ) => node,
         (Some(node), SignatureSelection::UniqueDocumentSignature)
             if signatures.next().is_none() =>
@@ -3245,7 +3312,10 @@ fn validate_verification_inputs(
         ctx.allowed_transform_uris(),
     )?;
     enforce_transform_allowed(ctx.allowed_transform_uris(), signed_info.c14n_method.uri())?;
-    if let Some(resources) = ctx.external_resources {
+    if let Some(resources) = ctx
+        .external_resources
+        .and_then(ExternalResourceSet::supplied)
+    {
         validate_external_resource_map(
             resources,
             ctx.policy.resources.max_external_resource_bytes,
@@ -4248,7 +4318,7 @@ fn materialize_external_key_info<P: KeyInfoReferencePolicy>(
             (resource, (!fragment.is_empty()).then_some(fragment))
         });
     let bytes = resolver
-        .external_resource(resource_uri)
+        .key_material_resource(resource_uri)
         .map_err(|error| {
             SignatureVerificationPipelineError::from(ReferenceProcessingError::UriDereference(
                 error,
@@ -4769,7 +4839,7 @@ fn visit_external_encapsulation<P: KeyInfoReferencePolicy>(
             reason: "KeyInfoReference safety depth exceeded",
         });
     }
-    let bytes = match resolver.external_resource(resource) {
+    let bytes = match resolver.key_material_resource(resource) {
         Ok(Some(bytes)) => bytes,
         Err(TransformError::Policy(violation)) => {
             return Err(DsigError::Policy(violation));
@@ -5325,9 +5395,11 @@ fn materialize_raw_certificate<P: KeyInfoReferencePolicy>(
         }
         .into());
     }
-    let certificate = resolver.external_resource(&resolved_uri).map_err(|error| {
-        SignatureVerificationPipelineError::from(ReferenceProcessingError::Transform(error))
-    })?;
+    let certificate = resolver
+        .key_material_resource(&resolved_uri)
+        .map_err(|error| {
+            SignatureVerificationPipelineError::from(ReferenceProcessingError::Transform(error))
+        })?;
     let Some(certificate) = certificate else {
         outcome.deferred_error.get_or_insert_with(|| {
             SignatureVerificationPipelineError::Reference(ReferenceProcessingError::Transform(

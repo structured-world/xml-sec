@@ -229,6 +229,90 @@ impl RecoveredContentKey {
         }
         Ok(core::mem::take(&mut *self.bytes))
     }
+
+    /// Consume a recovery whose key leaves for a content operation that
+    /// cannot carry its validity, such as a key handed through a C
+    /// interface. A rejected RSAES-PKCS1-v1_5 recovery yields its random
+    /// substitute of the same width, and nothing tells the two apart: the
+    /// content operation fails as it fails with any wrong key
+    /// (XML Encryption 1.1 section 6.1.2).
+    /// <https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-bleichenbacher-attack>
+    ///
+    /// # Errors
+    /// Returns `KeyNotExportable` for an opaque handle, or
+    /// `AuthenticationFailed` for an invalid recovery of a mechanism whose
+    /// failure is already public.
+    pub fn into_key_or_substitute(mut self) -> Result<zeroize::Zeroizing<Vec<u8>>, ProviderError> {
+        if self.opaque.is_some() {
+            return Err(ProviderError::KeyNotExportable);
+        }
+        // Branches on the public recovery mechanism, never on padding validity.
+        if !self.implicit_rejection && !self.valid() {
+            return Err(ProviderError::AuthenticationFailed);
+        }
+        Ok(core::mem::take(&mut self.bytes))
+    }
+
+    /// [`Self::into_key_or_substitute`] with the recovery's validity, for a
+    /// key that leaves through an interface that cannot carry it but whose
+    /// content operation can consult it once its content work is done
+    /// (XML Encryption 1.1 section 6.1.2).
+    /// <https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-bleichenbacher-attack>
+    ///
+    /// # Errors
+    /// As for [`Self::into_key_or_substitute`].
+    pub fn into_key_with_validity(
+        self,
+    ) -> Result<(zeroize::Zeroizing<Vec<u8>>, RecoveryValidity), ProviderError> {
+        // `into_key_or_substitute` hands out an implicitly rejected recovery
+        // whatever its validity, which travels with it here, and fails any
+        // other mechanism's invalid recovery at once.
+        let validity = RecoveryValidity(self.valid);
+        self.into_key_or_substitute().map(|key| (key, validity))
+    }
+}
+
+/// Whether a key recovery was valid, kept apart from its key so the content
+/// operation the key serves consults it only after its content work. Debug
+/// output never shows it.
+#[cfg(feature = "xmlenc")]
+#[derive(Clone, Copy)]
+pub struct RecoveryValidity(subtle::Choice);
+
+#[cfg(feature = "xmlenc")]
+impl RecoveryValidity {
+    /// The validity of keys whose recovery cannot be rejected implicitly.
+    #[must_use]
+    pub fn accepted() -> Self {
+        Self(subtle::Choice::from(1))
+    }
+
+    /// The validity of keys recovered by `self` and by `other` together.
+    #[must_use]
+    pub fn and(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    /// Whether every recovery was valid. Consult only once the content work
+    /// the keys served is done.
+    #[must_use]
+    pub fn is_valid(self) -> bool {
+        bool::from(self.0)
+    }
+}
+
+#[cfg(feature = "xmlenc")]
+impl Default for RecoveryValidity {
+    fn default() -> Self {
+        Self::accepted()
+    }
+}
+
+#[cfg(feature = "xmlenc")]
+impl core::fmt::Debug for RecoveryValidity {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RecoveryValidity").finish_non_exhaustive()
+    }
 }
 #[cfg(all(feature = "aws-lc-fips", feature = "xmlenc"))]
 pub use aws_lc::AwsLcRsaPrivateKey;
@@ -1653,6 +1737,23 @@ impl RustCryptoRsaPublicKey {
             modulus,
             exponent,
         }
+    }
+
+    /// Decode an RSA `SubjectPublicKeyInfo`, for a caller that holds the key
+    /// as DER rather than as a parsed `RustCrypto` key.
+    ///
+    /// # Errors
+    /// Returns [`ProviderError::InvalidInput`] for DER that is no valid RSA
+    /// public key.
+    pub fn from_spki_der(spki: &[u8]) -> Result<Self, ProviderError> {
+        use crate::rsa_encoding::RsaPublicKeyEncoding as _;
+        rsa::RsaPublicKey::from_public_key_der(spki)
+            .map(Self::new)
+            .map_err(|_| {
+                ProviderError::InvalidInput(ProviderInputError::PrimitiveInitialization(
+                    "RSA public key",
+                ))
+            })
     }
 }
 
@@ -3307,6 +3408,26 @@ mod tests {
                 assert_eq!(a.same_candidate(&b), left == right);
             }
         }
+    }
+
+    #[cfg(feature = "xmlenc")]
+    #[test]
+    fn a_failed_public_recovery_fails_when_its_validity_is_carried() {
+        // Only an implicitly rejected recovery hides its failure behind a
+        // substitute; any other mechanism's failure is already public, so
+        // handing the key out with its validity fails at once, as handing
+        // it out without its validity does.
+        let mut key = RecoveredContentKey::confirmed(vec![0x52; 16]);
+        key.valid = subtle::Choice::from(0);
+        assert!(matches!(
+            key.into_key_with_validity(),
+            Err(ProviderError::AuthenticationFailed)
+        ));
+        let (bytes, validity) = RecoveredContentKey::confirmed(vec![0x52; 16])
+            .into_key_with_validity()
+            .expect("a confirmed key is handed out");
+        assert_eq!(*bytes, vec![0x52; 16]);
+        assert!(validity.is_valid());
     }
 
     #[cfg(all(feature = "legacy-algorithms", feature = "xmlenc"))]

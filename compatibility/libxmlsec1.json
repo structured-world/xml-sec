@@ -9275,7 +9275,7 @@
       "kind": "backend-api",
       "name": "xmlSecOpenSSLKeysStoreAdoptKey",
       "source": "include/xmlsec/openssl/keysstore.h",
-      "detail": "XMLSEC_CRYPTO_EXPORT int xmlSecOpenSSLKeysStoreAdoptKey(xmlSecKeyStorePtr store, xmlSecKeyPtr key);",
+      "detail": "XMLSEC_CRYPTO_EXPORT int xmlSecOpenSSLKeysStoreAdoptKey (xmlSecKeyStorePtr store, xmlSecKeyPtr key);",
       "conditions": [
         "#ifndef XMLSEC_OPENSSL_KEYSSTORE_H"
       ],
@@ -9285,7 +9285,7 @@
       "kind": "backend-api",
       "name": "xmlSecOpenSSLKeysStoreGetKlass",
       "source": "include/xmlsec/openssl/keysstore.h",
-      "detail": "XMLSEC_CRYPTO_EXPORT xmlSecKeyStoreId xmlSecOpenSSLKeysStoreGetKlass(void);",
+      "detail": "XMLSEC_CRYPTO_EXPORT xmlSecKeyStoreId xmlSecOpenSSLKeysStoreGetKlass (void);",
       "conditions": [
         "#ifndef XMLSEC_OPENSSL_KEYSSTORE_H"
       ],
@@ -26096,7 +26096,7 @@
       "kind": "export-function",
       "name": "xmlSecCryptoDLGetLibraryFunctions",
       "source": "include/xmlsec/dl.h",
-      "detail": "XMLSEC_EXPORT xmlSecCryptoDLFunctionsPtr xmlSecCryptoDLGetLibraryFunctions(const xmlChar* crypto);",
+      "detail": "XMLSEC_EXPORT xmlSecCryptoDLFunctionsPtr xmlSecCryptoDLGetLibraryFunctions (const xmlChar* crypto);",
       "conditions": [
         "#ifndef XMLSEC_DL_H",
         "#ifndef XMLSEC_NO_CRYPTO_DYNAMIC_LOADING"
@@ -56587,7 +56587,7 @@
       "kind": "typedef",
       "name": "xmlSecKeyX509DataValue",
       "source": "include/xmlsec/x509.h",
-      "detail": "typedef struct _xmlSecKeyX509DataValue xmlSecKeyX509DataValue;",
+      "detail": "typedef struct _xmlSecKeyX509DataValue xmlSecKeyX509DataValue, *xmlSecKeyX509DataValuePtr;",
       "conditions": [
         "#ifndef XMLSEC_X509_H"
       ],
@@ -56597,7 +56597,7 @@
       "kind": "typedef",
       "name": "xmlSecKeyX509DataValuePtr",
       "source": "include/xmlsec/x509.h",
-      "detail": "typedef struct _xmlSecKeyX509DataValue *xmlSecKeyX509DataValuePtr;",
+      "detail": "typedef struct _xmlSecKeyX509DataValue xmlSecKeyX509DataValue, *xmlSecKeyX509DataValuePtr;",
       "conditions": [
         "#ifndef XMLSEC_X509_H"
       ],

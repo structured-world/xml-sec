@@ -874,6 +874,166 @@ fn empty_digest_input_reaches_the_compiled_snapshots() {
     ));
 }
 
+#[test]
+fn generated_canonicalization_reaches_the_compiled_snapshots() {
+    // How signing completes a node-set chain reaches the compiled signing
+    // snapshot: explicit C14N 1.1 by default and implicit in the
+    // libxmlsec1-compatible profile. It is an interpretation, so a layer
+    // restates its base's and cannot change it; unknown names are schema
+    // errors.
+    use xml_sec::policy::GeneratedCanonicalization;
+    let config = |base: &str, extra: &str| {
+        Configuration::from_str(
+            &format!("schema_version = 1\n[profiles.team]\nbase = '{base}'\n{extra}"),
+            LoadLimits::default(),
+        )
+    };
+    let decision = |base: &str, extra: &str| {
+        effective(&config(base, extra).expect("strict config"), "team")
+            .compiled()
+            .signing()
+            .unwrap()
+            .transforms
+            .generated_canonicalization
+    };
+    let implicit = "[profiles.team.signing.transforms]\ngenerated_canonicalization='Implicit'";
+    assert_eq!(
+        decision("Modern", ""),
+        GeneratedCanonicalization::ExplicitC14n11
+    );
+    assert_eq!(
+        decision("XmlSecCompatible", ""),
+        GeneratedCanonicalization::Implicit
+    );
+    assert_eq!(
+        decision("XmlSecCompatible", implicit),
+        GeneratedCanonicalization::Implicit
+    );
+    let changed = config("Modern", implicit).expect("strict config");
+    assert!(matches!(
+        changed.compile(
+            "team",
+            default_provider(),
+            &PolicyCompileContext {
+                external_resources: false,
+                target_evidence: true,
+            },
+            None,
+        ),
+        Err(xml_sec_config::Error::Policy(
+            xml_sec::policy::PolicyViolation::Configuration { .. }
+        ))
+    ));
+    assert!(matches!(
+        config(
+            "Modern",
+            "[profiles.team.signing.transforms]\ngenerated_canonicalization='Sometimes'"
+        ),
+        Err(xml_sec_config::Error::Schema(message)) if message.contains("generated_canonicalization")
+    ));
+}
+
+#[test]
+fn generated_canonicalization_is_a_signing_setting_only() {
+    // Only signing generates a canonicalization: a verification or
+    // decryption table naming one sets nothing, so it is a schema error, and
+    // the effective output reports the setting for signing alone.
+    let config = |extra: &str| {
+        Configuration::from_str(
+            &format!("schema_version = 1\n[profiles.team]\nbase = 'XmlSecCompatible'\n{extra}"),
+            LoadLimits::default(),
+        )
+    };
+    let mut tables = vec!["verification"];
+    if cfg!(feature = "xmlenc") {
+        tables.push("decryption");
+    }
+    for table in tables {
+        assert!(
+            matches!(
+                config(&format!(
+                    "[profiles.team.{table}.transforms]\ngenerated_canonicalization='Implicit'"
+                )),
+                Err(xml_sec_config::Error::Schema(message))
+                    if message.contains("generated_canonicalization")
+            ),
+            "{table}"
+        );
+    }
+    // Without XML Encryption there is no decryption table to enable.
+    let extra = if cfg!(feature = "xmlenc") {
+        "[profiles.team.decryption]\nenabled=true"
+    } else {
+        ""
+    };
+    let output = effective(&config(extra).expect("strict config"), "team")
+        .to_toml()
+        .expect("effective output");
+    assert_eq!(
+        output.matches("generated_canonicalization").count(),
+        1,
+        "{output}"
+    );
+    let restored =
+        Configuration::from_str(&output, LoadLimits::default()).expect("effective configuration");
+    assert_eq!(
+        effective(&restored, "effective")
+            .to_toml()
+            .expect("round trip"),
+        output
+    );
+}
+
+#[test]
+fn request_selections_reach_the_compiled_snapshots() {
+    // A deployment lists what a request may select: the libxmlsec1 profile
+    // lists libxmlsec1's selections, a layer can narrow them, and unknown
+    // values are schema errors.
+    use std::collections::BTreeSet;
+    use xml_sec::policy::{RequestSelections, SameDocumentIdSemantics};
+    let config = |base: &str, extra: &str| {
+        Configuration::from_str(
+            &format!("schema_version = 1\n[profiles.team]\nbase = '{base}'\n{extra}"),
+            LoadLimits::default(),
+        )
+    };
+    let selections = |base: &str, extra: &str| {
+        effective(&config(base, extra).expect("strict config"), "team")
+            .compiled()
+            .verification()
+            .unwrap()
+            .request_selections
+            .clone()
+    };
+    assert_eq!(
+        selections("XmlSecCompatible", ""),
+        RequestSelections::libxmlsec1()
+    );
+    assert_eq!(selections("Modern", ""), RequestSelections::default());
+    let narrowed = selections(
+        "XmlSecCompatible",
+        "[profiles.team.verification.request_selections]\n\
+         same_document_id_semantics=['XmlSecVisa3d']\n\
+         ecdsa_signature_value_encodings=[]\nmanifest_processing=[]",
+    );
+    // Every set is narrowed to exactly what the layer lists.
+    assert_eq!(
+        narrowed,
+        RequestSelections {
+            same_document_id_semantics: BTreeSet::from([SameDocumentIdSemantics::XmlSecVisa3d]),
+            ecdsa_signature_value_encodings: BTreeSet::new(),
+            manifest_processing: BTreeSet::new(),
+        }
+    );
+    assert!(matches!(
+        config(
+            "Modern",
+            "[profiles.team.verification.request_selections]\nmanifest_processing=['Sometimes']"
+        ),
+        Err(xml_sec_config::Error::Schema(message)) if message.contains("manifest_processing")
+    ));
+}
+
 #[cfg(feature = "xmldsig-sign")]
 #[test]
 fn configured_snapshots_enforce_real_sign_and_verify_limits() {

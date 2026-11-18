@@ -776,8 +776,13 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetDebugDump(
                     }
                 }
             }
-            let count = nodes::node_set_members(member.nodes).len();
-            write(&format!("  nodes: {count}\n"));
+            if member.nodes.is_null() {
+                // A member without a node list is the whole document.
+                write("  nodes: (whole document)\n");
+            } else {
+                let count = nodes::node_set_members(member.nodes).len();
+                write(&format!("  nodes: {count}\n"));
+            }
             current = member.next;
             if current.is_null() {
                 errors::assertion(here, c"curNset != NULL");

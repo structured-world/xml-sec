@@ -148,8 +148,11 @@ impl Target {
                 "tests/c/digests.c",
                 "tests/c/hmac.c",
                 "tests/c/signatures.c",
+                "tests/c/ciphers.c",
                 "tests/c/app.c",
                 "tests/c/x509.c",
+                "tests/c/xmldsig.c",
+                "tests/c/xmlenc.c",
             ],
         }
     }

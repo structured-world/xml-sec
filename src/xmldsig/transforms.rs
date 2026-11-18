@@ -1307,8 +1307,9 @@ mod chain_policy_sealed {
 }
 
 /// An operation policy snapshot that governs a reference chain: the
-/// verification policy of a verifier, the signing policy of a signer, each
-/// with its own transform permissions, XML allowances and limits.
+/// verification policy of a verifier, the signing policy of a signer, the
+/// decryption policy of a decryptor reading a `CipherReference`, each with
+/// its own transform permissions, XML allowances and limits.
 pub trait TransformChainPolicy: chain_policy_sealed::Sealed {
     #[doc(hidden)]
     fn validate_snapshot(&self) -> Result<(), crate::policy::PolicyViolation>;
@@ -1349,6 +1350,10 @@ macro_rules! impl_chain_policy {
 
 impl_chain_policy!(crate::policy::VerificationPolicy);
 impl_chain_policy!(crate::policy::SigningPolicy);
+// XML Encryption 1.1 section 3.3.1: a CipherReference's Transforms are
+// processed as a signature reference's are, under the decryptor's policy.
+#[cfg(feature = "xmlenc")]
+impl_chain_policy!(crate::policy::DecryptionPolicy);
 
 /// Execute a standalone reference chain under a trusted operation policy
 /// snapshot: a [`VerificationPolicy`](crate::policy::VerificationPolicy) for
@@ -1579,8 +1584,9 @@ pub(crate) fn enveloped_signature_for_reference<'a, E, I: Instruction>(
 pub(crate) struct TransformDependencyOutput {
     pub(crate) dependencies: Set<usize>,
     /// The output's digest, present when the execution proved the output
-    /// independent of every tracked field, so a later execution would repeat it.
-    pub(crate) digest: Option<super::DigestOutput>,
+    /// independent of every tracked field, so a later execution would repeat
+    /// it; with the bytes it covered when the request retains them.
+    pub(crate) digest: Option<ReferenceDigest>,
 }
 
 struct TransformChainOutput<T> {
@@ -1925,7 +1931,7 @@ impl TransformTerminal<Native> for CollectTerminal {
 struct AnalysisTerminal<'p>(Option<DigestRequest<'p>>);
 #[cfg(feature = "xmldsig-sign")]
 impl TransformTerminal<Native> for AnalysisTerminal<'_> {
-    type Output = Option<super::DigestOutput>;
+    type Output = Option<ReferenceDigest>;
     type Error = ReferenceDigestError;
 
     fn settle(&mut self, independent: bool) {
@@ -1946,11 +1952,7 @@ impl TransformTerminal<Native> for AnalysisTerminal<'_> {
         budget: &TransformExecutionBudget,
     ) -> Result<Self::Output, ReferenceDigestError> {
         self.0
-            .map(|request| {
-                DigestTerminal(request)
-                    .finish(data, explicit, budget)
-                    .map(|digest| digest.digest)
-            })
+            .map(|request| DigestTerminal(request).finish(data, explicit, budget))
             .transpose()
     }
 
@@ -1961,11 +1963,7 @@ impl TransformTerminal<Native> for AnalysisTerminal<'_> {
         scratch: &Native,
     ) -> Result<Self::Output, ReferenceDigestError> {
         self.0
-            .map(|request| {
-                DigestTerminal(request)
-                    .finish_base64(data, budget, scratch)
-                    .map(|digest| digest.digest)
-            })
+            .map(|request| DigestTerminal(request).finish_base64(data, budget, scratch))
             .transpose()
     }
 }
