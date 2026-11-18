@@ -2784,6 +2784,59 @@ fn signing_leaves_a_node_set_conversion_implicit_as_xmlsec1_does() {
             .arg(&public_key)
             .arg(&signed),
     );
+
+    // A fragment under an element carrying xml:id tells the versions apart:
+    // Canonical XML 1.0 renders the ancestor's xml: attributes on the
+    // subset's apex (Canonical XML 1.0 section 2.4), 1.1 leaves xml:id out
+    // (Canonical XML 1.1 section 2.4), so only the 1.0 digest matches.
+    fs::write(
+        &template,
+        r##"<root xml:id="r"><payload Id="p">payload</payload><Signature xmlns="http://www.w3.org/2000/09/xmldsig#"><SignedInfo><CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><Reference URI="#p"><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue/></Reference></SignedInfo><SignatureValue/></Signature></root>"##,
+    )
+    .unwrap();
+    run_success(
+        Command::new(binary())
+            .args(["sign", "--add-id-attr", "Id", "--privkey-pem"])
+            .arg(&private_key)
+            .args(["--output"])
+            .arg(&signed)
+            .arg(&template),
+    );
+    let xml = fs::read_to_string(&signed).unwrap();
+    let document = roxmltree::Document::parse(&xml).unwrap();
+    assert!(
+        !document
+            .descendants()
+            .any(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "Transform"))),
+        "{xml}"
+    );
+    let digest_of = |canonical: &[u8]| {
+        base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            <sha2::Sha256 as sha2::Digest>::digest(canonical),
+        )
+    };
+    let digest_value = document
+        .descendants()
+        .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "DigestValue")))
+        .and_then(|node| node.text())
+        .unwrap();
+    assert_eq!(
+        digest_value,
+        digest_of(br#"<payload Id="p" xml:id="r">payload</payload>"#),
+        "{xml}"
+    );
+    assert_ne!(
+        digest_value,
+        digest_of(br#"<payload Id="p">payload</payload>"#),
+        "C14N 1.1 would leave the inherited xml:id out"
+    );
+    run_success(
+        Command::new(binary())
+            .args(["verify", "--add-id-attr", "Id", "--pubkey-pem"])
+            .arg(&public_key)
+            .arg(&signed),
+    );
 }
 
 #[test]

@@ -1903,9 +1903,9 @@ fn lazy_resources_are_fetched_one_by_one_within_the_aggregate_allowance() {
     let xml = format!(
         r#"<ds:Signature xmlns:ds="{XMLDSIG_NS}"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>{references}</ds:SignedInfo><ds:SignatureValue>AQ==</ds:SignatureValue></ds:Signature>"#
     );
-    let fetched = core::cell::Cell::new(0_usize);
-    let fetch = |_: &str| {
-        fetched.set(fetched.get() + 1);
+    let fetched = core::cell::RefCell::new(Vec::new());
+    let fetch = |uri: &str| {
+        fetched.borrow_mut().push(uri.to_owned());
         Some(payload.to_vec())
     };
     let resources = super::super::uri::LazyExternalResources::new(
@@ -1937,7 +1937,11 @@ fn lazy_resources_are_fetched_one_by_one_within_the_aggregate_allowance() {
             .to_string()
             .contains("aggregate external resource bytes")
     );
-    assert_eq!(fetched.get(), 2, "a resource was fetched before its turn");
+    assert_eq!(
+        *fetched.borrow(),
+        ["urn:one", "urn:two"],
+        "a resource was fetched before its turn"
+    );
 }
 
 #[test]
@@ -1966,7 +1970,7 @@ fn a_key_info_reference_never_fetches_from_lazy_resources() {
 
     let forged = VerifyContext::new()
         .key(&RejectingKey)
-        .policy(policy)
+        .policy(policy.clone())
         .lazy_external_resources(&resources)
         .verify(&xml);
 
@@ -1975,6 +1979,24 @@ fn a_key_info_reference_never_fetches_from_lazy_resources() {
         "a forged signature verified"
     );
     assert_eq!(fetched.get(), 0, "key material came from the lazy source");
+
+    // A resolver that reads the KeyInfo makes the KeyInfoReference be
+    // materialized: the listed resource is not key material, so it stays
+    // unavailable there and the source is still asked for nothing.
+    let resolved = VerifyContext::new()
+        .key_resolver(&ConsumingKeyInfoResolver)
+        .policy(policy)
+        .lazy_external_resources(&resources)
+        .verify(&xml);
+    assert!(
+        !matches!(resolved, Ok(ref result) if result.status == DsigStatus::Valid),
+        "a signature verified without a key"
+    );
+    assert_eq!(
+        fetched.get(),
+        0,
+        "materializing the KeyInfo fetched from the lazy source"
+    );
 }
 
 #[test]
@@ -2771,6 +2793,62 @@ fn manifest_reference_without_caller_bytes_is_unavailable() {
         result.manifest_references[0].status,
         DsigStatus::Invalid(FailureReason::ReferenceUnavailable { ref_index: 0 })
     );
+}
+
+#[test]
+fn only_a_reference_that_obtained_its_bytes_has_resident_evidence() {
+    // Two Manifest References name one listed resource: the first fetches
+    // and digests it; the second is refused by the transform allowlist
+    // before it dereferences anything, so it carries neither resident
+    // evidence nor the fingerprint of the bytes the first one fetched.
+    const XPATH: &str = "http://www.w3.org/TR/1999/REC-xpath-19991116";
+    let payload = b"payload";
+    let digest = base64::engine::general_purpose::STANDARD.encode(crate::xmldsig::compute_digest(
+        DigestAlgorithm::Sha256,
+        payload,
+    ));
+    let xml = signature_with_manifest_xml_with_manifest_mutation(true, |xml| {
+        xml.replacen(
+            "<ds:Reference URI=\"#target\">",
+            &format!(
+                concat!(
+                    "<ds:Reference URI=\"urn:one\">",
+                    "<ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>",
+                    "<ds:DigestValue>{}</ds:DigestValue></ds:Reference>",
+                    "<ds:Reference URI=\"urn:one\"><ds:Transforms>",
+                    "<ds:Transform Algorithm=\"{}\"><ds:XPath>true()</ds:XPath></ds:Transform>",
+                    "</ds:Transforms>"
+                ),
+                digest, XPATH
+            ),
+            1,
+        )
+    });
+    let fetch = |_: &str| Some(payload.to_vec());
+    let resources = super::super::uri::LazyExternalResources::new(["urn:one".to_owned()], &fetch);
+    let result = VerifyContext::new()
+        .key(&AcceptingKey)
+        .process_manifests(true)
+        .allowed_uri_types(UriTypeSet::ALL)
+        .allowed_transforms([
+            "http://www.w3.org/2001/10/xml-exc-c14n#",
+            "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+        ])
+        .lazy_external_resources(&resources)
+        .verify(&xml)
+        .expect("a refused Manifest Reference is that Reference's own result");
+    assert_eq!(result.status, DsigStatus::Valid);
+    let [fetched, refused] = result.manifest_references.as_slice() else {
+        panic!("two Manifest References: {:?}", result.manifest_references);
+    };
+    assert_eq!(fetched.status, DsigStatus::Valid);
+    assert_eq!(fetched.external_payload, Some(ExternalPayload::Resident));
+    assert!(matches!(
+        refused.status,
+        DsigStatus::Invalid(FailureReason::ReferencePolicyViolation { .. })
+    ));
+    assert_eq!(refused.external_payload, None);
+    assert_eq!(refused.external_resource_fingerprint, None);
 }
 
 #[test]

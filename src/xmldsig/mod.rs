@@ -152,7 +152,7 @@ pub use transforms::{
     XSLT_TRANSFORM_URI, execute_transforms, execute_transforms_with_policy, parse_transforms,
 };
 pub use trust::{KeyTrustEvidence, ResolvedVerificationKey, TrustedPublicKey, X509TrustEvidence};
-pub use types::{NodeSet, TransformData, TransformError};
+pub use types::{KeptInputs, NodeSet, TransformData, TransformError};
 pub use utc_facts::{LeapSecondsError, LeapSecondsList};
 #[cfg(feature = "rustcrypto")]
 pub use verify::verify_signature_with_pem_key;

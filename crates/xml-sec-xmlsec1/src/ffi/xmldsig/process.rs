@@ -18,9 +18,9 @@ use xml_sec::policy::{
     SameDocumentIdSemantics, SigningPolicy, VerificationPolicy,
 };
 use xml_sec::xmldsig::{
-    DsigStatus, FailureReason, HmacSigningKey, HmacVerificationKey, ReferenceResult, SignContext,
-    SignatureAlgorithm, SignatureTemplateSelection, SigningKey, VerificationKey, VerifyContext,
-    VerifyResult, VerifyingKey, uri::LazyExternalResources,
+    DsigStatus, FailureReason, HmacSigningKey, HmacVerificationKey, KeptInputs, ReferenceResult,
+    SignContext, SignatureAlgorithm, SignatureTemplateSelection, SigningKey, VerificationKey,
+    VerifyContext, VerifyResult, VerifyingKey, uri::LazyExternalResources,
 };
 use xml_sec_libxml2::ffi::tree::{xsNodeGetChildren, xsNodeGetDoc};
 
@@ -202,6 +202,10 @@ unsafe fn process_signature_node(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode) ->
     let Some(pinned) = Pinned::current(here) else {
         return -1;
     };
+    // The signature's own chain reads its methods under that revision too:
+    // an HMAC method keeps the revision it was read under for its key.
+    // SAFETY: the context's own transform context.
+    unsafe { super::super::transforms::ctx::pin_run(&raw mut ctx.transform_ctx, &pinned) };
     let policies = match operation_policies(ctx, &pinned) {
         Ok(policies) => policies,
         Err(violation) => {
@@ -520,6 +524,12 @@ unsafe fn pending_resources(
 }
 
 /// Reads `resource` through the caller's input callbacks under `scope`.
+///
+/// The callbacks are asked for the URI as the element writes it, not as XML
+/// Base resolves it: libxmlsec1 opens `ctx->uri` as copied from the
+/// attribute (`xmlSecTransformCtxSetUri`), so callbacks written for it match
+/// those names. The octets each open returns are the ones the core digests
+/// for that element alone, whatever key it resolves the URI to.
 ///
 /// # Safety
 /// `resource` names live elements and contexts of `doc`.
@@ -1233,17 +1243,24 @@ unsafe fn run_verification(
         bytes
     };
     let resources = LazyExternalResources::new(keys.iter().cloned(), &fetch);
-    let store = ctx.flags
-        & (FLAGS_STORE_SIGNATURE
-            | FLAGS_STORE_SIGNEDINFO_REFERENCES
-            | FLAGS_STORE_MANIFEST_REFERENCES)
-        != 0;
+    // Each storage flag keeps its own inputs, and only those count against
+    // the operation's canonicalized-bytes limit.
+    let mut kept = KeptInputs::NONE;
+    if ctx.flags & FLAGS_STORE_SIGNATURE != 0 {
+        kept = kept.with_signed_info();
+    }
+    if ctx.flags & FLAGS_STORE_SIGNEDINFO_REFERENCES != 0 {
+        kept = kept.with_signed_info_references();
+    }
+    if ctx.flags & FLAGS_STORE_MANIFEST_REFERENCES != 0 {
+        kept = kept.with_manifest_references();
+    }
     let outcome = VerifyContext::new()
         .shared_policy(policy)
         .key(key.as_ref())
         .signature(signature)
         .lazy_external_resources(&resources)
-        .store_pre_digest(store)
+        .keep_inputs(kept)
         .verify_document(&document);
     let result = match outcome {
         Ok(result) => result,
@@ -1473,8 +1490,7 @@ unsafe fn run_signing(
             .and_then(std::num::NonZeroUsize::new);
     let manifests = policy.manifest_processing == ManifestProcessing::Process;
     // SAFETY: the context's own reference contexts.
-    let keep_inputs =
-        unsafe { stores_pre_digest(ctx, manifests) } || !ctx.pre_sign_mem_buf_method.is_null();
+    let kept = unsafe { kept_inputs(ctx, manifests) };
     let signed = xml_sec_libxml2::document::with_document(node, &**policy, |document, _| {
         let Some(template) = identity_in(document, external) else {
             return Err("the template is not in its document".to_owned());
@@ -1490,12 +1506,12 @@ unsafe fn run_signing(
         // The storage flags keep the bytes the core digested and signed, as
         // libxmlsec1 keeps them from its one run of each chain: nothing runs
         // again, and the work stays within the operation's own budgets.
-        if keep_inputs {
-            context
-                .sign_document_keeping_inputs(document)
-                .map(|(_, inputs)| Some(inputs))
-        } else {
+        if kept == KeptInputs::NONE {
             context.sign_document(document).map(|_| None)
+        } else {
+            context
+                .sign_document_keeping(document, kept)
+                .map(|(_, inputs)| Some(inputs))
         }
         .map_err(|error| error.to_string())
     });
@@ -1579,18 +1595,30 @@ unsafe fn signed_reference(reference: &mut XmlSecDSigReferenceCtx) {
     }
 }
 
-/// Whether a storage flag keeps the pre-digest bytes of a reference: one of
-/// `SignedInfo`'s, or of a Manifest when `manifests` are processed.
+/// The inputs the context's storage buffers ask the core to keep: the
+/// canonical `SignedInfo` for its pre-signature buffer, and the pre-digest
+/// bytes of `SignedInfo`'s references or, when `manifests` are processed,
+/// of a Manifest's for a reference holding a pre-digest buffer. Nothing else
+/// is retained or charged.
 ///
 /// # Safety
 /// The context's lists hold read reference contexts.
-unsafe fn stores_pre_digest(ctx: &mut XmlSecDSigCtx, manifests: bool) -> bool {
+unsafe fn kept_inputs(ctx: &mut XmlSecDSigCtx, manifests: bool) -> KeptInputs {
     let stores = |list| {
         // SAFETY: by the caller's contract.
         unsafe { references(list) }.any(|reference| !reference.pre_digest_mem_buf_method.is_null())
     };
-    stores(&raw mut ctx.signed_info_references)
-        || (manifests && stores(&raw mut ctx.manifest_references))
+    let mut kept = KeptInputs::NONE;
+    if !ctx.pre_sign_mem_buf_method.is_null() {
+        kept = kept.with_signed_info();
+    }
+    if stores(&raw mut ctx.signed_info_references) {
+        kept = kept.with_signed_info_references();
+    }
+    if manifests && stores(&raw mut ctx.manifest_references) {
+        kept = kept.with_manifest_references();
+    }
+    kept
 }
 
 /// Fills the pre-digest buffer of each reference context of `list` that has

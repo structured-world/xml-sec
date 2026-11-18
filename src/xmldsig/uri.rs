@@ -889,7 +889,7 @@ impl<'a> UriReferenceResolver<'a> {
         }
         let resolved = resolve_uri_from_node_with_budget(origin, uri, xml_base_budget)
             .map_err(map_xml_base_resolution_error)?;
-        self.dereference_with_budget(&resolved, budget)
+        self.dereference_external(&resolved)
     }
 
     /// Preserve an admitted external lookup's absence. Unsupported fragment
@@ -963,13 +963,20 @@ impl<'a> UriReferenceResolver<'a> {
         } else if let Some(fragment) = uri.strip_prefix('#') {
             self.dereference_fragment(fragment, budget)
         } else {
-            self.external_resource_input(uri)?
-                .map(|input| match input {
-                    ReferenceInput::Binary { bytes, uri } => TransformData::Resource { bytes, uri },
-                    ReferenceInput::Xml { .. } => unreachable!("external resources are octets"),
-                })
-                .ok_or_else(|| TransformError::ExternalResourceUnavailable(uri.to_string()))
+            self.dereference_external(uri)
         }
+    }
+
+    /// The caller-supplied resource an external reference names by `uri`,
+    /// whatever form `uri` took once resolved: a resolution that leaves only
+    /// a fragment still selects part of that resource, not of this document.
+    fn dereference_external(&self, uri: &str) -> Result<TransformData<'a>, TransformError> {
+        self.external_resource_input(uri)?
+            .map(|input| match input {
+                ReferenceInput::Binary { bytes, uri } => TransformData::Resource { bytes, uri },
+                ReferenceInput::Xml { .. } => unreachable!("external resources are octets"),
+            })
+            .ok_or_else(|| TransformError::ExternalResourceUnavailable(uri.to_string()))
     }
 
     /// Resolve a URI fragment (the part after `#`).

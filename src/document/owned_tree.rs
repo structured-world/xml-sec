@@ -701,8 +701,11 @@ impl OwnedTree {
         fragment: &str,
         policy: &impl XmlDocumentPolicy,
     ) -> Result<Option<TreeNode>, XmlDocumentError> {
-        let max_depth = policy.resource_policy().max_xml_depth;
-        self.parse_wrapped_in_context(context, fragment, max_depth, |parts| {
+        let limits = (
+            policy.resource_policy().max_xml_depth,
+            policy.xml_input_policy().allow_internal_dtd,
+        );
+        self.parse_wrapped_in_context(context, fragment, limits, |parts| {
             Self::parse_parts_with_policy(parts, policy)
         })
     }
@@ -723,8 +726,11 @@ impl OwnedTree {
         policy: &impl XmlDocumentPolicy,
         spent: &mut usize,
     ) -> Result<Option<TreeNode>, XmlDocumentError> {
-        let max_depth = policy.resource_policy().max_xml_depth;
-        self.parse_wrapped_in_context(context, fragment, max_depth, |parts| {
+        let limits = (
+            policy.resource_policy().max_xml_depth,
+            policy.xml_input_policy().allow_internal_dtd,
+        );
+        self.parse_wrapped_in_context(context, fragment, limits, |parts| {
             Self::parse_parts_within(parts, policy, spent)
         })
     }
@@ -732,12 +738,16 @@ impl OwnedTree {
     /// Parses `fragment` with `parse` inside an element declaring the
     /// bindings in scope at `context` and imports its nodes, refusing a
     /// fragment whose elements would lie deeper than `max_depth` below the
-    /// document node once linked at `context`.
+    /// document node once linked at `context`. When `internal_dtd` admits
+    /// it, the fragment also sees the document's internal subset, as
+    /// libxml2's `xmlParseInNodeContext` parses with the document's DTD: an
+    /// entity the document declares expands in the fragment as it does in
+    /// the document, so content dumped with its entity references parses back.
     fn parse_wrapped_in_context(
         &mut self,
         context: TreeNode,
         fragment: &str,
-        max_depth: usize,
+        (max_depth, internal_dtd): (usize, bool),
         parse: impl FnOnce(&[&[u8]]) -> Result<Self, XmlDocumentError>,
     ) -> Result<Option<TreeNode>, XmlDocumentError> {
         let id = self
@@ -752,7 +762,29 @@ impl OwnedTree {
             })?;
             self.bindings_in_scope(element)
         };
-        let mut wrapped = String::from("<w");
+        let root = self.document.root();
+        let subset = internal_dtd
+            .then(|| {
+                self.document
+                    .children(root)
+                    .find_map(|id| match &self.document.node(id).kind {
+                        NodeKind::DocumentType {
+                            internal_subset: Some(subset),
+                            ..
+                        } => Some(subset.as_str()),
+                        _ => None,
+                    })
+            })
+            .flatten();
+        let mut wrapped = String::new();
+        if let Some(subset) = subset {
+            // The wrapper is the document element the declarations apply to;
+            // a non-validating parse does not hold it to the declared name.
+            wrapped.push_str("<!DOCTYPE w [");
+            wrapped.push_str(subset);
+            wrapped.push_str("]>");
+        }
+        wrapped.push_str("<w");
         for (prefix, uri) in bindings {
             match prefix {
                 Some(prefix) => {

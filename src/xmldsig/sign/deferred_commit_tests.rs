@@ -179,9 +179,18 @@ fn kept_signing_inputs_are_the_bytes_the_operation_digested_and_signed() {
     // produced the signature, on every digest path: each Reference's kept
     // bytes hash to the DigestValue written for it, and the kept SignedInfo
     // is the one the key signed. Nothing is recomputed outside the operation.
-    for (name, xml, policy) in cases() {
+    // Values wrapped in lines narrower than a SHA-256 digest's 44 characters
+    // put line feeds into the Manifests a later level digests, so the kept
+    // bytes of that level must hold the wrapped values the document holds.
+    let widths = [None, core::num::NonZeroUsize::new(16)];
+    for ((name, xml, policy), width) in cases()
+        .into_iter()
+        .flat_map(|case| widths.map(|width| (case.clone(), width)))
+    {
         let key = RecordingSigningKey::default();
-        let context = SignContext::new(&key).policy(policy);
+        let context = SignContext::new(&key)
+            .policy(policy)
+            .base64_line_size(width);
         let mut document = XmlDocument::parse(xml.as_str()).expect("fixture must parse");
         let (_, inputs) = context
             .sign_document_keeping_inputs(&mut document)
@@ -212,13 +221,107 @@ fn kept_signing_inputs_are_the_bytes_the_operation_digested_and_signed() {
                 crate::xmldsig::DigestAlgorithm::Sha256,
                 bytes,
             );
+            // The written value is compared decoded: its line feeds are
+            // layout, the kept bytes are hashed exactly as returned.
+            let unwrapped = value
+                .chars()
+                .filter(|c| !c.is_ascii_whitespace())
+                .collect::<String>();
             assert_eq!(
                 base64::engine::general_purpose::STANDARD.encode(digest),
-                *value,
-                "{name}"
+                unwrapped,
+                "{name} at width {width:?}"
             );
         }
     }
+}
+
+#[test]
+fn kept_binary_digest_inputs_are_charged_to_the_retention_limit() {
+    // Bytes a Reference digests without canonicalizing them are copied only
+    // for a caller keeping the signing inputs, so they count against the
+    // operation's canonicalized-bytes limit then, and only then: signing
+    // without keeping them is not refused.
+    let payload = vec![0x41_u8; 4096];
+    let resources = BTreeMap::from([("urn:payload".to_owned(), payload.clone())]);
+    let xml = template(
+        EXCLUSIVE,
+        &reference("urn:payload", "", "<ds:DigestValue/>"),
+        "<ds:SignatureValue/>",
+        "",
+    );
+    let policy = |max_canonicalized_bytes: usize| {
+        let mut policy = crate::policy::SigningPolicy::default();
+        policy.uris.references = crate::xmldsig::UriTypeSet::ALL;
+        policy.resources.max_canonicalized_bytes = max_canonicalized_bytes;
+        policy
+    };
+    let key = RecordingSigningKey::default();
+    let sign = |max_canonicalized_bytes: usize, keep: bool| {
+        let context = SignContext::new(&key)
+            .policy(policy(max_canonicalized_bytes))
+            .external_resources(&resources);
+        let mut document = XmlDocument::parse(xml.as_str()).expect("fixture must parse");
+        if keep {
+            context
+                .sign_document_keeping_inputs(&mut document)
+                .map(|(_, inputs)| Some(inputs))
+        } else {
+            context.sign_document(&mut document).map(|_| None)
+        }
+    };
+    assert!(
+        sign(1024, false).is_ok(),
+        "nothing is kept, nothing charged"
+    );
+    assert!(
+        matches!(
+            sign(1024, true),
+            Err(SigningError::Policy(PolicyViolation::ResourceLimit { .. })
+                | SigningError::Digest(
+                    SigningDigestError::Policy(PolicyViolation::ResourceLimit { .. })
+                        | SigningDigestError::Transform(TransformError::Policy(
+                            PolicyViolation::ResourceLimit { .. }
+                        ))
+                ))
+        ),
+        "the kept payload exceeds the limit"
+    );
+    let kept = sign(64 * 1024, true)
+        .expect("the kept payload fits")
+        .expect("inputs are kept");
+    assert_eq!(kept.signed_info_references, [payload]);
+}
+
+#[test]
+fn an_external_uri_resolving_to_a_fragment_stays_external() {
+    // `./#payload` is an external reference: removing its dot segment leaves
+    // `#payload` (RFC 3986 section 5.2.4), which still names a fragment of the
+    // resource the reference points at, not an element of this document. It
+    // is refused as verification refuses it, never signed as `#payload`.
+    let xml = template(
+        EXCLUSIVE,
+        &reference("./#payload", "", "<ds:DigestValue/>"),
+        "<ds:SignatureValue/>",
+        "",
+    );
+    let mut policy = crate::policy::SigningPolicy::default();
+    policy.uris.references = crate::xmldsig::UriTypeSet::ALL;
+    let key = RecordingSigningKey::default();
+    let resources = BTreeMap::new();
+    let result = SignContext::new(&key)
+        .policy(policy)
+        .external_resources(&resources)
+        .sign_template(&xml);
+    assert!(
+        matches!(
+            result,
+            Err(SigningError::Digest(SigningDigestError::Transform(
+                TransformError::ExternalResourceFragment(_)
+            )))
+        ),
+        "{result:?}"
+    );
 }
 
 #[test]

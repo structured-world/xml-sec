@@ -774,8 +774,13 @@ unsafe fn read_method_and_key(ctx: &mut XmlSecEncCtx, add_base64: bool) -> c_int
         ctx.key_info_read_ctx.operation = ctx.operation;
         ctx.key_info_write_ctx.operation = ctx.operation;
         let method_name = (*(*ctx.enc_method).id).name.cast();
-        if ctx.mode == MODE_ENCRYPTED_KEY && !admit_key_method(ctx, here) {
-            return -1;
+        if ctx.mode == MODE_ENCRYPTED_KEY {
+            if !admit_key_method(ctx, here) {
+                return -1;
+            }
+            // The method's cipher is admitted again where it runs, under the
+            // same key-wrap permission.
+            run_budget(transforms).wraps_key = true;
         }
         if xmlSecTransformSetKeyReq(ctx.enc_method, &raw mut ctx.key_info_read_ctx.key_req) < 0 {
             errors::internal(here, method_name, c"xmlSecTransformSetKeyReq");

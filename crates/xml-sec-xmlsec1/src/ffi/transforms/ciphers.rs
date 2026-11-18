@@ -73,6 +73,9 @@ struct Cipher {
     /// `execute` and kept, so its admission and its bound on the collected
     /// bytes come from one revision.
     policy: Option<policy::Pinned>,
+    /// The run's method carries a key, taken with the policy: a block
+    /// cipher is then admitted as a CBC key wrap, not as content.
+    wraps_key: bool,
 }
 
 /// A cipher klass of `name` and `href`.
@@ -214,6 +217,7 @@ unsafe extern "C" fn initialize(transform: *mut XmlSecTransform) -> c_int {
                 key: None,
                 data: Zeroizing::new(Vec::new()),
                 policy: None,
+                wraps_key: false,
             });
         }
         0
@@ -309,12 +313,19 @@ unsafe extern "C" fn set_key(transform: *mut XmlSecTransform, key: *mut c_void) 
     })
 }
 
-/// The run's admission of `method` for `operation` under `pinned`.
+/// The run's admission of `method` for `operation` under `pinned`; a content
+/// cipher of a run that wraps a key is admitted as that CBC key wrap, the
+/// one permission its `EncryptedKey` was admitted under.
 fn admit(
     pinned: &policy::Pinned,
     operation: c_int,
     method: Method,
+    wraps_key: bool,
 ) -> Result<usize, PolicyViolation> {
+    let method = match method {
+        Method::Data(algorithm) if wraps_key => Method::Wrap(KeyWrapAlgorithm::Cbc(algorithm)),
+        method => method,
+    };
     if operation == OPERATION_ENCRYPT {
         let policy = &pinned.encryption;
         policy.validate()?;
@@ -348,7 +359,7 @@ fn collect(
         errors::assertion(here, c"ctx->policy != NULL");
         return -1;
     };
-    let maximum = match admit(pinned, object.operation, method) {
+    let maximum = match admit(pinned, object.operation, method, cipher.wraps_key) {
         Ok(maximum) => maximum,
         Err(violation) => {
             errors::report(
@@ -474,6 +485,8 @@ unsafe extern "C" fn execute(
                 return -1;
             };
             cipher.policy = Some(pinned);
+            // SAFETY: as above.
+            cipher.wraps_key = unsafe { super::ctx::run_budget(ctx) }.wraps_key;
             object.status = STATUS_WORKING;
         }
         match object.status {

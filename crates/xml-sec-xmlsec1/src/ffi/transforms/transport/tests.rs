@@ -128,46 +128,51 @@ fn encryption_reads_oaep_parameters_under_the_encryption_policy() {
 fn a_label_read_before_the_operation_is_known_is_bounded_when_encrypting() {
     // A standalone chain reads its method before its operation is set; an
     // encryption still refuses a label beyond the encryption policy's
-    // metadata limit when it transports the key.
+    // metadata limit when it transports the key. The same flow under the
+    // unchanged policy transports it, so the limit alone refuses.
     let label = "A".repeat(96);
     let method = format!(
         "<EncryptionMethod xmlns=\"http://www.w3.org/2001/04/xmlenc#\" \
          Algorithm=\"http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p\">\
          <OAEPparams>{label}</OAEPparams></EncryptionMethod>"
     );
-    let mut pinned = super::super::super::policy::Pinned::current(here!("test"))
+    let unchanged = super::super::super::policy::Pinned::current(here!("test"))
         .expect("the library policy compiles");
-    std::sync::Arc::make_mut(&mut pinned.encryption)
+    let mut limited = unchanged.clone();
+    std::sync::Arc::make_mut(&mut limited.encryption)
         .resources
         .max_encryption_metadata_bytes = 64;
     let key = rsa_key();
-    // SAFETY: a document, a context, its transform and the key, created and
-    // released here.
-    unsafe {
-        let doc = xml_sec_libxml2::ffi::tree::xsReadMemory(
-            method.as_ptr().cast(),
-            c_int::try_from(method.len()).expect("a short document"),
-            std::ptr::null(),
-            std::ptr::null(),
-            0,
-        );
-        assert!(!doc.is_null());
-        let ctx = xmlSecTransformCtxCreate();
-        super::super::ctx::pin_run(ctx, &pinned);
-        let transform = xmlSecTransformCtxCreateAndAppend(ctx, rsa_oaep());
-        let node = xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc);
-        assert_eq!(read_node(transform, node, ctx), 0);
-        (*transform).operation = OPERATION_ENCRYPT;
-        assert_eq!(xmlSecTransformSetKey(transform, key.cast()), 0);
-        let content_key = [0x42_u8; 16];
-        assert_eq!(
-            xmlSecTransformCtxBinaryExecute(ctx, content_key.as_ptr(), content_key.len()),
-            -1
-        );
-        xmlSecTransformCtxDestroy(ctx);
-        xml_sec_libxml2::ffi::tree::xsFreeDoc(doc);
-        xmlSecKeyDestroy(key);
+    for (pinned, expected) in [(&unchanged, 0), (&limited, -1)] {
+        // SAFETY: a document, a context and its transform, created and
+        // released here, and the key.
+        unsafe {
+            let doc = xml_sec_libxml2::ffi::tree::xsReadMemory(
+                method.as_ptr().cast(),
+                c_int::try_from(method.len()).expect("a short document"),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+            );
+            assert!(!doc.is_null());
+            let ctx = xmlSecTransformCtxCreate();
+            super::super::ctx::pin_run(ctx, pinned);
+            let transform = xmlSecTransformCtxCreateAndAppend(ctx, rsa_oaep());
+            let node = xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc);
+            assert_eq!(read_node(transform, node, ctx), 0);
+            (*transform).operation = OPERATION_ENCRYPT;
+            assert_eq!(xmlSecTransformSetKey(transform, key.cast()), 0);
+            let content_key = [0x42_u8; 16];
+            assert_eq!(
+                xmlSecTransformCtxBinaryExecute(ctx, content_key.as_ptr(), content_key.len()),
+                expected
+            );
+            xmlSecTransformCtxDestroy(ctx);
+            xml_sec_libxml2::ffi::tree::xsFreeDoc(doc);
+        }
     }
+    // SAFETY: the key created above.
+    unsafe { xmlSecKeyDestroy(key) };
 }
 
 #[test]

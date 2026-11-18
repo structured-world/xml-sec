@@ -99,6 +99,10 @@ pub(crate) struct RunBudget {
     pub(crate) xml_parse: usize,
     /// `XPath` expressions evaluated, of `max_xpath_expressions`.
     pub(crate) xpath_expressions: usize,
+    /// The run's method carries a key, as an `EncryptedKey`'s does, so a
+    /// block cipher of it is admitted as a key wrap rather than as content
+    /// (XML Encryption 1.1 section 3.4).
+    pub(crate) wraps_key: bool,
     /// The policy revision of the run, pinned at its first read or handed
     /// down by the `KeyInfo` read that runs the chain.
     policy: Option<policy::Pinned>,
@@ -185,7 +189,6 @@ pub(crate) unsafe fn run_policy(
 ///
 /// # Safety
 /// `ctx` is an initialized context.
-#[cfg(test)]
 pub(crate) unsafe fn pin_run(ctx: *mut XmlSecTransformCtx, pinned: &policy::Pinned) {
     // SAFETY: by the caller's contract.
     let run = unsafe { run_budget(ctx) };
@@ -248,7 +251,7 @@ pub(crate) unsafe fn run_spent(ctx: *mut XmlSecTransformCtx) -> policy::Spent {
 /// total, so the key's work and the operation's share one allowance. The
 /// `KeyInfo` work ran under its own parts' limits, so the total is checked
 /// against the operation's `resources`; `false` after a report at `here`
-/// when it exceeds one.
+/// when it exceeds one, and `false` when a limit refused one of its reads.
 ///
 /// # Safety
 /// `ctx` is an initialized context; `key_info_slot` is null or a pin.
@@ -311,7 +314,11 @@ pub(crate) unsafe fn charge_key_info(
     }
     // SAFETY: by the caller's contract.
     unsafe { take_spent(ctx, spent) };
-    true
+    // A read the `KeyInfo` work had refused by a limit ends the operation
+    // whatever key the work yielded; the refusal was reported where it
+    // happened, and an operation whose references are all in the document
+    // reads nothing later that would see it.
+    !spent.limit_reached
 }
 
 /// Takes what the run of `ctx` has spent of the per-operation budgets off
@@ -1160,7 +1167,11 @@ unsafe fn read_algorithm(
             errors::internal(here, name, c"xmlSecTransformCreate(id)");
             return std::ptr::null_mut();
         };
-        (*transform).operation = operation;
+        // The public readers name no operation and keep the one the klass's
+        // initializer chose (Base64 decodes), as libxmlsec1's reader does.
+        if operation != super::OPERATION_NONE {
+            (*transform).operation = operation;
+        }
         if let Some(read_node) = klass.read_node
             && read_node(transform, node, ctx) < 0
         {
@@ -1965,10 +1976,17 @@ impl<'a> ResourceScope<'a> {
 }
 
 /// What a pre-execute callback can change of a chain: its transforms in
-/// order, with their klasses and operations, and its URI selection.
+/// order, with their klasses, operations and `here` nodes (an enveloped
+/// signature transform finds the signature it excludes from its node), and
+/// its URI selection.
 #[derive(PartialEq, Eq)]
 struct ChainShape {
-    transforms: Vec<(*const XmlSecTransform, *const XmlSecTransformKlass, c_int)>,
+    transforms: Vec<(
+        *const XmlSecTransform,
+        *const XmlSecTransformKlass,
+        c_int,
+        *const XmlNode,
+    )>,
     uri: Option<Vec<u8>>,
     xptr_expr: Option<Vec<u8>>,
 }
@@ -1992,7 +2010,12 @@ impl ChainShape {
         unsafe {
             let mut transform = (*ctx).first;
             while let Some(current) = transform.as_ref() {
-                transforms.push((transform.cast_const(), current.id, current.operation));
+                transforms.push((
+                    transform.cast_const(),
+                    current.id,
+                    current.operation,
+                    current.here_node.cast_const(),
+                ));
                 transform = current.next;
             }
             Self {

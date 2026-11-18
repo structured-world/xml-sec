@@ -243,10 +243,12 @@ fn encrypted_key_nesting_counts_as_key_reference_depth() {
     // An EncryptedKey in a KeyInfo nests key material as a key reference
     // does (XML Encryption 1.1 section 3.5.1): the policy's depth bounds the
     // levels of all three kinds together, whatever higher EncryptedKey level
-    // the caller set, and refuses before anything is decrypted or read.
+    // the caller set, and refuses before anything is decrypted or read. On a
+    // decryption that depth is the decryption policy's for every kind, so a
+    // more generous verification depth admits none of them.
     own_process();
     policy::republish(
-        |verification| verification.resources.max_key_info_reference_depth = 1,
+        |verification| verification.resources.max_key_info_reference_depth = 3,
         |_| {},
     )
     .expect("the library policy compiles");
@@ -260,12 +262,15 @@ fn encrypted_key_nesting_counts_as_key_reference_depth() {
                          </EncryptedKey>";
     let retrieval = "<RetrievalMethod xmlns=\"http://www.w3.org/2000/09/xmldsig#\" \
                      URI=\"#absent\" Type=\"http://www.w3.org/2000/09/xmldsig#RSAKeyValue\"/>";
+    let reference =
+        "<KeyInfoReference xmlns=\"http://www.w3.org/2009/xmldsig11#\" URI=\"#absent\"/>";
     // SAFETY: a registry initialized for the klass accessors.
-    let (encrypted_klass, retrieval_klass) = unsafe {
+    let (encrypted_klass, retrieval_klass, reference_klass) = unsafe {
         assert_eq!(xmlSecKeyDataIdsInit(), 0);
         (
             crate::ffi::keysdata::xmlSecKeyDataEncryptedKeyGetKlass(),
             crate::ffi::keysdata::xmlSecKeyDataRetrievalMethodGetKlass(),
+            crate::ffi::keysdata::xmlSecKeyDataKeyInfoReferenceGetKlass(),
         )
     };
     let cases = [
@@ -273,6 +278,7 @@ fn encrypted_key_nesting_counts_as_key_reference_depth() {
         (encrypted_key, encrypted_klass, (0, 1, 0)),
         (encrypted_key, encrypted_klass, (0, 0, 1)),
         (retrieval, retrieval_klass, (1, 0, 0)),
+        (reference, reference_klass, (1, 0, 0)),
     ];
     for (xml, klass, (encrypted_keys, retrievals, references)) in cases {
         let doc = parse(xml);

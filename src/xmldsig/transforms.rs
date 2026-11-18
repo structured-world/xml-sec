@@ -1994,6 +1994,11 @@ pub(crate) struct DigestRequest<'p> {
     pub(crate) provider: &'p dyn crate::provider::CryptoProvider,
     pub(crate) algorithm: super::DigestAlgorithm,
     pub(crate) retain_pre_digest: bool,
+    /// Whether retained octets the chain did not canonicalize are charged to
+    /// its canonicalization output before each is copied, as signing keeps
+    /// its inputs within that one account; verification charges what it
+    /// retains to its own diagnostic budget.
+    pub(crate) charge_retained_octets: bool,
     /// Whether no data at all is digested or refused.
     pub(crate) empty_input: crate::policy::EmptyDigestInput,
 }
@@ -2105,6 +2110,7 @@ impl TransformTerminal<Native> for DigestTerminal<'_> {
             provider,
             algorithm,
             retain_pre_digest,
+            charge_retained_octets,
             empty_input,
         } = self.0;
         let mut sink = DigestWriter::new(
@@ -2113,6 +2119,12 @@ impl TransformTerminal<Native> for DigestTerminal<'_> {
             retain_pre_digest,
         );
         if let Some(bytes) = data.binary() {
+            if retain_pre_digest && charge_retained_octets {
+                budget
+                    .c14n
+                    .charge(bytes.len())
+                    .map_err(TransformError::from)?;
+            }
             sink.absorb(bytes).map_err(ReferenceDigestError::Provider)?;
         } else {
             let nodes = data.nodes().expect("execution has nodes or bytes");
@@ -2161,6 +2173,7 @@ impl TransformTerminal<Native> for DigestTerminal<'_> {
             provider,
             algorithm,
             retain_pre_digest,
+            charge_retained_octets,
             empty_input,
         } = self.0;
         let mut sink = DigestWriter::new(
@@ -2168,8 +2181,15 @@ impl TransformTerminal<Native> for DigestTerminal<'_> {
                 .map_err(ReferenceDigestError::Provider)?,
             retain_pre_digest,
         );
+        let charge_retained = retain_pre_digest && charge_retained_octets;
         let mut absorb = |decoded: &[u8]| -> Result<(), ReferenceDigestError> {
             budget.base64.charge_output(decoded.len())?;
+            if charge_retained {
+                budget
+                    .c14n
+                    .charge(decoded.len())
+                    .map_err(TransformError::from)?;
+            }
             sink.absorb(decoded).map_err(ReferenceDigestError::Provider)
         };
         let mut stream = super::base64_stream::Base64Stream::new();

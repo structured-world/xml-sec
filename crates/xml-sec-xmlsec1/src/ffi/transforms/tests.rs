@@ -133,6 +133,36 @@ fn base64_first_decodes_the_text_of_xml_input() {
     }
 }
 
+/// A transform read from its node keeps the operation its klass's
+/// initializer chose: the public readers name none, so a Base64 transform
+/// read from XML decodes, as libxmlsec1's reader leaves it.
+#[test]
+fn a_transform_read_from_xml_keeps_its_klass_operation() {
+    let xml = br#"<Transform xmlns="http://www.w3.org/2000/09/xmldsig#" Algorithm="http://www.w3.org/2000/09/xmldsig#base64"/>"#;
+    // SAFETY: the document and context are used while live.
+    unsafe {
+        assert_eq!(xmlSecTransformIdsInit(), 0);
+        let doc = crate::ffi::parser::xmlSecParseMemory(xml.as_ptr(), xml.len(), 0);
+        assert!(!doc.is_null());
+        let ctx = xmlSecTransformCtxCreate();
+        let transform = super::ctx::xmlSecTransformCtxNodeRead(
+            ctx,
+            nodes::first_child(doc),
+            USAGE_DSIG_TRANSFORM,
+        );
+        assert!(!transform.is_null());
+        assert_eq!((*transform).operation, OPERATION_DECODE);
+        assert_eq!(xmlSecTransformCtxBinaryExecute(ctx, b"QQ==".as_ptr(), 4), 0);
+        let result = (*ctx).result;
+        let text =
+            std::slice::from_raw_parts(xmlSecBufferGetData(result), xmlSecBufferGetSize(result));
+        assert_eq!(text, b"A");
+        xmlSecTransformCtxDestroy(ctx);
+        xml_sec_libxml2::document::free(doc);
+        xmlSecTransformIdsShutdown();
+    }
+}
+
 /// Adjacent text and CDATA nodes of a tree are one text node in the
 /// canonical form (Canonical XML 1.0 section 2.1): the whole document
 /// canonicalizes, and a node set selecting only part of that text is refused

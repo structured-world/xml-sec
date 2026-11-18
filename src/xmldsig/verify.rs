@@ -490,7 +490,7 @@ pub struct VerifyContext<'a> {
     identity: Option<Arc<crate::policy::PolicyIdentity>>,
     provider: &'a dyn crate::provider::CryptoProvider,
     xml_backend: crate::XmlBackend,
-    store_pre_digest: bool,
+    store_pre_digest: super::KeptInputs,
     external_resources: Option<ExternalResourceSet<'a>>,
     signature_selection: SignatureSelection<'a>,
     id_attributes: &'a [crate::IdAttributeRegistration],
@@ -515,7 +515,7 @@ impl<'a> VerifyContext<'a> {
             identity: None,
             provider: crate::provider::default_provider(),
             xml_backend: crate::XmlBackend::default(),
-            store_pre_digest: false,
+            store_pre_digest: super::KeptInputs::NONE,
             external_resources: None,
             signature_selection: SignatureSelection::UniqueDocumentSignature,
             id_attributes: &[],
@@ -755,7 +755,18 @@ impl<'a> VerifyContext<'a> {
     /// verification always materializes it. Overflow remains a typed policy
     /// violation at both low-level and end-to-end entry points.
     pub fn store_pre_digest(mut self, enabled: bool) -> Self {
-        self.store_pre_digest = enabled;
+        self.store_pre_digest = if enabled {
+            super::KeptInputs::ALL
+        } else {
+            super::KeptInputs::NONE
+        };
+        self
+    }
+
+    /// [`Self::store_pre_digest`] for the inputs `kept` names alone: the
+    /// others are neither retained nor charged.
+    pub fn keep_inputs(mut self, kept: super::KeptInputs) -> Self {
+        self.store_pre_digest = kept;
         self
     }
 
@@ -1427,12 +1438,10 @@ fn bind_external_evidence(
     let OperationResourceIdentity::BorrowedExternal { uri, .. } = observed else {
         return;
     };
-    // A listed resource its source did not supply has no bytes to describe;
-    // a fetched one is resident, whether its digest matched or not.
-    if matches!(
-        result.status,
-        DsigStatus::Invalid(FailureReason::ReferenceUnavailable { .. })
-    ) {
+    // Only a Reference that obtained the bytes itself describes them, whether
+    // its digest matched or not: one refused or left without bytes does not
+    // borrow the evidence of another Reference that fetched the same URI.
+    if result.external_payload != Some(ExternalPayload::Resident) {
         return;
     }
     // Without transforms a valid SHA-256 DigestValue was just compared against
@@ -1444,7 +1453,6 @@ fn bind_external_evidence(
         .flatten();
     result.external_resource_fingerprint =
         budgets.external_resource_fingerprint(uri, resolver, digested);
-    result.external_payload = Some(ExternalPayload::Resident);
 }
 
 fn bind_reference_evidence(
@@ -1763,6 +1771,9 @@ fn process_reference_with_options<C: VerificationCapture>(
             },
         )
         .map_err(ReferenceProcessingError::UriDereference)?;
+    // This Reference obtained the bytes of an external resource itself.
+    let external_payload = matches!(initial_data, super::TransformData::Resource { .. })
+        .then_some(ExternalPayload::Resident);
 
     // 2. Apply transform chain
     let source = reference_node.unwrap_or(signature_node);
@@ -1788,6 +1799,8 @@ fn process_reference_with_options<C: VerificationCapture>(
             provider: execution.provider,
             algorithm: reference.digest_method,
             retain_pre_digest: execution.store_pre_digest,
+            // Charged to the diagnostic budget once returned, below.
+            charge_retained_octets: false,
             empty_input: execution.transform_options.empty_digest_decision(),
         },
     )
@@ -1822,7 +1835,7 @@ fn process_reference_with_options<C: VerificationCapture>(
         reference_identity: None,
         target_identity: None,
         external_resource_fingerprint: None,
-        external_payload: None,
+        external_payload,
         coverage: ReferenceCoverage::TransformedData,
         reference_set,
         reference_index,
@@ -3053,7 +3066,7 @@ fn process_signed_info_references<C: VerificationCapture>(
         let mut result = operation.run_with_resource(node, &observed, || {
             let budgets = operation.budgets();
             let execution = ReferenceExecutionContext {
-                store_pre_digest: ctx.store_pre_digest,
+                store_pre_digest: ctx.store_pre_digest.signed_info_references(),
                 transform_options: ctx.transform_options(),
                 transform_budget: &budgets.transforms,
                 canonicalized_data_budget: &budgets.canonicalized,
@@ -3667,6 +3680,7 @@ fn finish_authenticated_verification<C: VerificationCapture>(
     )?;
     let canonicalized_signed_info = ctx
         .store_pre_digest
+        .signed_info()
         .then_some(completion.canonical_signed_info);
     if let Some(first_failure) = references.first_failure {
         // Core validation failed (XMLDSig 1.1 §3.2): Manifest content stays
@@ -3801,7 +3815,7 @@ fn verify_signature_authenticator<C: VerificationCapture>(
             view,
             signature_node,
             completion,
-            ctx.store_pre_digest,
+            ctx.store_pre_digest.signed_info(),
             (
                 super::KeyTrustEvidence::NotEvaluated,
                 operation.audit(ctx.identity.as_ref()),
@@ -3843,7 +3857,7 @@ fn verify_signature_authenticator<C: VerificationCapture>(
             view,
             signature_node,
             completion,
-            ctx.store_pre_digest,
+            ctx.store_pre_digest.signed_info(),
             (key_trust, operation.audit(ctx.identity.as_ref())),
             FailureReason::SignatureMismatch,
         ));
@@ -5997,7 +6011,7 @@ fn execute_manifest_reference<C: VerificationCapture>(
                 let reference = &compiled.reference;
                 let budgets = operation.budgets();
                 let execution = ReferenceExecutionContext {
-                    store_pre_digest: ctx.store_pre_digest,
+                    store_pre_digest: ctx.store_pre_digest.manifest_references(),
                     transform_options: ctx.transform_options(),
                     transform_budget: &budgets.transforms,
                     canonicalized_data_budget: &budgets.canonicalized,

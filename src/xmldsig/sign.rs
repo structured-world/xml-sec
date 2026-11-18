@@ -1903,7 +1903,7 @@ impl<'a> SignContext<'a> {
         &self,
         document: &mut XmlDocument,
     ) -> Result<crate::policy::PolicyAudit, SigningError> {
-        self.sign_document_storing(document, None)
+        self.sign_document_storing(document, super::KeptInputs::NONE)
             .map(|(audit, _)| audit)
     }
 
@@ -1918,22 +1918,36 @@ impl<'a> SignContext<'a> {
         &self,
         document: &mut XmlDocument,
     ) -> Result<(crate::policy::PolicyAudit, SigningInputs), SigningError> {
-        self.sign_document_storing(document, Some(SigningInputs::default()))
+        self.sign_document_keeping(document, super::KeptInputs::ALL)
+    }
+
+    /// [`Self::sign_document_keeping_inputs`] keeping only the inputs `kept`
+    /// names: the others are neither copied nor charged.
+    ///
+    /// # Errors
+    /// As for [`Self::sign_document`].
+    pub fn sign_document_keeping(
+        &self,
+        document: &mut XmlDocument,
+        kept: super::KeptInputs,
+    ) -> Result<(crate::policy::PolicyAudit, SigningInputs), SigningError> {
+        self.sign_document_storing(document, kept)
             .map(|(audit, inputs)| (audit, inputs.unwrap_or_default()))
     }
 
-    /// Signs `document`, keeping the signing inputs when `stored` asks.
+    /// Signs `document`, keeping the signing inputs `kept` names.
     fn sign_document_storing(
         &self,
         document: &mut XmlDocument,
-        stored: Option<SigningInputs>,
+        kept: super::KeptInputs,
     ) -> Result<(crate::policy::PolicyAudit, Option<SigningInputs>), SigningError> {
         self.validate_owned_document_input(document)?;
         let mut budgets = SigningOperationBudgets::from_resources_with_backend(
             &self.policy.resources,
             self.xml_backend,
         );
-        budgets.stored = stored;
+        budgets.stored = kept.any().then(SigningInputs::default);
+        budgets.kept = kept;
         budgets
             .transforms
             .xml_parse_work()
@@ -2775,8 +2789,10 @@ impl<'a> SignContext<'a> {
                     .transforms
                     .charge_c14n_output(result.2.len())
                     .map_err(SigningDigestError::Transform)?;
-                // Copied only for a caller that keeps the signing inputs.
-                if let Some(stored) = budgets.stored.as_mut() {
+                // Copied only for a caller that keeps it.
+                if budgets.kept.signed_info()
+                    && let Some(stored) = budgets.stored.as_mut()
+                {
                     stored.signed_info = Some(result.2.clone());
                 }
                 Ok::<_, SigningError>(result)
@@ -3349,6 +3365,23 @@ struct SigningOperationBudgets {
     xpath_parse: XPathSignatureParseBudget,
     /// The signing inputs kept for the caller, when it asked for them.
     stored: Option<SigningInputs>,
+    /// Which of them the caller asked for.
+    kept: super::KeptInputs,
+}
+
+/// Which references of a signature keep the bytes they digest: those of the
+/// sets `kept` names, the first `signed_info` of them being `SignedInfo`'s.
+#[derive(Clone, Copy)]
+struct Retention {
+    kept: super::KeptInputs,
+    signed_info: usize,
+}
+
+impl Retention {
+    /// Whether the reference at `index` among all of them keeps its bytes.
+    fn keeps(self, index: usize) -> bool {
+        self.kept.reference(index < self.signed_info)
+    }
 }
 
 /// The inputs a signing operation digested and signed, as
@@ -3516,6 +3549,7 @@ impl SigningOperationBudgets {
             transforms,
             xpath_parse,
             stored: None,
+            kept: super::KeptInputs::NONE,
         }
     }
 
@@ -3532,6 +3566,7 @@ impl SigningOperationBudgets {
             transforms,
             xpath_parse,
             stored: None,
+            kept: super::KeptInputs::NONE,
         }
     }
 }
@@ -3901,7 +3936,10 @@ fn current_generation_levels(
             (
                 request.uri_resolution(policy.transforms.same_document_id_semantics),
                 request.provider,
-                budgets.stored.is_some(),
+                Retention {
+                    kept: budgets.kept,
+                    signed_info: references.signed_info.len(),
+                },
             ),
         )
     })
@@ -3996,7 +4034,10 @@ fn analyze_signing_placeholder_generation(
         (
             request.uri_resolution(policy.transforms.same_document_id_semantics),
             request.provider,
-            budgets.stored.is_some(),
+            Retention {
+                kept: budgets.kept,
+                signed_info: signed_info_references.len(),
+            },
         ),
     )
     .map(|plan| SigningDependencyPlan {
@@ -4088,7 +4129,13 @@ fn reparsed_level_digests(
             &budgets.transforms,
         ),
         request.uri_resolution,
-        budgets.stored.is_some(),
+        |position| {
+            Retention {
+                kept: budgets.kept,
+                signed_info: signed_info_references.len(),
+            }
+            .keeps(level[position])
+        },
     )?;
     keep_level_digests(
         &mut budgets.stored,
@@ -4174,7 +4221,13 @@ fn compute_deferred_reference_digests(
                     &budgets.transforms,
                 ),
                 request.uri_resolution,
-                budgets.stored.is_some(),
+                |position| {
+                    Retention {
+                        kept: budgets.kept,
+                        signed_info: references.signed_info.len(),
+                    }
+                    .keeps(level[position])
+                },
             )?;
             keep_level_digests(
                 &mut budgets.stored,
@@ -4435,10 +4488,10 @@ fn reference_dependency_levels(
     generated: &[NodeId],
     transform_options: TransformOptions<'_>,
     execution_budget: &TransformExecutionBudget,
-    (uri_resolution, provider, retain): (
+    (uri_resolution, provider, retention): (
         SigningUriResolution<'_, '_>,
         &dyn crate::provider::CryptoProvider,
-        bool,
+        Retention,
     ),
 ) -> Result<SigningDependencyPlan, SigningDigestError> {
     let resolver = uri_resolution.external_resources.bind(
@@ -4452,7 +4505,8 @@ fn reference_dependency_levels(
     let mut digests = Vec::with_capacity(references.len());
     let mut analyses = references
         .iter()
-        .map(|reference| {
+        .enumerate()
+        .map(|(index, reference)| {
             let origin = signing_reference_origin(doc, reference)?;
             let initial_data = resolver.dereference_from_with_budget(
                 &reference.uri,
@@ -4471,8 +4525,10 @@ fn reference_dependency_levels(
                     provider,
                     algorithm: reference.digest_method,
                     // A final digest is not computed again, so the bytes a
-                    // kept signing input needs are retained here.
-                    retain_pre_digest: retain,
+                    // kept signing input needs are retained, and charged,
+                    // here alone.
+                    retain_pre_digest: retention.keeps(index),
+                    charge_retained_octets: true,
                     empty_input: transform_options.empty_digest_decision(),
                 }),
             )
@@ -4790,7 +4846,7 @@ fn compute_signing_reference_digests(
             .collect(),
         (transform_options, provider, execution_budget),
         uri_resolution,
-        false,
+        |_| false,
     )
     .map(|computed| computed.into_iter().map(|digest| digest.computed).collect())
 }
@@ -4803,7 +4859,8 @@ struct RetainedDigest {
 
 /// Digest each `Reference`, taking the value its dependency analysis already
 /// proved final where there is one, with the bytes each digest covered when
-/// `retain`: the analysis retained them for a value it proved final.
+/// `retain` answers so for its position in `references`: the analysis
+/// retained them for a value it proved final.
 fn compute_signing_reference_digests_retaining(
     doc: &Document<'_>,
     signature: Node<'_, '_>,
@@ -4814,7 +4871,7 @@ fn compute_signing_reference_digests_retaining(
         &TransformExecutionBudget,
     ),
     uri_resolution: SigningUriResolution<'_, '_>,
-    retain: bool,
+    retain: impl Fn(usize) -> bool,
 ) -> Result<Vec<RetainedDigest>, SigningDigestError> {
     let resolver = uri_resolution.external_resources.bind(
         doc,
@@ -4854,7 +4911,8 @@ fn compute_signing_reference_digests_retaining(
                 super::transforms::DigestRequest {
                     provider,
                     algorithm: reference.digest_method,
-                    retain_pre_digest: retain,
+                    retain_pre_digest: retain(index),
+                    charge_retained_octets: true,
                     empty_input: transform_options.empty_digest_decision(),
                 },
             )

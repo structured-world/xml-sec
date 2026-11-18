@@ -1261,6 +1261,24 @@ fn an_encrypted_key_method_is_admitted_as_a_key_wrap() {
             recovered
         };
         assert!(recovered(), "the compatible profile admits a CBC key wrap");
+        // The CBC key wrap alone decides: content limited to AES-GCM does not
+        // refuse the cipher that wraps the key.
+        xml_sec_libxml2::policy::republish_encryption(
+            |_| {},
+            |decryption| {
+                decryption.key_wrap_algorithms = Some(std::collections::BTreeSet::from([
+                    xml_sec::xmlenc::KeyWrapAlgorithm::Cbc(DataEncryptionAlgorithm::Aes128Cbc),
+                ]));
+                decryption.data_algorithms = Some(std::collections::BTreeSet::from([
+                    DataEncryptionAlgorithm::Aes128Gcm,
+                ]));
+            },
+        )
+        .expect("the library policy compiles");
+        assert!(
+            recovered(),
+            "a CBC key wrap is admitted as a key wrap, not as content"
+        );
         xml_sec_libxml2::policy::republish_encryption(
             |_| {},
             |decryption| {
@@ -1327,6 +1345,65 @@ fn decrypted_xml_is_parsed_under_the_decryption_policy() {
         );
         xmlSecEncCtxDestroy(ctx);
         xsFreeDoc(doc);
+        shut_down();
+    }
+}
+
+#[test]
+fn an_element_using_a_declared_entity_survives_encryption() {
+    // libxmlsec1 encrypts an element as xmlNodeDumpOutput writes it, so an
+    // entity the document declares stays a reference in the plaintext; the
+    // replacement is then parsed in the document's context, its internal
+    // subset included, as xmlParseInNodeContext parses it.
+    own_process();
+    // SAFETY: the library, a document and contexts set up and released
+    // here, on this thread alone.
+    unsafe {
+        start_up();
+        // A deployment that admits internal DTDs for the documents it reads
+        // and the plaintexts it decrypts.
+        crate::ffi::policy::republish(
+            |verification| verification.xml.allow_internal_dtd = true,
+            |_| {},
+        )
+        .expect("the library policy compiles");
+        xml_sec_libxml2::policy::republish_encryption(
+            |_| {},
+            |decryption| decryption.xml.allow_internal_dtd = true,
+        )
+        .expect("the library policy compiles");
+        let doc = parsed(concat!(
+            "<!DOCTYPE root [<!ENTITY label \"declared text\">]>",
+            "<root><item>&label; and more</item></root>"
+        ));
+        let root = xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc.cast());
+        let item = xml_sec_libxml2::ffi::tree::xsNodeGetChildren(root);
+        let tmpl = xmlSecTmplEncDataCreate(
+            doc,
+            aes128_cbc(),
+            std::ptr::null(),
+            c"http://www.w3.org/2001/04/xmlenc#Element".as_ptr().cast(),
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+        assert!(!xmlSecTmplEncDataEnsureCipherValue(tmpl).is_null());
+        let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
+        (*ctx).enc_key = aes_key();
+        assert_eq!(xmlSecEncCtxXmlEncrypt(ctx, tmpl, item.cast()), 0);
+        xmlSecEncCtxDestroy(ctx);
+        let encrypted = xml_sec_libxml2::ffi::tree::xsNodeGetChildren(root);
+        let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
+        (*ctx).enc_key = aes_key();
+        assert_eq!(xmlSecEncCtxDecrypt(ctx, encrypted.cast()), 0);
+        xmlSecEncCtxDestroy(ctx);
+        let restored = xml_sec_libxml2::ffi::tree::xsNodeGetChildren(root);
+        let content = xml_sec_libxml2::ffi::tree::xsNodeGetContent(restored);
+        assert_eq!(
+            std::ffi::CStr::from_ptr(content.cast()).to_str(),
+            Ok("declared text and more")
+        );
+        crate::ffi::free(content.cast());
+        xsFreeDoc(doc.cast());
         shut_down();
     }
 }

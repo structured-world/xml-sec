@@ -274,6 +274,24 @@ unsafe fn result_document(
     }
 }
 
+/// The resources whose `max_key_info_reference_depth` bounds the key
+/// references read in `ctx`: the policy of the operation the key is read
+/// for, as an `EncryptedKey` nested with them is bounded, so one depth
+/// governs all three kinds on every path.
+///
+/// # Safety
+/// `ctx` is a context.
+unsafe fn depth_resources(
+    pinned: &policy::Pinned,
+    ctx: *const XmlSecKeyInfoCtx,
+) -> &xml_sec::policy::ResourcePolicy {
+    // SAFETY: by the caller's contract.
+    let operation = unsafe { (*ctx).operation };
+    let side =
+        super::super::transforms::ctx::operation_side(operation).unwrap_or(policy::Side::Verify);
+    pinned.of(side).resources()
+}
+
 /// The depth of a key reference or `EncryptedKey` read now in `ctx`: the
 /// levels taken by all three kinds, as the policy's
 /// `max_key_info_reference_depth` bounds their nesting together, plus this
@@ -361,7 +379,7 @@ pub(crate) unsafe extern "C" fn retrieval_xml_read(
             let Some(pinned) = read_policy(ctx, here) else {
                 return -1;
             };
-            let resources = &pinned.verification.resources;
+            let resources = depth_resources(&pinned, ctx);
             if resources
                 .validate_key_info_reference_depth(next_reference_depth(ctx))
                 .is_err()
@@ -604,7 +622,7 @@ pub(crate) unsafe extern "C" fn reference_xml_read(
             let Some(pinned) = read_policy(ctx, here) else {
                 return -1;
             };
-            let resources = &pinned.verification.resources;
+            let resources = depth_resources(&pinned, ctx);
             if resources
                 .validate_key_info_reference_depth(next_reference_depth(ctx))
                 .is_err()

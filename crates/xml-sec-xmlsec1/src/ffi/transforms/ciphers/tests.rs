@@ -72,13 +72,47 @@ fn a_cipher_value_round_trips_and_carries_its_iv() {
     unsafe { xmlSecKeyDestroy(key) };
 }
 
+/// The reasons the library reported, in order.
+static REASONS: std::sync::Mutex<Vec<c_int>> = std::sync::Mutex::new(Vec::new());
+
+unsafe extern "C" fn record(
+    _file: *const std::ffi::c_char,
+    _line: c_int,
+    _func: *const std::ffi::c_char,
+    _object: *const std::ffi::c_char,
+    _subject: *const std::ffi::c_char,
+    reason: c_int,
+    _message: *const std::ffi::c_char,
+) {
+    REASONS.lock().expect("one test thread").push(reason);
+}
+
 #[test]
 fn gcm_refuses_a_tampered_cipher_value() {
+    // The untouched value decrypts under the same key and setup, so the
+    // refusal of the changed tag is GCM's authentication failing, reported
+    // as a cryptographic failure, not a broken fixture.
     let key = aes_key(&[0x22; 32]);
     let mut encrypted = run(aes256_gcm(), OPERATION_ENCRYPT, key, b"payload").expect("encrypts");
+    assert_eq!(
+        run(aes256_gcm(), OPERATION_DECRYPT, key, &encrypted).as_deref(),
+        Some(&b"payload"[..])
+    );
     let last = encrypted.len() - 1;
     encrypted[last] ^= 0x01;
+    // SAFETY: the callback has the callback's signature.
+    unsafe {
+        crate::ffi::errors::xmlSecErrorsSetCallback(Some(
+            record as crate::ffi::errors::ErrorsCallback,
+        ));
+    }
     assert_eq!(run(aes256_gcm(), OPERATION_DECRYPT, key, &encrypted), None);
+    // SAFETY: restores the default callback.
+    unsafe { crate::ffi::errors::xmlSecErrorsSetCallback(None) };
+    assert_eq!(
+        REASONS.lock().expect("one test thread").first(),
+        Some(&crate::ffi::errors::R_CRYPTO_FAILED)
+    );
     // SAFETY: the key created above.
     unsafe { xmlSecKeyDestroy(key) };
 }

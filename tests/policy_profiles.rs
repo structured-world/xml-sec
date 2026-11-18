@@ -84,9 +84,28 @@ fn a_request_selects_only_what_its_policy_lists() {
     let current = verification.manifest_processing;
     assert_eq!(verification.select_manifest_processing(current), Ok(()));
 
-    // A layer that lists nothing leaves a composed policy with nothing.
-    let narrowed = RequestSelections::libxmlsec1().intersection(&RequestSelections::default());
-    assert_eq!(narrowed, RequestSelections::default());
+    // A layer that lists nothing leaves the compiled policy with nothing: the
+    // selection the base listed is refused, the policy's own value stays.
+    let compatibility = || compiler(PolicyProfile::XmlSecCompatible);
+    let mut layer = compatibility().policies().clone();
+    layer.verification.as_mut().unwrap().request_selections = RequestSelections::default();
+    let narrowed = compatibility()
+        .restrict(&layer)
+        .unwrap()
+        .compile(&context())
+        .unwrap();
+    let mut verification = narrowed.verification().unwrap().clone();
+    assert_eq!(
+        verification.select_same_document_id_semantics(SameDocumentIdSemantics::XmlSecVisa3d),
+        Err(PolicyViolation::RequestSelection {
+            setting: "same_document_id_semantics"
+        })
+    );
+    let current = verification.transforms.same_document_id_semantics;
+    assert_eq!(
+        verification.select_same_document_id_semantics(current),
+        Ok(())
+    );
 }
 
 #[test]
