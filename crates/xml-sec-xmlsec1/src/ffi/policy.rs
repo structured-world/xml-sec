@@ -113,6 +113,29 @@ impl<'a> OperationPolicy<'a> {
             Self::Decrypt(policy) => policy.uris.references,
         }
     }
+
+    /// The URI classes the operation admits for a `RetrievalMethod` of the
+    /// key it reads; an encryption's, whose `KeyInfo` is its caller's
+    /// template, as for [`Self::references`].
+    pub(crate) fn retrieval_methods(self) -> UriTypeSet {
+        match self {
+            Self::Verify(policy) => policy.uris.retrieval_methods,
+            Self::Sign(policy) => policy.uris.retrieval_methods,
+            Self::Encrypt(_) => UriTypeSet::ALL,
+            Self::Decrypt(policy) => policy.uris.retrieval_methods,
+        }
+    }
+
+    /// The URI classes the operation admits for a `KeyInfoReference` of the
+    /// key it reads, as for [`Self::retrieval_methods`].
+    pub(crate) fn key_info_references(self) -> UriTypeSet {
+        match self {
+            Self::Verify(policy) => policy.uris.key_info_references,
+            Self::Sign(policy) => policy.uris.key_info_references,
+            Self::Encrypt(_) => UriTypeSet::ALL,
+            Self::Decrypt(policy) => policy.uris.key_info_references,
+        }
+    }
 }
 
 /// `$body` with `$policy` bound to the snapshot `$operation` selects, typed

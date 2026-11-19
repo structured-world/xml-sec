@@ -673,7 +673,24 @@ pub(crate) unsafe fn replace_node_buffer_under(
     // SAFETY: by the caller's contract.
     unsafe {
         replace_with_parsed(node, replaced, here, |node| {
-            xml_sec_libxml2::nodes::parse_replacing_under(node, bytes, policy, spent).ok()
+            xml_sec_libxml2::nodes::parse_replacing_under(node, bytes, policy, spent)
+                .inspect_err(|error| {
+                    // A limit refusing the result names that limit, not the
+                    // parse that met it.
+                    if let xml_sec_libxml2::nodes::FragmentError::Document(
+                        xml_sec::XmlDocumentError::Policy(
+                            xml_sec::policy::PolicyViolation::ResourceLimit {
+                                resource,
+                                maximum,
+                                ..
+                            },
+                        ),
+                    ) = error
+                    {
+                        errors::limit_exceeded(here, std::ptr::null(), resource, *maximum);
+                    }
+                })
+                .ok()
         })
     }
 }

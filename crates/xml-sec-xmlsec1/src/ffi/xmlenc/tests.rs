@@ -1562,10 +1562,128 @@ fn an_encryption_writes_no_document_past_its_size_limit() {
 }
 
 #[test]
+fn a_decryption_reads_key_references_under_the_decryption_policy() {
+    // Verification admits external RetrievalMethods, decryption does not: a
+    // key read for a decryption opens none, so no input callback sees the
+    // URI an encrypted document names.
+    own_process();
+    crate::ffi::policy::republish(
+        |verification| {
+            verification.uris.retrieval_methods = xml_sec::xmldsig::UriTypeSet::ALL;
+        },
+        |_| {},
+    )
+    .expect("the library policy compiles");
+    // SAFETY: the library, a document, a context and a manager set up and
+    // released here, on this thread alone.
+    unsafe {
+        start_up();
+        serve_by_uri(vec![("test:key", vec![0x5a; 16])]);
+        let (cipher, _) = encrypted(aes128_cbc(), b"under the decryption policy");
+        let doc = parsed(&format!(
+            "{}{cipher}{}",
+            concat!(
+                "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\">",
+                "<EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#aes128-cbc\"/>",
+                "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\">",
+                "<RetrievalMethod URI=\"test:key\" ",
+                "Type=\"http://www.w3.org/2001/04/xmlenc#EncryptedKey\"/>",
+                "</KeyInfo><CipherData><CipherValue>",
+            ),
+            "</CipherValue></CipherData></EncryptedData>"
+        ));
+        let mngr = xmlSecKeysMngrCreate();
+        (*mngr).get_key = Some(kek_or_read);
+        let ctx = xmlSecEncCtxCreate(mngr);
+        (*ctx).key_info_read_ctx.retrieval_method_ctx.enabled_uris = 0xFFFF;
+        let (result, reasons) = reported(|| {
+            xmlSecEncCtxDecryptToBuffer(
+                ctx,
+                xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc.cast()),
+            )
+        });
+        assert!(result.is_null(), "no key was found: {reasons:?}");
+        assert_eq!(
+            OPENS.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the decryption policy refused the URI before any read"
+        );
+        xmlSecEncCtxDestroy(ctx);
+        xmlSecKeysMngrDestroy(mngr);
+        xsFreeDoc(doc.cast());
+        shut_down();
+    }
+}
+
+#[test]
+fn a_decryption_leaves_no_document_past_its_size_limit() {
+    // An EncryptedData naming its ciphertext by CipherReference is short, its
+    // plaintext long: each fits max_xml_document_bytes, the document with
+    // the plaintext in place does not. The replacement is refused before the
+    // tree changes, as the core refuses it, and a limit that admits the
+    // result lets it through.
+    own_process();
+    // SAFETY: the library, documents, contexts and keys set up and released
+    // here, on this thread alone.
+    unsafe {
+        start_up();
+        let plaintext = format!("<data>{}</data>", "<a/>".repeat(150));
+        let (_, cipher) = encrypted(aes128_cbc(), plaintext.as_bytes());
+        serve_by_uri(vec![("test:cipher", cipher)]);
+        let document = format!(
+            "<root>{}{}</root>",
+            "<pad/>".repeat(60),
+            concat!(
+                "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\" ",
+                "Type=\"http://www.w3.org/2001/04/xmlenc#Element\">",
+                "<EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#aes128-cbc\"/>",
+                "<CipherData><CipherReference URI=\"test:cipher\"/></CipherData>",
+                "</EncryptedData>"
+            )
+        );
+        let limit = document.len().max(plaintext.len()) + 64;
+        for (maximum, decrypts) in [(limit, false), (2 * limit, true)] {
+            xml_sec_libxml2::policy::republish_encryption(
+                |_| {},
+                |decryption| decryption.resources.max_xml_document_bytes = maximum,
+            )
+            .expect("the library policy compiles");
+            let doc = parsed(&document);
+            let root = xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc.cast());
+            let encrypted_data = xml_sec_libxml2::ffi::tree::xsNodeGetLast(root);
+            let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
+            (*ctx).enc_key = aes_key();
+            (*ctx).transform_ctx.enabled_uris = 0xFFFF;
+            let (status, reasons) = reported(|| xmlSecEncCtxDecrypt(ctx, encrypted_data));
+            if decrypts {
+                assert_eq!(status, 0, "{reasons:?}");
+                assert_eq!((*ctx).result_replaced, 1);
+            } else {
+                assert_eq!(status, -1, "{reasons:?}");
+                assert_eq!(
+                    reasons.first(),
+                    Some(&crate::ffi::errors::R_INVALID_SIZE),
+                    "{reasons:?}"
+                );
+                assert_eq!(
+                    xml_sec_libxml2::ffi::tree::xsNodeGetLast(root),
+                    encrypted_data
+                );
+            }
+            xmlSecEncCtxDestroy(ctx);
+            xsFreeDoc(doc.cast());
+        }
+        shut_down();
+    }
+}
+
+#[test]
 fn an_xml_encryption_measures_the_document_it_replaces_into() {
     // An unlinked template replaces an element: the document the encryption
     // leaves is the element's, its octets gone and the template's in their
-    // place, and one byte short of its size refuses the encryption.
+    // place, and one byte short of its size refuses the encryption. The
+    // template's non-ASCII Id counts as the document writes it, a character
+    // reference in a document declaring no encoding.
     own_process();
     // SAFETY: the library, documents and contexts set up and released here,
     // on this thread alone.
@@ -1581,7 +1699,7 @@ fn an_xml_encryption_measures_the_document_it_replaces_into() {
             let tmpl = xmlSecTmplEncDataCreate(
                 target.cast(),
                 aes128_cbc(),
-                std::ptr::null(),
+                c"\u{e9}t\u{e9}".as_ptr().cast(),
                 c"http://www.w3.org/2001/04/xmlenc#Element".as_ptr().cast(),
                 std::ptr::null(),
                 std::ptr::null(),
@@ -2454,20 +2572,16 @@ fn a_pre_execute_veto_stops_decryption_before_the_document_changes() {
 fn a_replacement_past_the_node_limit_leaves_the_document_unchanged() {
     // The document and the plaintext each fit the decryption policy's node
     // limit, the document with the plaintext in place of its EncryptedData
-    // does not: the replacement is refused before the tree changes, as the
-    // core refuses it for a document it decrypts.
+    // does not: the replacement is refused before the tree changes, naming
+    // the node limit, as the core refuses it for a document it decrypts. A
+    // limit that admits the result lets the same decryption through.
     own_process();
-    xml_sec_libxml2::policy::republish_encryption(
-        |_| {},
-        |decryption| decryption.resources.max_xml_nodes = 45,
-    )
-    .expect("the library policy compiles");
-    // SAFETY: the library, a document, a context and a key set up and
-    // released here, on this thread alone.
+    // SAFETY: the library, documents, contexts and keys set up and released
+    // here, on this thread alone.
     unsafe {
         start_up();
         let (cipher, _) = encrypted(aes128_cbc(), "<a/>".repeat(20).as_bytes());
-        let doc = parsed(&format!(
+        let document = format!(
             "<root>{}{}{cipher}{}</root>",
             "<p/>".repeat(30),
             concat!(
@@ -2477,21 +2591,39 @@ fn a_replacement_past_the_node_limit_leaves_the_document_unchanged() {
                 "<CipherData><CipherValue>",
             ),
             "</CipherValue></CipherData></EncryptedData>"
-        ));
-        let root = xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc.cast());
-        let encrypted_data = xml_sec_libxml2::ffi::tree::xsNodeGetLast(root);
-        let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
-        (*ctx).enc_key = aes_key();
-        let (status, reasons) = reported(|| xmlSecEncCtxDecrypt(ctx, encrypted_data));
-        assert_eq!(status, -1, "{reasons:?}");
-        assert_eq!((*ctx).result_replaced, 0);
-        assert_eq!(
-            xml_sec_libxml2::ffi::tree::xsNodeGetLast(root),
-            encrypted_data,
-            "the EncryptedData stays in place"
         );
-        xmlSecEncCtxDestroy(ctx);
-        xsFreeDoc(doc.cast());
+        for (maximum, decrypts) in [(45, false), (60, true)] {
+            xml_sec_libxml2::policy::republish_encryption(
+                |_| {},
+                |decryption| decryption.resources.max_xml_nodes = maximum,
+            )
+            .expect("the library policy compiles");
+            let doc = parsed(&document);
+            let root = xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc.cast());
+            let encrypted_data = xml_sec_libxml2::ffi::tree::xsNodeGetLast(root);
+            let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
+            (*ctx).enc_key = aes_key();
+            let (status, reasons) = reported(|| xmlSecEncCtxDecrypt(ctx, encrypted_data));
+            if decrypts {
+                assert_eq!(status, 0, "{reasons:?}");
+                assert_eq!((*ctx).result_replaced, 1);
+            } else {
+                assert_eq!(status, -1, "{reasons:?}");
+                assert_eq!(
+                    reasons.first(),
+                    Some(&crate::ffi::errors::R_INVALID_SIZE),
+                    "the node limit refused it: {reasons:?}"
+                );
+                assert_eq!((*ctx).result_replaced, 0);
+                assert_eq!(
+                    xml_sec_libxml2::ffi::tree::xsNodeGetLast(root),
+                    encrypted_data,
+                    "the EncryptedData stays in place"
+                );
+            }
+            xmlSecEncCtxDestroy(ctx);
+            xsFreeDoc(doc.cast());
+        }
         shut_down();
     }
 }

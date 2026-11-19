@@ -566,6 +566,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformXPointerSetExpr(
             -1
         );
         let location = here!("xmlSecTransformXPointerSetExpr");
+        super::ctx::note_setting_change(transform);
         // SAFETY: by the caller's contract.
         unsafe {
             let name = name_of(transform);

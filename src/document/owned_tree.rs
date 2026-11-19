@@ -906,17 +906,16 @@ impl OwnedTree {
         replaced: NodeId,
         max_nodes: usize,
     ) -> Result<(), XmlDocumentError> {
-        // The wrapper is not imported; the replaced subtree leaves the
-        // document only if it is in it.
-        let added = parsed.subtree_nodes(wrapper) - 1;
         let root = self.document.root();
-        let mut actual = self.subtree_nodes(root);
-        if self.under(replaced, root) {
-            // Part of the document just counted.
-            actual -= self.subtree_nodes(replaced);
+        // A replacement outside the document changes none of its nodes; its
+        // own content is bounded by the fragment's parse.
+        if !self.under(replaced, root) {
+            return Ok(());
         }
-        // Both terms count nodes held in memory.
-        actual += added;
+        // The wrapper is not imported. The replaced subtree is a part of the
+        // document counted, and both terms count nodes held in memory.
+        let added = parsed.subtree_nodes(wrapper) - 1;
+        let actual = self.subtree_nodes(root) - self.subtree_nodes(replaced) + added;
         if actual > max_nodes {
             return Err(crate::policy::PolicyViolation::ResourceLimit {
                 resource: crate::policy::resource_name::XML_NODES,

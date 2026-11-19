@@ -183,7 +183,9 @@ unsafe fn admit_document(
         };
         (pinned, !nodes::parent(tmpl).is_null(), xsNodeGetDoc(tmpl))
     };
-    let length = |node: *const XmlNode| nodes::dump(node).map(|xml| xml.len());
+    // Every term is measured as a document's own dump writes it, character
+    // references included, so a template's octets are those it adds there.
+    let length = |node: *const XmlNode| nodes::dump_in_document(node).map(|xml| xml.len());
     let size = match replacing {
         None if linked => length(doc.cast()),
         None => length(tmpl),
@@ -568,6 +570,24 @@ pub(super) unsafe fn decrypt(ctx: &mut XmlSecEncCtx, node: *mut XmlNode) -> c_in
     let Some(pinned) = (unsafe { run_policy(transforms, here) }) else {
         return -1;
     };
+    // The document the replacement leaves must fit max_xml_document_bytes,
+    // as the core admits the document it decrypts: its octets less the
+    // EncryptedData's, as the document writes it, plus the plaintext's.
+    // SAFETY: a live node.
+    let doc = unsafe { xsNodeGetDoc(node) };
+    let Some(projected) = nodes::dump(doc.cast::<XmlNode>())
+        .zip(nodes::dump_in_document(node))
+        .and_then(|(document, replaced)| document.len().checked_sub(replaced.len()))
+        .and_then(|rest| rest.checked_add(size))
+    else {
+        errors::xml_failed(here, std::ptr::null(), c"xmlNodeDumpOutput");
+        return -1;
+    };
+    let maximum = pinned.decryption.resources.max_xml_document_bytes;
+    if projected > maximum {
+        errors::limit_exceeded(here, std::ptr::null(), "max_xml_document_bytes", maximum);
+        return -1;
+    }
     let destination = if ctx.flags & FLAGS_RETURN_REPLACED_NODE != 0 {
         &raw mut ctx.replaced_node_list
     } else {

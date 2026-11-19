@@ -672,6 +672,42 @@ fn a_long_run_of_the_wrapper_letter_in_the_subset_is_handled_in_linear_time() {
     assert_eq!(tree.namespace(item), Ok(None));
 }
 
+#[cfg(feature = "xmldsig")]
+#[test]
+fn a_detached_replacement_is_not_charged_to_the_document() {
+    // `d` is unlinked, so replacing its child changes no node of the
+    // document, which keeps its three nodes under a limit of four whatever
+    // the replacement holds; the same replacement inside a document of four
+    // nodes passes that limit. The fragment's own parse (the document node,
+    // its wrapper and two elements) fits the limit either way.
+    let mut policy = VerificationPolicy::default();
+    policy.resources.max_xml_nodes = 5;
+    let mut tree = OwnedTree::parse_with_policy("<r><p/><d><x/></d></r>", &policy)
+        .expect("the document parses");
+    let mut attached =
+        OwnedTree::parse_with_policy("<r><p/><x/></r>", &policy).expect("the document parses");
+    policy.resources.max_xml_nodes = 4;
+    let root = tree.root_element().expect("a document element");
+    let d = children(&tree, root)[1];
+    let x = children(&tree, d)[0];
+    tree.unlink(d).expect("a live node");
+    let mut spent = 0;
+    assert!(
+        tree.parse_replacing_within(x, "<a/><b/>", &policy, &mut spent)
+            .is_ok(),
+        "a detached replacement leaves the document as it is"
+    );
+    let root = attached.root_element().expect("a document element");
+    let x = children(&attached, root)[1];
+    let mut spent = 0;
+    assert!(
+        attached
+            .parse_replacing_within(x, "<a/><b/>", &policy, &mut spent)
+            .is_err(),
+        "four nodes, less one, plus two pass the limit"
+    );
+}
+
 #[test]
 fn entity_expanded_markup_is_held_to_the_same_depth_as_direct_markup() {
     // A context at depth three under a depth limit of four leaves room for
