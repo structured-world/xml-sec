@@ -947,12 +947,14 @@ fn a_failed_recipient_leaves_no_rejected_recovery_behind() {
 
 /// The recovery validity [`validity_lookup`] reports for the key it hands
 /// out.
+#[cfg(feature = "legacy-algorithms")]
 static LOOKUP_VALIDITY: std::sync::Mutex<Option<xml_sec::provider::RecoveryValidity>> =
     std::sync::Mutex::new(None);
 
 /// A key manager's lookup that hands back [`aes_key`] for an element without
 /// a `KeyInfo`, as a recovery of [`LOOKUP_VALIDITY`], and reads the `KeyInfo`
 /// of any other.
+#[cfg(feature = "legacy-algorithms")]
 unsafe extern "C" fn validity_lookup(
     node: *mut XmlNode,
     ctx: *mut XmlSecKeyInfoCtx,
