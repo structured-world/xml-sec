@@ -886,6 +886,27 @@ unsafe fn add_reference(
             );
             return std::ptr::null_mut();
         }
+        // The core runs the Relationship transform as ISO/IEC 29500-2
+        // section 13.2.4.24 specifies it; libxmlsec1's historical variant
+        // the flag asks for is not implemented, so a Reference it would
+        // change is refused rather than processed the other way.
+        if ctx.flags & super::FLAGS_RELATIONSHIP_LEGACY != 0 {
+            let mut transform = (*reference).transform_ctx.first;
+            while let Some(current) = transform.as_ref() {
+                if std::ptr::eq(
+                    current.id,
+                    super::super::transforms::relationship::relationship(),
+                ) {
+                    errors::not_implemented(
+                        here,
+                        "the historical Relationship transform of \
+                         XMLSEC_DSIG_FLAGS_RELATIONSHIP_LEGACY",
+                    );
+                    return std::ptr::null_mut();
+                }
+                transform = current.next;
+            }
+        }
         reference
     }
 }

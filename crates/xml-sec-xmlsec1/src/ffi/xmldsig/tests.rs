@@ -613,6 +613,115 @@ fn a_chain_changed_by_a_pre_execute_callback_fails_the_operation() {
     }
 }
 
+/// The reasons reported during [`reported`], in order.
+static REASONS: std::sync::Mutex<Vec<std::ffi::c_int>> = std::sync::Mutex::new(Vec::new());
+
+unsafe extern "C" fn record(
+    _file: *const std::ffi::c_char,
+    _line: std::ffi::c_int,
+    func: *const std::ffi::c_char,
+    _object: *const std::ffi::c_char,
+    _subject: *const std::ffi::c_char,
+    reason: std::ffi::c_int,
+    message: *const std::ffi::c_char,
+) {
+    let text = |text: *const std::ffi::c_char| {
+        // SAFETY: the library passes null or NUL-terminated strings.
+        unsafe { text.as_ref() }.map_or_else(String::new, |_| {
+            // SAFETY: as above.
+            unsafe { std::ffi::CStr::from_ptr(text) }
+                .to_string_lossy()
+                .into_owned()
+        })
+    };
+    // Shown with a failing assertion's output.
+    eprintln!("{}: {reason}: {}", text(func), text(message));
+    REASONS.lock().expect("one test thread").push(reason);
+}
+
+/// `run`'s result and the reasons reported while it ran.
+fn reported<T>(run: impl FnOnce() -> T) -> (T, Vec<std::ffi::c_int>) {
+    REASONS.lock().expect("one test thread").clear();
+    // SAFETY: the callback has the callback's signature.
+    unsafe {
+        crate::ffi::errors::xmlSecErrorsSetCallback(Some(
+            record as crate::ffi::errors::ErrorsCallback,
+        ));
+    }
+    let result = run();
+    // SAFETY: restores the default callback.
+    unsafe { crate::ffi::errors::xmlSecErrorsSetCallback(None) };
+    (result, REASONS.lock().expect("one test thread").clone())
+}
+
+#[test]
+fn the_legacy_relationship_flag_refuses_a_relationship_reference() {
+    // The core runs the Relationship transform as ISO/IEC 29500-2 specifies
+    // it, not libxmlsec1's historical variant: a context asking for that
+    // variant over a Reference that has the transform is refused rather than
+    // signed in the other one. Without the flag the same template signs.
+    own_process();
+    let template = concat!(
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">",
+        "<Relationship Id=\"rId1\" Type=\"urn:t:a\" Target=\"a.xml\"/>",
+        "<Signature xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><SignedInfo>",
+        "<CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>",
+        "<SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#hmac-sha256\"/>",
+        "<Reference URI=\"\"><Transforms>",
+        "<Transform Algorithm=\"http://www.w3.org/2000/09/xmldsig#enveloped-signature\"/>",
+        "<Transform Algorithm=\"http://schemas.openxmlformats.org/package/2006/RelationshipTransform\">",
+        "<m:RelationshipReference ",
+        "xmlns:m=\"http://schemas.openxmlformats.org/package/2006/digital-signature\" ",
+        "SourceId=\"rId1\"/></Transform>",
+        "<Transform Algorithm=\"http://www.w3.org/TR/2001/REC-xml-c14n-20010315\"/>",
+        "</Transforms>",
+        "<DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>",
+        "<DigestValue/></Reference></SignedInfo><SignatureValue/>",
+        "</Signature></Relationships>"
+    );
+    // SAFETY: the library, documents, keys and contexts set up and torn down
+    // here, on this thread alone.
+    unsafe {
+        assert_eq!(xmlSecInit(), 0);
+        assert_eq!(xmlSecCryptoDLLoadLibrary(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoAppInit(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoInit(), 0);
+        for (flags, signed) in [(0, true), (FLAGS_RELATIONSHIP_LEGACY, false)] {
+            let doc = xsReadMemory(
+                template.as_ptr().cast(),
+                i32::try_from(template.len()).expect("a short document"),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+            );
+            assert!(!doc.is_null());
+            let ctx = xmlSecDSigCtxCreate(std::ptr::null_mut());
+            (*ctx).sign_key = hmac_key(ctx);
+            (*ctx).flags |= flags;
+            let signature = xmlSecFindNode(
+                xsDocGetRootElement(doc),
+                c"Signature".as_ptr().cast(),
+                c"http://www.w3.org/2000/09/xmldsig#".as_ptr().cast(),
+            );
+            let (status, reasons) = reported(|| xmlSecDSigCtxSign(ctx, signature));
+            if signed {
+                assert_eq!(status, 0, "{reasons:?}");
+            } else {
+                assert_eq!(status, -1, "{reasons:?}");
+                assert!(
+                    reasons.contains(&crate::ffi::errors::R_NOT_IMPLEMENTED),
+                    "{reasons:?}"
+                );
+            }
+            xmlSecDSigCtxDestroy(ctx);
+            xsFreeDoc(doc);
+        }
+        assert_eq!(xmlSecCryptoShutdown(), 0);
+        assert_eq!(xmlSecCryptoAppShutdown(), 0);
+        assert_eq!(xmlSecShutdown(), 0);
+    }
+}
+
 #[test]
 fn a_fragment_of_an_external_reference_is_refused_before_it_is_read() {
     // An external resource reaches the core as octets, which select no
