@@ -198,10 +198,32 @@ unsafe fn render(
     let Some((pinned, side)) = scope else {
         return -1;
     };
-    policy::with_document_policy!(pinned.of(side), |policy| {
-        // SAFETY: by the caller's contract.
-        unsafe { render_under(selectors, selected, out, policy, here) }
-    })
+    match pinned.of(side) {
+        policy::OperationPolicy::Verify(policy) => {
+            // SAFETY: by the caller's contract.
+            unsafe { render_under(selectors, selected, out, policy, here) }
+        }
+        policy::OperationPolicy::Sign(policy) => {
+            // SAFETY: by the caller's contract.
+            unsafe { render_under(selectors, selected, out, policy, here) }
+        }
+        policy::OperationPolicy::Decrypt(policy) => {
+            // SAFETY: by the caller's contract.
+            unsafe { render_under(selectors, selected, out, policy, here) }
+        }
+        // Relationship is an XML Signature transform (libxmlsec1 marks it
+        // xmlSecTransformUsageDSigTransform) and an encryption transforms no
+        // document, so its policy permits none. A chain only learns that it
+        // encrypts when it runs, so this is the first point to refuse it.
+        policy::OperationPolicy::Encrypt(_) => {
+            errors::not_implemented(
+                here,
+                "the Relationship transform in an encryption chain: an encryption \
+                 transforms no document",
+            );
+            -1
+        }
+    }
 }
 
 /// [`render`] under the operation policy `policy`.

@@ -12,8 +12,12 @@ and pinned [XML security](features.md) and [XSLT oracles](xslt-conformance.md), 
 
 ```sh
 PKCS11_MODULE=/absolute/path/to/libsofthsm2.so \
+XMLSEC1_PREFIX=/absolute/path/to/xmlsec1-oracle \
   cargo run -p xml-sec-tools -- hardening coverage /absolute/new/evidence-directory
 ```
+
+`XMLSEC1_PREFIX` names the installed libxmlsec1 oracle: the C programs of the
+libxmlsec1-compatible library run against it under coverage.
 
 The evidence directory must be new and outside Cargo build output. All-feature
 workspace tests execute with the real isolated token provider. Known lexical

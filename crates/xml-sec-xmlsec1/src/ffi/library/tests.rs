@@ -11,7 +11,8 @@ use crate::ffi::buffer::xmlSecBufferInitialize;
 use crate::ffi::crypto::{
     xmlSecCryptoAppInit, xmlSecCryptoAppShutdown, xmlSecCryptoDLGetFunctions,
     xmlSecCryptoDLLoadLibrary, xmlSecCryptoInit, xmlSecCryptoShutdown,
-    xmlSecTransformAes128CbcGetKlass, xmlSecTransformSha256GetKlass,
+    xmlSecTransformAes128CbcGetKlass, xmlSecTransformGostR3411_94GetKlass,
+    xmlSecTransformSha256GetKlass,
 };
 use crate::ffi::errors::{ErrorsCallback, R_ASSERTION, R_NOT_IMPLEMENTED, xmlSecErrorsSetCallback};
 use crate::ffi::list::xmlSecPtrListGetSize;
@@ -135,14 +136,18 @@ fn default_crypto_loads_the_builtin_table() {
         assert_eq!(xmlSecCryptoInit(), 0);
         take();
         // A klass of the built-in table resolves; a method the table lacks
-        // (ciphers are not part of it) reports and resolves to nothing.
+        // (the provider implements no GOST) reports and resolves to nothing.
         let sha256 = xmlSecTransformSha256GetKlass();
+        assert!(!sha256.is_null(), "the table has SHA-256");
         assert_eq!(CStr::from_ptr((*sha256).name.cast()).to_bytes(), b"sha256");
-        assert!(xmlSecTransformAes128CbcGetKlass().is_null());
+        let aes = xmlSecTransformAes128CbcGetKlass();
+        assert!(!aes.is_null(), "the table has AES-128-CBC");
+        assert_eq!(CStr::from_ptr((*aes).name.cast()).to_bytes(), b"aes128-cbc");
+        assert!(xmlSecTransformGostR3411_94GetKlass().is_null());
         assert_eq!(
             take(),
             [(
-                "xmlSecTransformAes128CbcGetKlass".to_owned(),
+                "xmlSecTransformGostR3411_94GetKlass".to_owned(),
                 R_NOT_IMPLEMENTED
             )]
         );

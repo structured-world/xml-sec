@@ -12,21 +12,25 @@ use crate::ffi::buffer::xmlSecBufferGetSize;
 use crate::ffi::policy;
 use crate::ffi::transforms::OPERATION_SIGN;
 use crate::ffi::transforms::ctx::{
-    xmlSecTransformCtxCreate, xmlSecTransformCtxCreateAndAppend, xmlSecTransformCtxDestroy,
-    xmlSecTransformCtxUriExecute,
+    self, ResourceScope, xmlSecTransformCtxCreate, xmlSecTransformCtxCreateAndAppend,
+    xmlSecTransformCtxDestroy, xmlSecTransformCtxUriExecute,
 };
 use crate::ffi::transforms::digests::sha256;
 use std::ffi::{c_char, c_int, c_void};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use xml_sec_libxml2::ffi::tree::{xsDocGetRootElement, xsFreeDoc, xsReadMemory};
 
 /// The octets the resource still holds; `usize::MAX` for an endless one.
 static LEFT: AtomicUsize = AtomicUsize::new(0);
+/// How many times a callback opened a resource.
+static OPENED: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "C" fn matches(_uri: *const c_char) -> c_int {
     1
 }
 
 unsafe extern "C" fn open(_uri: *const c_char) -> *mut c_void {
+    OPENED.fetch_add(1, Ordering::Relaxed);
     std::ptr::NonNull::<u8>::dangling().as_ptr().cast()
 }
 
@@ -138,4 +142,125 @@ fn resource_of_the_limit_is_read_and_one_more_refused() {
     assert_eq!(read_resource(), Some(limit));
     LEFT.store(limit + 1, Ordering::Relaxed);
     assert_eq!(read_resource(), None);
+}
+
+/// Reads `size` octets of one external resource for the operation `scope`,
+/// as a signature or decryption context reads each resource it hands the
+/// core; the octets read, or `None` when the read is refused.
+fn read_for(scope: &mut ResourceScope<'_>, size: usize) -> Option<usize> {
+    const DOCUMENT: &str = "<Envelope xmlns=\"urn:envelope\"/>";
+    LEFT.store(size, Ordering::Relaxed);
+    // SAFETY: the callback list, the document and the context are used by
+    // this test alone and released here.
+    unsafe {
+        assert_eq!(xmlSecIOInit(), 0);
+        let registered =
+            xmlSecIORegisterCallbacks(Some(matches), Some(open), Some(read), Some(close));
+        assert_eq!(registered, 0);
+        let doc = xsReadMemory(
+            DOCUMENT.as_ptr().cast(),
+            c_int::try_from(DOCUMENT.len()).expect("a short document"),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        assert!(!doc.is_null());
+        let prefs = xmlSecTransformCtxCreate();
+        // The caller enables every URI type, `xmlSecTransformUriTypeAny`, so
+        // the operation's policy alone decides.
+        (*prefs).enabled_uris = 0xFFFF;
+        let bytes = ctx::read_resource(
+            prefs,
+            b"test:resource",
+            xsDocGetRootElement(doc),
+            doc,
+            scope,
+        );
+        xmlSecTransformCtxDestroy(prefs);
+        xsFreeDoc(doc);
+        xmlSecIOShutdown();
+        bytes.map(|bytes| bytes.len())
+    }
+}
+
+/// The current revision with `edit` applied, as one operation pins it.
+fn pinned_with(edit: impl FnOnce(&mut policy::Pinned)) -> policy::Pinned {
+    let mut pinned = policy::Pinned::current(crate::ffi::errors::here!("test"))
+        .expect("the library policy compiles");
+    edit(&mut pinned);
+    pinned
+}
+
+/// The resources one operation reads share its total allowance: a second
+/// read stops where the operation's total is spent instead of starting a
+/// fresh count, so the operation never collects more than the total.
+#[test]
+fn reads_of_one_operation_share_its_total_allowance() {
+    own_process();
+    let pinned = pinned_with(|pinned| {
+        std::sync::Arc::make_mut(&mut pinned.verification)
+            .resources
+            .max_external_resource_total_bytes = 24;
+    });
+    let mut scope = ResourceScope::new(&pinned, policy::Side::Verify, policy::Spent::default());
+    assert_eq!(read_for(&mut scope, 16), Some(16));
+    assert_eq!(scope.refused_by, None);
+    assert_eq!(read_for(&mut scope, 16), None);
+    assert_eq!(
+        scope.refused_by,
+        Some(crate::ffi::transforms::ctx::Limit {
+            name: "max_external_resource_total_bytes",
+            max: 24,
+        }),
+        "the refusal is the total's"
+    );
+}
+
+/// A read runs under the revision its operation pinned: a republish after
+/// the operation began, here one that refuses external references, does not
+/// change what the operation's reads admit.
+#[test]
+fn a_read_runs_under_its_operations_revision() {
+    own_process();
+    let pinned = pinned_with(|_| {});
+    policy::republish(
+        |verification| verification.uris.references = UriTypeSet::SAME_DOCUMENT,
+        |_| {},
+    )
+    .expect("the library policy compiles");
+    let mut scope = ResourceScope::new(&pinned, policy::Side::Verify, policy::Spent::default());
+    assert_eq!(read_for(&mut scope, 16), Some(16));
+}
+
+/// A signing operation reads its detached references under the signing
+/// policy: a resource signing admits is read even when verification refuses
+/// external references.
+#[test]
+fn a_signing_read_admits_what_signing_admits() {
+    own_process();
+    policy::republish(
+        |verification| verification.uris.references = UriTypeSet::SAME_DOCUMENT,
+        |signing| signing.uris.references = UriTypeSet::ALL,
+    )
+    .expect("the library policy compiles");
+    let pinned = pinned_with(|_| {});
+    let mut scope = ResourceScope::new(&pinned, policy::Side::Sign, policy::Spent::default());
+    assert_eq!(read_for(&mut scope, 16), Some(16));
+}
+
+/// A `CipherReference` is read under the decryption policy: a URI class
+/// decryption refuses is refused before any callback opens it, whatever
+/// verification admits.
+#[test]
+fn a_decryption_read_is_refused_before_a_callback_opens_it() {
+    own_process();
+    let pinned = pinned_with(|pinned| {
+        std::sync::Arc::make_mut(&mut pinned.decryption)
+            .uris
+            .references = UriTypeSet::SAME_DOCUMENT;
+    });
+    let mut scope = ResourceScope::new(&pinned, policy::Side::Decrypt, policy::Spent::default());
+    assert_eq!(read_for(&mut scope, 16), None);
+    assert_eq!(OPENED.load(Ordering::Relaxed), 0);
+    assert_eq!(scope.refused_by, None, "a URI class refusal is no limit's");
 }

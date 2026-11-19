@@ -1275,7 +1275,7 @@ fn validate_recipient(
     policy: &crate::policy::EncryptionPolicy,
 ) -> Result<(), XmlEncError> {
     let metadata_limit = policy.resources.max_encryption_metadata_bytes;
-    let (name, key_name, label_len) = match recipient {
+    let (name, key_name) = match recipient {
         #[cfg(feature = "legacy-algorithms")]
         EncryptionRecipient::RsaPkcs1v15 {
             public_key,
@@ -1295,7 +1295,7 @@ fn validate_recipient(
                 .into());
             }
             validate_key_transport_recipient(public_key.as_ref(), policy)?;
-            (recipient, key_name, None)
+            (recipient, key_name)
         }
         EncryptionRecipient::RsaOaep {
             public_key,
@@ -1304,7 +1304,7 @@ fn validate_recipient(
             key_name,
         } => {
             validate_oaep_recipient(public_key.as_ref(), parameters, policy)?;
-            (recipient, key_name, Some(parameters.label.len()))
+            (recipient, key_name)
         }
         EncryptionRecipient::AesKeyWrap {
             kek,
@@ -1313,20 +1313,31 @@ fn validate_recipient(
             key_name,
         } => {
             validate_aes_key_wrap_recipient(kek, *algorithm, policy)?;
-            (recipient, key_name, None)
+            (recipient, key_name)
         }
     };
     validate_metadata("EncryptedKey Recipient", name.as_deref(), metadata_limit)?;
-    validate_key_name("EncryptedKey KeyName", key_name.as_deref(), metadata_limit)?;
-    if let Some(label_len) = label_len {
-        validate_metadata_len(label_len, metadata_limit)?;
-    }
-    Ok(())
+    validate_key_name("EncryptedKey KeyName", key_name.as_deref(), metadata_limit)
 }
 
 /// Check an RSA-OAEP recipient's key and transport, digest and mask policy.
 fn validate_oaep_recipient(
     public_key: &dyn crate::provider::KeyTransportKey,
+    parameters: &super::RsaOaepParameters,
+    policy: &crate::policy::EncryptionPolicy,
+) -> Result<(), XmlEncError> {
+    validate_key_transport_recipient(public_key, policy)?;
+    admit_oaep_parameters(parameters, policy)
+}
+
+/// Check RSA-OAEP transport `parameters` against the encryption `policy`:
+/// the transport, the OAEP digest, the mask digest and the label, which the
+/// written `OAEPparams` carries as encryption metadata.
+///
+/// # Errors
+/// Returns [`XmlEncError::InvalidEncryptionConfig`] for parameters that are
+/// no OAEP configuration, or the policy's refusal of one of them.
+pub fn admit_oaep_parameters(
     parameters: &super::RsaOaepParameters,
     policy: &crate::policy::EncryptionPolicy,
 ) -> Result<(), XmlEncError> {
@@ -1350,14 +1361,7 @@ fn validate_oaep_recipient(
             "OAEP mask digest has no XML Encryption identifier".into(),
         )
     })?;
-    validate_key_transport_recipient(public_key, policy)?;
-    if policy
-        .key_transport_algorithms
-        .as_ref()
-        .is_some_and(|allowed| !allowed.contains(&parameters.algorithm))
-    {
-        return Err(rejected(parameters.algorithm.uri()));
-    }
+    policy.check_key_transport_algorithm(parameters.algorithm)?;
     if parameters.digest.requires_explicit_permission()
         && !policy
             .oaep_digests
@@ -1374,7 +1378,10 @@ fn validate_oaep_recipient(
             return Err(rejected(mgf_uri));
         }
     }
-    Ok(())
+    validate_metadata_len(
+        parameters.label.len(),
+        policy.resources.max_encryption_metadata_bytes,
+    )
 }
 
 /// Check an AES key-wrap recipient's algorithm policy and KEK length.
@@ -1383,19 +1390,7 @@ fn validate_aes_key_wrap_recipient(
     algorithm: KeyWrapAlgorithm,
     policy: &crate::policy::EncryptionPolicy,
 ) -> Result<(), XmlEncError> {
-    if policy
-        .key_wrap_algorithms
-        .as_ref()
-        .map_or(algorithm.requires_explicit_permission(), |allowed| {
-            !allowed.contains(&algorithm)
-        })
-    {
-        return Err(crate::policy::PolicyViolation::Algorithm {
-            operation: "encryption",
-            algorithm: algorithm.uri().to_string(),
-        }
-        .into());
-    }
+    policy.check_key_wrap_algorithm(algorithm)?;
     if kek.len() != algorithm.key_len() {
         return Err(XmlEncError::InvalidEncryptionConfig(format!(
             "{} requires a {}-byte key-encryption key, got {} bytes",

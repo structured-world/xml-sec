@@ -129,7 +129,12 @@ executes. Verification follows `XMLDSig`'s implicit C14N 1.0 coercion for a Refe
 as a node set. Signature generation follows the Second Edition recommendation instead: before
 digest planning it materializes C14N 1.1 as an explicit `Transform` wherever the generated chain
 still produces a node set. The mutation is operation-gated, policy-checked, bounded, and included
-in the canonicalized `<SignedInfo>` rather than being an invisible signing option. The declared
+in the canonicalized `<SignedInfo>` rather than being an invisible signing option. A signing policy
+whose `transforms.generated_canonicalization` is
+[`GeneratedCanonicalization::Implicit`](crate::policy::GeneratedCanonicalization::Implicit) writes
+nothing and digests the node set with C14N 1.0, as libxmlsec1 signs a template; the libxmlsec1 C
+library and the `xmlsec1` command select it, so donor templates sign to the donor's documents. The
+`XmlSecCompatible` profile verifies such documents but signs as every other profile does. The declared
 canonicalization method for `<SignedInfo>` is governed by the same policy. Reference output and
 `<SignedInfo>` serialization consume one bounded canonicalization budget, so policy rejection
 occurs during rendering rather than after an oversized buffer has already been allocated.
@@ -591,7 +596,15 @@ error as a rejected document; never continue an authentication flow after either
 External references are disabled by default. Verification and signing callers must both allow
 their URI class with `UriTypeSet` and provide every payload through
 `VerifyContext::external_resources` or `SignContext::external_resources`; neither operation
-performs network or filesystem I/O. Individual resources are limited to 8 MiB and the
+performs network or filesystem I/O. A verifier that fetches payloads itself can hand
+`VerifyContext::lazy_external_resources` a `LazyExternalResources` instead: the core asks its
+source for a listed URI only when it dereferences that resource, after the `SignatureValue`
+verified, so a forged signature makes the caller fetch nothing. Resources are fetched one at a
+time as their references are digested, each within what the aggregate limit leaves. Key material
+an external `KeyInfoReference` or `RetrievalMethod` names is read before the signature is
+checked, so it never comes from that source. The two sources are alternatives, and the one set
+last replaces the other: a verifier that needs external key material supplies every resource,
+payloads included, with `VerifyContext::external_resources`. Individual resources are limited to 8 MiB and the
 complete map to 32 MiB. The same aggregate ceiling is charged again per successful dereference,
 so repeatedly referencing one map entry cannot multiply transform work or retained diagnostics
 without bound. Signing dependency analysis and actual digest execution share that aggregate

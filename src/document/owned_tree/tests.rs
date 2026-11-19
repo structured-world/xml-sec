@@ -9,6 +9,34 @@ fn parsed(xml: &str) -> OwnedTree {
     OwnedTree::parse_with_policy(xml, &VerificationPolicy::default()).expect("the document parses")
 }
 
+#[test]
+fn a_node_serializes_with_only_the_declarations_it_carries() {
+    // libxml2's xmlNodeDumpOutput writes a node as it is: a prefix bound on
+    // an ancestor is not redeclared, and no XML declaration is written.
+    let tree = parsed("<r xmlns:p=\"urn:p\"><p:a x=\"1\">t<b xmlns=\"urn:b\"/></p:a></r>");
+    let root = tree.root_element().expect("a root element");
+    let a = children(&tree, root)[0];
+    assert_eq!(
+        tree.serialize_node(a).expect("a live node"),
+        "<p:a x=\"1\">t<b xmlns=\"urn:b\"/></p:a>"
+    );
+    let text = children(&tree, a)[0];
+    assert_eq!(tree.serialize_node(text).expect("a live node"), "t");
+}
+
+#[test]
+fn the_document_node_serializes_as_the_whole_document() {
+    // libxml2's xmlNodeDumpOutput writes a document node through
+    // xmlDocContentDumpOutput: the declaration and every child, as
+    // xmlDocDumpMemory writes the document.
+    let tree = parsed("<r><c/></r>");
+    assert_eq!(
+        tree.serialize_node(tree.document_node())
+            .expect("a live node"),
+        tree.serialize()
+    );
+}
+
 fn children(tree: &OwnedTree, node: TreeNode) -> Vec<TreeNode> {
     let mut found = Vec::new();
     let mut current = tree.first_child(node).expect("a live node");
@@ -600,6 +628,144 @@ fn a_fragment_unlinked_and_linked_elsewhere_declares_what_it_uses() {
 }
 
 #[test]
+fn the_document_subset_gives_no_default_to_the_parse_wrapper() {
+    // A fragment parsed in context sees the document's internal subset, but
+    // the element that carries it during the parse is not the document's:
+    // an attribute default the subset declares for that element's name,
+    // `xmlns` included, must not reach the fragment.
+    let mut policy = VerificationPolicy::default();
+    policy.xml.allow_internal_dtd = true;
+    for name in ["w", "w_", "x"] {
+        let xml = format!("<!DOCTYPE root [<!ATTLIST {name} xmlns CDATA 'urn:other'>]><root/>");
+        let mut tree = OwnedTree::parse_with_policy(&xml, &policy).expect("the document parses");
+        let root = tree.root_element().expect("a document element");
+        let item = tree
+            .parse_in_context(root, "<item/>", &policy)
+            .expect("the fragment parses")
+            .expect("the fragment has nodes");
+        assert_eq!(tree.namespace(item), Ok(None), "subset for {name}");
+    }
+}
+
+#[test]
+fn a_long_run_of_the_wrapper_letter_in_the_subset_is_handled_in_linear_time() {
+    // The wrapper's name must not occur in the subset; a subset holding a
+    // long run of its letter must not make finding one quadratic.
+    let mut policy = VerificationPolicy::default();
+    policy.xml.allow_internal_dtd = true;
+    let run = "w".repeat(200_000);
+    let xml = format!("<!DOCTYPE root [<!ENTITY e '{run}'>]><root/>");
+    let mut tree = OwnedTree::parse_with_policy(&xml, &policy).expect("the document parses");
+    let root = tree.root_element().expect("a document element");
+    let started = std::time::Instant::now();
+    let item = tree
+        .parse_in_context(root, "<item/>", &policy)
+        .expect("the fragment parses")
+        .expect("the fragment has nodes");
+    // A linear scan takes milliseconds; trying every longer name takes
+    // minutes at this size.
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(tree.namespace(item), Ok(None));
+}
+
+#[cfg(feature = "xmldsig")]
+#[test]
+fn a_detached_replacement_is_not_charged_to_the_document() {
+    // `d` is unlinked, so replacing its child changes no node of the
+    // document, which keeps its three nodes under a limit of four whatever
+    // the replacement holds; the same replacement inside a document of four
+    // nodes passes that limit. The fragment's own parse (the document node,
+    // its wrapper and two elements) fits the limit either way.
+    let mut policy = VerificationPolicy::default();
+    policy.resources.max_xml_nodes = 5;
+    let mut tree = OwnedTree::parse_with_policy("<r><p/><d><x/></d></r>", &policy)
+        .expect("the document parses");
+    let mut attached =
+        OwnedTree::parse_with_policy("<r><p/><x/></r>", &policy).expect("the document parses");
+    policy.resources.max_xml_nodes = 4;
+    let root = tree.root_element().expect("a document element");
+    let d = children(&tree, root)[1];
+    let x = children(&tree, d)[0];
+    tree.unlink(d).expect("a live node");
+    let mut spent = 0;
+    assert!(
+        tree.parse_replacing_within(x, "<a/><b/>", &policy, &mut spent)
+            .is_ok(),
+        "a detached replacement leaves the document as it is"
+    );
+    let root = attached.root_element().expect("a document element");
+    let x = children(&attached, root)[1];
+    let mut spent = 0;
+    assert!(
+        attached
+            .parse_replacing_within(x, "<a/><b/>", &policy, &mut spent)
+            .is_err(),
+        "four nodes, less one, plus two pass the limit"
+    );
+}
+
+#[test]
+fn a_node_of_an_entity_expansion_is_not_replaced() {
+    // The document writes `&e;`, not the expansion, so `x` has no text of its
+    // own there: a replacement would change the entity's content and be
+    // measured against octets the document does not hold. It is refused,
+    // while the same markup written directly is replaced.
+    let mut policy = VerificationPolicy::default();
+    policy.xml.allow_internal_dtd = true;
+    let expanded = "<!DOCTYPE r [<!ENTITY e '<a><x><b/></x></a>'>]><r>&e;</r>";
+    let mut tree = OwnedTree::parse_with_policy(expanded, &policy).expect("the document parses");
+    let root = tree.root_element().expect("a document element");
+    let reference = children(&tree, root)[0];
+    let a = children(&tree, reference)[0];
+    let x = children(&tree, a)[0];
+    let mut spent = 0;
+    assert!(matches!(
+        tree.parse_replacing_within(x, "<y/>", &policy, &mut spent),
+        Err(XmlDocumentError::EntityExpandedMutationTarget)
+    ));
+    let mut direct = OwnedTree::parse_with_policy("<r><a><x><b/></x></a></r>", &policy)
+        .expect("the document parses");
+    let root = direct.root_element().expect("a document element");
+    let a = children(&direct, root)[0];
+    let x = children(&direct, a)[0];
+    let mut spent = 0;
+    assert!(
+        direct
+            .parse_replacing_within(x, "<y/>", &policy, &mut spent)
+            .is_ok()
+    );
+}
+
+#[test]
+fn entity_expanded_markup_is_held_to_the_same_depth_as_direct_markup() {
+    // A context at depth three under a depth limit of four leaves room for
+    // one level: `<a><b/></a>` needs two, whether written directly or
+    // expanded from an entity the subset declares.
+    let mut policy = VerificationPolicy::default();
+    policy.xml.allow_internal_dtd = true;
+    policy.resources.max_xml_depth = 4;
+    let xml = "<!DOCTYPE r [<!ENTITY e '<a><b/></a>'>]><r><c><d/></c></r>";
+    for fragment in ["<a><b/></a>", "&e;"] {
+        let mut tree = OwnedTree::parse_with_policy(xml, &policy).expect("the document parses");
+        let root = tree.root_element().expect("a document element");
+        let c = children(&tree, root)[0];
+        let d = children(&tree, c)[0];
+        assert!(
+            tree.parse_in_context(d, fragment, &policy).is_err(),
+            "{fragment} reaches depth five"
+        );
+        assert!(
+            tree.parse_in_context(c, fragment, &policy).is_ok(),
+            "{fragment} fits under depth two"
+        );
+    }
+}
+
+#[test]
 fn a_fragment_in_no_namespace_unlinked_and_linked_under_a_default_one_undeclares_it() {
     // `x` was read in no namespace. Unlinked from its run it needs no
     // declaration, but linked under a default namespace it must undeclare
@@ -821,6 +987,37 @@ fn a_fragment_parses_in_the_document_context() {
         tree.parse_in_context(document, "<p:x/>", &VerificationPolicy::default())
             .is_err(),
         "the document binds no prefix"
+    );
+}
+
+#[test]
+fn a_fragment_is_as_deep_as_the_context_it_is_parsed_in() {
+    // The fragment's elements lie below its context: a fragment within the
+    // depth limit on its own is refused when its context is deep enough to
+    // put them past it, and one that stays within it is accepted.
+    let mut tree = parsed("<a><b><c/></b></a>");
+    let a = tree.root_element().expect("a root element");
+    let b = children(&tree, a)[0];
+    let c = children(&tree, b)[0];
+    let mut policy = VerificationPolicy::default();
+    policy.resources.max_xml_depth = 4;
+    assert!(
+        tree.parse_in_context(c, "<d/>", &policy)
+            .expect("the fourth level is within the limit")
+            .is_some()
+    );
+    assert!(matches!(
+        tree.parse_in_context(c, "<d><e/></d>", &policy),
+        Err(XmlDocumentError::Policy(PolicyViolation::ResourceLimit {
+            resource: resource_name::XML_DEPTH,
+            maximum: 4,
+            actual: 5,
+        }))
+    ));
+    assert!(
+        tree.parse_in_context(c, "text only", &policy)
+            .expect("text adds no level")
+            .is_some()
     );
 }
 

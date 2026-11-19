@@ -402,10 +402,12 @@ struct SelfClosingContentEdit {
 }
 
 #[cfg(feature = "xmldsig-sign")]
+/// Whether `value` is Base64 text, possibly laid out in lines, that XML
+/// character data holds as is.
 fn is_unescaped_base64_text(value: &str) -> bool {
     value
         .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'\n'))
 }
 
 #[cfg(feature = "xmldsig-sign")]

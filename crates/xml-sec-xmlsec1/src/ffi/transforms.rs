@@ -27,6 +27,7 @@ use super::{contain, free, malloc, write_stream};
 use xml_sec::policy::{EmptyDigestInput, PolicyViolation};
 
 pub(crate) mod builtin;
+pub(crate) mod ciphers;
 pub(crate) mod ctx;
 pub(crate) mod digests;
 pub(crate) mod hmac;
@@ -34,6 +35,7 @@ pub(crate) mod io;
 pub(crate) mod parser;
 pub(crate) mod relationship;
 pub(crate) mod signatures;
+pub(crate) mod transport;
 pub(crate) mod xpath;
 
 #[cfg(test)]
@@ -57,6 +59,8 @@ pub(crate) const MODE_PUSH: c_int = 1;
 /// `xmlSecTransformModePop`.
 pub(crate) const MODE_POP: c_int = 2;
 
+/// `xmlSecTransformOperationNone`.
+pub(crate) const OPERATION_NONE: c_int = 0;
 /// `xmlSecTransformOperationEncode`.
 pub(crate) const OPERATION_ENCODE: c_int = 1;
 /// `xmlSecTransformOperationDecode`.
@@ -65,6 +69,10 @@ pub(crate) const OPERATION_DECODE: c_int = 2;
 pub(crate) const OPERATION_SIGN: c_int = 3;
 /// `xmlSecTransformOperationVerify`.
 pub(crate) const OPERATION_VERIFY: c_int = 4;
+/// `xmlSecTransformOperationEncrypt`.
+pub(crate) const OPERATION_ENCRYPT: c_int = 5;
+/// `xmlSecTransformOperationDecrypt`.
+pub(crate) const OPERATION_DECRYPT: c_int = 6;
 
 /// `xmlSecTransformDataTypeUnknown`.
 pub(crate) const DATA_UNKNOWN: u8 = 0;
@@ -81,6 +89,8 @@ pub(crate) const USAGE_C14N_METHOD: c_uint = 0x0002;
 pub(crate) const USAGE_DIGEST_METHOD: c_uint = 0x0004;
 /// `xmlSecTransformUsageSignatureMethod`.
 pub(crate) const USAGE_SIGNATURE_METHOD: c_uint = 0x0008;
+/// `xmlSecTransformUsageEncryptionMethod`.
+pub(crate) const USAGE_ENCRYPTION_METHOD: c_uint = 0x0010;
 
 /// `XMLSEC_TRANSFORM_FLAGS_USER_SPECIFIED`.
 pub(crate) const FLAGS_USER_SPECIFIED: usize = 0x0001;
@@ -88,17 +98,7 @@ pub(crate) const FLAGS_USER_SPECIFIED: usize = 0x0001;
 /// `xmlSecKeyUsageAny`.
 const KEY_USAGE_ANY: c_uint = 0xFFFF_FFFF;
 
-/// `xmlSecKeyReq`, written by [`xmlSecTransformSetKeyReq`].
-#[repr(C)]
-pub(crate) struct XmlSecKeyReq {
-    pub(crate) key_id: *const c_void,
-    pub(crate) key_type: c_uint,
-    pub(crate) key_usage: c_uint,
-    pub(crate) key_bits_size: usize,
-    pub(crate) key_use_with_list: XmlSecPtrList,
-    pub(crate) reserved1: *mut c_void,
-    pub(crate) reserved2: *mut c_void,
-}
+pub(crate) use super::keys::XmlSecKeyReq;
 
 pub(crate) type InitializeMethod = Option<unsafe extern "C" fn(*mut XmlSecTransform) -> c_int>;
 pub(crate) type FinalizeMethod = Option<unsafe extern "C" fn(*mut XmlSecTransform)>;
@@ -852,6 +852,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformSetKey(
     contain(-1, || {
         let (_, klass) = valid_or!(transform, "xmlSecTransformSetKey", -1);
         check!(!key.is_null(), "xmlSecTransformSetKey", c"key != NULL", -1);
+        ctx::note_setting_change(transform);
         // SAFETY: the klass method keeps libxmlsec1's contract.
         klass
             .set_key

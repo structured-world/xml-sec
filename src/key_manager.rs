@@ -1061,6 +1061,10 @@ struct InventoryDirectSymmetric {
 
 #[cfg(feature = "xmlenc")]
 impl crate::xmlenc::DecryptionKeyResolver for InventoryDirectSymmetric {
+    fn consults_encrypted_keys(&self) -> bool {
+        false
+    }
+
     fn resolve_key(
         &self,
         _provider: &dyn crate::provider::CryptoProvider,

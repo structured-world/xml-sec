@@ -10,7 +10,9 @@ use std::sync::Arc;
 
 use super::errors::{self, Here};
 
-use xml_sec::policy::{ResourcePolicy, SigningPolicy, VerificationPolicy};
+use xml_sec::policy::{
+    DecryptionPolicy, EncryptionPolicy, ResourcePolicy, SigningPolicy, VerificationPolicy,
+};
 use xml_sec::xmldsig::UriTypeSet;
 
 /// The current verification snapshot; `None` when it cannot be compiled.
@@ -35,19 +37,23 @@ pub(crate) fn verification_at(here: Here) -> Option<Arc<VerificationPolicy>> {
 pub(crate) struct Pinned {
     pub(crate) verification: Arc<VerificationPolicy>,
     pub(crate) signing: Arc<SigningPolicy>,
+    pub(crate) encryption: Arc<EncryptionPolicy>,
+    pub(crate) decryption: Arc<DecryptionPolicy>,
 }
 
 impl Pinned {
     /// The current revision, reported at `here` when the profile is
     /// unavailable.
     pub(crate) fn current(here: Here) -> Option<Self> {
-        let Some((verification, signing)) = xml_sec_libxml2::policy::snapshot() else {
+        let Some(snapshots) = xml_sec_libxml2::policy::snapshots() else {
             errors::policy_unavailable(here);
             return None;
         };
         Some(Self {
-            verification,
-            signing,
+            verification: snapshots.verification,
+            signing: snapshots.signing,
+            encryption: snapshots.encryption,
+            decryption: snapshots.decryption,
         })
     }
 
@@ -56,18 +62,23 @@ impl Pinned {
         match side {
             Side::Verify => OperationPolicy::Verify(&self.verification),
             Side::Sign => OperationPolicy::Sign(&self.signing),
+            Side::Encrypt => OperationPolicy::Encrypt(&self.encryption),
+            Side::Decrypt => OperationPolicy::Decrypt(&self.decryption),
         }
     }
 }
 
-/// The operation a run of a transform chain serves: signing when one of its
-/// transforms signs (a signature method, or a reference's digest method set
-/// to sign), verification otherwise, as libxmlsec1 marks each transform with
-/// its operation.
+/// The operation a run of a transform chain serves, as libxmlsec1 marks each
+/// transform with its operation: signing when one of its transforms signs (a
+/// signature method, or a reference's digest method set to sign), encryption
+/// or decryption when its cipher, wrap or transport does, verification
+/// otherwise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Side {
     Verify,
     Sign,
+    Encrypt,
+    Decrypt,
 }
 
 /// The snapshot of one side of a pinned revision.
@@ -75,6 +86,8 @@ pub(crate) enum Side {
 pub(crate) enum OperationPolicy<'a> {
     Verify(&'a VerificationPolicy),
     Sign(&'a SigningPolicy),
+    Encrypt(&'a EncryptionPolicy),
+    Decrypt(&'a DecryptionPolicy),
 }
 
 impl<'a> OperationPolicy<'a> {
@@ -83,15 +96,37 @@ impl<'a> OperationPolicy<'a> {
         match self {
             Self::Verify(policy) => &policy.resources,
             Self::Sign(policy) => &policy.resources,
+            Self::Encrypt(policy) => &policy.resources,
+            Self::Decrypt(policy) => &policy.resources,
         }
     }
 
-    /// The URI classes the operation admits for a signature's references.
-    pub(crate) fn references(self) -> UriTypeSet {
+    /// The URI-class permissions of the operation.
+    fn uris(self) -> xml_sec::policy::UriPolicy {
         match self {
-            Self::Verify(policy) => policy.uris.references,
-            Self::Sign(policy) => policy.uris.references,
+            Self::Verify(policy) => policy.uris,
+            Self::Sign(policy) => policy.uris,
+            Self::Encrypt(policy) => policy.uris,
+            Self::Decrypt(policy) => policy.uris,
         }
+    }
+
+    /// The URI classes the operation admits for a signature's references, a
+    /// `CipherReference` or the resource an encryption reads by URI.
+    pub(crate) fn references(self) -> UriTypeSet {
+        self.uris().references
+    }
+
+    /// The URI classes the operation admits for a `RetrievalMethod` of the
+    /// key it reads.
+    pub(crate) fn retrieval_methods(self) -> UriTypeSet {
+        self.uris().retrieval_methods
+    }
+
+    /// The URI classes the operation admits for a `KeyInfoReference` of the
+    /// key it reads.
+    pub(crate) fn key_info_references(self) -> UriTypeSet {
+        self.uris().key_info_references
     }
 }
 
@@ -102,6 +137,8 @@ macro_rules! with_document_policy {
         match $operation {
             $crate::ffi::policy::OperationPolicy::Verify($policy) => $body,
             $crate::ffi::policy::OperationPolicy::Sign($policy) => $body,
+            $crate::ffi::policy::OperationPolicy::Encrypt($policy) => $body,
+            $crate::ffi::policy::OperationPolicy::Decrypt($policy) => $body,
         }
     };
 }
@@ -120,22 +157,55 @@ pub(crate) struct Spent {
     pub(crate) xml_parse: usize,
     /// `XPath` expressions evaluated, of `max_xpath_expressions`.
     pub(crate) xpath_expressions: usize,
+    /// The limit that refused work of the operation: its budget is spent,
+    /// so the operation ends wherever its parts hand it back.
+    pub(crate) refused_by: Option<super::transforms::ctx::Limit>,
+    /// Whether the keys the operation recovered were recovered validly,
+    /// consulted only once its content work is done.
+    pub(crate) recovery: xml_sec::provider::RecoveryValidity,
+    /// The side of the operation that uses the keys its `KeyInfo` reads
+    /// find, fixed by its outermost read and handed to nested ones.
+    pub(crate) serves: Option<Side>,
 }
 
 /// The key candidates one `KeyInfo` read has inspected of the policy's
 /// `max_key_candidates`, across every key-store search it makes.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub(crate) struct KeyCandidates {
     pub(crate) inspected: usize,
     /// A search was refused for the allowance; the read fails rather than
     /// taking the refusal for a missing key.
     pub(crate) exhausted: bool,
+    /// The `max_key_candidates` of the operation the read is a part of, which
+    /// bounds the read with its own; unbounded for a read of its own.
+    operation_max: usize,
+}
+
+impl Default for KeyCandidates {
+    fn default() -> Self {
+        Self {
+            inspected: 0,
+            exhausted: false,
+            operation_max: usize::MAX,
+        }
+    }
 }
 
 impl KeyCandidates {
-    /// Charges one more candidate within `max`; refused, marked exhausted and
-    /// reported for `object` at `here` once the allowance is spent.
+    /// These candidates, read as a part of an operation whose policy allows
+    /// `max`.
+    pub(crate) fn within(self, max: usize) -> Self {
+        Self {
+            operation_max: self.operation_max.min(max),
+            ..self
+        }
+    }
+
+    /// Charges one more candidate within `max`, the read's allowance, and the
+    /// operation's; refused, marked exhausted and reported for `object` at
+    /// `here` once either is spent.
     pub(crate) fn charge(&mut self, max: usize, here: Here, object: *const c_char) -> bool {
+        let max = max.min(self.operation_max);
         if self.inspected >= max {
             self.exhausted = true;
             errors::limit_exceeded(here, object, "max_key_candidates", max);
@@ -175,14 +245,40 @@ impl SlotPin {
             if !(*slot).is_null() {
                 return Some(Self { slot, owned: false });
             }
+            Some(Self::hold_pinned(
+                slot,
+                Pinned::current(here)?,
+                Spent::default(),
+                KeyCandidates::default(),
+            ))
+        }
+    }
+
+    /// Pins `pinned` into `slot` unless it holds a pin, so the read sees the
+    /// revision of the operation that makes it and counts on from `spent`
+    /// and `candidates`, what that operation spent before it.
+    ///
+    /// # Safety
+    /// As for [`SlotPin::hold`].
+    pub(crate) unsafe fn hold_pinned(
+        slot: *mut *mut c_void,
+        pinned: Pinned,
+        spent: Spent,
+        candidates: KeyCandidates,
+    ) -> Self {
+        // SAFETY: by the caller's contract.
+        unsafe {
+            if !(*slot).is_null() {
+                return Self { slot, owned: false };
+            }
             let operation = Operation {
-                pinned: Pinned::current(here)?,
-                spent: Cell::default(),
-                key_candidates: Cell::default(),
+                pinned,
+                spent: Cell::new(spent),
+                key_candidates: Cell::new(candidates),
             };
             *slot = Box::into_raw(Box::new(operation)).cast();
         }
-        Some(Self { slot, owned: true })
+        Self { slot, owned: true }
     }
 }
 

@@ -31,6 +31,8 @@ pub(crate) mod transforms;
 pub(crate) mod tree;
 pub(crate) mod version;
 pub(crate) mod x509;
+pub(crate) mod xmldsig;
+pub(crate) mod xmlenc;
 pub(crate) mod xmltree;
 
 #[cfg(test)]

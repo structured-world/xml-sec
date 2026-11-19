@@ -457,7 +457,11 @@ unsafe fn base64_step(
                 name: "max_base64_transform_input_bytes",
                 max: resources.max_base64_transform_input_bytes,
             };
-            charge(&mut budget.base64_input, in_size, limit, here, name)?;
+            if charge(&mut budget.base64_input, in_size, limit, here, name).is_none() {
+                // The operation's budget is spent: its other parts end too.
+                budget.refused_by.get_or_insert(limit);
+                return None;
+            }
             let reserve = if (*codec).encode != 0 {
                 Base64Codec::encoded_capacity((*codec).columns, in_size)
             } else {
@@ -506,7 +510,11 @@ unsafe fn base64_step(
             max: resources.max_base64_transform_output_bytes,
         };
         let produced = xmlSecBufferGetSize(output) - before;
-        charge(&mut budget.base64_output, produced, limit, here, name)
+        let charged = charge(&mut budget.base64_output, produced, limit, here, name);
+        if charged.is_none() {
+            budget.refused_by.get_or_insert(limit);
+        }
+        charged
     }
 }
 

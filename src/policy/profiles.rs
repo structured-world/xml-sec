@@ -8,8 +8,8 @@ use super::{
     KeyWrapAlgorithm, OaepDigestAlgorithm,
 };
 use super::{
-    DigestAlgorithm, KeySourceKind, KeySourcePolicy, PolicyViolation, RsaPssPermission,
-    SameDocumentIdSemantics, SignatureAlgorithm, SigningPolicy, TransformPolicy,
+    DigestAlgorithm, KeySourceKind, KeySourcePolicy, PolicyViolation, RequestSelections,
+    RsaPssPermission, SameDocumentIdSemantics, SignatureAlgorithm, SigningPolicy, TransformPolicy,
     UnknownX509CertificateSemantics, UriPolicy, UriTypeSet, VerificationPolicy,
     XsltStylesheetSemantics,
 };
@@ -437,10 +437,15 @@ fn verification_profile(
         verification.key_trust.rsa_keys.minimum_modulus_bits = 1024;
         verification.key_trust.dsa_keys.minimum_modulus_bits = 1024;
         verification.hmac.minimum_output_bits = 80;
+        // Verification resolves a bare-name fragment as libxmlsec1 does, so it
+        // accepts the documents libxmlsec1 signs; signing keeps to the
+        // specification's ID form, which libxmlsec1 verifies as well.
         verification.transforms.same_document_id_semantics =
             SameDocumentIdSemantics::XmlSecBarename;
         verification.key_trust.unknown_x509_certificate =
             UnknownX509CertificateSemantics::Libxmlsec1;
+        // libxmlsec1's context flags select these for one operation.
+        verification.request_selections = RequestSelections::libxmlsec1();
     }
     if constraints != SignatureConstraints::General {
         verification.key_sources = KeySourcePolicy::from([
@@ -468,7 +473,9 @@ fn verification_profile(
 fn profile_transforms(compatibility: bool) -> TransformPolicy {
     if compatibility {
         // Signers and verifiers in this profile must agree with libxmlsec1 on the
-        // digested output of XSLT transforms.
+        // digested output of XSLT transforms. Signing otherwise writes what
+        // the specification recommends; byte-for-byte libxmlsec1 templates
+        // are the business of the C library and the xmlsec1 command.
         TransformPolicy {
             xslt_stylesheet_semantics: XsltStylesheetSemantics::Libxmlsec1,
             ..TransformPolicy::default()
@@ -530,6 +537,8 @@ fn signing_profile(
         } else {
             UriPolicy::default()
         },
+        // A request selects for signing what it may select for verification.
+        request_selections: verification.request_selections.clone(),
         ..SigningPolicy::default()
     }
 }

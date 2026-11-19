@@ -162,6 +162,14 @@ pub enum PolicyViolation {
     #[cfg(feature = "xmldsig")]
     #[error("Manifest reference processing is disabled by policy")]
     ManifestProcessingDisabled,
+    /// A request selected a value the policy does not list in its
+    /// [`RequestSelections`].
+    #[cfg(feature = "xmldsig")]
+    #[error("policy does not let a request select its {setting}")]
+    RequestSelection {
+        /// The policy setting the request tried to select.
+        setting: &'static str,
+    },
     /// The policy refuses to digest a Reference whose transforms produce no
     /// octets ([`EmptyDigestInput::Refuse`]).
     #[cfg(feature = "xmldsig")]
@@ -1117,7 +1125,7 @@ pub enum OpcRelationshipEdition {
 
 /// `XMLDSig` transform and canonicalization decisions shared by signing and verification.
 #[cfg(feature = "xmldsig")]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SameDocumentIdSemantics {
     /// Require bare fragment identifiers to satisfy the XML `NCName` grammar.
     #[default]
@@ -1153,7 +1161,7 @@ pub enum XsltStylesheetSemantics {
 
 /// Wire representation used for ECDSA `SignatureValue` bytes.
 #[cfg(feature = "xmldsig")]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EcdsaSignatureValueEncoding {
     /// `XMLDSig` fixed-width `r || s` representation.
     #[default]
@@ -1177,6 +1185,22 @@ pub enum EmptyDigestInput {
     Refuse,
 }
 
+/// How signing completes a `Reference` whose transform chain ends in a node
+/// set. Verification reads both forms: the node set's conversion to octets
+/// with Canonical XML 1.0 is mandatory (`XMLDSig` 1.1 section 4.4.3.2).
+#[cfg(feature = "xmldsig")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GeneratedCanonicalization {
+    /// Write an explicit C14N 1.1 `Transform`, so the conversion is part of
+    /// what `SignedInfo` authenticates (`XMLDSig` 1.1 section 3.1.1
+    /// recommends not relying on the implicit one when generating).
+    #[default]
+    ExplicitC14n11,
+    /// Write nothing and leave the node set to the implicit Canonical XML 1.0
+    /// conversion, as libxmlsec1 signs a template.
+    Implicit,
+}
+
 /// `XMLDSig` transform and canonicalization decisions shared by signing and verification.
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1193,6 +1217,8 @@ pub struct TransformPolicy {
     pub xslt_stylesheet_semantics: XsltStylesheetSemantics,
     /// Whether a Reference whose transforms produce no octets is digested.
     pub empty_digest_input: EmptyDigestInput,
+    /// How signing completes a Reference whose chain ends in a node set.
+    pub generated_canonicalization: GeneratedCanonicalization,
 }
 
 /// URI-class decisions shared by `XMLDSig` reference and key retrieval processing.
@@ -1410,7 +1436,7 @@ impl KeyTrustPolicy {
 /// Whether an `XMLDSig` operation evaluates Manifest references. Verification
 /// requires original authenticated coverage; signing populates direct Object/Manifest digests.
 #[cfg(feature = "xmldsig")]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ManifestProcessing {
     /// Leave Manifest reference values untouched and perform no Manifest work.
     #[default]
@@ -1443,6 +1469,142 @@ pub enum TimestampTokenEncoding {
     /// RFC 5652 BER. A level then asserts nothing about EN 319 132-1 §5.1.3.
     Ber,
 }
+
+/// Values a request may select for its own operation in place of the
+/// policy's: a caller's compatibility option (a libxmlsec1 context flag)
+/// takes effect only when the policy lists the value here, so a request
+/// never reaches a mode the deployment did not admit.
+#[cfg(feature = "xmldsig")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestSelections {
+    /// Same-document ID semantics a request may select.
+    pub same_document_id_semantics: BTreeSet<SameDocumentIdSemantics>,
+    /// ECDSA `SignatureValue` encodings a request may select.
+    pub ecdsa_signature_value_encodings: BTreeSet<EcdsaSignatureValueEncoding>,
+    /// Manifest processing a request may select.
+    pub manifest_processing: BTreeSet<ManifestProcessing>,
+}
+
+#[cfg(feature = "xmldsig")]
+impl RequestSelections {
+    /// Every value libxmlsec1's context flags select.
+    #[must_use]
+    pub fn libxmlsec1() -> Self {
+        Self {
+            same_document_id_semantics: BTreeSet::from([SameDocumentIdSemantics::XmlSecVisa3d]),
+            ecdsa_signature_value_encodings: BTreeSet::from([
+                EcdsaSignatureValueEncoding::XmlSecAsn1Der,
+            ]),
+            manifest_processing: BTreeSet::from([
+                ManifestProcessing::Ignore,
+                ManifestProcessing::Process,
+            ]),
+        }
+    }
+
+    /// The selections both `self` and `other` admit.
+    #[must_use]
+    pub fn intersection(&self, other: &Self) -> Self {
+        Self {
+            same_document_id_semantics: self
+                .same_document_id_semantics
+                .intersection(&other.same_document_id_semantics)
+                .copied()
+                .collect(),
+            ecdsa_signature_value_encodings: self
+                .ecdsa_signature_value_encodings
+                .intersection(&other.ecdsa_signature_value_encodings)
+                .copied()
+                .collect(),
+            manifest_processing: self
+                .manifest_processing
+                .intersection(&other.manifest_processing)
+                .copied()
+                .collect(),
+        }
+    }
+
+    /// `selected` when it is `current` or the policy lists it.
+    fn admit<T: Ord + Copy>(
+        listed: &BTreeSet<T>,
+        current: T,
+        selected: T,
+        setting: &'static str,
+    ) -> Result<T, PolicyViolation> {
+        if selected == current || listed.contains(&selected) {
+            Ok(selected)
+        } else {
+            Err(PolicyViolation::RequestSelection { setting })
+        }
+    }
+}
+
+/// Applies a request's selections to an `XMLDSig` operation policy.
+#[cfg(feature = "xmldsig")]
+macro_rules! select_methods {
+    ($policy:ty) => {
+        impl $policy {
+            /// Selects `semantics` for this request's same-document IDs.
+            ///
+            /// # Errors
+            /// [`PolicyViolation::RequestSelection`] when the policy does not
+            /// list it.
+            pub fn select_same_document_id_semantics(
+                &mut self,
+                semantics: SameDocumentIdSemantics,
+            ) -> Result<(), PolicyViolation> {
+                self.transforms.same_document_id_semantics = RequestSelections::admit(
+                    &self.request_selections.same_document_id_semantics,
+                    self.transforms.same_document_id_semantics,
+                    semantics,
+                    "same_document_id_semantics",
+                )?;
+                Ok(())
+            }
+
+            /// Selects `encoding` for this request's ECDSA signature values.
+            ///
+            /// # Errors
+            /// [`PolicyViolation::RequestSelection`] when the policy does not
+            /// list it.
+            pub fn select_ecdsa_signature_value_encoding(
+                &mut self,
+                encoding: EcdsaSignatureValueEncoding,
+            ) -> Result<(), PolicyViolation> {
+                self.ecdsa_signature_value_encoding = RequestSelections::admit(
+                    &self.request_selections.ecdsa_signature_value_encodings,
+                    self.ecdsa_signature_value_encoding,
+                    encoding,
+                    "ecdsa_signature_value_encoding",
+                )?;
+                Ok(())
+            }
+
+            /// Selects `processing` for this request's Manifests.
+            ///
+            /// # Errors
+            /// [`PolicyViolation::RequestSelection`] when the policy does not
+            /// list it.
+            pub fn select_manifest_processing(
+                &mut self,
+                processing: ManifestProcessing,
+            ) -> Result<(), PolicyViolation> {
+                self.manifest_processing = RequestSelections::admit(
+                    &self.request_selections.manifest_processing,
+                    self.manifest_processing,
+                    processing,
+                    "manifest_processing",
+                )?;
+                Ok(())
+            }
+        }
+    };
+}
+
+#[cfg(feature = "xmldsig")]
+select_methods!(VerificationPolicy);
+#[cfg(feature = "xmldsig")]
+select_methods!(SigningPolicy);
 
 /// Immutable policy snapshot for `XMLDSig` verification.
 #[cfg(feature = "xmldsig")]
@@ -1477,6 +1639,8 @@ pub struct VerificationPolicy {
     pub transforms: TransformPolicy,
     /// Whether authenticated Manifest references are processed.
     pub manifest_processing: ManifestProcessing,
+    /// Values a request may select in place of the policy's.
+    pub request_selections: RequestSelections,
     /// Whether a caller-attested digest may complete a detached Reference.
     pub detached_digest_attestation: DetachedDigestAttestation,
     /// How the signature's timestamp tokens are read.
@@ -1646,6 +1810,8 @@ pub struct SigningPolicy {
     pub transforms: TransformPolicy,
     /// Whether direct `<Object>/<Manifest>` reference digests are populated.
     pub manifest_processing: ManifestProcessing,
+    /// Values a request may select in place of the policy's.
+    pub request_selections: RequestSelections,
     /// XML parser rules.
     pub xml: XmlInputPolicy,
     /// Resource ceilings.
@@ -1761,6 +1927,9 @@ pub struct EncryptionPolicy {
     pub oaep_digests: Option<BTreeSet<OaepDigestAlgorithm>>,
     /// RSA requirements enforced when producing OAEP key transport.
     pub rsa_keys: RsaKeyPolicy,
+    /// URI-class permissions for a resource an encryption reads by URI and
+    /// for the indirect key references of the key it encrypts with.
+    pub uris: UriPolicy,
     /// Shared agreement/KDF permission and cumulative work requirements.
     pub key_establishment: KeyEstablishmentPolicy,
     /// XML parser rules.
@@ -1784,6 +1953,102 @@ impl EncryptionPolicy {
         self.key_establishment.validate()?;
         self.rsa_keys.validate()
     }
+
+    /// Check whether content may be encrypted with `algorithm`.
+    ///
+    /// # Errors
+    /// Returns [`PolicyViolation::Algorithm`] for an algorithm the snapshot
+    /// does not admit.
+    pub fn check_data_algorithm(
+        &self,
+        algorithm: DataEncryptionAlgorithm,
+    ) -> Result<(), PolicyViolation> {
+        check_content_algorithm(self.data_algorithms.as_ref(), algorithm, "encryption")
+    }
+
+    /// Check whether keys may be wrapped with `algorithm`.
+    ///
+    /// # Errors
+    /// Returns [`PolicyViolation::Algorithm`] for a wrap the snapshot does not
+    /// admit.
+    pub fn check_key_wrap_algorithm(
+        &self,
+        algorithm: KeyWrapAlgorithm,
+    ) -> Result<(), PolicyViolation> {
+        check_key_wrap(self.key_wrap_algorithms.as_ref(), algorithm, "encryption")
+    }
+
+    /// Check whether keys may be transported with `algorithm`.
+    ///
+    /// # Errors
+    /// Returns [`PolicyViolation::Algorithm`] for a transport the snapshot
+    /// does not admit.
+    pub fn check_key_transport_algorithm(
+        &self,
+        algorithm: KeyTransportAlgorithm,
+    ) -> Result<(), PolicyViolation> {
+        check_key_transport(
+            self.key_transport_algorithms.as_ref(),
+            algorithm,
+            "encryption",
+        )
+    }
+}
+
+/// The shared key-transport permission contract: without an allowlist, only
+/// transports that need no explicit permission are admitted. Composition and
+/// enforcement both decide by it.
+#[cfg(feature = "xmlenc")]
+pub(crate) fn key_transport_allowed(
+    allowlist: Option<&BTreeSet<KeyTransportAlgorithm>>,
+    algorithm: KeyTransportAlgorithm,
+) -> bool {
+    allowlist.map_or(!algorithm.requires_explicit_permission(), |allowed| {
+        allowed.contains(&algorithm)
+    })
+}
+
+/// The shared key-wrap permission contract, as [`key_transport_allowed`].
+#[cfg(feature = "xmlenc")]
+pub(crate) fn key_wrap_allowed(
+    allowlist: Option<&BTreeSet<KeyWrapAlgorithm>>,
+    algorithm: KeyWrapAlgorithm,
+) -> bool {
+    allowlist.map_or(!algorithm.requires_explicit_permission(), |allowed| {
+        allowed.contains(&algorithm)
+    })
+}
+
+/// Enforce [`key_transport_allowed`].
+#[cfg(feature = "xmlenc")]
+fn check_key_transport(
+    allowlist: Option<&BTreeSet<KeyTransportAlgorithm>>,
+    algorithm: KeyTransportAlgorithm,
+    operation: &'static str,
+) -> Result<(), PolicyViolation> {
+    if !key_transport_allowed(allowlist, algorithm) {
+        return Err(PolicyViolation::Algorithm {
+            operation,
+            algorithm: algorithm.uri().to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Enforce [`key_wrap_allowed`].
+#[cfg(feature = "xmlenc")]
+fn check_key_wrap(
+    allowlist: Option<&BTreeSet<KeyWrapAlgorithm>>,
+    algorithm: KeyWrapAlgorithm,
+    operation: &'static str,
+) -> Result<(), PolicyViolation> {
+    if !key_wrap_allowed(allowlist, algorithm) {
+        return Err(PolicyViolation::Algorithm {
+            operation,
+            algorithm: algorithm.uri().to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Immutable policy snapshot for `XMLEnc` decryption.
@@ -1829,6 +2094,46 @@ impl DecryptionPolicy {
         self.resources.validate()?;
         self.key_establishment.validate()?;
         self.rsa_keys.validate()
+    }
+
+    /// Check whether content may be decrypted with `algorithm`.
+    ///
+    /// # Errors
+    /// Returns [`PolicyViolation::Algorithm`] for an algorithm the snapshot
+    /// does not admit.
+    pub fn check_data_algorithm(
+        &self,
+        algorithm: DataEncryptionAlgorithm,
+    ) -> Result<(), PolicyViolation> {
+        check_content_algorithm(self.data_algorithms.as_ref(), algorithm, "decryption")
+    }
+
+    /// Check whether keys wrapped with `algorithm` may be unwrapped.
+    ///
+    /// # Errors
+    /// Returns [`PolicyViolation::Algorithm`] for a wrap the snapshot does not
+    /// admit.
+    pub fn check_key_wrap_algorithm(
+        &self,
+        algorithm: KeyWrapAlgorithm,
+    ) -> Result<(), PolicyViolation> {
+        check_key_wrap(self.key_wrap_algorithms.as_ref(), algorithm, "decryption")
+    }
+
+    /// Check whether keys transported with `algorithm` may be recovered.
+    ///
+    /// # Errors
+    /// Returns [`PolicyViolation::Algorithm`] for a transport the snapshot
+    /// does not admit.
+    pub fn check_key_transport_algorithm(
+        &self,
+        algorithm: KeyTransportAlgorithm,
+    ) -> Result<(), PolicyViolation> {
+        check_key_transport(
+            self.key_transport_algorithms.as_ref(),
+            algorithm,
+            "decryption",
+        )
     }
 }
 

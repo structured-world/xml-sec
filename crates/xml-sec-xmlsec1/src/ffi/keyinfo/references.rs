@@ -108,13 +108,36 @@ unsafe fn enabled(ctx: *mut XmlSecKeyInfoCtx) -> *mut super::super::list::XmlSec
     }
 }
 
-/// The policy terms one dereference runs under: the read's revision, the URI
-/// classes admitted for this kind of key reference, and what the read has
-/// spent of its budgets, when the read is pinned.
+/// The policy terms one dereference runs under: the read's revision, the
+/// side of the operation the key is read for, the URI classes that side
+/// admits for this kind of key reference, and what the read has spent of
+/// its budgets, when the read is pinned.
 struct Terms<'a> {
     pinned: &'a policy::Pinned,
+    side: policy::Side,
     admitted: UriTypeSet,
     spent: Option<&'a Cell<policy::Spent>>,
+}
+
+/// The side of the operation the key read in `ctx` serves: a key read for a
+/// decryption dereferences and parses its references under the decryption
+/// policy, one of a signature under verification's. A read nested in an
+/// `EncryptedKey` decrypts that key for the operation its outermost read
+/// serves, whose policy governs its references too.
+///
+/// # Safety
+/// `ctx` is a context whose slot is null or a pin.
+unsafe fn read_side(ctx: *const XmlSecKeyInfoCtx) -> policy::Side {
+    // SAFETY: by the caller's contract.
+    let (operation, served) = unsafe {
+        (
+            (*ctx).operation,
+            policy::spent((*ctx).reserved0).and_then(|spent| spent.get().serves),
+        )
+    };
+    served.unwrap_or_else(|| {
+        super::super::transforms::ctx::operation_side(operation).unwrap_or(policy::Side::Verify)
+    })
 }
 
 /// Resolves the URI of `node` with the optional `Transforms` child in
@@ -137,6 +160,7 @@ unsafe fn dereference(
 ) -> bool {
     let Terms {
         pinned,
+        side,
         admitted,
         spent,
     } = *terms;
@@ -154,10 +178,18 @@ unsafe fn dereference(
     // SAFETY: by the caller's contract.
     unsafe {
         xmlSecTransformCtxReset(context);
-        // The chain runs under the read's revision, not a later one, opens
-        // the URI under the classes admitted for this key reference, and
-        // charges what the read's earlier references spent.
-        seed_run(context, pinned, admitted, spent.map_or_default(Cell::get));
+        // The chain runs under the read's revision, not a later one, and on
+        // the side of the operation the key is read for whatever the chain's
+        // transforms say, opens the URI under the classes admitted for this
+        // key reference, and charges what the read's earlier references
+        // spent.
+        seed_run(
+            context,
+            pinned,
+            side,
+            Some(admitted),
+            spent.map_or_default(Cell::get),
+        );
         if xmlSecTransformCtxSetUri(context, uri, node) < 0 {
             let shown = if uri.is_null() {
                 "NULL".to_owned()
@@ -216,9 +248,10 @@ unsafe fn dereference(
 }
 
 /// The document `context`'s result parses into, recovering as libxmlsec1
-/// parses it; null after a report. The parse runs within what the read has
-/// left of its parse work and charges it, so references reparsing the same
-/// target, siblings included, cannot parse past the operation's allowance.
+/// parses it, under the policy of the side `served`; null after a report. The parse
+/// runs within what the read has left of its parse work and charges it, so
+/// references reparsing the same target, siblings included, cannot parse
+/// past the operation's allowance.
 ///
 /// # Safety
 /// `context` holds a result.
@@ -226,7 +259,7 @@ unsafe fn result_document(
     here: Here,
     object: *const std::ffi::c_char,
     context: *mut XmlSecTransformCtx,
-    pinned: &policy::Pinned,
+    (pinned, served): (&policy::Pinned, policy::Side),
     spent: Option<&Cell<policy::Spent>>,
 ) -> *mut XmlDoc {
     // SAFETY: by the caller's contract.
@@ -241,17 +274,20 @@ unsafe fn result_document(
             errors::size_to_int_impossible(here, size);
             return std::ptr::null_mut();
         }
-        // libxmlsec1 parses with its options and XML_PARSE_RECOVER; the
-        // parser recovers from nothing, so malformed retrieved XML is
-        // refused. It parses under the read's revision.
+        // libxmlsec1 parses with its default options, which recover from
+        // nothing, so malformed retrieved XML is refused. It parses under
+        // the read's revision.
         let mut total = spent.map_or_default(Cell::get);
-        let doc = crate::ffi::parser::parse_within(
-            std::slice::from_raw_parts(data, size),
-            here,
-            object,
-            &*pinned.verification,
-            &mut total.xml_parse,
-        );
+        let bytes = std::slice::from_raw_parts(data, size);
+        let doc = policy::with_document_policy!(pinned.of(served), |document_policy| {
+            crate::ffi::parser::parse_within(
+                bytes,
+                here,
+                object,
+                document_policy,
+                &mut total.xml_parse,
+            )
+        });
         if let Some(spent) = spent {
             spent.set(total);
         }
@@ -267,28 +303,53 @@ unsafe fn result_document(
     }
 }
 
-/// The depth of a key reference read now in `ctx`: the levels taken by both
-/// kinds, as the policy's `max_key_info_reference_depth` bounds the nesting
-/// of key references of either kind together, plus this one. The context
-/// keeps libxmlsec1's two counters, each with its own maximum.
+/// The resources whose `max_key_info_reference_depth` bounds the key
+/// references read in `ctx`: the policy of the operation the key is read
+/// for, as an `EncryptedKey` nested with them is bounded, so one depth
+/// governs all three kinds on every path.
 ///
 /// # Safety
 /// `ctx` is a context.
-unsafe fn next_reference_depth(ctx: *const XmlSecKeyInfoCtx) -> usize {
+unsafe fn depth_resources(
+    pinned: &policy::Pinned,
+    ctx: *const XmlSecKeyInfoCtx,
+) -> &xml_sec::policy::ResourcePolicy {
     // SAFETY: by the caller's contract.
-    let (retrievals, references) = unsafe {
-        (
+    pinned.of(unsafe { read_side(ctx) }).resources()
+}
+
+/// The depth of a key reference or `EncryptedKey` read now in `ctx`: the
+/// levels taken by all three kinds, as the policy's
+/// `max_key_info_reference_depth` bounds their nesting together, plus this
+/// one. The context keeps libxmlsec1's three counters, each with its own
+/// maximum.
+///
+/// # Safety
+/// `ctx` is a context.
+pub(crate) unsafe fn next_reference_depth(ctx: *const XmlSecKeyInfoCtx) -> usize {
+    // SAFETY: by the caller's contract.
+    let levels = unsafe {
+        [
             (*ctx).cur_retrieval_method_level,
             (*ctx).cur_key_info_reference_level,
-        )
+            (*ctx).cur_encrypted_key_level,
+        ]
     };
     // A negative level a caller wrote into the public fields is past every
     // limit, so it cannot lift the policy's bound.
-    match (usize::try_from(retrievals), usize::try_from(references)) {
-        // Two `c_int` levels and one more fit in `usize`.
-        (Ok(retrievals), Ok(references)) => retrievals + references + 1,
-        _ => usize::MAX,
+    let mut depth = 1_usize;
+    for level in levels {
+        // A sum past `usize` (three `c_int` levels on a 32-bit target) is
+        // past every limit too.
+        let Some(next) = usize::try_from(level)
+            .ok()
+            .and_then(|level| depth.checked_add(level))
+        else {
+            return usize::MAX;
+        };
+        depth = next;
     }
+    depth
 }
 
 // ----------------------------------------------------------------------------
@@ -344,7 +405,7 @@ pub(crate) unsafe extern "C" fn retrieval_xml_read(
             let Some(pinned) = read_policy(ctx, here) else {
                 return -1;
             };
-            let resources = &pinned.verification.resources;
+            let resources = depth_resources(&pinned, ctx);
             if resources
                 .validate_key_info_reference_depth(next_reference_depth(ctx))
                 .is_err()
@@ -402,6 +463,7 @@ unsafe fn retrieve(
         };
         let context = &raw mut (*ctx).retrieval_method_ctx;
         let uri = xsGetProp(node, xmlSecAttrURI.as_ptr());
+        let side = read_side(ctx);
         let dereferenced = dereference(
             here,
             object,
@@ -411,7 +473,8 @@ unsafe fn retrieve(
             true,
             &Terms {
                 pinned: &pinned,
-                admitted: pinned.verification.uris.retrieval_methods,
+                side,
+                admitted: pinned.of(side).retrieval_methods(),
                 spent: policy::spent((*ctx).reserved0),
             },
         );
@@ -464,7 +527,7 @@ unsafe fn read_retrieved_xml(
             here,
             object,
             context,
-            pinned,
+            (pinned, read_side(ctx)),
             policy::spent((*ctx).reserved0),
         );
         if doc.is_null() {
@@ -587,7 +650,7 @@ pub(crate) unsafe extern "C" fn reference_xml_read(
             let Some(pinned) = read_policy(ctx, here) else {
                 return -1;
             };
-            let resources = &pinned.verification.resources;
+            let resources = depth_resources(&pinned, ctx);
             if resources
                 .validate_key_info_reference_depth(next_reference_depth(ctx))
                 .is_err()
@@ -629,6 +692,7 @@ unsafe fn dereference_key_info(
             return -1;
         }
         let context = &raw mut (*ctx).key_info_reference_ctx;
+        let side = read_side(ctx);
         let dereferenced = dereference(
             here,
             object,
@@ -638,7 +702,8 @@ unsafe fn dereference_key_info(
             false,
             &Terms {
                 pinned,
-                admitted: pinned.verification.uris.key_info_references,
+                side,
+                admitted: pinned.of(side).key_info_references(),
                 spent: policy::spent((*ctx).reserved0),
             },
         );
@@ -653,7 +718,7 @@ unsafe fn dereference_key_info(
             inner,
             object,
             context,
-            pinned,
+            (pinned, side),
             policy::spent((*ctx).reserved0),
         );
         let result =

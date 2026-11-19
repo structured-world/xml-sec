@@ -23,6 +23,20 @@ pub(super) struct ParsingPolicy<'a> {
     resources: &'a crate::policy::ResourcePolicy,
     uris: Option<&'a crate::policy::UriPolicy>,
     transforms: Option<&'a crate::policy::TransformPolicy>,
+    /// The method an `EncryptedData` without `EncryptionMethod` uses: the
+    /// one its recipient knows (XML Encryption 1.1 section 3.1).
+    default_method: Option<super::DataEncryptionAlgorithm>,
+}
+
+impl ParsingPolicy<'_> {
+    /// This context with `method` for an `EncryptedData` that names none.
+    pub(super) fn with_default_method(
+        mut self,
+        method: Option<super::DataEncryptionAlgorithm>,
+    ) -> Self {
+        self.default_method = method;
+        self
+    }
 }
 
 impl<'a> From<&'a crate::policy::EncryptionPolicy> for ParsingPolicy<'a> {
@@ -33,6 +47,7 @@ impl<'a> From<&'a crate::policy::EncryptionPolicy> for ParsingPolicy<'a> {
             resources: &policy.resources,
             uris: None,
             transforms: None,
+            default_method: None,
         }
     }
 }
@@ -45,6 +60,7 @@ impl<'a> From<&'a crate::policy::DecryptionPolicy> for ParsingPolicy<'a> {
             resources: &policy.resources,
             uris: Some(&policy.uris),
             transforms: Some(&policy.transforms),
+            default_method: None,
         }
     }
 }
@@ -564,10 +580,25 @@ fn parse_encrypted_data_node_traced<'doc>(
     budget.xml_parse = xml_parse;
     validate_encrypted_type_attributes(node, policy)?;
     let mut children = element_children(node);
-    let encryption_method = parse_encryption_method_with_limit(
-        next_required(&mut children, "EncryptionMethod")?,
-        policy.resources.max_encryption_metadata_bytes,
-    )?;
+    let named = children
+        .peek()
+        .is_some_and(|child| child.has_tag_name((XMLENC_NS, "EncryptionMethod")));
+    let encryption_method = match policy.default_method {
+        // XML Encryption 1.1 section 3.1: EncryptionMethod is optional; when
+        // it is absent the recipient must know the algorithm.
+        Some(method) if !named => EncryptionMethod {
+            algorithm: method.uri().to_owned(),
+            key_size_bits: None,
+            oaep_digest: None,
+            mgf_algorithm: None,
+            oaep_params: None,
+            chacha: None,
+        },
+        _ => parse_encryption_method_with_limit(
+            next_required(&mut children, "EncryptionMethod")?,
+            policy.resources.max_encryption_metadata_bytes,
+        )?,
+    };
     if children
         .peek()
         .is_some_and(|child| child.has_tag_name((XMLENC_NS, "EncryptionMethod")))
@@ -1737,9 +1768,20 @@ where
     }
 }
 
-#[cfg(test)]
-fn parse_encryption_method(node: Node<'_, '_>) -> Result<EncryptionMethod, XmlEncError> {
-    parse_encryption_method_with_limit(node, crate::hard_limits::ENCRYPTION_METADATA_BYTE_CEILING)
+impl EncryptionMethod {
+    /// Parse the `EncryptionMethod` element `node`, its key size, OAEP and
+    /// `ChaCha` parameters included, each value within the operation's
+    /// `max_encryption_metadata_bytes`.
+    ///
+    /// # Errors
+    /// Returns a node that is no `EncryptionMethod`, malformed parameters, or
+    /// a value beyond the metadata limit of `resources`.
+    pub fn from_element(
+        node: Node<'_, '_>,
+        resources: &crate::policy::ResourcePolicy,
+    ) -> Result<Self, XmlEncError> {
+        parse_encryption_method_with_limit(node, resources.max_encryption_metadata_bytes)
+    }
 }
 
 fn parse_method_algorithm(
@@ -2879,8 +2921,11 @@ mod tests {
                 "<xenc:EncryptionMethod xmlns:xenc=\"{XMLENC_NS}\" Algorithm=\"http://www.w3.org/2009/xmlenc11#rsa-oaep\"><xenc:OAEPparams>{params}</xenc:OAEPparams></xenc:EncryptionMethod>"
             );
             let document = Document::parse(&xml).expect("test method must be XML");
-            let parsed = parse_encryption_method(document.root_element())
-                .expect("empty OAEPparams must decode as an empty label");
+            let parsed = EncryptionMethod::from_element(
+                document.root_element(),
+                &crate::policy::ResourcePolicy::default(),
+            )
+            .expect("empty OAEPparams must decode as an empty label");
             assert_eq!(parsed.oaep_params, Some(Vec::new()));
         }
 
@@ -2928,14 +2973,15 @@ mod tests {
                 "<xenc:EncryptionMethod xmlns:xenc=\"{XMLENC_NS}\" Algorithm=\"{algorithm}\"><xenc:KeySize>{bits}</xenc:KeySize></xenc:EncryptionMethod>"
             );
             let document = Document::parse(&xml).expect("test method must be XML");
-            let parsed = parse_encryption_method(document.root_element())
+            let resources = crate::policy::ResourcePolicy::default();
+            let parsed = EncryptionMethod::from_element(document.root_element(), &resources)
                 .expect("matching AES KeySize must parse");
             assert_eq!(parsed.key_size_bits, Some(bits));
 
             let inconsistent = xml.replace(&format!(">{bits}<"), ">192<");
             let document = Document::parse(&inconsistent).expect("test method must be XML");
             assert!(matches!(
-                parse_encryption_method(document.root_element()),
+                EncryptionMethod::from_element(document.root_element(), &resources),
                 Err(XmlEncError::InvalidStructure(_))
             ));
         }
@@ -2946,7 +2992,10 @@ mod tests {
             );
             let document = Document::parse(&xml).expect("test method must be XML");
             assert!(matches!(
-                parse_encryption_method(document.root_element()),
+                EncryptionMethod::from_element(
+                    document.root_element(),
+                    &crate::policy::ResourcePolicy::default()
+                ),
                 Err(XmlEncError::InvalidStructure(_))
             ));
         }
