@@ -46,7 +46,9 @@ use super::{
     FAILURE_KEY_NOT_FOUND, FAILURE_UNKNOWN, FLAGS_RETURN_REPLACED_NODE, MODE_ENCRYPTED_DATA,
     MODE_ENCRYPTED_KEY, XmlSecEncCtx,
 };
-use xml_sec_libxml2::ffi::tree::{xsNodeGetChildren, xsNodeGetDoc};
+use xml_sec_libxml2::ffi::tree::{
+    xsAddChild, xsDocCopyNode, xsFreeNode, xsNodeGetChildren, xsNodeGetDoc, xsUnlinkNode,
+};
 
 /// A name of libxmlsec1's strings.
 macro_rules! name {
@@ -127,6 +129,54 @@ unsafe fn begin_encryption(
         }
     }
     0
+}
+
+/// Runs `encrypt`, which writes an encryption into the template `tmpl`, and
+/// puts the template's content back as it was when it fails, as when the
+/// document it would leave passes `max_xml_document_bytes`: a refused
+/// encryption leaves the caller's template unchanged.
+///
+/// # Safety
+/// `tmpl` is null or a live node; `encrypt` writes only inside it.
+unsafe fn restoring_template(
+    tmpl: *mut XmlNode,
+    here: errors::Here,
+    encrypt: impl FnOnce() -> c_int,
+) -> c_int {
+    if tmpl.is_null() {
+        return encrypt();
+    }
+    // SAFETY: a live node of its document.
+    let copy = unsafe { xsDocCopyNode(tmpl, xsNodeGetDoc(tmpl), 1) };
+    if copy.is_null() {
+        errors::internal(here, std::ptr::null(), c"xmlDocCopyNode");
+        return -1;
+    }
+    let done = encrypt();
+    // SAFETY: the template and its unlinked copy, both live; a freed node's
+    // handles are refused afterwards, so the context's pointers into the
+    // written template reach nothing.
+    unsafe {
+        if done < 0 {
+            let mut child = xsNodeGetChildren(tmpl);
+            while !child.is_null() {
+                let next = nodes::next(child);
+                xsFreeNode(child);
+                child = next;
+            }
+            loop {
+                let child = xsNodeGetChildren(copy);
+                if child.is_null() {
+                    break;
+                }
+                xsUnlinkNode(child);
+                xsAddChild(tmpl, child);
+            }
+            add_ids(tmpl);
+        }
+        xsFreeNode(copy);
+    }
+    done
 }
 
 /// Encrypts `data` through the context's chain and writes the template.
@@ -258,12 +308,97 @@ unsafe fn admit_document(
         errors::xml_failed(here, std::ptr::null(), c"xmlNodeDumpOutput");
         return false;
     };
-    let maximum = pinned.encryption.resources.max_xml_document_bytes;
+    let resources = &pinned.encryption.resources;
+    let maximum = resources.max_xml_document_bytes;
     if size > maximum {
         errors::limit_exceeded(here, std::ptr::null(), "max_xml_document_bytes", maximum);
         return false;
     }
+    let Some(replaced) = replacing else {
+        return true;
+    };
+    // The replacement leaves the replaced node's document with the
+    // template's nodes in place of the replaced ones, the template at the
+    // replaced position: its nodes and depth are held to the same policy.
+    let (position, removed) = match replaced {
+        Replaced::Element(node) => (nodes::parent(node), subtree_shape(node).0),
+        Replaced::Content(node) => {
+            let mut removed = 0_usize;
+            let mut child = nodes::first_child(node);
+            while !child.is_null() {
+                // At most the document's nodes.
+                removed += subtree_shape(child).0;
+                child = nodes::next(child);
+            }
+            (node, removed)
+        }
+    };
+    let (Replaced::Element(node) | Replaced::Content(node)) = replaced;
+    // SAFETY: a live node.
+    let destination = unsafe { xsNodeGetDoc(node) };
+    let (template_nodes, template_height) = subtree_shape(tmpl);
+    // A template already in that document outside what it replaces is
+    // counted there; one inside it leaves with it and comes back.
+    // SAFETY: live nodes.
+    let counted = linked
+        && doc == destination
+        && unsafe { replaced_octets(replaced, tmpl) }.is_some_and(|(_, inside)| !inside);
+    let added = if counted { 0 } else { template_nodes };
+    // The replaced nodes are a part of the document's.
+    let nodes_left = subtree_shape(destination.cast()).0 - removed + added;
+    if nodes_left > resources.max_xml_nodes {
+        errors::limit_exceeded(
+            here,
+            std::ptr::null(),
+            "max_xml_nodes",
+            resources.max_xml_nodes,
+        );
+        return false;
+    }
+    // Within the depths of two validated trees.
+    let depth = element_depth(position) + template_height;
+    if depth > resources.max_xml_depth {
+        errors::limit_exceeded(
+            here,
+            std::ptr::null(),
+            "max_xml_depth",
+            resources.max_xml_depth,
+        );
+        return false;
+    }
     true
+}
+
+/// The nodes of `node`'s subtree, `node` included, and the elements on its
+/// deepest path, `node` counted when it is one: as the core counts a
+/// document's nodes and depth.
+pub(super) fn subtree_shape(node: *const XmlNode) -> (usize, usize) {
+    let (mut count, mut deepest) = (0_usize, 0_usize);
+    let mut pending = vec![(node.cast_mut(), usize::from(nodes::is_element(node)))];
+    while let Some((current, depth)) = pending.pop() {
+        // At most the nodes and depth of a validated tree.
+        count += 1;
+        deepest = deepest.max(depth);
+        let mut child = nodes::first_child(current);
+        while !child.is_null() {
+            pending.push((child, depth + usize::from(nodes::is_element(child))));
+            child = nodes::next(child);
+        }
+    }
+    (count, deepest)
+}
+
+/// The elements on the path from `node` up to its document, `node` included
+/// when it is one.
+fn element_depth(node: *const XmlNode) -> usize {
+    let mut depth = 0_usize;
+    let mut current = node.cast_mut();
+    while !current.is_null() {
+        // At most the depth of a validated tree.
+        depth += usize::from(nodes::is_element(current));
+        current = nodes::parent(current);
+    }
+    depth
 }
 
 /// `xmlSecEncCtxBinaryEncrypt` past its first precondition.
@@ -283,19 +418,21 @@ pub(super) unsafe fn binary_encrypt(
     }
     // SAFETY: by the caller's contract.
     unsafe {
-        if begin_encryption(ctx, tmpl, here) < 0 {
-            return -1;
-        }
-        let data = if data.is_null() {
-            &[][..]
-        } else {
-            std::slice::from_raw_parts(data, size)
-        };
-        if encrypt_bytes(ctx, data, here) < 0 || !admit_document(ctx, tmpl, None, here) {
-            return -1;
-        }
+        restoring_template(tmpl, here, || {
+            if begin_encryption(ctx, tmpl, here) < 0 {
+                return -1;
+            }
+            let data = if data.is_null() {
+                &[][..]
+            } else {
+                std::slice::from_raw_parts(data, size)
+            };
+            if encrypt_bytes(ctx, data, here) < 0 || !admit_document(ctx, tmpl, None, here) {
+                return -1;
+            }
+            0
+        })
     }
-    0
 }
 
 /// `xmlSecEncCtxXmlEncrypt` past its first precondition: `node` (an
@@ -314,6 +451,48 @@ pub(super) unsafe fn xml_encrypt(
         errors::assertion(here, c"node != NULL");
         return -1;
     }
+    let mut element = false;
+    // SAFETY: by the caller's contract.
+    let encrypted =
+        unsafe { restoring_template(tmpl, here, || encrypt_node(ctx, tmpl, node, &mut element)) };
+    if encrypted < 0 {
+        return -1;
+    }
+    // SAFETY: by the caller's contract.
+    unsafe {
+        let returned = if ctx.flags & FLAGS_RETURN_REPLACED_NODE != 0 {
+            &raw mut ctx.replaced_node_list
+        } else {
+            std::ptr::null_mut()
+        };
+        let replaced = if element {
+            xmlSecReplaceNodeAndReturn(node, tmpl, returned)
+        } else {
+            xmlSecReplaceContentAndReturn(node, tmpl, returned)
+        };
+        if replaced < 0 {
+            let object = super::super::tree::name_for_report(node);
+            errors::internal(here, object.as_ptr(), c"xmlSecReplaceNode");
+            return -1;
+        }
+        ctx.result_replaced = 1;
+    }
+    0
+}
+
+/// [`xml_encrypt`] up to the replacement: `node` (an `Element` template,
+/// `element` set) or its content written and encrypted into the template,
+/// once the document the replacement leaves is admitted.
+///
+/// # Safety
+/// As for [`xml_encrypt`], with both nodes live.
+unsafe fn encrypt_node(
+    ctx: &mut XmlSecEncCtx,
+    tmpl: *mut XmlNode,
+    node: *mut XmlNode,
+    element: &mut bool,
+) -> c_int {
+    let here = here!("xmlSecEncCtxXmlEncrypt");
     // SAFETY: by the caller's contract.
     unsafe {
         if begin_encryption(ctx, tmpl, here) < 0 {
@@ -321,7 +500,7 @@ pub(super) unsafe fn xml_encrypt(
         }
         // libxmlsec1 requires the Type: without it the decryptor could not
         // restore the document (XMLEnc 1.1 section 3.1).
-        let element = match c_text(ctx.type_) {
+        *element = match c_text(ctx.type_) {
             Some("http://www.w3.org/2001/04/xmlenc#Element") => true,
             Some("http://www.w3.org/2001/04/xmlenc#Content") => false,
             other => {
@@ -354,7 +533,7 @@ pub(super) unsafe fn xml_encrypt(
             );
             return -1;
         }
-        let text = if element {
+        let text = if *element {
             nodes::dump(node)
         } else {
             // A child that cannot be written fails the whole content, never
@@ -379,7 +558,7 @@ pub(super) unsafe fn xml_encrypt(
             errors::xml_failed(here, std::ptr::null(), c"xmlNodeDumpOutput");
             return -1;
         };
-        let replaced = if element {
+        let replaced = if *element {
             Replaced::Element(node)
         } else {
             Replaced::Content(node)
@@ -389,22 +568,6 @@ pub(super) unsafe fn xml_encrypt(
         {
             return -1;
         }
-        let returned = if ctx.flags & FLAGS_RETURN_REPLACED_NODE != 0 {
-            &raw mut ctx.replaced_node_list
-        } else {
-            std::ptr::null_mut()
-        };
-        let replaced = if element {
-            xmlSecReplaceNodeAndReturn(node, tmpl, returned)
-        } else {
-            xmlSecReplaceContentAndReturn(node, tmpl, returned)
-        };
-        if replaced < 0 {
-            let object = super::super::tree::name_for_report(node);
-            errors::internal(here, object.as_ptr(), c"xmlSecReplaceNode");
-            return -1;
-        }
-        ctx.result_replaced = 1;
     }
     0
 }
@@ -457,28 +620,30 @@ pub(super) unsafe fn uri_encrypt(
             );
             return -1;
         }
-        if read_enc_data(ctx, tmpl, true) < 0 {
-            errors::internal(here, std::ptr::null(), c"xmlSecEncCtxEncDataNodeRead");
-            return -1;
-        }
-        if xmlSecTransformCtxExecute(transforms, xsNodeGetDoc(tmpl)) < 0 {
-            errors::internal(here, std::ptr::null(), c"xmlSecTransformCtxExecute");
-            return -1;
-        }
-        ctx.result = ctx.transform_ctx.result;
-        if ctx.result.is_null() {
-            errors::assertion(here, c"encCtx->result != NULL");
-            return -1;
-        }
-        if write_enc_data(ctx) < 0 {
-            errors::internal(here, std::ptr::null(), c"xmlSecEncCtxEncDataNodeWrite");
-            return -1;
-        }
-        if !admit_document(ctx, tmpl, None, here) {
-            return -1;
-        }
+        restoring_template(tmpl, here, || {
+            if read_enc_data(ctx, tmpl, true) < 0 {
+                errors::internal(here, std::ptr::null(), c"xmlSecEncCtxEncDataNodeRead");
+                return -1;
+            }
+            if xmlSecTransformCtxExecute(transforms, xsNodeGetDoc(tmpl)) < 0 {
+                errors::internal(here, std::ptr::null(), c"xmlSecTransformCtxExecute");
+                return -1;
+            }
+            ctx.result = ctx.transform_ctx.result;
+            if ctx.result.is_null() {
+                errors::assertion(here, c"encCtx->result != NULL");
+                return -1;
+            }
+            if write_enc_data(ctx) < 0 {
+                errors::internal(here, std::ptr::null(), c"xmlSecEncCtxEncDataNodeWrite");
+                return -1;
+            }
+            if !admit_document(ctx, tmpl, None, here) {
+                return -1;
+            }
+            0
+        })
     }
-    0
 }
 
 /// libxmlsec1's `xmlSecEncCtxEncDataNodeWrite`: the method's parameters,
@@ -1065,6 +1230,35 @@ unsafe fn admit_key_method(ctx: &mut XmlSecEncCtx, here: errors::Here) -> bool {
         );
         return false;
     }
+    // A rejected RSAES-PKCS1-v1_5 recovery yields a random key, and only a
+    // decryption's content work consults its validity. A signature or an
+    // encryption made with the key, or a key it unwraps for another
+    // EncryptedKey (which a recipient may fail to yield, letting the next one
+    // be tried), would show whether the padding was accepted; such a use is
+    // refused before anything is read, whatever the padding.
+    // https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-bleichenbacher-attack
+    #[cfg(feature = "legacy-algorithms")]
+    if !encrypting
+        && matches!(
+            KeyTransportAlgorithm::from_uri(href),
+            Ok(KeyTransportAlgorithm::RsaPkcs1v15)
+        )
+    {
+        // SAFETY: the context's own transform context.
+        let serves = unsafe { run_budget(&raw mut ctx.transform_ctx) }.serves;
+        let nested = ctx.key_info_read_ctx.cur_encrypted_key_level > 1;
+        if nested || matches!(serves, Some(Side::Sign | Side::Encrypt)) {
+            errors::report(
+                here,
+                name,
+                std::ptr::null(),
+                errors::R_TRANSFORM_DISABLED,
+                "an RSAES-PKCS1-v1_5 recovery yields no key for signing, encrypting or \
+                 unwrapping another key",
+            );
+            return false;
+        }
+    }
     true
 }
 
@@ -1394,6 +1588,8 @@ unsafe fn run_decryption(ctx: &mut XmlSecEncCtx, node: *mut XmlNode) -> *mut Xml
             errors::internal(here, std::ptr::null(), c"xmlSecBufferSetData");
             return std::ptr::null_mut();
         }
+        // libxmlsec1 publishes the chain's result in both contexts.
+        ctx.transform_ctx.result = buffer;
         ctx.result = buffer;
         buffer
     }

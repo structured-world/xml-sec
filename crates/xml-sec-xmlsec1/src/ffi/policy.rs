@@ -101,40 +101,32 @@ impl<'a> OperationPolicy<'a> {
         }
     }
 
-    /// The URI classes the operation admits for a signature's references or
-    /// a `CipherReference`. An encryption reads only the resource its caller
-    /// names, never a URI of a document, so its policy has no URI classes:
-    /// the caller's choice and the context's enabled URIs decide.
-    pub(crate) fn references(self) -> UriTypeSet {
+    /// The URI-class permissions of the operation.
+    fn uris(self) -> xml_sec::policy::UriPolicy {
         match self {
-            Self::Verify(policy) => policy.uris.references,
-            Self::Sign(policy) => policy.uris.references,
-            Self::Encrypt(_) => UriTypeSet::ALL,
-            Self::Decrypt(policy) => policy.uris.references,
+            Self::Verify(policy) => policy.uris,
+            Self::Sign(policy) => policy.uris,
+            Self::Encrypt(policy) => policy.uris,
+            Self::Decrypt(policy) => policy.uris,
         }
+    }
+
+    /// The URI classes the operation admits for a signature's references, a
+    /// `CipherReference` or the resource an encryption reads by URI.
+    pub(crate) fn references(self) -> UriTypeSet {
+        self.uris().references
     }
 
     /// The URI classes the operation admits for a `RetrievalMethod` of the
-    /// key it reads; an encryption's, whose `KeyInfo` is its caller's
-    /// template, as for [`Self::references`].
+    /// key it reads.
     pub(crate) fn retrieval_methods(self) -> UriTypeSet {
-        match self {
-            Self::Verify(policy) => policy.uris.retrieval_methods,
-            Self::Sign(policy) => policy.uris.retrieval_methods,
-            Self::Encrypt(_) => UriTypeSet::ALL,
-            Self::Decrypt(policy) => policy.uris.retrieval_methods,
-        }
+        self.uris().retrieval_methods
     }
 
     /// The URI classes the operation admits for a `KeyInfoReference` of the
-    /// key it reads, as for [`Self::retrieval_methods`].
+    /// key it reads.
     pub(crate) fn key_info_references(self) -> UriTypeSet {
-        match self {
-            Self::Verify(policy) => policy.uris.key_info_references,
-            Self::Sign(policy) => policy.uris.key_info_references,
-            Self::Encrypt(_) => UriTypeSet::ALL,
-            Self::Decrypt(policy) => policy.uris.key_info_references,
-        }
+        self.uris().key_info_references
     }
 }
 

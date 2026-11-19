@@ -190,6 +190,36 @@ pub(crate) unsafe fn run_policy(
     run.policy.clone()
 }
 
+/// Forgets the run of `ctx`, its policy revision and what it spent, so an
+/// operation beginning afresh on the context pins its own.
+///
+/// # Safety
+/// `ctx` is an initialized context.
+pub(crate) unsafe fn forget_run(ctx: *mut XmlSecTransformCtx) {
+    // SAFETY: by the caller's contract; the slot is null or the run.
+    unsafe {
+        let run = (*ctx).reserved0;
+        if !run.is_null() {
+            drop(Box::from_raw(run.cast::<RunBudget>()));
+            (*ctx).reserved0 = std::ptr::null_mut();
+        }
+    }
+}
+
+/// Starts the run of `ctx` afresh under `pinned` for an operation beginning
+/// on it: an earlier call refused before it read anything may have pinned
+/// another revision and spent part of its budgets.
+///
+/// # Safety
+/// `ctx` is an initialized context.
+pub(crate) unsafe fn restart_run(ctx: *mut XmlSecTransformCtx, pinned: &policy::Pinned) {
+    // SAFETY: by the caller's contract.
+    unsafe {
+        forget_run(ctx);
+        pin_run(ctx, pinned);
+    }
+}
+
 /// Makes `pinned` the revision of the fresh run of `ctx`, leaving its side to
 /// its chain.
 ///
@@ -791,13 +821,10 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxReset(ctx: *mut XmlSecTransfor
         // SAFETY: an initialized context whose chain, strings and lists it
         // owns.
         unsafe {
+            forget_run(ctx);
             let context = &mut *ctx;
             context.result = std::ptr::null_mut();
             context.status = STATUS_NONE;
-            if !context.reserved0.is_null() {
-                drop(Box::from_raw(context.reserved0.cast::<RunBudget>()));
-                context.reserved0 = std::ptr::null_mut();
-            }
             if !context.extra_key_data.is_null() {
                 xmlSecPtrListDestroy(context.extra_key_data);
                 context.extra_key_data = std::ptr::null_mut();
@@ -2102,23 +2129,47 @@ impl ChainShape {
 /// `ctx` is an initialized context whose callback is callable with it.
 pub(crate) unsafe fn run_pre_execute(ctx: *mut XmlSecTransformCtx, here: errors::Here) -> bool {
     // SAFETY: by the caller's contract.
+    unsafe { run_pre_executes(&[ctx], here) }
+}
+
+/// Runs the pre-execute callbacks of `chains`, chains of one operation the
+/// core runs from the document, in order, as [`run_pre_execute`] runs one:
+/// every chain is watched from before the first callback until the last
+/// returns, so a callback changing another chain, through state of its own,
+/// refuses the operation too. `false` after a report at `here`.
+///
+/// # Safety
+/// `chains` are initialized contexts whose callbacks are callable with them.
+pub(crate) unsafe fn run_pre_executes(
+    chains: &[*mut XmlSecTransformCtx],
+    here: errors::Here,
+) -> bool {
+    // SAFETY: by the caller's contract.
     unsafe {
-        let Some(callback) = (*ctx).pre_exec_callback else {
+        if chains.iter().all(|&ctx| (*ctx).pre_exec_callback.is_none()) {
             return true;
-        };
-        let before = ChainShape::of(ctx);
+        }
+        let before: Vec<ChainShape> = chains.iter().map(|&ctx| ChainShape::of(ctx)).collect();
         let watch = PreExecuteWatch::start(
             before
-                .transforms
                 .iter()
-                .map(|&(transform, ..)| transform)
+                .flat_map(|shape| shape.transforms.iter().map(|&(transform, ..)| transform))
                 .collect(),
         );
-        if callback(ctx) < 0 {
-            errors::internal(here, std::ptr::null(), c"ctx->preExecCallback");
-            return false;
+        for &ctx in chains {
+            if let Some(callback) = (*ctx).pre_exec_callback
+                && callback(ctx) < 0
+            {
+                errors::internal(here, std::ptr::null(), c"ctx->preExecCallback");
+                return false;
+            }
         }
-        if watch.changed() || ChainShape::of(ctx) != before {
+        if watch.changed()
+            || chains
+                .iter()
+                .zip(&before)
+                .any(|(&ctx, shape)| ChainShape::of(ctx) != *shape)
+        {
             errors::not_implemented(
                 here,
                 "a pre-execute callback changed a chain the operation runs from the document",

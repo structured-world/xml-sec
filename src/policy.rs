@@ -1927,6 +1927,9 @@ pub struct EncryptionPolicy {
     pub oaep_digests: Option<BTreeSet<OaepDigestAlgorithm>>,
     /// RSA requirements enforced when producing OAEP key transport.
     pub rsa_keys: RsaKeyPolicy,
+    /// URI-class permissions for a resource an encryption reads by URI and
+    /// for the indirect key references of the key it encrypts with.
+    pub uris: UriPolicy,
     /// Shared agreement/KDF permission and cumulative work requirements.
     pub key_establishment: KeyEstablishmentPolicy,
     /// XML parser rules.

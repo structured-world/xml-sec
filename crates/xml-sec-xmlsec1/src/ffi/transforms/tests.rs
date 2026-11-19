@@ -406,15 +406,23 @@ fn base64_output_is_bounded_per_run() {
 /// ends rather than trying more under the same allowance.
 #[test]
 fn a_base64_limit_refusal_ends_the_operation() {
-    let limit = crate::ffi::policy::verification()
-        .expect("the library policy compiles")
-        .resources
-        .max_base64_transform_output_bytes;
+    // A two-octet output limit under a far larger input limit: `AAAA` asks
+    // for three octets, so the output limit alone refuses it.
+    crate::ffi::tests::own_process();
+    let limit = 2;
+    crate::ffi::policy::republish(
+        |verification| {
+            verification.resources.max_base64_transform_output_bytes = limit;
+            verification.resources.max_base64_transform_input_bytes = 1024;
+        },
+        |_| {},
+    )
+    .expect("the library policy compiles");
     // SAFETY: the context and its transform are used while live.
     unsafe {
         let ctx = xmlSecTransformCtxCreate();
         assert!(!xmlSecTransformCtxCreateAndAppend(ctx, base64()).is_null());
-        let input = b"AAAA".repeat(limit / 3 + 1);
+        let input = b"AAAA";
         assert_eq!(
             xmlSecTransformCtxBinaryExecute(ctx, input.as_ptr(), input.len()),
             -1
@@ -522,6 +530,83 @@ fn relationship_transform_keeps_the_incoming_selection() {
         .expect("UTF-8");
         assert!(output.contains("rId1"), "{output}");
         assert!(!output.contains("rId3"), "{output}");
+        xmlSecTransformCtxDestroy(ctx);
+        crate::ffi::nodeset::xmlSecNodeSetDestroy(selection);
+        xml_sec_libxml2::document::free(template);
+        xml_sec_libxml2::document::free(doc);
+    }
+}
+
+/// The reasons reported while a test runs.
+static REASONS: std::sync::Mutex<Vec<std::ffi::c_int>> = std::sync::Mutex::new(Vec::new());
+
+unsafe extern "C" fn record(
+    _file: *const std::ffi::c_char,
+    _line: std::ffi::c_int,
+    _func: *const std::ffi::c_char,
+    _object: *const std::ffi::c_char,
+    _subject: *const std::ffi::c_char,
+    reason: std::ffi::c_int,
+    _message: *const std::ffi::c_char,
+) {
+    REASONS.lock().expect("one test thread").push(reason);
+}
+
+/// The Relationship transform is an XML Signature transform: a chain that
+/// encrypts what it produces is refused as not implemented when it runs,
+/// the first point at which the chain knows it encrypts.
+#[test]
+fn an_encryption_chain_refuses_the_relationship_transform() {
+    let xml =
+        b"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'>\
+        <Relationship Id='rId1' Type='urn:t:a' Target='a.xml'/></Relationships>";
+    let selectors =
+        b"<Transform xmlns:m='http://schemas.openxmlformats.org/package/2006/digital-signature'>\
+        <m:RelationshipReference SourceId='rId1'/></Transform>";
+    // SAFETY: the documents, node set, key and context are used while live.
+    unsafe {
+        let doc = crate::ffi::parser::xmlSecParseMemory(xml.as_ptr(), xml.len(), 0);
+        let template =
+            crate::ffi::parser::xmlSecParseMemory(selectors.as_ptr(), selectors.len(), 0);
+        assert!(!doc.is_null() && !template.is_null());
+        let selection =
+            crate::ffi::nodeset::xmlSecNodeSetGetChildren(doc, nodes::first_child(doc), 0, 0);
+        let ctx = xmlSecTransformCtxCreate();
+        let transform = xmlSecTransformCtxCreateAndAppend(ctx, super::relationship::relationship());
+        let read = (*super::relationship::relationship())
+            .read_node
+            .expect("the klass reads its node");
+        assert_eq!(read(transform, nodes::first_child(template), ctx), 0);
+        let cipher = xmlSecTransformCtxCreateAndAppend(ctx, super::ciphers::aes128_cbc());
+        (*cipher).operation = super::OPERATION_ENCRYPT;
+        let info = crate::ffi::keyinfo::xmlSecKeyInfoCtxCreate(std::ptr::null_mut());
+        let key = crate::ffi::keys::xmlSecKeyCreate();
+        let bytes = [0x5a_u8; 16];
+        assert_eq!(
+            crate::ffi::keysdata::xmlSecKeyDataBinRead(
+                crate::ffi::symkeys::aes(),
+                key.cast(),
+                bytes.as_ptr(),
+                bytes.len(),
+                info.cast(),
+            ),
+            0
+        );
+        assert_eq!(super::xmlSecTransformSetKey(cipher, key.cast()), 0);
+        REASONS.lock().expect("one test thread").clear();
+        crate::ffi::errors::xmlSecErrorsSetCallback(Some(
+            record as crate::ffi::errors::ErrorsCallback,
+        ));
+        let executed = super::ctx::xmlSecTransformCtxXmlExecute(ctx, selection);
+        crate::ffi::errors::xmlSecErrorsClearCallback();
+        let reasons = REASONS.lock().expect("one test thread").clone();
+        assert_eq!(executed, -1, "{reasons:?}");
+        assert!(
+            reasons.contains(&crate::ffi::errors::R_NOT_IMPLEMENTED),
+            "{reasons:?}"
+        );
+        crate::ffi::keys::xmlSecKeyDestroy(key);
+        crate::ffi::keyinfo::xmlSecKeyInfoCtxDestroy(info);
         xmlSecTransformCtxDestroy(ctx);
         crate::ffi::nodeset::xmlSecNodeSetDestroy(selection);
         xml_sec_libxml2::document::free(template);

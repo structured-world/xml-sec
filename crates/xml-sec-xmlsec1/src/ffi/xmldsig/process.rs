@@ -41,7 +41,7 @@ use super::super::transforms::builtin::{
 };
 use super::super::transforms::ctx::{
     ReadResources, ResourceScope, XmlSecTransformCtx, charge_key_info, external_spent,
-    leave_unspent, operation_side, read_resource, resource_keys, run_budget, run_pre_execute,
+    leave_unspent, operation_side, read_resource, resource_keys, run_budget, run_pre_executes,
     run_spent, xmlSecTransformCtxCreateAndAppend, xmlSecTransformCtxExecute,
     xmlSecTransformCtxNodeRead, xmlSecTransformCtxNodesListRead, xmlSecTransformCtxSetUri,
 };
@@ -204,8 +204,8 @@ unsafe fn process_signature_node(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode) ->
     };
     // The signature's own chain reads its methods under that revision too:
     // an HMAC method keeps the revision it was read under for its key.
-    // SAFETY: the context's own transform context.
-    unsafe { super::super::transforms::ctx::pin_run(&raw mut ctx.transform_ctx, &pinned) };
+    // SAFETY: the context's own transform context, its chain still empty.
+    unsafe { super::super::transforms::ctx::restart_run(&raw mut ctx.transform_ctx, &pinned) };
     let policies = match operation_policies(ctx, &pinned) {
         Ok(policies) => policies,
         Err(violation) => {
@@ -329,7 +329,11 @@ unsafe fn run_operation(
                     Side::Sign,
                     external_spent(&raw mut ctx.transform_ctx),
                 );
-                let Some(resources) = read_all(pending, xsNodeGetDoc(node), &mut scope) else {
+                let Ok(keys) = shared_resource_keys(node, &policy, &pending) else {
+                    return -1;
+                };
+                let Some(resources) = read_all(pending, keys, xsNodeGetDoc(node), &mut scope)
+                else {
                     errors::internal(
                         here!("xmlSecDSigCtxProcessSignatureNode"),
                         std::ptr::null(),
@@ -447,23 +451,22 @@ unsafe fn references<'a>(
 unsafe fn run_pre_execute_callbacks(ctx: &mut XmlSecDSigCtx) -> c_int {
     let here = here!("xmlSecTransformCtxPrepare");
     // The context's own chain is the one libxmlsec1 prepares for SignedInfo.
-    // SAFETY: the caller's callback with the context's chain.
-    if !unsafe { run_pre_execute(&raw mut ctx.transform_ctx, here) } {
-        return -1;
-    }
+    let mut chains = vec![&raw mut ctx.transform_ctx];
     for list in [
         &raw mut ctx.signed_info_references,
         &raw mut ctx.manifest_references,
     ] {
         // SAFETY: the context's own lists of reference contexts.
         for reference in unsafe { references(list) } {
-            // SAFETY: the caller's callback with the reference's context.
-            if !unsafe { run_pre_execute(&raw mut reference.transform_ctx, here) } {
-                return -1;
-            }
+            chains.push(&raw mut reference.transform_ctx);
         }
     }
-    0
+    // SAFETY: the caller's callbacks with the context's chains.
+    if unsafe { run_pre_executes(&chains, here) } {
+        0
+    } else {
+        -1
+    }
 }
 
 /// An external resource a reference of the context names, not read yet.
@@ -553,19 +556,63 @@ unsafe fn read_pending(
     }
 }
 
+/// The key each resource of `pending` resolves to in the document of `node`,
+/// so references whose URIs resolve to one key read their resource once;
+/// none for a single resource, which needs no keys. `Err` after a report.
+fn shared_resource_keys(
+    node: *mut XmlNode,
+    policy: &SigningPolicy,
+    pending: &[PendingResource],
+) -> Result<Option<Vec<String>>, ()> {
+    if pending.len() < 2 {
+        return Ok(None);
+    }
+    let resolved = xml_sec_libxml2::document::with_document(node, policy, |document, _| {
+        resource_keys(
+            document,
+            pending
+                .iter()
+                .map(|resource| (resource.origin, resource.uri.as_str())),
+            &policy.resources,
+        )
+    });
+    match resolved {
+        Ok(Ok(keys)) => Ok(Some(keys)),
+        Ok(Err(error)) => Err(error),
+        Err(error) => Err(error.to_string()),
+    }
+    .map_err(|error| {
+        errors::internal_with(
+            here!("xmlSecTransformCtxUriExecute"),
+            std::ptr::null(),
+            c"resource keys",
+            &error,
+        );
+    })
+}
+
 /// Every resource of `pending` read under the operation `scope`, one
 /// allowance across them all, as signing digests each of them; `None` after
-/// a report.
+/// a report. With `keys`, the key each resolves to, a resource two
+/// references name is read and charged once, for the first of them.
 ///
 /// # Safety
 /// As for [`read_pending`].
 unsafe fn read_all(
     pending: Vec<PendingResource>,
+    keys: Option<Vec<String>>,
     doc: *mut XmlDoc,
     scope: &mut ResourceScope<'_>,
 ) -> Option<ReadResources> {
     let mut resources = ReadResources::default();
+    let mut read = std::collections::BTreeSet::new();
+    let mut keys = keys.map(Vec::into_iter);
     for resource in pending {
+        if let Some(key) = keys.as_mut().and_then(Iterator::next)
+            && !read.insert(key)
+        {
+            continue;
+        }
         // SAFETY: by the caller's contract.
         let bytes = unsafe { read_pending(&resource, doc, scope) }?;
         resources.push(resource.origin, resource.uri, bytes);
@@ -878,7 +925,12 @@ unsafe fn add_reference(
         // while the key was looked up, before the references are read, does
         // not reach it.
         super::super::transforms::ctx::pin_run(&raw mut (*reference).transform_ctx, pinned);
-        if read_reference(&mut *reference, node).is_none() {
+        let parent = ParentSettings {
+            flags: ctx.flags,
+            operation: ctx.operation,
+            default_digest: std::ptr::null(),
+        };
+        if read_reference(&mut *reference, node, &parent).is_none() {
             errors::internal(
                 here,
                 c"Reference".as_ptr(),
@@ -916,28 +968,36 @@ struct ReadReference {
     digest_value: *mut XmlNode,
 }
 
-/// The reading half of libxmlsec1's `xmlSecDSigReferenceCtxProcessNode`:
-/// the attributes, the start URI, the transforms, the kept pre-digest
-/// buffer and the digest method. The `Reference` element is kept in the
-/// context's `reserved0` to match the core's result to it.
+/// The parent's settings a reference is read with, taken by the caller,
+/// which holds the parent, rather than through the reference's pointer to
+/// it.
+struct ParentSettings {
+    flags: std::ffi::c_uint,
+    operation: c_int,
+    /// The digest method of a `Reference` that names none; null where one is
+    /// required.
+    default_digest: *const super::super::transforms::XmlSecTransformKlass,
+}
+
+/// The reading half of libxmlsec1's `xmlSecDSigReferenceCtxProcessNode`,
+/// for a reference of a context with `parent`'s settings: the attributes,
+/// the start URI, the transforms, the kept pre-digest buffer and the digest
+/// method. The `Reference` element is kept in the context's `reserved0` to
+/// match the core's result to it.
 ///
 /// # Safety
-/// `node` is a live node.
+/// `node` is a live node; a default digest is null or a klass.
 unsafe fn read_reference(
     reference: &mut XmlSecDSigReferenceCtx,
     node: *mut XmlNode,
+    parent: &ParentSettings,
 ) -> Option<ReadReference> {
+    let (flags, operation) = (parent.flags, parent.operation);
     let here = here!("xmlSecDSigReferenceCtxProcessNode");
-    // SAFETY: the reference's parent outlives it.
-    let Some(parent) = (unsafe { reference.dsig_ctx.as_ref() }) else {
-        errors::assertion(here, c"dsigRefCtx->dsigCtx != NULL");
-        return None;
-    };
     if !reference.digest_method.is_null() || !reference.pre_digest_mem_buf_method.is_null() {
         errors::assertion(here, c"dsigRefCtx->digestMethod == NULL");
         return None;
     }
-    let (flags, operation) = (parent.flags, parent.operation);
     let transforms = &raw mut reference.transform_ctx;
     reference.reserved0 = node.cast::<c_void>();
     reference.uri = attribute(node, "URI");
@@ -996,9 +1056,18 @@ unsafe fn read_reference(
                 return None;
             }
             cur = next_element(cur);
+        } else if !parent.default_digest.is_null() {
+            // A Reference processed on its own takes the context's
+            // `defDigestMethodId`, as libxmlsec1's does.
+            reference.digest_method =
+                xmlSecTransformCtxCreateAndAppend(transforms, parent.default_digest);
+            if reference.digest_method.is_null() {
+                errors::internal(here, std::ptr::null(), c"xmlSecTransformCtxCreateAndAppend");
+                return None;
+            }
         } else {
-            // Departure: no `defDigestMethodId` fallback; a Reference requires
-            // its DigestMethod (XMLDSig 1.1 section 4.4.3).
+            // A signature's Reference requires its DigestMethod (XMLDSig 1.1
+            // section 4.4.3), which the core reads from the document.
             errors::invalid_node(here, cur, "DigestMethod", std::ptr::null());
             return None;
         }
@@ -1028,12 +1097,22 @@ pub(super) unsafe fn reference_node(
     node: *mut XmlNode,
 ) -> c_int {
     let here = here!("xmlSecDSigReferenceCtxProcessNode");
-    // SAFETY: a live node.
-    let Some(read) = (unsafe { read_reference(reference, node) }) else {
+    // SAFETY: the reference's parent outlives it; an application calls this
+    // with no borrow of the parent live.
+    let Some(parent) = (unsafe { reference.dsig_ctx.as_ref() }) else {
+        errors::assertion(here, c"dsigRefCtx->dsigCtx != NULL");
         return -1;
     };
-    // SAFETY: an initialized parent, checked by the read.
-    let operation = unsafe { (*reference.dsig_ctx).operation };
+    let parent = ParentSettings {
+        flags: parent.flags,
+        operation: parent.operation,
+        default_digest: parent.def_digest_method_id,
+    };
+    let operation = parent.operation;
+    // SAFETY: a live node; the context's default is null or a klass.
+    let Some(read) = (unsafe { read_reference(reference, node, &parent) }) else {
+        return -1;
+    };
     let transforms = &raw mut reference.transform_ctx;
     // SAFETY: the reference's own transform context and live nodes.
     unsafe {
@@ -1328,28 +1407,34 @@ unsafe fn report_verification(
     result: &VerifyResult,
 ) -> c_int {
     // SAFETY: the context's own lists of reference contexts.
-    unsafe {
+    let kept = unsafe {
+        let mut kept = true;
         let list = &raw mut ctx.signed_info_references;
         for (index, outcome) in result.signed_info_references.iter().enumerate() {
             let reference = xmlSecPtrListGetItem(list, index).cast::<XmlSecDSigReferenceCtx>();
             if let Some(reference) = reference.as_mut() {
-                apply_reference(reference, outcome);
+                kept &= apply_reference(reference, outcome);
             }
         }
         let list = &raw mut ctx.manifest_references;
         for outcome in &result.manifest_references {
             if let Some(reference) = manifest_reference(list, document, outcome) {
-                apply_reference(&mut *reference, outcome);
+                kept &= apply_reference(&mut *reference, outcome);
             }
         }
         if ctx.flags & FLAGS_STORE_SIGNATURE != 0
             && let Some(signed_info) = result.canonicalized_signed_info.as_deref()
         {
-            keep(
+            kept &= keep(
                 xmlSecTransformMemBufGetBuffer(ctx.pre_sign_mem_buf_method),
                 signed_info,
             );
         }
+        kept
+    };
+    // A buffer the caller asked for and cannot have fails the operation.
+    if !kept {
+        return -1;
     }
     // A mismatch is reported as libxmlsec1's verifying transforms report it,
     // with the method's name: a digest's as invalid data, a signature's as
@@ -1416,30 +1501,35 @@ unsafe fn manifest_reference(
 }
 
 /// A reference context's status and kept pre-digest bytes from the core's
-/// `outcome`.
+/// `outcome`; false after a report when the bytes cannot be kept.
 ///
 /// # Safety
 /// The context's membuf, if any, is live.
-unsafe fn apply_reference(reference: &mut XmlSecDSigReferenceCtx, outcome: &ReferenceResult) {
+#[must_use]
+unsafe fn apply_reference(
+    reference: &mut XmlSecDSigReferenceCtx,
+    outcome: &ReferenceResult,
+) -> bool {
     reference.status = match outcome.status {
         DsigStatus::Valid => STATUS_SUCCEEDED,
         DsigStatus::Invalid(_) => STATUS_INVALID,
         // `NotProcessed`: not dereferenced, the signature value did not verify.
         _ => STATUS_UNKNOWN,
     };
-    if let Some(bytes) = outcome.pre_digest_data.as_deref()
-        && !reference.pre_digest_mem_buf_method.is_null()
-    {
-        // SAFETY: the context's own membuf.
-        unsafe {
-            keep(
-                xmlSecTransformMemBufGetBuffer(reference.pre_digest_mem_buf_method),
-                bytes,
-            );
-        }
-    }
     // A verified reference leaves no result: libxmlsec1's digest transform
     // checks the value and outputs nothing.
+    match outcome.pre_digest_data.as_deref() {
+        Some(bytes) if !reference.pre_digest_mem_buf_method.is_null() => {
+            // SAFETY: the context's own membuf.
+            unsafe {
+                keep(
+                    xmlSecTransformMemBufGetBuffer(reference.pre_digest_mem_buf_method),
+                    bytes,
+                )
+            }
+        }
+        _ => true,
+    }
 }
 
 /// Makes `bytes` the reference's `result`, as libxmlsec1 leaves the output
@@ -1448,7 +1538,8 @@ unsafe fn apply_reference(reference: &mut XmlSecDSigReferenceCtx, outcome: &Refe
 ///
 /// # Safety
 /// The reference's transform context is initialized.
-unsafe fn keep_reference_result(reference: &mut XmlSecDSigReferenceCtx, bytes: &[u8]) {
+#[must_use]
+unsafe fn keep_reference_result(reference: &mut XmlSecDSigReferenceCtx, bytes: &[u8]) -> bool {
     // SAFETY: by the caller's contract.
     unsafe {
         let holder = xmlSecTransformCtxCreateAndAppend(
@@ -1461,21 +1552,23 @@ unsafe fn keep_reference_result(reference: &mut XmlSecDSigReferenceCtx, bytes: &
                 std::ptr::null(),
                 c"xmlSecTransformCtxCreateAndAppend",
             );
-            return;
+            return false;
         }
         let buffer = xmlSecTransformMemBufGetBuffer(holder);
-        keep(buffer, bytes);
         reference.result = buffer;
+        keep(buffer, bytes)
     }
 }
 
-/// Puts `bytes` into the kept `buffer`.
+/// Puts `bytes` into the kept `buffer`; false after a report when it cannot,
+/// which fails the operation rather than leaving a requested buffer empty.
 ///
 /// # Safety
 /// `buffer` is null or a membuf's buffer.
-unsafe fn keep(buffer: *mut XmlSecBuffer, bytes: &[u8]) {
+#[must_use]
+unsafe fn keep(buffer: *mut XmlSecBuffer, bytes: &[u8]) -> bool {
     if buffer.is_null() {
-        return;
+        return true;
     }
     // SAFETY: by the caller's contract.
     if unsafe { xmlSecBufferSetData(buffer, bytes.as_ptr(), bytes.len()) } < 0 {
@@ -1484,7 +1577,9 @@ unsafe fn keep(buffer: *mut XmlSecBuffer, bytes: &[u8]) {
             std::ptr::null(),
             c"xmlSecBufferSetData",
         );
+        return false;
     }
+    true
 }
 
 /// Runs the core signing of the template `node` in place under `policy`,
@@ -1573,24 +1668,25 @@ unsafe fn run_signing(
     };
     // SAFETY: the context's own lists and its signature value element.
     unsafe {
+        let mut kept = true;
         for reference in references(&raw mut ctx.signed_info_references) {
-            signed_reference(reference);
+            kept &= signed_reference(reference);
         }
         // The core wrote the Manifest digests it processes.
         if manifests {
             for reference in references(&raw mut ctx.manifest_references) {
-                signed_reference(reference);
+                kept &= signed_reference(reference);
             }
         }
         if let Some(inputs) = inputs {
             // The core keeps the references in the order these lists were
             // read in: SignedInfo's, then the Objects' Manifests'.
-            keep_pre_digests(
+            kept &= keep_pre_digests(
                 &raw mut ctx.signed_info_references,
                 &inputs.signed_info_references,
             );
             if manifests {
-                keep_pre_digests(
+                kept &= keep_pre_digests(
                     &raw mut ctx.manifest_references,
                     &inputs.manifest_references,
                 );
@@ -1598,11 +1694,16 @@ unsafe fn run_signing(
             if let Some(signed_info) = inputs.signed_info
                 && !ctx.pre_sign_mem_buf_method.is_null()
             {
-                keep(
+                kept &= keep(
                     xmlSecTransformMemBufGetBuffer(ctx.pre_sign_mem_buf_method),
                     &signed_info,
                 );
             }
+        }
+        // The template is signed by now, but a buffer the caller asked for
+        // and cannot have fails the operation.
+        if !kept {
+            return -1;
         }
         keep_result(ctx)
     }
@@ -1614,7 +1715,8 @@ unsafe fn run_signing(
 ///
 /// # Safety
 /// The reference context was read from a live `Reference` element.
-unsafe fn signed_reference(reference: &mut XmlSecDSigReferenceCtx) {
+#[must_use]
+unsafe fn signed_reference(reference: &mut XmlSecDSigReferenceCtx) -> bool {
     reference.status = STATUS_SUCCEEDED;
     // SAFETY: by the caller's contract.
     unsafe {
@@ -1623,9 +1725,8 @@ unsafe fn signed_reference(reference: &mut XmlSecDSigReferenceCtx) {
             name!(xmlSecNodeDigestValue),
             name!(xmlSecDSigNs),
         );
-        if let Some(written) = nodes::content(digest_value) {
-            keep_reference_result(reference, written.as_bytes());
-        }
+        nodes::content(digest_value)
+            .is_none_or(|written| keep_reference_result(reference, written.as_bytes()))
     }
 }
 
@@ -1660,7 +1761,9 @@ unsafe fn kept_inputs(ctx: &mut XmlSecDSigCtx, manifests: bool) -> KeptInputs {
 ///
 /// # Safety
 /// `list` holds read reference contexts with live buffers.
-unsafe fn keep_pre_digests(list: *mut super::XmlSecPtrList, kept: &[Vec<u8>]) {
+#[must_use]
+unsafe fn keep_pre_digests(list: *mut super::XmlSecPtrList, kept: &[Vec<u8>]) -> bool {
+    let mut all = true;
     for (index, bytes) in kept.iter().enumerate() {
         // SAFETY: by the caller's contract.
         unsafe {
@@ -1668,13 +1771,14 @@ unsafe fn keep_pre_digests(list: *mut super::XmlSecPtrList, kept: &[Vec<u8>]) {
             if let Some(reference) = reference.as_ref()
                 && !reference.pre_digest_mem_buf_method.is_null()
             {
-                keep(
+                all &= keep(
                     xmlSecTransformMemBufGetBuffer(reference.pre_digest_mem_buf_method),
                     bytes,
                 );
             }
         }
     }
+    all
 }
 
 /// Makes the written `SignatureValue` the context's `result`, a buffer the

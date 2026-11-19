@@ -138,8 +138,10 @@ fn default_crypto_loads_the_builtin_table() {
         // A klass of the built-in table resolves; a method the table lacks
         // (the provider implements no GOST) reports and resolves to nothing.
         let sha256 = xmlSecTransformSha256GetKlass();
+        assert!(!sha256.is_null(), "the table has SHA-256");
         assert_eq!(CStr::from_ptr((*sha256).name.cast()).to_bytes(), b"sha256");
         let aes = xmlSecTransformAes128CbcGetKlass();
+        assert!(!aes.is_null(), "the table has AES-128-CBC");
         assert_eq!(CStr::from_ptr((*aes).name.cast()).to_bytes(), b"aes128-cbc");
         assert!(xmlSecTransformGostR3411_94GetKlass().is_null());
         assert_eq!(

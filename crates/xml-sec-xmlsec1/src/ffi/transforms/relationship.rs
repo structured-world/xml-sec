@@ -211,14 +211,15 @@ unsafe fn render(
             // SAFETY: by the caller's contract.
             unsafe { render_under(selectors, selected, out, policy, here) }
         }
-        // An encryption transforms no document, so its policy permits no
-        // document transform.
+        // Relationship is an XML Signature transform (libxmlsec1 marks it
+        // xmlSecTransformUsageDSigTransform) and an encryption transforms no
+        // document, so its policy permits none. A chain only learns that it
+        // encrypts when it runs, so this is the first point to refuse it.
         policy::OperationPolicy::Encrypt(_) => {
-            errors::internal_with(
+            errors::not_implemented(
                 here,
-                name(),
-                c"xmlSecTransformRelationshipProcessNodeList",
-                "the encryption policy permits no document transform",
+                "the Relationship transform in an encryption chain: an encryption \
+                 transforms no document",
             );
             -1
         }

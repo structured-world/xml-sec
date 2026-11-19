@@ -22,7 +22,7 @@ use super::keysmngr::XmlSecKeysMngr;
 use super::list::{
     XmlSecPtrList, XmlSecPtrListKlass, xmlSecPtrListAdd, xmlSecPtrListCopy, xmlSecPtrListCreate,
     xmlSecPtrListDebugDump, xmlSecPtrListDebugXmlDump, xmlSecPtrListDestroy, xmlSecPtrListFinalize,
-    xmlSecPtrListInitialize,
+    xmlSecPtrListGetItem, xmlSecPtrListGetSize, xmlSecPtrListInitialize,
 };
 use super::transforms::builtin::xmlSecTransformMemBufGetBuffer;
 use super::transforms::ctx::{
@@ -416,9 +416,44 @@ pub(crate) unsafe extern "C" fn xmlSecDSigCtxSign(
             return -1;
         };
         check!(!tmpl.is_null(), "xmlSecDSigCtxSign", c"tmpl != NULL", -1);
-        // SAFETY: an initialized context and a live node.
-        unsafe { process::sign(context, tmpl) }
+        check!(
+            !super::tree::nodes::doc(tmpl).is_null(),
+            "xmlSecDSigCtxSign",
+            c"tmpl->doc != NULL",
+            -1
+        );
+        // SAFETY: an initialized context and a live node; the operation's
+        // borrow of the context ends before its references are rebound.
+        unsafe {
+            let signed = process::sign(context, tmpl);
+            rebind_references(ctx);
+            signed
+        }
     })
+}
+
+/// Points the reference contexts in `ctx`'s lists back at `ctx`, the
+/// caller's pointer: the operation made them through its own borrow of the
+/// context, which ends when it returns, while the caller reads them, and
+/// their parent through them, afterwards.
+///
+/// # Safety
+/// `ctx` is an initialized context no borrow of which is live.
+unsafe fn rebind_references(ctx: *mut XmlSecDSigCtx) {
+    // SAFETY: by the caller's contract; the lists hold reference contexts.
+    unsafe {
+        for list in [
+            &raw mut (*ctx).signed_info_references,
+            &raw mut (*ctx).manifest_references,
+        ] {
+            for index in 0..xmlSecPtrListGetSize(list) {
+                let reference = xmlSecPtrListGetItem(list, index).cast::<XmlSecDSigReferenceCtx>();
+                if let Some(reference) = reference.as_mut() {
+                    reference.dsig_ctx = ctx;
+                }
+            }
+        }
+    }
 }
 
 /// `xmlSecDSigCtxVerify`: verifies the `Signature` element `node`; 0 with
@@ -439,8 +474,19 @@ pub(crate) unsafe extern "C" fn xmlSecDSigCtxVerify(
             -1
         );
         check!(!node.is_null(), "xmlSecDSigCtxVerify", c"node != NULL", -1);
-        // SAFETY: an initialized context and a live node.
-        unsafe { process::verify(&mut *ctx, node) }
+        check!(
+            !super::tree::nodes::doc(node).is_null(),
+            "xmlSecDSigCtxVerify",
+            c"node->doc != NULL",
+            -1
+        );
+        // SAFETY: an initialized context and a live node; the operation's
+        // borrow of the context ends before its references are rebound.
+        unsafe {
+            let verified = process::verify(&mut *ctx, node);
+            rebind_references(ctx);
+            verified
+        }
     })
 }
 
@@ -502,12 +548,14 @@ pub(crate) unsafe extern "C" fn xmlSecDSigCtxDebugDump(
             "xmlSecDSigCtxDebugDump",
             c"output != NULL"
         );
-        // SAFETY: an initialized context and a live stream.
+        // SAFETY: an initialized context and a live stream. The context is
+        // read through `ctx` field by field, never through a reference held
+        // across the dumps of its references, which read it through their
+        // own pointer to it.
         unsafe {
-            let context = &mut *ctx;
             write_stream(
                 output,
-                if context.operation == OPERATION_SIGN {
+                if (*ctx).operation == OPERATION_SIGN {
                     "= SIGNATURE CONTEXT\n"
                 } else {
                     "= VERIFICATION CONTEXT\n"
@@ -517,40 +565,40 @@ pub(crate) unsafe extern "C" fn xmlSecDSigCtxDebugDump(
                 output,
                 &format!(
                     "== Status: {}\n== Failure reason: {}\n== flags: 0x{:08x}\n== flags2: 0x{:08x}\n",
-                    status_string(context.status).to_string_lossy(),
-                    failure_string(context.failure_reason).to_string_lossy(),
-                    context.flags,
-                    context.flags2
+                    status_string((*ctx).status).to_string_lossy(),
+                    failure_string((*ctx).failure_reason).to_string_lossy(),
+                    (*ctx).flags,
+                    (*ctx).flags2
                 ),
             );
-            if !context.id.is_null() {
-                write_stream(output, &format!("== Id: \"{}\"\n", text_of(context.id)));
+            if !(*ctx).id.is_null() {
+                write_stream(output, &format!("== Id: \"{}\"\n", text_of((*ctx).id)));
             }
             write_stream(output, "== Key Info Read Ctx:\n");
-            xmlSecKeyInfoCtxDebugDump(&raw mut context.key_info_read_ctx, output);
+            xmlSecKeyInfoCtxDebugDump(&raw mut (*ctx).key_info_read_ctx, output);
             write_stream(output, "== Key Info Write Ctx:\n");
-            xmlSecKeyInfoCtxDebugDump(&raw mut context.key_info_write_ctx, output);
+            xmlSecKeyInfoCtxDebugDump(&raw mut (*ctx).key_info_write_ctx, output);
             write_stream(output, "== Signature Transform Ctx:\n");
-            xmlSecTransformCtxDebugDump(&raw mut context.transform_ctx, output);
-            if !context.sign_method.is_null() {
+            xmlSecTransformCtxDebugDump(&raw mut (*ctx).transform_ctx, output);
+            if !(*ctx).sign_method.is_null() {
                 write_stream(output, "== Signature Method:\n");
-                xmlSecTransformDebugDump(context.sign_method, output);
+                xmlSecTransformDebugDump((*ctx).sign_method, output);
             }
-            if !context.sign_key.is_null() {
+            if !(*ctx).sign_key.is_null() {
                 write_stream(output, "== Signature Key:\n");
-                xmlSecKeyDebugDump(context.sign_key, output);
+                xmlSecKeyDebugDump((*ctx).sign_key, output);
             }
             write_stream(output, "== SignedInfo References List:\n");
-            xmlSecPtrListDebugDump(&raw mut context.signed_info_references, output);
+            xmlSecPtrListDebugDump(&raw mut (*ctx).signed_info_references, output);
             write_stream(output, "== Manifest References List:\n");
-            xmlSecPtrListDebugDump(&raw mut context.manifest_references, output);
-            if has_data(context.result) {
+            xmlSecPtrListDebugDump(&raw mut (*ctx).manifest_references, output);
+            if has_data((*ctx).result) {
                 write_stream(output, "== Result - start buffer:\n");
-                xmlSecBufferDebugHexDump(context.result, output);
+                xmlSecBufferDebugHexDump((*ctx).result, output);
                 write_stream(output, "\n== Result - end buffer\n");
             }
             let pre_sign = xmlSecDSigCtxGetPreSignBuffer(ctx);
-            if context.flags & FLAGS_STORE_SIGNATURE != 0 && has_data(pre_sign) {
+            if (*ctx).flags & FLAGS_STORE_SIGNATURE != 0 && has_data(pre_sign) {
                 write_stream(output, "== PreSign data - start buffer:\n");
                 xmlSecBufferDebugHexDump(pre_sign, output);
                 write_stream(output, "\n== PreSign data - end buffer\n");
@@ -588,10 +636,10 @@ pub(crate) unsafe extern "C" fn xmlSecDSigCtxDebugXmlDump(
             "xmlSecDSigCtxDebugXmlDump",
             c"output != NULL"
         );
-        // SAFETY: an initialized context and a live stream.
+        // SAFETY: an initialized context and a live stream, read field by
+        // field as in [`xmlSecDSigCtxDebugDump`].
         unsafe {
-            let context = &mut *ctx;
-            let element = if context.operation == OPERATION_SIGN {
+            let element = if (*ctx).operation == OPERATION_SIGN {
                 "SignatureContext"
             } else {
                 "VerificationContext"
@@ -600,42 +648,42 @@ pub(crate) unsafe extern "C" fn xmlSecDSigCtxDebugXmlDump(
                 output,
                 &format!(
                     "<{element} status=\"{}\" failureReason=\"{}\">\n<Flags>{:08x}</Flags>\n<Flags2>{:08x}</Flags2>\n<Id>",
-                    status_string(context.status).to_string_lossy(),
-                    failure_string(context.failure_reason).to_string_lossy(),
-                    context.flags,
-                    context.flags2
+                    status_string((*ctx).status).to_string_lossy(),
+                    failure_string((*ctx).failure_reason).to_string_lossy(),
+                    (*ctx).flags,
+                    (*ctx).flags2
                 ),
             );
-            xmlSecPrintXmlString(output, context.id);
+            xmlSecPrintXmlString(output, (*ctx).id);
             write_stream(output, "</Id>\n<KeyInfoReadCtx>\n");
-            xmlSecKeyInfoCtxDebugXmlDump(&raw mut context.key_info_read_ctx, output);
+            xmlSecKeyInfoCtxDebugXmlDump(&raw mut (*ctx).key_info_read_ctx, output);
             write_stream(output, "</KeyInfoReadCtx>\n<KeyInfoWriteCtx>\n");
-            xmlSecKeyInfoCtxDebugXmlDump(&raw mut context.key_info_write_ctx, output);
+            xmlSecKeyInfoCtxDebugXmlDump(&raw mut (*ctx).key_info_write_ctx, output);
             write_stream(output, "</KeyInfoWriteCtx>\n<SignatureTransformCtx>\n");
-            xmlSecTransformCtxDebugXmlDump(&raw mut context.transform_ctx, output);
+            xmlSecTransformCtxDebugXmlDump(&raw mut (*ctx).transform_ctx, output);
             write_stream(output, "</SignatureTransformCtx>\n");
-            if !context.sign_method.is_null() {
+            if !(*ctx).sign_method.is_null() {
                 write_stream(output, "<SignatureMethod>\n");
-                xmlSecTransformDebugXmlDump(context.sign_method, output);
+                xmlSecTransformDebugXmlDump((*ctx).sign_method, output);
                 write_stream(output, "</SignatureMethod>\n");
             }
-            if !context.sign_key.is_null() {
+            if !(*ctx).sign_key.is_null() {
                 write_stream(output, "<SignatureKey>\n");
-                xmlSecKeyDebugXmlDump(context.sign_key, output);
+                xmlSecKeyDebugXmlDump((*ctx).sign_key, output);
                 write_stream(output, "</SignatureKey>\n");
             }
             write_stream(output, "<SignedInfoReferences>\n");
-            xmlSecPtrListDebugXmlDump(&raw mut context.signed_info_references, output);
+            xmlSecPtrListDebugXmlDump(&raw mut (*ctx).signed_info_references, output);
             write_stream(output, "</SignedInfoReferences>\n<ManifestReferences>\n");
-            xmlSecPtrListDebugXmlDump(&raw mut context.manifest_references, output);
+            xmlSecPtrListDebugXmlDump(&raw mut (*ctx).manifest_references, output);
             write_stream(output, "</ManifestReferences>\n");
-            if has_data(context.result) {
+            if has_data((*ctx).result) {
                 write_stream(output, "<Result>\n");
-                xmlSecBufferDebugHexDump(context.result, output);
+                xmlSecBufferDebugHexDump((*ctx).result, output);
                 write_stream(output, "\n</Result>\n");
             }
             let pre_sign = xmlSecDSigCtxGetPreSignBuffer(ctx);
-            if context.flags & FLAGS_STORE_SIGNATURE != 0 && has_data(pre_sign) {
+            if (*ctx).flags & FLAGS_STORE_SIGNATURE != 0 && has_data(pre_sign) {
                 write_stream(output, "<PreSignData>\n");
                 xmlSecBufferDebugHexDump(pre_sign, output);
                 write_stream(output, "\n</PreSignData>\n");
@@ -850,6 +898,12 @@ pub(crate) unsafe extern "C" fn xmlSecDSigReferenceCtxProcessNode(
             !node.is_null(),
             "xmlSecDSigReferenceCtxProcessNode",
             c"node != NULL",
+            -1
+        );
+        check!(
+            !super::tree::nodes::doc(node).is_null(),
+            "xmlSecDSigReferenceCtxProcessNode",
+            c"node->doc != NULL",
             -1
         );
         // SAFETY: an initialized context and a live node.

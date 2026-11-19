@@ -58,10 +58,6 @@ struct Transport {
     /// `EncryptedKey` requires, taken when the run starts.
     #[cfg(feature = "legacy-algorithms")]
     expected: Option<usize>,
-    /// The side of the operation the recovered key serves, taken when the
-    /// run starts.
-    #[cfg(feature = "legacy-algorithms")]
-    serves: Option<policy::Side>,
 }
 
 #[cfg(test)]
@@ -201,8 +197,6 @@ unsafe extern "C" fn initialize(transform: *mut XmlSecTransform) -> c_int {
                 policy: None,
                 #[cfg(feature = "legacy-algorithms")]
                 expected: None,
-                #[cfg(feature = "legacy-algorithms")]
-                serves: None,
             });
         }
         0
@@ -236,7 +230,7 @@ unsafe extern "C" fn read_node(
     contain(-1, || {
         let here = here!("xmlSecOpenSSLRsaOaepNodeRead");
         // SAFETY: the dispatcher passes a transform.
-        let Some((object, _, transport)) = (unsafe { object(transform, here) }) else {
+        let Some((object, algorithm, transport)) = (unsafe { object(transform, here) }) else {
             return -1;
         };
         if node.is_null() || ctx.is_null() {
@@ -256,6 +250,18 @@ unsafe extern "C" fn read_node(
         } else {
             parse_method(node, &*pinned.decryption, &pinned.decryption.resources)
         };
+        // An OAEP method's digest and MGF identifiers are resolved as they
+        // are read, as libxmlsec1's reader resolves them; whether the policy
+        // admits them is decided when the transform runs.
+        let parsed = parsed.and_then(|method| {
+            if matches!(
+                algorithm,
+                KeyTransportAlgorithm::RsaOaepMgf1p | KeyTransportAlgorithm::RsaOaep11
+            ) {
+                parameters(algorithm, Some(&method)).map_err(|error| error.to_string())?;
+            }
+            Ok(method)
+        });
         match parsed {
             Ok(method) => {
                 transport.method = Some(method);
@@ -402,11 +408,6 @@ fn parameters(
 /// yields a random key of that width rather than an error, so the result
 /// never reveals padding validity (XML Encryption 1.1 section 6.1.2). A chain
 /// run outside a `KeyInfo` has no expected width and is refused.
-///
-/// Only a decryption consults that validity once its content work is done; a
-/// signature or an encryption made with the key would show it (a random key
-/// changes the output on every repeat), so a key serving either is refused
-/// before anything is recovered, whatever the padding.
 /// <https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-bleichenbacher-attack>
 #[cfg(feature = "legacy-algorithms")]
 fn recover_pkcs1v15(
@@ -414,14 +415,6 @@ fn recover_pkcs1v15(
     transport: &Transport,
     policy: &xml_sec::policy::DecryptionPolicy,
 ) -> Result<(Zeroizing<Vec<u8>>, RecoveryValidity), String> {
-    if matches!(
-        transport.serves,
-        Some(policy::Side::Sign | policy::Side::Encrypt)
-    ) {
-        return Err(
-            "an RSAES-PKCS1-v1_5 recovery yields no key for signing or encrypting".to_owned(),
-        );
-    }
     let expected = transport.expected.ok_or(
         "RSAES-PKCS1-v1_5 recovery needs the key width the EncryptedKey's consumer requires",
     )?;
@@ -559,8 +552,6 @@ unsafe extern "C" fn execute(
             {
                 // SAFETY: a non-null, initialized context.
                 transport.expected = unsafe { expected_width(ctx) };
-                // SAFETY: as above.
-                transport.serves = unsafe { super::ctx::run_budget(ctx) }.serves;
             }
             object.status = STATUS_WORKING;
         }

@@ -550,7 +550,9 @@ pub(super) unsafe fn within_key_info(
         let mut before = policy::spent(slot).map_or_default(std::cell::Cell::get);
         // The outermost read names the operation its keys serve; a nested
         // read's own operation is the decryption recovering a key for it.
-        before.serves = before.serves.or(operation_side((*ctx).operation));
+        before.serves = before.serves.or(Some(
+            operation_side((*ctx).operation).unwrap_or(policy::Side::Verify),
+        ));
         if let Some(pinned) = policy::pinned(slot) {
             let side = operation_side((*enc).operation).unwrap_or(policy::Side::Verify);
             seed_run(transforms, pinned, side, None, before);

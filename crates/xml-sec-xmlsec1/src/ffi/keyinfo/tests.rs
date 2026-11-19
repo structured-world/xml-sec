@@ -117,6 +117,52 @@ fn a_retrieval_method_reaches_only_the_uri_classes_policy_admits_for_keys() {
 }
 
 #[test]
+fn an_encryption_reaches_only_the_uri_classes_its_policy_admits_for_keys() {
+    // The KeyInfo of an encryption's key is read under the encryption
+    // policy's URI classes, as any other operation's: an external
+    // RetrievalMethod is refused for its class unless that policy admits it.
+    own_process();
+    let xml = "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><RetrievalMethod \
+               URI=\"http://example.com/key\" \
+               Type=\"http://www.w3.org/2000/09/xmldsig#RSAKeyValue\"/></KeyInfo>";
+    for (external, refused) in [(false, true), (true, false)] {
+        xml_sec_libxml2::policy::republish_encryption(
+            |encryption| {
+                encryption.uris.retrieval_methods = if external {
+                    UriTypeSet::ALL
+                } else {
+                    UriTypeSet::SAME_DOCUMENT
+                };
+            },
+            |_| {},
+        )
+        .expect("the library policy compiles");
+        // SAFETY: a context created and destroyed here.
+        unsafe {
+            assert_eq!(xmlSecKeyDataIdsInit(), 0);
+            let ctx = xmlSecKeyInfoCtxCreate(std::ptr::null_mut());
+            (*ctx).operation = crate::ffi::transforms::OPERATION_ENCRYPT;
+            // The context's own setting opens every class; the policy decides.
+            (*ctx).retrieval_method_ctx.enabled_uris = 0xFFFF;
+            let enabled = &raw mut (*ctx).enabled_key_data;
+            let retrieval = crate::ffi::keysdata::xmlSecKeyDataRetrievalMethodGetKlass();
+            assert_eq!(xmlSecPtrListAdd(enabled, retrieval.cast_mut().cast()), 0);
+            assert_eq!(
+                xmlSecPtrListAdd(enabled, asymkeys::rsa().cast_mut().cast()),
+                0
+            );
+            let (_, reasons) = read_reported(xml, ctx);
+            assert_eq!(
+                reasons.first() == Some(&errors::R_INVALID_URI_TYPE),
+                refused,
+                "external admitted: {external}: {reasons:?}"
+            );
+            xmlSecKeyInfoCtxDestroy(ctx);
+        }
+    }
+}
+
+#[test]
 fn key_info_reference_depth_is_bounded_by_policy_whatever_the_context_says() {
     own_process();
     // A KeyInfo referring to itself recurses until a bound stops it: the

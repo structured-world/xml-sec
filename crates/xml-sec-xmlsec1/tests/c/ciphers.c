@@ -30,6 +30,20 @@ static void record(const char *file, int line, const char *func, const char *obj
 
 static const xmlSecByte plaintext[] = "The quick brown fox jumps over the lazy dog";
 
+/* Set when an encryption a later step reads failed; the program then exits
+ * with a failure rather than reading a length that is not one. */
+static int failed;
+
+/* Whether the output length `size` can be read on; marks the run failed
+ * otherwise. */
+static int produced(int size) {
+    if (size < 0) {
+        failed = 1;
+        return 0;
+    }
+    return 1;
+}
+
 static xmlSecKeyPtr key_of(xmlSecKeyDataId id, xmlSecByte fill, xmlSecSize size) {
     xmlSecByte bytes[32];
     xmlSecKeyInfoCtxPtr ctx = xmlSecKeyInfoCtxCreate(NULL);
@@ -85,10 +99,12 @@ static void check(xmlSecTransformId id, xmlSecKeyDataId keyId, xmlSecSize keySiz
     encrypted_size = run(id, xmlSecTransformOperationEncrypt, key, plaintext,
                          sizeof(plaintext) - 1, encrypted);
     printf("  encrypted: %d\n", encrypted_size);
-    decrypted_size = run(id, xmlSecTransformOperationDecrypt, key, encrypted,
-                         (xmlSecSize)encrypted_size, decrypted);
-    printf("  decrypted: %d %.*s\n", decrypted_size, decrypted_size > 0 ? decrypted_size : 0,
-           (const char *)decrypted);
+    if (produced(encrypted_size)) {
+        decrypted_size = run(id, xmlSecTransformOperationDecrypt, key, encrypted,
+                             (xmlSecSize)encrypted_size, decrypted);
+        printf("  decrypted: %d %.*s\n", decrypted_size,
+               decrypted_size > 0 ? decrypted_size : 0, (const char *)decrypted);
+    }
     printf("  short key: %d\n", run(id, xmlSecTransformOperationEncrypt, short_key, plaintext,
                                     sizeof(plaintext) - 1, encrypted));
     xmlSecKeyDestroy(key);
@@ -113,16 +129,18 @@ static void wrap(xmlSecTransformId id, xmlSecKeyDataId keyId, xmlSecSize kekSize
         printf("%02x", wrapped[i]);
     }
     printf("\n");
-    /* The recovery completes before its bytes are compared: the order in
-     * which printf's arguments are evaluated is unspecified. */
-    unwrapped_size =
-        run(id, xmlSecTransformOperationDecrypt, kek, wrapped, (xmlSecSize)size, unwrapped);
-    printf("  unwrapped: %d same=%d\n", unwrapped_size,
-           unwrapped_size == (int)sizeof(content_key) &&
-               memcmp(unwrapped, content_key, sizeof(content_key)) == 0);
-    wrapped[0] ^= 0x01;
-    printf("  tampered: %d\n",
-           run(id, xmlSecTransformOperationDecrypt, kek, wrapped, (xmlSecSize)size, unwrapped));
+    if (produced(size)) {
+        /* The recovery completes before its bytes are compared: the order in
+         * which printf's arguments are evaluated is unspecified. */
+        unwrapped_size =
+            run(id, xmlSecTransformOperationDecrypt, kek, wrapped, (xmlSecSize)size, unwrapped);
+        printf("  unwrapped: %d same=%d\n", unwrapped_size,
+               unwrapped_size == (int)sizeof(content_key) &&
+                   memcmp(unwrapped, content_key, sizeof(content_key)) == 0);
+        wrapped[0] ^= 0x01;
+        printf("  tampered: %d\n",
+               run(id, xmlSecTransformOperationDecrypt, kek, wrapped, (xmlSecSize)size, unwrapped));
+    }
     xmlSecKeyDestroy(kek);
 }
 
@@ -184,14 +202,16 @@ static void oaep(const char *label, xmlSecTransformId id, const char *xml) {
     size = transport(id, xml, xmlSecTransformOperationEncrypt, key, content_key,
                      sizeof(content_key), transported);
     printf("  transported: %d\n", size);
-    recovered_size = transport(id, xml, xmlSecTransformOperationDecrypt, key, transported,
-                               (xmlSecSize)size, recovered);
-    printf("  recovered: %d same=%d\n", recovered_size,
-           recovered_size == (int)sizeof(content_key) &&
-               memcmp(recovered, content_key, sizeof(content_key)) == 0);
-    transported[0] ^= 0x01;
-    printf("  tampered: %d\n", transport(id, xml, xmlSecTransformOperationDecrypt, key, transported,
-                                         (xmlSecSize)size, recovered));
+    if (produced(size)) {
+        recovered_size = transport(id, xml, xmlSecTransformOperationDecrypt, key, transported,
+                                   (xmlSecSize)size, recovered);
+        printf("  recovered: %d same=%d\n", recovered_size,
+               recovered_size == (int)sizeof(content_key) &&
+                   memcmp(recovered, content_key, sizeof(content_key)) == 0);
+        transported[0] ^= 0x01;
+        printf("  tampered: %d\n", transport(id, xml, xmlSecTransformOperationDecrypt, key,
+                                             transported, (xmlSecSize)size, recovered));
+    }
     xmlSecKeyDestroy(key);
 }
 
@@ -246,13 +266,16 @@ int main(void) {
     key = key_of(xmlSecKeyDataAesId, 0x33, 16);
     size = run(xmlSecTransformAes128GcmId, xmlSecTransformOperationEncrypt, key, plaintext,
                sizeof(plaintext) - 1, encrypted);
-    encrypted[size - 1] ^= 0x01;
-    printf("gcm tampered: %d\n", run(xmlSecTransformAes128GcmId, xmlSecTransformOperationDecrypt,
-                                     key, encrypted, (xmlSecSize)size, decrypted));
+    if (produced(size) && size > 0) {
+        encrypted[size - 1] ^= 0x01;
+        printf("gcm tampered: %d\n",
+               run(xmlSecTransformAes128GcmId, xmlSecTransformOperationDecrypt, key, encrypted,
+                   (xmlSecSize)size, decrypted));
+    }
     xmlSecKeyDestroy(key);
 
     xmlSecCryptoShutdown();
     xmlSecCryptoAppShutdown();
     xmlSecShutdown();
-    return 0;
+    return failed;
 }

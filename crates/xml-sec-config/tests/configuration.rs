@@ -845,6 +845,26 @@ fn unknown_x509_certificate_semantics_comes_from_the_base_profile() {
 }
 
 #[test]
+fn encryption_uri_classes_reach_the_compiled_snapshot() {
+    // The encryption table bounds the key references of the key it encrypts
+    // with as the other operations do; a layer can narrow them but the empty
+    // set admits nothing, so an encryption refuses any key reference.
+    use xml_sec::xmldsig::UriTypeSet;
+    let uris = |extra: &str| {
+        effective(&config(extra), "team")
+            .compiled()
+            .encryption()
+            .unwrap()
+            .uris
+    };
+    assert_eq!(uris("").retrieval_methods, UriTypeSet::SAME_DOCUMENT);
+    let narrowed =
+        uris("[profiles.team.encryption.uris]\nretrieval_methods = []\nkey_info_references = []");
+    assert!(!narrowed.retrieval_methods.allows("#key"));
+    assert!(!narrowed.key_info_references.allows("#key"));
+}
+
+#[test]
 fn empty_digest_input_reaches_the_compiled_snapshots() {
     // Refusing to digest no data reaches the compiled snapshots, accepting it
     // is the default, and unknown names are schema errors.

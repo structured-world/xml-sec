@@ -651,6 +651,7 @@ macro_rules! encryption_fields {
                 })?
             }
             "rsa_keys" => rsa(&mut $p.rsa_keys, $value)?,
+            "uris" => uris(&mut $p.uris, $value)?,
             "key_establishment" => key_establishment(&mut $p.key_establishment, $value)?,
             "resources" => resources(&mut $p.resources, $value)?,
             "xml" => xml(&mut $p.xml, $value)?,
@@ -670,7 +671,6 @@ fn encryption(p: &mut EncryptionPolicy, t: &Table, syntax_only: bool) -> Result<
 fn decryption(p: &mut DecryptionPolicy, t: &Table, syntax_only: bool) -> Result<(), Error> {
     for (key, value) in fields(t, syntax_only) {
         match key.as_str() {
-            "uris" => uris(&mut p.uris, value)?,
             "transforms" => transforms(&mut p.transforms, value, TransformTable::Processing)?,
             _ => encryption_fields!(p, key, value),
         }
@@ -1160,6 +1160,7 @@ macro_rules! encryption_snapshot {
                 optional_value($p.oaep_digests.as_ref(), |v| text(v.uri())),
             ),
             ("rsa_keys".into(), rsa_snapshot($p.rsa_keys)),
+            ("uris".into(), uri_snapshot($p.uris)),
             (
                 "key_establishment".into(),
                 establishment_snapshot(&$p.key_establishment),
@@ -1240,6 +1241,7 @@ fn encryption_policy_snapshot(p: &EncryptionPolicy) -> Result<Value, Error> {
         key_wrap_algorithms: _,
         oaep_digests: _,
         rsa_keys: _,
+        uris: _,
         key_establishment: _,
         xml: _,
         resources: _,
@@ -1263,7 +1265,6 @@ fn decryption_snapshot(p: &DecryptionPolicy) -> Result<Value, Error> {
         transforms: _,
     } = p;
     let mut t = encryption_snapshot!(p);
-    t.insert("uris".into(), uri_snapshot(p.uris));
     t.insert(
         "transforms".into(),
         transform_snapshot(&p.transforms, TransformTable::Processing),

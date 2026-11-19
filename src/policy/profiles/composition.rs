@@ -638,6 +638,7 @@ fn encryption(
             |v| oaep_allowed(b.oaep_digests.as_ref(), v),
         ),
         rsa_keys: rsa(a.rsa_keys, b.rsa_keys),
+        uris: uris(a.uris, b.uris),
         key_establishment: key_establishment(&a.key_establishment, &b.key_establishment),
         xml: xml(a.xml, b.xml),
         resources: resources(&a.resources, &b.resources),

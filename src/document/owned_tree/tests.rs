@@ -709,6 +709,38 @@ fn a_detached_replacement_is_not_charged_to_the_document() {
 }
 
 #[test]
+fn a_node_of_an_entity_expansion_is_not_replaced() {
+    // The document writes `&e;`, not the expansion, so `x` has no text of its
+    // own there: a replacement would change the entity's content and be
+    // measured against octets the document does not hold. It is refused,
+    // while the same markup written directly is replaced.
+    let mut policy = VerificationPolicy::default();
+    policy.xml.allow_internal_dtd = true;
+    let expanded = "<!DOCTYPE r [<!ENTITY e '<a><x><b/></x></a>'>]><r>&e;</r>";
+    let mut tree = OwnedTree::parse_with_policy(expanded, &policy).expect("the document parses");
+    let root = tree.root_element().expect("a document element");
+    let reference = children(&tree, root)[0];
+    let a = children(&tree, reference)[0];
+    let x = children(&tree, a)[0];
+    let mut spent = 0;
+    assert!(matches!(
+        tree.parse_replacing_within(x, "<y/>", &policy, &mut spent),
+        Err(XmlDocumentError::EntityExpandedMutationTarget)
+    ));
+    let mut direct = OwnedTree::parse_with_policy("<r><a><x><b/></x></a></r>", &policy)
+        .expect("the document parses");
+    let root = direct.root_element().expect("a document element");
+    let a = children(&direct, root)[0];
+    let x = children(&direct, a)[0];
+    let mut spent = 0;
+    assert!(
+        direct
+            .parse_replacing_within(x, "<y/>", &policy, &mut spent)
+            .is_ok()
+    );
+}
+
+#[test]
 fn entity_expanded_markup_is_held_to_the_same_depth_as_direct_markup() {
     // A context at depth three under a depth limit of four leaves room for
     // one level: `<a><b/></a>` needs two, whether written directly or

@@ -31,7 +31,8 @@ a disabled operation. Encryption tables require an encryption-enabled build.
 | `detached_digest_attestation` | verify | `Forbidden`, `Accepted` |
 | `timestamp_token_encoding` | verify | `Declared`, `Ber` |
 | `hmac` | verify, sign | `minimum_key_bits`, `minimum_output_bits` (nonnegative integers) |
-| `uris`, `transforms` | verify, sign, decrypt | Nested tables below |
+| `uris` | all | Nested table below |
+| `transforms` | verify, sign, decrypt | Nested table below |
 | `key_trust`, `key_sources` | verify | Nested tables below |
 | `rsa_keys` | sign, encrypt, decrypt | `minimum_modulus_bits` (nonnegative integer) |
 | `dsa_keys` | sign | `minimum_modulus_bits` (nonnegative integer) |
@@ -55,7 +56,9 @@ minima, feature/provider availability and cross-field consistency.
 `uris` accepts `references`, `retrieval_methods`, `key_info_references`, each
 an array containing any distinct subset of `"empty"`, `"same-document"`,
 `"external"`. An empty array denies every URI class. External permission does
-not create a resolver, resource map or network access.
+not create a resolver, resource map or network access. In the `encryption`
+table, `references` bounds a resource an encryption reads by URI and the other
+two bound the key references of its key.
 
 | `transforms` field | Value |
 | --- | --- |

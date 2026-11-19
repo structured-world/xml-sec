@@ -746,6 +746,12 @@ impl OwnedTree {
         let id = self
             .live(replaced)
             .map_err(|_| XmlDocumentError::MissingNode)?;
+        // A node of an entity's expansion has no text of its own in the
+        // document, whose serialization writes the reference (XML 1.0
+        // section 4.4.2): replacing it would change the entity, not the node.
+        if self.in_entity_expansion(id) {
+            return Err(XmlDocumentError::EntityExpandedMutationTarget);
+        }
         let context = self
             .linked_parent(id)
             .ok_or(XmlDocumentError::MissingNode)?;
@@ -923,8 +929,9 @@ impl OwnedTree {
             return Ok(());
         }
         let length = |id| xmloxide::serial::serialize_subtree_in_document(&self.document, id).len();
-        // The replaced node's text is a part of the document's, and the
-        // unlinked run is not in it yet.
+        // The replaced node's text is a part of the document's, as no node
+        // of an entity's expansion is replaced, and the unlinked run is not
+        // in it yet.
         let mut actual = xmloxide::serial::serialize(&self.document).len() - length(replacing.node);
         for &top in tops {
             // At most the octets the run's serialization holds.
@@ -985,6 +992,18 @@ impl OwnedTree {
             pending.extend(self.document.children(node));
         }
         count
+    }
+
+    /// Whether `id` lies inside an entity reference's expansion.
+    fn in_entity_expansion(&self, id: NodeId) -> bool {
+        let mut current = self.document.parent(id);
+        while let Some(node) = current {
+            if matches!(self.document.node(node).kind, NodeKind::EntityRef { .. }) {
+                return true;
+            }
+            current = self.document.parent(node);
+        }
+        false
     }
 
     /// Whether `ancestor` is `id` or one of its ancestors.

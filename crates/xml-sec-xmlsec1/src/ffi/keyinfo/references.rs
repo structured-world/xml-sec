@@ -121,14 +121,23 @@ struct Terms<'a> {
 
 /// The side of the operation the key read in `ctx` serves: a key read for a
 /// decryption dereferences and parses its references under the decryption
-/// policy, one of a signature under verification's.
+/// policy, one of a signature under verification's. A read nested in an
+/// `EncryptedKey` decrypts that key for the operation its outermost read
+/// serves, whose policy governs its references too.
 ///
 /// # Safety
-/// `ctx` is a context.
+/// `ctx` is a context whose slot is null or a pin.
 unsafe fn read_side(ctx: *const XmlSecKeyInfoCtx) -> policy::Side {
     // SAFETY: by the caller's contract.
-    let operation = unsafe { (*ctx).operation };
-    super::super::transforms::ctx::operation_side(operation).unwrap_or(policy::Side::Verify)
+    let (operation, served) = unsafe {
+        (
+            (*ctx).operation,
+            policy::spent((*ctx).reserved0).and_then(|spent| spent.get().serves),
+        )
+    };
+    served.unwrap_or_else(|| {
+        super::super::transforms::ctx::operation_side(operation).unwrap_or(policy::Side::Verify)
+    })
 }
 
 /// Resolves the URI of `node` with the optional `Transforms` child in

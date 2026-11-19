@@ -121,6 +121,10 @@ fn compile() -> Option<Published> {
         .key_transport_algorithms
         .clone_from(&decryption.key_transport_algorithms);
     encryption.oaep_digests.clone_from(&decryption.oaep_digests);
+    // A resource named to xmlSecEncCtxUriEncrypt is read from the bytes the
+    // caller's input callbacks supply, as a CipherReference is; the key's
+    // references keep the decryption's classes.
+    encryption.uris = decryption.uris;
     Some(Published {
         verification: Arc::new(verification),
         signing: Arc::new(signing),
