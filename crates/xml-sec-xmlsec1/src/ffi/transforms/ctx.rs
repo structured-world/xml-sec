@@ -86,9 +86,12 @@ pub(crate) struct RunBudget {
     pub(crate) base64_output: usize,
     /// Octets read from external resources through the input callbacks.
     pub(crate) external_resources: usize,
-    /// An external-resource limit refused a read of the run: the operation's
-    /// budget is spent, which ends the operation rather than one reference.
-    pub(crate) resource_limit_reached: bool,
+    /// The first limit that refused work of the run: an external-resource
+    /// read, a Base64 charge, a cipher's plaintext size or an `XPath`
+    /// expression count. The operation's budget is spent, which ends the
+    /// operation rather than one reference, and a later read is refused
+    /// naming this limit.
+    pub(crate) refused_by: Option<Limit>,
     /// Whether the keys the run's transports recovered were recovered
     /// validly, consulted only once the operation's content work is done.
     pub(crate) recovery: xml_sec::provider::RecoveryValidity,
@@ -236,7 +239,7 @@ pub(crate) unsafe fn run_spent(ctx: *mut XmlSecTransformCtx) -> policy::Spent {
             external_resources: run.external_resources,
             xml_parse: run.xml_parse,
             xpath_expressions: run.xpath_expressions,
-            limit_reached: run.resource_limit_reached,
+            refused_by: run.refused_by,
             recovery: run.recovery,
         },
         None => policy::Spent::default(),
@@ -318,7 +321,7 @@ pub(crate) unsafe fn charge_key_info(
     // whatever key the work yielded; the refusal was reported where it
     // happened, and an operation whose references are all in the document
     // reads nothing later that would see it.
-    !spent.limit_reached
+    spent.refused_by.is_none()
 }
 
 /// Takes what the run of `ctx` has spent of the per-operation budgets off
@@ -387,7 +390,7 @@ pub(crate) unsafe fn take_spent(ctx: *mut XmlSecTransformCtx, spent: policy::Spe
     // A refusal is never taken back by what a part hands over, nor is an
     // invalid recovery: `spent` carries only the recovery of the key the
     // part yields, a failed recipient's being dropped where it is tried.
-    run.resource_limit_reached |= spent.limit_reached;
+    run.refused_by = run.refused_by.or(spent.refused_by);
     run.recovery = run.recovery.and(spent.recovery);
 }
 
@@ -401,8 +404,8 @@ pub(crate) unsafe fn external_spent(ctx: *mut XmlSecTransformCtx) -> policy::Spe
     let spent = unsafe { run_spent(ctx) };
     policy::Spent {
         external_resources: spent.external_resources,
-        // A limit that refused a read already ends every later read.
-        limit_reached: spent.limit_reached,
+        // A limit that refused work already ends every later read.
+        refused_by: spent.refused_by,
         ..policy::Spent::default()
     }
 }
@@ -423,7 +426,7 @@ pub(crate) unsafe fn run_budget<'a>(ctx: *mut XmlSecTransformCtx) -> &'a mut Run
 }
 
 /// A policy limit as a charge names it in its report.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Limit {
     pub(crate) name: &'static str,
     pub(crate) max: usize,
@@ -1954,9 +1957,9 @@ pub(crate) struct ResourceScope<'a> {
     pub(crate) pinned: &'a policy::Pinned,
     pub(crate) side: policy::Side,
     pub(crate) spent: policy::Spent,
-    /// Set when an external-resource limit refused a read, which the core
-    /// treats as a refusal of the whole operation, not a missing resource.
-    pub(crate) limit_reached: bool,
+    /// The limit that refused a read, which the core treats as a refusal of
+    /// the whole operation, not a missing resource.
+    pub(crate) refused_by: Option<Limit>,
 }
 
 impl<'a> ResourceScope<'a> {
@@ -1970,25 +1973,80 @@ impl<'a> ResourceScope<'a> {
             pinned,
             side,
             spent,
-            limit_reached: false,
+            refused_by: None,
         }
     }
 }
 
 /// What a pre-execute callback can change of a chain: its transforms in
-/// order, with their klasses, operations and `here` nodes (an enveloped
-/// signature transform finds the signature it excludes from its node), and
-/// its URI selection.
+/// order, with their klasses, operations, statuses (a transform the
+/// callback ran) and `here` nodes (an enveloped signature transform finds
+/// the signature it excludes from its node), and its URI selection. A
+/// transform's own settings (its key, an expression) live in its klass's
+/// context and are watched by [`PreExecuteWatch`].
 #[derive(PartialEq, Eq)]
 struct ChainShape {
     transforms: Vec<(
         *const XmlSecTransform,
         *const XmlSecTransformKlass,
         c_int,
+        c_int,
         *const XmlNode,
     )>,
     uri: Option<Vec<u8>>,
     xptr_expr: Option<Vec<u8>>,
+}
+
+std::thread_local! {
+    /// The chains whose pre-execute callbacks run on this thread, innermost
+    /// last: each chain's transforms and whether a callback changed a
+    /// setting of one of them. A callback runs on its operation's thread,
+    /// so another thread's work never marks this one's chains.
+    static PRE_EXECUTING: std::cell::RefCell<Vec<(Vec<*const XmlSecTransform>, bool)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Watches the settings of a chain's transforms while its pre-execute
+/// callback runs, as the entry at `index` of [`PRE_EXECUTING`]; dropping it
+/// ends the watch, and those of callbacks nested in it.
+struct PreExecuteWatch {
+    index: usize,
+}
+
+impl PreExecuteWatch {
+    /// Starts watching `transforms`.
+    fn start(transforms: Vec<*const XmlSecTransform>) -> Self {
+        PRE_EXECUTING.with_borrow_mut(|chains| {
+            chains.push((transforms, false));
+            Self {
+                index: chains.len() - 1,
+            }
+        })
+    }
+
+    /// Whether a setting of a watched transform changed.
+    fn changed(&self) -> bool {
+        PRE_EXECUTING
+            .with_borrow(|chains| chains.get(self.index).is_some_and(|(_, changed)| *changed))
+    }
+}
+
+impl Drop for PreExecuteWatch {
+    fn drop(&mut self) {
+        PRE_EXECUTING.with_borrow_mut(|chains| chains.truncate(self.index));
+    }
+}
+
+/// Records that a setting of `transform` changes: a chain whose pre-execute
+/// callback is running on this thread and holds it is then refused.
+pub(crate) fn note_setting_change(transform: *const XmlSecTransform) {
+    PRE_EXECUTING.with_borrow_mut(|chains| {
+        for (transforms, changed) in chains.iter_mut() {
+            if transforms.contains(&transform) {
+                *changed = true;
+            }
+        }
+    });
 }
 
 impl ChainShape {
@@ -2014,6 +2072,7 @@ impl ChainShape {
                     transform.cast_const(),
                     current.id,
                     current.operation,
+                    current.status,
                     current.here_node.cast_const(),
                 ));
                 transform = current.next;
@@ -2029,9 +2088,10 @@ impl ChainShape {
 
 /// Runs the pre-execute callback of `ctx`, a chain whose operation the core
 /// runs from the document: a negative return refuses the operation, and so
-/// does a callback that changed the chain, a change the core would not see
-/// (libxmlsec1 lets the callback edit the chain it then runs itself).
-/// `false` after a report at `here`.
+/// does a callback that changed the chain or a setting of one of its
+/// transforms, such as its key, a change the core would not see (libxmlsec1
+/// lets the callback edit the chain it then runs itself). `false` after a
+/// report at `here`.
 ///
 /// # Safety
 /// `ctx` is an initialized context whose callback is callable with it.
@@ -2042,11 +2102,18 @@ pub(crate) unsafe fn run_pre_execute(ctx: *mut XmlSecTransformCtx, here: errors:
             return true;
         };
         let before = ChainShape::of(ctx);
+        let watch = PreExecuteWatch::start(
+            before
+                .transforms
+                .iter()
+                .map(|&(transform, ..)| transform)
+                .collect(),
+        );
         if callback(ctx) < 0 {
             errors::internal(here, std::ptr::null(), c"ctx->preExecCallback");
             return false;
         }
-        if ChainShape::of(ctx) != before {
+        if watch.changed() || ChainShape::of(ctx) != before {
             errors::not_implemented(
                 here,
                 "a pre-execute callback changed a chain the operation runs from the document",
@@ -2093,20 +2160,12 @@ pub(crate) unsafe fn read_resource(
         );
         return None;
     }
-    // A resource limit that refused an earlier read of the operation, a key
-    // lookup's included, spent its budget: nothing more is read.
-    if scope.spent.limit_reached || scope.limit_reached {
-        scope.limit_reached = true;
-        errors::limit_exceeded(
-            location,
-            std::ptr::null(),
-            "max_external_resource_total_bytes",
-            scope
-                .pinned
-                .of(scope.side)
-                .resources()
-                .max_external_resource_total_bytes,
-        );
+    // A limit that refused earlier work of the operation, a key lookup's
+    // included, spent its budget: nothing more is read, and the refusal
+    // names that limit.
+    if let Some(limit) = scope.refused_by.or(scope.spent.refused_by) {
+        scope.refused_by = Some(limit);
+        errors::limit_exceeded(location, std::ptr::null(), limit.name, limit.max);
         return None;
     }
     let Ok(base) = std::ffi::CString::new(base) else {
@@ -2142,7 +2201,7 @@ pub(crate) unsafe fn read_resource(
                 }
             });
         scope.spent = run_spent(ctx);
-        scope.limit_reached |= run_budget(ctx).resource_limit_reached;
+        scope.refused_by = scope.refused_by.or(run_budget(ctx).refused_by);
         xmlSecTransformCtxDestroy(ctx);
         bytes
     }

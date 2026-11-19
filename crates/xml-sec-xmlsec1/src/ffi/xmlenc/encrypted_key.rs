@@ -569,7 +569,7 @@ pub(super) unsafe fn within_key_info(
         if let Some(candidates) = policy::key_candidates(slot) {
             candidates.set(run_budget(transforms).key_candidates);
         }
-        if run_budget(transforms).resource_limit_reached {
+        if run_budget(transforms).refused_by.is_some() {
             return -1;
         }
         done

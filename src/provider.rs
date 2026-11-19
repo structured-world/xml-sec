@@ -233,9 +233,12 @@ impl RecoveredContentKey {
     /// Consume a recovery whose key leaves for a content operation that
     /// cannot carry its validity, such as a key handed through a C
     /// interface. A rejected RSAES-PKCS1-v1_5 recovery yields its random
-    /// substitute of the same width, and nothing tells the two apart: the
-    /// content operation fails as it fails with any wrong key
-    /// (XML Encryption 1.1 section 6.1.2).
+    /// substitute of the same width, and nothing tells the two apart. The
+    /// returned bytes prove neither the recovery nor the content: an
+    /// unauthenticated cipher such as CBC can decrypt under a substitute
+    /// without error. An operation that decides whether to release content
+    /// uses [`Self::into_key_with_validity`] instead and consults the validity
+    /// after its content work (XML Encryption 1.1 section 6.1.2).
     /// <https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-bleichenbacher-attack>
     ///
     /// # Errors

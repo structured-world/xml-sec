@@ -583,14 +583,28 @@ impl OwnedTree {
     }
 
     /// The node `node` and its subtree as XML text, as libxml2's
-    /// `xmlNodeDumpOutput` writes it unformatted: only the namespace
-    /// declarations the nodes carry, no XML declaration.
+    /// `xmlNodeDumpOutput` writes it unformatted with no encoding named:
+    /// UTF-8, only the namespace declarations the nodes carry, no XML
+    /// declaration.
     ///
     /// # Errors
     /// [`TreeError::StaleNode`] for a node this tree does not hold.
     pub fn serialize_node(&self, node: TreeNode) -> Result<String, TreeError> {
         let id = self.live(node)?;
         Ok(xmloxide::serial::serialize_subtree(&self.document, id))
+    }
+
+    /// [`Self::serialize_node`] as the node's text within
+    /// [`Self::serialize`]: what the node's octets are in the document's.
+    ///
+    /// # Errors
+    /// [`TreeError::StaleNode`] for a node this tree does not hold.
+    pub fn serialize_node_in_document(&self, node: TreeNode) -> Result<String, TreeError> {
+        let id = self.live(node)?;
+        Ok(xmloxide::serial::serialize_subtree_in_document(
+            &self.document,
+            id,
+        ))
     }
 
     /// The node standing for the whole document.
@@ -701,55 +715,68 @@ impl OwnedTree {
         fragment: &str,
         policy: &impl XmlDocumentPolicy,
     ) -> Result<Option<TreeNode>, XmlDocumentError> {
-        let limits = (
-            policy.resource_policy().max_xml_depth,
-            policy.xml_input_policy().allow_internal_dtd,
-        );
+        let limits = WrappedLimits::of(policy, None);
         self.parse_wrapped_in_context(context, fragment, limits, |parts| {
             Self::parse_parts_with_policy(parts, policy)
         })
     }
 
-    /// [`Self::parse_in_context`] as one parse of an operation that has
-    /// `spent` octets of `policy`'s `max_xml_parse_work_bytes`, charged as
-    /// [`Self::parse_parts_within`] charges it.
+    /// [`Self::parse_in_context`] at the place of `replaced`, in the context
+    /// of its parent, as one parse of an operation that has `spent` octets of
+    /// `policy`'s `max_xml_parse_work_bytes`, charged as
+    /// [`Self::parse_parts_within`] charges it. The document with the
+    /// fragment in place of `replaced` must stay within the policy's
+    /// `max_xml_nodes`, as a document the operation parsed would; the caller
+    /// then links the run there.
     ///
     /// # Errors
-    /// As for [`Self::parse_in_context`], or the policy's
-    /// `max_xml_parse_work_bytes` violation when the operation's work would
-    /// pass it.
+    /// As for [`Self::parse_in_context`] for the parent of `replaced`
+    /// ([`XmlDocumentError::MissingNode`] for a node without one), the
+    /// policy's `max_xml_parse_work_bytes` violation when the operation's
+    /// work would pass it, or its `max_xml_nodes` violation for the document
+    /// the replacement would leave.
     #[cfg(feature = "xmldsig")]
-    pub fn parse_in_context_within(
+    pub fn parse_replacing_within(
         &mut self,
-        context: TreeNode,
+        replaced: TreeNode,
         fragment: &str,
         policy: &impl XmlDocumentPolicy,
         spent: &mut usize,
     ) -> Result<Option<TreeNode>, XmlDocumentError> {
-        let limits = (
-            policy.resource_policy().max_xml_depth,
-            policy.xml_input_policy().allow_internal_dtd,
-        );
-        self.parse_wrapped_in_context(context, fragment, limits, |parts| {
+        let id = self
+            .live(replaced)
+            .map_err(|_| XmlDocumentError::MissingNode)?;
+        let context = self
+            .linked_parent(id)
+            .ok_or(XmlDocumentError::MissingNode)?;
+        let limits = WrappedLimits::of(policy, Some(id));
+        self.parse_wrapped_in_context(TreeNode::of(context), fragment, limits, |parts| {
             Self::parse_parts_within(parts, policy, spent)
         })
     }
 
     /// Parses `fragment` with `parse` inside an element declaring the
     /// bindings in scope at `context` and imports its nodes, refusing a
-    /// fragment whose elements would lie deeper than `max_depth` below the
-    /// document node once linked at `context`. When `internal_dtd` admits
-    /// it, the fragment also sees the document's internal subset, as
-    /// libxml2's `xmlParseInNodeContext` parses with the document's DTD: an
-    /// entity the document declares expands in the fragment as it does in
-    /// the document, so content dumped with its entity references parses back.
+    /// fragment whose elements would lie deeper than the limits' depth below
+    /// the document node once linked at `context`, or that would take the
+    /// document past their node count in place of the node they replace.
+    /// When the limits admit internal DTDs, the fragment also sees the
+    /// document's internal subset, as libxml2's `xmlParseInNodeContext`
+    /// parses with the document's DTD: an entity the document declares
+    /// expands in the fragment as it does in the document, so content dumped
+    /// with its entity references parses back.
     fn parse_wrapped_in_context(
         &mut self,
         context: TreeNode,
         fragment: &str,
-        (max_depth, internal_dtd): (usize, bool),
+        limits: WrappedLimits,
         parse: impl FnOnce(&[&[u8]]) -> Result<Self, XmlDocumentError>,
     ) -> Result<Option<TreeNode>, XmlDocumentError> {
+        let WrappedLimits {
+            max_depth,
+            internal_dtd,
+            ..
+        } = limits;
         let id = self
             .live(context)
             .map_err(|_| XmlDocumentError::MissingNode)?;
@@ -781,13 +808,16 @@ impl OwnedTree {
         // no parameter entity reference may occur inside one (XML 1.0
         // section 2.8, "PEs in Internal Subset"), so a name the subset's text
         // does not contain receives no attribute default, `xmlns` included.
-        let mut element_name = String::from("w");
-        if let Some(subset) = subset {
-            while subset.contains(element_name.as_str()) {
-                // Longer than the subset at the latest, so this ends.
-                element_name.push('w');
-            }
-        }
+        // One pass finds the longest run of `w`; a run one longer occurs
+        // nowhere in the subset, and its length stays within the subset's.
+        let longest = subset.map_or(0, |subset| {
+            subset
+                .split(|character| character != 'w')
+                .map(str::len)
+                .max()
+                .unwrap_or(0)
+        });
+        let element_name = "w".repeat(longest + 1);
         let mut wrapped = String::new();
         if let Some(subset) = subset {
             // The wrapper is the document element the declarations apply to;
@@ -837,6 +867,9 @@ impl OwnedTree {
                 .into());
             }
         }
+        if let Some((replaced, max_nodes)) = limits.replacing {
+            self.admit_replacement(&parsed, element, replaced, max_nodes)?;
+        }
         let tops: Vec<NodeId> = parsed
             .document
             .children(element)
@@ -861,6 +894,62 @@ impl OwnedTree {
             current = self.document.parent(node);
         }
         depth
+    }
+
+    /// Refuses the content of `wrapper`, the element of `parsed` holding a
+    /// fragment, in place of `replaced` when the document would then hold
+    /// more than `max_nodes` nodes.
+    fn admit_replacement(
+        &self,
+        parsed: &Self,
+        wrapper: NodeId,
+        replaced: NodeId,
+        max_nodes: usize,
+    ) -> Result<(), XmlDocumentError> {
+        // The wrapper is not imported; the replaced subtree leaves the
+        // document only if it is in it.
+        let added = parsed.subtree_nodes(wrapper) - 1;
+        let root = self.document.root();
+        let mut actual = self.subtree_nodes(root);
+        if self.under(replaced, root) {
+            // Part of the document just counted.
+            actual -= self.subtree_nodes(replaced);
+        }
+        // Both terms count nodes held in memory.
+        actual += added;
+        if actual > max_nodes {
+            return Err(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_NODES,
+                maximum: max_nodes,
+                actual,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    /// The nodes of the subtree of `id`, `id` included.
+    fn subtree_nodes(&self, id: NodeId) -> usize {
+        let mut count = 0;
+        let mut pending = vec![id];
+        while let Some(node) = pending.pop() {
+            // At most the number of nodes in the tree.
+            count += 1;
+            pending.extend(self.document.children(node));
+        }
+        count
+    }
+
+    /// Whether `ancestor` is `id` or one of its ancestors.
+    fn under(&self, id: NodeId, ancestor: NodeId) -> bool {
+        let mut current = Some(id);
+        while let Some(node) = current {
+            if node == ancestor {
+                return true;
+            }
+            current = self.document.parent(node);
+        }
+        false
     }
 
     /// The levels of elements below `element`: zero when it has no element
@@ -2232,6 +2321,31 @@ fn declaration(attribute: &Attribute) -> Option<TreeNamespace<'_>> {
         })
     } else {
         None
+    }
+}
+
+/// The policy limits a fragment parsed in context is held to beyond the
+/// parse's own.
+#[derive(Clone, Copy)]
+struct WrappedLimits {
+    /// Elements below the document node once the fragment is linked.
+    max_depth: usize,
+    /// Whether the fragment sees the document's internal subset.
+    internal_dtd: bool,
+    /// The node the fragment replaces and the document's node limit once it
+    /// has.
+    replacing: Option<(NodeId, usize)>,
+}
+
+impl WrappedLimits {
+    /// The limits of `policy`, for a fragment replacing `replaced` if given.
+    fn of(policy: &impl XmlDocumentPolicy, replaced: Option<NodeId>) -> Self {
+        let resources = policy.resource_policy();
+        Self {
+            max_depth: resources.max_xml_depth,
+            internal_dtd: policy.xml_input_policy().allow_internal_dtd,
+            replacing: replaced.map(|id| (id, resources.max_xml_nodes)),
+        }
     }
 }
 

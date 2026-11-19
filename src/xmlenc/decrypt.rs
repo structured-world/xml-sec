@@ -26,6 +26,22 @@ use super::{
 #[cfg(test)]
 use super::parse_encrypted_data;
 
+impl XmlEncError {
+    /// The failure of content decryption under a key whose RSAES-PKCS1-v1_5
+    /// recovery was rejected: the one a wrong key's content work reports for
+    /// `algorithm`, whatever the substitute key's content work yielded, so a
+    /// rejected recovery cannot be told from an accepted recovery of a wrong
+    /// key (XML Encryption 1.1 sections 6.1.2 and 6.7).
+    #[must_use]
+    pub const fn rejected_recovery(algorithm: DataEncryptionAlgorithm) -> Self {
+        if algorithm.cbc_block_len().is_some() {
+            Self::InvalidPadding
+        } else {
+            Self::AeadAuthenticationFailed
+        }
+    }
+}
+
 /// Aggregate key-candidate work allowance for one cryptographic operation.
 ///
 /// Resolver implementations must consume one unit before each key lookup or
@@ -1178,11 +1194,7 @@ impl<'a> DecryptContext<'a> {
                     if let Ok(mut plaintext) = result {
                         zeroize::Zeroize::zeroize(&mut plaintext);
                     }
-                    return Err(if algorithm.cbc_block_len().is_some() {
-                        XmlEncError::InvalidPadding
-                    } else {
-                        XmlEncError::AeadAuthenticationFailed
-                    });
+                    return Err(XmlEncError::rejected_recovery(algorithm));
                 }
                 let plaintext = result.map_err(|error| {
                     map_data_decryption_error(algorithm, ciphertext.len(), error)

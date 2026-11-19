@@ -419,9 +419,13 @@ fn a_base64_limit_refusal_ends_the_operation() {
             xmlSecTransformCtxBinaryExecute(ctx, input.as_ptr(), input.len()),
             -1
         );
-        assert!(
-            super::ctx::run_budget(ctx).resource_limit_reached,
-            "the refusal ends the operation"
+        assert_eq!(
+            super::ctx::run_budget(ctx).refused_by,
+            Some(super::ctx::Limit {
+                name: "max_base64_transform_output_bytes",
+                max: limit,
+            }),
+            "the refusal ends the operation, naming its limit"
         );
         xmlSecTransformCtxDestroy(ctx);
     }

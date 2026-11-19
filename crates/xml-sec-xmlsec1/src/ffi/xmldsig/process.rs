@@ -256,7 +256,8 @@ unsafe fn process_signature_node(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode) ->
         while is(cur, name!(xmlSecNodeObject)) {
             // The effective policy, the context's flag applied, decides: the
             // core never processes an ignored Manifest, so none is read.
-            if manifests == ManifestProcessing::Process && read_object(ctx, cur, max_references) < 0
+            if manifests == ManifestProcessing::Process
+                && read_object(ctx, cur, (max_references, &pinned)) < 0
             {
                 errors::internal(here, std::ptr::null(), c"xmlSecDSigCtxProcessObjectNode");
                 return -1;
@@ -280,7 +281,7 @@ unsafe fn process_signature_node(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode) ->
             errors::internal(here, std::ptr::null(), c"xmlSecDSigCtxProcessKeyInfoNode");
             return -1;
         }
-        if read_references(ctx, first_reference, max_references) < 0 {
+        if read_references(ctx, first_reference, (max_references, &pinned)) < 0 {
             errors::internal(here, std::ptr::null(), c"xmlSecDSigCtxProcessReferences");
             return -1;
         }
@@ -747,13 +748,17 @@ unsafe fn read_key(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode, pinned: &Pinned)
 ///
 /// # Safety
 /// `node` is a live node.
-unsafe fn read_object(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode, max_references: usize) -> c_int {
+unsafe fn read_object(
+    ctx: &mut XmlSecDSigCtx,
+    node: *mut XmlNode,
+    operation: (usize, &Pinned),
+) -> c_int {
     let here = here!("xmlSecDSigCtxProcessObjectNode");
     // SAFETY: live nodes.
     unsafe {
         let mut cur = first_element(node);
         while !cur.is_null() {
-            if is(cur, name!(xmlSecNodeManifest)) && read_manifest(ctx, cur, max_references) < 0 {
+            if is(cur, name!(xmlSecNodeManifest)) && read_manifest(ctx, cur, operation) < 0 {
                 errors::internal(here, std::ptr::null(), c"xmlSecDSigCtxProcessManifestNode");
                 return -1;
             }
@@ -771,7 +776,7 @@ unsafe fn read_object(ctx: &mut XmlSecDSigCtx, node: *mut XmlNode, max_reference
 unsafe fn read_manifest(
     ctx: &mut XmlSecDSigCtx,
     node: *mut XmlNode,
-    max_references: usize,
+    operation: (usize, &Pinned),
 ) -> c_int {
     let here = here!("xmlSecDSigCtxProcessManifestNode");
     let list = &raw mut ctx.manifest_references;
@@ -780,7 +785,7 @@ unsafe fn read_manifest(
         let mut cur = first_element(node);
         let mut count = 0_usize;
         while is(cur, name!(xmlSecNodeReference)) {
-            if add_reference(ctx, list, (ORIGIN_MANIFEST, max_references), cur).is_null() {
+            if add_reference(ctx, list, (ORIGIN_MANIFEST, operation), cur).is_null() {
                 return -1;
             }
             count += 1;
@@ -806,7 +811,7 @@ unsafe fn read_manifest(
 unsafe fn read_references(
     ctx: &mut XmlSecDSigCtx,
     first: *mut XmlNode,
-    max_references: usize,
+    operation: (usize, &Pinned),
 ) -> c_int {
     let here = here!("xmlSecDSigCtxProcessReferences");
     let list = &raw mut ctx.signed_info_references;
@@ -826,7 +831,7 @@ unsafe fn read_references(
                 errors::invalid_node(here, cur, "Reference", std::ptr::null());
                 return -1;
             }
-            if add_reference(ctx, list, (ORIGIN_SIGNED_INFO, max_references), cur).is_null() {
+            if add_reference(ctx, list, (ORIGIN_SIGNED_INFO, operation), cur).is_null() {
                 return -1;
             }
             cur = next_element(cur);
@@ -836,16 +841,16 @@ unsafe fn read_references(
 }
 
 /// A new reference context of `origin` for the `Reference` element `node`,
-/// added to `list` and read; null after a report. The operation's
-/// `max_references` bounds the contexts of `SignedInfo` and its Manifests
-/// together, checked before another is made.
+/// added to `list` and read under the operation's revision `pinned`; null
+/// after a report. The operation's `max_references` bounds the contexts of
+/// `SignedInfo` and its Manifests together, checked before another is made.
 ///
 /// # Safety
 /// `list` is one of the context's reference lists; `node` a live node.
 unsafe fn add_reference(
     ctx: &mut XmlSecDSigCtx,
     list: *mut super::XmlSecPtrList,
-    (origin, max_references): (c_int, usize),
+    (origin, (max_references, pinned)): (c_int, (usize, &Pinned)),
     node: *mut XmlNode,
 ) -> *mut XmlSecDSigReferenceCtx {
     let here = here!("xmlSecDSigCtxProcessReferences");
@@ -869,6 +874,10 @@ unsafe fn add_reference(
             xmlSecDSigReferenceCtxDestroy(reference);
             return std::ptr::null_mut();
         }
+        // The reference's chain is a part of the operation: a republish
+        // while the key was looked up, before the references are read, does
+        // not reach it.
+        super::super::transforms::ctx::pin_run(&raw mut (*reference).transform_ctx, pinned);
         if read_reference(&mut *reference, node).is_none() {
             errors::internal(
                 here,
@@ -1243,7 +1252,7 @@ unsafe fn run_verification(
         // SAFETY: by the contract of `run_verification`.
         let bytes = unsafe { read_pending(resource, doc, &mut scope) };
         spent.set(scope.spent);
-        exhausted.set(scope.limit_reached);
+        exhausted.set(scope.refused_by.is_some());
         bytes
     };
     let resources = LazyExternalResources::new(keys.iter().cloned(), &fetch);

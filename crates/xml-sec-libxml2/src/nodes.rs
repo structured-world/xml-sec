@@ -318,12 +318,24 @@ pub fn text<T>(node: *const T) -> Option<String> {
     .flatten()
 }
 
-/// `xmlNodeDumpOutput` unformatted: `node` and its subtree as XML text,
-/// with only the namespace declarations the nodes carry.
+/// `xmlNodeDumpOutput` unformatted with no encoding named: `node` and its
+/// subtree as UTF-8 XML text, with only the namespace declarations the nodes
+/// carry.
 #[must_use]
 pub fn dump<T>(node: *const T) -> Option<String> {
     let (document, node) = tree_node(node.cast())?;
     handles::read_document(document, |tree| tree.serialize_node(node).ok())
+        .ok()
+        .flatten()
+}
+
+/// [`dump`] as the node's text within its document's own dump, whose
+/// non-ASCII characters are references when the document declares no
+/// encoding: the octets the node takes in that dump.
+#[must_use]
+pub fn dump_in_document<T>(node: *const T) -> Option<String> {
+    let (document, node) = tree_node(node.cast())?;
+    handles::read_document(document, |tree| tree.serialize_node_in_document(node).ok())
         .ok()
         .flatten()
 }
@@ -779,22 +791,24 @@ pub fn parse_in_context(node: *const Node, bytes: &[u8]) -> Result<*mut Node, Fr
         .inspect_err(crate::document::record_error)
 }
 
-/// [`parse_in_context`] as a part of an operation: under `policy`, the
-/// snapshot the operation runs under, rather than the current library
-/// policy, and within what is left of its `max_xml_parse_work_bytes` after
-/// `spent`, to which the parse's work is added.
+/// [`parse_in_context`] for the place of `replaced`, in the context of its
+/// parent, as a part of an operation: under `policy`, the snapshot the
+/// operation runs under, rather than the current library policy, within what
+/// is left of its `max_xml_parse_work_bytes` after `spent`, to which the
+/// parse's work is added, and refused when the document with the nodes in
+/// place of `replaced` would pass its `max_xml_nodes`.
 ///
 /// # Errors
 /// As for [`parse_in_context`], an unavailable policy aside, or the core's
-/// refusal for the operation's parse work.
-pub fn parse_in_context_under(
-    node: *const Node,
+/// refusal for the operation's parse work or node limit.
+pub fn parse_replacing_under(
+    replaced: *const Node,
     bytes: &[u8],
     policy: &impl xml_sec::XmlDocumentPolicy,
     spent: &mut usize,
 ) -> Result<*mut Node, FragmentError> {
-    parse_fragment(node, bytes, |tree, context, fragment| {
-        tree.parse_in_context_within(context, fragment, policy, spent)
+    parse_fragment(replaced, bytes, |tree, replaced, fragment| {
+        tree.parse_replacing_within(replaced, fragment, policy, spent)
     })
     .inspect_err(crate::document::record_error)
 }

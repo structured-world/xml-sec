@@ -637,10 +637,10 @@ pub(crate) unsafe extern "C" fn xmlSecReplaceNodeBufferAndReturn(
         // SAFETY: handles are validated by each call; `buffer` holds `len`
         // bytes and `replaced` is writable by the caller's contract.
         unsafe {
-            replace_with_parsed(node, replaced, here, |parent| {
+            replace_with_parsed(node, replaced, here, |node| {
                 let mut results: *mut XmlNode = std::ptr::null_mut();
                 let parsed = xsParseInNodeContext(
-                    parent,
+                    nodes::parent(node),
                     buffer.cast(),
                     len,
                     xmlSecParserGetDefaultOptions(),
@@ -656,7 +656,9 @@ pub(crate) unsafe extern "C" fn xmlSecReplaceNodeBufferAndReturn(
 /// [`xmlSecReplaceNodeBufferAndReturn`] for an operation: `bytes` are
 /// parsed under `policy`, the snapshot the operation runs under, rather than
 /// the current library policy, within what is left of its
-/// `max_xml_parse_work_bytes` after `spent`, to which the parse is added.
+/// `max_xml_parse_work_bytes` after `spent`, to which the parse is added,
+/// and refused when the document they would leave in place of `node` passes
+/// its `max_xml_nodes`.
 ///
 /// # Safety
 /// `node` is a live node with a parent; `replaced` is null or writable.
@@ -670,15 +672,15 @@ pub(crate) unsafe fn replace_node_buffer_under(
     let here = here!("xmlSecReplaceNodeBufferAndReturn");
     // SAFETY: by the caller's contract.
     unsafe {
-        replace_with_parsed(node, replaced, here, |parent| {
-            xml_sec_libxml2::nodes::parse_in_context_under(parent, bytes, policy, spent).ok()
+        replace_with_parsed(node, replaced, here, |node| {
+            xml_sec_libxml2::nodes::parse_replacing_under(node, bytes, policy, spent).ok()
         })
     }
 }
 
-/// Replaces `node` with the run `parse` gives in the context of its parent,
-/// `None` when it refuses the bytes; the unlinked `node` goes to `replaced`,
-/// or is freed when it is null.
+/// Replaces `node` with the run `parse` gives for it, parsed in the context
+/// of its parent, `None` when it refuses the bytes; the unlinked `node` goes
+/// to `replaced`, or is freed when it is null.
 ///
 /// # Safety
 /// `node` is a live node with a parent; `replaced` is null or writable.
@@ -690,7 +692,7 @@ unsafe fn replace_with_parsed(
 ) -> c_int {
     // SAFETY: handles are validated by each call; by the caller's contract.
     unsafe {
-        let Some(results) = parse(nodes::parent(node)) else {
+        let Some(results) = parse(node) else {
             errors::xml_failed(here, std::ptr::null(), c"xmlParseInNodeContext");
             return -1;
         };

@@ -7,4 +7,7 @@
 
 pub mod xml;
 
-pub use xml::{SerializeOptions, serialize, serialize_subtree, serialize_with_options};
+pub use xml::{
+    SerializeOptions, serialize, serialize_subtree, serialize_subtree_in_document,
+    serialize_with_options,
+};

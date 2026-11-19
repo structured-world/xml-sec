@@ -2056,8 +2056,9 @@ impl<'p> DigestWriter<'p> {
             pending: 0,
             retained: retain.then(Vec::new),
             charge: match retention {
-                RetainedCharge::Every(charge) if retain => Some(charge),
-                _ => None,
+                #[cfg(feature = "xmldsig-sign")]
+                RetainedCharge::Uncanonicalized => None,
+                RetainedCharge::Every(charge) => retain.then_some(charge),
             },
             written: 0,
             failure: None,

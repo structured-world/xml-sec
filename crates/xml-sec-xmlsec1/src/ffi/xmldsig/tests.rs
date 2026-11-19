@@ -1028,7 +1028,10 @@ unsafe extern "C" fn refused_lookup(
     // SAFETY: the read context the operation passes.
     if let Some(spent) = unsafe { crate::ffi::policy::spent((*ctx).reserved0) } {
         spent.set(crate::ffi::policy::Spent {
-            limit_reached: true,
+            refused_by: Some(crate::ffi::transforms::ctx::Limit {
+                name: "max_external_resource_total_bytes",
+                max: 0,
+            }),
             ..spent.get()
         });
     }
@@ -1435,6 +1438,78 @@ fn the_kept_signed_info_is_canonicalized_under_the_operations_revision() {
             crate::ffi::buffer::xmlSecBufferGetSize(kept) > 16,
             "the whole SignedInfo was kept"
         );
+        xmlSecDSigCtxDestroy(ctx);
+        crate::ffi::keysmngr::xmlSecKeysMngrDestroy(mngr);
+        xsFreeDoc(doc);
+        assert_eq!(xmlSecCryptoShutdown(), 0);
+        assert_eq!(xmlSecCryptoAppShutdown(), 0);
+        assert_eq!(xmlSecShutdown(), 0);
+    }
+}
+
+/// A key manager's lookup that republishes snapshots admitting only
+/// SHA-512 digests while it answers, then hands back the HMAC key of
+/// [`TAMPERED`].
+unsafe extern "C" fn digest_narrowing_lookup(
+    node: *mut XmlNode,
+    ctx: *mut crate::ffi::keyinfo::XmlSecKeyInfoCtx,
+) -> *mut crate::ffi::keys::XmlSecKey {
+    let only_sha512 = || {
+        Some(std::collections::BTreeSet::from([
+            xml_sec::xmldsig::DigestAlgorithm::Sha512,
+        ]))
+    };
+    crate::ffi::policy::republish(
+        |verification| verification.digest_algorithms = only_sha512(),
+        |signing| signing.digest_algorithms = only_sha512(),
+    )
+    .expect("the library policy compiles");
+    // SAFETY: by this callback's contract.
+    unsafe { recording_lookup(node, ctx) }
+}
+
+#[test]
+fn references_read_after_the_key_keep_the_operations_revision() {
+    // The references are read after the key is looked up; a republish during
+    // that lookup, here one refusing their SHA-256 digest, takes effect for
+    // later operations, not for this one's references.
+    own_process();
+    let template = concat!(
+        "<Envelope xmlns=\"urn:envelope\"><Data Id=\"data\">payload</Data>",
+        "<Signature xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><SignedInfo>",
+        "<CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>",
+        "<SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#hmac-sha256\"/>",
+        "<Reference URI=\"#data\">",
+        "<DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>",
+        "<DigestValue/></Reference></SignedInfo><SignatureValue/>",
+        "</Signature></Envelope>"
+    );
+    // SAFETY: the library, a document, a manager and a context set up and
+    // torn down here, on this thread alone.
+    unsafe {
+        assert_eq!(xmlSecInit(), 0);
+        assert_eq!(xmlSecCryptoDLLoadLibrary(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoAppInit(std::ptr::null()), 0);
+        assert_eq!(xmlSecCryptoInit(), 0);
+        let doc = xsReadMemory(
+            template.as_ptr().cast(),
+            i32::try_from(template.len()).expect("a short document"),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        assert!(!doc.is_null());
+        let ids = [c"Id".as_ptr().cast::<u8>(), std::ptr::null()];
+        xmlSecAddIDs(doc, std::ptr::null_mut(), ids.as_ptr());
+        let signature = xmlSecFindNode(
+            xsDocGetRootElement(doc),
+            c"Signature".as_ptr().cast(),
+            c"http://www.w3.org/2000/09/xmldsig#".as_ptr().cast(),
+        );
+        let mngr = crate::ffi::keysmngr::xmlSecKeysMngrCreate();
+        (*mngr).get_key = Some(digest_narrowing_lookup);
+        let ctx = xmlSecDSigCtxCreate(mngr);
+        assert_eq!(xmlSecDSigCtxSign(ctx, signature), 0);
         xmlSecDSigCtxDestroy(ctx);
         crate::ffi::keysmngr::xmlSecKeysMngrDestroy(mngr);
         xsFreeDoc(doc);

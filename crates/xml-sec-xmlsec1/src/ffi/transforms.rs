@@ -852,6 +852,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformSetKey(
     contain(-1, || {
         let (_, klass) = valid_or!(transform, "xmlSecTransformSetKey", -1);
         check!(!key.is_null(), "xmlSecTransformSetKey", c"key != NULL", -1);
+        ctx::note_setting_change(transform);
         // SAFETY: the klass method keeps libxmlsec1's contract.
         klass
             .set_key

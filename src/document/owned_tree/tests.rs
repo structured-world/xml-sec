@@ -648,6 +648,31 @@ fn the_document_subset_gives_no_default_to_the_parse_wrapper() {
 }
 
 #[test]
+fn a_long_run_of_the_wrapper_letter_in_the_subset_is_handled_in_linear_time() {
+    // The wrapper's name must not occur in the subset; a subset holding a
+    // long run of its letter must not make finding one quadratic.
+    let mut policy = VerificationPolicy::default();
+    policy.xml.allow_internal_dtd = true;
+    let run = "w".repeat(200_000);
+    let xml = format!("<!DOCTYPE root [<!ENTITY e '{run}'>]><root/>");
+    let mut tree = OwnedTree::parse_with_policy(&xml, &policy).expect("the document parses");
+    let root = tree.root_element().expect("a document element");
+    let started = std::time::Instant::now();
+    let item = tree
+        .parse_in_context(root, "<item/>", &policy)
+        .expect("the fragment parses")
+        .expect("the fragment has nodes");
+    // A linear scan takes milliseconds; trying every longer name takes
+    // minutes at this size.
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(tree.namespace(item), Ok(None));
+}
+
+#[test]
 fn entity_expanded_markup_is_held_to_the_same_depth_as_direct_markup() {
     // A context at depth three under a depth limit of four leaves room for
     // one level: `<a><b/></a>` needs two, whether written directly or

@@ -511,7 +511,7 @@ unsafe extern "C" fn input_uri_pop_bin(
     // limits.
     let Some(left) = per_run.max.checked_sub(budget.external_resources) else {
         errors::limit_exceeded(here, name, per_run.name, per_run.max);
-        budget.resource_limit_reached = true;
+        budget.refused_by.get_or_insert(per_run);
         return -1;
     };
     let allowance = (per_resource.max - state.read).min(left);
@@ -537,10 +537,12 @@ unsafe extern "C" fn input_uri_pop_bin(
         );
         return -1;
     }
-    if charge(&mut state.read, got, per_resource, here, name).is_none()
-        || charge(&mut budget.external_resources, got, per_run, here, name).is_none()
-    {
-        budget.resource_limit_reached = true;
+    if charge(&mut state.read, got, per_resource, here, name).is_none() {
+        budget.refused_by.get_or_insert(per_resource);
+        return -1;
+    }
+    if charge(&mut budget.external_resources, got, per_run, here, name).is_none() {
+        budget.refused_by.get_or_insert(per_run);
         return -1;
     }
     // SAFETY: `size` is writable.

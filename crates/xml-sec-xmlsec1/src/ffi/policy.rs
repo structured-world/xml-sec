@@ -142,9 +142,9 @@ pub(crate) struct Spent {
     pub(crate) xml_parse: usize,
     /// `XPath` expressions evaluated, of `max_xpath_expressions`.
     pub(crate) xpath_expressions: usize,
-    /// A resource limit refused work of the operation: its budget is spent,
+    /// The limit that refused work of the operation: its budget is spent,
     /// so the operation ends wherever its parts hand it back.
-    pub(crate) limit_reached: bool,
+    pub(crate) refused_by: Option<super::transforms::ctx::Limit>,
     /// Whether the keys the operation recovered were recovered validly,
     /// consulted only once its content work is done.
     pub(crate) recovery: xml_sec::provider::RecoveryValidity,

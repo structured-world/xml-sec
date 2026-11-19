@@ -162,19 +162,21 @@ unsafe fn encrypt_bytes(ctx: &mut XmlSecEncCtx, data: &[u8], here: errors::Here)
 /// Whether the document an encryption leaves fits the operation's
 /// `max_xml_document_bytes`, as the core admits the document it writes,
 /// after a report at `here`. The written template is that document when it
-/// stands alone, or a part of its document when linked into it; when it is
-/// to take the place of `replaced` octets of written XML, those leave the
-/// document as the template enters it.
+/// stands alone, or a part of its document when linked into it. When it is
+/// to take the place of a node of `replaced` octets of written XML, the
+/// document left is the node's: those octets leave it and the template's
+/// enter it, unless the template is already a part of its text.
 ///
 /// # Safety
-/// `tmpl` is a live node written by the context's encryption.
+/// `tmpl` is a live node written by the context's encryption; a replaced
+/// node is live.
 unsafe fn admit_document(
     ctx: &mut XmlSecEncCtx,
     tmpl: *mut XmlNode,
-    replaced: Option<usize>,
+    replacing: Option<(*mut XmlNode, usize)>,
     here: errors::Here,
 ) -> bool {
-    // SAFETY: the context's own transform context and a live node.
+    // SAFETY: the context's own transform context and live nodes.
     let (pinned, linked, doc) = unsafe {
         let Some(pinned) = run_policy(&raw mut ctx.transform_ctx, here) else {
             return false;
@@ -182,18 +184,23 @@ unsafe fn admit_document(
         (pinned, !nodes::parent(tmpl).is_null(), xsNodeGetDoc(tmpl))
     };
     let length = |node: *const XmlNode| nodes::dump(node).map(|xml| xml.len());
-    let size = match (replaced, linked) {
-        (None, false) => length(tmpl),
-        (None, true) => length(doc.cast()),
-        // A written node is a part of its document's text, so its octets
-        // never exceed the document's.
-        (Some(replaced), true) => {
-            length(doc.cast()).and_then(|document| document.checked_sub(replaced))
+    let size = match replacing {
+        None if linked => length(doc.cast()),
+        None => length(tmpl),
+        Some((node, replaced)) => {
+            // SAFETY: a live node.
+            let destination = unsafe { xsNodeGetDoc(node) };
+            // A written node is a part of its document's text, so its octets
+            // never exceed the document's.
+            let rest =
+                length(destination.cast()).and_then(|document| document.checked_sub(replaced));
+            if linked && doc == destination {
+                rest
+            } else {
+                rest.zip(length(tmpl))
+                    .and_then(|(rest, template)| rest.checked_add(template))
+            }
         }
-        (Some(replaced), false) => length(doc.cast())
-            .and_then(|document| document.checked_sub(replaced))
-            .zip(length(tmpl))
-            .and_then(|(rest, template)| rest.checked_add(template)),
     };
     let Some(size) = size else {
         errors::xml_failed(here, std::ptr::null(), c"xmlNodeDumpOutput");
@@ -298,12 +305,29 @@ pub(super) unsafe fn xml_encrypt(
             }
             text
         };
-        let Some(text) = text else {
+        // The plaintext is UTF-8, as xmlNodeDumpOutput writes it with no
+        // encoding named; what leaves the document is the node's text as the
+        // document's own dump writes it, character references included.
+        let replaced = if element {
+            nodes::dump_in_document(node).map(|xml| xml.len())
+        } else {
+            let mut total = Some(0_usize);
+            let mut child = xsNodeGetChildren(node);
+            while !child.is_null()
+                && let Some(sum) = total
+            {
+                // At most the document's length.
+                total = nodes::dump_in_document(child).map(|xml| sum + xml.len());
+                child = nodes::next(child);
+            }
+            total
+        };
+        let (Some(text), Some(replaced)) = (text, replaced) else {
             errors::xml_failed(here, std::ptr::null(), c"xmlNodeDumpOutput");
             return -1;
         };
         if encrypt_bytes(ctx, text.as_bytes(), here) < 0
-            || !admit_document(ctx, tmpl, Some(text.len()), here)
+            || !admit_document(ctx, tmpl, Some((node, replaced)), here)
         {
             return -1;
         }
@@ -1173,27 +1197,36 @@ unsafe fn cipher_reference_resources(
 /// from it; the core ran within what the operation left, so the sum stays
 /// within the policy's maximum. A key recovered by RSAES-PKCS1-v1_5 may be
 /// the random substitute of a rejected recovery, whose validity is consulted
-/// only now, after the content work, so the outcome reveals nothing of the
-/// padding (XML Encryption 1.1 section 6.1.2): `None` for a rejected one.
+/// only now, after the content work: whatever that work yielded, a rejected
+/// recovery fails as a wrong key's content work does, as the core's own
+/// decryption fails it, so the outcome reveals nothing of the padding (XML
+/// Encryption 1.1 sections 6.1.2 and 6.7).
 ///
 /// # Safety
 /// `transforms` is an initialized context.
 unsafe fn settle_decryption(
     transforms: *mut super::super::transforms::ctx::XmlSecTransformCtx,
+    algorithm: DataEncryptionAlgorithm,
     decrypted: Result<
         (xml_sec::policy::Audited<DecryptedContent>, usize),
         xml_sec::xmlenc::XmlEncError,
     >,
-) -> Option<Result<xml_sec::policy::Audited<DecryptedContent>, xml_sec::xmlenc::XmlEncError>> {
+) -> Result<xml_sec::policy::Audited<DecryptedContent>, xml_sec::xmlenc::XmlEncError> {
     // SAFETY: by the caller's contract.
     let run = unsafe { run_budget(transforms) };
-    match decrypted {
-        Ok((audited, spent)) => {
-            run.xml_parse += spent;
-            run.recovery.is_valid().then_some(Ok(audited))
-        }
-        Err(error) => Some(Err(error)),
+    if let Ok((_, spent)) = &decrypted {
+        run.xml_parse += spent;
     }
+    if !run.recovery.is_valid() {
+        if let Ok((audited, _)) = decrypted {
+            match audited.output {
+                DecryptedContent::Xml(text) => drop(Zeroizing::new(text)),
+                DecryptedContent::Bytes(bytes) => drop(Zeroizing::new(bytes)),
+            }
+        }
+        return Err(xml_sec::xmlenc::XmlEncError::rejected_recovery(algorithm));
+    }
+    decrypted.map(|(audited, _)| audited)
 }
 
 /// Runs the core decryption of the `EncryptedData` element `node` and makes
@@ -1272,17 +1305,7 @@ unsafe fn run_decryption(ctx: &mut XmlSecEncCtx, node: *mut XmlNode) -> *mut Xml
     }
     let decrypted = context.decrypt_in_document_counting_parse_work(&document, target);
     // SAFETY: the context's own transform context.
-    let Some(decrypted) = (unsafe { settle_decryption(&raw mut ctx.transform_ctx, decrypted) })
-    else {
-        errors::report(
-            here,
-            std::ptr::null(),
-            std::ptr::null(),
-            errors::R_CRYPTO_FAILED,
-            "content decryption failed",
-        );
-        return std::ptr::null_mut();
-    };
+    let decrypted = unsafe { settle_decryption(&raw mut ctx.transform_ctx, algorithm, decrypted) };
     let plaintext = match decrypted.map(|audited| audited.output) {
         Ok(DecryptedContent::Xml(text)) => Zeroizing::new(text.into_bytes()),
         Ok(DecryptedContent::Bytes(bytes)) => Zeroizing::new(bytes),

@@ -459,7 +459,7 @@ unsafe fn base64_step(
             };
             if charge(&mut budget.base64_input, in_size, limit, here, name).is_none() {
                 // The operation's budget is spent: its other parts end too.
-                budget.resource_limit_reached = true;
+                budget.refused_by.get_or_insert(limit);
                 return None;
             }
             let reserve = if (*codec).encode != 0 {
@@ -511,7 +511,9 @@ unsafe fn base64_step(
         };
         let produced = xmlSecBufferGetSize(output) - before;
         let charged = charge(&mut budget.base64_output, produced, limit, here, name);
-        budget.resource_limit_reached |= charged.is_none();
+        if charged.is_none() {
+            budget.refused_by.get_or_insert(limit);
+        }
         charged
     }
 }

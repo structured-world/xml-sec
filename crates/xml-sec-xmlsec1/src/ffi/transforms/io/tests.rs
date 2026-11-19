@@ -204,9 +204,16 @@ fn reads_of_one_operation_share_its_total_allowance() {
     });
     let mut scope = ResourceScope::new(&pinned, policy::Side::Verify, policy::Spent::default());
     assert_eq!(read_for(&mut scope, 16), Some(16));
-    assert!(!scope.limit_reached);
+    assert_eq!(scope.refused_by, None);
     assert_eq!(read_for(&mut scope, 16), None);
-    assert!(scope.limit_reached, "the refusal is the limit's");
+    assert_eq!(
+        scope.refused_by,
+        Some(crate::ffi::transforms::ctx::Limit {
+            name: "max_external_resource_total_bytes",
+            max: 24,
+        }),
+        "the refusal is the total's"
+    );
 }
 
 /// A read runs under the revision its operation pinned: a republish after
@@ -255,5 +262,5 @@ fn a_decryption_read_is_refused_before_a_callback_opens_it() {
     let mut scope = ResourceScope::new(&pinned, policy::Side::Decrypt, policy::Spent::default());
     assert_eq!(read_for(&mut scope, 16), None);
     assert_eq!(OPENED.load(Ordering::Relaxed), 0);
-    assert!(!scope.limit_reached, "a URI class refusal is no limit's");
+    assert_eq!(scope.refused_by, None, "a URI class refusal is no limit's");
 }

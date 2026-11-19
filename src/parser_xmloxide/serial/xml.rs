@@ -140,12 +140,35 @@ pub fn serialize_with_options(doc: &Document, options: &SerializeOptions) -> Str
 }
 
 /// Serializes the node `id` and its subtree as libxml2's `xmlNodeDumpOutput`
-/// writes it unformatted: no XML declaration, and only the namespace
-/// declarations the nodes themselves carry. The document node is written as
-/// the whole document, declaration included, as `xmlNodeDumpOutput` writes it
-/// through `xmlDocContentDumpOutput`.
+/// writes it unformatted with no encoding named: UTF-8, no XML declaration,
+/// and only the namespace declarations the nodes themselves carry. The
+/// document node is written as the whole document, declaration included, as
+/// `xmlNodeDumpOutput` writes it through `xmlDocContentDumpOutput`.
+///
+/// `id` must be a node of `doc`: an id of another document that falls within
+/// this one's arena names one of its nodes instead.
+///
+/// # Panics
+///
+/// Panics if `id` is out of range for `doc`, as [`Document::node`] does.
 #[must_use]
 pub fn serialize_subtree(doc: &Document, id: NodeId) -> String {
+    serialize_subtree_reencoding(doc, id, false)
+}
+
+/// [`serialize_subtree`] as the node's text within [`serialize`] of its
+/// document: non-ASCII characters are character references when the
+/// document declares no encoding, as there.
+///
+/// # Panics
+///
+/// As for [`serialize_subtree`].
+#[must_use]
+pub fn serialize_subtree_in_document(doc: &Document, id: NodeId) -> String {
+    serialize_subtree_reencoding(doc, id, doc.encoding.is_none())
+}
+
+fn serialize_subtree_reencoding(doc: &Document, id: NodeId, reencode_non_ascii: bool) -> String {
     if id == doc.root() {
         return serialize(doc);
     }
@@ -154,7 +177,7 @@ pub fn serialize_subtree(doc: &Document, id: NodeId) -> String {
         doc,
         id,
         &mut output,
-        doc.encoding.is_none(),
+        reencode_non_ascii,
         &SerializeOptions::default(),
         0,
         false,

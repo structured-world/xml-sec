@@ -91,7 +91,9 @@ unsafe extern "C" fn record(
 fn gcm_refuses_a_tampered_cipher_value() {
     // The untouched value decrypts under the same key and setup, so the
     // refusal of the changed tag is GCM's authentication failing, reported
-    // as a cryptographic failure, not a broken fixture.
+    // as a cryptographic failure, not a broken fixture. The error callback is
+    // process-wide.
+    crate::ffi::tests::own_process();
     let key = aes_key(&[0x22; 32]);
     let mut encrypted = run(aes256_gcm(), OPERATION_ENCRYPT, key, b"payload").expect("encrypts");
     assert_eq!(
@@ -122,6 +124,7 @@ fn decryption_refuses_plaintext_beyond_the_policy_limit() {
     // A GCM value adds 28 octets of nonce and tag, inside the input framing
     // allowance, so only a check of the recovered plaintext keeps one octet
     // over the limit out. Republishing runs in this test's own process.
+    crate::ffi::tests::own_process();
     let key = aes_key(&[0x44; 16]);
     let encrypted = run(aes128_gcm(), OPERATION_ENCRYPT, key, &[0x55; 17]).expect("encrypts");
     xml_sec_libxml2::policy::republish_encryption(

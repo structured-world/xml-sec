@@ -345,16 +345,65 @@ fn admit(
     }
 }
 
+/// Moves the octets of the input buffer of `object` onto `data` within
+/// `limit`: plaintext is bounded by it, a cipher value also by its framing
+/// (an IV or nonce, padding or a tag). `None` after a report at `here`; a
+/// refusal by the limit is recorded in `refused_by`.
+fn take_input(
+    object: &mut XmlSecTransform,
+    data: &mut Vec<u8>,
+    (limit, refused_by): (super::ctx::Limit, &mut Option<super::ctx::Limit>),
+    here: Here,
+) -> Option<()> {
+    let name = name_of(object);
+    let input = &raw mut object.in_buf;
+    // SAFETY: the transform's own input buffer.
+    unsafe {
+        let size = xmlSecBufferGetSize(input);
+        if size == 0 {
+            return Some(());
+        }
+        let ceiling = if object.operation == OPERATION_ENCRYPT {
+            Some(limit.max)
+        } else {
+            limit.max.checked_add(CIPHER_FRAMING)
+        };
+        if data
+            .len()
+            .checked_add(size)
+            .zip(ceiling)
+            .is_none_or(|(total, ceiling)| total > ceiling)
+        {
+            errors::limit_exceeded(here, name, limit.name, limit.max);
+            refused_by.get_or_insert(limit);
+            return None;
+        }
+        data.extend_from_slice(std::slice::from_raw_parts(xmlSecBufferGetData(input), size));
+        if xmlSecBufferRemoveHead(input, size) < 0 {
+            errors::internal_with(
+                here,
+                name,
+                c"xmlSecBufferRemoveHead",
+                &format!("size={size}"),
+            );
+            return None;
+        }
+    }
+    Some(())
+}
+
 /// Collects the input buffer; on the `last` chunk encrypts or decrypts it.
+/// A size refusal is recorded in `refused_by`, the run's: the operation's
+/// plaintext allowance is spent, which ends the operation, as a resource
+/// limit does, rather than one recipient.
 fn collect(
     object: &mut XmlSecTransform,
     method: Method,
     cipher: &mut Cipher,
-    last: bool,
+    (last, refused_by): (bool, &mut Option<super::ctx::Limit>),
     here: Here,
 ) -> c_int {
     let name = name_of(object);
-    let input = &raw mut object.in_buf;
     let Some(pinned) = cipher.policy.as_ref() else {
         errors::assertion(here, c"ctx->policy != NULL");
         return -1;
@@ -372,40 +421,12 @@ fn collect(
             return -1;
         }
     };
-    // SAFETY: the transform's own input buffer.
-    unsafe {
-        let size = xmlSecBufferGetSize(input);
-        if size > 0 {
-            // Plaintext is bounded by the ceiling; a cipher value also by
-            // its framing (an IV or nonce, padding or a tag).
-            let ceiling = if object.operation == OPERATION_ENCRYPT {
-                Some(maximum)
-            } else {
-                maximum.checked_add(CIPHER_FRAMING)
-            };
-            if cipher
-                .data
-                .len()
-                .checked_add(size)
-                .zip(ceiling)
-                .is_none_or(|(total, ceiling)| total > ceiling)
-            {
-                errors::limit_exceeded(here, name, "max_encryption_plaintext_bytes", maximum);
-                return -1;
-            }
-            cipher
-                .data
-                .extend_from_slice(std::slice::from_raw_parts(xmlSecBufferGetData(input), size));
-            if xmlSecBufferRemoveHead(input, size) < 0 {
-                errors::internal_with(
-                    here,
-                    name,
-                    c"xmlSecBufferRemoveHead",
-                    &format!("size={size}"),
-                );
-                return -1;
-            }
-        }
+    let limit = super::ctx::Limit {
+        name: "max_encryption_plaintext_bytes",
+        max: maximum,
+    };
+    if take_input(object, &mut cipher.data, (limit, &mut *refused_by), here).is_none() {
+        return -1;
     }
     if !last {
         return 0;
@@ -439,7 +460,8 @@ fn collect(
     };
     // The input allowance covers the framing, not the plaintext it frames.
     if !encrypting && output.len() > maximum {
-        errors::limit_exceeded(here, name, "max_encryption_plaintext_bytes", maximum);
+        errors::limit_exceeded(here, name, limit.name, limit.max);
+        refused_by.get_or_insert(limit);
         return -1;
     }
     // SAFETY: the transform's own output buffer.
@@ -490,7 +512,11 @@ unsafe extern "C" fn execute(
             object.status = STATUS_WORKING;
         }
         match object.status {
-            STATUS_WORKING => collect(object, algorithm, cipher, last != 0, here),
+            STATUS_WORKING => {
+                // SAFETY: as above.
+                let refused_by = unsafe { &mut super::ctx::run_budget(ctx).refused_by };
+                collect(object, algorithm, cipher, (last != 0, refused_by), here)
+            }
             STATUS_FINISHED => {
                 // SAFETY: the transform's own input buffer.
                 if unsafe { xmlSecBufferGetSize(&raw mut object.in_buf) } != 0 {
