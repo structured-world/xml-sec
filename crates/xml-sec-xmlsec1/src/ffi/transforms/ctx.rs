@@ -95,6 +95,9 @@ pub(crate) struct RunBudget {
     /// Whether the keys the run's transports recovered were recovered
     /// validly, consulted only once the operation's content work is done.
     pub(crate) recovery: xml_sec::provider::RecoveryValidity,
+    /// The side of the operation that uses the keys the run's transports
+    /// recover, handed down by the `KeyInfo` read that runs the chain.
+    pub(crate) serves: Option<policy::Side>,
     /// The key candidates the operation's `KeyInfo` work has inspected, of
     /// `max_key_candidates`, carried from one `KeyInfo` read to the next.
     pub(crate) key_candidates: policy::KeyCandidates,
@@ -241,6 +244,7 @@ pub(crate) unsafe fn run_spent(ctx: *mut XmlSecTransformCtx) -> policy::Spent {
             xpath_expressions: run.xpath_expressions,
             refused_by: run.refused_by,
             recovery: run.recovery,
+            serves: run.serves,
         },
         None => policy::Spent::default(),
     }
@@ -392,6 +396,7 @@ pub(crate) unsafe fn take_spent(ctx: *mut XmlSecTransformCtx, spent: policy::Spe
     // part yields, a failed recipient's being dropped where it is tried.
     run.refused_by = run.refused_by.or(spent.refused_by);
     run.recovery = run.recovery.and(spent.recovery);
+    run.serves = run.serves.or(spent.serves);
 }
 
 /// What the operation whose chain is `ctx` has spent of its external-resource

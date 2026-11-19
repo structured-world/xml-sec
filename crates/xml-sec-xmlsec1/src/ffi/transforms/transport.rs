@@ -58,6 +58,10 @@ struct Transport {
     /// `EncryptedKey` requires, taken when the run starts.
     #[cfg(feature = "legacy-algorithms")]
     expected: Option<usize>,
+    /// The side of the operation the recovered key serves, taken when the
+    /// run starts.
+    #[cfg(feature = "legacy-algorithms")]
+    serves: Option<policy::Side>,
 }
 
 #[cfg(test)]
@@ -197,6 +201,8 @@ unsafe extern "C" fn initialize(transform: *mut XmlSecTransform) -> c_int {
                 policy: None,
                 #[cfg(feature = "legacy-algorithms")]
                 expected: None,
+                #[cfg(feature = "legacy-algorithms")]
+                serves: None,
             });
         }
         0
@@ -396,6 +402,11 @@ fn parameters(
 /// yields a random key of that width rather than an error, so the result
 /// never reveals padding validity (XML Encryption 1.1 section 6.1.2). A chain
 /// run outside a `KeyInfo` has no expected width and is refused.
+///
+/// Only a decryption consults that validity once its content work is done; a
+/// signature or an encryption made with the key would show it (a random key
+/// changes the output on every repeat), so a key serving either is refused
+/// before anything is recovered, whatever the padding.
 /// <https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-bleichenbacher-attack>
 #[cfg(feature = "legacy-algorithms")]
 fn recover_pkcs1v15(
@@ -403,6 +414,14 @@ fn recover_pkcs1v15(
     transport: &Transport,
     policy: &xml_sec::policy::DecryptionPolicy,
 ) -> Result<(Zeroizing<Vec<u8>>, RecoveryValidity), String> {
+    if matches!(
+        transport.serves,
+        Some(policy::Side::Sign | policy::Side::Encrypt)
+    ) {
+        return Err(
+            "an RSAES-PKCS1-v1_5 recovery yields no key for signing or encrypting".to_owned(),
+        );
+    }
     let expected = transport.expected.ok_or(
         "RSAES-PKCS1-v1_5 recovery needs the key width the EncryptedKey's consumer requires",
     )?;
@@ -540,6 +559,8 @@ unsafe extern "C" fn execute(
             {
                 // SAFETY: a non-null, initialized context.
                 transport.expected = unsafe { expected_width(ctx) };
+                // SAFETY: as above.
+                transport.serves = unsafe { super::ctx::run_budget(ctx) }.serves;
             }
             object.status = STATUS_WORKING;
         }

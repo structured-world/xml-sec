@@ -785,33 +785,9 @@ fn a_rejected_key_recovery_fails_as_a_wrong_key_does() {
     // released here, on this thread alone.
     unsafe {
         start_up();
-        let (cipher, _) = encrypted(aes128_cbc(), b"decrypted with a substitute");
-        let doc = parsed(&format!(
-            "{}{cipher}{}",
-            concat!(
-                "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\">",
-                "<EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#aes128-cbc\"/>",
-                "<CipherData><CipherValue>",
-            ),
-            "</CipherValue></CipherData></EncryptedData>"
-        ));
-        let rejected = || {
-            xml_sec::provider::RecoveredContentKey::recovery(
-                zeroize::Zeroizing::new(vec![0; 16]),
-                subtle::Choice::from(0),
-            )
-            .into_key_with_validity()
-            .expect("an exportable recovery")
-            .1
-        };
-        let mut outcomes = Vec::new();
-        for (validity, key) in [
-            // A wrong key: its content work fails the padding check.
-            (xml_sec::provider::RecoveryValidity::accepted(), [0x11; 16]),
-            // Substitutes whose content work fails and passes the check.
-            (rejected(), [0x11; 16]),
-            (rejected(), [0x5a; 16]),
-        ] {
+        let decrypt = |doc: *mut crate::ffi::tree::XmlDoc,
+                       validity: xml_sec::provider::RecoveryValidity,
+                       key: [u8; 16]| {
             let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
             (*ctx).enc_key = aes_key_of(key);
             crate::ffi::transforms::ctx::run_budget(&raw mut (*ctx).transform_ctx).recovery =
@@ -822,9 +798,49 @@ fn a_rejected_key_recovery_fails_as_a_wrong_key_does() {
                     xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc.cast()),
                 )
             });
-            assert!(result.is_null(), "{reasons:?}");
-            outcomes.push(reasons);
             xmlSecEncCtxDestroy(ctx);
+            (result.is_null(), reasons)
+        };
+        // A wrong key: its content work fails the padding check. The IV is
+        // random and the check reads the last octet alone, so a wrong key
+        // passes it for about one ciphertext in sixteen; such a ciphertext is
+        // drawn again.
+        let (doc, wrong) = loop {
+            let (cipher, _) = encrypted(aes128_cbc(), b"decrypted with a substitute");
+            let doc = parsed(&format!(
+                "{}{cipher}{}",
+                concat!(
+                    "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\">",
+                    "<EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#aes128-cbc\"/>",
+                    "<CipherData><CipherValue>",
+                ),
+                "</CipherValue></CipherData></EncryptedData>"
+            ));
+            let (failed, reasons) = decrypt(
+                doc,
+                xml_sec::provider::RecoveryValidity::accepted(),
+                [0x11; 16],
+            );
+            if failed {
+                break (doc, reasons);
+            }
+            xsFreeDoc(doc.cast());
+        };
+        let rejected = || {
+            xml_sec::provider::RecoveredContentKey::recovery(
+                zeroize::Zeroizing::new(vec![0; 16]),
+                subtle::Choice::from(0),
+            )
+            .into_key_with_validity()
+            .expect("an exportable recovery")
+            .1
+        };
+        let mut outcomes = vec![wrong];
+        // Substitutes whose content work fails and passes the check.
+        for key in [[0x11; 16], [0x5a; 16]] {
+            let (failed, reasons) = decrypt(doc, rejected(), key);
+            assert!(failed, "{reasons:?}");
+            outcomes.push(reasons);
         }
         assert_eq!(
             outcomes[0].first(),
@@ -2836,6 +2852,138 @@ fn encryption_reads_its_oaep_label_under_the_encryption_policy() {
         assert_eq!(xmlSecCryptoShutdown(), 0);
         assert_eq!(xmlSecCryptoAppShutdown(), 0);
         assert_eq!(xmlSecShutdown(), 0);
+    }
+}
+
+/// A key manager's lookup that hands back the RSA fixture key for an element
+/// without a `KeyInfo` and reads the `KeyInfo` of any other.
+#[cfg(feature = "legacy-algorithms")]
+unsafe extern "C" fn rsa_or_read(node: *mut XmlNode, ctx: *mut XmlSecKeyInfoCtx) -> *mut XmlSecKey {
+    if node.is_null() {
+        let pem = include_bytes!("../../../../../tests/fixtures/keys/rsa/rsa-2048-key.pem");
+        // SAFETY: a PEM buffer of the given length; the caller owns the key.
+        return unsafe {
+            crate::ffi::app::key_load_memory(
+                pem.as_ptr(),
+                pem.len(),
+                2,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        }
+        .cast();
+    }
+    // SAFETY: the operation's node and read context.
+    unsafe { crate::ffi::keysmngr::xmlSecKeysMngrGetKey(node, ctx) }
+}
+
+#[cfg(feature = "legacy-algorithms")]
+#[test]
+fn an_rsa_1_5_key_is_not_recovered_for_signing_or_encrypting() {
+    // A rejected RSAES-PKCS1-v1_5 recovery yields a fresh random key; only a
+    // decryption consults its validity once its content work is done. A
+    // signature or an encryption made with the key would show whether the
+    // padding was accepted (equal results on repeat, or not), so the signing
+    // and encrypting side refuses the method outright, whatever the padding.
+    own_process();
+    let pem = include_bytes!("../../../../../tests/fixtures/keys/rsa/rsa-2048-key.pem");
+    // SAFETY: the library, documents, contexts and a key set up and released
+    // here, on this thread alone.
+    unsafe {
+        start_up();
+        let key = crate::ffi::app::key_load_memory(
+            pem.as_ptr(),
+            pem.len(),
+            2,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        assert!(!key.is_null(), "the fixture loads");
+        let source = xsNewDoc(c"1.0".as_ptr().cast());
+        let tmpl = xmlSecTmplEncDataCreate(
+            source,
+            crate::ffi::transforms::transport::rsa_pkcs1(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+        xsDocSetRootElement(source, tmpl);
+        let cipher_value = xmlSecTmplEncDataEnsureCipherValue(tmpl);
+        let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
+        (*ctx).enc_key = key.cast();
+        assert_eq!(
+            xmlSecEncCtxBinaryEncrypt(ctx, tmpl, [0x5a_u8; 16].as_ptr(), 16),
+            0
+        );
+        (*ctx).enc_key = std::ptr::null_mut();
+        xmlSecEncCtxDestroy(ctx);
+        let text = xml_sec_libxml2::ffi::tree::xsNodeGetContent(cipher_value.cast());
+        let value = std::ffi::CStr::from_ptr(text.cast())
+            .to_string_lossy()
+            .into_owned();
+        crate::ffi::free(text.cast());
+        xsFreeDoc(source);
+        crate::ffi::keys::xmlSecKeyDestroy(key.cast());
+        let doc = parsed(&format!(
+            "{}{value}{}",
+            concat!(
+                "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\">",
+                "<EncryptedKey xmlns=\"http://www.w3.org/2001/04/xmlenc#\">",
+                "<EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#rsa-1_5\"/>",
+                "<CipherData><CipherValue>",
+            ),
+            "</CipherValue></CipherData></EncryptedKey></KeyInfo>"
+        ));
+        let mngr = xmlSecKeysMngrCreate();
+        (*mngr).get_key = Some(rsa_or_read);
+        for (operation, recovered) in [
+            (crate::ffi::transforms::OPERATION_DECRYPT, true),
+            (crate::ffi::transforms::OPERATION_SIGN, false),
+            (crate::ffi::transforms::OPERATION_ENCRYPT, false),
+        ] {
+            let read = crate::ffi::keyinfo::xmlSecKeyInfoCtxCreate(mngr);
+            (*read).operation = operation;
+            (*read).key_req.key_id = symkeys::hmac();
+            (*read).key_req.key_bits_size = 128;
+            let key = xmlSecKeyCreate();
+            let (status, reasons) = reported(|| {
+                crate::ffi::keyinfo::xmlSecKeyInfoNodeRead(
+                    xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc.cast()),
+                    key,
+                    read,
+                )
+            });
+            assert_eq!(status, 0, "operation {operation}: {reasons:?}");
+            let value = crate::ffi::keys::xmlSecKeyGetValue(key);
+            assert_eq!(
+                !value.is_null(),
+                recovered,
+                "operation {operation}: {reasons:?}"
+            );
+            if recovered {
+                let buffer = crate::ffi::keysdata::xmlSecKeyDataBinaryValueGetBuffer(value);
+                assert_eq!(
+                    std::slice::from_raw_parts(
+                        xmlSecBufferGetData(buffer),
+                        xmlSecBufferGetSize(buffer)
+                    ),
+                    [0x5a_u8; 16]
+                );
+            } else {
+                assert!(
+                    reasons.contains(&crate::ffi::errors::R_CRYPTO_FAILED),
+                    "operation {operation}: {reasons:?}"
+                );
+            }
+            crate::ffi::keys::xmlSecKeyDestroy(key);
+            crate::ffi::keyinfo::xmlSecKeyInfoCtxDestroy(read);
+        }
+        xmlSecKeysMngrDestroy(mngr);
+        xsFreeDoc(doc.cast());
+        shut_down();
     }
 }
 

@@ -171,6 +171,9 @@ pub(crate) struct Spent {
     /// Whether the keys the operation recovered were recovered validly,
     /// consulted only once its content work is done.
     pub(crate) recovery: xml_sec::provider::RecoveryValidity,
+    /// The side of the operation that uses the keys its `KeyInfo` reads
+    /// find, fixed by its outermost read and handed to nested ones.
+    pub(crate) serves: Option<Side>,
 }
 
 /// The key candidates one `KeyInfo` read has inspected of the policy's

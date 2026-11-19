@@ -547,7 +547,10 @@ pub(super) unsafe fn within_key_info(
     unsafe {
         let transforms = &raw mut (*enc).transform_ctx;
         let slot = (*ctx).reserved0;
-        let before = policy::spent(slot).map_or_default(std::cell::Cell::get);
+        let mut before = policy::spent(slot).map_or_default(std::cell::Cell::get);
+        // The outermost read names the operation its keys serve; a nested
+        // read's own operation is the decryption recovering a key for it.
+        before.serves = before.serves.or(operation_side((*ctx).operation));
         if let Some(pinned) = policy::pinned(slot) {
             let side = operation_side((*enc).operation).unwrap_or(policy::Side::Verify);
             seed_run(transforms, pinned, side, None, before);
