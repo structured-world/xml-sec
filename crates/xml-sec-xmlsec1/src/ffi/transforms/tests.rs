@@ -572,12 +572,18 @@ fn an_encryption_chain_refuses_the_relationship_transform() {
         let selection =
             crate::ffi::nodeset::xmlSecNodeSetGetChildren(doc, nodes::first_child(doc), 0, 0);
         let ctx = xmlSecTransformCtxCreate();
+        assert!(!ctx.is_null(), "the transform context is created");
         let transform = xmlSecTransformCtxCreateAndAppend(ctx, super::relationship::relationship());
+        assert!(
+            !transform.is_null(),
+            "the Relationship transform is appended"
+        );
         let read = (*super::relationship::relationship())
             .read_node
             .expect("the klass reads its node");
         assert_eq!(read(transform, nodes::first_child(template), ctx), 0);
         let cipher = xmlSecTransformCtxCreateAndAppend(ctx, super::ciphers::aes128_cbc());
+        assert!(!cipher.is_null(), "the cipher is appended");
         (*cipher).operation = super::OPERATION_ENCRYPT;
         let info = crate::ffi::keyinfo::xmlSecKeyInfoCtxCreate(std::ptr::null_mut());
         let key = crate::ffi::keys::xmlSecKeyCreate();

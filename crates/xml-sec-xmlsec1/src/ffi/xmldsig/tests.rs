@@ -840,6 +840,9 @@ fn a_retried_operation_runs_under_the_revision_it_begins_with() {
             c"Object".as_ptr().cast(),
             c"http://www.w3.org/2000/09/xmldsig#".as_ptr().cast(),
         );
+        // A live node that is not a Signature: the refused call reaches the
+        // point where it pins the revision.
+        assert!(!object.is_null(), "the Object is found");
         minimum(512);
         let ctx = xmlSecDSigCtxCreate(std::ptr::null_mut());
         (*ctx).sign_key = hmac_key(ctx);
@@ -847,6 +850,7 @@ fn a_retried_operation_runs_under_the_revision_it_begins_with() {
         minimum(256);
         let (status, reasons) = reported(|| xmlSecDSigCtxSign(ctx, signature));
         assert_eq!(status, 0, "{reasons:?}");
+        assert_eq!((*ctx).status, STATUS_SUCCEEDED);
         xmlSecDSigCtxDestroy(ctx);
         xsFreeDoc(doc);
         assert_eq!(xmlSecCryptoShutdown(), 0);

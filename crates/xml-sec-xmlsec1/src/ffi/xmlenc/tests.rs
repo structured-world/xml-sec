@@ -918,6 +918,13 @@ fn a_nested_key_reference_takes_the_policy_of_the_operation_its_key_serves() {
     unsafe {
         start_up();
         let (wrapped, _) = encrypted(crate::ffi::transforms::ciphers::kw_aes128(), &[0x11; 16]);
+        crate::ffi::policy::republish(
+            |verification| {
+                verification.uris.retrieval_methods = xml_sec::xmldsig::UriTypeSet::SAME_DOCUMENT;
+            },
+            |_| {},
+        )
+        .expect("the library policy compiles");
         xml_sec_libxml2::policy::republish_encryption(
             |_| {},
             |decryption| decryption.uris.retrieval_methods = xml_sec::xmldsig::UriTypeSet::ALL,
@@ -942,6 +949,9 @@ fn a_nested_key_reference_takes_the_policy_of_the_operation_its_key_serves() {
             (crate::ffi::transforms::OPERATION_VERIFY, true),
             (crate::ffi::transforms::OPERATION_DECRYPT, false),
         ] {
+            // The decryption control reaches the input callbacks; the
+            // verification opens nothing.
+            serve_by_uri(vec![("http://example.com/kek", b"<kek/>".to_vec())]);
             let read = crate::ffi::keyinfo::xmlSecKeyInfoCtxCreate(mngr);
             (*read).operation = operation;
             (*read).key_req.key_id = symkeys::hmac();
@@ -957,6 +967,11 @@ fn a_nested_key_reference_takes_the_policy_of_the_operation_its_key_serves() {
             assert_eq!(
                 reasons.contains(&crate::ffi::errors::R_INVALID_URI_TYPE),
                 refused,
+                "operation {operation}: {reasons:?}"
+            );
+            assert_eq!(
+                OPENS.load(std::sync::atomic::Ordering::Relaxed),
+                usize::from(!refused),
                 "operation {operation}: {reasons:?}"
             );
             crate::ffi::keys::xmlSecKeyDestroy(key);
@@ -1980,6 +1995,166 @@ fn an_xml_encryption_holds_the_document_it_leaves_to_node_and_depth_limits() {
 }
 
 #[test]
+fn binary_and_uri_encryption_hold_the_document_they_write_to_node_and_depth_limits() {
+    // Writing the cipher value adds a node to the template's document: one
+    // node or one level short of the document an encryption writes refuses
+    // it and leaves the template as it was, for bytes and for a resource
+    // named by URI alike; exactly its count and depth let it through.
+    own_process();
+    // SAFETY: the library, documents and contexts set up and released here,
+    // on this thread alone.
+    unsafe {
+        start_up();
+        let plaintext = b"held to the node and depth limits";
+        serve_by_uri(vec![("test:plain", plaintext.to_vec())]);
+        for by_uri in [false, true] {
+            let encrypt = |max_nodes: usize, max_depth: usize| {
+                xml_sec_libxml2::policy::republish_encryption(
+                    |encryption| {
+                        encryption.resources.max_xml_nodes = max_nodes;
+                        encryption.resources.max_xml_depth = max_depth;
+                    },
+                    |_| {},
+                )
+                .expect("the library policy compiles");
+                let (doc, tmpl) = template_with_recipients(0);
+                let before = crate::ffi::tree::nodes::dump(tmpl);
+                let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
+                (*ctx).enc_key = aes_key();
+                let (status, reasons) = reported(|| {
+                    if by_uri {
+                        xmlSecEncCtxUriEncrypt(ctx, tmpl, c"test:plain".as_ptr().cast())
+                    } else {
+                        xmlSecEncCtxBinaryEncrypt(ctx, tmpl, plaintext.as_ptr(), plaintext.len())
+                    }
+                });
+                let unchanged = crate::ffi::tree::nodes::dump(tmpl) == before;
+                let shape = super::process::subtree_shape(doc.cast());
+                xmlSecEncCtxDestroy(ctx);
+                xsFreeDoc(doc.cast());
+                (status, reasons, unchanged, shape)
+            };
+            let (status, reasons, _, (nodes, depth)) = encrypt(1000, 64);
+            assert_eq!(status, 0, "by URI {by_uri}: {reasons:?}");
+            for (max_nodes, max_depth) in [(nodes - 1, depth), (nodes, depth - 1)] {
+                let (status, reasons, unchanged, _) = encrypt(max_nodes, max_depth);
+                assert_eq!(
+                    status, -1,
+                    "by URI {by_uri}: {nodes} nodes under {max_nodes}, depth {depth} under {max_depth}"
+                );
+                assert_eq!(
+                    reasons.first(),
+                    Some(&crate::ffi::errors::R_INVALID_SIZE),
+                    "by URI {by_uri}: {reasons:?}"
+                );
+                assert!(unchanged, "by URI {by_uri}: the template stays as it was");
+            }
+            let (status, reasons, ..) = encrypt(nodes, depth);
+            assert_eq!(status, 0, "by URI {by_uri}: {reasons:?}");
+        }
+        shut_down();
+    }
+}
+
+#[test]
+fn a_refused_encryption_keeps_the_template_nodes_the_caller_holds() {
+    // A caller keeps the CipherValue handle xmlSecTmplEncDataEnsureCipherValue
+    // returned. An encryption refused before it writes (a template without a
+    // Type) and one refused after it wrote the cipher value (a document past
+    // max_xml_document_bytes) both leave that node in the template, live and
+    // empty, rather than replaced by a copy.
+    own_process();
+    // SAFETY: the library, documents and contexts set up and released here,
+    // on this thread alone.
+    unsafe {
+        start_up();
+        let target = parsed("<root><secret>hidden</secret></root>");
+        let root = xml_sec_libxml2::ffi::tree::xsDocGetRootElement(target.cast());
+        let secret = xml_sec_libxml2::ffi::tree::xsNodeGetChildren(root);
+        let (doc, tmpl) = template_with_recipients(0);
+        let cipher_value = xmlSecTmplEncDataEnsureCipherValue(tmpl);
+        let held = |stage: &str| {
+            assert!(
+                crate::ffi::tree::nodes::tree_node(cipher_value).is_some(),
+                "{stage}: the held CipherValue lives"
+            );
+            assert_eq!(
+                xmlSecTmplEncDataEnsureCipherValue(tmpl),
+                cipher_value,
+                "{stage}: the held CipherValue is the template's"
+            );
+            assert_eq!(
+                crate::ffi::tree::nodes::first_child(cipher_value),
+                std::ptr::null_mut(),
+                "{stage}: the CipherValue is empty"
+            );
+        };
+        let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
+        (*ctx).enc_key = aes_key();
+        let (status, reasons) = reported(|| xmlSecEncCtxXmlEncrypt(ctx, tmpl, secret));
+        assert_eq!(status, -1, "no Type: {reasons:?}");
+        xmlSecEncCtxDestroy(ctx);
+        held("refused before writing");
+        xml_sec_libxml2::policy::republish_encryption(
+            |encryption| encryption.resources.max_xml_document_bytes = 1,
+            |_| {},
+        )
+        .expect("the library policy compiles");
+        let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
+        (*ctx).enc_key = aes_key();
+        let content = b"refused after writing";
+        let (status, reasons) =
+            reported(|| xmlSecEncCtxBinaryEncrypt(ctx, tmpl, content.as_ptr(), content.len()));
+        assert_eq!(status, -1, "past the size limit: {reasons:?}");
+        xmlSecEncCtxDestroy(ctx);
+        held("refused after writing");
+        xsFreeDoc(doc.cast());
+        xsFreeDoc(target.cast());
+        shut_down();
+    }
+}
+
+#[test]
+fn a_refused_content_replacement_leaves_the_template_unwritten() {
+    // A Content template linked inside the element whose content it would
+    // replace cannot take that content's place: the replacement is refused,
+    // and so is the encryption, which leaves the template as it was rather
+    // than holding a cipher value in the caller's tree.
+    own_process();
+    // SAFETY: the library, a document and a context set up and released
+    // here, on this thread alone.
+    unsafe {
+        start_up();
+        let target = parsed("<root><secret>hidden</secret></root>");
+        let root = xml_sec_libxml2::ffi::tree::xsDocGetRootElement(target.cast());
+        let secret = xml_sec_libxml2::ffi::tree::xsNodeGetChildren(root);
+        let tmpl = xmlSecTmplEncDataCreate(
+            target.cast(),
+            aes128_cbc(),
+            std::ptr::null(),
+            c"http://www.w3.org/2001/04/xmlenc#Content".as_ptr().cast(),
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+        assert!(!xmlSecTmplEncDataEnsureCipherValue(tmpl).is_null());
+        assert!(!xml_sec_libxml2::ffi::tree::xsAddChild(secret, tmpl).is_null());
+        let before = crate::ffi::tree::nodes::dump(target.cast::<XmlNode>());
+        let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
+        (*ctx).enc_key = aes_key();
+        let (status, reasons) = reported(|| xmlSecEncCtxXmlEncrypt(ctx, tmpl, secret));
+        assert_eq!(status, -1, "{reasons:?}");
+        assert_eq!(
+            crate::ffi::tree::nodes::dump(target.cast::<XmlNode>()),
+            before,
+            "the document and its template stay as they were"
+        );
+        xmlSecEncCtxDestroy(ctx);
+        xsFreeDoc(target.cast());
+        shut_down();
+    }
+}
+
+#[test]
 fn an_element_is_encrypted_as_utf8() {
     // libxmlsec1 encrypts the element as xmlNodeDumpOutput writes it with no
     // encoding named, UTF-8, even in a document declaring none, whose own
@@ -2877,7 +3052,8 @@ fn a_replacement_past_the_node_limit_leaves_the_document_unchanged() {
 
 /// A pre-execute callback that hands the chain's AES-128-CBC transform
 /// another AES key; a chain from a `CipherValue` starts with its Base64
-/// decoder, which takes no key.
+/// decoder, which takes no key. Without that transform it fails, which the
+/// caller's reasons show, rather than panicking across the C boundary.
 unsafe extern "C" fn rekey(
     ctx: *mut crate::ffi::transforms::XmlSecTransformCtx,
 ) -> std::ffi::c_int {
@@ -2887,10 +3063,9 @@ unsafe extern "C" fn rekey(
         while !cipher.is_null() && !std::ptr::eq((*cipher).id, aes128_cbc()) {
             cipher = (*cipher).next;
         }
-        assert!(
-            !cipher.is_null(),
-            "the chain holds the AES-128-CBC transform"
-        );
+        if cipher.is_null() {
+            return -1;
+        }
         let key = aes_key_of([0x11; 16]);
         let status = crate::ffi::transforms::xmlSecTransformSetKey(cipher, key.cast());
         crate::ffi::keys::xmlSecKeyDestroy(key);

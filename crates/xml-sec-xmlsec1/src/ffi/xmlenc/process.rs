@@ -131,13 +131,15 @@ unsafe fn begin_encryption(
     0
 }
 
-/// Runs `encrypt`, which writes an encryption into the template `tmpl`, and
-/// puts the template's content back as it was when it fails, as when the
-/// document it would leave passes `max_xml_document_bytes`: a refused
-/// encryption leaves the caller's template unchanged.
+/// Runs `encrypt`, which writes an encryption into the template `tmpl` and
+/// may put it in the caller's tree, and puts the template back as it was
+/// when it fails, as when the document it would leave passes a limit: a
+/// refused encryption leaves the caller's template unchanged, and every
+/// node of it the caller holds a handle to still in its place.
 ///
 /// # Safety
-/// `tmpl` is null or a live node; `encrypt` writes only inside it.
+/// `tmpl` is null or a live node; `encrypt` writes only inside it, or moves
+/// it whole.
 unsafe fn restoring_template(
     tmpl: *mut XmlNode,
     here: errors::Here,
@@ -152,31 +154,126 @@ unsafe fn restoring_template(
         errors::internal(here, std::ptr::null(), c"xmlDocCopyNode");
         return -1;
     }
+    let pairs = paired_children(tmpl, copy);
     let done = encrypt();
-    // SAFETY: the template and its unlinked copy, both live; a freed node's
-    // handles are refused afterwards, so the context's pointers into the
-    // written template reach nothing.
+    // SAFETY: the template and its unlinked copy, both live.
     unsafe {
         if done < 0 {
-            let mut child = xsNodeGetChildren(tmpl);
-            while !child.is_null() {
-                let next = nodes::next(child);
-                xsFreeNode(child);
-                child = next;
-            }
-            loop {
-                let child = xsNodeGetChildren(copy);
-                if child.is_null() {
-                    break;
-                }
-                xsUnlinkNode(child);
-                xsAddChild(tmpl, child);
-            }
+            restore(&pairs);
             add_ids(tmpl);
         }
         xsFreeNode(copy);
     }
     done
+}
+
+/// Each element of a template with its children, each child paired with
+/// the node in its place in the template's copy.
+type ChildPairs = Vec<(*mut XmlNode, Vec<(*mut XmlNode, *mut XmlNode)>)>;
+
+/// The children of each element of `original`'s subtree, each paired with
+/// the node of `copy` in its place, a parent before its children.
+fn paired_children(original: *mut XmlNode, copy: *mut XmlNode) -> ChildPairs {
+    let mut pairs = Vec::new();
+    let mut pending = vec![(original, copy)];
+    while let Some((parent, copied_parent)) = pending.pop() {
+        let mut children = Vec::new();
+        let (mut child, mut copied) = (
+            nodes::first_child(parent),
+            nodes::first_child(copied_parent),
+        );
+        while !child.is_null() && !copied.is_null() {
+            if nodes::is_element(child) {
+                pending.push((child, copied));
+            }
+            children.push((child, copied));
+            child = nodes::next(child);
+            copied = nodes::next(copied);
+        }
+        pairs.push((parent, children));
+    }
+    pairs
+}
+
+/// Puts each recorded parent's children back as [`paired_children`] found
+/// them: a node still in its place and as it was stays, so a handle to it
+/// keeps reaching it; one freed, moved or changed by the encryption gives
+/// way to its copy; a node the encryption added is freed.
+///
+/// # Safety
+/// The copied nodes are live and unlinked from the template.
+unsafe fn restore(pairs: &ChildPairs) {
+    for (parent, children) in pairs {
+        // A freed parent gave way to its copy, whose subtree came with it.
+        if nodes::tree_node(*parent).is_none() {
+            continue;
+        }
+        let kept: Vec<bool> = children
+            .iter()
+            .map(|&(child, copied)| nodes::parent(child) == *parent && unchanged(child, copied))
+            .collect();
+        // SAFETY: live nodes of the template's document.
+        unsafe {
+            let mut current = Vec::new();
+            let mut child = nodes::first_child(*parent);
+            while !child.is_null() {
+                current.push(child);
+                child = nodes::next(child);
+            }
+            for &child in &current {
+                xsUnlinkNode(child);
+            }
+            for (&(child, copied), &kept) in children.iter().zip(&kept) {
+                let node = if kept {
+                    child
+                } else {
+                    xsUnlinkNode(copied);
+                    copied
+                };
+                xsAddChild(*parent, node);
+            }
+            for child in current {
+                if nodes::parent(child).is_null() {
+                    xsFreeNode(child);
+                }
+            }
+        }
+    }
+}
+
+/// Whether `node` is as its copy `copied` was taken: of its kind, an
+/// element with its name, attributes and namespace declarations, any other
+/// node with its text. An element's children are compared on their own.
+fn unchanged(node: *mut XmlNode, copied: *mut XmlNode) -> bool {
+    if nodes::kind(node) != nodes::kind(copied) {
+        return false;
+    }
+    if !nodes::is_element(node) {
+        return nodes::text(node) == nodes::text(copied);
+    }
+    let attributes = |element: *mut XmlNode| {
+        nodes::attributes(element)
+            .into_iter()
+            .map(|attribute| {
+                (
+                    nodes::name(attribute),
+                    nodes::namespace(attribute),
+                    nodes::content(attribute),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let declarations = |element: *mut XmlNode| {
+        nodes::declarations(element)
+            .into_iter()
+            .map(|declaration| nodes::binding(declaration))
+            .collect::<Vec<_>>()
+    };
+    nodes::name(node) == nodes::name(copied)
+        && nodes::namespace(node) == nodes::namespace(copied)
+        && nodes::prefix(node) == nodes::prefix(copied)
+        && attributes(node) == attributes(copied)
+        && declarations(node) == declarations(copied)
 }
 
 /// Encrypts `data` through the context's chain and writes the template.
@@ -217,31 +314,33 @@ enum Replaced {
     Content(*mut XmlNode),
 }
 
-/// The octets `replaced` takes in its document's own dump, character
-/// references included, and whether `tmpl` is a part of it; measured as the
-/// document stands, the written template included. `None` for a node that
-/// cannot be written.
-///
-/// # Safety
-/// The nodes are live.
-unsafe fn replaced_octets(replaced: Replaced, tmpl: *mut XmlNode) -> Option<(usize, bool)> {
-    let (node, element) = match replaced {
-        Replaced::Element(node) => (node, true),
-        Replaced::Content(node) => (node, false),
+/// Whether `tmpl` is a part of what `replaced` names: the element itself, or
+/// a node strictly below it for its content.
+fn holds(replaced: Replaced, tmpl: *mut XmlNode) -> bool {
+    let (node, mut current) = match replaced {
+        Replaced::Element(node) => (node, tmpl),
+        Replaced::Content(node) => (node, nodes::parent(tmpl)),
     };
-    // The element itself, or a node strictly below it for its content.
-    let mut inside = false;
-    let mut current = if element { tmpl } else { nodes::parent(tmpl) };
     while !current.is_null() {
         if current == node {
-            inside = true;
-            break;
+            return true;
         }
         current = nodes::parent(current);
     }
-    if element {
-        return nodes::dump_in_document(node).map(|xml| (xml.len(), inside));
-    }
+    false
+}
+
+/// The octets `replaced` takes in its document's own dump, character
+/// references included, measured as the document stands, the written
+/// template included. `None` for a node that cannot be written.
+///
+/// # Safety
+/// The node is live.
+unsafe fn replaced_octets(replaced: Replaced) -> Option<usize> {
+    let node = match replaced {
+        Replaced::Element(node) => return nodes::dump_in_document(node).map(|xml| xml.len()),
+        Replaced::Content(node) => node,
+    };
     let mut total = 0_usize;
     // SAFETY: by the caller's contract.
     let mut child = unsafe { xsNodeGetChildren(node) };
@@ -250,18 +349,19 @@ unsafe fn replaced_octets(replaced: Replaced, tmpl: *mut XmlNode) -> Option<(usi
         total += nodes::dump_in_document(child)?.len();
         child = nodes::next(child);
     }
-    Some((total, inside))
+    Some(total)
 }
 
 /// Whether the document an encryption leaves fits the operation's
-/// `max_xml_document_bytes`, as the core admits the document it writes,
-/// after a report at `here`. The written template is that document when it
-/// stands alone, or a part of its document when linked into it. When it is
-/// to take the place of `replacing`, the document left is that node's: the
-/// replaced octets leave it and the template's enter it, unless the template
-/// is already a part of its text outside them. A template inside what it
-/// replaces is moved out before that leaves, as libxmlsec1 moves it, so its
-/// octets stay.
+/// `max_xml_document_bytes`, `max_xml_nodes` and `max_xml_depth`, as the
+/// core admits the document it writes, after a report at `here`. The
+/// written template is that document when it stands alone, or a part of its
+/// document when linked into it. When it is to take the place of
+/// `replacing`, the document left is that node's: the replaced octets leave
+/// it and the template's enter it, unless the template is already a part of
+/// its text outside them. A template inside the element it replaces is
+/// moved out before that leaves, as libxmlsec1 moves it, so its octets
+/// stay.
 ///
 /// # Safety
 /// `tmpl` is a live node written by the context's encryption; a replaced
@@ -289,14 +389,13 @@ unsafe fn admit_document(
             let (Replaced::Element(node) | Replaced::Content(node)) = replaced;
             // SAFETY: live nodes.
             let (destination, measured) =
-                unsafe { (xsNodeGetDoc(node), replaced_octets(replaced, tmpl)) };
+                unsafe { (xsNodeGetDoc(node), replaced_octets(replaced)) };
             // A written node is a part of its document's text, so its octets
             // never exceed the document's.
             let rest = length(destination.cast())
                 .zip(measured)
-                .and_then(|(document, (octets, _))| document.checked_sub(octets));
-            let kept = measured.is_some_and(|(_, inside)| !inside);
-            if linked && doc == destination && kept {
+                .and_then(|(document, octets)| document.checked_sub(octets));
+            if linked && doc == destination && !holds(replaced, tmpl) {
                 rest
             } else {
                 rest.zip(length(tmpl))
@@ -314,38 +413,40 @@ unsafe fn admit_document(
         errors::limit_exceeded(here, std::ptr::null(), "max_xml_document_bytes", maximum);
         return false;
     }
-    let Some(replaced) = replacing else {
-        return true;
-    };
-    // The replacement leaves the replaced node's document with the
-    // template's nodes in place of the replaced ones, the template at the
-    // replaced position: its nodes and depth are held to the same policy.
-    let (position, removed) = match replaced {
-        Replaced::Element(node) => (nodes::parent(node), subtree_shape(node).0),
-        Replaced::Content(node) => {
-            let mut removed = 0_usize;
-            let mut child = nodes::first_child(node);
-            while !child.is_null() {
-                // At most the document's nodes.
-                removed += subtree_shape(child).0;
-                child = nodes::next(child);
-            }
-            (node, removed)
+    // The nodes and depth of the document left are held to the same policy:
+    // the written template's own, or those of the document it is linked
+    // into; when it replaces, the replaced node's document without the
+    // replaced nodes and wherever the template stood, the template then at
+    // the replaced position.
+    let (nodes_left, depth) = match replacing {
+        None if linked => shape_skipping(doc.cast(), |_| false),
+        None => subtree_shape(tmpl),
+        Some(replaced) => {
+            let (position, skipped) = match replaced {
+                Replaced::Element(node) => (nodes::parent(node), node),
+                Replaced::Content(node) => (node, node),
+            };
+            // SAFETY: a live node.
+            let destination = unsafe { xsNodeGetDoc(skipped) };
+            let element = matches!(replaced, Replaced::Element(_));
+            let (rest, _) = shape_skipping(destination.cast(), |node| {
+                node == tmpl
+                    || if element {
+                        node == skipped
+                    } else {
+                        nodes::parent(node) == skipped
+                    }
+            });
+            let (template_nodes, template_height) = subtree_shape(tmpl);
+            // The rest of that document was validated with the source, so
+            // only the template at its new position can pass the depth.
+            // Within the nodes and depths of two validated trees.
+            (
+                rest + template_nodes,
+                element_depth(position) + template_height,
+            )
         }
     };
-    let (Replaced::Element(node) | Replaced::Content(node)) = replaced;
-    // SAFETY: a live node.
-    let destination = unsafe { xsNodeGetDoc(node) };
-    let (template_nodes, template_height) = subtree_shape(tmpl);
-    // A template already in that document outside what it replaces is
-    // counted there; one inside it leaves with it and comes back.
-    // SAFETY: live nodes.
-    let counted = linked
-        && doc == destination
-        && unsafe { replaced_octets(replaced, tmpl) }.is_some_and(|(_, inside)| !inside);
-    let added = if counted { 0 } else { template_nodes };
-    // The replaced nodes are a part of the document's.
-    let nodes_left = subtree_shape(destination.cast()).0 - removed + added;
     if nodes_left > resources.max_xml_nodes {
         errors::limit_exceeded(
             here,
@@ -355,8 +456,6 @@ unsafe fn admit_document(
         );
         return false;
     }
-    // Within the depths of two validated trees.
-    let depth = element_depth(position) + template_height;
     if depth > resources.max_xml_depth {
         errors::limit_exceeded(
             here,
@@ -373,6 +472,11 @@ unsafe fn admit_document(
 /// deepest path, `node` counted when it is one: as the core counts a
 /// document's nodes and depth.
 pub(super) fn subtree_shape(node: *const XmlNode) -> (usize, usize) {
+    shape_skipping(node, |_| false)
+}
+
+/// [`subtree_shape`] without the nodes `skip` names, each with its subtree.
+fn shape_skipping(node: *const XmlNode, skip: impl Fn(*mut XmlNode) -> bool) -> (usize, usize) {
     let (mut count, mut deepest) = (0_usize, 0_usize);
     let mut pending = vec![(node.cast_mut(), usize::from(nodes::is_element(node)))];
     while let Some((current, depth)) = pending.pop() {
@@ -381,7 +485,9 @@ pub(super) fn subtree_shape(node: *const XmlNode) -> (usize, usize) {
         deepest = deepest.max(depth);
         let mut child = nodes::first_child(current);
         while !child.is_null() {
-            pending.push((child, depth + usize::from(nodes::is_element(child))));
+            if !skip(child) {
+                pending.push((child, depth + usize::from(nodes::is_element(child))));
+            }
             child = nodes::next(child);
         }
     }
@@ -451,33 +557,35 @@ pub(super) unsafe fn xml_encrypt(
         errors::assertion(here, c"node != NULL");
         return -1;
     }
-    let mut element = false;
-    // SAFETY: by the caller's contract.
-    let encrypted =
-        unsafe { restoring_template(tmpl, here, || encrypt_node(ctx, tmpl, node, &mut element)) };
-    if encrypted < 0 {
-        return -1;
-    }
+    // The replacement is a part of what a failure undoes: one it refuses,
+    // such as a Content template inside the content it would replace,
+    // leaves the template unwritten. It checks before it moves anything.
     // SAFETY: by the caller's contract.
     unsafe {
-        let returned = if ctx.flags & FLAGS_RETURN_REPLACED_NODE != 0 {
-            &raw mut ctx.replaced_node_list
-        } else {
-            std::ptr::null_mut()
-        };
-        let replaced = if element {
-            xmlSecReplaceNodeAndReturn(node, tmpl, returned)
-        } else {
-            xmlSecReplaceContentAndReturn(node, tmpl, returned)
-        };
-        if replaced < 0 {
-            let object = super::super::tree::name_for_report(node);
-            errors::internal(here, object.as_ptr(), c"xmlSecReplaceNode");
-            return -1;
-        }
-        ctx.result_replaced = 1;
+        restoring_template(tmpl, here, || {
+            let mut element = false;
+            if encrypt_node(ctx, tmpl, node, &mut element) < 0 {
+                return -1;
+            }
+            let returned = if ctx.flags & FLAGS_RETURN_REPLACED_NODE != 0 {
+                &raw mut ctx.replaced_node_list
+            } else {
+                std::ptr::null_mut()
+            };
+            let replaced = if element {
+                xmlSecReplaceNodeAndReturn(node, tmpl, returned)
+            } else {
+                xmlSecReplaceContentAndReturn(node, tmpl, returned)
+            };
+            if replaced < 0 {
+                let object = super::super::tree::name_for_report(node);
+                errors::internal(here, object.as_ptr(), c"xmlSecReplaceNode");
+                return -1;
+            }
+            ctx.result_replaced = 1;
+            0
+        })
     }
-    0
 }
 
 /// [`xml_encrypt`] up to the replacement: `node` (an `Element` template,

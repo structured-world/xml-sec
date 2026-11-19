@@ -844,6 +844,7 @@ fn unknown_x509_certificate_semantics_comes_from_the_base_profile() {
     ));
 }
 
+#[cfg(feature = "xmlenc")]
 #[test]
 fn encryption_uri_classes_reach_the_compiled_snapshot() {
     // The encryption table bounds the key references of the key it encrypts
