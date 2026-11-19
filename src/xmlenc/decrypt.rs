@@ -26,6 +26,22 @@ use super::{
 #[cfg(test)]
 use super::parse_encrypted_data;
 
+impl XmlEncError {
+    /// The failure of content decryption under a key whose RSAES-PKCS1-v1_5
+    /// recovery was rejected: the one a wrong key's content work reports for
+    /// `algorithm`, whatever the substitute key's content work yielded, so a
+    /// rejected recovery cannot be told from an accepted recovery of a wrong
+    /// key (XML Encryption 1.1 sections 6.1.2 and 6.7).
+    #[must_use]
+    pub const fn rejected_recovery(algorithm: DataEncryptionAlgorithm) -> Self {
+        if algorithm.cbc_block_len().is_some() {
+            Self::InvalidPadding
+        } else {
+            Self::AeadAuthenticationFailed
+        }
+    }
+}
+
 /// Aggregate key-candidate work allowance for one cryptographic operation.
 ///
 /// Resolver implementations must consume one unit before each key lookup or
@@ -157,6 +173,14 @@ pub enum KeyEncryptionKeySource<'a> {
 
 /// Supplies keys for an `XMLEnc` operation under its immutable policy snapshot.
 pub trait DecryptionKeyResolver {
+    /// Whether the resolver recovers keys from the `EncryptedKey` elements of
+    /// a `KeyInfo`. One that supplies the content key itself never does, so
+    /// the operation neither dereferences their `CipherReference`s nor
+    /// offers them to it.
+    fn consults_encrypted_keys(&self) -> bool {
+        true
+    }
+
     /// Resolve an experimental KEM source under the operation snapshot. Raw
     /// content-key resolvers refuse by default rather than bypassing the KEM.
     ///
@@ -603,6 +627,10 @@ impl OpaqueContentKeyResolver {
 }
 
 impl DecryptionKeyResolver for OpaqueContentKeyResolver {
+    fn consults_encrypted_keys(&self) -> bool {
+        false
+    }
+
     fn resolve_key(
         &self,
         _provider: &dyn crate::provider::CryptoProvider,
@@ -701,6 +729,7 @@ pub struct DecryptContext<'a> {
     xml_backend: crate::XmlBackend,
     id_attributes: &'a [crate::IdAttributeRegistration],
     external_resources: Option<&'a std::collections::BTreeMap<String, Vec<u8>>>,
+    default_encryption_method: Option<DataEncryptionAlgorithm>,
 }
 
 /// One decryption operation, sharing its policy snapshot.
@@ -858,13 +887,32 @@ impl<'a> DecryptContext<'a> {
             xml_backend: crate::XmlBackend::default(),
             id_attributes: &[],
             external_resources: None,
+            default_encryption_method: None,
         }
+    }
+
+    /// The method an `EncryptedData` without `EncryptionMethod` was encrypted
+    /// with, known to its recipient (XML Encryption 1.1 section 3.1); the
+    /// policy admits it as it admits a named method.
+    #[must_use]
+    pub fn default_encryption_method(mut self, method: DataEncryptionAlgorithm) -> Self {
+        self.default_encryption_method = Some(method);
+        self
     }
 
     /// Replace the complete immutable decryption policy snapshot.
     #[must_use]
     pub fn policy(mut self, policy: crate::policy::DecryptionPolicy) -> Self {
         self.policy = Arc::new(policy);
+        self.identity = None;
+        self
+    }
+
+    /// Enforce a shared immutable policy snapshot without copying it, as an
+    /// application that publishes one snapshot to many operations does.
+    #[must_use]
+    pub fn shared_policy(mut self, policy: Arc<crate::policy::DecryptionPolicy>) -> Self {
+        self.policy = policy;
         self.identity = None;
         self
     }
@@ -955,6 +1003,74 @@ impl<'a> DecryptContext<'a> {
         .map(|processed| self.audited(processed))
     }
 
+    /// Decrypt exactly the `EncryptedData` element `encrypted_data` of
+    /// `document`, leaving the document unchanged.
+    ///
+    /// This is the caller-selected node of libxmlsec1's
+    /// `xmlSecEncCtxDecryptToBuffer`: the caller decides what the plaintext
+    /// replaces.
+    ///
+    /// # Errors
+    /// Returns an error for an identity of another document or generation, a
+    /// node that is no `EncryptedData`, invalid encryption metadata,
+    /// policy/resource refusal, unavailable keys, provider failure or failed
+    /// content authentication.
+    pub fn decrypt_in_document(
+        &self,
+        document: &XmlDocument,
+        encrypted_data: crate::NodeIdentity,
+    ) -> Result<Audited<DecryptedContent>, XmlEncError> {
+        self.process_in_document(document, encrypted_data)
+            .map(|processed| self.audited(processed))
+    }
+
+    /// [`Self::decrypt_in_document`] for a caller whose operation goes on
+    /// parsing XML within the same `max_xml_parse_work_bytes`, such as
+    /// replacing the element with its plaintext: also the parse work this
+    /// decryption spent, which the caller counts on from.
+    ///
+    /// # Errors
+    /// As for [`Self::decrypt_in_document`].
+    pub fn decrypt_in_document_counting_parse_work(
+        &self,
+        document: &XmlDocument,
+        encrypted_data: crate::NodeIdentity,
+    ) -> Result<(Audited<DecryptedContent>, usize), XmlEncError> {
+        self.process_in_document(document, encrypted_data)
+            .map(|processed| {
+                let spent = processed.operation.budgets().xml_parse.consumed();
+                (self.audited(processed), spent)
+            })
+    }
+
+    /// The decryption of [`Self::decrypt_in_document`], before its audit.
+    fn process_in_document(
+        &self,
+        document: &XmlDocument,
+        encrypted_data: crate::NodeIdentity,
+    ) -> Result<ProcessedDecryption<DecryptedContent>, XmlEncError> {
+        self.policy.resources.validate()?;
+        document.validate_operation_policy(self.policy.xml, &self.policy.resources)?;
+        let budgets = DecryptionOperationBudgets::from_policy(&self.policy);
+        let document_binding = Some((document.identity(), document.generation()));
+        document.with_view(|view| {
+            let node = view.resolve_node(encrypted_data)?;
+            if !node.has_tag_name((XMLENC_NS, "EncryptedData")) {
+                return Err(XmlEncError::EncryptedDataNotFound);
+            }
+            self.process_decryption_input(
+                DecryptionInput::Document {
+                    document: view.document(),
+                    node: node.id(),
+                },
+                document_binding,
+                false,
+                budgets,
+                |content, _| Ok(content),
+            )
+        })
+    }
+
     /// A finished operation's output with its audit.
     fn audited<T>(&self, processed: ProcessedDecryption<T>) -> Audited<T> {
         Audited::new(
@@ -993,7 +1109,8 @@ impl<'a> DecryptContext<'a> {
                 let selected = selected_encrypted_node(document, node)?;
                 let (encrypted, origins) = super::parse::parse_encrypted_data_node_with_origins(
                     selected,
-                    (&**operation.policy()).into(),
+                    super::parse::ParsingPolicy::from(&**operation.policy())
+                        .with_default_method(self.default_encryption_method),
                     false,
                     self.id_attributes,
                     self.provider,
@@ -1077,11 +1194,7 @@ impl<'a> DecryptContext<'a> {
                     if let Ok(mut plaintext) = result {
                         zeroize::Zeroize::zeroize(&mut plaintext);
                     }
-                    return Err(if algorithm.cbc_block_len().is_some() {
-                        XmlEncError::InvalidPadding
-                    } else {
-                        XmlEncError::AeadAuthenticationFailed
-                    });
+                    return Err(XmlEncError::rejected_recovery(algorithm));
                 }
                 let plaintext = result.map_err(|error| {
                     map_data_decryption_error(algorithm, ciphertext.len(), error)
@@ -1151,6 +1264,7 @@ impl<'a> DecryptContext<'a> {
             self.id_attributes,
         )?
         .with_operation(&reference_gate);
+        let recipients = Recipients::of_resolver(self.resolver);
         let parsed = operation.run(plan_nodes.ciphertext, || {
             // The graph gates parser work as well as cryptographic callbacks.
             // Typed inputs stay borrowed; XML inputs consume the same operation
@@ -1180,7 +1294,7 @@ impl<'a> DecryptContext<'a> {
                 }
                 _ => encrypted.cipher_data.octets()?.into_owned(),
             };
-            if let Some((document, _)) = source_document {
+            if let (Some((document, _)), Recipients::Consulted) = (source_document, recipients) {
                 resolve_key_cipher_references(
                     &mut encrypted.to_mut().encrypted_keys,
                     document,
@@ -1208,6 +1322,7 @@ impl<'a> DecryptContext<'a> {
                 self.provider,
                 algorithm,
                 &encrypted,
+                recipients.of(&encrypted),
                 self.resolver,
                 &operation,
                 document,
@@ -1355,6 +1470,10 @@ impl SymmetricKeyDecryptor {
 }
 
 impl DecryptionKeyResolver for SymmetricKeyDecryptor {
+    fn consults_encrypted_keys(&self) -> bool {
+        false
+    }
+
     fn resolve_content_keys_with_policy(
         &self,
         provider: &dyn crate::provider::CryptoProvider,
@@ -1622,11 +1741,7 @@ impl DecryptionKeyResolver for PrivateKeyDecryptor {
             return Err(XmlEncError::KeyNotFound);
         };
         validate_encrypted_key_policy(key, policy)?;
-        let width = policy.rsa_keys.validate_public_metadata(
-            "decryption",
-            self.key.rsa_modulus_bits(),
-            self.key.rsa_public_exponent(),
-        )?;
+        let width = validate_key_recovery_key(self.key.as_ref(), policy)?;
         let ciphertext = key.cipher_data.octets()?;
         if width != self.key.ciphertext_len() || ciphertext.len() != width {
             return Err(XmlEncError::InvalidWrappedKeyLength {
@@ -1733,11 +1848,7 @@ impl PrivateKeyDecryptor {
         policy.validate()?;
         let encrypted_key = encrypted_key.ok_or(XmlEncError::KeyNotFound)?;
         validate_encrypted_key_policy(encrypted_key, policy)?;
-        let width = policy.rsa_keys.validate_public_metadata(
-            "decryption",
-            self.key.rsa_modulus_bits(),
-            self.key.rsa_public_exponent(),
-        )?;
+        let width = validate_key_recovery_key(self.key.as_ref(), policy)?;
         if width != self.key.ciphertext_len() {
             return Err(crate::policy::PolicyViolation::InvalidKeyMaterial {
                 operation: "decryption",
@@ -2164,14 +2275,44 @@ fn admit_encrypted_key(
     }
 }
 
+/// Whether one decryption reads the `EncryptedKey` recipients of its
+/// `EncryptedData`: the resolver's answer, asked once per operation, so the
+/// stage resolving their references and the stage reading their keys agree.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Recipients {
+    Consulted,
+    /// A resolver supplying the content key itself reads no recipient.
+    Skipped,
+}
+
+impl Recipients {
+    fn of_resolver(resolver: &dyn DecryptionKeyResolver) -> Self {
+        if resolver.consults_encrypted_keys() {
+            Self::Consulted
+        } else {
+            Self::Skipped
+        }
+    }
+
+    /// The `EncryptedKey` elements of `encrypted` the operation reads.
+    fn of(self, encrypted: &EncryptedData) -> &[EncryptedKey] {
+        match self {
+            Self::Consulted => &encrypted.encrypted_keys,
+            Self::Skipped => &[],
+        }
+    }
+}
+
 /// The content-key candidates of `encrypted`, under the operation's policy
-/// and key-candidate budget. Each `EncryptedKey` the policy refuses is
-/// skipped, not fatal, so the operation's audit records both its refusals and
-/// the methods it permits.
+/// and key-candidate budget, reading its `recipients`, the `EncryptedKey`
+/// elements the operation consults. Each `EncryptedKey` the policy refuses
+/// is skipped, not fatal, so the operation's audit records both its refusals
+/// and the methods it permits.
 fn resolve_content_key_candidates(
     provider: &dyn crate::provider::CryptoProvider,
     algorithm: DataEncryptionAlgorithm,
     encrypted: &EncryptedData,
+    recipients: &[EncryptedKey],
     resolver: &dyn DecryptionKeyResolver,
     operation: &DecryptionExecution,
     mut document: Option<KeySourceDocument<'_, '_>>,
@@ -2250,7 +2391,7 @@ fn resolve_content_key_candidates(
             &mut last_error,
         )?;
     }
-    for encrypted_key in &encrypted.encrypted_keys {
+    for encrypted_key in recipients {
         let source = KeySourceView {
             key: encrypted_key,
             document: take_key_document(&mut document, encrypted_key)?,
@@ -2994,6 +3135,45 @@ fn validate_encrypted_key_policy(
     validate_key_encryption_method_policy(&encrypted_key.encryption_method, policy)
 }
 
+/// Validate an RSA recovery key against the decryption `policy` and return
+/// the width of the ciphertexts it recovers.
+///
+/// # Errors
+/// Returns the policy's refusal of the key's modulus or exponent.
+pub fn validate_key_recovery_key(
+    key: &dyn crate::provider::KeyRecoveryKey,
+    policy: &crate::policy::DecryptionPolicy,
+) -> Result<usize, XmlEncError> {
+    Ok(policy.rsa_keys.validate_public_metadata(
+        "decryption",
+        key.rsa_modulus_bits(),
+        key.rsa_public_exponent(),
+    )?)
+}
+
+/// The RSA-OAEP parameters of the key transport `method`, defaults
+/// included, once the decryption `policy` admitted the transport and its
+/// digests; `None` for an admitted RSAES-PKCS1-v1_5 transport or key wrap.
+///
+/// # Errors
+/// Returns an invalid or unsupported method, or the policy's refusal.
+pub fn admit_key_transport_method(
+    method: &super::EncryptionMethod,
+    policy: &crate::policy::DecryptionPolicy,
+) -> Result<Option<RsaOaepParameters>, XmlEncError> {
+    let Some(AdmittedOaep { digest, mgf_digest }) =
+        validate_key_encryption_method_policy(method, policy)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(RsaOaepParameters {
+        algorithm: KeyTransportAlgorithm::from_uri(&method.algorithm)?,
+        digest,
+        mgf_digest,
+        label: method.oaep_params.clone().unwrap_or_default(),
+    }))
+}
+
 /// Check a key transport or wrap method against `policy`; an RSA-OAEP
 /// transport also returns the digests it admitted.
 pub(super) fn validate_key_encryption_method_policy(
@@ -3003,19 +3183,13 @@ pub(super) fn validate_key_encryption_method_policy(
     method.validate_structure()?;
     let uri = &method.algorithm;
     if let Ok(transport) = KeyTransportAlgorithm::from_uri(uri) {
-        if policy
-            .key_transport_algorithms
-            .as_ref()
-            .map_or(transport.requires_explicit_permission(), |allowed| {
-                !allowed.contains(&transport)
-            })
-        {
-            return Err(crate::policy::PolicyViolation::Algorithm {
+        // The refusal names the URI the document carries.
+        policy
+            .check_key_transport_algorithm(transport)
+            .map_err(|_| crate::policy::PolicyViolation::Algorithm {
                 operation: "decryption",
                 algorithm: uri.clone(),
-            }
-            .into());
-        }
+            })?;
         #[cfg(feature = "legacy-algorithms")]
         if transport == KeyTransportAlgorithm::RsaPkcs1v15 {
             return Ok(None);
@@ -3067,19 +3241,13 @@ pub(super) fn validate_key_encryption_method_policy(
         Ok(Some(AdmittedOaep { digest, mgf_digest }))
     } else {
         let wrap = KeyWrapAlgorithm::from_uri(uri)?;
-        if policy
-            .key_wrap_algorithms
-            .as_ref()
-            .map_or(wrap.requires_explicit_permission(), |allowed| {
-                !allowed.contains(&wrap)
-            })
-        {
-            return Err(crate::policy::PolicyViolation::Algorithm {
+        // The refusal names the URI the document carries.
+        policy.check_key_wrap_algorithm(wrap).map_err(|_| {
+            crate::policy::PolicyViolation::Algorithm {
                 operation: "decryption",
                 algorithm: uri.clone(),
             }
-            .into());
-        }
+        })?;
         Ok(None)
     }
 }

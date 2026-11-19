@@ -325,7 +325,7 @@ unsafe extern "C" fn set_key_req(transform: *mut XmlSecTransform, req: *mut XmlS
             errors::assertion(here, c"keyReq != NULL");
             return -1;
         };
-        req.key_id = symkeys::hmac().cast();
+        req.key_id = symkeys::hmac();
         req.key_type = TYPE_SYMMETRIC;
         req.key_usage = if object.operation == OPERATION_SIGN {
             KEY_USAGE_SIGN

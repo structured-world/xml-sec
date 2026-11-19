@@ -10,13 +10,14 @@ use xml_sec::xmlenc::{
 use xml_sec::{
     policy::{
         CertificateSignatureAlgorithms, CompiledPolicies, DetachedDigestAttestation, DsaKeyPolicy,
-        EcdsaSignatureValueEncoding, EmptyDigestInput, ExtendedKeyPurpose, HmacPolicy, Instant,
-        KemContentAuthentication, KeyAgreementAlgorithm, KeyDerivationAlgorithm,
-        KeyEstablishmentPolicy, KeySourceKind, KeySourcePolicy, KeyTrustPolicy, ManifestProcessing,
-        OpcRelationshipEdition, PolicySet, PolicyValidity, ResourcePolicy, RsaKeyPolicy,
-        RsaPssPermission, SameDocumentIdSemantics, SignatureConstraints, SigningPolicy,
-        TimestampTokenEncoding, TransformPolicy, UnknownX509CertificateSemantics, UriPolicy,
-        VerificationPolicy, VerificationTrustMode, XmlInputPolicy, XsltStylesheetSemantics,
+        EcdsaSignatureValueEncoding, EmptyDigestInput, ExtendedKeyPurpose,
+        GeneratedCanonicalization, HmacPolicy, Instant, KemContentAuthentication,
+        KeyAgreementAlgorithm, KeyDerivationAlgorithm, KeyEstablishmentPolicy, KeySourceKind,
+        KeySourcePolicy, KeyTrustPolicy, ManifestProcessing, OpcRelationshipEdition, PolicySet,
+        PolicyValidity, RequestSelections, ResourcePolicy, RsaKeyPolicy, RsaPssPermission,
+        SameDocumentIdSemantics, SignatureConstraints, SigningPolicy, TimestampTokenEncoding,
+        TransformPolicy, UnknownX509CertificateSemantics, UriPolicy, VerificationPolicy,
+        VerificationTrustMode, XmlInputPolicy, XsltStylesheetSemantics,
     },
     provider::{KeyEncapsulationAlgorithm, X509SignatureAlgorithm},
     xmldsig::{
@@ -240,7 +241,16 @@ fn uris(p: &mut UriPolicy, v: &Value) -> Result<(), Error> {
     }
     Ok(())
 }
-fn transforms(p: &mut TransformPolicy, v: &Value) -> Result<(), Error> {
+/// The operation a `transforms` table configures: only signing generates a
+/// canonicalization of its own, so only its table takes
+/// `generated_canonicalization`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TransformTable {
+    Signing,
+    Processing,
+}
+
+fn transforms(p: &mut TransformPolicy, v: &Value, of: TransformTable) -> Result<(), Error> {
     for (key, value) in table(v, "transforms")? {
         match key.as_str() {
             "allowed_algorithms" => {
@@ -285,6 +295,14 @@ fn transforms(p: &mut TransformPolicy, v: &Value) -> Result<(), Error> {
                     key,
                     EmptyDigestInput::Accept,
                     EmptyDigestInput::Refuse
+                );
+            }
+            "generated_canonicalization" if of == TransformTable::Signing => {
+                p.generated_canonicalization = choice!(
+                    value,
+                    key,
+                    GeneratedCanonicalization::ExplicitC14n11,
+                    GeneratedCanonicalization::Implicit
                 );
             }
             _ => return Err(invalid(key)),
@@ -481,10 +499,50 @@ fn key_trust(p: &mut KeyTrustPolicy, v: &Value) -> Result<(), Error> {
     Ok(())
 }
 
+fn request_selections(p: &mut RequestSelections, v: &Value) -> Result<(), Error> {
+    for (key, value) in table(v, "request_selections")? {
+        match key.as_str() {
+            "same_document_id_semantics" => {
+                p.same_document_id_semantics = selected(value, key, |v| {
+                    Ok(choice!(
+                        v,
+                        key,
+                        SameDocumentIdSemantics::Specification,
+                        SameDocumentIdSemantics::XmlSecBarename,
+                        SameDocumentIdSemantics::XmlSecVisa3d
+                    ))
+                })?;
+            }
+            "ecdsa_signature_value_encodings" => {
+                p.ecdsa_signature_value_encodings = selected(value, key, |v| {
+                    Ok(choice!(
+                        v,
+                        key,
+                        EcdsaSignatureValueEncoding::XmlDsig,
+                        EcdsaSignatureValueEncoding::XmlSecAsn1Der
+                    ))
+                })?;
+            }
+            "manifest_processing" => {
+                p.manifest_processing = selected(value, key, |v| {
+                    Ok(choice!(
+                        v,
+                        key,
+                        ManifestProcessing::Ignore,
+                        ManifestProcessing::Process
+                    ))
+                })?;
+            }
+            _ => return Err(invalid(key)),
+        }
+    }
+    Ok(())
+}
+
 // Reuse the exact same field admissions for sign and verify. Encryption has
 // different applicable fields and must not accidentally accept signing knobs.
 macro_rules! signature_fields {
-    ($p:expr, $key:expr, $value:expr) => {
+    ($p:expr, $key:expr, $value:expr, $transforms:expr) => {
         match $key.as_str() {
             "validity" => validity(&mut $p.validity, $value)?,
             "signature_constraints" => $p.signature_constraints = signature_constraints($value)?,
@@ -515,9 +573,10 @@ macro_rules! signature_fields {
                     ManifestProcessing::Process
                 )
             }
+            "request_selections" => request_selections(&mut $p.request_selections, $value)?,
             "hmac" => hmac(&mut $p.hmac, $value)?,
             "uris" => uris(&mut $p.uris, $value)?,
-            "transforms" => transforms(&mut $p.transforms, $value)?,
+            "transforms" => transforms(&mut $p.transforms, $value, $transforms)?,
             "key_establishment" => key_establishment(&mut $p.key_establishment, $value)?,
             "resources" => resources(&mut $p.resources, $value)?,
             "xml" => xml(&mut $p.xml, $value)?,
@@ -551,7 +610,7 @@ fn verification(p: &mut VerificationPolicy, t: &Table, syntax_only: bool) -> Res
                     TimestampTokenEncoding::Ber
                 );
             }
-            _ => signature_fields!(p, key, value),
+            _ => signature_fields!(p, key, value, TransformTable::Processing),
         }
     }
     Ok(())
@@ -561,7 +620,7 @@ fn signing(p: &mut SigningPolicy, t: &Table, syntax_only: bool) -> Result<(), Er
         match key.as_str() {
             "rsa_keys" => rsa(&mut p.rsa_keys, value)?,
             "dsa_keys" => dsa(&mut p.dsa_keys, value)?,
-            _ => signature_fields!(p, key, value),
+            _ => signature_fields!(p, key, value, TransformTable::Signing),
         }
     }
     Ok(())
@@ -612,7 +671,7 @@ fn decryption(p: &mut DecryptionPolicy, t: &Table, syntax_only: bool) -> Result<
     for (key, value) in fields(t, syntax_only) {
         match key.as_str() {
             "uris" => uris(&mut p.uris, value)?,
-            "transforms" => transforms(&mut p.transforms, value)?,
+            "transforms" => transforms(&mut p.transforms, value, TransformTable::Processing)?,
             _ => encryption_fields!(p, key, value),
         }
     }
@@ -777,8 +836,40 @@ fn uri_snapshot(p: UriPolicy) -> Value {
         ("key_info_references".into(), one(p.key_info_references)),
     ]))
 }
-fn transform_snapshot(p: &TransformPolicy) -> Value {
+fn request_selections_snapshot(p: &RequestSelections) -> Value {
+    let RequestSelections {
+        same_document_id_semantics,
+        ecdsa_signature_value_encodings,
+        manifest_processing,
+    } = p;
+    let list = |values: Vec<Value>| Value::Array(values);
     Value::Table(Table::from_iter([
+        (
+            "same_document_id_semantics".into(),
+            list(
+                same_document_id_semantics
+                    .iter()
+                    .map(|v| named(*v))
+                    .collect(),
+            ),
+        ),
+        (
+            "ecdsa_signature_value_encodings".into(),
+            list(
+                ecdsa_signature_value_encodings
+                    .iter()
+                    .map(|v| named(*v))
+                    .collect(),
+            ),
+        ),
+        (
+            "manifest_processing".into(),
+            list(manifest_processing.iter().map(|v| named(*v)).collect()),
+        ),
+    ]))
+}
+fn transform_snapshot(p: &TransformPolicy, of: TransformTable) -> Value {
+    let mut t = Table::from_iter([
         (
             "allowed_algorithms".into(),
             match &p.allowed_algorithms {
@@ -800,7 +891,14 @@ fn transform_snapshot(p: &TransformPolicy) -> Value {
             named(p.xslt_stylesheet_semantics),
         ),
         ("empty_digest_input".into(), named(p.empty_digest_input)),
-    ]))
+    ]);
+    if of == TransformTable::Signing {
+        t.insert(
+            "generated_canonicalization".into(),
+            named(p.generated_canonicalization),
+        );
+    }
+    Value::Table(t)
 }
 fn establishment_snapshot(p: &KeyEstablishmentPolicy) -> Value {
     let KeyEstablishmentPolicy {
@@ -986,7 +1084,7 @@ fn source_snapshot(p: KeySourcePolicy) -> Value {
     )
 }
 macro_rules! signature_snapshot {
-    ($p:expr) => {
+    ($p:expr, $transforms:expr) => {
         Table::from_iter([
             ("enabled".into(), Value::Boolean(true)),
             ("validity".into(), validity_snapshot($p.validity.as_ref())?),
@@ -1021,8 +1119,15 @@ macro_rules! signature_snapshot {
                 named($p.ecdsa_signature_value_encoding),
             ),
             ("uris".into(), uri_snapshot($p.uris)),
-            ("transforms".into(), transform_snapshot(&$p.transforms)),
+            (
+                "transforms".into(),
+                transform_snapshot(&$p.transforms, $transforms),
+            ),
             ("manifest_processing".into(), named($p.manifest_processing)),
+            (
+                "request_selections".into(),
+                request_selections_snapshot(&$p.request_selections),
+            ),
             ("xml".into(), xml_snapshot($p.xml)),
             ("resources".into(), resource_snapshot(&$p.resources)),
             (
@@ -1081,12 +1186,13 @@ fn verification_snapshot(p: &VerificationPolicy) -> Result<Value, Error> {
         uris: _,
         transforms: _,
         manifest_processing: _,
+        request_selections: _,
         detached_digest_attestation: _,
         timestamp_token_encoding: _,
         xml: _,
         resources: _,
     } = p;
-    let mut t = signature_snapshot!(p);
+    let mut t = signature_snapshot!(p, TransformTable::Processing);
     t.insert("key_trust".into(), trust_snapshot(&p.key_trust)?);
     t.insert("key_sources".into(), source_snapshot(p.key_sources));
     t.insert(
@@ -1115,10 +1221,11 @@ fn signing_snapshot(p: &SigningPolicy) -> Result<Value, Error> {
         uris: _,
         transforms: _,
         manifest_processing: _,
+        request_selections: _,
         xml: _,
         resources: _,
     } = p;
-    let mut t = signature_snapshot!(p);
+    let mut t = signature_snapshot!(p, TransformTable::Signing);
     t.insert("rsa_keys".into(), rsa_snapshot(p.rsa_keys));
     t.insert("dsa_keys".into(), dsa_snapshot(p.dsa_keys));
     Ok(Value::Table(t))
@@ -1157,7 +1264,10 @@ fn decryption_snapshot(p: &DecryptionPolicy) -> Result<Value, Error> {
     } = p;
     let mut t = encryption_snapshot!(p);
     t.insert("uris".into(), uri_snapshot(p.uris));
-    t.insert("transforms".into(), transform_snapshot(&p.transforms));
+    t.insert(
+        "transforms".into(),
+        transform_snapshot(&p.transforms, TransformTable::Processing),
+    );
     Ok(Value::Table(t))
 }
 

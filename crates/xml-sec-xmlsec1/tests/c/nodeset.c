@@ -219,6 +219,12 @@ int main(void) {
     fflush(stdout);
     xmlSecNodeSetDestroy(nset);
 
+    /* A set without a node list is the whole document. */
+    nset = xmlSecNodeSetCreate(doc, NULL, xmlSecNodeSetNormal);
+    xmlSecNodeSetDebugDump(nset, stdout);
+    fflush(stdout);
+    xmlSecNodeSetDestroy(nset);
+
     /* A set told to destroy its document frees it with itself. */
     nset = xmlSecNodeSetGetChildren(doc, NULL, 1, 0);
     xmlSecNodeSetDocDestroy(nset);

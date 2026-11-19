@@ -318,6 +318,28 @@ pub fn text<T>(node: *const T) -> Option<String> {
     .flatten()
 }
 
+/// `xmlNodeDumpOutput` unformatted with no encoding named: `node` and its
+/// subtree as UTF-8 XML text, with only the namespace declarations the nodes
+/// carry.
+#[must_use]
+pub fn dump<T>(node: *const T) -> Option<String> {
+    let (document, node) = tree_node(node.cast())?;
+    handles::read_document(document, |tree| tree.serialize_node(node).ok())
+        .ok()
+        .flatten()
+}
+
+/// [`dump`] as the node's text within its document's own dump, whose
+/// non-ASCII characters are references when the document declares no
+/// encoding: the octets the node takes in that dump.
+#[must_use]
+pub fn dump_in_document<T>(node: *const T) -> Option<String> {
+    let (document, node) = tree_node(node.cast())?;
+    handles::read_document(document, |tree| tree.serialize_node_in_document(node).ok())
+        .ok()
+        .flatten()
+}
+
 /// `xmlNodeGetContent`: the character data of an element or document and
 /// its descendants, a leaf's text, an attribute's value or a namespace's
 /// URI.
@@ -759,16 +781,52 @@ pub enum FragmentError {
 /// UTF-8, an unavailable policy, or the core's refusal of the fragment,
 /// which is also this thread's [`crate::document::last_error`].
 pub fn parse_in_context(node: *const Node, bytes: &[u8]) -> Result<*mut Node, FragmentError> {
-    parse_fragment(node, bytes).inspect_err(crate::document::record_error)
+    let policy = crate::policy::library().ok_or(FragmentError::Policy);
+    policy
+        .and_then(|policy| {
+            parse_fragment(node, bytes, |tree, context, fragment| {
+                tree.parse_in_context(context, fragment, &*policy)
+            })
+        })
+        .inspect_err(crate::document::record_error)
 }
 
-fn parse_fragment(node: *const Node, bytes: &[u8]) -> Result<*mut Node, FragmentError> {
+/// [`parse_in_context`] for the place of `replaced`, in the context of its
+/// parent, as a part of an operation: under `policy`, the snapshot the
+/// operation runs under, rather than the current library policy, within what
+/// is left of its `max_xml_parse_work_bytes` after `spent`, to which the
+/// parse's work is added, and refused when the document with the nodes in
+/// place of `replaced` would pass its `max_xml_nodes`.
+///
+/// # Errors
+/// As for [`parse_in_context`], an unavailable policy aside, or the core's
+/// refusal for the operation's parse work or node limit.
+pub fn parse_replacing_under(
+    replaced: *const Node,
+    bytes: &[u8],
+    policy: &impl xml_sec::XmlDocumentPolicy,
+    spent: &mut usize,
+) -> Result<*mut Node, FragmentError> {
+    parse_fragment(replaced, bytes, |tree, replaced, fragment| {
+        tree.parse_replacing_within(replaced, fragment, policy, spent)
+    })
+    .inspect_err(crate::document::record_error)
+}
+
+/// Parses `bytes` as content of `node` with `parse`, which receives the
+/// node's tree, the node and the bytes as text.
+fn parse_fragment(
+    node: *const Node,
+    bytes: &[u8],
+    parse: impl FnOnce(
+        &mut OwnedTree,
+        TreeNode,
+        &str,
+    ) -> Result<Option<TreeNode>, xml_sec::XmlDocumentError>,
+) -> Result<*mut Node, FragmentError> {
     let (document, context) = handles::node(handle_of(node))?;
     let fragment = std::str::from_utf8(bytes).map_err(|_| FragmentError::Encoding)?;
-    let policy = crate::policy::library().ok_or(FragmentError::Policy)?;
-    let first = handles::update_document(document, |tree| {
-        tree.parse_in_context(context, fragment, &*policy)
-    })??;
+    let first = handles::update_document(document, |tree| parse(tree, context, fragment))??;
     Ok(first.map_or(std::ptr::null_mut(), |first| node_pointer(document, first)))
 }
 

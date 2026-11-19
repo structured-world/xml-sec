@@ -302,7 +302,7 @@ unsafe extern "C" fn set_key_req(transform: *mut XmlSecTransform, req: *mut XmlS
             errors::assertion(here, c"keyReq != NULL");
             return -1;
         };
-        req.key_id = family.klass().cast();
+        req.key_id = family.klass();
         (req.key_type, req.key_usage) = if object.operation == OPERATION_SIGN {
             (TYPE_PRIVATE, KEY_USAGE_SIGN)
         } else {
@@ -554,7 +554,7 @@ fn collect(
 
 /// The signing key of the PKCS#8 key `private` for `algorithm`, admitted
 /// under the run's signing `policy`: its family, strength and usage.
-fn signing_key(
+pub(crate) fn signing_key(
     policy: &SigningPolicy,
     algorithm: SignatureAlgorithm,
     private: &[u8],

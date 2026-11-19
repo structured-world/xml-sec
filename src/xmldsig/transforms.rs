@@ -1307,8 +1307,9 @@ mod chain_policy_sealed {
 }
 
 /// An operation policy snapshot that governs a reference chain: the
-/// verification policy of a verifier, the signing policy of a signer, each
-/// with its own transform permissions, XML allowances and limits.
+/// verification policy of a verifier, the signing policy of a signer, the
+/// decryption policy of a decryptor reading a `CipherReference`, each with
+/// its own transform permissions, XML allowances and limits.
 pub trait TransformChainPolicy: chain_policy_sealed::Sealed {
     #[doc(hidden)]
     fn validate_snapshot(&self) -> Result<(), crate::policy::PolicyViolation>;
@@ -1349,6 +1350,10 @@ macro_rules! impl_chain_policy {
 
 impl_chain_policy!(crate::policy::VerificationPolicy);
 impl_chain_policy!(crate::policy::SigningPolicy);
+// XML Encryption 1.1 section 3.3.1: a CipherReference's Transforms are
+// processed as a signature reference's are, under the decryptor's policy.
+#[cfg(feature = "xmlenc")]
+impl_chain_policy!(crate::policy::DecryptionPolicy);
 
 /// Execute a standalone reference chain under a trusted operation policy
 /// snapshot: a [`VerificationPolicy`](crate::policy::VerificationPolicy) for
@@ -1579,8 +1584,9 @@ pub(crate) fn enveloped_signature_for_reference<'a, E, I: Instruction>(
 pub(crate) struct TransformDependencyOutput {
     pub(crate) dependencies: Set<usize>,
     /// The output's digest, present when the execution proved the output
-    /// independent of every tracked field, so a later execution would repeat it.
-    pub(crate) digest: Option<super::DigestOutput>,
+    /// independent of every tracked field, so a later execution would repeat
+    /// it; with the bytes it covered when the request retains them.
+    pub(crate) digest: Option<ReferenceDigest>,
 }
 
 struct TransformChainOutput<T> {
@@ -1925,7 +1931,7 @@ impl TransformTerminal<Native> for CollectTerminal {
 struct AnalysisTerminal<'p>(Option<DigestRequest<'p>>);
 #[cfg(feature = "xmldsig-sign")]
 impl TransformTerminal<Native> for AnalysisTerminal<'_> {
-    type Output = Option<super::DigestOutput>;
+    type Output = Option<ReferenceDigest>;
     type Error = ReferenceDigestError;
 
     fn settle(&mut self, independent: bool) {
@@ -1946,11 +1952,7 @@ impl TransformTerminal<Native> for AnalysisTerminal<'_> {
         budget: &TransformExecutionBudget,
     ) -> Result<Self::Output, ReferenceDigestError> {
         self.0
-            .map(|request| {
-                DigestTerminal(request)
-                    .finish(data, explicit, budget)
-                    .map(|digest| digest.digest)
-            })
+            .map(|request| DigestTerminal(request).finish(data, explicit, budget))
             .transpose()
     }
 
@@ -1961,11 +1963,7 @@ impl TransformTerminal<Native> for AnalysisTerminal<'_> {
         scratch: &Native,
     ) -> Result<Self::Output, ReferenceDigestError> {
         self.0
-            .map(|request| {
-                DigestTerminal(request)
-                    .finish_base64(data, budget, scratch)
-                    .map(|digest| digest.digest)
-            })
+            .map(|request| DigestTerminal(request).finish_base64(data, budget, scratch))
             .transpose()
     }
 }
@@ -1996,8 +1994,35 @@ pub(crate) struct DigestRequest<'p> {
     pub(crate) provider: &'p dyn crate::provider::CryptoProvider,
     pub(crate) algorithm: super::DigestAlgorithm,
     pub(crate) retain_pre_digest: bool,
+    /// The account retained octets are charged to before each is copied.
+    pub(crate) retention: RetainedCharge<'p>,
     /// Whether no data at all is digested or refused.
     pub(crate) empty_input: crate::policy::EmptyDigestInput,
+}
+
+/// Where retained digest input is charged, before it is copied.
+#[derive(Clone, Copy)]
+pub(crate) enum RetainedCharge<'p> {
+    /// Octets the chain did not canonicalize are charged to its
+    /// canonicalization output, as signing keeps its inputs within that one
+    /// account; canonicalized octets are charged there as work already.
+    #[cfg(feature = "xmldsig-sign")]
+    Uncanonicalized,
+    /// Every retained octet is charged to this account, as verification
+    /// keeps its diagnostic copies within its own budget.
+    Every(&'p dyn Fn(usize) -> Result<(), crate::policy::PolicyViolation>),
+}
+
+impl RetainedCharge<'_> {
+    /// Whether octets the chain did not canonicalize go to its
+    /// canonicalization output.
+    const fn uncanonicalized(self) -> bool {
+        match self {
+            #[cfg(feature = "xmldsig-sign")]
+            Self::Uncanonicalized => true,
+            Self::Every(_) => false,
+        }
+    }
 }
 
 /// Digest input is passed to the provider in blocks of this size: the
@@ -2005,33 +2030,52 @@ pub(crate) struct DigestRequest<'p> {
 /// dynamic dispatch or, for a token, a module call.
 const DIGEST_BLOCK: usize = 4096;
 
-/// Feeds final bytes to the digest as they are produced. A provider refusal is
-/// kept as the sticky cause; the serializer only sees an I/O stop.
+/// Feeds final bytes to the digest as they are produced. A provider or
+/// retention refusal is kept as the sticky cause; the serializer only sees an
+/// I/O stop.
 struct DigestWriter<'p> {
     state: Box<dyn crate::provider::DigestState + 'p>,
     block: [u8; DIGEST_BLOCK],
     pending: usize,
     retained: Option<Vec<u8>>,
+    /// Charged for each retained chunk before it is copied.
+    charge: Option<&'p dyn Fn(usize) -> Result<(), crate::policy::PolicyViolation>>,
     written: usize,
-    failure: Option<crate::provider::ProviderError>,
+    failure: Option<ReferenceDigestError>,
 }
 
 impl<'p> DigestWriter<'p> {
-    fn new(state: Box<dyn crate::provider::DigestState + 'p>, retain: bool) -> Self {
+    fn new(
+        state: Box<dyn crate::provider::DigestState + 'p>,
+        retain: bool,
+        retention: RetainedCharge<'p>,
+    ) -> Self {
         Self {
             state,
             block: [0; DIGEST_BLOCK],
             pending: 0,
             retained: retain.then(Vec::new),
+            charge: match retention {
+                #[cfg(feature = "xmldsig-sign")]
+                RetainedCharge::Uncanonicalized => None,
+                RetainedCharge::Every(charge) => retain.then_some(charge),
+            },
             written: 0,
             failure: None,
         }
     }
 
-    fn absorb(&mut self, mut bytes: &[u8]) -> Result<(), crate::provider::ProviderError> {
+    fn absorb(&mut self, bytes: &[u8]) -> Result<(), ReferenceDigestError> {
         if let Some(retained) = &mut self.retained {
+            if let Some(charge) = self.charge {
+                charge(bytes.len()).map_err(TransformError::from)?;
+            }
             retained.extend_from_slice(bytes);
         }
+        self.digest(bytes).map_err(ReferenceDigestError::Provider)
+    }
+
+    fn digest(&mut self, mut bytes: &[u8]) -> Result<(), crate::provider::ProviderError> {
         // Serializer output is bounded by the remaining canonical budget.
         self.written += bytes.len();
         if self.pending > 0 {
@@ -2067,7 +2111,7 @@ impl<'p> DigestWriter<'p> {
 }
 
 // The serializer stops at the refusal; the terminal reports the retained
-// provider failure instead of the serializer's error.
+// provider or retention failure instead of the serializer's error.
 impl c14n::sink::ByteSink for DigestWriter<'_> {
     fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), c14n::C14nError> {
         self.absorb(bytes).map_err(|error| {
@@ -2107,15 +2151,23 @@ impl TransformTerminal<Native> for DigestTerminal<'_> {
             provider,
             algorithm,
             retain_pre_digest,
+            retention,
             empty_input,
         } = self.0;
         let mut sink = DigestWriter::new(
             super::digest::begin_digest(provider, algorithm, &budget.digest_memory)
                 .map_err(ReferenceDigestError::Provider)?,
             retain_pre_digest,
+            retention,
         );
         if let Some(bytes) = data.binary() {
-            sink.absorb(bytes).map_err(ReferenceDigestError::Provider)?;
+            if retain_pre_digest && retention.uncanonicalized() {
+                budget
+                    .c14n
+                    .charge(bytes.len())
+                    .map_err(TransformError::from)?;
+            }
+            sink.absorb(bytes)?;
         } else {
             let nodes = data.nodes().expect("execution has nodes or bytes");
             let implicit;
@@ -2136,7 +2188,7 @@ impl TransformTerminal<Native> for DigestTerminal<'_> {
                 &Native,
             );
             if let Some(error) = sink.failure.take() {
-                return Err(ReferenceDigestError::Provider(error));
+                return Err(error);
             }
             result.map_err(|error| map_c14n_limit_error(error, &budget.c14n))?;
             budget
@@ -2163,16 +2215,25 @@ impl TransformTerminal<Native> for DigestTerminal<'_> {
             provider,
             algorithm,
             retain_pre_digest,
+            retention,
             empty_input,
         } = self.0;
         let mut sink = DigestWriter::new(
             super::digest::begin_digest(provider, algorithm, &budget.digest_memory)
                 .map_err(ReferenceDigestError::Provider)?,
             retain_pre_digest,
+            retention,
         );
+        let charge_retained = retain_pre_digest && retention.uncanonicalized();
         let mut absorb = |decoded: &[u8]| -> Result<(), ReferenceDigestError> {
             budget.base64.charge_output(decoded.len())?;
-            sink.absorb(decoded).map_err(ReferenceDigestError::Provider)
+            if charge_retained {
+                budget
+                    .c14n
+                    .charge(decoded.len())
+                    .map_err(TransformError::from)?;
+            }
+            sink.absorb(decoded)
         };
         let mut stream = super::base64_stream::Base64Stream::new();
         for_each_base64_input(data.binary(), data.nodes(), scratch, |encoded| {

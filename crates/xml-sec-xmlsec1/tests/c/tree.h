@@ -31,6 +31,7 @@
 #define xsNewDocNode xmlNewDocNode
 #define xsNodeGetContent xmlNodeGetContent
 #define xsFreeNode xmlFreeNode
+#define xsUnlinkNode xmlUnlinkNode
 #define xsFreeNodeList xmlFreeNodeList
 #define xsNewDocText xmlNewDocText
 #define xsSearchNs xmlSearchNs

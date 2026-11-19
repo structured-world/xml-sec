@@ -133,6 +133,36 @@ fn base64_first_decodes_the_text_of_xml_input() {
     }
 }
 
+/// A transform read from its node keeps the operation its klass's
+/// initializer chose: the public readers name none, so a Base64 transform
+/// read from XML decodes, as libxmlsec1's reader leaves it.
+#[test]
+fn a_transform_read_from_xml_keeps_its_klass_operation() {
+    let xml = br#"<Transform xmlns="http://www.w3.org/2000/09/xmldsig#" Algorithm="http://www.w3.org/2000/09/xmldsig#base64"/>"#;
+    // SAFETY: the document and context are used while live.
+    unsafe {
+        assert_eq!(xmlSecTransformIdsInit(), 0);
+        let doc = crate::ffi::parser::xmlSecParseMemory(xml.as_ptr(), xml.len(), 0);
+        assert!(!doc.is_null());
+        let ctx = xmlSecTransformCtxCreate();
+        let transform = super::ctx::xmlSecTransformCtxNodeRead(
+            ctx,
+            nodes::first_child(doc),
+            USAGE_DSIG_TRANSFORM,
+        );
+        assert!(!transform.is_null());
+        assert_eq!((*transform).operation, OPERATION_DECODE);
+        assert_eq!(xmlSecTransformCtxBinaryExecute(ctx, b"QQ==".as_ptr(), 4), 0);
+        let result = (*ctx).result;
+        let text =
+            std::slice::from_raw_parts(xmlSecBufferGetData(result), xmlSecBufferGetSize(result));
+        assert_eq!(text, b"A");
+        xmlSecTransformCtxDestroy(ctx);
+        xml_sec_libxml2::document::free(doc);
+        xmlSecTransformIdsShutdown();
+    }
+}
+
 /// Adjacent text and CDATA nodes of a tree are one text node in the
 /// canonical form (Canonical XML 1.0 section 2.1): the whole document
 /// canonicalizes, and a node set selecting only part of that text is refused
@@ -369,6 +399,36 @@ fn base64_output_is_bounded_per_run() {
     let raw = vec![0u8; limit / 9 * 4];
     assert_eq!(run(&[OPERATION_ENCODE], &raw), 0);
     assert_eq!(run(&[OPERATION_ENCODE, OPERATION_DECODE], &raw), -1);
+}
+
+/// A Base64 limit refusing work spends the operation's budget: the run is
+/// marked so the work it is part of (a key read trying recipients in turn)
+/// ends rather than trying more under the same allowance.
+#[test]
+fn a_base64_limit_refusal_ends_the_operation() {
+    let limit = crate::ffi::policy::verification()
+        .expect("the library policy compiles")
+        .resources
+        .max_base64_transform_output_bytes;
+    // SAFETY: the context and its transform are used while live.
+    unsafe {
+        let ctx = xmlSecTransformCtxCreate();
+        assert!(!xmlSecTransformCtxCreateAndAppend(ctx, base64()).is_null());
+        let input = b"AAAA".repeat(limit / 3 + 1);
+        assert_eq!(
+            xmlSecTransformCtxBinaryExecute(ctx, input.as_ptr(), input.len()),
+            -1
+        );
+        assert_eq!(
+            super::ctx::run_budget(ctx).refused_by,
+            Some(super::ctx::Limit {
+                name: "max_base64_transform_output_bytes",
+                max: limit,
+            }),
+            "the refusal ends the operation, naming its limit"
+        );
+        xmlSecTransformCtxDestroy(ctx);
+    }
 }
 
 /// Base64 input of one run is bounded by the policy even when it decodes

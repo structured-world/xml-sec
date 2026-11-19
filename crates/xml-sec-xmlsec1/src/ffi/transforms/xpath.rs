@@ -566,6 +566,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformXPointerSetExpr(
             -1
         );
         let location = here!("xmlSecTransformXPointerSetExpr");
+        super::ctx::note_setting_change(transform);
         // SAFETY: by the caller's contract.
         unsafe {
             let name = name_of(transform);
@@ -775,6 +776,11 @@ unsafe extern "C" fn execute(
         )
     };
     if super::ctx::charge(spent, count, limit, here, name).is_none() {
+        // The operation's budget is spent: its other parts end too.
+        // SAFETY: an initialized context.
+        unsafe { super::ctx::run_budget(ctx) }
+            .refused_by
+            .get_or_insert(limit);
         return -1;
     }
     // SAFETY: an expression transform read from a live element.
@@ -1017,6 +1023,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformVisa3DHackSetID(
             c"(*idPtr) == NULL",
             -1
         );
+        super::ctx::note_setting_change(transform);
         // SAFETY: `id` is NUL-terminated; the copy holds its bytes.
         unsafe {
             let bytes = CStr::from_ptr(id.cast()).to_bytes_with_nul();

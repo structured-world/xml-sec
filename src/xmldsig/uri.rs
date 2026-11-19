@@ -80,9 +80,20 @@ fn invalid_fragment() -> TransformError {
     TransformError::InvalidFragment
 }
 
+/// Whether an external `uri` selects part of its resource. An external
+/// resource is octets: a non-empty fragment would select part of it, which
+/// `XMLDSig` 1.1 section 4.4.3.2 leaves optional, so it is refused rather than
+/// silently covering the whole resource. An empty fragment names the whole
+/// resource (RFC 3986 section 4.1).
+fn selects_external_fragment(uri: &str) -> bool {
+    uri.split_once('#')
+        .is_some_and(|(_, fragment)| !fragment.is_empty())
+}
+
 pub(crate) enum UriFailureKind {
     MissingId,
     Unsupported,
+    ExternalFragment,
 }
 
 pub(crate) trait UriScratch: Scratch {
@@ -94,6 +105,9 @@ impl UriScratch for Native {
         match kind {
             UriFailureKind::MissingId => TransformError::ElementNotFound(parts.concat()),
             UriFailureKind::Unsupported => TransformError::UnsupportedUri(parts.concat()),
+            UriFailureKind::ExternalFragment => {
+                TransformError::ExternalResourceFragment(parts.concat())
+            }
         }
     }
 }
@@ -107,6 +121,9 @@ impl<W: structured_asn1::memory::Work> UriScratch for Accounted<'_, W> {
                 }
                 UriFailureKind::Unsupported => {
                     TransformError::AccountedUnsupportedUri(text.into_owned())
+                }
+                UriFailureKind::ExternalFragment => {
+                    TransformError::AccountedExternalResourceFragment(text.into_owned())
                 }
             },
             Err(cause) => cause.into(),
@@ -160,11 +177,187 @@ pub(crate) fn validate_signing_reference_request(
     Ok(())
 }
 
+/// External resources a caller supplies on demand: the operation asks
+/// `source` for the octets under one of the caller's `keys` only when it
+/// dereferences that resource, and keeps them once fetched. A resource
+/// longer than the operation can take is refused without being kept, and
+/// that refusal ends the operation: no later resource is fetched. A
+/// verification that fails
+/// on its `SignatureValue` dereferences no reference, so a forged signature
+/// makes the caller fetch nothing it names.
+///
+/// Keys are the resolved URI identities
+/// [`UriReferenceResolver::external_resource_key`] yields; a key the caller
+/// did not list, or one `source` answers with `None`, is unavailable, as a
+/// key absent from a resource map is. The octets are bounded by the
+/// operation's external-resource limits when they are used, so a resource is
+/// fetched only once the ones before it fit. Key material a `KeyInfo` names
+/// (an external `KeyInfoReference` or `RetrievalMethod`) is read before the
+/// `SignatureValue` is checked and so never comes from this source; a
+/// verifier that needs it supplies a resource map instead.
+///
+/// # Examples
+///
+/// ```
+/// use xml_sec::xmldsig::uri::LazyExternalResources;
+///
+/// let fetch = |uri: &str, _most: usize| (uri == "urn:payload").then(|| b"payload".to_vec());
+/// let resources = LazyExternalResources::new(["urn:payload".to_owned()], &fetch);
+/// assert_eq!(resources.len(), 1);
+/// ```
+pub struct LazyExternalResources<'s> {
+    slots: BTreeMap<String, core::cell::OnceCell<Option<Vec<u8>>>>,
+    source: &'s dyn Fn(&str, usize) -> Option<Vec<u8>>,
+}
+
+impl<'s> LazyExternalResources<'s> {
+    /// Resources under `keys`, each fetched from `source` when first used.
+    /// `source` is told the most octets the operation can still take of the
+    /// resource: it may stop reading one octet past them, as a longer
+    /// resource is refused whatever its length and its octets are not kept.
+    #[must_use]
+    pub fn new(
+        keys: impl IntoIterator<Item = String>,
+        source: &'s dyn Fn(&str, usize) -> Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            slots: keys
+                .into_iter()
+                .map(|key| (key, core::cell::OnceCell::new()))
+                .collect(),
+            source,
+        }
+    }
+
+    /// How many resources the caller listed.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Whether the caller listed no resource.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// The listed key `uri` and its octets, fetched on first use for an
+    /// operation that can take `most` of them; `Err` with the length of a
+    /// resource longer than that, whose octets are dropped, never kept.
+    fn get_key_value(&self, uri: &str, most: usize) -> Result<Option<(&str, &[u8])>, usize> {
+        let Some((key, slot)) = self.slots.get_key_value(uri) else {
+            return Ok(None);
+        };
+        if slot.get().is_none() {
+            let fetched = (self.source)(key, most);
+            if let Some(bytes) = &fetched
+                && bytes.len() > most
+            {
+                return Err(bytes.len());
+            }
+            slot.get_or_init(|| fetched);
+        }
+        Ok(slot
+            .get()
+            .and_then(|bytes| bytes.as_deref())
+            .map(|bytes| (key.as_str(), bytes)))
+    }
+
+    /// The address of the listed key `uri`'s slot, which names the resource
+    /// for the whole operation without fetching it: the set stays borrowed
+    /// and unchanged while the operation runs.
+    fn slot_address(&self, uri: &str) -> Option<usize> {
+        self.slots
+            .get(uri)
+            .map(|slot| core::ptr::from_ref(slot).addr())
+    }
+
+    /// The octets of `uri` if an earlier use fetched them; never fetches.
+    fn fetched(&self, uri: &str) -> Option<&[u8]> {
+        self.slots.get(uri)?.get()?.as_deref()
+    }
+}
+
+/// The external resources of an operation: bytes the caller supplied up
+/// front, or a [`LazyExternalResources`] that fetches them when used.
+#[derive(Clone, Copy)]
+pub(crate) enum ExternalResourceSet<'a> {
+    Map(&'a BTreeMap<String, Vec<u8>>),
+    Lazy(&'a LazyExternalResources<'a>),
+}
+
+impl<'a> ExternalResourceSet<'a> {
+    /// The key `uri` and its octets; a lazy resource is fetched here for an
+    /// operation that can take `most` of them.
+    fn get_key_value(self, uri: &str, most: usize) -> Result<Option<(&'a str, &'a [u8])>, usize> {
+        match self {
+            Self::Map(resources) => Ok(resources
+                .get_key_value(uri)
+                .map(|(key, bytes)| (key.as_str(), bytes.as_slice()))),
+            Self::Lazy(resources) => resources.get_key_value(uri, most),
+        }
+    }
+
+    /// The octets of `uri` already at hand: supplied up front, or fetched by
+    /// an earlier dereference; never fetches.
+    fn at_hand(self, uri: &str) -> Option<&'a [u8]> {
+        match self {
+            Self::Map(resources) => resources.get(uri).map(Vec::as_slice),
+            Self::Lazy(resources) => resources.fetched(uri),
+        }
+    }
+
+    /// The octets of `uri` when the caller supplied them up front. Key
+    /// material is read before the `SignatureValue` is checked, so it never
+    /// comes from a lazy set, whose source is asked only for authenticated
+    /// references.
+    fn key_material(self, uri: &str) -> Option<&'a [u8]> {
+        match self {
+            Self::Map(resources) => resources.get(uri).map(Vec::as_slice),
+            Self::Lazy(_) => None,
+        }
+    }
+
+    /// Where `uri`'s resource lives and how long it is, for an identity
+    /// that never reads or fetches its bytes; the length of a lazy resource
+    /// is unknown until it is fetched.
+    fn location(self, uri: &str) -> Option<(usize, usize)> {
+        match self {
+            Self::Map(resources) => resources
+                .get(uri)
+                .map(|bytes| (bytes.as_ptr().addr(), bytes.len())),
+            Self::Lazy(resources) => resources.slot_address(uri).map(|address| (address, 0)),
+        }
+    }
+
+    /// The address of the caller's set, which stays borrowed for the whole
+    /// operation and so identifies its bytes without reading them.
+    fn address(self) -> usize {
+        match self {
+            Self::Map(resources) => core::ptr::from_ref(resources).addr(),
+            Self::Lazy(resources) => core::ptr::from_ref(resources).addr(),
+        }
+    }
+
+    /// The bytes supplied up front, validated before any is used; a lazy
+    /// set is bounded as each resource is used.
+    pub(crate) fn supplied(self) -> Option<&'a BTreeMap<String, Vec<u8>>> {
+        match self {
+            Self::Map(resources) => Some(resources),
+            Self::Lazy(_) => None,
+        }
+    }
+}
+
 /// External resource byte limits: one resource, and all of them together.
 struct ExternalResourceBudget {
     remaining_total: Cell<usize>,
     per_resource: usize,
     total: usize,
+    /// The first limit that refused a resource, as `(resource, maximum,
+    /// actual)`: a refusal ends the operation, so no later resource is
+    /// fetched and every later lookup reports it.
+    refused: Cell<Option<(&'static str, usize, usize)>>,
 }
 
 pub(crate) enum ExternalResourceMapError {
@@ -246,7 +439,7 @@ impl<'a> ExternalResourceContext<'a> {
     {
         let mut resolver = UriReferenceResolver::with_id_registrations(doc, registrations)
             .with_same_document_id_semantics(same_document_id_semantics);
-        resolver.external_resources = self.resources;
+        resolver.external_resources = self.resources.map(ExternalResourceSet::Map);
         resolver.external_resource_budget = Rc::clone(&self.budget);
         resolver
     }
@@ -267,27 +460,55 @@ impl ExternalResourceBudget {
             remaining_total: Cell::new(max_total_bytes),
             per_resource: max_resource_bytes,
             total: max_total_bytes,
+            refused: Cell::new(None),
         }
     }
 
-    fn charge(&self, bytes: usize) -> Result<(), TransformError> {
-        if bytes > self.per_resource {
-            return Err(transform_resource_limit(
+    /// Refuses a lookup before its bytes are fetched once a limit refused
+    /// one; nothing is measured again, the first refusal is reported.
+    fn admit(&self) -> Result<(), TransformError> {
+        if let Some((resource, maximum, actual)) = self.refused.get() {
+            return Err(transform_resource_limit(resource, maximum, actual));
+        }
+        Ok(())
+    }
+
+    /// The most octets one more resource can have within both limits.
+    fn allowance(&self) -> usize {
+        self.per_resource.min(self.remaining_total.get())
+    }
+
+    /// Records the refusal of a resource of `bytes` octets past the
+    /// [`Self::allowance`], which ends the operation's fetching.
+    fn refuse(&self, bytes: usize) -> TransformError {
+        let refusal = if bytes > self.per_resource {
+            (
                 crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
                 self.per_resource,
                 bytes,
-            ));
-        }
-        let remaining = self.remaining_total.get();
-        let Some(next) = remaining.checked_sub(bytes) else {
-            self.remaining_total.set(0);
-            return Err(transform_resource_limit(
+            )
+        } else {
+            // `bytes` exceeds what remains of the total here; the reported
+            // total is a diagnostic, capped at the largest value it can name.
+            let remaining = self.remaining_total.get();
+            (
                 crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
                 self.total,
-                self.total.saturating_add(bytes.saturating_sub(remaining)),
-            ));
+                self.total.saturating_add(bytes - remaining),
+            )
         };
-        self.remaining_total.set(next);
+        self.remaining_total.set(0);
+        self.refused.set(Some(refusal));
+        let (resource, maximum, actual) = refusal;
+        transform_resource_limit(resource, maximum, actual)
+    }
+
+    fn charge(&self, bytes: usize) -> Result<(), TransformError> {
+        if bytes > self.allowance() {
+            return Err(self.refuse(bytes));
+        }
+        // Within the allowance, so within what remains of the total.
+        self.remaining_total.set(self.remaining_total.get() - bytes);
         Ok(())
     }
 }
@@ -319,7 +540,7 @@ pub struct UriReferenceResolver<'a> {
     resource_identity: Option<String>,
     id_registrations: Vec<crate::IdAttributeRegistration>,
     id_index: ResolverIdIndex<'a>,
-    external_resources: Option<&'a BTreeMap<String, Vec<u8>>>,
+    external_resources: Option<ExternalResourceSet<'a>>,
     external_resource_budget: Rc<ExternalResourceBudget>,
     same_document_id_semantics: SameDocumentIdSemantics,
 }
@@ -508,8 +729,47 @@ impl<'a> UriReferenceResolver<'a> {
     /// query and fragment suffixes are retained.
     #[must_use]
     pub fn with_external_resources(mut self, resources: &'a BTreeMap<String, Vec<u8>>) -> Self {
+        self.external_resources = Some(ExternalResourceSet::Map(resources));
+        self
+    }
+
+    /// Attach caller-supplied external resources fetched only when a
+    /// reference is dereferenced; see [`LazyExternalResources`].
+    #[must_use]
+    pub fn with_lazy_external_resources(
+        mut self,
+        resources: &'a LazyExternalResources<'a>,
+    ) -> Self {
+        self.external_resources = Some(ExternalResourceSet::Lazy(resources));
+        self
+    }
+
+    /// Attach the operation's external resources, supplied or lazy.
+    pub(crate) fn with_external_resource_set(mut self, resources: ExternalResourceSet<'a>) -> Self {
         self.external_resources = Some(resources);
         self
+    }
+
+    /// The key under which a caller-owned external-resource map
+    /// ([`Self::with_external_resources`]) holds the resource the external
+    /// reference `uri` names from `origin`, the element that carries it:
+    /// `uri` resolved against the XML Base `origin` inherits (RFC 3986
+    /// section 5.2), dot segments removed, query and fragment kept, within
+    /// the XML Base limits of `resources`.
+    ///
+    /// # Errors
+    /// [`TransformError`] when the resolution exceeds those limits.
+    pub fn external_resource_key(
+        origin: Node<'_, '_>,
+        uri: &str,
+        resources: &crate::policy::ResourcePolicy,
+    ) -> Result<String, TransformError> {
+        let budget = XmlBaseResolutionBudget::with_limits(
+            resources.max_xml_base_components,
+            resources.max_xml_base_resolution_bytes,
+        );
+        resolve_uri_from_node_with_budget(origin, uri, &budget)
+            .map_err(map_xml_base_resolution_error)
     }
 
     pub(crate) fn with_external_resource_limits(
@@ -524,10 +784,56 @@ impl<'a> UriReferenceResolver<'a> {
         self
     }
 
+    /// The caller-supplied resource for `uri` with its stored key, charged to
+    /// the external-resource budget.
+    fn charged_resource(&self, uri: &str) -> Result<Option<(&'a str, &'a [u8])>, TransformError> {
+        if selects_external_fragment(uri) {
+            return Err(Native.diagnostic(UriFailureKind::ExternalFragment, &[uri]));
+        }
+        self.external_resource_budget.admit()?;
+        let most = self.external_resource_budget.allowance();
+        let found = match self.external_resources {
+            Some(resources) => resources
+                .get_key_value(uri, most)
+                .map_err(|length| self.external_resource_budget.refuse(length))?,
+            None => None,
+        };
+        let Some((uri, bytes)) = found else {
+            return Ok(None);
+        };
+        self.external_resource_budget.charge(bytes.len())?;
+        Ok(Some((uri, bytes)))
+    }
+
+    #[cfg(feature = "xmlenc")]
     pub(crate) fn external_resource(&self, uri: &str) -> Result<Option<&'a [u8]>, TransformError> {
+        Ok(self.charged_resource(uri)?.map(|(_, bytes)| bytes))
+    }
+
+    fn external_resource_input(
+        &self,
+        uri: &str,
+    ) -> Result<Option<ReferenceInput<'a>>, TransformError> {
+        Ok(self
+            .charged_resource(uri)?
+            .map(|(uri, bytes)| ReferenceInput::Binary { bytes, uri }))
+    }
+
+    /// The external resource `uri` names as key material (an external
+    /// `KeyInfoReference` or `RetrievalMethod`), charged like any external
+    /// resource; only bytes supplied up front are key material.
+    pub(crate) fn key_material_resource(
+        &self,
+        uri: &str,
+    ) -> Result<Option<&'a [u8]>, TransformError> {
+        // The whole resource is not the part a fragment selects.
+        if selects_external_fragment(uri) {
+            return Err(Native.diagnostic(UriFailureKind::ExternalFragment, &[uri]));
+        }
+        self.external_resource_budget.admit()?;
         let Some(bytes) = self
             .external_resources
-            .and_then(|resources| resources.get(uri))
+            .and_then(|resources| resources.key_material(uri))
         else {
             return Ok(None);
         };
@@ -535,52 +841,40 @@ impl<'a> UriReferenceResolver<'a> {
         Ok(Some(bytes))
     }
 
-    fn external_resource_input(
-        &self,
-        uri: &str,
-    ) -> Result<Option<ReferenceInput<'a>>, TransformError> {
-        let Some((uri, bytes)) = self
-            .external_resources
-            .and_then(|resources| resources.get_key_value(uri))
-        else {
-            return Ok(None);
-        };
-        self.external_resource_budget.charge(bytes.len())?;
-        Ok(Some(ReferenceInput::Binary { bytes, uri }))
-    }
-
+    /// The identity of the resource `uri` names, planned without reading or
+    /// fetching it: a lazy resource is fetched, and charged, only when its
+    /// reference is dereferenced.
     pub(crate) fn external_resource_identity(
         &self,
         uri: &str,
     ) -> Option<crate::operation::OperationResourceIdentity> {
         self.external_resources
-            .and_then(|resources| resources.get(uri))
-            .map(
-                |bytes| crate::operation::OperationResourceIdentity::BorrowedExternal {
+            .and_then(|resources| resources.location(uri))
+            .map(|(address, length)| {
+                crate::operation::OperationResourceIdentity::BorrowedExternal {
                     uri: uri.to_owned(),
-                    address: bytes.as_ptr().addr(),
-                    length: bytes.len(),
-                },
-            )
+                    address,
+                    length,
+                }
+            })
     }
 
-    /// SHA-256 identity of the bytes mapped to `uri`.
+    /// SHA-256 identity of the bytes mapped to `uri`, when they are at hand;
+    /// a lazy resource no reference dereferenced has none.
     pub(crate) fn external_resource_fingerprint(&self, uri: &str) -> Option<[u8; 32]> {
         use sha2::Digest as _;
 
         self.external_resources
-            .and_then(|resources| resources.get(uri))
+            .and_then(|resources| resources.at_hand(uri))
             .map(|bytes| sha2::Sha256::digest(bytes).into())
     }
 
     pub(crate) fn external_resource_set_identity(
         &self,
     ) -> crate::operation::OperationResourceIdentity {
-        // The map stays immutably borrowed for the whole operation, so its
-        // address identifies its bytes without reading them.
         crate::operation::OperationResourceIdentity::BorrowedResourceSet(
             self.external_resources
-                .map_or(0, |resources| core::ptr::from_ref(resources).addr()),
+                .map_or(0, ExternalResourceSet::address),
         )
     }
 
@@ -629,7 +923,7 @@ impl<'a> UriReferenceResolver<'a> {
         }
         let resolved = resolve_uri_from_node_with_budget(origin, uri, xml_base_budget)
             .map_err(map_xml_base_resolution_error)?;
-        self.dereference_with_budget(&resolved, budget)
+        self.dereference_external(&resolved)
     }
 
     /// Preserve an admitted external lookup's absence. Unsupported fragment
@@ -674,6 +968,10 @@ impl<'a> UriReferenceResolver<'a> {
         scratch
             .charge(resolved.len())
             .map_err(map_xml_base_execution_error)?;
+        if selects_external_fragment(resolved) {
+            // The diagnostic stays charged to the replay's scratch.
+            return Err(scratch.diagnostic(UriFailureKind::ExternalFragment, &[resolved]));
+        }
         self.external_resource_input(resolved)
     }
 
@@ -699,13 +997,20 @@ impl<'a> UriReferenceResolver<'a> {
         } else if let Some(fragment) = uri.strip_prefix('#') {
             self.dereference_fragment(fragment, budget)
         } else {
-            self.external_resource_input(uri)?
-                .map(|input| match input {
-                    ReferenceInput::Binary { bytes, uri } => TransformData::Resource { bytes, uri },
-                    ReferenceInput::Xml { .. } => unreachable!("external resources are octets"),
-                })
-                .ok_or_else(|| TransformError::ExternalResourceUnavailable(uri.to_string()))
+            self.dereference_external(uri)
         }
+    }
+
+    /// The caller-supplied resource an external reference names by `uri`,
+    /// whatever form `uri` took once resolved: a resolution that leaves only
+    /// a fragment still selects part of that resource, not of this document.
+    fn dereference_external(&self, uri: &str) -> Result<TransformData<'a>, TransformError> {
+        self.external_resource_input(uri)?
+            .map(|input| match input {
+                ReferenceInput::Binary { bytes, uri } => TransformData::Resource { bytes, uri },
+                ReferenceInput::Xml { .. } => unreachable!("external resources are octets"),
+            })
+            .ok_or_else(|| TransformError::ExternalResourceUnavailable(uri.to_string()))
     }
 
     /// Resolve a URI fragment (the part after `#`).
@@ -1630,6 +1935,95 @@ mod tests {
     }
 
     #[test]
+    fn key_material_refuses_a_fragment_of_an_external_resource() {
+        // A fragment selects part of a resource, so the whole resource is
+        // not the key material it names, even under an exact map key.
+        let doc = Document::parse("<root/>").unwrap();
+        let resources = BTreeMap::from([("urn:cert#part".to_owned(), vec![0x30, 0x00])]);
+        let resolver = UriReferenceResolver::new(&doc).with_external_resources(&resources);
+        assert!(matches!(
+            resolver.key_material_resource("urn:cert#part"),
+            Err(TransformError::ExternalResourceFragment(_))
+        ));
+        let resources = BTreeMap::from([("urn:cert".to_owned(), vec![0x30, 0x00])]);
+        let resolver = UriReferenceResolver::new(&doc).with_external_resources(&resources);
+        assert_eq!(
+            resolver.key_material_resource("urn:cert").unwrap(),
+            Some(&[0x30, 0x00][..])
+        );
+    }
+
+    #[test]
+    fn no_resource_is_fetched_once_the_aggregate_limit_refused_one() {
+        // The aggregate allowance is the operation's: once a resource passes
+        // it, every later lookup is refused before the caller is asked for
+        // bytes, whichever signature of a batch makes it.
+        let fetched = core::cell::Cell::new(0_usize);
+        let fetch = |_: &str, _: usize| {
+            fetched.set(fetched.get() + 1);
+            Some(vec![0; 8])
+        };
+        let resources =
+            LazyExternalResources::new(["urn:first".to_owned(), "urn:second".to_owned()], &fetch);
+        let doc = Document::parse("<root/>").unwrap();
+        let resolver = UriReferenceResolver::new(&doc)
+            .with_lazy_external_resources(&resources)
+            .with_external_resource_limits(8, 4);
+        assert!(resolver.dereference("urn:first").is_err());
+        assert_eq!(fetched.get(), 1);
+        // The later refusal reports the total that passed the allowance,
+        // 4 + (8 - 4), not a new measurement.
+        assert!(matches!(
+            resolver.dereference("urn:second"),
+            Err(TransformError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    maximum: 4,
+                    actual: 8,
+                    ..
+                }
+            ))
+        ));
+        assert_eq!(fetched.get(), 1, "nothing is fetched past the refusal");
+    }
+
+    #[test]
+    fn external_fragment_diagnostic_obeys_current_capacity() {
+        // The refused URI is attacker-controlled text too: the diagnostic is
+        // charged to the query as the resolution was, so it fails when the
+        // query cannot retain it rather than escaping as an uncharged String.
+        use crate::c14n::scratch::Accounted;
+        use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
+        let doc = Document::parse("<root/>").unwrap();
+        let resolver = UriReferenceResolver::new(&doc);
+        let uri = format!("urn:doc#{}", "x".repeat(600));
+        let work = Memory::new(std::sync::Arc::new(MemoryAccount::new(1024, 1 << 22)));
+        assert!(matches!(
+            resolver.replay_input_from_with_budget(
+                &uri,
+                doc.root_element(),
+                &NodeSetMaterializationBudget::default(),
+                &XmlBaseResolutionBudget::default(),
+                &Accounted(&work),
+            ),
+            Err(TransformError::C14n(
+                crate::c14n::C14nError::SharedExecution(MemoryError::LimitExceeded)
+            ))
+        ));
+        assert_eq!(work.used(), 0);
+        let work = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 16, 1 << 22)));
+        assert!(matches!(
+            resolver.replay_input_from_with_budget(
+                &uri,
+                doc.root_element(),
+                &NodeSetMaterializationBudget::default(),
+                &XmlBaseResolutionBudget::default(),
+                &Accounted(&work),
+            ),
+            Err(TransformError::AccountedExternalResourceFragment(_))
+        ));
+    }
+
+    #[test]
     fn external_uri_without_caller_bytes_is_unavailable() {
         // No I/O: an external URI resolves only from caller-supplied bytes,
         // and their absence is reported as such, not as an unsupported URI.
@@ -1816,6 +2210,42 @@ mod tests {
             .expect("the normalized resource key must resolve without xml:base");
 
         assert_eq!(data.into_binary().unwrap(), b"payload");
+    }
+
+    #[test]
+    fn a_fragment_of_an_external_resource_is_refused() {
+        // An external resource is octets: a reference selecting part of one
+        // is refused rather than covering the whole resource, even when the
+        // caller supplied bytes under the full URI (XMLDSig 1.1 section
+        // 4.4.3.2 leaves external fragments optional).
+        let xml = r#"<root><reference URI="https://example.test/data.xml#chapter1"/></root>"#;
+        let doc = Document::parse(xml).unwrap();
+        let reference = doc
+            .descendants()
+            .find(|node| node.has_tag_name("reference"))
+            .unwrap();
+        let resources = BTreeMap::from([(
+            "https://example.test/data.xml#chapter1".to_owned(),
+            b"<doc><chapter id='chapter1'/></doc>".to_vec(),
+        )]);
+        let budget = NodeSetMaterializationBudget::default();
+        let xml_base_budget = XmlBaseResolutionBudget::default();
+        let resolver = UriReferenceResolver::new(&doc).with_external_resources(&resources);
+
+        let error = resolver
+            .dereference_from_with_budget(
+                reference.attribute("URI").unwrap(),
+                reference,
+                &budget,
+                &xml_base_budget,
+            )
+            .expect_err("a fragment of an external resource is not selected");
+
+        assert!(
+            matches!(&error, TransformError::ExternalResourceFragment(uri)
+                if uri == "https://example.test/data.xml#chapter1"),
+            "{error:?}"
+        );
     }
 
     #[test]

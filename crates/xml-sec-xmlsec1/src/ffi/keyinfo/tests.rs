@@ -239,6 +239,86 @@ fn key_reference_depth_counts_both_kinds_of_reference() {
 }
 
 #[test]
+fn encrypted_key_nesting_counts_as_key_reference_depth() {
+    // An EncryptedKey in a KeyInfo nests key material as a key reference
+    // does (XML Encryption 1.1 section 3.5.1): the policy's depth bounds the
+    // levels of all three kinds together, whatever higher EncryptedKey level
+    // the caller set, and refuses before anything is decrypted or read. On a
+    // decryption that depth is the decryption policy's for every kind, so a
+    // more generous verification depth admits none of them.
+    own_process();
+    policy::republish(
+        |verification| verification.resources.max_key_info_reference_depth = 3,
+        |_| {},
+    )
+    .expect("the library policy compiles");
+    xml_sec_libxml2::policy::republish_encryption(
+        |_| {},
+        |decryption| decryption.resources.max_key_info_reference_depth = 1,
+    )
+    .expect("the library policy compiles");
+    let encrypted_key = "<EncryptedKey xmlns=\"http://www.w3.org/2001/04/xmlenc#\">\
+                         <CipherData><CipherValue>AAAA</CipherValue></CipherData>\
+                         </EncryptedKey>";
+    let retrieval = "<RetrievalMethod xmlns=\"http://www.w3.org/2000/09/xmldsig#\" \
+                     URI=\"#absent\" Type=\"http://www.w3.org/2000/09/xmldsig#RSAKeyValue\"/>";
+    let reference =
+        "<KeyInfoReference xmlns=\"http://www.w3.org/2009/xmldsig11#\" URI=\"#absent\"/>";
+    // SAFETY: a registry initialized for the klass accessors.
+    let (encrypted_klass, retrieval_klass, reference_klass) = unsafe {
+        assert_eq!(xmlSecKeyDataIdsInit(), 0);
+        (
+            crate::ffi::keysdata::xmlSecKeyDataEncryptedKeyGetKlass(),
+            crate::ffi::keysdata::xmlSecKeyDataRetrievalMethodGetKlass(),
+            crate::ffi::keysdata::xmlSecKeyDataKeyInfoReferenceGetKlass(),
+        )
+    };
+    let cases = [
+        (encrypted_key, encrypted_klass, (1, 0, 0)),
+        (encrypted_key, encrypted_klass, (0, 1, 0)),
+        (encrypted_key, encrypted_klass, (0, 0, 1)),
+        (retrieval, retrieval_klass, (1, 0, 0)),
+        (reference, reference_klass, (1, 0, 0)),
+    ];
+    for (xml, klass, (encrypted_keys, retrievals, references)) in cases {
+        let doc = parse(xml);
+        // SAFETY: objects created and destroyed here.
+        unsafe {
+            let ctx = xmlSecKeyInfoCtxCreate(std::ptr::null_mut());
+            (*ctx).operation = crate::ffi::transforms::OPERATION_DECRYPT;
+            (*ctx).max_encrypted_key_level = 1000;
+            (*ctx).max_retrieval_method_level = 1000;
+            (*ctx).cur_encrypted_key_level = encrypted_keys;
+            (*ctx).cur_retrieval_method_level = retrievals;
+            (*ctx).cur_key_info_reference_level = references;
+            REASONS.lock().expect("reasons").clear();
+            errors::xmlSecErrorsSetCallback(Some(record as errors::ErrorsCallback));
+            let key = xmlSecKeyCreate();
+            let read = xmlSecKeyDataXmlRead(
+                klass,
+                key.cast(),
+                xsDocGetRootElement(doc).cast(),
+                ctx.cast(),
+            );
+            let reasons = REASONS.lock().expect("reasons").clone();
+            let levels = (encrypted_keys, retrievals, references);
+            assert_eq!(read, -1, "{levels:?}");
+            assert_eq!(
+                reasons.first(),
+                Some(&errors::R_INVALID_SIZE),
+                "{levels:?} {reasons:?}"
+            );
+            (*ctx).cur_encrypted_key_level = 0;
+            (*ctx).cur_retrieval_method_level = 0;
+            (*ctx).cur_key_info_reference_level = 0;
+            xmlSecKeyDestroy(key);
+            xmlSecKeyInfoCtxDestroy(ctx);
+            xsFreeDoc(doc);
+        }
+    }
+}
+
+#[test]
 fn an_unknown_key_name_names_the_key_and_a_second_name_is_refused() {
     // A name the keys manager does not know still names the key, whatever
     // the deprecated XMLSEC_KEYINFO_FLAGS_KEYNAME_STOP_ON_UNKNOWN says; a

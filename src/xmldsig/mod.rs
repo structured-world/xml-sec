@@ -132,7 +132,7 @@ pub use sign::{
     ComputedReferenceDigest, DerEncodedKeyValueInfoWriter, DsaSigningKey, EcdsaP256SigningKey,
     EcdsaP384SigningKey, EcdsaP521SigningKey, HmacSigningKey, KeyInfoWriteError, KeyInfoWriter,
     KeyValueInfoWriter, RsaSigningKey, SignContext, SignatureTemplateSelection, SigningDigestError,
-    SigningError, X509CertificateKeyInfoWriter, X509DigestKeyInfoWriter,
+    SigningError, SigningInputs, X509CertificateKeyInfoWriter, X509DigestKeyInfoWriter,
     compute_reference_digest_values, fill_reference_digest_values, validate_signing_key,
 };
 pub use signature::SignatureVerificationError;
@@ -152,7 +152,7 @@ pub use transforms::{
     XSLT_TRANSFORM_URI, execute_transforms, execute_transforms_with_policy, parse_transforms,
 };
 pub use trust::{KeyTrustEvidence, ResolvedVerificationKey, TrustedPublicKey, X509TrustEvidence};
-pub use types::{NodeSet, TransformData, TransformError};
+pub use types::{KeptInputs, NodeSet, TransformData, TransformError};
 pub use utc_facts::{LeapSecondsError, LeapSecondsList};
 #[cfg(feature = "rustcrypto")]
 pub use verify::verify_signature_with_pem_key;

@@ -13,15 +13,30 @@
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use xml_sec::policy::{
+    DecryptionPolicy, EncryptionPolicy, GeneratedCanonicalization, ManifestProcessing,
     PolicyCompileContext, PolicyCompiler, PolicyProfile, SigningPolicy, VerificationPolicy,
 };
 use xml_sec::provider::ProviderCapability;
 use xml_sec::xmldsig::UriTypeSet;
 
-/// The published snapshots of both operations.
+/// The published snapshots of every operation.
 struct Published {
     verification: Arc<VerificationPolicy>,
     signing: Arc<SigningPolicy>,
+    encryption: Arc<EncryptionPolicy>,
+    decryption: Arc<DecryptionPolicy>,
+}
+
+/// One revision of every operation's snapshot, taken together.
+pub struct Snapshots {
+    /// The verification snapshot.
+    pub verification: Arc<VerificationPolicy>,
+    /// The signing snapshot.
+    pub signing: Arc<SigningPolicy>,
+    /// The encryption snapshot.
+    pub encryption: Arc<EncryptionPolicy>,
+    /// The decryption snapshot.
+    pub decryption: Arc<DecryptionPolicy>,
 }
 
 // no-std: spin::RwLock
@@ -54,12 +69,16 @@ fn compile() -> Option<Published> {
         .ok()?;
     let mut verification = compiled.verification()?.clone();
     verification.uris.references = UriTypeSet::ALL;
+    // libxmlsec1 processes Manifests unless a context asks it not to; the
+    // profile lets a request select either.
+    verification.manifest_processing = ManifestProcessing::Process;
     // Signing admits what this boundary verifies, as libxmlsec1 signs with
     // every method it verifies; the xmlsec1 command opts in the same way.
     let mut signing = compiled.signing()?.clone();
     // A detached reference is digested when it is signed, from the same
     // caller-supplied bytes it is verified from.
     signing.uris.references = verification.uris.references;
+    signing.manifest_processing = verification.manifest_processing;
     signing.signature_algorithms = verification.signature_algorithms.as_ref().map(|methods| {
         methods
             .iter()
@@ -72,9 +91,53 @@ fn compile() -> Option<Published> {
         .clone_from(&verification.digest_algorithms);
     signing.parameterized_rsa_pss = verification.parameterized_rsa_pss;
     signing.hmac = verification.hmac;
+    // libxmlsec1 signs a template as written: a node set is left to the
+    // implicit Canonical XML 1.0 conversion (XMLDSig 1.1 section 4.4.3.2), and
+    // a bare-name fragment is looked up as its verification looks it up.
+    signing.transforms.generated_canonicalization = GeneratedCanonicalization::Implicit;
+    signing.transforms.same_document_id_semantics =
+        verification.transforms.same_document_id_semantics;
+    let mut decryption = compiled.decryption()?.clone();
+    // A CipherReference resolves as a signature's reference does: external
+    // URIs from the bytes the caller's input callbacks supply, same-document
+    // IDs as libxmlsec1 finds them.
+    decryption.uris.references = verification.uris.references;
+    decryption.transforms.same_document_id_semantics =
+        verification.transforms.same_document_id_semantics;
+    // Encryption admits what this boundary decrypts, as libxmlsec1 encrypts
+    // with every cipher it decrypts with.
+    let mut encryption = compiled.encryption()?.clone();
+    encryption.data_algorithms = decryption.data_algorithms.as_ref().map(|ciphers| {
+        ciphers
+            .iter()
+            .copied()
+            .filter(|cipher| provider.supports(ProviderCapability::Encrypt(*cipher)))
+            .collect()
+    });
+    encryption
+        .key_wrap_algorithms
+        .clone_from(&decryption.key_wrap_algorithms);
+    encryption
+        .key_transport_algorithms
+        .clone_from(&decryption.key_transport_algorithms);
+    encryption.oaep_digests.clone_from(&decryption.oaep_digests);
     Some(Published {
         verification: Arc::new(verification),
         signing: Arc::new(signing),
+        encryption: Arc::new(encryption),
+        decryption: Arc::new(decryption),
+    })
+}
+
+/// Every operation's current snapshot, of one revision; `None` when the
+/// profile cannot be compiled.
+#[must_use]
+pub fn snapshots() -> Option<Snapshots> {
+    current(|published| Snapshots {
+        verification: Arc::clone(&published.verification),
+        signing: Arc::clone(&published.signing),
+        encryption: Arc::clone(&published.encryption),
+        decryption: Arc::clone(&published.decryption),
     })
 }
 
@@ -135,14 +198,36 @@ pub fn republish(
     // The lock guards no data, only the turn: a turn whose edit panicked
     // published nothing, so its poison is cleared.
     let _turn = WRITER.lock().unwrap_or_else(PoisonError::into_inner);
-    let (verification, signing) = snapshot()?;
-    let mut verification = VerificationPolicy::clone(&verification);
-    let mut signing = SigningPolicy::clone(&signing);
+    let current = snapshots()?;
+    let mut verification = VerificationPolicy::clone(&current.verification);
+    let mut signing = SigningPolicy::clone(&current.signing);
     edit_verification(&mut verification);
     edit_signing(&mut signing);
     *PUBLISHED.write().ok()? = Some(Published {
         verification: Arc::new(verification),
         signing: Arc::new(signing),
+        encryption: current.encryption,
+        decryption: current.decryption,
+    });
+    Some(())
+}
+
+/// [`republish`] for the encryption and decryption snapshots.
+pub fn republish_encryption(
+    edit_encryption: impl FnOnce(&mut EncryptionPolicy),
+    edit_decryption: impl FnOnce(&mut DecryptionPolicy),
+) -> Option<()> {
+    let _turn = WRITER.lock().unwrap_or_else(PoisonError::into_inner);
+    let current = snapshots()?;
+    let mut encryption = EncryptionPolicy::clone(&current.encryption);
+    let mut decryption = DecryptionPolicy::clone(&current.decryption);
+    edit_encryption(&mut encryption);
+    edit_decryption(&mut decryption);
+    *PUBLISHED.write().ok()? = Some(Published {
+        verification: current.verification,
+        signing: current.signing,
+        encryption: Arc::new(encryption),
+        decryption: Arc::new(decryption),
     });
     Some(())
 }

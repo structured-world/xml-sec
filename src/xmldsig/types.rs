@@ -21,6 +21,99 @@ use crate::c14n::NodeVisibility;
 
 pub(crate) mod projection;
 
+/// The canonical inputs a signing or verification keeps for its caller: the
+/// `SignedInfo` the signature covers and the bytes the references of
+/// `SignedInfo` and of its `Manifest`s digested. Each kept input counts
+/// against the operation's `max_canonicalized_bytes`, so a caller keeps only
+/// what it reads.
+///
+/// # Examples
+/// ```
+/// use xml_sec::xmldsig::KeptInputs;
+///
+/// let kept = KeptInputs::NONE.with_signed_info();
+/// assert!(kept.signed_info());
+/// assert!(!kept.signed_info_references());
+/// assert_eq!(KeptInputs::ALL, kept.with_signed_info_references().with_manifest_references());
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeptInputs {
+    signed_info: bool,
+    signed_info_references: bool,
+    manifest_references: bool,
+}
+
+impl KeptInputs {
+    /// Nothing kept.
+    pub const NONE: Self = Self {
+        signed_info: false,
+        signed_info_references: false,
+        manifest_references: false,
+    };
+    /// Every input kept.
+    pub const ALL: Self = Self {
+        signed_info: true,
+        signed_info_references: true,
+        manifest_references: true,
+    };
+
+    /// `self`, also keeping the canonical `SignedInfo`.
+    #[must_use]
+    pub const fn with_signed_info(mut self) -> Self {
+        self.signed_info = true;
+        self
+    }
+
+    /// `self`, also keeping the bytes each `SignedInfo` `Reference` digested.
+    #[must_use]
+    pub const fn with_signed_info_references(mut self) -> Self {
+        self.signed_info_references = true;
+        self
+    }
+
+    /// `self`, also keeping the bytes each `Manifest` `Reference` digested.
+    #[must_use]
+    pub const fn with_manifest_references(mut self) -> Self {
+        self.manifest_references = true;
+        self
+    }
+
+    /// Whether the canonical `SignedInfo` is kept.
+    #[must_use]
+    pub const fn signed_info(self) -> bool {
+        self.signed_info
+    }
+
+    /// Whether the bytes of the `SignedInfo` references are kept.
+    #[must_use]
+    pub const fn signed_info_references(self) -> bool {
+        self.signed_info_references
+    }
+
+    /// Whether the bytes of the `Manifest` references are kept.
+    #[must_use]
+    pub const fn manifest_references(self) -> bool {
+        self.manifest_references
+    }
+
+    /// Whether anything is kept.
+    #[cfg(feature = "xmldsig-sign")]
+    pub(crate) const fn any(self) -> bool {
+        self.signed_info || self.signed_info_references || self.manifest_references
+    }
+
+    /// Whether a reference of `SignedInfo`, or of a `Manifest` otherwise,
+    /// keeps its bytes.
+    #[cfg(feature = "xmldsig-sign")]
+    pub(crate) const fn reference(self, in_signed_info: bool) -> bool {
+        if in_signed_info {
+            self.signed_info_references
+        } else {
+            self.manifest_references
+        }
+    }
+}
+
 // roxmltree 0.21 uses `Node<'a, 'input: 'a>`. We tie both lifetimes together
 // with a single `'a` by requiring `'input = 'a` at every use site (`Node<'a, 'a>`).
 // This is safe because our NodeSet borrows the Document which owns the input.
@@ -453,6 +546,17 @@ pub enum TransformError {
     /// The caller supplied no bytes for this external URI.
     #[error("external resource not supplied: {0}")]
     ExternalResourceUnavailable(String),
+
+    /// The URI selects a fragment of an external resource, which is octets
+    /// here: the selection is refused rather than covering the whole
+    /// resource (`XMLDSig` 1.1 section 4.4.3.2 leaves it optional).
+    #[error("fragment of an external resource is not supported: {0}")]
+    ExternalResourceFragment(String),
+
+    /// [`Self::ExternalResourceFragment`] whose diagnostic retains its
+    /// current-query capacity charge.
+    #[error("fragment of an external resource is not supported: {0}")]
+    AccountedExternalResourceFragment(structured_asn1::memory::OwnedText),
 
     /// Malformed same-document syntax, requiring no diagnostic allocation.
     #[error("unsupported URI: invalid same-document fragment")]

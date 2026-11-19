@@ -39,6 +39,9 @@ use super::transforms::{
     },
 };
 use super::tree::{XmlNode, nodes, xmlStrEqual};
+use super::xmlenc::{
+    xmlSecEncCtxDebugDump, xmlSecEncCtxDebugXmlDump, xmlSecEncCtxDestroy, xmlSecEncCtxReset,
+};
 use super::xmltree::{
     xmlSecAddChild, xmlSecGetNextElementNode, xmlSecGetNodeContentAndTrim, xmlSecGetNodeNsHref,
     xmlSecIsEmptyNode, xmlSecNodeEncodeAndSetContent,
@@ -49,7 +52,8 @@ mod references;
 #[cfg(test)]
 mod tests;
 pub(crate) use references::{
-    reference_xml_read, reference_xml_write, retrieval_xml_read, retrieval_xml_write,
+    next_reference_depth, reference_xml_read, reference_xml_write, retrieval_xml_read,
+    retrieval_xml_write,
 };
 
 /// The policy revision a read with `ctx` runs under: the one pinned for the
@@ -499,7 +503,8 @@ pub(crate) unsafe extern "C" fn xmlSecKeyInfoCtxCreate(
 /// [`xmlSecKeyInfoCtxCreate`].
 ///
 /// # Safety
-/// `ctx` is null or a created context.
+/// `ctx` is null or a created context that no call in progress uses, as for
+/// [`xmlSecKeyInfoCtxFinalize`].
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecKeyInfoCtxDestroy(ctx: *mut XmlSecKeyInfoCtx) {
     contain((), || {
@@ -585,7 +590,10 @@ pub(crate) unsafe extern "C" fn xmlSecKeyInfoCtxInitialize(
 /// it.
 ///
 /// # Safety
-/// `ctx` is null or an initialized context.
+/// `ctx` is null or an initialized context that no call in progress uses:
+/// a read, or a callback it runs, must not finalize the context it reads
+/// with, whose nested encryption context and state the read uses after the
+/// callback returns, as libxmlsec1 requires too.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecKeyInfoCtxFinalize(ctx: *mut XmlSecKeyInfoCtx) {
     contain((), || {
@@ -597,12 +605,15 @@ pub(crate) unsafe extern "C" fn xmlSecKeyInfoCtxFinalize(ctx: *mut XmlSecKeyInfo
         // SAFETY: an initialized context.
         unsafe {
             let context = &mut *ctx;
+            if !context.enc_ctx.is_null() {
+                xmlSecEncCtxDestroy(context.enc_ctx.cast());
+            }
             xmlSecPtrListFinalize(&raw mut context.enabled_key_data);
             xmlSecTransformCtxFinalize(&raw mut context.retrieval_method_ctx);
             xmlSecTransformCtxFinalize(&raw mut context.key_info_reference_ctx);
             xmlSecKeyReqFinalize(&raw mut context.key_req);
-            // A read's guard releases its pin; one left by a context finalized
-            // from inside the read is freed rather than zeroed away.
+            // A read's guard releases its pin on return, so none is left
+            // here; the slot is emptied the same way should one be.
             policy::release(&raw mut context.reserved0);
             ctx.cast::<u8>()
                 .write_bytes(0, size_of::<XmlSecKeyInfoCtx>());
@@ -630,6 +641,9 @@ pub(crate) unsafe extern "C" fn xmlSecKeyInfoCtxReset(ctx: *mut XmlSecKeyInfoCtx
             context.cur_retrieval_method_level = 0;
             xmlSecTransformCtxReset(&raw mut context.key_info_reference_ctx);
             context.cur_key_info_reference_level = 0;
+            if !context.enc_ctx.is_null() {
+                xmlSecEncCtxReset(context.enc_ctx.cast());
+            }
             context.cur_encrypted_key_level = 0;
             // xmlSecTransformOperationNone.
             context.operation = 0;
@@ -777,6 +791,9 @@ pub(crate) unsafe extern "C" fn xmlSecKeyInfoCtxDebugDump(
                     context.cur_encrypted_key_level, context.max_encrypted_key_level
                 ),
             );
+            if !context.enc_ctx.is_null() {
+                xmlSecEncCtxDebugDump(context.enc_ctx.cast(), output);
+            }
             xmlSecKeyReqDebugDump(&raw mut context.key_req, output);
         }
     });
@@ -857,6 +874,9 @@ pub(crate) unsafe extern "C" fn xmlSecKeyInfoCtxDebugXmlDump(
                     )
                 ),
             );
+            if !context.enc_ctx.is_null() {
+                xmlSecEncCtxDebugXmlDump(context.enc_ctx.cast(), output);
+            }
             xmlSecKeyReqDebugXmlDump(&raw mut context.key_req, output);
             match context.mode {
                 MODE_READ => write_stream(output, "</KeyInfoReadContext>\n"),
