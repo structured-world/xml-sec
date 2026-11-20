@@ -196,8 +196,12 @@ pub fn direct_encapsulation<'a, 'input>(
 /// Monotonic reservations shared by KDF, agreement, and encapsulation.
 ///
 /// A caller that runs one operation in parts carries the value from one part
-/// to the next ([`crate::xmlenc::KeyEstablishmentBudget::resume`]), so every
-/// part spends one allowance.
+/// to the next, so every part spends one allowance.
+#[cfg_attr(
+    feature = "xmlenc",
+    doc = "",
+    doc = "The XML Encryption budget resumes from it: [`crate::xmlenc::KeyEstablishmentBudget::resume`]."
+)]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct KeyEstablishmentUsage {
     pub(crate) hash_blocks: usize,

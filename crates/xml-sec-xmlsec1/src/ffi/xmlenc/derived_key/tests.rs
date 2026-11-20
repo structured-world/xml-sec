@@ -227,6 +227,76 @@ fn a_reference_list_names_the_data_the_derived_key_serves() {
 }
 
 #[test]
+fn a_derived_key_serves_only_the_data_its_list_names() {
+    // The read derives the key of the first DerivedKey, whose list names
+    // other data; the second names this EncryptedData but its master key is
+    // absent. The first key decrypts nothing outside its list, whichever
+    // DerivedKey of the KeyInfo the decryption asks for its key.
+    with_library(|| {
+        let second = "<xenc11:DerivedKey>\
+             <xenc11:KeyDerivationMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#pbkdf2\">\
+             <xenc11:PBKDF2-params><xenc11:Salt><xenc11:Specified>c2FsdA==</xenc11:Specified>\
+             </xenc11:Salt><xenc11:IterationCount>2</xenc11:IterationCount>\
+             <xenc11:KeyLength>32</xenc11:KeyLength>\
+             <xenc11:PRF Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#hmac-sha256\"/>\
+             </xenc11:PBKDF2-params></xenc11:KeyDerivationMethod>\
+             <xenc:ReferenceList><xenc:DataReference URI=\"#data\"/></xenc:ReferenceList>\
+             <xenc11:MasterKeyName>absent</xenc11:MasterKeyName></xenc11:DerivedKey>";
+        let xml = template(
+            "master",
+            "<xenc:ReferenceList><xenc:DataReference URI=\"#other\"/></xenc:ReferenceList>",
+        )
+        .replace("</ds:KeyInfo>", &format!("{second}</ds:KeyInfo>"));
+        // SAFETY: the library is initialized; every object is released.
+        unsafe {
+            let doc = encrypted_with_derived(b"listed elsewhere", &xml);
+            let mngr = manager_with_master(c"master");
+            assert_eq!(decrypted(doc, mngr, 0), None);
+            xmlSecKeysMngrDestroy(mngr);
+            xsFreeDoc(doc.cast());
+        }
+    });
+}
+
+#[test]
+fn a_key_not_derived_does_not_stand_for_a_derivation() {
+    // A key the caller set on the context is no key a DerivedKey derived:
+    // the KeyInfo is not read, so no derivation runs under the policy, and
+    // the EncryptedData whose key is derived does not decrypt with it.
+    with_library(|| {
+        // SAFETY: the library is initialized; every object is released.
+        unsafe {
+            let doc = encrypted_with_derived(b"content", &template("master", ""));
+            let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
+            let key = derived();
+            (*ctx).enc_key = xmlSecKeyReadMemory(symkeys::aes(), key.as_ptr(), key.len());
+            assert!(xmlSecEncCtxDecryptToBuffer(ctx, xsDocGetRootElement(doc.cast())).is_null());
+            xmlSecEncCtxDestroy(ctx);
+            xsFreeDoc(doc.cast());
+        }
+    });
+}
+
+#[test]
+fn a_generation_derives_under_the_policy_of_its_operation() {
+    // A generation on a fresh context reads its method before the chain
+    // holds it: the derivation still runs under the policy of the operation
+    // the KeyInfo context names, a decryption admitting no derivation here.
+    with_library(|| {
+        let mut pinned = crate::ffi::policy::Pinned::current(here!("test"))
+            .expect("the library policy compiles");
+        std::sync::Arc::make_mut(&mut pinned.decryption)
+            .key_establishment
+            .derivation_algorithms = Some(std::collections::BTreeSet::new());
+        let named = generated_name(|enc| {
+            // SAFETY: the generating context's own transform context.
+            unsafe { crate::ffi::transforms::ctx::pin_run(&raw mut (*enc).transform_ctx, &pinned) };
+        });
+        assert_eq!(named, None);
+    });
+}
+
+#[test]
 fn a_derivation_reads_the_derived_key_element_strictly() {
     // libxmlsec1 requires the KeyDerivationMethod first and refuses any
     // child after MasterKeyName: such a DerivedKey derives no key.
@@ -250,44 +320,57 @@ fn a_derivation_reads_the_derived_key_element_strictly() {
     });
 }
 
+/// The name of the key a direct generation derives from the template's
+/// `DerivedKey` for a decrypting `KeyInfo` context, `None` when it derives
+/// none; `prepare` adjusts the fresh generating context first. Runs within
+/// [`with_library`].
+fn generated_name(prepare: impl FnOnce(*mut XmlSecEncCtx)) -> Option<Vec<u8>> {
+    // SAFETY: a document, keys manager and contexts created and released
+    // here.
+    unsafe {
+        let xml = template("master", "");
+        let doc = xsReadMemory(
+            xml.as_ptr().cast(),
+            c_int::try_from(xml.len()).expect("a short document"),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        let mngr = manager_with_master(c"master");
+        let ctx = xmlSecEncCtxCreate(mngr);
+        let key_info = &raw mut (*ctx).key_info_read_ctx;
+        (*key_info).operation = crate::ffi::transforms::OPERATION_DECRYPT;
+        (*key_info).key_req.key_id = symkeys::aes();
+        (*key_info).key_req.key_bits_size = 256;
+        assert_eq!(xmlSecKeyInfoCtxCreateEncCtx(key_info), 0);
+        let enc = (*key_info).enc_ctx.cast::<XmlSecEncCtx>();
+        prepare(enc);
+        let node = crate::ffi::xmltree::xmlSecFindNode(
+            xsDocGetRootElement(doc).cast(),
+            strings::xmlSecNodeDerivedKey.as_ptr(),
+            strings::xmlSecEnc11Ns.as_ptr(),
+        );
+        let key = xmlSecEncCtxDerivedKeyGenerate(enc, symkeys::aes(), node, key_info);
+        let name = (!key.is_null()).then(|| {
+            std::ffi::CStr::from_ptr((*key).name.cast())
+                .to_bytes()
+                .to_vec()
+        });
+        if !key.is_null() {
+            xmlSecKeyDestroy(key);
+        }
+        xmlSecEncCtxDestroy(ctx);
+        xmlSecKeysMngrDestroy(mngr);
+        xsFreeDoc(doc);
+        name
+    }
+}
+
 #[test]
 fn the_derived_key_is_named_by_its_derived_key_name() {
     // The derived key carries the DerivedKeyName, as libxmlsec1 names it.
     with_library(|| {
-        // SAFETY: the library is initialized; every object is released.
-        unsafe {
-            let xml = template("master", "");
-            let doc = xsReadMemory(
-                xml.as_ptr().cast(),
-                c_int::try_from(xml.len()).expect("a short document"),
-                std::ptr::null(),
-                std::ptr::null(),
-                0,
-            );
-            let mngr = manager_with_master(c"master");
-            let ctx = xmlSecEncCtxCreate(mngr);
-            let key_info = &raw mut (*ctx).key_info_read_ctx;
-            (*key_info).operation = crate::ffi::transforms::OPERATION_DECRYPT;
-            (*key_info).key_req.key_id = symkeys::aes();
-            (*key_info).key_req.key_bits_size = 256;
-            assert_eq!(xmlSecKeyInfoCtxCreateEncCtx(key_info), 0);
-            let enc = (*key_info).enc_ctx.cast::<XmlSecEncCtx>();
-            let node = crate::ffi::xmltree::xmlSecFindNode(
-                xsDocGetRootElement(doc).cast(),
-                strings::xmlSecNodeDerivedKey.as_ptr(),
-                strings::xmlSecEnc11Ns.as_ptr(),
-            );
-            let key = xmlSecEncCtxDerivedKeyGenerate(enc, symkeys::aes(), node, key_info);
-            assert!(!key.is_null());
-            assert_eq!(
-                std::ffi::CStr::from_ptr((*key).name.cast()).to_bytes(),
-                b"session"
-            );
-            xmlSecKeyDestroy(key);
-            xmlSecEncCtxDestroy(ctx);
-            xmlSecKeysMngrDestroy(mngr);
-            xsFreeDoc(doc);
-        }
+        assert_eq!(generated_name(|_| {}).as_deref(), Some(&b"session"[..]));
     });
 }
 

@@ -128,6 +128,38 @@ fn an_element_of_a_tree_reads_as_its_text_does() {
 }
 
 #[test]
+fn a_derived_key_element_reads_as_its_encrypted_data_reads_it() {
+    // A caller holding a DerivedKey of an EncryptedData's KeyInfo in a parsed
+    // tree reads the descriptor the decryption reads there, so the two
+    // compare equal; the metadata bound applies to it alike.
+    let xml = format!(
+        "<EncryptedData xmlns='http://www.w3.org/2001/04/xmlenc#'>\
+         <EncryptionMethod Algorithm='http://www.w3.org/2009/xmlenc11#aes256-gcm'/>\
+         <KeyInfo xmlns='http://www.w3.org/2000/09/xmldsig#'>\
+         <DerivedKey xmlns='http://www.w3.org/2009/xmlenc11#'>{}\
+         <ReferenceList xmlns='http://www.w3.org/2001/04/xmlenc#'>\
+         <DataReference URI='#data'/></ReferenceList>\
+         <MasterKeyName>master</MasterKeyName></DerivedKey></KeyInfo>\
+         <CipherData><CipherValue>AAAA</CipherValue></CipherData></EncryptedData>",
+        concat("AlgorithmID='0000' PartyUInfo='03D8' PartyVInfo='03D0'")
+    );
+    let parsed = xml_sec::xmlenc::parse_encrypted_data(&xml).unwrap();
+    let document = xml_sec::Document::parse(&xml).unwrap();
+    let element = document
+        .root_element()
+        .descendants()
+        .find(|node| node.tag_name().name() == "DerivedKey")
+        .unwrap();
+    let mut resources = xml_sec::policy::ResourcePolicy::default();
+    assert_eq!(
+        xml_sec::xmlenc::DerivedKey::from_element(element, &resources).unwrap(),
+        parsed.derived_keys[0]
+    );
+    resources.max_encryption_metadata_bytes = 2;
+    assert!(xml_sec::xmlenc::DerivedKey::from_element(element, &resources).is_err());
+}
+
+#[test]
 fn kdf_xml_bounds_metadata_before_decoding() {
     // The standalone entry point must use the same immutable parser and
     // metadata policy as EncryptedData; small limits cannot be bypassed.

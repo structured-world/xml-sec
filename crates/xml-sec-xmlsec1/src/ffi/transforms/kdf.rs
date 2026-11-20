@@ -18,11 +18,11 @@ use super::super::buffer::{xmlSecBufferAppend, xmlSecBufferGetData, xmlSecBuffer
 use super::super::errors::{self, Here, here};
 use super::super::keys::{TYPE_SYMMETRIC, XmlSecKey, xmlSecKeyGetValue};
 use super::super::keysdata::{XmlSecKeyDataKlass, check_id, xmlSecKeyDataBinaryValueGetBuffer};
-use super::super::policy::with_document_policy;
+use super::super::policy::{OperationPolicy, Pinned, Side, with_document_policy};
 use super::super::tree::XmlNode;
 use super::super::{contain, strings, symkeys};
 use super::builtin::klass;
-use super::ctx::{Limit, run_budget, run_scope};
+use super::ctx::{Limit, operation_side, run_budget, run_policy, run_scope};
 use super::{
     OPERATION_DECRYPT, OPERATION_ENCRYPT, STATUS_FINISHED, STATUS_NONE, STATUS_WORKING,
     USAGE_KEY_DERIVATION_METHOD, WithContext, XmlSecKeyReq, XmlSecTransform, XmlSecTransformCtx,
@@ -34,8 +34,9 @@ const KEY_USAGE_KEY_DERIVE: c_uint = 0x0000_0020;
 
 /// The state of a key derivation.
 struct Kdf {
-    /// The parameters the `KeyDerivationMethod` names.
-    method: Option<KeyDerivationMethod>,
+    /// The parameters the `KeyDerivationMethod` names, with the side whose
+    /// policy they were read under.
+    method: Option<(KeyDerivationMethod, Side)>,
     /// The key's binary value, from `setKey`.
     secret: Option<Zeroizing<Vec<u8>>>,
 }
@@ -186,8 +187,89 @@ unsafe extern "C" fn finalize(transform: *mut XmlSecTransform) {
     });
 }
 
+/// The policy revision of the run of `ctx` and the side a derivation by
+/// `transform` falls under: the operation the transform serves once it is
+/// known, which a reader naming it sets before the transform joins a chain,
+/// and the run's side before that.
+///
+/// # Safety
+/// `ctx` is an initialized context whose chain is live.
+unsafe fn scope(
+    transform: &XmlSecTransform,
+    ctx: *mut XmlSecTransformCtx,
+    here: Here,
+) -> Option<(Pinned, Side)> {
+    // SAFETY: by the caller's contract.
+    unsafe {
+        match operation_side(transform.operation) {
+            Some(side) => Some((run_policy(ctx, here)?, side)),
+            None => run_scope(ctx, here),
+        }
+    }
+}
+
+/// The parameters of the `KeyDerivationMethod` element `node`, as the core
+/// parses them under `operation`'s policy; the reason otherwise.
+fn parse_method(
+    node: *mut XmlNode,
+    operation: OperationPolicy<'_>,
+) -> Result<KeyDerivationMethod, String> {
+    with_document_policy!(operation, |policy| {
+        xml_sec_libxml2::document::subtree(node, policy)
+            .map_err(|error| error.to_string())
+            .and_then(|document| {
+                document.with_view(|view| {
+                    KeyDerivationMethod::from_element(
+                        view.document().root_element(),
+                        operation.resources(),
+                    )
+                    .map_err(|error| error.to_string())
+                })
+            })
+    })
+}
+
+/// The read `method` under the policy of `side`, `operation`: a method read
+/// before its operation was known is read again from its element `node`;
+/// `None` after a report at `here`.
+fn method_under<'a>(
+    method: &'a mut Option<(KeyDerivationMethod, Side)>,
+    node: *mut XmlNode,
+    operation: OperationPolicy<'_>,
+    side: Side,
+    here: Here,
+) -> Option<&'a KeyDerivationMethod> {
+    match method {
+        None => {
+            errors::assertion(here, c"ctx->paramsInitialized != 0");
+            return None;
+        }
+        Some((_, read)) if *read != side => {
+            if node.is_null() {
+                errors::assertion(here, c"transform->hereNode != NULL");
+                return None;
+            }
+            match parse_method(node, operation) {
+                Ok(parsed) => *method = Some((parsed, side)),
+                Err(error) => {
+                    errors::report(
+                        here,
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        errors::R_INVALID_TRANSFORM,
+                        &error,
+                    );
+                    return None;
+                }
+            }
+        }
+        Some(_) => {}
+    }
+    method.as_ref().map(|(parsed, _)| parsed)
+}
+
 /// `readNode`: the parameters of the `KeyDerivationMethod` element `node`,
-/// as the core parses them under the run's policy.
+/// as the core parses them under the policy of the derivation's side.
 unsafe extern "C" fn read_node(
     transform: *mut XmlSecTransform,
     node: *mut XmlNode,
@@ -204,26 +286,12 @@ unsafe extern "C" fn read_node(
             return -1;
         }
         // SAFETY: a non-null, initialized context.
-        let Some((pinned, side)) = (unsafe { run_scope(ctx, here) }) else {
+        let Some((pinned, side)) = (unsafe { scope(object, ctx, here) }) else {
             return -1;
         };
-        let operation = pinned.of(side);
-        let parsed = with_document_policy!(operation, |policy| {
-            xml_sec_libxml2::document::subtree(node, policy)
-                .map_err(|error| error.to_string())
-                .and_then(|document| {
-                    document.with_view(|view| {
-                        KeyDerivationMethod::from_element(
-                            view.document().root_element(),
-                            operation.resources(),
-                        )
-                        .map_err(|error| error.to_string())
-                    })
-                })
-        });
-        match parsed {
+        match parse_method(node, pinned.of(side)) {
             Ok(method) => {
-                kdf.method = Some(method);
+                kdf.method = Some((method, side));
                 0
             }
             Err(error) => {
@@ -355,16 +423,30 @@ unsafe extern "C" fn execute(
             );
             return -1;
         }
-        let (Some(method), Some(secret)) = (kdf.method.as_ref(), kdf.secret.as_deref()) else {
+        // SAFETY: a non-null, initialized context.
+        let Some((pinned, side)) = (unsafe { scope(object, ctx, here) }) else {
+            return -1;
+        };
+        let Some(method) = method_under(
+            &mut kdf.method,
+            object.here_node,
+            pinned.of(side),
+            side,
+            here,
+        ) else {
+            return -1;
+        };
+        let Some(secret) = kdf.secret.as_deref() else {
             errors::assertion(here, c"ctx->paramsInitialized != 0");
             return -1;
         };
         // SAFETY: a non-null, initialized context.
-        let Some((pinned, side)) = (unsafe { run_scope(ctx, here) }) else {
-            return -1;
-        };
-        // SAFETY: a non-null, initialized context.
         let run = unsafe { run_budget(ctx) };
+        // A refusal ends the operation: no later part derives under it.
+        if let Some(limit) = run.refused_by {
+            errors::limit_exceeded(here, name, limit.name, limit.max);
+            return -1;
+        }
         let output = match derive(
             method,
             width,

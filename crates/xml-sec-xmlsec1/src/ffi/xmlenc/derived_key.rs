@@ -11,18 +11,22 @@
 use std::cell::Cell;
 use std::ffi::{CString, c_int, c_void};
 
+use xml_sec::xmlenc::DerivedKey;
+use zeroize::Zeroizing;
+
 use super::super::buffer::{xmlSecBufferGetData, xmlSecBufferGetSize};
 use super::super::errors::{self, check, here};
 use super::super::keyinfo::{MODE_READ, MODE_WRITE, XmlSecKeyInfoCtx};
 use super::super::keys::{
-    XmlSecKey, key_valid, xmlSecKeyCopy, xmlSecKeyCreate, xmlSecKeyDestroy, xmlSecKeyMatch,
-    xmlSecKeyReqMatchKey, xmlSecKeySetName,
+    XmlSecKey, key_valid, xmlSecKeyCopy, xmlSecKeyCreate, xmlSecKeyDestroy, xmlSecKeyGetValue,
+    xmlSecKeyMatch, xmlSecKeyReqMatchKey, xmlSecKeySetName,
 };
 use super::super::keysdata::{
-    XmlSecKeyDataKlass, xmlSecKeyDataBinRead, xmlSecKeyDataDerivedKeyGetKlass,
+    XmlSecKeyDataKlass, xmlSecKeyDataBinRead, xmlSecKeyDataBinaryValueGetBuffer,
+    xmlSecKeyDataDerivedKeyGetKlass,
 };
 use super::super::keysmngr::xmlSecKeysMngrFindKey;
-use super::super::policy::{Side, SlotPin};
+use super::super::policy::{self, Side, SlotPin, with_document_policy};
 use super::super::transforms::ctx::{
     charge_key_info, ctx_node_read_for, operation_side, run_budget, run_policy, run_spent,
     xmlSecTransformCtxBinaryExecute,
@@ -42,6 +46,95 @@ use super::{FAILURE_KEY_NOT_FOUND, FAILURE_UNKNOWN, XmlSecEncCtx};
 
 #[cfg(test)]
 mod tests;
+
+/// The `DerivedKey` a `KeyInfo` read derived its key from, with the octets
+/// it derived, kept in the read context's `reserved1` until the decryption
+/// reading with that context takes the key: the core takes it for this
+/// `DerivedKey` alone.
+pub(super) struct Derivation {
+    /// The element as the core reads it among the `KeyInfo`'s descriptors.
+    pub(super) descriptor: DerivedKey,
+    key: Zeroizing<Vec<u8>>,
+}
+
+impl Derivation {
+    /// Whether `key` holds the octets this derivation yielded: a later child
+    /// of a read that does not stop on the key may have replaced them.
+    pub(super) fn yielded(&self, key: &[u8]) -> bool {
+        self.key.as_slice() == key
+    }
+}
+
+/// Forgets the derivation the read with `ctx` recorded.
+///
+/// # Safety
+/// `ctx` is an initialized context.
+pub(crate) unsafe fn forget_derivation(ctx: *mut XmlSecKeyInfoCtx) {
+    // SAFETY: by the caller's contract; the slot is null or a recorded
+    // derivation, released once.
+    unsafe {
+        let slot = (*ctx).reserved1;
+        if !slot.is_null() {
+            drop(Box::from_raw(slot.cast::<Derivation>()));
+            (*ctx).reserved1 = std::ptr::null_mut();
+        }
+    }
+}
+
+/// The derivation the read with `ctx` recorded, taken from it.
+///
+/// # Safety
+/// `ctx` is an initialized context.
+pub(super) unsafe fn take_derivation(ctx: *mut XmlSecKeyInfoCtx) -> Option<Box<Derivation>> {
+    // SAFETY: by the caller's contract; the slot is null or a recorded
+    // derivation, whose ownership moves to the caller.
+    unsafe {
+        let slot = std::mem::replace(&mut (*ctx).reserved1, std::ptr::null_mut());
+        (!slot.is_null()).then(|| Box::from_raw(slot.cast::<Derivation>()))
+    }
+}
+
+/// The derivation by which the `DerivedKey` `node` yielded `key`, read under
+/// the decryption policy of the read with `ctx`; `None` when that read pins
+/// no revision or the core reads no descriptor there, so no decryption
+/// takes the key for the element.
+///
+/// # Safety
+/// `ctx` is an initialized context; `node` a live node; `key` a key.
+unsafe fn derivation(
+    ctx: *mut XmlSecKeyInfoCtx,
+    node: *mut XmlNode,
+    key: *mut XmlSecKey,
+) -> Option<Derivation> {
+    // SAFETY: by the caller's contract.
+    unsafe {
+        let pinned = policy::pinned((*ctx).reserved0)?;
+        let operation = pinned.of(Side::Decrypt);
+        let descriptor = with_document_policy!(operation, |policy| {
+            xml_sec_libxml2::document::subtree(node, policy)
+                .ok()
+                .and_then(|document| {
+                    document.with_view(|view| {
+                        DerivedKey::from_element(
+                            view.document().root_element(),
+                            operation.resources(),
+                        )
+                        .ok()
+                    })
+                })
+        })?;
+        let buffer = xmlSecKeyDataBinaryValueGetBuffer(xmlSecKeyGetValue(key));
+        let data = xmlSecBufferGetData(buffer);
+        if data.is_null() {
+            return None;
+        }
+        let key = std::slice::from_raw_parts(data, xmlSecBufferGetSize(buffer));
+        Some(Derivation {
+            descriptor,
+            key: Zeroizing::new(key.to_vec()),
+        })
+    }
+}
 
 /// The trimmed text of `node`, copied, after libxmlsec1's report of an
 /// unreadable one at `here`.
@@ -412,6 +505,9 @@ pub(crate) unsafe extern "C" fn xml_read(
                 return -1;
             }
             let enc = (*ctx).enc_ctx.cast::<XmlSecEncCtx>();
+            // The derivation's run is seeded under the side of the operation
+            // the key is read for, the one the generation derives under.
+            (*enc).operation = map_operation((*ctx).operation);
             (*enc).transform_ctx.parent_key_info_ctx = ctx.cast();
             let generated = Cell::new(std::ptr::null_mut::<XmlSecKey>());
             let done = within_key_info(
@@ -456,11 +552,18 @@ pub(crate) unsafe extern "C" fn xml_read(
                 xmlSecKeyDestroy(generated);
                 return 0;
             }
+            let derived = derivation(ctx, node, generated);
             let copied = xmlSecKeyCopy(key, generated);
             xmlSecKeyDestroy(generated);
             if copied < 0 {
                 errors::internal(here, name, c"xmlSecKeyCopy");
                 return -1;
+            }
+            // The decryption reading with this key takes it for this
+            // DerivedKey alone.
+            forget_derivation(ctx);
+            if let Some(derived) = derived {
+                (*ctx).reserved1 = Box::into_raw(Box::new(derived)).cast();
             }
         }
         0

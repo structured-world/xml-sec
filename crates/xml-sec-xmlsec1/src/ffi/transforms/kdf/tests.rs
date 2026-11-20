@@ -5,13 +5,22 @@ use super::super::ctx::{
     pin_run, run_spent, seed_run, xmlSecTransformCtxBinaryExecute, xmlSecTransformCtxCreate,
     xmlSecTransformCtxCreateAndAppend, xmlSecTransformCtxDestroy,
 };
-use super::super::xmlSecTransformSetKey;
+use super::super::{xmlSecTransformCreate, xmlSecTransformDestroy, xmlSecTransformSetKey};
 use super::*;
 use xml_sec::provider::{CryptoProvider, KdfContext, KdfParameters, RUST_CRYPTO_PROVIDER};
 
 const PBKDF2_SHA256: &str = "<KeyDerivationMethod xmlns=\"http://www.w3.org/2009/xmlenc11#\" \
      Algorithm=\"http://www.w3.org/2009/xmlenc11#pbkdf2\"><PBKDF2-params><Salt>\
      <Specified>c2FsdA==</Specified></Salt><IterationCount>2</IterationCount>\
+     <KeyLength>32</KeyLength>\
+     <PRF Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#hmac-sha256\"/>\
+     </PBKDF2-params></KeyDerivationMethod>";
+
+/// `PBKDF2_SHA256` at one iteration: cheaper than it.
+const PBKDF2_ONE_ITERATION: &str = "<KeyDerivationMethod \
+     xmlns=\"http://www.w3.org/2009/xmlenc11#\" \
+     Algorithm=\"http://www.w3.org/2009/xmlenc11#pbkdf2\"><PBKDF2-params><Salt>\
+     <Specified>c2FsdA==</Specified></Salt><IterationCount>1</IterationCount>\
      <KeyLength>32</KeyLength>\
      <PRF Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#hmac-sha256\"/>\
      </PBKDF2-params></KeyDerivationMethod>";
@@ -177,32 +186,74 @@ fn the_policy_decides_whether_a_derivation_runs() {
 #[test]
 fn one_operation_spends_one_derivation_allowance() {
     // An operation that derives in several parts carries its reservations
-    // from one part to the next: the second derivation is refused once the
-    // first spent the allowance, and the refusal ends the operation.
+    // from one part to the next: what the first part's run spent, seeded into
+    // the second part's run, leaves the second derivation no allowance.
     let mut pinned = Pinned::current(here!("test")).expect("the library policy compiles");
     // PBKDF2 at two iterations costs six hash blocks for a 32-octet SHA-256
     // key: the allowance admits one such derivation.
     std::sync::Arc::make_mut(&mut pinned.decryption)
         .key_establishment
         .max_hash_blocks = 6;
-    let earlier = crate::ffi::policy::Spent {
-        key_establishment: derived_usage(&pinned),
-        ..crate::ffi::policy::Spent::default()
-    };
-    let run = |spent: crate::ffi::policy::Spent| {
-        derive_with(
-            pbkdf2(),
-            symkeys::pbkdf2(),
-            PBKDF2_SHA256,
-            SECRET,
-            |ctx, _| {
-                // SAFETY: the run's live context.
-                unsafe { seed_run(ctx, &pinned, crate::ffi::policy::Side::Decrypt, None, spent) };
-            },
-        )
-    };
-    assert!(run(crate::ffi::policy::Spent::default()).is_some());
-    assert!(run(earlier).is_none());
+    // SAFETY: contexts created and released here.
+    unsafe {
+        let first = xmlSecTransformCtxCreate();
+        pin_run(first, &pinned);
+        assert_eq!(execute_once(first, PBKDF2_SHA256), 0);
+        let earlier = run_spent(first);
+        xmlSecTransformCtxDestroy(first);
+        let second = xmlSecTransformCtxCreate();
+        seed_run(
+            second,
+            &pinned,
+            crate::ffi::policy::Side::Decrypt,
+            None,
+            earlier,
+        );
+        assert_eq!(execute_once(second, PBKDF2_SHA256), -1);
+        xmlSecTransformCtxDestroy(second);
+    }
+}
+
+#[test]
+fn a_refused_operation_derives_nothing_more() {
+    // A refusal ends the operation: a later derivation on the same context
+    // is refused too, though it is cheap enough that a fresh context admits
+    // it.
+    let mut pinned = Pinned::current(here!("test")).expect("the library policy compiles");
+    std::sync::Arc::make_mut(&mut pinned.decryption)
+        .key_establishment
+        .max_hash_blocks = 5;
+    // SAFETY: contexts created and released here.
+    unsafe {
+        let fresh = xmlSecTransformCtxCreate();
+        pin_run(fresh, &pinned);
+        assert_eq!(execute_once(fresh, PBKDF2_ONE_ITERATION), 0);
+        xmlSecTransformCtxDestroy(fresh);
+        let ctx = xmlSecTransformCtxCreate();
+        pin_run(ctx, &pinned);
+        assert_eq!(execute_once(ctx, PBKDF2_SHA256), -1);
+        assert_eq!(execute_once(ctx, PBKDF2_ONE_ITERATION), -1);
+        xmlSecTransformCtxDestroy(ctx);
+    }
+}
+
+#[test]
+fn a_derivation_read_before_its_chain_runs_under_its_operation() {
+    // A reader that names the operation reads the method before it appends
+    // the transform, so the chain is still empty: the derivation runs under
+    // the policy of that operation, here a decryption admitting none, not
+    // under verification's.
+    let mut pinned = Pinned::current(here!("test")).expect("the library policy compiles");
+    std::sync::Arc::make_mut(&mut pinned.decryption)
+        .key_establishment
+        .derivation_algorithms = Some(std::collections::BTreeSet::new());
+    // SAFETY: a context created and released here.
+    unsafe {
+        let ctx = xmlSecTransformCtxCreate();
+        pin_run(ctx, &pinned);
+        assert_eq!(execute_once(ctx, PBKDF2_SHA256), -1);
+        xmlSecTransformCtxDestroy(ctx);
+    }
 }
 
 #[test]
@@ -244,20 +295,39 @@ fn a_refused_allowance_ends_the_operation() {
     assert_eq!(recorded, Some("key establishment hash blocks"));
 }
 
-/// What one PBKDF2 derivation of `PBKDF2_SHA256` reserves under `pinned`.
-fn derived_usage(pinned: &Pinned) -> xml_sec::key_establishment::KeyEstablishmentUsage {
-    let document = xml_sec::Document::parse(PBKDF2_SHA256).expect("the method parses");
-    let method =
-        KeyDerivationMethod::from_element(document.root_element(), &pinned.decryption.resources)
-            .expect("the method reads");
-    let mut usage = xml_sec::key_establishment::KeyEstablishmentUsage::default();
-    derive(
-        &method,
-        32,
-        SECRET,
-        &pinned.decryption.key_establishment,
-        &mut usage,
-    )
-    .expect("one derivation fits");
-    usage
+/// What one decrypting PBKDF2 derivation of `method` from [`SECRET`] returns
+/// as a part of the run of `ctx`, its method read the way a reader naming the
+/// operation reads it: before the transform joins any chain.
+///
+/// # Safety
+/// `ctx` is an initialized context.
+unsafe fn execute_once(ctx: *mut XmlSecTransformCtx, method: &str) -> c_int {
+    // SAFETY: by the caller's contract; a document, a key and a transform
+    // created and released here.
+    unsafe {
+        let doc = xml_sec_libxml2::ffi::tree::xsReadMemory(
+            method.as_ptr().cast(),
+            c_int::try_from(method.len()).expect("a short document"),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        assert!(!doc.is_null());
+        let transform = xmlSecTransformCreate(pbkdf2());
+        (*transform).operation = OPERATION_DECRYPT;
+        (*transform).expected_output_size = 32;
+        let key = xmlSecKeyReadMemory(symkeys::pbkdf2(), SECRET.as_ptr(), SECRET.len());
+        let node = xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc);
+        let done = if read_node(transform, node, ctx) == 0
+            && xmlSecTransformSetKey(transform, key.cast()) == 0
+        {
+            execute(transform, 1, ctx)
+        } else {
+            -1
+        };
+        xmlSecKeyDestroy(key);
+        xmlSecTransformDestroy(transform);
+        xml_sec_libxml2::ffi::tree::xsFreeDoc(doc);
+        done
+    }
 }

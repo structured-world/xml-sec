@@ -28,6 +28,22 @@ pub struct DerivedKey {
     pub reference_list: Option<super::ReferenceList>,
 }
 
+impl DerivedKey {
+    /// Parse the `DerivedKey` element `node` as a decryption reads the
+    /// descriptors of an `EncryptedData`'s `KeyInfo`, each value within the
+    /// operation's `max_encryption_metadata_bytes`.
+    ///
+    /// # Errors
+    /// Returns a node that is no `DerivedKey`, a malformed child or method,
+    /// or a value beyond the metadata limit of `resources`.
+    pub fn from_element(
+        node: Node<'_, '_>,
+        resources: &crate::policy::ResourcePolicy,
+    ) -> Result<Self, XmlEncError> {
+        parse(node, resources)
+    }
+}
+
 pub(super) fn parse(
     node: Node<'_, '_>,
     resources: &crate::policy::ResourcePolicy,
