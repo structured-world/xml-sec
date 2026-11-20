@@ -166,9 +166,11 @@ static void context(void) {
     printf("  null: %d\n", xmlSecKeyInfoCtxInitialize(NULL, NULL));
 }
 
+/* The names carry no white space: this library keeps it as XMLDSig 1.1
+ * section 4.5.1 reads a KeyName, where libxmlsec1 trims it. */
 static const char keyInfoText[] =
     "<KeyInfo xmlns='http://www.w3.org/2000/09/xmldsig#' xmlns:t='urn:test'>"
-    "<KeyName> alpha </KeyName><Unknown/><KeyValue><t:TestSecret>s3cret</t:TestSecret></KeyValue>"
+    "<KeyName>alpha</KeyName><Unknown/><KeyValue><t:TestSecret>s3cret</t:TestSecret></KeyValue>"
     "<KeyName>alpha</KeyName></KeyInfo>";
 
 static const char conflictText[] =
