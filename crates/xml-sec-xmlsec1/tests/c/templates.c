@@ -193,6 +193,8 @@ static void encryption(void) {
     printf("  mgf again: %d\n", xmlSecTmplTransformAddRsaMgf(transform, BAD_CAST "urn:alg:mgf"));
     printf("  rsa digest: %d\n", xmlSecTmplTransformAddRsaDigest(transform, BAD_CAST "urn:alg:digest"));
     printf("  rsa digest again: %d\n", xmlSecTmplTransformAddRsaDigest(transform, BAD_CAST "urn:alg:digest"));
+    /* no buffer and no size are empty parameters, written as an empty element */
+    printf("  empty oaep: %d\n", xmlSecTmplTransformAddRsaOaepParam(xmlSecTmplEncDataGetEncMethodNode(encKey), NULL, 0));
     dump_node("  tree", doc, enc);
     xsFreeDoc(doc);
 

@@ -8586,7 +8586,7 @@
       "kind": "backend-api",
       "name": "xmlSecOpenSSLGetLibCtx",
       "source": "include/xmlsec/openssl/crypto.h",
-      "detail": "XMLSEC_CRYPTO_EXPORT OSSL_LIB_CTX* xmlSecOpenSSLGetLibCtx(void);",
+      "detail": "XMLSEC_CRYPTO_EXPORT OSSL_LIB_CTX* xmlSecOpenSSLGetLibCtx (void);",
       "conditions": [
         "#ifndef XMLSEC_OPENSSL_CRYPTO_H",
         "#if !defined(XMLSEC_OPENSSL_API_111)"
@@ -9325,7 +9325,7 @@
       "kind": "backend-api",
       "name": "xmlSecOpenSSLSetLibCtx",
       "source": "include/xmlsec/openssl/crypto.h",
-      "detail": "XMLSEC_CRYPTO_EXPORT int xmlSecOpenSSLSetLibCtx(OSSL_LIB_CTX* libctx);",
+      "detail": "XMLSEC_CRYPTO_EXPORT int xmlSecOpenSSLSetLibCtx (OSSL_LIB_CTX* libctx);",
       "conditions": [
         "#ifndef XMLSEC_OPENSSL_CRYPTO_H",
         "#if !defined(XMLSEC_OPENSSL_API_111)"
@@ -38962,7 +38962,18 @@
       "detail": "#define XMLSEC_NO_CAMELLIA 1",
       "conditions": [
         "#ifndef XMLSEC_OPENSSL_CRYPTO_H",
-        "#if defined(XMLSEC_OPENSSL_IS_BORINGSSL) || defined(XMLSEC_OPENSSL_IS_AWSLC)"
+        "#if defined(XMLSEC_OPENSSL_IS_AWSLC)"
+      ],
+      "classification": "backend-specific-surface"
+    },
+    {
+      "kind": "macro",
+      "name": "XMLSEC_NO_CAMELLIA",
+      "source": "include/xmlsec/openssl/crypto.h",
+      "detail": "#define XMLSEC_NO_CAMELLIA 1",
+      "conditions": [
+        "#ifndef XMLSEC_OPENSSL_CRYPTO_H",
+        "#if defined(XMLSEC_OPENSSL_IS_BORINGSSL)"
       ],
       "classification": "backend-specific-surface"
     },
@@ -38995,7 +39006,18 @@
       "detail": "#define XMLSEC_NO_CHACHA20 1",
       "conditions": [
         "#ifndef XMLSEC_OPENSSL_CRYPTO_H",
-        "#if defined(XMLSEC_OPENSSL_IS_BORINGSSL) || defined(XMLSEC_OPENSSL_IS_AWSLC)"
+        "#if defined(XMLSEC_OPENSSL_IS_AWSLC)"
+      ],
+      "classification": "backend-specific-surface"
+    },
+    {
+      "kind": "macro",
+      "name": "XMLSEC_NO_CHACHA20",
+      "source": "include/xmlsec/openssl/crypto.h",
+      "detail": "#define XMLSEC_NO_CHACHA20 1",
+      "conditions": [
+        "#ifndef XMLSEC_OPENSSL_CRYPTO_H",
+        "#if defined(XMLSEC_OPENSSL_IS_BORINGSSL)"
       ],
       "classification": "backend-specific-surface"
     },
@@ -39061,7 +39083,18 @@
       "detail": "#define XMLSEC_NO_DH 1",
       "conditions": [
         "#ifndef XMLSEC_OPENSSL_CRYPTO_H",
-        "#if defined(XMLSEC_OPENSSL_IS_BORINGSSL) || defined(XMLSEC_OPENSSL_IS_AWSLC)"
+        "#if defined(XMLSEC_OPENSSL_IS_AWSLC)"
+      ],
+      "classification": "backend-specific-surface"
+    },
+    {
+      "kind": "macro",
+      "name": "XMLSEC_NO_DH",
+      "source": "include/xmlsec/openssl/crypto.h",
+      "detail": "#define XMLSEC_NO_DH 1",
+      "conditions": [
+        "#ifndef XMLSEC_OPENSSL_CRYPTO_H",
+        "#if defined(XMLSEC_OPENSSL_IS_BORINGSSL)"
       ],
       "classification": "backend-specific-surface"
     },
@@ -39094,7 +39127,18 @@
       "detail": "#define XMLSEC_NO_DSA 1",
       "conditions": [
         "#ifndef XMLSEC_OPENSSL_CRYPTO_H",
-        "#if defined(XMLSEC_OPENSSL_IS_BORINGSSL) || defined(XMLSEC_OPENSSL_IS_AWSLC)"
+        "#if defined(XMLSEC_OPENSSL_IS_AWSLC)"
+      ],
+      "classification": "backend-specific-surface"
+    },
+    {
+      "kind": "macro",
+      "name": "XMLSEC_NO_DSA",
+      "source": "include/xmlsec/openssl/crypto.h",
+      "detail": "#define XMLSEC_NO_DSA 1",
+      "conditions": [
+        "#ifndef XMLSEC_OPENSSL_CRYPTO_H",
+        "#if defined(XMLSEC_OPENSSL_IS_BORINGSSL)"
       ],
       "classification": "backend-specific-surface"
     },
@@ -39161,7 +39205,18 @@
       "detail": "#define XMLSEC_NO_GOST 1",
       "conditions": [
         "#ifndef XMLSEC_OPENSSL_CRYPTO_H",
-        "#if defined(XMLSEC_OPENSSL_IS_BORINGSSL) || defined(XMLSEC_OPENSSL_IS_AWSLC)"
+        "#if defined(XMLSEC_OPENSSL_IS_AWSLC)"
+      ],
+      "classification": "backend-specific-surface"
+    },
+    {
+      "kind": "macro",
+      "name": "XMLSEC_NO_GOST",
+      "source": "include/xmlsec/openssl/crypto.h",
+      "detail": "#define XMLSEC_NO_GOST 1",
+      "conditions": [
+        "#ifndef XMLSEC_OPENSSL_CRYPTO_H",
+        "#if defined(XMLSEC_OPENSSL_IS_BORINGSSL)"
       ],
       "classification": "backend-specific-surface"
     },
@@ -39183,7 +39238,18 @@
       "detail": "#define XMLSEC_NO_GOST2012 1",
       "conditions": [
         "#ifndef XMLSEC_OPENSSL_CRYPTO_H",
-        "#if defined(XMLSEC_OPENSSL_IS_BORINGSSL) || defined(XMLSEC_OPENSSL_IS_AWSLC)"
+        "#if defined(XMLSEC_OPENSSL_IS_AWSLC)"
+      ],
+      "classification": "backend-specific-surface"
+    },
+    {
+      "kind": "macro",
+      "name": "XMLSEC_NO_GOST2012",
+      "source": "include/xmlsec/openssl/crypto.h",
+      "detail": "#define XMLSEC_NO_GOST2012 1",
+      "conditions": [
+        "#ifndef XMLSEC_OPENSSL_CRYPTO_H",
+        "#if defined(XMLSEC_OPENSSL_IS_BORINGSSL)"
       ],
       "classification": "backend-specific-surface"
     },
@@ -39372,7 +39438,7 @@
       "detail": "#define XMLSEC_NO_RIPEMD160 1",
       "conditions": [
         "#ifndef XMLSEC_OPENSSL_CRYPTO_H",
-        "#if defined(XMLSEC_OPENSSL_IS_BORINGSSL) || defined(XMLSEC_OPENSSL_IS_AWSLC)"
+        "#if defined(XMLSEC_OPENSSL_IS_BORINGSSL)"
       ],
       "classification": "backend-specific-surface"
     },
@@ -39416,7 +39482,18 @@
       "detail": "#define XMLSEC_NO_RSA_OAEP 1",
       "conditions": [
         "#ifndef XMLSEC_OPENSSL_CRYPTO_H",
-        "#if defined(XMLSEC_OPENSSL_IS_BORINGSSL) || defined(XMLSEC_OPENSSL_IS_AWSLC)"
+        "#if defined(XMLSEC_OPENSSL_IS_AWSLC)"
+      ],
+      "classification": "backend-specific-surface"
+    },
+    {
+      "kind": "macro",
+      "name": "XMLSEC_NO_RSA_OAEP",
+      "source": "include/xmlsec/openssl/crypto.h",
+      "detail": "#define XMLSEC_NO_RSA_OAEP 1",
+      "conditions": [
+        "#ifndef XMLSEC_OPENSSL_CRYPTO_H",
+        "#if defined(XMLSEC_OPENSSL_IS_BORINGSSL)"
       ],
       "classification": "backend-specific-surface"
     },
@@ -39460,7 +39537,7 @@
       "detail": "#define XMLSEC_NO_SHA3 1",
       "conditions": [
         "#ifndef XMLSEC_OPENSSL_CRYPTO_H",
-        "#if defined(XMLSEC_OPENSSL_IS_BORINGSSL) || defined(XMLSEC_OPENSSL_IS_AWSLC)"
+        "#if defined(XMLSEC_OPENSSL_IS_BORINGSSL)"
       ],
       "classification": "backend-specific-surface"
     },

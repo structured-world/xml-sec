@@ -1820,11 +1820,12 @@ fn an_xml_encryption_holds_its_source_to_the_encryption_xml_policy() {
 }
 
 #[test]
-fn an_xml_encryption_counts_a_template_linked_inside_the_element() {
-    // The template is linked inside the element it encrypts: the
-    // replacement moves it out before the element leaves, so the document
-    // keeps the filled template. One byte short of the result's size
-    // refuses the encryption; exactly that size lets it through.
+fn an_xml_encryption_counts_a_template_linked_elsewhere_in_the_document() {
+    // The template is linked in the document beside the element it
+    // encrypts: the replacement moves it into the element's place, so the
+    // document holds the filled template once. One byte short of the
+    // result's size refuses the encryption; exactly that size lets it
+    // through.
     own_process();
     // SAFETY: the library, documents and contexts set up and released here,
     // on this thread alone.
@@ -1851,7 +1852,7 @@ fn an_xml_encryption_counts_a_template_linked_inside_the_element() {
                 std::ptr::null(),
             );
             assert!(!xmlSecTmplEncDataEnsureCipherValue(tmpl).is_null());
-            assert!(!xml_sec_libxml2::ffi::tree::xsAddChild(secret, tmpl).is_null());
+            assert!(!xml_sec_libxml2::ffi::tree::xsAddChild(root, tmpl).is_null());
             let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
             (*ctx).enc_key = aes_key();
             let status = xmlSecEncCtxXmlEncrypt(ctx, tmpl, secret);
@@ -2115,41 +2116,46 @@ fn a_refused_encryption_keeps_the_template_nodes_the_caller_holds() {
 }
 
 #[test]
-fn a_refused_content_replacement_leaves_the_template_unwritten() {
-    // A Content template linked inside the element whose content it would
-    // replace cannot take that content's place: the replacement is refused,
-    // and so is the encryption, which leaves the template as it was rather
-    // than holding a cipher value in the caller's tree.
+fn a_refused_replacement_leaves_the_template_unwritten() {
+    // A template linked inside the element it would replace, or whose
+    // content it would replace, cannot take that place: libxmlsec1 refuses
+    // the replacement, and so the encryption, which leaves the template as
+    // it was rather than holding a cipher value in the caller's tree.
     own_process();
-    // SAFETY: the library, a document and a context set up and released
-    // here, on this thread alone.
+    // SAFETY: the library, documents and contexts set up and released here,
+    // on this thread alone.
     unsafe {
         start_up();
-        let target = parsed("<root><secret>hidden</secret></root>");
-        let root = xml_sec_libxml2::ffi::tree::xsDocGetRootElement(target.cast());
-        let secret = xml_sec_libxml2::ffi::tree::xsNodeGetChildren(root);
-        let tmpl = xmlSecTmplEncDataCreate(
-            target.cast(),
-            aes128_cbc(),
-            std::ptr::null(),
-            c"http://www.w3.org/2001/04/xmlenc#Content".as_ptr().cast(),
-            std::ptr::null(),
-            std::ptr::null(),
-        );
-        assert!(!xmlSecTmplEncDataEnsureCipherValue(tmpl).is_null());
-        assert!(!xml_sec_libxml2::ffi::tree::xsAddChild(secret, tmpl).is_null());
-        let before = crate::ffi::tree::nodes::dump(target.cast::<XmlNode>());
-        let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
-        (*ctx).enc_key = aes_key();
-        let (status, reasons) = reported(|| xmlSecEncCtxXmlEncrypt(ctx, tmpl, secret));
-        assert_eq!(status, -1, "{reasons:?}");
-        assert_eq!(
-            crate::ffi::tree::nodes::dump(target.cast::<XmlNode>()),
-            before,
-            "the document and its template stay as they were"
-        );
-        xmlSecEncCtxDestroy(ctx);
-        xsFreeDoc(target.cast());
+        for kind in [
+            c"http://www.w3.org/2001/04/xmlenc#Element",
+            c"http://www.w3.org/2001/04/xmlenc#Content",
+        ] {
+            let target = parsed("<root><secret>hidden</secret></root>");
+            let root = xml_sec_libxml2::ffi::tree::xsDocGetRootElement(target.cast());
+            let secret = xml_sec_libxml2::ffi::tree::xsNodeGetChildren(root);
+            let tmpl = xmlSecTmplEncDataCreate(
+                target.cast(),
+                aes128_cbc(),
+                std::ptr::null(),
+                kind.as_ptr().cast(),
+                std::ptr::null(),
+                std::ptr::null(),
+            );
+            assert!(!xmlSecTmplEncDataEnsureCipherValue(tmpl).is_null());
+            assert!(!xml_sec_libxml2::ffi::tree::xsAddChild(secret, tmpl).is_null());
+            let before = crate::ffi::tree::nodes::dump(target.cast::<XmlNode>());
+            let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
+            (*ctx).enc_key = aes_key();
+            let (status, reasons) = reported(|| xmlSecEncCtxXmlEncrypt(ctx, tmpl, secret));
+            assert_eq!(status, -1, "{kind:?}: {reasons:?}");
+            assert_eq!(
+                crate::ffi::tree::nodes::dump(target.cast::<XmlNode>()),
+                before,
+                "{kind:?}: the document and its template stay as they were"
+            );
+            xmlSecEncCtxDestroy(ctx);
+            xsFreeDoc(target.cast());
+        }
         shut_down();
     }
 }

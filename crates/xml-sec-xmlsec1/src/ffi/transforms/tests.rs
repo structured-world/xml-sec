@@ -9,11 +9,12 @@ use super::ctx::{
     xmlSecTransformCtxDestroy,
 };
 use super::{
-    OPERATION_DECODE, OPERATION_ENCODE, USAGE_DSIG_TRANSFORM, XmlSecTransformKlass,
-    xmlSecTransformIdListFindByHref, xmlSecTransformIdListFindByName, xmlSecTransformIdsGet,
-    xmlSecTransformIdsInit, xmlSecTransformIdsShutdown,
+    OPERATION_DECODE, OPERATION_ENCODE, USAGE_AGREEMENT_METHOD, USAGE_DSIG_TRANSFORM,
+    USAGE_KEY_DERIVATION_METHOD, XmlSecTransformKlass, xmlSecTransformCreate,
+    xmlSecTransformDestroy, xmlSecTransformIdListFindByHref, xmlSecTransformIdListFindByName,
+    xmlSecTransformIdsGet, xmlSecTransformIdsInit, xmlSecTransformIdsShutdown,
 };
-use crate::ffi::buffer::{xmlSecBufferGetData, xmlSecBufferGetSize};
+use crate::ffi::buffer::{xmlSecBufferGetData, xmlSecBufferGetSize, xmlSecBufferIsSecure};
 use crate::ffi::list::{xmlSecPtrListGetItem, xmlSecPtrListGetSize};
 use crate::ffi::tree::nodes;
 use std::ffi::{CStr, c_int};
@@ -667,4 +668,37 @@ fn library_policy_runs_the_relationship_transform() {
          </Relationship><Relationship Id=\"rId3\" Target=\"c.xml\" TargetMode=\"Internal\" \
          Type=\"urn:t:c\"></Relationship></Relationships>"
     );
+}
+
+#[test]
+fn key_derivation_and_agreement_transforms_hold_secrets_in_both_buffers() {
+    // libxmlsec1 creates a key derivation or agreement transform with both
+    // buffers marked as holding secrets (the shared secret in, the derived
+    // key out); a transform of any other usage keeps them unmarked.
+    static DERIVATION: XmlSecTransformKlass = super::builtin::klass(
+        size_of::<super::XmlSecTransform>(),
+        c"derivation".as_ptr().cast(),
+        std::ptr::null(),
+        USAGE_KEY_DERIVATION_METHOD,
+    );
+    static AGREEMENT: XmlSecTransformKlass = super::builtin::klass(
+        size_of::<super::XmlSecTransform>(),
+        c"agreement".as_ptr().cast(),
+        std::ptr::null(),
+        USAGE_AGREEMENT_METHOD,
+    );
+    for (klass, secure) in [
+        (&raw const DERIVATION, 1),
+        (&raw const AGREEMENT, 1),
+        (base64(), 0),
+    ] {
+        // SAFETY: a transform of a static klass, created and destroyed here.
+        unsafe {
+            let transform = xmlSecTransformCreate(klass);
+            assert!(!transform.is_null(), "{}", name(klass));
+            assert_eq!(xmlSecBufferIsSecure(&raw mut (*transform).in_buf), secure);
+            assert_eq!(xmlSecBufferIsSecure(&raw mut (*transform).out_buf), secure);
+            xmlSecTransformDestroy(transform);
+        }
+    }
 }

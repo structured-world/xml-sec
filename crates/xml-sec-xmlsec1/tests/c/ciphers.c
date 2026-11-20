@@ -65,6 +65,10 @@ static xmlSecKeyPtr key_of(xmlSecKeyDataId id, xmlSecByte fill, xmlSecSize size)
     return key;
 }
 
+/* Whether the output buffer of the last transform run was marked as holding
+ * a secret. */
+static int last_secure;
+
 /* Runs `id` with `operation` and `key` over `size` bytes of `data` into
  * `out`; returns the output length or -1. */
 static int run(xmlSecTransformId id, xmlSecTransformOperation operation, xmlSecKeyPtr key,
@@ -73,8 +77,10 @@ static int run(xmlSecTransformId id, xmlSecTransformOperation operation, xmlSecK
     xmlSecTransformCtxPtr ctx = xmlSecTransformCtxCreate();
     xmlSecTransformPtr transform = xmlSecTransformCtxCreateAndAppend(ctx, id);
     transform->operation = operation;
+    last_secure = -1;
     if (xmlSecTransformSetKey(transform, key) == 0 &&
         xmlSecTransformCtxBinaryExecute(ctx, data, size) == 0) {
+        last_secure = xmlSecBufferIsSecure(&(transform->outBuf));
         result = (int)xmlSecBufferGetSize(ctx->result);
         if (result > 0) {
             memcpy(out, xmlSecBufferGetData(ctx->result), (size_t)result);
@@ -113,8 +119,8 @@ static void check(xmlSecTransformId id, xmlSecKeyDataId keyId, xmlSecSize keySiz
     if (produced(encrypted_size)) {
         decrypted_size = run(id, xmlSecTransformOperationDecrypt, key, encrypted,
                              (xmlSecSize)encrypted_size, decrypted);
-        printf("  decrypted: %d %.*s\n", decrypted_size,
-               decrypted_size > 0 ? decrypted_size : 0, (const char *)decrypted);
+        printf("  decrypted: %d %.*s secure=%d\n", decrypted_size,
+               decrypted_size > 0 ? decrypted_size : 0, (const char *)decrypted, last_secure);
         same(decrypted, decrypted_size, plaintext, sizeof(plaintext) - 1);
     }
     printf("  short key: %d\n", run(id, xmlSecTransformOperationEncrypt, short_key, plaintext,
@@ -146,8 +152,8 @@ static void wrap(xmlSecTransformId id, xmlSecKeyDataId keyId, xmlSecSize kekSize
          * which printf's arguments are evaluated is unspecified. */
         unwrapped_size =
             run(id, xmlSecTransformOperationDecrypt, kek, wrapped, (xmlSecSize)size, unwrapped);
-        printf("  unwrapped: %d same=%d\n", unwrapped_size,
-               same(unwrapped, unwrapped_size, content_key, sizeof(content_key)));
+        printf("  unwrapped: %d same=%d secure=%d\n", unwrapped_size,
+               same(unwrapped, unwrapped_size, content_key, sizeof(content_key)), last_secure);
         wrapped[0] ^= 0x01;
         printf("  tampered: %d\n",
                run(id, xmlSecTransformOperationDecrypt, kek, wrapped, (xmlSecSize)size, unwrapped));
@@ -185,10 +191,12 @@ static int transport(xmlSecTransformId id, const char *xml, xmlSecTransformOpera
     } else {
         transform = xmlSecTransformCtxCreateAndAppend(ctx, id);
     }
+    last_secure = -1;
     if (transform != NULL) {
         transform->operation = operation;
         if (xmlSecTransformSetKey(transform, key) == 0 &&
             xmlSecTransformCtxBinaryExecute(ctx, data, size) == 0) {
+            last_secure = xmlSecBufferIsSecure(&(transform->outBuf));
             result = (int)xmlSecBufferGetSize(ctx->result);
             memcpy(out, xmlSecBufferGetData(ctx->result), (size_t)result);
         }
@@ -216,8 +224,8 @@ static void oaep(const char *label, xmlSecTransformId id, const char *xml) {
     if (produced(size)) {
         recovered_size = transport(id, xml, xmlSecTransformOperationDecrypt, key, transported,
                                    (xmlSecSize)size, recovered);
-        printf("  recovered: %d same=%d\n", recovered_size,
-               same(recovered, recovered_size, content_key, sizeof(content_key)));
+        printf("  recovered: %d same=%d secure=%d\n", recovered_size,
+               same(recovered, recovered_size, content_key, sizeof(content_key)), last_secure);
         transported[0] ^= 0x01;
         printf("  tampered: %d\n", transport(id, xml, xmlSecTransformOperationDecrypt, key,
                                              transported, (xmlSecSize)size, recovered));

@@ -314,22 +314,6 @@ enum Replaced {
     Content(*mut XmlNode),
 }
 
-/// Whether `tmpl` is a part of what `replaced` names: the element itself, or
-/// a node strictly below it for its content.
-fn holds(replaced: Replaced, tmpl: *mut XmlNode) -> bool {
-    let (node, mut current) = match replaced {
-        Replaced::Element(node) => (node, tmpl),
-        Replaced::Content(node) => (node, nodes::parent(tmpl)),
-    };
-    while !current.is_null() {
-        if current == node {
-            return true;
-        }
-        current = nodes::parent(current);
-    }
-    false
-}
-
 /// The octets `replaced` takes in its document's own dump, character
 /// references included, measured as the document stands, the written
 /// template included. `None` for a node that cannot be written.
@@ -359,9 +343,8 @@ unsafe fn replaced_octets(replaced: Replaced) -> Option<usize> {
 /// document when linked into it. When it is to take the place of
 /// `replacing`, the document left is that node's: the replaced octets leave
 /// it and the template's enter it, unless the template is already a part of
-/// its text outside them. A template inside the element it replaces is
-/// moved out before that leaves, as libxmlsec1 moves it, so its octets
-/// stay.
+/// its text. A template inside what it replaces is not measured apart: the
+/// replacement refuses it, as libxmlsec1 refuses it.
 ///
 /// # Safety
 /// `tmpl` is a live node written by the context's encryption; a replaced
@@ -395,7 +378,7 @@ unsafe fn admit_document(
             let rest = length(destination.cast())
                 .zip(measured)
                 .and_then(|(document, octets)| document.checked_sub(octets));
-            if linked && doc == destination && !holds(replaced, tmpl) {
+            if linked && doc == destination {
                 rest
             } else {
                 rest.zip(length(tmpl))
@@ -558,7 +541,7 @@ pub(super) unsafe fn xml_encrypt(
         return -1;
     }
     // The replacement is a part of what a failure undoes: one it refuses,
-    // such as a Content template inside the content it would replace,
+    // such as a template inside the element or content it would replace,
     // leaves the template unwritten. It checks before it moves anything.
     // SAFETY: by the caller's contract.
     unsafe {

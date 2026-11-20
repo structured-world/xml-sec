@@ -15,7 +15,8 @@ use xml_sec::xmlenc::{DataEncryptionAlgorithm, KeyWrapAlgorithm};
 use zeroize::Zeroizing;
 
 use super::super::buffer::{
-    xmlSecBufferAppend, xmlSecBufferGetData, xmlSecBufferGetSize, xmlSecBufferRemoveHead,
+    xmlSecBufferAppend, xmlSecBufferGetData, xmlSecBufferGetSize, xmlSecBufferMakeSecure,
+    xmlSecBufferRemoveHead,
 };
 use super::super::errors::{self, Here, here};
 use super::super::keys::{TYPE_SYMMETRIC, XmlSecKey, xmlSecKeyGetValue};
@@ -463,6 +464,12 @@ fn collect(
         errors::limit_exceeded(here, name, limit.name, limit.max);
         refused_by.get_or_insert(limit);
         return -1;
+    }
+    // An unwrap's output is the recovered key, marked as a secret as
+    // libxmlsec1 marks it.
+    if !encrypting && matches!(method, Method::Wrap(_)) {
+        // SAFETY: the transform's own output buffer.
+        unsafe { xmlSecBufferMakeSecure(&raw mut object.out_buf) };
     }
     // SAFETY: the transform's own output buffer.
     let appended =

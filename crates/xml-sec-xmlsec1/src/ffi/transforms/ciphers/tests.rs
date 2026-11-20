@@ -1,6 +1,8 @@
 use super::*;
 
-use crate::ffi::buffer::{XmlSecBuffer, xmlSecBufferGetData, xmlSecBufferGetSize};
+use crate::ffi::buffer::{
+    XmlSecBuffer, xmlSecBufferGetData, xmlSecBufferGetSize, xmlSecBufferIsSecure,
+};
 use crate::ffi::keys::{xmlSecKeyCreate, xmlSecKeyDestroy, xmlSecKeySetValue};
 use crate::ffi::keysdata::{xmlSecKeyDataBinaryValueSetBuffer, xmlSecKeyDataCreate};
 use crate::ffi::transforms::ctx::{
@@ -114,6 +116,55 @@ fn gcm_refuses_a_tampered_cipher_value() {
     assert_eq!(
         REASONS.lock().expect("one test thread").first(),
         Some(&crate::ffi::errors::R_CRYPTO_FAILED)
+    );
+    // SAFETY: the key created above.
+    unsafe { xmlSecKeyDestroy(key) };
+}
+
+/// Whether the cipher `id` run with `operation` and `key` over `input` marks
+/// its output buffer as holding a secret; `None` when it fails.
+fn marks_output_secure(
+    id: *const XmlSecTransformKlass,
+    operation: c_int,
+    key: *mut XmlSecKey,
+    input: &[u8],
+) -> Option<bool> {
+    // SAFETY: a context created and destroyed here.
+    unsafe {
+        let ctx = xmlSecTransformCtxCreate();
+        let transform = xmlSecTransformCtxCreateAndAppend(ctx, id);
+        (*transform).operation = operation;
+        let marked = (xmlSecTransformSetKey(transform, key.cast()) == 0
+            && xmlSecTransformCtxBinaryExecute(ctx, input.as_ptr(), input.len()) == 0)
+            .then(|| xmlSecBufferIsSecure(&raw mut (*transform).out_buf) == 1);
+        xmlSecTransformCtxDestroy(ctx);
+        marked
+    }
+}
+
+#[test]
+fn an_unwrapped_key_is_written_to_a_secure_buffer() {
+    // libxmlsec1 marks the output of a key unwrap as holding a secret; the
+    // wrap's output and a data decryption's output stay unmarked.
+    let key = aes_key(&[0x22; 16]);
+    let content_key = [0x33_u8; 16];
+    let wrapped = run(kw_aes128(), OPERATION_ENCRYPT, key, &content_key).expect("wraps");
+    assert_eq!(
+        run(kw_aes128(), OPERATION_DECRYPT, key, &wrapped).as_deref(),
+        Some(&content_key[..])
+    );
+    assert_eq!(
+        marks_output_secure(kw_aes128(), OPERATION_ENCRYPT, key, &content_key),
+        Some(false)
+    );
+    assert_eq!(
+        marks_output_secure(kw_aes128(), OPERATION_DECRYPT, key, &wrapped),
+        Some(true)
+    );
+    let encrypted = run(aes128_cbc(), OPERATION_ENCRYPT, key, b"data").expect("encrypts");
+    assert_eq!(
+        marks_output_secure(aes128_cbc(), OPERATION_DECRYPT, key, &encrypted),
+        Some(false)
     );
     // SAFETY: the key created above.
     unsafe { xmlSecKeyDestroy(key) };

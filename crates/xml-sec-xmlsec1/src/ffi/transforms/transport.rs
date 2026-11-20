@@ -21,7 +21,8 @@ use zeroize::Zeroizing;
 
 use super::super::asymkeys::{self, material_of};
 use super::super::buffer::{
-    xmlSecBufferAppend, xmlSecBufferGetData, xmlSecBufferGetSize, xmlSecBufferRemoveHead,
+    xmlSecBufferAppend, xmlSecBufferGetData, xmlSecBufferGetSize, xmlSecBufferMakeSecure,
+    xmlSecBufferRemoveHead,
 };
 use super::super::errors::{self, Here, here};
 use super::super::keys::{TYPE_PRIVATE, TYPE_PUBLIC, XmlSecKey, xmlSecKeyGetValue};
@@ -625,6 +626,12 @@ unsafe extern "C" fn execute(
                 return -1;
             }
         };
+        // A decryption's output is the recovered key, marked as a secret as
+        // libxmlsec1 marks it.
+        if object.operation == OPERATION_DECRYPT {
+            // SAFETY: the transform's own output buffer.
+            unsafe { xmlSecBufferMakeSecure(&raw mut object.out_buf) };
+        }
         // SAFETY: the transform's own output buffer.
         let appended =
             unsafe { xmlSecBufferAppend(&raw mut object.out_buf, output.as_ptr(), output.len()) };

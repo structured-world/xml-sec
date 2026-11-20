@@ -1992,7 +1992,8 @@ pub(crate) unsafe extern "C" fn xmlSecTmplTransformAddHmacOutputLength(
 }
 
 /// `xmlSecTmplTransformAddRsaOaepParam`: the only `<OAEPparams>` of
-/// `transform_node`, holding the Base64 of `size` bytes of `buf`.
+/// `transform_node`, holding the Base64 of `size` bytes of `buf`, empty when
+/// `size` is 0.
 ///
 /// # Safety
 /// `transform_node` is null or a live node; `buf` null or holding `size`
@@ -2010,16 +2011,12 @@ pub(crate) unsafe extern "C" fn xmlSecTmplTransformAddRsaOaepParam(
             c"transformNode != NULL",
             -1
         );
+        // No buffer and no size are empty parameters, written as an empty
+        // OAEPparams that reads back as an empty label.
         check!(
-            !buf.is_null(),
+            !buf.is_null() || size == 0,
             "xmlSecTmplTransformAddRsaOaepParam",
-            c"buf != NULL",
-            -1
-        );
-        check!(
-            size > 0,
-            "xmlSecTmplTransformAddRsaOaepParam",
-            c"size > 0",
+            c"(buf != NULL) || (size == 0)",
             -1
         );
         let here = here!("xmlSecTmplTransformAddRsaOaepParam");
