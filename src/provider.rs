@@ -1743,20 +1743,19 @@ impl RustCryptoRsaPublicKey {
     }
 
     /// Decode an RSA `SubjectPublicKeyInfo`, for a caller that holds the key
-    /// as DER rather than as a parsed `RustCrypto` key.
+    /// as DER rather than as a parsed `RustCrypto` key. Only an
+    /// `rsaEncryption` key transports keys: an `id-RSASSA-PSS` one is for
+    /// signatures alone (RFC 4055 section 1.2).
     ///
     /// # Errors
     /// Returns [`ProviderError::InvalidInput`] for DER that is no valid RSA
-    /// public key.
+    /// public key, or a key restricted to signatures.
     pub fn from_spki_der(spki: &[u8]) -> Result<Self, ProviderError> {
-        use crate::rsa_encoding::RsaPublicKeyEncoding as _;
-        rsa::RsaPublicKey::from_public_key_der(spki)
+        crate::rsa_encoding::read_transport_spki_public_key(spki)
             .map(Self::new)
-            .map_err(|_| {
-                ProviderError::InvalidInput(ProviderInputError::PrimitiveInitialization(
-                    "RSA public key",
-                ))
-            })
+            .ok_or(ProviderError::InvalidInput(
+                ProviderInputError::PrimitiveInitialization("RSA public key"),
+            ))
     }
 }
 

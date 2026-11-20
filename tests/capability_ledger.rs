@@ -164,7 +164,7 @@ fn complete_surface_categories_are_stable() {
         counts,
         BTreeMap::from([
             ("algorithm-uri", 136),
-            ("backend-api", 856),
+            ("backend-api", 857),
             ("build-define", 50),
             ("callback", 65),
             ("class-id", 1_128),
@@ -178,7 +178,7 @@ fn complete_surface_categories_are_stable() {
             ("header", 59),
             ("internal-export", 70),
             ("key-format", 11),
-            ("macro", 1_663),
+            ("macro", 1_670),
             ("registry", 15),
             ("struct-layout", 25),
             ("test-family", 29),
@@ -911,7 +911,7 @@ fn backend_source_tier_is_not_claimed() {
         .iter()
         .filter(|item| from_backend_header(item))
         .collect();
-    assert_eq!(backend_items.len(), 3_097);
+    assert_eq!(backend_items.len(), 3_105);
     for item in &backend_items {
         let expected = if item.classification == "backend-provider-transform-surface" {
             "provider-limited"
@@ -1234,7 +1234,9 @@ fn xmldsig_second_edition_family_is_exhaustively_classified() {
     assert!(
         suite.contains("complete_second_edition_verification_corpus_is_classified_and_executed")
     );
-    assert!(suite.contains("second_edition_template_materializes_c14n11_and_signs_detached_xml"));
+    assert!(suite.contains(
+        "second_edition_template_materializes_its_canonicalization_and_signs_detached_xml"
+    ));
 }
 
 /// Every runtime command is a complete, behavior-compatible donor entry.

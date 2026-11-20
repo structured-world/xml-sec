@@ -741,6 +741,34 @@ fn a_node_of_an_entity_expansion_is_not_replaced() {
 }
 
 #[test]
+fn an_attribute_default_holding_a_double_quote_reaches_the_fragment() {
+    // The subset declares a default whose literal is single-quoted around a
+    // double quote: the subset the fragment parse sees must keep it a valid
+    // literal, so the fragment parses and its element takes the default.
+    let mut policy = VerificationPolicy::default();
+    policy.xml.allow_internal_dtd = true;
+    for declaration in [
+        r#"<!ATTLIST item a CDATA 'say "hi"'>"#,
+        r#"<!ATTLIST item a CDATA #FIXED 'say "hi"'>"#,
+    ] {
+        let xml = format!("<!DOCTYPE root [{declaration}]><root/>");
+        let mut tree = OwnedTree::parse_with_policy(&xml, &policy).expect("the document parses");
+        let root = tree.root_element().expect("a document element");
+        let item = tree
+            .parse_in_context(root, "<item/>", &policy)
+            .expect("the fragment parses")
+            .expect("the fragment has nodes");
+        tree.append_child(root, item)
+            .expect("an unlinked node links");
+        let serialized = tree.serialize();
+        assert!(
+            serialized.ends_with("<root><item a=\"say &quot;hi&quot;\"/></root>\n"),
+            "{declaration}: {serialized}"
+        );
+    }
+}
+
+#[test]
 fn entity_expanded_markup_is_held_to_the_same_depth_as_direct_markup() {
     // A context at depth three under a depth limit of four leaves room for
     // one level: `<a><b/></a>` needs two, whether written directly or

@@ -90,6 +90,9 @@ pub struct CipherReferenceContext<'a> {
     id_attributes: &'a [crate::IdAttributeRegistration],
     backend: crate::XmlBackend,
     operation: Option<&'a dyn ReferenceOperationGate>,
+    /// The decryption reads no `EncryptedKey` recipient, so none of their
+    /// `CipherReference`s is resolved, however the recipient was reached.
+    recipients_declined: bool,
 }
 
 pub(super) trait ReferenceOperationGate {
@@ -201,6 +204,14 @@ impl<'a> CipherReferenceContext<'a> {
         self.operation = Some(operation);
         self
     }
+    /// For a decryption that reads no `EncryptedKey` recipient.
+    pub(super) fn declining_recipients(mut self, declined: bool) -> Self {
+        self.recipients_declined = declined;
+        self
+    }
+    pub(super) fn recipients_declined(&self) -> bool {
+        self.recipients_declined
+    }
     pub(super) fn backend(&self) -> crate::XmlBackend {
         self.backend
     }
@@ -311,6 +322,7 @@ impl<'a> CipherReferenceContext<'a> {
             id_attributes,
             backend,
             operation: None,
+            recipients_declined: false,
         })
     }
 

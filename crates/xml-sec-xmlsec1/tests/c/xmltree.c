@@ -154,6 +154,8 @@ static void replacing(void) {
     /* neither node may be a descendant of the other */
     printf("  own child: %d\n", xmlSecReplaceContent(root, xsNodeGetChildren(root)));
     printf("  own ancestor: %d\n", xmlSecReplaceContent(xsNodeGetChildren(root), root));
+    printf("  node by own child: %d\n", xmlSecReplaceNode(root, xsNodeGetChildren(root)));
+    printf("  node by own ancestor: %d\n", xmlSecReplaceNode(xsNodeGetChildren(root), root));
     printf("  buffer: %d\n", xmlSecReplaceNodeBuffer(xsNodeGetLast(root), BAD_CAST "<p>1</p><q/>", 12));
     printf("  bad buffer: %d\n", xmlSecReplaceNodeBuffer(xsNodeGetLast(root), BAD_CAST "<p>", 3));
     replaced = NULL;

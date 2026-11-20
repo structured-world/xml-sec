@@ -78,7 +78,7 @@ fn reference(q: &str, uri: &str, transforms: &str) -> String {
 
 #[test]
 fn a_generated_canonicalization_signs_exactly_like_an_explicit_one() {
-    // XMLDSig Second Edition generation makes C14N 1.1 explicit. Whether that
+    // Generation makes the node set's canonicalization explicit. Whether that
     // transform is committed first or joins the final mutation, the document
     // and the signed bytes must be the ones a template already stating it gives.
     let policy = crate::policy::SigningPolicy::default();
@@ -93,7 +93,7 @@ fn a_generated_canonicalization_signs_exactly_like_an_explicit_one() {
             ("xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"", "ds:"),
             ("xmlns=\"http://www.w3.org/2000/09/xmldsig#\"", ""),
         ] {
-            let last = format!("<{q}Transform Algorithm=\"{C14N11}\"/>");
+            let last = format!("<{q}Transform Algorithm=\"{GENERATED_C14N_URI}\"/>");
             let enveloped = format!("<{q}Transform Algorithm=\"{ENVELOPED}\"/>");
             let cases = [
                 (
@@ -159,7 +159,9 @@ fn a_generated_canonicalization_covers_every_reference_of_a_signature() {
     let q = "ds:";
     let open = "xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"";
     let exclusive = "http://www.w3.org/2001/10/xml-exc-c14n#";
-    let last = format!("<{q}Transforms><{q}Transform Algorithm=\"{C14N11}\"/></{q}Transforms>");
+    let last = format!(
+        "<{q}Transforms><{q}Transform Algorithm=\"{GENERATED_C14N_URI}\"/></{q}Transforms>"
+    );
     let build = |transforms: &str| {
         let references =
             reference(q, "#payload", transforms) + &reference(q, "#payload", transforms);
@@ -189,7 +191,9 @@ fn a_generated_canonicalization_read_by_another_reference_commits_first() {
     let open = "xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"";
     let exclusive = "http://www.w3.org/2001/10/xml-exc-c14n#";
     let outer = format!("<{q}Transforms><{q}Transform Algorithm=\"{exclusive}\"/></{q}Transforms>");
-    let last = format!("<{q}Transforms><{q}Transform Algorithm=\"{C14N11}\"/></{q}Transforms>");
+    let last = format!(
+        "<{q}Transforms><{q}Transform Algorithm=\"{GENERATED_C14N_URI}\"/></{q}Transforms>"
+    );
     let build = |inner: &str| {
         template(exclusive, open, q, &reference(q, "#manifest", &outer)).replace(
             "<ds:SignatureValue/>",
@@ -223,7 +227,7 @@ fn a_generated_canonicalization_takes_the_prefix_of_foreign_transforms() {
         &reference(
             "ds:",
             "#payload",
-            &format!("{declared}><x:Transform Algorithm=\"{C14N11}\"/></x:Transforms>"),
+            &format!("{declared}><x:Transform Algorithm=\"{GENERATED_C14N_URI}\"/></x:Transforms>"),
         ),
     );
     assert_eq!(signed(&generated, &policy), signed(&explicit, &policy));
@@ -304,7 +308,9 @@ fn a_shrinking_signature_value_keeps_the_projected_length_in_range() {
         )
         .replace("<ds:SignatureValue/>", &stale)
     };
-    let last = format!("<ds:Transforms><ds:Transform Algorithm=\"{C14N11}\"/></ds:Transforms>");
+    let last = format!(
+        "<ds:Transforms><ds:Transform Algorithm=\"{GENERATED_C14N_URI}\"/></ds:Transforms>"
+    );
     assert_eq!(signed(&build(""), &policy), signed(&build(&last), &policy));
 }
 
@@ -444,7 +450,9 @@ fn a_generated_canonicalization_adds_no_document_parse() {
     context
         .sign_document_in_place::<CommitDocument>(&mut document, &mut measured)
         .expect("signing succeeds");
-    assert!(document.as_xml().contains(C14N11));
+    assert!(document.as_xml().contains(&format!(
+        "<ds:Transform Algorithm=\"{GENERATED_C14N_URI}\"/>"
+    )));
     let once = XmlParseWorkBudget::from_resources(&policy.resources);
     XmlDocument::parse_with_settings_and_budget(
         document.as_xml().to_owned(),

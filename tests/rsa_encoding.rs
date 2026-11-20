@@ -110,6 +110,29 @@ fn rsa_encoding_validates_algorithm_parameters() {
     assert!(key.n().bit_width_vartime() >= 2048);
 }
 
+#[cfg(feature = "xmlenc")]
+#[test]
+fn a_transport_key_refuses_a_signing_only_rsa_key() {
+    // RFC 4055 section 1.2: id-RSASSA-PSS names a key for RSASSA-PSS
+    // signatures alone, so it never becomes a key that encrypts with OAEP;
+    // the same key under rsaEncryption (NULL parameters) is unrestricted.
+    use xml_sec::provider::RustCryptoRsaPublicKey;
+    let encoded = RsaPublicKey::from_public_key_pem(PUBLIC)
+        .unwrap()
+        .to_public_key_der()
+        .unwrap();
+    assert!(RustCryptoRsaPublicKey::from_spki_der(encoded.as_bytes()).is_ok());
+    let mut info = pkcs8::SubjectPublicKeyInfoRef::from_der(encoded.as_bytes()).unwrap();
+    info.algorithm.oid = pkcs8::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.10");
+    info.algorithm.parameters = None;
+    let pss = info.to_der().unwrap();
+    assert!(
+        RsaPublicKey::from_public_key_der(&pss).is_ok(),
+        "a PSS key still verifies signatures"
+    );
+    assert!(RustCryptoRsaPublicKey::from_spki_der(&pss).is_err());
+}
+
 #[test]
 fn rsa_encoding_protected_container_requires_correct_password() {
     // Protected import must decrypt first and never reinterpret an error as a

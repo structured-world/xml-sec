@@ -464,8 +464,8 @@ fn the_audit_names_the_implicit_canonicalization_a_reference_digests_with() {
         .unwrap();
     assert_ne!(result.status, DsigStatus::Valid);
     assert!(names_implicit(&result.policy));
-    // Signing such a template generates an explicit C14N 1.1 transform, so
-    // nothing is applied implicitly and the audit names the explicit one.
+    // Signing such a template generates an explicit Exclusive C14N transform,
+    // so nothing is applied implicitly and the audit names the explicit one.
     let key = HmacSigningKey::new(vec![0x42; 32]).unwrap();
     let signed = api
         .signer(&key)
@@ -476,7 +476,7 @@ fn the_audit_names_the_implicit_canonicalization_a_reference_digests_with() {
     assert!(signed.policy.decisions.iter().any(|decision| matches!(
         decision,
         PolicyDecision::Algorithm { role: AlgorithmRole::Transform, uri }
-            if uri == "http://www.w3.org/2006/12/xml-c14n11"
+            if uri == "http://www.w3.org/2001/10/xml-exc-c14n#"
     )));
 }
 

@@ -9,7 +9,7 @@ use super::super::xmlSecCheckNodeName;
 use super::{
     xmlSecAddChild, xmlSecAddChildNode, xmlSecAddNextSibling, xmlSecAddPrevSibling,
     xmlSecEnsureEmptyChild, xmlSecReplaceContent, xmlSecReplaceContentAndReturn,
-    xmlSecReplaceNodeBufferAndReturn,
+    xmlSecReplaceNodeAndReturn, xmlSecReplaceNodeBufferAndReturn,
 };
 use crate::ffi::parser::xmlSecParseMemory;
 use crate::ffi::tree::{XmlNode, nodes};
@@ -95,6 +95,34 @@ fn a_descendant_cannot_become_the_content_of_its_ancestor() {
             );
             assert_eq!(nodes::content(root).as_deref(), Some("kept"));
             assert_eq!(nodes::parent(child), root);
+        }
+        xsFreeDoc(doc);
+    }
+}
+
+#[test]
+fn a_node_is_not_replaced_by_itself_its_relatives_or_another_kind() {
+    // libxmlsec1 refuses a replacement by the node itself, by a node of
+    // another kind, and by an ancestor or a descendant of the node: the call
+    // fails and the tree keeps its shape.
+    let xml = "<r><a/><n>kept<g/></n><b/></r>";
+    // SAFETY: handles are validated by each call; the document is freed once.
+    unsafe {
+        let doc = xmlSecParseMemory(xml.as_ptr(), xml.len(), 1);
+        assert!(!doc.is_null(), "the document parses");
+        let root = xsDocGetRootElement(doc);
+        let n = nodes::next(nodes::first_child(root));
+        let text = nodes::first_child(n);
+        let g = nodes::last_child(n);
+        for (node, new_node) in [(n, n), (n, text), (n, g), (g, n), (root, n)] {
+            assert_eq!(
+                xmlSecReplaceNodeAndReturn(node, new_node, std::ptr::null_mut()),
+                -1
+            );
+            assert_eq!(nodes::parent(n), root);
+            assert_eq!(nodes::parent(g), n);
+            assert_eq!(nodes::first_child(n), text);
+            assert_eq!(xsDocGetRootElement(doc), root);
         }
         xsFreeDoc(doc);
     }

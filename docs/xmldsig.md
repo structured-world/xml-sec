@@ -126,15 +126,16 @@ interoperating with legacy libxmlsec1 `here()` behavior can explicitly select
 
 `SigningPolicy::transforms` applies to every canonicalization algorithm the signing pipeline
 executes. Verification follows `XMLDSig`'s implicit C14N 1.0 coercion for a Reference chain ending
-as a node set. Signature generation follows the Second Edition recommendation instead: before
-digest planning it materializes C14N 1.1 as an explicit `Transform` wherever the generated chain
-still produces a node set. The mutation is operation-gated, policy-checked, bounded, and included
-in the canonicalized `<SignedInfo>` rather than being an invisible signing option. A signing policy
-whose `transforms.generated_canonicalization` is
+as a node set. Signature generation follows the `XMLDSig` 1.1 section 3.1.1 recommendation instead:
+before digest planning it materializes Exclusive C14N as an explicit `Transform` wherever the
+generated chain still produces a node set, which libxmlsec1, .NET and Java verifiers all accept and
+which keeps a signed subset independent of its ancestors' namespaces and `xml:*` attributes. The
+mutation is operation-gated, policy-checked, bounded, and included in the canonicalized
+`<SignedInfo>` rather than being an invisible signing option. Every named profile selects it, the
+`XmlSecCompatible` one included. A signing policy whose `transforms.generated_canonicalization` is
 [`GeneratedCanonicalization::Implicit`](crate::policy::GeneratedCanonicalization::Implicit) writes
 nothing and digests the node set with C14N 1.0, as libxmlsec1 signs a template; the libxmlsec1 C
-library and the `xmlsec1` command select it, so donor templates sign to the donor's documents. The
-`XmlSecCompatible` profile verifies such documents but signs as every other profile does. The declared
+library and the `xmlsec1` command select it, so donor templates sign to the donor's documents. The declared
 canonicalization method for `<SignedInfo>` is governed by the same policy. Reference output and
 `<SignedInfo>` serialization consume one bounded canonicalization budget, so policy rejection
 occurs during rendering rather than after an oversized buffer has already been allocated.

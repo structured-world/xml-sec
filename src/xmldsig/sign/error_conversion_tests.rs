@@ -722,12 +722,13 @@ fn signing_rejects_references_that_retain_signature_value() {
 }
 
 #[test]
-fn second_edition_c14n_materialization_handles_both_reference_shapes() {
+fn generated_c14n_materialization_handles_both_reference_shapes() {
     // Templates may omit <Transforms> entirely or serialize an empty
-    // prefixed element. Both forms must become one valid explicit chain.
+    // prefixed element. Both forms must become one valid explicit chain,
+    // each gaining exactly one Exclusive C14N transform.
     let xml = r##"<root><payload Id="payload"/><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2006/12/xml-c14n11"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#payload"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference><ds:Reference URI="#payload"><ds:Transforms/><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature></root>"##;
     let document = XmlDocument::parse(xml).expect("fixture must parse");
-    let candidate = materialize_second_edition_c14n11_candidate(
+    let candidate = materialize_generated_c14n_candidate(
         &document,
         0,
         &crate::policy::SigningPolicy::default(),
@@ -736,23 +737,28 @@ fn second_edition_c14n_materialization_handles_both_reference_shapes() {
     .expect("materialization planning must succeed")
     .expect("both node-set chains require explicit canonicalization");
 
-    assert_eq!(
-        candidate
-            .matches(SECOND_EDITION_GENERATION_C14N_URI)
-            .count(),
-        3
-    );
+    assert_eq!(candidate.matches(GENERATED_C14N_URI).count(), 2);
     assert!(candidate.contains("<ds:Transforms><ds:Transform"));
     XmlDocument::parse(candidate).expect("materialized candidate must remain well-formed");
 }
 
 #[test]
-fn second_edition_c14n_materialization_is_idempotent_for_binary_chains() {
+fn generated_c14n_mode_names_the_written_uri() {
+    // The builder writes the generated transform from its mode, the template
+    // path from its URI; both must name the same algorithm.
+    assert_eq!(
+        crate::c14n::C14nAlgorithm::new(GENERATED_C14N_MODE, false).uri(),
+        GENERATED_C14N_URI
+    );
+}
+
+#[test]
+fn generated_c14n_materialization_is_idempotent_for_binary_chains() {
     // An explicit canonicalization already produces octets; planning must
     // avoid both duplicate transforms and a no-op document generation.
     let xml = r##"<root><payload Id="payload"/><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2006/12/xml-c14n11"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#payload"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2006/12/xml-c14n11"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature></root>"##;
     let document = XmlDocument::parse(xml).expect("fixture must parse");
-    let candidate = materialize_second_edition_c14n11_candidate(
+    let candidate = materialize_generated_c14n_candidate(
         &document,
         0,
         &crate::policy::SigningPolicy::default(),

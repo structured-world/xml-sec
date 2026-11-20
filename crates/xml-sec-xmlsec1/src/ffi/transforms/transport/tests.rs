@@ -1,5 +1,5 @@
 use super::super::super::app::key_load_memory;
-use super::super::super::buffer::xmlSecBufferAppend;
+use super::super::super::buffer::{xmlSecBufferAppend, xmlSecBufferIsSecure};
 use super::super::super::keys::xmlSecKeyDestroy;
 use super::super::ctx::{
     xmlSecTransformCtxBinaryExecute, xmlSecTransformCtxCreate, xmlSecTransformCtxCreateAndAppend,
@@ -256,6 +256,50 @@ fn input_after_a_finished_transport_is_refused() {
             0
         );
         assert_eq!(xmlSecTransformExecute(transform, 1, ctx), -1);
+        xmlSecTransformCtxDestroy(ctx);
+        xmlSecKeyDestroy(key);
+    }
+}
+
+#[test]
+fn a_recovered_key_is_written_to_a_secure_buffer() {
+    // libxmlsec1 marks the output of a key transport decryption as holding
+    // a secret; the encryption's output, a ciphertext, stays unmarked.
+    let key = rsa_key();
+    let content_key = [0x42_u8; 16];
+    // SAFETY: two contexts, their transforms and the key, created and
+    // released here; the result buffer belongs to the first context.
+    unsafe {
+        let ctx = xmlSecTransformCtxCreate();
+        let transform = xmlSecTransformCtxCreateAndAppend(ctx, rsa_oaep());
+        (*transform).operation = OPERATION_ENCRYPT;
+        assert_eq!(xmlSecTransformSetKey(transform, key.cast()), 0);
+        assert_eq!(
+            xmlSecTransformCtxBinaryExecute(ctx, content_key.as_ptr(), content_key.len()),
+            0
+        );
+        assert_eq!(xmlSecBufferIsSecure(&raw mut (*transform).out_buf), 0);
+        let result = (*ctx).result;
+        assert!(!result.is_null(), "the encryption has a result");
+        let ciphertext =
+            std::slice::from_raw_parts(xmlSecBufferGetData(result), xmlSecBufferGetSize(result))
+                .to_vec();
+        xmlSecTransformCtxDestroy(ctx);
+
+        let ctx = xmlSecTransformCtxCreate();
+        let transform = xmlSecTransformCtxCreateAndAppend(ctx, rsa_oaep());
+        (*transform).operation = OPERATION_DECRYPT;
+        assert_eq!(xmlSecTransformSetKey(transform, key.cast()), 0);
+        assert_eq!(
+            xmlSecTransformCtxBinaryExecute(ctx, ciphertext.as_ptr(), ciphertext.len()),
+            0
+        );
+        let result = (*ctx).result;
+        assert_eq!(
+            std::slice::from_raw_parts(xmlSecBufferGetData(result), xmlSecBufferGetSize(result)),
+            content_key
+        );
+        assert_eq!(xmlSecBufferIsSecure(&raw mut (*transform).out_buf), 1);
         xmlSecTransformCtxDestroy(ctx);
         xmlSecKeyDestroy(key);
     }

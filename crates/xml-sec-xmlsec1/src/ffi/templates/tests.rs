@@ -102,3 +102,43 @@ fn a_refused_transform_attribute_fails_and_takes_its_child_back() {
         xsFreeDoc(doc);
     }
 }
+
+#[test]
+fn empty_oaep_params_write_an_empty_element() {
+    // libxmlsec1 takes no buffer and no size as empty OAEP parameters and
+    // writes an empty OAEPparams, which reads back as an empty label; a size
+    // without a buffer is refused before any child is added.
+    let xml = "<EncryptionMethod/>";
+    // SAFETY: the bytes and their length; every object is released here.
+    unsafe {
+        let doc = xsReadMemory(
+            xml.as_ptr().cast(),
+            i32::try_from(xml.len()).expect("a short document"),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        assert!(!doc.is_null(), "the document parses");
+        let method = xsDocGetRootElement(doc);
+        let params = || {
+            xmlSecFindChild(
+                method,
+                super::name(&super::xmlSecNodeRsaOAEPparams),
+                super::name(&super::xmlSecEncNs),
+            )
+        };
+        assert_eq!(
+            super::xmlSecTmplTransformAddRsaOaepParam(method, std::ptr::null(), 5),
+            -1
+        );
+        assert!(params().is_null(), "no OAEPparams for a refused call");
+        assert_eq!(
+            super::xmlSecTmplTransformAddRsaOaepParam(method, std::ptr::null(), 0),
+            0
+        );
+        let added = params();
+        assert!(!added.is_null(), "an OAEPparams for empty parameters");
+        assert!(super::nodes::first_child(added).is_null(), "it is empty");
+        xsFreeDoc(doc);
+    }
+}

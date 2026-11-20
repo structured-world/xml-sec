@@ -13,8 +13,8 @@ use super::tree::XmlNode;
 
 use super::buffer::{
     XmlSecBuffer, xmlSecBufferAppend, xmlSecBufferFinalize, xmlSecBufferGetData,
-    xmlSecBufferGetSize, xmlSecBufferInitialize, xmlSecBufferRemoveHead, xmlSecBufferSetMaxSize,
-    xmlSecBufferSetSize,
+    xmlSecBufferGetSize, xmlSecBufferInitialize, xmlSecBufferMakeSecure, xmlSecBufferRemoveHead,
+    xmlSecBufferSetMaxSize, xmlSecBufferSetSize,
 };
 use super::errors::{self, check, here};
 use super::list::{
@@ -91,6 +91,10 @@ pub(crate) const USAGE_DIGEST_METHOD: c_uint = 0x0004;
 pub(crate) const USAGE_SIGNATURE_METHOD: c_uint = 0x0008;
 /// `xmlSecTransformUsageEncryptionMethod`.
 pub(crate) const USAGE_ENCRYPTION_METHOD: c_uint = 0x0010;
+/// `xmlSecTransformUsageKeyDerivationMethod`.
+pub(crate) const USAGE_KEY_DERIVATION_METHOD: c_uint = 0x0020;
+/// `xmlSecTransformUsageAgreementMethod`.
+pub(crate) const USAGE_AGREEMENT_METHOD: c_uint = 0x0040;
 
 /// `XMLSEC_TRANSFORM_FLAGS_USER_SPECIFIED`.
 pub(crate) const FLAGS_USER_SPECIFIED: usize = 0x0001;
@@ -798,6 +802,12 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCreate(
                 errors::internal(here, name, c"xmlSecBufferInitialize");
                 xmlSecTransformDestroy(transform);
                 return null;
+            }
+            // A key derivation or agreement takes a shared secret in and
+            // gives a key out: both buffers hold secrets.
+            if klass.usage & (USAGE_KEY_DERIVATION_METHOD | USAGE_AGREEMENT_METHOD) != 0 {
+                xmlSecBufferMakeSecure(&raw mut (*transform).in_buf);
+                xmlSecBufferMakeSecure(&raw mut (*transform).out_buf);
             }
         }
         transform

@@ -442,6 +442,29 @@ pub(crate) unsafe extern "C" fn xmlSecReplaceNodeAndReturn(
             c"newNode != NULL",
             -1
         );
+        check!(
+            !std::ptr::eq(node, new_node),
+            "xmlSecReplaceNodeAndReturn",
+            c"node != newNode",
+            -1
+        );
+        check!(
+            nodes::kind(node) == nodes::kind(new_node),
+            "xmlSecReplaceNodeAndReturn",
+            c"node->type == newNode->type",
+            -1
+        );
+        // Neither node may be a descendant of the other: a descendant would
+        // leave with the node it replaces, and an ancestor cannot take the
+        // place of a node inside it.
+        if is_descendant(node, new_node) {
+            errors::invalid_data(here, std::ptr::null(), "node is a descendant of newNode");
+            return -1;
+        }
+        if is_descendant(new_node, node) {
+            errors::invalid_data(here, std::ptr::null(), "newNode is a descendant of node");
+            return -1;
+        }
         // The tree keeps its document element in its place, so a replaced
         // one needs none of the pointer repair libxmlsec1 does over libxml2.
         // SAFETY: handles are validated by each call; `replaced` is writable

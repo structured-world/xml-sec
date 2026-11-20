@@ -777,13 +777,36 @@ fn write_attribute_default<R: Storage, S: Storage>(
         AttributeDefault::Required => out.push_str("#REQUIRED")?,
         AttributeDefault::Implied => out.push_str("#IMPLIED")?,
         AttributeDefault::Fixed(value) => {
-            out.format(format_args!("#FIXED \"{value}\""))?;
+            out.push_str("#FIXED ")?;
+            write_default_literal(out, value)?;
         }
-        AttributeDefault::Default(value) => {
-            out.format(format_args!("\"{value}\""))?;
-        }
+        AttributeDefault::Default(value) => write_default_literal(out, value)?,
     }
     Ok(())
+}
+
+/// Writes a default's literal text between quotes it does not contain, as
+/// it was declared, so the declaration reparses to the same value (XML 1.0
+/// section 2.3, production `AttValue`). A literal holds both quotes only if
+/// a reference wrote one; `&quot;` then stands for the double quote.
+fn write_default_literal<S: Storage>(
+    out: &mut DtdOutput<S>,
+    value: &str,
+) -> Result<(), crate::xml::dom::ParseError> {
+    if !value.contains('"') {
+        return out.format(format_args!("\"{value}\""));
+    }
+    if !value.contains('\'') {
+        return out.format(format_args!("'{value}'"));
+    }
+    out.push('"')?;
+    for (index, part) in value.split('"').enumerate() {
+        if index > 0 {
+            out.push_str("&quot;")?;
+        }
+        out.push_str(part)?;
+    }
+    out.push('"')
 }
 
 /// Escapes an entity value for DTD serialization.

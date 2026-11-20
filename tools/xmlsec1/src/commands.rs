@@ -559,10 +559,11 @@ fn expand_output_path(invocation: &Invocation, template: &OsStr) -> Result<PathB
         .file_name()
         .unwrap_or(input)
         .as_encoded_bytes();
-    let stem = basename
-        .iter()
-        .rposition(|byte| *byte == b'.')
-        .map_or(basename, |dot| &basename[..dot]);
+    // A leading dot names a dotfile, not an extension, as libxmlsec1 reads it.
+    let stem = match basename.iter().rposition(|byte| *byte == b'.') {
+        Some(dot) if dot > 0 => &basename[..dot],
+        _ => basename,
+    };
     let mut expanded = Vec::with_capacity(template_bytes.len() - PLACEHOLDER.len() + stem.len());
     expanded.extend_from_slice(&template_bytes[..start]);
     expanded.extend_from_slice(stem);

@@ -289,6 +289,13 @@ int main(void) {
         xmlSecBufferDebugHexDump(buf, stdout);
         printf("\n");
         {
+            /* content that fails to decode leaves the buffer empty */
+            int read;
+            xsNodeSetContent(out, BAD_CAST "Zm9v!!");
+            read = xmlSecBufferBase64NodeContentRead(buf, out);
+            printf("bad node read: %d size=%d\n", read, (int)xmlSecBufferGetSize(buf));
+        }
+        {
             xmlSecTransformCtxPtr ctx = xmlSecTransformCtxCreate();
             xmlSecTransformPtr checker = xmlSecTransformCreate(&checkerKlass);
             printf("verify node: %d status=%d\n", xmlSecTransformVerifyNodeContent(checker, root, ctx),

@@ -273,7 +273,7 @@ fn validation_mod_rs_example_1() -> impl std::process::Termination {
     assert!(result.is_valid);
 }
 
-// validation/dtd.rs:934; original runnable example.
+// validation/dtd.rs:957; original runnable example.
 #[test]
 fn validation_dtd_rs_example_1() -> impl std::process::Termination {
     use crate::parser_xmloxide as xmloxide;
@@ -283,7 +283,7 @@ fn validation_dtd_rs_example_1() -> impl std::process::Termination {
     assert!(dtd.elements.contains_key("root"));
 }
 
-// validation/dtd.rs:2544; original runnable example.
+// validation/dtd.rs:2567; original runnable example.
 #[test]
 fn validation_dtd_rs_example_2() -> impl std::process::Termination {
     use crate::parser_xmloxide as xmloxide;

@@ -706,7 +706,7 @@ pub(crate) unsafe extern "C" fn xmlSecBufferHexRead(
 
 /// `xmlSecBufferBase64NodeContentRead`: replaces the contents with the
 /// Base64 decoding of `node`'s trimmed text content; empty content is the
-/// encoding of no bytes.
+/// encoding of no bytes, and content that fails to decode leaves it empty.
 ///
 /// # Safety
 /// `buf` is null or a valid buffer; `node` is null or a live node.
@@ -757,6 +757,8 @@ pub(crate) unsafe extern "C" fn xmlSecBufferBase64NodeContentRead(
             ) < 0
             {
                 errors::internal(here, std::ptr::null(), c"xmlSecBase64Decode_ex");
+                // Never left resized over partly decoded bytes.
+                xmlSecBufferEmpty(buf);
                 true
             } else if xmlSecBufferSetSize(buf, written) < 0 {
                 errors::internal_with(
