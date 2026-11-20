@@ -10,7 +10,8 @@ use std::ffi::c_int;
 
 use xml_sec::document::external::ExternalNode;
 use xml_sec::xmlenc::{
-    DataEncryptionAlgorithm, DecryptContext, DecryptedContent, SymmetricKeyDecryptor,
+    DataEncryptionAlgorithm, DecryptContext, DecryptedContent, DecryptionKeyResolver,
+    SymmetricKeyDecryptor,
 };
 use zeroize::Zeroizing;
 
@@ -61,7 +62,7 @@ macro_rules! name {
 ///
 /// # Safety
 /// `node` is null or a live node.
-unsafe fn is(node: *mut XmlNode, name: *const u8, ns: *const u8) -> bool {
+pub(super) unsafe fn is(node: *mut XmlNode, name: *const u8, ns: *const u8) -> bool {
     // SAFETY: by the caller's contract.
     !node.is_null() && unsafe { xmlSecCheckNodeName(node, name, ns) } != 0
 }
@@ -70,7 +71,7 @@ unsafe fn is(node: *mut XmlNode, name: *const u8, ns: *const u8) -> bool {
 ///
 /// # Safety
 /// `node` is a live node.
-unsafe fn first_element(node: *mut XmlNode) -> *mut XmlNode {
+pub(super) unsafe fn first_element(node: *mut XmlNode) -> *mut XmlNode {
     // SAFETY: by the caller's contract.
     unsafe { xmlSecGetNextElementNode(xsNodeGetChildren(node)) }
 }
@@ -79,7 +80,7 @@ unsafe fn first_element(node: *mut XmlNode) -> *mut XmlNode {
 ///
 /// # Safety
 /// `node` is a live node.
-unsafe fn next_element(node: *mut XmlNode) -> *mut XmlNode {
+pub(super) unsafe fn next_element(node: *mut XmlNode) -> *mut XmlNode {
     // SAFETY: by the caller's contract.
     unsafe { xmlSecGetNextElementNode(nodes::next(node)) }
 }
@@ -94,7 +95,7 @@ fn attribute(node: *mut XmlNode, name: &str) -> *mut u8 {
 ///
 /// # Safety
 /// `node` is a live node.
-unsafe fn add_ids(node: *mut XmlNode) {
+pub(super) unsafe fn add_ids(node: *mut XmlNode) {
     let ids = [name!(xmlSecAttrId), std::ptr::null()];
     // SAFETY: a live node of its document and a null-terminated list.
     unsafe { xmlSecAddIDs(xsNodeGetDoc(node), node, ids.as_ptr()) };
@@ -1572,6 +1573,107 @@ unsafe fn settle_decryption(
     decrypted.map(|(audited, _)| audited)
 }
 
+/// The content key the context's read `KeyInfo` context found, offered to
+/// the core once, whichever source of the element's `KeyInfo` the core asks
+/// for it.
+///
+/// The `KeyInfo` read is this library's, as libxmlsec1's is its own: it
+/// took the key from the first child that yields one, a `DerivedKey`
+/// derived by its klass under the library policy included (as an
+/// `EncryptedKey` recovered by its nested context is). The core then
+/// decrypts with that key; it neither consults the `EncryptedKey`s again nor
+/// repeats a derivation the read already ran.
+struct KeyInfoKey {
+    key: SymmetricKeyDecryptor,
+    offered: std::cell::Cell<bool>,
+}
+
+impl KeyInfoKey {
+    fn new(key: SymmetricKeyDecryptor) -> Self {
+        Self {
+            key,
+            offered: std::cell::Cell::new(false),
+        }
+    }
+
+    /// The key as the one candidate of the operation; later asks find none.
+    fn offer(
+        &self,
+        provider: &dyn xml_sec::provider::CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        policy: &xml_sec::policy::DecryptionPolicy,
+        budget: &mut xml_sec::xmlenc::KeyCandidateBudget,
+    ) -> Result<Vec<xml_sec::provider::RecoveredContentKey>, xml_sec::xmlenc::XmlEncError> {
+        if self.offered.replace(true) {
+            return Err(xml_sec::xmlenc::XmlEncError::KeyNotFound);
+        }
+        self.key
+            .resolve_content_keys_with_policy(provider, algorithm, None, policy, budget)
+    }
+}
+
+impl xml_sec::xmlenc::DecryptionKeyResolver for KeyInfoKey {
+    fn consults_encrypted_keys(&self) -> bool {
+        false
+    }
+
+    fn resolve_content_keys_with_policy(
+        &self,
+        provider: &dyn xml_sec::provider::CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        encrypted_key: Option<&xml_sec::xmlenc::EncryptedKey>,
+        policy: &xml_sec::policy::DecryptionPolicy,
+        budget: &mut xml_sec::xmlenc::KeyCandidateBudget,
+    ) -> Result<Vec<xml_sec::provider::RecoveredContentKey>, xml_sec::xmlenc::XmlEncError> {
+        if encrypted_key.is_some() {
+            return Err(xml_sec::xmlenc::XmlEncError::KeyNotFound);
+        }
+        self.offer(provider, algorithm, policy, budget)
+    }
+
+    fn resolve_derived_content_keys_with_policy(
+        &self,
+        provider: &dyn xml_sec::provider::CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        _descriptor: &xml_sec::xmlenc::DerivedKey,
+        policy: &xml_sec::policy::DecryptionPolicy,
+        budget: &mut xml_sec::xmlenc::KeyCandidateBudget,
+    ) -> Result<Vec<xml_sec::provider::RecoveredContentKey>, xml_sec::xmlenc::XmlEncError> {
+        self.offer(provider, algorithm, policy, budget)
+    }
+
+    fn resolve_agreement_content_keys_with_policy(
+        &self,
+        provider: &dyn xml_sec::provider::CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        _descriptor: &xml_sec::xmlenc::AgreementMethod,
+        policy: &xml_sec::policy::DecryptionPolicy,
+        budget: &mut xml_sec::xmlenc::KeyCandidateBudget,
+    ) -> Result<Vec<xml_sec::provider::RecoveredContentKey>, xml_sec::xmlenc::XmlEncError> {
+        self.offer(provider, algorithm, policy, budget)
+    }
+
+    fn resolve_encapsulation_content_keys_with_policy(
+        &self,
+        provider: &dyn xml_sec::provider::CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        _descriptor: &xml_sec::key_establishment::EncapsulationMechanism,
+        policy: &xml_sec::policy::DecryptionPolicy,
+        budget: &mut xml_sec::xmlenc::KeyCandidateBudget,
+    ) -> Result<Vec<xml_sec::provider::RecoveredContentKey>, xml_sec::xmlenc::XmlEncError> {
+        self.offer(provider, algorithm, policy, budget)
+    }
+
+    fn resolve_key(
+        &self,
+        provider: &dyn xml_sec::provider::CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        _encrypted_key: Option<&xml_sec::xmlenc::EncryptedKey>,
+    ) -> Result<Vec<u8>, xml_sec::xmlenc::XmlEncError> {
+        self.key.resolve_key(provider, algorithm, None)
+    }
+}
+
 /// Runs the core decryption of the `EncryptedData` element `node` and makes
 /// the plaintext the context's result, a buffer of its method.
 ///
@@ -1637,7 +1739,10 @@ unsafe fn run_decryption(ctx: &mut XmlSecEncCtx, node: *mut XmlNode) -> *mut Xml
             return std::ptr::null_mut();
         }
     };
-    let resolver = SymmetricKeyDecryptor::with_kind(key.to_vec(), algorithm.key_kind());
+    let resolver = KeyInfoKey::new(SymmetricKeyDecryptor::with_kind(
+        key.to_vec(),
+        algorithm.key_kind(),
+    ));
     let mut context = DecryptContext::new(&resolver)
         .shared_policy(policy)
         .external_resources(&resources.by_key);

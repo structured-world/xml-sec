@@ -1143,6 +1143,49 @@ fn kdf_reservations_are_atomic_and_cumulative_across_retries() {
 }
 
 #[test]
+fn a_resumed_allowance_counts_on_from_the_earlier_parts() {
+    // An operation run in parts (a compatibility layer deriving one key per
+    // call) carries its reservations from part to part: the second part is
+    // refused where a fresh allowance would admit it, so splitting an
+    // operation never multiplies its budget.
+    let provider = RecordingProvider::new();
+    let policy = KeyEstablishmentPolicy {
+        max_hash_blocks: 6,
+        max_owned_bytes: 32,
+        ..Default::default()
+    };
+    let mut first = KeyEstablishmentBudget::new(&policy).unwrap();
+    assert_eq!(
+        first
+            .derive_key(&provider, &parameters(), b"secret")
+            .unwrap()
+            .len(),
+        16
+    );
+    let usage = first.usage();
+    let mut second = KeyEstablishmentBudget::resume(&policy, usage).unwrap();
+    assert_eq!(second.hash_blocks(), 6);
+    assert_eq!(second.owned_bytes(), 16);
+    assert!(matches!(
+        second.derive_key(&provider, &parameters(), b"secret"),
+        Err(XmlEncError::Policy(
+            xml_sec::policy::PolicyViolation::ResourceLimit {
+                resource: "key establishment hash blocks",
+                maximum: 6,
+                actual: 12
+            }
+        ))
+    ));
+    assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+    let mut fresh = KeyEstablishmentBudget::new(&policy).unwrap();
+    assert!(
+        fresh
+            .derive_key(&provider, &parameters(), b"secret")
+            .is_ok()
+    );
+}
+
+#[test]
 fn oversized_iteration_count_and_context_fail_before_dispatch() {
     // XML u64 iteration counts must not truncate or initiate CPU work before
     // the operation-wide limit. Typed callers also undergo syntax validation.

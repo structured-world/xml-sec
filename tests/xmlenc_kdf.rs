@@ -98,6 +98,36 @@ fn pbkdf2_xml_has_no_asn1_defaults() {
 }
 
 #[test]
+fn an_element_of_a_tree_reads_as_its_text_does() {
+    // A caller holding the element in a parsed tree (the libxmlsec1 KDF
+    // klasses) reads the same method, under the same metadata bound, as the
+    // standalone entry point reads its text.
+    let xml = concat("AlgorithmID='0000' PartyUInfo='03D8' PartyVInfo='03D0'");
+    let document = xml_sec::Document::parse(&xml).unwrap();
+    let mut resources = xml_sec::policy::ResourcePolicy::default();
+    let method =
+        xml_sec::xmlenc::KeyDerivationMethod::from_element(document.root_element(), &resources)
+            .unwrap();
+    assert_eq!(
+        method,
+        parse_key_derivation_method(&xml, &DecryptionPolicy::default()).unwrap()
+    );
+    resources.max_encryption_metadata_bytes = 2;
+    assert!(
+        xml_sec::xmlenc::KeyDerivationMethod::from_element(document.root_element(), &resources)
+            .is_err()
+    );
+    let other = xml_sec::Document::parse("<KeyDerivation xmlns='urn:other'/>").unwrap();
+    assert!(
+        xml_sec::xmlenc::KeyDerivationMethod::from_element(
+            other.root_element(),
+            &xml_sec::policy::ResourcePolicy::default()
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn kdf_xml_bounds_metadata_before_decoding() {
     // The standalone entry point must use the same immutable parser and
     // metadata policy as EncryptedData; small limits cannot be bypassed.

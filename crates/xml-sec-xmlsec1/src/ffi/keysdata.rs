@@ -1322,8 +1322,8 @@ static DERIVED_KEY: XmlSecKeyDataKlass = key_info_child(
     xmlSecHrefDerivedKey.as_ptr(),
     xmlSecNodeDerivedKey.as_ptr(),
     xmlSecEnc11Ns.as_ptr(),
-    None,
-    None,
+    Some(super::xmlenc::derived_key::xml_read),
+    Some(super::xmlenc::derived_key::xml_write),
 );
 static AGREEMENT_METHOD: XmlSecKeyDataKlass = key_info_child(
     xmlSecNameAgreementMethod.as_ptr(),

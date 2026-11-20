@@ -32,6 +32,7 @@ pub(crate) mod ctx;
 pub(crate) mod digests;
 pub(crate) mod hmac;
 pub(crate) mod io;
+pub(crate) mod kdf;
 pub(crate) mod parser;
 pub(crate) mod relationship;
 pub(crate) mod signatures;
