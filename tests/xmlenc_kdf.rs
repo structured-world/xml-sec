@@ -131,7 +131,7 @@ fn an_element_of_a_tree_reads_as_its_text_does() {
 fn a_derived_key_element_reads_as_its_encrypted_data_reads_it() {
     // A caller holding a DerivedKey of an EncryptedData's KeyInfo in a parsed
     // tree reads the descriptor the decryption reads there, so the two
-    // compare equal; the metadata bound applies to it alike.
+    // compare equal; the metadata bound and the key name rule apply alike.
     let xml = format!(
         "<EncryptedData xmlns='http://www.w3.org/2001/04/xmlenc#'>\
          <EncryptionMethod Algorithm='http://www.w3.org/2009/xmlenc11#aes256-gcm'/>\
@@ -139,7 +139,7 @@ fn a_derived_key_element_reads_as_its_encrypted_data_reads_it() {
          <DerivedKey xmlns='http://www.w3.org/2009/xmlenc11#'>{}\
          <ReferenceList xmlns='http://www.w3.org/2001/04/xmlenc#'>\
          <DataReference URI='#data'/></ReferenceList>\
-         <MasterKeyName>master</MasterKeyName></DerivedKey></KeyInfo>\
+         <MasterKeyName> master </MasterKeyName></DerivedKey></KeyInfo>\
          <CipherData><CipherValue>AAAA</CipherValue></CipherData></EncryptedData>",
         concat("AlgorithmID='0000' PartyUInfo='03D8' PartyVInfo='03D0'")
     );
@@ -150,13 +150,21 @@ fn a_derived_key_element_reads_as_its_encrypted_data_reads_it() {
         .descendants()
         .find(|node| node.tag_name().name() == "DerivedKey")
         .unwrap();
-    let mut resources = xml_sec::policy::ResourcePolicy::default();
+    let mut policy = DecryptionPolicy::default();
+    let read = xml_sec::xmlenc::DerivedKey::from_element(element, &policy).unwrap();
+    assert_eq!(read, parsed.derived_keys[0]);
+    // XML Encryption 1.1 section 3.5.2: the name keeps its white space.
+    assert_eq!(read.master_key_name.as_deref(), Some(" master "));
+    policy.xml.key_names = xml_sec::policy::KeyNameSemantics::Libxmlsec1;
     assert_eq!(
-        xml_sec::xmlenc::DerivedKey::from_element(element, &resources).unwrap(),
-        parsed.derived_keys[0]
+        xml_sec::xmlenc::DerivedKey::from_element(element, &policy)
+            .unwrap()
+            .master_key_name
+            .as_deref(),
+        Some("master")
     );
-    resources.max_encryption_metadata_bytes = 2;
-    assert!(xml_sec::xmlenc::DerivedKey::from_element(element, &resources).is_err());
+    policy.resources.max_encryption_metadata_bytes = 2;
+    assert!(xml_sec::xmlenc::DerivedKey::from_element(element, &policy).is_err());
 }
 
 #[test]

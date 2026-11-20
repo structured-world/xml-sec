@@ -44,7 +44,7 @@ use super::xmlenc::{
     xmlSecEncCtxDebugDump, xmlSecEncCtxDebugXmlDump, xmlSecEncCtxDestroy, xmlSecEncCtxReset,
 };
 use super::xmltree::{
-    xmlSecAddChild, xmlSecGetNextElementNode, xmlSecGetNodeContentAndTrim, xmlSecGetNodeNsHref,
+    key_name_content, xmlSecAddChild, xmlSecGetNextElementNode, xmlSecGetNodeNsHref,
     xmlSecIsEmptyNode, xmlSecNodeEncodeAndSetContent,
 };
 use super::{contain, free, malloc, policy, write_stream};
@@ -941,10 +941,16 @@ pub(crate) unsafe extern "C" fn name_xml_read(
             c"keyInfoCtx->mode == xmlSecKeyInfoModeRead",
             -1
         );
+        // SAFETY: a context whose slot is null or a pin.
+        let Some(pinned) = (unsafe { read_policy(ctx, here) }) else {
+            return -1;
+        };
+        // SAFETY: as above.
+        let key_names = pinned.of(unsafe { references::read_side(ctx) }).key_names();
         // SAFETY: a key, a live node and a context; the name is freed here.
         unsafe {
             let object = klass_name(id);
-            let new_name = xmlSecGetNodeContentAndTrim(node);
+            let new_name = key_name_content(node, key_names);
             if new_name.is_null() || *new_name == 0 {
                 errors::invalid_node_content(here, node, object, "empty");
                 if !new_name.is_null() {

@@ -112,6 +112,16 @@ impl<'a> OperationPolicy<'a> {
         }
     }
 
+    /// How the operation reads a key name element.
+    pub(crate) fn key_names(self) -> xml_sec::policy::KeyNameSemantics {
+        match self {
+            Self::Verify(policy) => policy.xml.key_names,
+            Self::Sign(policy) => policy.xml.key_names,
+            Self::Encrypt(policy) => policy.xml.key_names,
+            Self::Decrypt(policy) => policy.xml.key_names,
+        }
+    }
+
     /// The URI-class permissions of the operation.
     fn uris(self) -> xml_sec::policy::UriPolicy {
         match self {

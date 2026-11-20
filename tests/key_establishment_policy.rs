@@ -476,16 +476,46 @@ fn xml_derivation_matches_context_before_provider_work() {
         Err(XmlEncError::KeyNotFound)
     ));
     assert_eq!(provider.calls.load(Ordering::Relaxed), 0);
-    let resolver = resolver.master_key_name(" master ");
-    assert_eq!(
-        DecryptContext::new(&resolver)
+    // A policy reading names as libxmlsec1 does trims the transported name,
+    // so the padded association no longer matches; the trimmed one does.
+    let mut trimming = xml_sec::policy::DecryptionPolicy::default();
+    trimming.xml.key_names = xml_sec::policy::KeyNameSemantics::Libxmlsec1;
+    let fresh = || {
+        DerivedKeyDecryptor::content(
+            &method,
+            DerivedKeyInput::Secret(b"secret"),
+            DataEncryptionAlgorithm::Aes128Gcm,
+        )
+    };
+    let padded = fresh().master_key_name(" master ");
+    assert!(matches!(
+        DecryptContext::new(&padded)
             .provider(&provider)
+            .policy(trimming.clone())
+            .decrypt(&named),
+        Err(XmlEncError::KeyNotFound)
+    ));
+    assert_eq!(provider.calls.load(Ordering::Relaxed), 0);
+    let trimmed = fresh().master_key_name("master");
+    assert_eq!(
+        DecryptContext::new(&trimmed)
+            .provider(&provider)
+            .policy(trimming)
             .decrypt(&named)
             .unwrap()
             .output,
         xml_sec::xmlenc::DecryptedContent::Bytes(b"payload".to_vec())
     );
     assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        DecryptContext::new(&padded)
+            .provider(&provider)
+            .decrypt(&named)
+            .unwrap()
+            .output,
+        xml_sec::xmlenc::DecryptedContent::Bytes(b"payload".to_vec())
+    );
+    assert_eq!(provider.calls.load(Ordering::Relaxed), 2);
 }
 
 #[test]

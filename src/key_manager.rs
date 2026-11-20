@@ -2701,6 +2701,7 @@ impl KeyInventory {
         info: Node<'_, '_>,
         material_budget: &mut XmlImportMaterialBudget,
         resources: &crate::policy::ResourcePolicy,
+        key_names: crate::policy::KeyNameSemantics,
     ) -> Result<(String, ParsedMaterial), KeyStoreError> {
         let mut name = None;
         let mut value = None;
@@ -2709,7 +2710,7 @@ impl KeyInventory {
                 if name.is_some() {
                     return Err(KeyStoreError::Invalid("duplicate KeyName".into()));
                 }
-                let text = element_text(child)?;
+                let text = key_names.owned_name(element_text(child)?);
                 if text.is_empty() {
                     return Err(KeyStoreError::Invalid("empty KeyName".into()));
                 }
@@ -2940,8 +2941,12 @@ impl KeyInventory {
             *inspected += 1;
             entry_count += 1;
             preflight_xml_material(info, &mut material_budget)?;
-            let (name, material) =
-                Self::read_xml_store_entry(info, &mut material_budget, resources)?;
+            let (name, material) = Self::read_xml_store_entry(
+                info,
+                &mut material_budget,
+                resources,
+                policy.xml_input_policy().key_names,
+            )?;
             if !names.insert(name.clone()) {
                 return Err(KeyStoreError::Invalid("duplicate key name".into()));
             }

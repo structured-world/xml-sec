@@ -210,6 +210,10 @@ fn one_operation_spends_one_derivation_allowance() {
             earlier,
         );
         assert_eq!(execute_once(second, PBKDF2_SHA256), -1);
+        assert_eq!(
+            run_spent(second).refused_by.map(|limit| limit.name),
+            Some("key establishment hash blocks")
+        );
         xmlSecTransformCtxDestroy(second);
     }
 }
@@ -318,13 +322,12 @@ unsafe fn execute_once(ctx: *mut XmlSecTransformCtx, method: &str) -> c_int {
         (*transform).expected_output_size = 32;
         let key = xmlSecKeyReadMemory(symkeys::pbkdf2(), SECRET.as_ptr(), SECRET.len());
         let node = xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc);
-        let done = if read_node(transform, node, ctx) == 0
-            && xmlSecTransformSetKey(transform, key.cast()) == 0
-        {
-            execute(transform, 1, ctx)
-        } else {
-            -1
-        };
+        // Reading the method and taking the key never consult the
+        // derivation's allowance: a failure here is a broken setup, not the
+        // refusal the callers assert.
+        assert_eq!(read_node(transform, node, ctx), 0);
+        assert_eq!(xmlSecTransformSetKey(transform, key.cast()), 0);
+        let done = execute(transform, 1, ctx);
         xmlSecKeyDestroy(key);
         xmlSecTransformDestroy(transform);
         xml_sec_libxml2::ffi::tree::xsFreeDoc(doc);

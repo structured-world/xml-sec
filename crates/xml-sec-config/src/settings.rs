@@ -12,12 +12,12 @@ use xml_sec::{
         CertificateSignatureAlgorithms, CompiledPolicies, DetachedDigestAttestation, DsaKeyPolicy,
         EcdsaSignatureValueEncoding, EmptyDigestInput, ExtendedKeyPurpose,
         GeneratedCanonicalization, HmacPolicy, Instant, KemContentAuthentication,
-        KeyAgreementAlgorithm, KeyDerivationAlgorithm, KeyEstablishmentPolicy, KeySourceKind,
-        KeySourcePolicy, KeyTrustPolicy, ManifestProcessing, OpcRelationshipEdition, PolicySet,
-        PolicyValidity, RequestSelections, ResourcePolicy, RsaKeyPolicy, RsaPssPermission,
-        SameDocumentIdSemantics, SignatureConstraints, SigningPolicy, TimestampTokenEncoding,
-        TransformPolicy, UnknownX509CertificateSemantics, UriPolicy, VerificationPolicy,
-        VerificationTrustMode, XmlInputPolicy, XsltStylesheetSemantics,
+        KeyAgreementAlgorithm, KeyDerivationAlgorithm, KeyEstablishmentPolicy, KeyNameSemantics,
+        KeySourceKind, KeySourcePolicy, KeyTrustPolicy, ManifestProcessing, OpcRelationshipEdition,
+        PolicySet, PolicyValidity, RequestSelections, ResourcePolicy, RsaKeyPolicy,
+        RsaPssPermission, SameDocumentIdSemantics, SignatureConstraints, SigningPolicy,
+        TimestampTokenEncoding, TransformPolicy, UnknownX509CertificateSemantics, UriPolicy,
+        VerificationPolicy, VerificationTrustMode, XmlInputPolicy, XsltStylesheetSemantics,
     },
     provider::{KeyEncapsulationAlgorithm, X509SignatureAlgorithm},
     xmldsig::{
@@ -386,10 +386,18 @@ fn dsa(p: &mut DsaKeyPolicy, v: &Value) -> Result<(), Error> {
 }
 fn xml(p: &mut XmlInputPolicy, v: &Value) -> Result<(), Error> {
     for (key, value) in table(v, "xml")? {
-        if key != "allow_internal_dtd" {
-            return Err(invalid(key));
+        match key.as_str() {
+            "allow_internal_dtd" => p.allow_internal_dtd = boolean(value, key)?,
+            "key_names" => {
+                p.key_names = choice!(
+                    value,
+                    key,
+                    KeyNameSemantics::Specification,
+                    KeyNameSemantics::Libxmlsec1
+                );
+            }
+            _ => return Err(invalid(key)),
         }
-        p.allow_internal_dtd = boolean(value, key)?;
     }
     Ok(())
 }
@@ -969,10 +977,13 @@ fn validity_snapshot(p: Option<&PolicyValidity>) -> Result<Value, Error> {
     })
 }
 fn xml_snapshot(p: XmlInputPolicy) -> Value {
-    Value::Table(Table::from_iter([(
-        "allow_internal_dtd".into(),
-        Value::Boolean(p.allow_internal_dtd),
-    )]))
+    Value::Table(Table::from_iter([
+        (
+            "allow_internal_dtd".into(),
+            Value::Boolean(p.allow_internal_dtd),
+        ),
+        ("key_names".into(), named(p.key_names)),
+    ]))
 }
 fn rsa_snapshot(p: RsaKeyPolicy) -> Value {
     Value::Table(Table::from_iter([(

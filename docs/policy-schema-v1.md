@@ -142,8 +142,12 @@ The selected provider and immutable operation allowance still govern execution.
 
 ## XML And Resource Tables
 
-`xml` accepts only boolean `allow_internal_dtd`. It grants neither external DTD
-loading nor network discovery.
+`xml` accepts boolean `allow_internal_dtd`, which grants neither external DTD
+loading nor network discovery, and `key_names`: `Specification` (the default)
+reads `KeyName`, `CarriedKeyName`, `DerivedKeyName` and `MasterKeyName` with
+significant white space, as XMLDSig 1.1 section 4.5.1 and XML Encryption 1.1
+sections 3.5.1 and 3.5.2 require; `Libxmlsec1` first removes leading and
+trailing white space, as libxmlsec1 does. Layers must agree on `key_names`.
 
 Every `resources` value is a nonnegative integer. Field names and units follow
 the public `ResourcePolicy`; they are maxima, not evidence that a deployment can

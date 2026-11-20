@@ -11,6 +11,7 @@
 use std::cell::Cell;
 use std::ffi::{CString, c_int, c_void};
 
+use xml_sec::policy::KeyNameSemantics;
 use xml_sec::xmlenc::DerivedKey;
 use zeroize::Zeroizing;
 
@@ -35,7 +36,7 @@ use super::super::transforms::{
     USAGE_KEY_DERIVATION_METHOD, xmlSecTransformSetKey, xmlSecTransformSetKeyReq,
 };
 use super::super::tree::{XmlNode, c_text, nodes};
-use super::super::xmltree::xmlSecGetNodeContentAndTrim;
+use super::super::xmltree::key_name_content;
 use super::super::{contain, free, strings};
 use super::encrypted_key::{
     FLAGS_ENCKEY_STOP_ON_FAILED_DECRYPTION, level_allowed, level_open, map_operation,
@@ -115,11 +116,8 @@ unsafe fn derivation(
                 .ok()
                 .and_then(|document| {
                     document.with_view(|view| {
-                        DerivedKey::from_element(
-                            view.document().root_element(),
-                            operation.resources(),
-                        )
-                        .ok()
+                        DerivedKey::from_element(view.document().root_element(), &pinned.decryption)
+                            .ok()
                     })
                 })
         })?;
@@ -136,15 +134,19 @@ unsafe fn derivation(
     }
 }
 
-/// The trimmed text of `node`, copied, after libxmlsec1's report of an
-/// unreadable one at `here`.
+/// The name the key name element `node` carries under `key_names`, copied,
+/// after libxmlsec1's report of an unreadable one at `here`.
 ///
 /// # Safety
 /// `node` is a live node.
-unsafe fn name_of_node(node: *mut XmlNode, here: errors::Here) -> Option<CString> {
+unsafe fn name_of_node(
+    node: *mut XmlNode,
+    key_names: KeyNameSemantics,
+    here: errors::Here,
+) -> Option<CString> {
     // SAFETY: a live node; the copy the call returns is freed here.
     unsafe {
-        let content = xmlSecGetNodeContentAndTrim(node);
+        let content = key_name_content(node, key_names);
         if content.is_null() {
             errors::invalid_node_content(here, node, std::ptr::null(), "empty");
             return None;
@@ -256,7 +258,13 @@ unsafe fn derive(
         (*ctx.enc_method).operation = ctx.operation;
         ctx.key_info_read_ctx.operation = ctx.operation;
         ctx.key_info_write_ctx.operation = ctx.operation;
-        let Some((derived_name, master_name)) = names(next_element(cur), here) else {
+        let Some(pinned) = run_policy(transforms, here) else {
+            return std::ptr::null_mut();
+        };
+        let key_names = pinned
+            .of(operation_side(ctx.operation).unwrap_or(Side::Decrypt))
+            .key_names();
+        let Some((derived_name, master_name)) = names(next_element(cur), key_names, here) else {
             return std::ptr::null_mut();
         };
         if !key_method(ctx, master_name.as_deref(), here) {
@@ -279,13 +287,14 @@ unsafe fn derive(
 }
 
 /// The `DerivedKeyName` and `MasterKeyName` of a `DerivedKey` whose children
-/// after its method start at `cur`; `None` after a report at `here` for an
-/// unreadable name or a child past them.
+/// after its method start at `cur`, read under `key_names`; `None` after a
+/// report at `here` for an unreadable name or a child past them.
 ///
 /// # Safety
 /// `cur` is null or a live node.
 unsafe fn names(
     mut cur: *mut XmlNode,
+    key_names: KeyNameSemantics,
     here: errors::Here,
 ) -> Option<(Option<CString>, Option<CString>)> {
     // SAFETY: by the caller's contract; each next sibling is live.
@@ -305,7 +314,7 @@ unsafe fn names(
             strings::xmlSecNodeMasterKeyName.as_ptr(),
         ]) {
             if is(cur, name, strings::xmlSecEnc11Ns.as_ptr()) {
-                *slot = Some(name_of_node(cur, here)?);
+                *slot = Some(name_of_node(cur, key_names, here)?);
                 cur = next_element(cur);
             }
         }

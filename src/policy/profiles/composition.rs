@@ -294,10 +294,11 @@ fn manifests(a: ManifestProcessing, b: ManifestProcessing) -> ManifestProcessing
         ManifestProcessing::Ignore
     }
 }
-fn xml(a: XmlInputPolicy, b: XmlInputPolicy) -> XmlInputPolicy {
-    XmlInputPolicy {
+fn xml(a: XmlInputPolicy, b: XmlInputPolicy) -> Result<XmlInputPolicy, PolicyViolation> {
+    Ok(XmlInputPolicy {
         allow_internal_dtd: a.allow_internal_dtd && b.allow_internal_dtd,
-    }
+        key_names: equal(a.key_names, b.key_names)?,
+    })
 }
 
 fn key_establishment(
@@ -533,7 +534,7 @@ fn verification(
             a.timestamp_token_encoding,
             b.timestamp_token_encoding,
         ),
-        xml: xml(a.xml, b.xml),
+        xml: xml(a.xml, b.xml)?,
         resources: resources(&a.resources, &b.resources),
     })
 }
@@ -601,7 +602,7 @@ fn signing(a: &SigningPolicy, b: &SigningPolicy) -> Result<SigningPolicy, Policy
         manifest_processing: manifests(a.manifest_processing, b.manifest_processing),
         // A request may select only what every layer lets it select.
         request_selections: a.request_selections.intersection(&b.request_selections),
-        xml: xml(a.xml, b.xml),
+        xml: xml(a.xml, b.xml)?,
         resources: resources(&a.resources, &b.resources),
     })
 }
@@ -640,7 +641,7 @@ fn encryption(
         rsa_keys: rsa(a.rsa_keys, b.rsa_keys),
         uris: uris(a.uris, b.uris),
         key_establishment: key_establishment(&a.key_establishment, &b.key_establishment),
-        xml: xml(a.xml, b.xml),
+        xml: xml(a.xml, b.xml)?,
         resources: resources(&a.resources, &b.resources),
     })
 }
@@ -678,7 +679,7 @@ fn decryption(
         ),
         rsa_keys: rsa(a.rsa_keys, b.rsa_keys),
         key_establishment: key_establishment(&a.key_establishment, &b.key_establishment),
-        xml: xml(a.xml, b.xml),
+        xml: xml(a.xml, b.xml)?,
         resources: resources(&a.resources, &b.resources),
         uris: uris(a.uris, b.uris),
         transforms: transforms(&a.transforms, &b.transforms)?,
@@ -742,5 +743,17 @@ mod tests {
             composed.transforms.empty_digest_input,
             EmptyDigestInput::Accept
         );
+    }
+
+    #[test]
+    fn layers_must_agree_on_how_key_names_are_read() {
+        // Neither reading of a key name is a restriction of the other: a name
+        // one layer finds the other may not, so composing them is refused.
+        let trimming = XmlInputPolicy {
+            key_names: crate::policy::KeyNameSemantics::Libxmlsec1,
+            ..XmlInputPolicy::default()
+        };
+        assert!(xml(XmlInputPolicy::default(), trimming).is_err());
+        assert_eq!(xml(trimming, trimming).expect("one reading"), trimming);
     }
 }

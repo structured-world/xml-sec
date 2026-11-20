@@ -28,6 +28,7 @@ fn public_owned_parser_uses_the_operation_policy_snapshot() {
     let permissive = SigningPolicy {
         xml: xml_sec::policy::XmlInputPolicy {
             allow_internal_dtd: true,
+            ..xml_sec::policy::XmlInputPolicy::default()
         },
         ..SigningPolicy::default()
     };
@@ -109,6 +110,7 @@ fn public_owned_parser_enforces_cumulative_parse_work() {
     let dtd_capable = |max_xml_parse_work_bytes| SigningPolicy {
         xml: xml_sec::policy::XmlInputPolicy {
             allow_internal_dtd: true,
+            ..xml_sec::policy::XmlInputPolicy::default()
         },
         resources: ResourcePolicy {
             max_xml_parse_work_bytes,

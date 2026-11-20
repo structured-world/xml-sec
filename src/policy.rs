@@ -1108,6 +1108,72 @@ impl ResourcePolicy {
 pub struct XmlInputPolicy {
     /// Permit bounded internal DTD declarations. External resolution stays off.
     pub allow_internal_dtd: bool,
+    /// How the text of a key name element becomes the name it carries.
+    pub key_names: KeyNameSemantics,
+}
+
+/// How the text of `ds:KeyName`, `CarriedKeyName`, `DerivedKeyName` and
+/// `MasterKeyName` becomes the name matched against keys and references.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum KeyNameSemantics {
+    /// The text exactly: white space is significant in `KeyName` (`XMLDSig`
+    /// 1.1 section 4.5.1) and so in `CarriedKeyName` and `DerivedKeyName`
+    /// (`XMLEnc` 1.1 sections 3.5.1 and 3.5.2); `MasterKeyName`, a label of the
+    /// same kind, is read the same way.
+    #[default]
+    Specification,
+    /// libxmlsec1: leading and trailing white space (C `isspace`) is removed
+    /// first, so documents with padded names find the keys libxmlsec1 finds.
+    Libxmlsec1,
+}
+
+impl KeyNameSemantics {
+    /// The name the content `text` of a key name element carries.
+    #[must_use]
+    pub fn name(self, text: &str) -> &str {
+        match self {
+            Self::Specification => text,
+            Self::Libxmlsec1 => {
+                text.trim_matches(|character| u8::try_from(character).is_ok_and(Self::is_space))
+            }
+        }
+    }
+
+    /// [`Self::name`] of an owned text, reusing it when nothing is removed.
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn owned_name(self, text: String) -> String {
+        let name = self.name(&text);
+        if name.len() == text.len() {
+            text
+        } else {
+            name.to_owned()
+        }
+    }
+
+    /// Whether the text split into `parts` carries `name`, a name this
+    /// semantics produced, without joining the parts.
+    #[cfg(feature = "xmlenc")]
+    pub(crate) fn carries<'t>(self, parts: impl Iterator<Item = &'t str>, name: &str) -> bool {
+        let mut bytes = parts.flat_map(str::bytes).peekable();
+        if self == Self::Libxmlsec1 {
+            while bytes.next_if(|byte| Self::is_space(*byte)).is_some() {}
+        }
+        for expected in name.bytes() {
+            if bytes.next() != Some(expected) {
+                return false;
+            }
+        }
+        match self {
+            Self::Specification => bytes.next().is_none(),
+            // `name` has no white space at its end, so only padding remains.
+            Self::Libxmlsec1 => bytes.all(Self::is_space),
+        }
+    }
+
+    /// C `isspace` in the "C" locale, which libxmlsec1 trims names with.
+    fn is_space(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+    }
 }
 
 /// Trusted edition of relationship selection and normalization.
@@ -2143,6 +2209,25 @@ impl DecryptionPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "xmlenc")]
+    #[test]
+    fn key_name_semantics_keep_or_trim_the_padding() {
+        // The specification keeps every character of a key name; libxmlsec1
+        // removes C white space at both ends, whatever text node it is in,
+        // and keeps white space inside the name.
+        let spec = KeyNameSemantics::Specification;
+        let trim = KeyNameSemantics::Libxmlsec1;
+        assert_eq!(spec.name(" \tkey name\r\n"), " \tkey name\r\n");
+        assert_eq!(trim.name(" \tkey name\x0b\x0c\r\n"), "key name");
+        assert_eq!(trim.owned_name("\u{a0}key\u{a0}".into()), "\u{a0}key\u{a0}");
+        assert!(spec.carries(["key ", "name"].into_iter(), "key name"));
+        assert!(!spec.carries([" key name"].into_iter(), "key name"));
+        assert!(!spec.carries(["key name "].into_iter(), "key name"));
+        assert!(trim.carries([" \n", " key ", "name", "\t "].into_iter(), "key name"));
+        assert!(!trim.carries([" key namex "].into_iter(), "key name"));
+        assert!(!trim.carries([" key "].into_iter(), "key name"));
+    }
 
     #[cfg(all(feature = "legacy-algorithms", feature = "xmldsig"))]
     #[test]

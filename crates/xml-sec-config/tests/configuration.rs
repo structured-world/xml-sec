@@ -844,6 +844,71 @@ fn unknown_x509_certificate_semantics_comes_from_the_base_profile() {
     ));
 }
 
+#[test]
+fn key_names_follow_the_specification_in_every_base_profile() {
+    // Every base reads key names with significant white space, the
+    // libxmlsec1-compatible one included; libxmlsec1's trimming is another
+    // interpretation, so an ordinary layer cannot select it over its base,
+    // and an unknown name is a schema error.
+    use xml_sec::policy::{KeyNameSemantics, PolicyViolation};
+    let base = |base: &str, extra: &str| {
+        Configuration::from_str(
+            &format!("schema_version = 1\n[profiles.team]\nbase = '{base}'\n{extra}"),
+            LoadLimits::default(),
+        )
+    };
+    for name in ["XmlSecCompatible", "Modern"] {
+        let config = base(name, "").expect("strict config");
+        assert_eq!(
+            effective(&config, "team")
+                .compiled()
+                .verification()
+                .unwrap()
+                .xml
+                .key_names,
+            KeyNameSemantics::Specification,
+            "{name}"
+        );
+    }
+    let restated = base(
+        "Modern",
+        "[profiles.team.verification.xml]\nkey_names='Specification'",
+    )
+    .expect("strict config");
+    assert_eq!(
+        effective(&restated, "team")
+            .compiled()
+            .verification()
+            .unwrap()
+            .xml
+            .key_names,
+        KeyNameSemantics::Specification
+    );
+    let compiled = base(
+        "XmlSecCompatible",
+        "[profiles.team.verification.xml]\nkey_names='Libxmlsec1'",
+    )
+    .expect("strict config")
+    .compile(
+        "team",
+        default_provider(),
+        &PolicyCompileContext {
+            external_resources: false,
+            target_evidence: true,
+        },
+        None,
+    );
+    assert!(matches!(
+        compiled,
+        Err(xml_sec_config::Error::Policy(PolicyViolation::Configuration { reason }))
+            if reason.contains("incompatible interpretation semantics")
+    ));
+    assert!(matches!(
+        base("Modern", "[profiles.team.verification.xml]\nkey_names='Trimmed'"),
+        Err(xml_sec_config::Error::Schema(message)) if message.contains("key_names")
+    ));
+}
+
 #[cfg(feature = "xmlenc")]
 #[test]
 fn encryption_uri_classes_reach_the_compiled_snapshot() {

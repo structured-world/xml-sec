@@ -288,11 +288,11 @@ fn a_generation_derives_under_the_policy_of_its_operation() {
         std::sync::Arc::make_mut(&mut pinned.decryption)
             .key_establishment
             .derivation_algorithms = Some(std::collections::BTreeSet::new());
-        let named = generated_name(|enc| {
+        let named = generated_name(&template("master", ""), c"master", |enc| {
             // SAFETY: the generating context's own transform context.
             unsafe { crate::ffi::transforms::ctx::pin_run(&raw mut (*enc).transform_ctx, &pinned) };
         });
-        assert_eq!(named, None);
+        assert_eq!(named, Generated::Nothing);
     });
 }
 
@@ -320,15 +320,29 @@ fn a_derivation_reads_the_derived_key_element_strictly() {
     });
 }
 
-/// The name of the key a direct generation derives from the template's
-/// `DerivedKey` for a decrypting `KeyInfo` context, `None` when it derives
-/// none; `prepare` adjusts the fresh generating context first. Runs within
+/// What a direct generation yields.
+#[derive(Debug, PartialEq, Eq)]
+enum Generated {
+    /// No key.
+    Nothing,
+    /// A key without a name.
+    Unnamed,
+    /// A key with this name.
+    Named(Vec<u8>),
+}
+
+/// What a direct generation derives from the `DerivedKey` of `xml` for a
+/// decrypting `KeyInfo` context, with the master key stored under `master`;
+/// `prepare` adjusts the fresh generating context first. Runs within
 /// [`with_library`].
-fn generated_name(prepare: impl FnOnce(*mut XmlSecEncCtx)) -> Option<Vec<u8>> {
+fn generated_name(
+    xml: &str,
+    master: &std::ffi::CStr,
+    prepare: impl FnOnce(*mut XmlSecEncCtx),
+) -> Generated {
     // SAFETY: a document, keys manager and contexts created and released
     // here.
     unsafe {
-        let xml = template("master", "");
         let doc = xsReadMemory(
             xml.as_ptr().cast(),
             c_int::try_from(xml.len()).expect("a short document"),
@@ -336,7 +350,7 @@ fn generated_name(prepare: impl FnOnce(*mut XmlSecEncCtx)) -> Option<Vec<u8>> {
             std::ptr::null(),
             0,
         );
-        let mngr = manager_with_master(c"master");
+        let mngr = manager_with_master(master);
         let ctx = xmlSecEncCtxCreate(mngr);
         let key_info = &raw mut (*ctx).key_info_read_ctx;
         (*key_info).operation = crate::ffi::transforms::OPERATION_DECRYPT;
@@ -351,11 +365,17 @@ fn generated_name(prepare: impl FnOnce(*mut XmlSecEncCtx)) -> Option<Vec<u8>> {
             strings::xmlSecEnc11Ns.as_ptr(),
         );
         let key = xmlSecEncCtxDerivedKeyGenerate(enc, symkeys::aes(), node, key_info);
-        let name = (!key.is_null()).then(|| {
-            std::ffi::CStr::from_ptr((*key).name.cast())
-                .to_bytes()
-                .to_vec()
-        });
+        let name = if key.is_null() {
+            Generated::Nothing
+        } else if (*key).name.is_null() {
+            Generated::Unnamed
+        } else {
+            Generated::Named(
+                std::ffi::CStr::from_ptr((*key).name.cast())
+                    .to_bytes()
+                    .to_vec(),
+            )
+        };
         if !key.is_null() {
             xmlSecKeyDestroy(key);
         }
@@ -370,7 +390,51 @@ fn generated_name(prepare: impl FnOnce(*mut XmlSecEncCtx)) -> Option<Vec<u8>> {
 fn the_derived_key_is_named_by_its_derived_key_name() {
     // The derived key carries the DerivedKeyName, as libxmlsec1 names it.
     with_library(|| {
-        assert_eq!(generated_name(|_| {}).as_deref(), Some(&b"session"[..]));
+        assert_eq!(
+            generated_name(&template("master", ""), c"master", |_| {}),
+            Generated::Named(b"session".to_vec())
+        );
+    });
+}
+
+#[test]
+fn derived_key_names_keep_their_white_space_unless_the_policy_trims_it() {
+    // XML Encryption 1.1 section 3.5.2: white space is significant in
+    // DerivedKeyName, and MasterKeyName is read the same way, so padded names
+    // find the master key stored under them and name the derived key as
+    // written. libxmlsec1 trims both, which KeyNameSemantics::Libxmlsec1
+    // selects.
+    with_library(|| {
+        let xml = template(" master ", "").replace(
+            "<xenc11:DerivedKeyName>session</xenc11:DerivedKeyName>",
+            "<xenc11:DerivedKeyName> session </xenc11:DerivedKeyName>",
+        );
+        assert_eq!(generated_name(&xml, c"master", |_| {}), Generated::Nothing);
+        assert_eq!(
+            generated_name(&xml, c" master ", |_| {}),
+            Generated::Named(b" session ".to_vec())
+        );
+        let mut pinned = crate::ffi::policy::Pinned::current(here!("test"))
+            .expect("the library policy compiles");
+        std::sync::Arc::make_mut(&mut pinned.decryption)
+            .xml
+            .key_names = xml_sec::policy::KeyNameSemantics::Libxmlsec1;
+        let trimmed = generated_name(&xml, c"master", |enc| {
+            // SAFETY: the generating context's own transform context.
+            unsafe { crate::ffi::transforms::ctx::pin_run(&raw mut (*enc).transform_ctx, &pinned) };
+        });
+        assert_eq!(trimmed, Generated::Named(b"session".to_vec()));
+        // The decryption takes the key derived for the padded names: the core
+        // reads the DerivedKey with the same names.
+        let plaintext = b"padded names";
+        // SAFETY: the library is initialized; every object is released.
+        unsafe {
+            let doc = encrypted_with_derived(plaintext, &xml);
+            let mngr = manager_with_master(c" master ");
+            assert_eq!(decrypted(doc, mngr, 0).as_deref(), Some(&plaintext[..]));
+            xmlSecKeysMngrDestroy(mngr);
+            xsFreeDoc(doc.cast());
+        }
     });
 }
 

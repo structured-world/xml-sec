@@ -364,6 +364,7 @@ fn a_document_type_is_refused_unless_the_policy_allows_it() {
     let allowing = VerificationPolicy {
         xml: XmlInputPolicy {
             allow_internal_dtd: true,
+            ..XmlInputPolicy::default()
         },
         ..VerificationPolicy::default()
     };

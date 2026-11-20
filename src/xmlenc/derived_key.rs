@@ -16,7 +16,8 @@ pub struct DerivedKey {
     pub method: Option<KeyDerivationMethod>,
     /// Optional name of the derived key, distinct from the master key name.
     pub derived_key_name: Option<String>,
-    /// Optional master-key association. Names are whitespace significant.
+    /// Optional master-key association, read under the policy's
+    /// [`crate::policy::KeyNameSemantics`] like `derived_key_name`.
     pub master_key_name: Option<String>,
     /// Optional recipient association, supplied to the application resolver.
     pub recipient: Option<String>,
@@ -29,24 +30,26 @@ pub struct DerivedKey {
 }
 
 impl DerivedKey {
-    /// Parse the `DerivedKey` element `node` as a decryption reads the
-    /// descriptors of an `EncryptedData`'s `KeyInfo`, each value within the
-    /// operation's `max_encryption_metadata_bytes`.
+    /// Parse the `DerivedKey` element `node` as a decryption under `policy`
+    /// reads the descriptors of an `EncryptedData`'s `KeyInfo`: each value
+    /// within its `max_encryption_metadata_bytes`, names under its
+    /// [`crate::policy::KeyNameSemantics`].
     ///
     /// # Errors
     /// Returns a node that is no `DerivedKey`, a malformed child or method,
-    /// or a value beyond the metadata limit of `resources`.
+    /// or a value beyond the metadata limit of `policy`.
     pub fn from_element(
         node: Node<'_, '_>,
-        resources: &crate::policy::ResourcePolicy,
+        policy: &crate::policy::DecryptionPolicy,
     ) -> Result<Self, XmlEncError> {
-        parse(node, resources)
+        parse(node, &policy.resources, policy.xml.key_names)
     }
 }
 
 pub(super) fn parse(
     node: Node<'_, '_>,
     resources: &crate::policy::ResourcePolicy,
+    key_names: crate::policy::KeyNameSemantics,
 ) -> Result<DerivedKey, XmlEncError> {
     let maximum = resources.max_encryption_metadata_bytes;
     super::parse::require_element(node, XMLENC11_NS, "DerivedKey")?;
@@ -98,11 +101,11 @@ pub(super) fn parse(
             .peek()
             .is_some_and(|child| child.has_tag_name((XMLENC11_NS, tag)))
         {
-            Ok(Some(bounded_simple_text_with_limit(
+            Ok(Some(key_names.owned_name(bounded_simple_text_with_limit(
                 children.next().expect("peeked child"),
                 tag,
                 maximum,
-            )?))
+            )?)))
         } else {
             Ok(None)
         }

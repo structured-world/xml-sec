@@ -3474,6 +3474,7 @@ fn prepare_verification_signature<'a, C: VerificationCapture>(
                     super::parse::SourceContext {
                         document_base: None,
                         origins: key_info_origins.as_mut(),
+                        key_names: ctx.policy.xml.key_names,
                     },
                     ctx.policy
                         .key_trust
@@ -4400,6 +4401,7 @@ fn materialize_external_key_info<P: KeyInfoReferencePolicy>(
             super::parse::SourceContext {
                 document_base: Some(resource_uri),
                 origins: None,
+                key_names: context.policy.xml().key_names,
             },
         )?;
         let mut nested_outcome = materialize_key_info_visit(
@@ -4471,6 +4473,7 @@ fn parse_same_document_key_info<P: KeyInfoReferencePolicy>(
         super::parse::SourceContext {
             document_base: None,
             origins: origins.as_mut(),
+            key_names: context.policy.xml().key_names,
         },
     )?;
     Ok((referenced, origins))
@@ -5056,7 +5059,10 @@ fn inspect_signature_key_info_with_budgets<P: KeyInfoReferencePolicy>(
         provider,
         budgets.execution.xml_base_resolution(),
         policy.resources(),
-        super::parse::SourceContext::default(),
+        super::parse::SourceContext {
+            key_names: policy.xml().key_names,
+            ..super::parse::SourceContext::default()
+        },
         policy.certificate_signature_algorithms(),
         &mut budgets.key_info_parse.borrow_mut(),
     )
@@ -5100,7 +5106,10 @@ fn inspect_signature_key_info_with_budgets<P: KeyInfoReferencePolicy>(
                     provider,
                     budgets.execution.xml_base_resolution(),
                     policy.resources(),
-                    super::parse::SourceContext::default(),
+                    super::parse::SourceContext {
+                        key_names: policy.xml().key_names,
+                        ..super::parse::SourceContext::default()
+                    },
                     policy.certificate_signature_algorithms(),
                     &mut budgets.key_info_parse.borrow_mut(),
                 )

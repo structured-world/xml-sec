@@ -40,8 +40,9 @@ use super::super::transforms::{
 };
 use super::super::tree::{XmlNode, c_text, give, nodes};
 use super::super::xmltree::{
-    replace_node_buffer_under, xmlSecAddIDs, xmlSecCheckNodeName, xmlSecGetNextElementNode,
-    xmlSecGetNodeContentAndTrim, xmlSecReplaceContentAndReturn, xmlSecReplaceNodeAndReturn,
+    key_name_content, replace_node_buffer_under, xmlSecAddIDs, xmlSecCheckNodeName,
+    xmlSecGetNextElementNode, xmlSecGetNodeContentAndTrim, xmlSecReplaceContentAndReturn,
+    xmlSecReplaceNodeAndReturn,
 };
 use super::{
     FAILURE_KEY_NOT_FOUND, FAILURE_UNKNOWN, FLAGS_RETURN_REPLACED_NODE, MODE_ENCRYPTED_DATA,
@@ -1134,7 +1135,11 @@ unsafe fn read_enc_data(ctx: &mut XmlSecEncCtx, node: *mut XmlNode, add_base64: 
                 cur = next_element(cur);
             }
             if is(cur, name!(xmlSecNodeCarriedKeyName), enc_ns) {
-                ctx.carried_key_name = xmlSecGetNodeContentAndTrim(cur);
+                let Some(pinned) = run_policy(&raw mut ctx.transform_ctx, here) else {
+                    return -1;
+                };
+                let side = operation_side(ctx.operation).unwrap_or(Side::Decrypt);
+                ctx.carried_key_name = key_name_content(cur, pinned.of(side).key_names());
                 if ctx.carried_key_name.is_null() {
                     errors::invalid_node_content(here, cur, std::ptr::null(), "empty");
                     return -1;

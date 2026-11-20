@@ -1675,6 +1675,7 @@ pub struct KeyInfoParsingSession<'a> {
     resources: &'a crate::policy::ResourcePolicy,
     xml_base: XmlBaseResolutionBudget,
     usage: KeyInfoParseUsage,
+    key_names: crate::policy::KeyNameSemantics,
 }
 
 pub(crate) struct KeyInfoParseUsage {
@@ -1715,6 +1716,8 @@ impl<'a> KeyInfoParsingSession<'a> {
                 x509_binary_bytes: 0,
                 certificates: certificates.share(),
             },
+            // Writes certificates for signing and reads no KeyName.
+            key_names: crate::policy::KeyNameSemantics::default(),
         })
     }
     /// Inspect original certificate SPKI without constructing display metadata
@@ -1828,7 +1831,15 @@ impl<'a> KeyInfoParsingSession<'a> {
                 resources.effective_xml_base_resolution_bytes(),
             ),
             usage: KeyInfoParseUsage::new(resources),
+            key_names: crate::policy::KeyNameSemantics::default(),
         })
+    }
+
+    /// This session reading `KeyName` under the operation's `key_names`.
+    #[cfg(feature = "xmlenc")]
+    pub(crate) fn with_key_names(mut self, key_names: crate::policy::KeyNameSemantics) -> Self {
+        self.key_names = key_names;
+        self
     }
 
     /// Parse another element without resetting this operation's allowance.
@@ -1868,6 +1879,7 @@ impl<'a> KeyInfoParsingSession<'a> {
             SourceContext {
                 document_base,
                 origins: None,
+                key_names: self.key_names,
             },
             None,
             &mut self.usage,
@@ -1896,7 +1908,10 @@ impl<'a> KeyInfoParsingSession<'a> {
             provider,
             &self.xml_base,
             self.resources,
-            SourceContext::default(),
+            SourceContext {
+                key_names: self.key_names,
+                ..SourceContext::default()
+            },
             None,
             &mut self.usage,
         )
@@ -1961,6 +1976,8 @@ pub(crate) struct SourceContext<'a> {
     pub(crate) document_base: Option<&'a str>,
     /// Receives the element of each returned source, index for index.
     pub(crate) origins: Option<&'a mut Vec<SourceOrigin>>,
+    /// How `KeyName` text becomes the name it carries.
+    pub(crate) key_names: crate::policy::KeyNameSemantics,
 }
 
 pub(crate) fn parse_key_info_in_session(
@@ -1997,6 +2014,7 @@ fn parse_key_info_contents_in_session(
     let SourceContext {
         document_base,
         mut origins,
+        key_names,
     } = context;
     let mut sources = Vec::new();
     // KeyInfo is parsed before source selection, so preflight the cardinality
@@ -2011,8 +2029,11 @@ fn parse_key_info_contents_in_session(
         let source = match (child.tag_name().namespace(), child.tag_name().name()) {
             (Some(XMLDSIG_NS), "KeyName") => {
                 ensure_no_element_children(child, "KeyName")?;
-                let key_name =
-                    collect_text_content_bounded(child, MAX_KEY_NAME_TEXT_LEN, "KeyName")?;
+                let key_name = key_names.owned_name(collect_text_content_bounded(
+                    child,
+                    MAX_KEY_NAME_TEXT_LEN,
+                    "KeyName",
+                )?);
                 KeyInfoSource::KeyName(key_name)
             }
             (Some(XMLDSIG_NS), "KeyValue") => {

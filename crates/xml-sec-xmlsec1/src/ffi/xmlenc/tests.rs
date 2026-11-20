@@ -2665,6 +2665,115 @@ fn a_decryption_inspects_no_more_candidates_than_its_own_policy_allows() {
 }
 
 #[test]
+fn a_key_name_keeps_its_white_space_unless_the_policy_trims_it() {
+    // XMLDSig 1.1 section 4.5.1: white space is significant in KeyName, so
+    // the padded name finds the key stored under it and not the key named
+    // without it. libxmlsec1 trims it first, which the decryption policy's
+    // KeyNameSemantics::Libxmlsec1 selects.
+    own_process();
+    // SAFETY: the library, a document, contexts, keys and managers set up
+    // and released here, on this thread alone.
+    unsafe {
+        use crate::ffi::keys::xmlSecKeySetName;
+        use crate::ffi::keysmngr::{
+            xmlSecKeyStoreCreate, xmlSecKeysMngrAdoptKeysStore, xmlSecKeysMngrGetKey,
+            xmlSecSimpleKeysStoreAdoptKey, xmlSecSimpleKeysStoreGetKlass,
+        };
+        use xml_sec::policy::KeyNameSemantics;
+        start_up();
+        let (cipher, _) = encrypted(aes128_cbc(), b"named with padding");
+        let doc = parsed(&format!(
+            "{}{cipher}{}",
+            concat!(
+                "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\">",
+                "<EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#aes128-cbc\"/>",
+                "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName> k </KeyName>",
+                "</KeyInfo><CipherData><CipherValue>",
+            ),
+            "</CipherValue></CipherData></EncryptedData>"
+        ));
+        for (stored, semantics, decrypts) in [
+            (c"k", KeyNameSemantics::Specification, false),
+            (c" k ", KeyNameSemantics::Specification, true),
+            (c"k", KeyNameSemantics::Libxmlsec1, true),
+        ] {
+            xml_sec_libxml2::policy::republish_encryption(
+                |_| {},
+                |decryption| decryption.xml.key_names = semantics,
+            )
+            .expect("the library policy compiles");
+            let mngr = xmlSecKeysMngrCreate();
+            let store = xmlSecKeyStoreCreate(xmlSecSimpleKeysStoreGetKlass());
+            assert_eq!(xmlSecKeysMngrAdoptKeysStore(mngr, store), 0);
+            let key = aes_key();
+            assert_eq!(xmlSecKeySetName(key, stored.as_ptr().cast()), 0);
+            assert_eq!(xmlSecSimpleKeysStoreAdoptKey(store, key), 0);
+            (*mngr).get_key = Some(xmlSecKeysMngrGetKey);
+            let ctx = xmlSecEncCtxCreate(mngr);
+            let result = xmlSecEncCtxDecryptToBuffer(
+                ctx,
+                xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc.cast()),
+            );
+            assert_eq!(!result.is_null(), decrypts, "{stored:?} {semantics:?}");
+            xmlSecEncCtxDestroy(ctx);
+            xmlSecKeysMngrDestroy(mngr);
+        }
+        xsFreeDoc(doc.cast());
+        shut_down();
+    }
+}
+
+#[test]
+fn a_carried_key_name_keeps_its_white_space_unless_the_policy_trims_it() {
+    // XML Encryption 1.1 section 3.5.1: white space is significant in
+    // CarriedKeyName as in KeyName; libxmlsec1 trims it, which the decryption
+    // policy's KeyNameSemantics::Libxmlsec1 selects.
+    own_process();
+    // SAFETY: the library, a document and contexts set up and released
+    // here, on this thread alone.
+    unsafe {
+        use xml_sec::policy::KeyNameSemantics;
+        start_up();
+        let (value, _) = encrypted(aes128_cbc(), &[0x5a; 16]);
+        let doc = parsed(&format!(
+            "{}{value}{}",
+            concat!(
+                "<EncryptedKey xmlns=\"http://www.w3.org/2001/04/xmlenc#\">",
+                "<EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#aes128-cbc\"/>",
+                "<CipherData><CipherValue>",
+            ),
+            "</CipherValue></CipherData><CarriedKeyName> carried </CarriedKeyName></EncryptedKey>"
+        ));
+        for (semantics, expected) in [
+            (KeyNameSemantics::Specification, c" carried "),
+            (KeyNameSemantics::Libxmlsec1, c"carried"),
+        ] {
+            xml_sec_libxml2::policy::republish_encryption(
+                |_| {},
+                |decryption| decryption.xml.key_names = semantics,
+            )
+            .expect("the library policy compiles");
+            let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
+            (*ctx).mode = MODE_ENCRYPTED_KEY;
+            (*ctx).enc_key = aes_key();
+            let result = xmlSecEncCtxDecryptToBuffer(
+                ctx,
+                xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc.cast()),
+            );
+            assert!(!result.is_null(), "{semantics:?}");
+            assert!(!(*ctx).carried_key_name.is_null(), "{semantics:?}");
+            assert_eq!(
+                std::ffi::CStr::from_ptr((*ctx).carried_key_name.cast()),
+                expected
+            );
+            xmlSecEncCtxDestroy(ctx);
+        }
+        xsFreeDoc(doc.cast());
+        shut_down();
+    }
+}
+
+#[test]
 fn encrypted_key_recipients_share_the_candidate_allowance() {
     // The key candidates every recipient's lookup inspects belong to one
     // KeyInfo read: a recipient whose key fails does not hand the next one a
