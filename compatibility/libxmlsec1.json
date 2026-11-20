@@ -39488,28 +39488,6 @@
     },
     {
       "kind": "macro",
-      "name": "XMLSEC_NO_RSA_OAEP",
-      "source": "include/xmlsec/openssl/crypto.h",
-      "detail": "#define XMLSEC_NO_RSA_OAEP 1",
-      "conditions": [
-        "#ifndef XMLSEC_OPENSSL_CRYPTO_H",
-        "#if defined(XMLSEC_OPENSSL_IS_AWSLC)"
-      ],
-      "classification": "backend-specific-surface"
-    },
-    {
-      "kind": "macro",
-      "name": "XMLSEC_NO_RSA_OAEP",
-      "source": "include/xmlsec/openssl/crypto.h",
-      "detail": "#define XMLSEC_NO_RSA_OAEP 1",
-      "conditions": [
-        "#ifndef XMLSEC_OPENSSL_CRYPTO_H",
-        "#if defined(XMLSEC_OPENSSL_IS_BORINGSSL)"
-      ],
-      "classification": "backend-specific-surface"
-    },
-    {
-      "kind": "macro",
       "name": "XMLSEC_NO_SHA1",
       "source": "include/xmlsec/openssl/crypto.h",
       "detail": "#define XMLSEC_NO_SHA1 1",
