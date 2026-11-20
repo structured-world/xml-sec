@@ -164,7 +164,7 @@ fn complete_surface_categories_are_stable() {
         counts,
         BTreeMap::from([
             ("algorithm-uri", 136),
-            ("backend-api", 856),
+            ("backend-api", 857),
             ("build-define", 50),
             ("callback", 65),
             ("class-id", 1_128),
@@ -911,7 +911,7 @@ fn backend_source_tier_is_not_claimed() {
         .iter()
         .filter(|item| from_backend_header(item))
         .collect();
-    assert_eq!(backend_items.len(), 3_104);
+    assert_eq!(backend_items.len(), 3_105);
     for item in &backend_items {
         let expected = if item.classification == "backend-provider-transform-surface" {
             "provider-limited"

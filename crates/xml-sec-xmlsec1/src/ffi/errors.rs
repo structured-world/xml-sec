@@ -161,7 +161,7 @@ static TABLE: [(c_int, &CStr); 55] = [
 const MESSAGE_CAPACITY: usize = 1024;
 
 /// The message a format that cannot be expanded reports instead.
-const FATAL: &CStr = c"Can not format error message";
+const FATAL: &CStr = c"Cannot format error message";
 
 /// The address that marks a slot as never set; no callback has it.
 static UNSET: u8 = 0;

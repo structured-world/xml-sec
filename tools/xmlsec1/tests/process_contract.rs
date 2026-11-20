@@ -4524,6 +4524,38 @@ fn output_template_expands_the_extensionless_input_basename() {
 }
 
 #[test]
+fn output_template_keeps_a_dotfile_name_whole() {
+    // A leading dot names a dotfile, not an extension, so libxmlsec1 keeps
+    // ".enveloping" whole instead of expanding the placeholder to nothing.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join(".enveloping");
+    std::fs::copy(
+        project_root()
+            .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl"),
+        &template,
+    )
+    .unwrap();
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+
+    let signed = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(private_key)
+        .arg("--output")
+        .arg(temp.path().join("signed-{inputfile}.xml"))
+        .arg(&template)
+        .output()
+        .unwrap();
+
+    assert!(
+        signed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&signed.stderr)
+    );
+    assert!(temp.path().join("signed-.enveloping.xml").is_file());
+    assert!(!temp.path().join("signed-.xml").exists());
+}
+
+#[test]
 fn repeated_output_options_fail_before_creating_files() {
     // Canonical and alias spellings identify one donor singleton; accepting
     // both would silently redirect output through last-value wins behavior.

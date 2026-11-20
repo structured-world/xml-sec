@@ -5879,6 +5879,17 @@
     },
     {
       "kind": "backend-api",
+      "name": "xmlSecMSCryptoKeyDataDesSet",
+      "source": "include/xmlsec/mscrypto/crypto.h",
+      "detail": "XMLSEC_CRYPTO_EXPORT int xmlSecMSCryptoKeyDataDesSet (xmlSecKeyDataPtr data, const xmlSecByte* buf, xmlSecSize bufSize);",
+      "conditions": [
+        "#ifndef XMLSEC_MSCRYPTO_CRYPTO_H",
+        "#ifndef XMLSEC_NO_DES"
+      ],
+      "classification": "backend-specific-surface"
+    },
+    {
+      "kind": "backend-api",
       "name": "xmlSecMSCryptoKeyDataDsaGetKlass",
       "source": "include/xmlsec/mscrypto/crypto.h",
       "detail": "XMLSEC_CRYPTO_EXPORT xmlSecKeyDataId xmlSecMSCryptoKeyDataDsaGetKlass(void);",

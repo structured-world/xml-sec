@@ -214,6 +214,6 @@ fn long_messages_are_replaced() {
     report(here!("probe"), std::ptr::null(), std::ptr::null(), 1, &fits);
     report(here!("probe"), std::ptr::null(), std::ptr::null(), 1, &long);
     let messages: Vec<String> = take().into_iter().map(|report| report.message).collect();
-    let fatal = "Can not format error message".to_owned();
+    let fatal = "Cannot format error message".to_owned();
     assert_eq!(messages, [fits.clone(), fatal.clone(), fits, fatal]);
 }

@@ -273,6 +273,31 @@ fn hex_read_decodes_and_refuses() {
     }
 }
 
+/// Base64 node content replaces the contents; content that fails to decode
+/// leaves the buffer empty, never resized over partly decoded bytes, as
+/// libxmlsec1 does.
+#[test]
+fn base64_node_read_failure_leaves_the_buffer_empty() {
+    use xml_sec_libxml2::ffi::tree::{xsDocGetRootElement, xsFreeDoc};
+    let buf = Buffer::new(0);
+    for (xml, read, contents) in [
+        (&b"<a> Zm9v </a>"[..], 0, &b"foo"[..]),
+        (&b"<a>Zm9v!!</a>"[..], -1, &b""[..]),
+    ] {
+        assert_eq!(buf.append(b"previous"), 0);
+        // SAFETY: `xml` holds its length in bytes; the document is freed
+        // once, after its root is read.
+        unsafe {
+            let doc = crate::ffi::parser::xmlSecParseMemory(xml.as_ptr(), xml.len(), 0);
+            assert!(!doc.is_null(), "the document parses");
+            let root = xsDocGetRootElement(doc);
+            assert_eq!(super::xmlSecBufferBase64NodeContentRead(buf.0, root), read);
+            xsFreeDoc(doc);
+        }
+        assert_eq!(buf.contents(), contents);
+    }
+}
+
 /// Bytes reverse in place; zero and one bytes are trivially reversed.
 #[test]
 fn reverse_in_place() {
