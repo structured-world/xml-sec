@@ -84,9 +84,10 @@ struct SharedKeySourceParseBudget<'a> {
 
 impl<'a> SharedKeySourceParseBudget<'a> {
     fn new(
-        resources: &'a crate::policy::ResourcePolicy,
+        policy: ParsingPolicy<'a>,
         references: Option<&super::CipherReferenceContext<'_>>,
     ) -> Result<Self, XmlEncError> {
+        let resources = policy.resources;
         Ok(Self {
             retained_cipher_bytes: 0,
             transforms: match references {
@@ -96,7 +97,8 @@ impl<'a> SharedKeySourceParseBudget<'a> {
                 }
             },
             key_info: crate::xmldsig::parse::KeyInfoParsingSession::new(resources)
-                .map_err(super::agreement::map_key_info_error)?,
+                .map_err(super::agreement::map_key_info_error)?
+                .with_key_names(policy.xml.key_names),
             reference_ancestry: Vec::new(),
         })
     }
@@ -574,7 +576,7 @@ fn parse_encrypted_data_node_traced<'doc>(
     xml_parse: Option<&XmlParseWorkBudget>,
 ) -> Result<TracedEncryptedData<'doc>, XmlEncError> {
     require_element(node, XMLENC_NS, "EncryptedData")?;
-    let mut shared = SharedKeySourceParseBudget::new(policy.resources, references)?;
+    let mut shared = SharedKeySourceParseBudget::new(policy, references)?;
     let mut budget = KeySourceParseBudget::new(policy, registrations, provider, &mut shared);
     budget.references = references;
     budget.xml_parse = xml_parse;
@@ -933,9 +935,11 @@ fn parse_retrieved_key_info<'doc>(
     if target.has_tag_name((XMLENC11_NS, "DerivedKey")) {
         budget.charge()?;
         parsed.source_nodes.push(target.id());
-        parsed
-            .derived_keys
-            .push(super::derived_key::parse(target, policy.resources)?);
+        parsed.derived_keys.push(super::derived_key::parse(
+            target,
+            policy.resources,
+            policy.xml.key_names,
+        )?);
         return Ok(());
     }
     // A named ML-KEM EncryptedKey is decapsulated as a direct child would be.
@@ -1026,9 +1030,11 @@ fn parse_key_info<'doc>(
         } else if child.has_tag_name((XMLENC11_NS, "DerivedKey")) {
             budget.charge()?;
             parsed.source_nodes.push(child.id());
-            parsed
-                .derived_keys
-                .push(super::derived_key::parse(child, policy.resources)?);
+            parsed.derived_keys.push(super::derived_key::parse(
+                child,
+                policy.resources,
+                policy.xml.key_names,
+            )?);
         } else if child.has_tag_name((XMLENC_NS, "AgreementMethod")) {
             budget.charge()?;
             // Role parsing preflights against this same session before binary
@@ -1230,6 +1236,7 @@ fn parse_processed_key_reference(
                 return Ok(RetrievedKey::Derived(super::derived_key::parse(
                     target,
                     child_budget.policy.resources,
+                    child_budget.policy.xml.key_names,
                 )?));
             }
             // A KEM ciphertext keeps no binding to a transformed or external
@@ -1399,11 +1406,10 @@ fn detached_key_matches<'doc>(
             })
             .is_some_and(|label| {
                 label.children().all(|child| !child.is_element())
-                    && label
-                        .children()
-                        .filter_map(Node::text)
-                        .flat_map(str::bytes)
-                        .eq(expected.bytes())
+                    && policy
+                        .xml
+                        .key_names
+                        .carries(label.children().filter_map(Node::text), expected)
             })
     });
     let mut referenced = false;
@@ -1509,8 +1515,11 @@ fn append_detached_keys<'doc>(
         if derived {
             budget.charge()?;
             info.source_nodes.push(id);
-            info.derived_keys
-                .push(super::derived_key::parse(candidate, policy.resources)?);
+            info.derived_keys.push(super::derived_key::parse(
+                candidate,
+                policy.resources,
+                policy.xml.key_names,
+            )?);
             continue;
         }
         budget.charge_recipient(policy.resources, info.encrypted_keys.len())?;
@@ -1661,7 +1670,11 @@ fn parse_carried_key_name(
     policy: ParsingPolicy<'_>,
 ) -> Result<String, XmlEncError> {
     require_element(node, XMLENC_NS, "CarriedKeyName")?;
-    let value = bounded_simple_text(node, "CarriedKeyName", policy)?;
+    let value =
+        policy
+            .xml
+            .key_names
+            .owned_name(bounded_simple_text(node, "CarriedKeyName", policy)?);
     if value.is_empty() {
         return Err(XmlEncError::InvalidStructure(
             "CarriedKeyName is empty".into(),
@@ -1671,7 +1684,10 @@ fn parse_carried_key_name(
 }
 
 fn parse_key_name(node: Node<'_, '_>, policy: ParsingPolicy<'_>) -> Result<String, XmlEncError> {
-    let value = bounded_simple_text(node, "KeyName", policy)?;
+    let value = policy
+        .xml
+        .key_names
+        .owned_name(bounded_simple_text(node, "KeyName", policy)?);
     if value.is_empty() {
         return Err(XmlEncError::InvalidStructure("KeyName is empty".into()));
     }

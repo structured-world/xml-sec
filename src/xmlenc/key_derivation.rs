@@ -52,6 +52,20 @@ pub struct KeyDerivationMethod {
 }
 
 impl KeyDerivationMethod {
+    /// Parse the `KeyDerivationMethod` element `node`, each value within the
+    /// operation's `max_encryption_metadata_bytes`.
+    ///
+    /// # Errors
+    /// Returns a node that is no `KeyDerivationMethod`, an unsupported
+    /// algorithm, malformed parameters, or a value beyond the metadata limit
+    /// of `resources`.
+    pub fn from_element(
+        node: Node<'_, '_>,
+        resources: &crate::policy::ResourcePolicy,
+    ) -> Result<Self, XmlEncError> {
+        parse_node(node, resources.max_encryption_metadata_bytes)
+    }
+
     pub(super) fn validate_metadata(&self, maximum: usize) -> Result<(), XmlEncError> {
         serialize::validate_metadata(self, maximum)
     }

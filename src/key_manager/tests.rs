@@ -1062,6 +1062,30 @@ fn xml_store_accepts_xmlsig11_ec_key_value() {
 }
 
 #[test]
+fn xml_store_names_follow_the_key_name_semantics() {
+    // XMLDSig 1.1 section 4.5.1: a stored KeyName keeps its white space;
+    // read as libxmlsec1 reads it, the name is trimmed, so the store answers
+    // the names a document read the same way carries.
+    let encoded = base64::engine::general_purpose::STANDARD.encode(include_bytes!(
+        "../../tests/fixtures/xmlenc/keys/ec/ec-prime256v1-pubkey.der"
+    ));
+    let xml = format!(
+        "<Keys xmlns=\"{XMLSEC_NS}\"><KeyInfo xmlns=\"{XMLDSIG_NS}\"><KeyName> ec </KeyName><DEREncodedKeyValue xmlns=\"{XMLDSIG11_NS}\">{encoded}</DEREncodedKeyValue></KeyInfo></Keys>"
+    );
+    let name = |key_names| {
+        let mut policy = xml_policy(ResourcePolicy::default());
+        policy.xml.key_names = key_names;
+        KeyInventory::from_xml_bytes(xml.as_bytes(), &policy, XmlBackend::default())
+            .expect("the store loads")
+            .public_keys()[0]
+            .name
+            .clone()
+    };
+    assert_eq!(name(crate::policy::KeyNameSemantics::Specification), " ec ");
+    assert_eq!(name(crate::policy::KeyNameSemantics::Libxmlsec1), "ec");
+}
+
+#[test]
 fn xml_store_der_keys_share_one_x509_work_budget() {
     // Every key read while loading one store is paid by the same X.509
     // work account: the allowance that admits one DEREncodedKeyValue must

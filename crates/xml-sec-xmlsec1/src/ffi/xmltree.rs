@@ -36,6 +36,21 @@ pub(crate) fn trimmed_content(cur: *const XmlNode) -> Option<String> {
     )
 }
 
+/// The name the key name element `cur` carries under `semantics`, which the
+/// caller frees with `xmlFree`; null when `cur` has no content. libxmlsec1
+/// always trims it, which only [`xml_sec::policy::KeyNameSemantics::Libxmlsec1`]
+/// does.
+pub(crate) fn key_name_content(
+    cur: *const XmlNode,
+    semantics: xml_sec::policy::KeyNameSemantics,
+) -> *mut u8 {
+    give(
+        nodes::content(cur)
+            .as_deref()
+            .map(|text| semantics.name(text)),
+    )
+}
+
 /// `xmlSecGetNodeContentAndTrim`: the text content of `cur` without leading
 /// and trailing C-locale white space, which the caller frees with `xmlFree`.
 ///

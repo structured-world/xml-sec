@@ -1140,6 +1140,7 @@ fn schema_references_and_the_w3c_dtd_fetch_nothing() {
     assert!(refused.to_string().contains("DTD"), "{refused}");
     let dtd = XmlInputPolicy {
         allow_internal_dtd: true,
+        ..XmlInputPolicy::default()
     };
     for producer in producers() {
         for (name, certificate, xml_input) in [

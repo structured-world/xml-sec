@@ -98,6 +98,76 @@ fn pbkdf2_xml_has_no_asn1_defaults() {
 }
 
 #[test]
+fn an_element_of_a_tree_reads_as_its_text_does() {
+    // A caller holding the element in a parsed tree (the libxmlsec1 KDF
+    // klasses) reads the same method, under the same metadata bound, as the
+    // standalone entry point reads its text.
+    let xml = concat("AlgorithmID='0000' PartyUInfo='03D8' PartyVInfo='03D0'");
+    let document = xml_sec::Document::parse(&xml).unwrap();
+    let mut resources = xml_sec::policy::ResourcePolicy::default();
+    let method =
+        xml_sec::xmlenc::KeyDerivationMethod::from_element(document.root_element(), &resources)
+            .unwrap();
+    assert_eq!(
+        method,
+        parse_key_derivation_method(&xml, &DecryptionPolicy::default()).unwrap()
+    );
+    resources.max_encryption_metadata_bytes = 2;
+    assert!(
+        xml_sec::xmlenc::KeyDerivationMethod::from_element(document.root_element(), &resources)
+            .is_err()
+    );
+    let other = xml_sec::Document::parse("<KeyDerivation xmlns='urn:other'/>").unwrap();
+    assert!(
+        xml_sec::xmlenc::KeyDerivationMethod::from_element(
+            other.root_element(),
+            &xml_sec::policy::ResourcePolicy::default()
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn a_derived_key_element_reads_as_its_encrypted_data_reads_it() {
+    // A caller holding a DerivedKey of an EncryptedData's KeyInfo in a parsed
+    // tree reads the descriptor the decryption reads there, so the two
+    // compare equal; the metadata bound and the key name rule apply alike.
+    let xml = format!(
+        "<EncryptedData xmlns='http://www.w3.org/2001/04/xmlenc#'>\
+         <EncryptionMethod Algorithm='http://www.w3.org/2009/xmlenc11#aes256-gcm'/>\
+         <KeyInfo xmlns='http://www.w3.org/2000/09/xmldsig#'>\
+         <DerivedKey xmlns='http://www.w3.org/2009/xmlenc11#'>{}\
+         <ReferenceList xmlns='http://www.w3.org/2001/04/xmlenc#'>\
+         <DataReference URI='#data'/></ReferenceList>\
+         <MasterKeyName> master </MasterKeyName></DerivedKey></KeyInfo>\
+         <CipherData><CipherValue>AAAA</CipherValue></CipherData></EncryptedData>",
+        concat("AlgorithmID='0000' PartyUInfo='03D8' PartyVInfo='03D0'")
+    );
+    let parsed = xml_sec::xmlenc::parse_encrypted_data(&xml).unwrap();
+    let document = xml_sec::Document::parse(&xml).unwrap();
+    let element = document
+        .root_element()
+        .descendants()
+        .find(|node| node.tag_name().name() == "DerivedKey")
+        .unwrap();
+    let mut policy = DecryptionPolicy::default();
+    let read = xml_sec::xmlenc::DerivedKey::from_element(element, &policy).unwrap();
+    assert_eq!(read, parsed.derived_keys[0]);
+    // XML Encryption 1.1 section 3.5.2: the name keeps its white space.
+    assert_eq!(read.master_key_name.as_deref(), Some(" master "));
+    policy.xml.key_names = xml_sec::policy::KeyNameSemantics::Libxmlsec1;
+    assert_eq!(
+        xml_sec::xmlenc::DerivedKey::from_element(element, &policy)
+            .unwrap()
+            .master_key_name
+            .as_deref(),
+        Some("master")
+    );
+    policy.resources.max_encryption_metadata_bytes = 2;
+    assert!(xml_sec::xmlenc::DerivedKey::from_element(element, &policy).is_err());
+}
+
+#[test]
 fn kdf_xml_bounds_metadata_before_decoding() {
     // The standalone entry point must use the same immutable parser and
     // metadata policy as EncryptedData; small limits cannot be bypassed.

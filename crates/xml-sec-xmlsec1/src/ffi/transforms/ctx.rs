@@ -105,6 +105,10 @@ pub(crate) struct RunBudget {
     pub(crate) xml_parse: usize,
     /// `XPath` expressions evaluated, of `max_xpath_expressions`.
     pub(crate) xpath_expressions: usize,
+    /// The key derivation work the operation reserved of its key
+    /// establishment limits, so every derivation of one operation spends one
+    /// allowance, as the core's derivations of one operation do.
+    pub(crate) key_establishment: xml_sec::key_establishment::KeyEstablishmentUsage,
     /// The run's method carries a key, as an `EncryptedKey`'s does, so a
     /// block cipher of it is admitted as a key wrap rather than as content
     /// (XML Encryption 1.1 section 3.4).
@@ -272,6 +276,7 @@ pub(crate) unsafe fn run_spent(ctx: *mut XmlSecTransformCtx) -> policy::Spent {
             external_resources: run.external_resources,
             xml_parse: run.xml_parse,
             xpath_expressions: run.xpath_expressions,
+            key_establishment: run.key_establishment,
             refused_by: run.refused_by,
             recovery: run.recovery,
             serves: run.serves,
@@ -421,6 +426,7 @@ pub(crate) unsafe fn take_spent(ctx: *mut XmlSecTransformCtx, spent: policy::Spe
     run.external_resources = spent.external_resources;
     run.xml_parse = spent.xml_parse;
     run.xpath_expressions = spent.xpath_expressions;
+    run.key_establishment = spent.key_establishment;
     // A refusal is never taken back by what a part hands over, nor is an
     // invalid recovery: `spent` carries only the recovery of the key the
     // part yields, a failed recipient's being dropped where it is tried.

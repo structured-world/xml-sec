@@ -305,8 +305,9 @@ policy-aware KEK path without copying the derived KEK. The complete attempt's
 candidate allowance is checked before agreement or derivation, so an exhausted
 unwrap allowance does not initiate unusable KDF work. Parsed `DerivedKey`
 descriptors are matched against the explicit request before provider dispatch;
-`MasterKeyName` is whitespace significant and requires the caller's exact
-`master_key_name` association. An omitted XML method requires the request's
+`MasterKeyName` is read under the policy's `xml.key_names` (white space
+significant by default, trimmed under `Libxmlsec1`) and requires the caller's
+exact `master_key_name` association. An omitted XML method requires the request's
 explicit method. Raw content-key resolvers cannot bypass a transported derivation.
 Parsed `AgreementMethod` descriptors preserve originator/recipient key metadata,
 KDF parameters and legacy DH nonce/digest fields. `AgreementDecryptor::content`

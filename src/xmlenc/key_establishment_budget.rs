@@ -29,11 +29,27 @@ impl<'a> KeyEstablishmentBudget<'a> {
     /// # Errors
     /// Returns the policy violation if the snapshot is inconsistent.
     pub fn new(policy: &'a KeyEstablishmentPolicy) -> Result<Self, PolicyViolation> {
+        Self::resume(policy, KeyEstablishmentUsage::default())
+    }
+
+    /// Continue an operation's allowance from `usage`, what its earlier parts
+    /// reserved ([`Self::usage`]), so an operation run in parts spends one
+    /// allowance rather than a fresh one per part.
+    ///
+    /// # Errors
+    /// Returns the policy violation if the snapshot is inconsistent.
+    pub fn resume(
+        policy: &'a KeyEstablishmentPolicy,
+        usage: KeyEstablishmentUsage,
+    ) -> Result<Self, PolicyViolation> {
         policy.validate()?;
-        Ok(Self {
-            policy,
-            usage: KeyEstablishmentUsage::default(),
-        })
+        Ok(Self { policy, usage })
+    }
+
+    /// What this allowance has reserved so far, failed attempts included.
+    #[must_use]
+    pub const fn usage(&self) -> KeyEstablishmentUsage {
+        self.usage
     }
 
     /// Derive through the selected provider only after syntax, permission,

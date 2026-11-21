@@ -101,6 +101,27 @@ impl<'a> OperationPolicy<'a> {
         }
     }
 
+    /// The key derivation, agreement and encapsulation rules of the
+    /// operation.
+    pub(crate) fn key_establishment(self) -> &'a xml_sec::policy::KeyEstablishmentPolicy {
+        match self {
+            Self::Verify(policy) => &policy.key_establishment,
+            Self::Sign(policy) => &policy.key_establishment,
+            Self::Encrypt(policy) => &policy.key_establishment,
+            Self::Decrypt(policy) => &policy.key_establishment,
+        }
+    }
+
+    /// How the operation reads a key name element.
+    pub(crate) fn key_names(self) -> xml_sec::policy::KeyNameSemantics {
+        match self {
+            Self::Verify(policy) => policy.xml.key_names,
+            Self::Sign(policy) => policy.xml.key_names,
+            Self::Encrypt(policy) => policy.xml.key_names,
+            Self::Decrypt(policy) => policy.xml.key_names,
+        }
+    }
+
     /// The URI-class permissions of the operation.
     fn uris(self) -> xml_sec::policy::UriPolicy {
         match self {
@@ -157,6 +178,8 @@ pub(crate) struct Spent {
     pub(crate) xml_parse: usize,
     /// `XPath` expressions evaluated, of `max_xpath_expressions`.
     pub(crate) xpath_expressions: usize,
+    /// The key derivation work reserved of the key establishment limits.
+    pub(crate) key_establishment: xml_sec::key_establishment::KeyEstablishmentUsage,
     /// The limit that refused work of the operation: its budget is spent,
     /// so the operation ends wherever its parts hand it back.
     pub(crate) refused_by: Option<super::transforms::ctx::Limit>,

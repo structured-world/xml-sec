@@ -2,7 +2,8 @@
  * Element EncryptedData replaced by its plaintext, the replaced node
  * returned on request, a Content one, one without a Type decrypted to a
  * buffer and left in place, a missing key, a wrong key, and a node that is
- * no EncryptedData. The cipher values are made with the AES-CBC transform
+ * no EncryptedData, and keys derived by PBKDF2, HKDF and ConcatKDF from a
+ * named master key. The cipher values are made with the AES-CBC transform
  * of the same library, so both libraries decrypt their own. Built against
  * the libxmlsec1 oracle with its default crypto library and against this
  * crate, both must print the same. */
@@ -368,6 +369,96 @@ static void session_key(const char *label, xmlSecTransformId transport, const ch
     xsFreeDoc(doc);
 }
 
+#define DERIVED_HEAD                                                                      \
+    "<xenc:EncryptedData xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\" "                 \
+    "xmlns:xenc=\"http://www.w3.org/2001/04/xmlenc#\" "                                    \
+    "xmlns:xenc11=\"http://www.w3.org/2009/xmlenc11#\">"
+#define DERIVED_TAIL                                                                      \
+    "<xenc11:DerivedKeyName>session</xenc11:DerivedKeyName>"                               \
+    "<xenc11:MasterKeyName>master</xenc11:MasterKeyName></xenc11:DerivedKey></ds:KeyInfo>" \
+    "<xenc:CipherData><xenc:CipherValue/></xenc:CipherData></xenc:EncryptedData>"
+
+static const char pbkdf2_template[] =
+    DERIVED_HEAD
+    "<xenc:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes256-gcm\"/>"
+    "<ds:KeyInfo><xenc11:DerivedKey>"
+    "<xenc11:KeyDerivationMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#pbkdf2\">"
+    "<xenc11:PBKDF2-params><xenc11:Salt><xenc11:Specified>Df3dRAhjGh8=</xenc11:Specified>"
+    "</xenc11:Salt><xenc11:IterationCount>1000</xenc11:IterationCount>"
+    "<xenc11:KeyLength>32</xenc11:KeyLength>"
+    "<xenc11:PRF Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#hmac-sha256\"/>"
+    "</xenc11:PBKDF2-params></xenc11:KeyDerivationMethod>" DERIVED_TAIL;
+
+static const char hkdf_template[] =
+    DERIVED_HEAD
+    "<xenc:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes256-gcm\"/>"
+    "<ds:KeyInfo><xenc11:DerivedKey>"
+    "<xenc11:KeyDerivationMethod Algorithm=\"http://www.w3.org/2021/04/xmldsig-more#hkdf\">"
+    "<m:HKDFParams xmlns:m=\"http://www.w3.org/2021/04/xmldsig-more#\">"
+    "<m:PRF Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#hmac-sha256\"/>"
+    "<m:Salt>AAECAwQFBgcICQoL</m:Salt><m:Info>aW5mbw==</m:Info>"
+    "<m:KeyLength>32</m:KeyLength></m:HKDFParams></xenc11:KeyDerivationMethod>" DERIVED_TAIL;
+
+static const char concat_kdf_template[] =
+    DERIVED_HEAD
+    "<xenc:EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#aes256-cbc\"/>"
+    "<ds:KeyInfo><xenc11:DerivedKey>"
+    "<xenc11:KeyDerivationMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#ConcatKDF\">"
+    "<xenc11:ConcatKDFParams AlgorithmID=\"00123456789ABCDEF0\" PartyUInfo=\"00414C494345313233\" "
+    "PartyVInfo=\"00424F424259343536\">"
+    "<ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>"
+    "</xenc11:ConcatKDFParams></xenc11:KeyDerivationMethod>" DERIVED_TAIL;
+
+/* Data encrypted under the key the template's DerivedKey derives from the
+ * master key "master" of `klass`, found through the keys manager, then
+ * decrypted by a fresh context deriving the key again: the derived key is
+ * deterministic, so its bytes and name are printed. With `master_name`
+ * other than "master" the recipient finds no master key. */
+static void derived_key(const char *label, const char *template, xmlSecKeyDataId klass,
+                        const char *master_name) {
+    static const char bytes[] = "derived key payload";
+    xmlSecByte secret[24];
+    xmlSecKeysMngrPtr mngr = xmlSecKeysMngrCreate();
+    xmlSecKeysMngrPtr recipient = xmlSecKeysMngrCreate();
+    xmlDocPtr doc = xsReadMemory(template, (int)strlen(template), "derived.xml", NULL, 0);
+    xmlSecEncCtxPtr ctx;
+    xmlSecBufferPtr result;
+    xmlSecKeyPtr key;
+    memset(secret, 0x5c, sizeof(secret));
+    xmlSecCryptoAppDefaultKeysMngrInit(mngr);
+    key = xmlSecKeyReadMemory(klass, secret, sizeof(secret));
+    xmlSecKeySetName(key, BAD_CAST "master");
+    xmlSecCryptoAppDefaultKeysMngrAdoptKey(mngr, key);
+    xmlSecCryptoAppDefaultKeysMngrInit(recipient);
+    key = xmlSecKeyReadMemory(klass, secret, sizeof(secret));
+    xmlSecKeySetName(key, BAD_CAST master_name);
+    xmlSecCryptoAppDefaultKeysMngrAdoptKey(recipient, key);
+    printf("%s\n", label);
+    ctx = xmlSecEncCtxCreate(mngr);
+    printf("  encrypt: %d\n", xmlSecEncCtxBinaryEncrypt(ctx, xsDocGetRootElement(doc),
+                                                        (const xmlSecByte *)bytes,
+                                                        sizeof(bytes) - 1));
+    xmlSecEncCtxDestroy(ctx);
+    ctx = xmlSecEncCtxCreate(recipient);
+    result = xmlSecEncCtxDecryptToBuffer(ctx, xsDocGetRootElement(doc));
+    printf("  decrypted: %.*s failure=%s\n", result != NULL ? (int)xmlSecBufferGetSize(result) : 0,
+           result != NULL ? (const char *)xmlSecBufferGetData(result) : "",
+           xmlSecEncCtxGetFailureReasonString(ctx->failureReason));
+    if (ctx->encKey != NULL) {
+        xmlSecBufferPtr value = xmlSecKeyDataBinaryValueGetBuffer(xmlSecKeyGetValue(ctx->encKey));
+        xmlSecSize index;
+        printf("  key %s:", (const char *)xmlSecKeyGetName(ctx->encKey));
+        for (index = 0; index < xmlSecBufferGetSize(value); index++) {
+            printf("%02x", xmlSecBufferGetData(value)[index]);
+        }
+        printf("\n");
+    }
+    xmlSecEncCtxDestroy(ctx);
+    xmlSecKeysMngrDestroy(recipient);
+    xmlSecKeysMngrDestroy(mngr);
+    xsFreeDoc(doc);
+}
+
 int main(void) {
     xmlDocPtr doc;
     xmlSecEncCtxPtr ctx;
@@ -401,6 +492,11 @@ int main(void) {
     session_key("session key rsa-1_5", xmlSecTransformRsaPkcs1Id, "recipient", 0);
     session_key("session key kw-aes128", xmlSecTransformKWAes128Id, "kek", 0);
     session_key("session key kw-aes128 tampered", xmlSecTransformKWAes128Id, "kek", 1);
+    derived_key("derived key pbkdf2", pbkdf2_template, xmlSecKeyDataPbkdf2Id, "master");
+    derived_key("derived key hkdf", hkdf_template, xmlSecKeyDataHkdfId, "master");
+    derived_key("derived key concatkdf", concat_kdf_template, xmlSecKeyDataConcatKdfId, "master");
+    derived_key("derived key without its master", pbkdf2_template, xmlSecKeyDataPbkdf2Id,
+                "another");
 
     /* No key: the keys manager has none. */
     key = aes_key(0x11);

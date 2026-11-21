@@ -39,11 +39,12 @@ use super::transforms::{
     },
 };
 use super::tree::{XmlNode, nodes, xmlStrEqual};
+use super::xmlenc::derived_key::forget_derivation;
 use super::xmlenc::{
     xmlSecEncCtxDebugDump, xmlSecEncCtxDebugXmlDump, xmlSecEncCtxDestroy, xmlSecEncCtxReset,
 };
 use super::xmltree::{
-    xmlSecAddChild, xmlSecGetNextElementNode, xmlSecGetNodeContentAndTrim, xmlSecGetNodeNsHref,
+    key_name_content, xmlSecAddChild, xmlSecGetNextElementNode, xmlSecGetNodeNsHref,
     xmlSecIsEmptyNode, xmlSecNodeEncodeAndSetContent,
 };
 use super::{contain, free, malloc, policy, write_stream};
@@ -615,6 +616,7 @@ pub(crate) unsafe extern "C" fn xmlSecKeyInfoCtxFinalize(ctx: *mut XmlSecKeyInfo
             // A read's guard releases its pin on return, so none is left
             // here; the slot is emptied the same way should one be.
             policy::release(&raw mut context.reserved0);
+            forget_derivation(ctx);
             ctx.cast::<u8>()
                 .write_bytes(0, size_of::<XmlSecKeyInfoCtx>());
         }
@@ -648,6 +650,7 @@ pub(crate) unsafe extern "C" fn xmlSecKeyInfoCtxReset(ctx: *mut XmlSecKeyInfoCtx
             // xmlSecTransformOperationNone.
             context.operation = 0;
             xmlSecKeyReqReset(&raw mut context.key_req);
+            forget_derivation(ctx);
         }
     });
 }
@@ -938,10 +941,16 @@ pub(crate) unsafe extern "C" fn name_xml_read(
             c"keyInfoCtx->mode == xmlSecKeyInfoModeRead",
             -1
         );
+        // SAFETY: a context whose slot is null or a pin.
+        let Some(pinned) = (unsafe { read_policy(ctx, here) }) else {
+            return -1;
+        };
+        // SAFETY: as above.
+        let key_names = pinned.of(unsafe { references::read_side(ctx) }).key_names();
         // SAFETY: a key, a live node and a context; the name is freed here.
         unsafe {
             let object = klass_name(id);
-            let new_name = xmlSecGetNodeContentAndTrim(node);
+            let new_name = key_name_content(node, key_names);
             if new_name.is_null() || *new_name == 0 {
                 errors::invalid_node_content(here, node, object, "empty");
                 if !new_name.is_null() {

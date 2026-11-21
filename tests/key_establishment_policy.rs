@@ -476,16 +476,46 @@ fn xml_derivation_matches_context_before_provider_work() {
         Err(XmlEncError::KeyNotFound)
     ));
     assert_eq!(provider.calls.load(Ordering::Relaxed), 0);
-    let resolver = resolver.master_key_name(" master ");
-    assert_eq!(
-        DecryptContext::new(&resolver)
+    // A policy reading names as libxmlsec1 does trims the transported name,
+    // so the padded association no longer matches; the trimmed one does.
+    let mut trimming = xml_sec::policy::DecryptionPolicy::default();
+    trimming.xml.key_names = xml_sec::policy::KeyNameSemantics::Libxmlsec1;
+    let fresh = || {
+        DerivedKeyDecryptor::content(
+            &method,
+            DerivedKeyInput::Secret(b"secret"),
+            DataEncryptionAlgorithm::Aes128Gcm,
+        )
+    };
+    let padded = fresh().master_key_name(" master ");
+    assert!(matches!(
+        DecryptContext::new(&padded)
             .provider(&provider)
+            .policy(trimming.clone())
+            .decrypt(&named),
+        Err(XmlEncError::KeyNotFound)
+    ));
+    assert_eq!(provider.calls.load(Ordering::Relaxed), 0);
+    let trimmed = fresh().master_key_name("master");
+    assert_eq!(
+        DecryptContext::new(&trimmed)
+            .provider(&provider)
+            .policy(trimming)
             .decrypt(&named)
             .unwrap()
             .output,
         xml_sec::xmlenc::DecryptedContent::Bytes(b"payload".to_vec())
     );
     assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        DecryptContext::new(&padded)
+            .provider(&provider)
+            .decrypt(&named)
+            .unwrap()
+            .output,
+        xml_sec::xmlenc::DecryptedContent::Bytes(b"payload".to_vec())
+    );
+    assert_eq!(provider.calls.load(Ordering::Relaxed), 2);
 }
 
 #[test]
@@ -1140,6 +1170,49 @@ fn kdf_reservations_are_atomic_and_cumulative_across_retries() {
     assert_eq!(budget.hash_blocks(), 0);
     assert_eq!(budget.owned_bytes(), 0);
     assert_eq!(provider.calls.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn a_resumed_allowance_counts_on_from_the_earlier_parts() {
+    // An operation run in parts (a compatibility layer deriving one key per
+    // call) carries its reservations from part to part: the second part is
+    // refused where a fresh allowance would admit it, so splitting an
+    // operation never multiplies its budget.
+    let provider = RecordingProvider::new();
+    let policy = KeyEstablishmentPolicy {
+        max_hash_blocks: 6,
+        max_owned_bytes: 32,
+        ..Default::default()
+    };
+    let mut first = KeyEstablishmentBudget::new(&policy).unwrap();
+    assert_eq!(
+        first
+            .derive_key(&provider, &parameters(), b"secret")
+            .unwrap()
+            .len(),
+        16
+    );
+    let usage = first.usage();
+    let mut second = KeyEstablishmentBudget::resume(&policy, usage).unwrap();
+    assert_eq!(second.hash_blocks(), 6);
+    assert_eq!(second.owned_bytes(), 16);
+    assert!(matches!(
+        second.derive_key(&provider, &parameters(), b"secret"),
+        Err(XmlEncError::Policy(
+            xml_sec::policy::PolicyViolation::ResourceLimit {
+                resource: "key establishment hash blocks",
+                maximum: 6,
+                actual: 12
+            }
+        ))
+    ));
+    assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+    let mut fresh = KeyEstablishmentBudget::new(&policy).unwrap();
+    assert!(
+        fresh
+            .derive_key(&provider, &parameters(), b"secret")
+            .is_ok()
+    );
 }
 
 #[test]

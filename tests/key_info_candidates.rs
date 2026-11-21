@@ -180,6 +180,40 @@ fn a_caller_key_leaves_key_info_unread_not_empty() {
 }
 
 #[test]
+fn a_key_name_is_read_as_the_policy_reads_key_names() {
+    // XMLDSig 1.1 section 4.5.1: white space is significant in KeyName, so
+    // the padded name finds the key stored under it, not the key named
+    // without it; a policy reading names as libxmlsec1 does trims it first.
+    use xml_sec::policy::KeyNameSemantics::{Libxmlsec1, Specification};
+    let document = signed_with(
+        &format!("<KeyInfo xmlns=\"{DS}\"><KeyName> signer </KeyName></KeyInfo>"),
+        "",
+    );
+    let verifies = |stored: &str, key_names| {
+        let mut inventory = xml_sec::key_manager::KeyInventory::default();
+        inventory
+            .add_public_pem(
+                stored,
+                include_bytes!("fixtures/keys/rsa/rsa-2048-pubkey.pem"),
+                &xml_sec::policy::ResourcePolicy::default(),
+            )
+            .unwrap();
+        let resolver = inventory.verification_resolver();
+        let mut policy = cryptographic_only();
+        policy.xml.key_names = key_names;
+        VerifyContext::new()
+            .policy(policy)
+            .key_resolver(&resolver)
+            .verify_document(&document)
+            .is_ok_and(|result| result.status == DsigStatus::Valid)
+    };
+    assert!(!verifies("signer", Specification));
+    assert!(verifies(" signer ", Specification));
+    assert!(verifies("signer", Libxmlsec1));
+    assert!(!verifies(" signer ", Libxmlsec1));
+}
+
+#[test]
 fn referenced_and_retrieved_same_document_material_keeps_its_element() {
     // A same-document KeyInfoReference and an X509Data RetrievalMethod read
     // elements of this document: each certificate names its own element.

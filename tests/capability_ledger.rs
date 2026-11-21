@@ -178,7 +178,7 @@ fn complete_surface_categories_are_stable() {
             ("header", 59),
             ("internal-export", 70),
             ("key-format", 11),
-            ("macro", 1_670),
+            ("macro", 1_668),
             ("registry", 15),
             ("struct-layout", 25),
             ("test-family", 29),
@@ -911,7 +911,7 @@ fn backend_source_tier_is_not_claimed() {
         .iter()
         .filter(|item| from_backend_header(item))
         .collect();
-    assert_eq!(backend_items.len(), 3_105);
+    assert_eq!(backend_items.len(), 3_103);
     for item in &backend_items {
         let expected = if item.classification == "backend-provider-transform-surface" {
             "provider-limited"

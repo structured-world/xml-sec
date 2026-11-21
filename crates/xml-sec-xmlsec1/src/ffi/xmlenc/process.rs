@@ -10,7 +10,8 @@ use std::ffi::c_int;
 
 use xml_sec::document::external::ExternalNode;
 use xml_sec::xmlenc::{
-    DataEncryptionAlgorithm, DecryptContext, DecryptedContent, SymmetricKeyDecryptor,
+    DataEncryptionAlgorithm, DecryptContext, DecryptedContent, DecryptionKeyResolver,
+    SymmetricKeyDecryptor,
 };
 use zeroize::Zeroizing;
 
@@ -39,8 +40,9 @@ use super::super::transforms::{
 };
 use super::super::tree::{XmlNode, c_text, give, nodes};
 use super::super::xmltree::{
-    replace_node_buffer_under, xmlSecAddIDs, xmlSecCheckNodeName, xmlSecGetNextElementNode,
-    xmlSecGetNodeContentAndTrim, xmlSecReplaceContentAndReturn, xmlSecReplaceNodeAndReturn,
+    key_name_content, replace_node_buffer_under, xmlSecAddIDs, xmlSecCheckNodeName,
+    xmlSecGetNextElementNode, xmlSecGetNodeContentAndTrim, xmlSecReplaceContentAndReturn,
+    xmlSecReplaceNodeAndReturn,
 };
 use super::{
     FAILURE_KEY_NOT_FOUND, FAILURE_UNKNOWN, FLAGS_RETURN_REPLACED_NODE, MODE_ENCRYPTED_DATA,
@@ -61,7 +63,7 @@ macro_rules! name {
 ///
 /// # Safety
 /// `node` is null or a live node.
-unsafe fn is(node: *mut XmlNode, name: *const u8, ns: *const u8) -> bool {
+pub(super) unsafe fn is(node: *mut XmlNode, name: *const u8, ns: *const u8) -> bool {
     // SAFETY: by the caller's contract.
     !node.is_null() && unsafe { xmlSecCheckNodeName(node, name, ns) } != 0
 }
@@ -70,7 +72,7 @@ unsafe fn is(node: *mut XmlNode, name: *const u8, ns: *const u8) -> bool {
 ///
 /// # Safety
 /// `node` is a live node.
-unsafe fn first_element(node: *mut XmlNode) -> *mut XmlNode {
+pub(super) unsafe fn first_element(node: *mut XmlNode) -> *mut XmlNode {
     // SAFETY: by the caller's contract.
     unsafe { xmlSecGetNextElementNode(xsNodeGetChildren(node)) }
 }
@@ -79,7 +81,7 @@ unsafe fn first_element(node: *mut XmlNode) -> *mut XmlNode {
 ///
 /// # Safety
 /// `node` is a live node.
-unsafe fn next_element(node: *mut XmlNode) -> *mut XmlNode {
+pub(super) unsafe fn next_element(node: *mut XmlNode) -> *mut XmlNode {
     // SAFETY: by the caller's contract.
     unsafe { xmlSecGetNextElementNode(nodes::next(node)) }
 }
@@ -94,7 +96,7 @@ fn attribute(node: *mut XmlNode, name: &str) -> *mut u8 {
 ///
 /// # Safety
 /// `node` is a live node.
-unsafe fn add_ids(node: *mut XmlNode) {
+pub(super) unsafe fn add_ids(node: *mut XmlNode) {
     let ids = [name!(xmlSecAttrId), std::ptr::null()];
     // SAFETY: a live node of its document and a null-terminated list.
     unsafe { xmlSecAddIDs(xsNodeGetDoc(node), node, ids.as_ptr()) };
@@ -1133,7 +1135,11 @@ unsafe fn read_enc_data(ctx: &mut XmlSecEncCtx, node: *mut XmlNode, add_base64: 
                 cur = next_element(cur);
             }
             if is(cur, name!(xmlSecNodeCarriedKeyName), enc_ns) {
-                ctx.carried_key_name = xmlSecGetNodeContentAndTrim(cur);
+                let Some(pinned) = run_policy(&raw mut ctx.transform_ctx, here) else {
+                    return -1;
+                };
+                let side = operation_side(ctx.operation).unwrap_or(Side::Decrypt);
+                ctx.carried_key_name = key_name_content(cur, pinned.of(side).key_names());
                 if ctx.carried_key_name.is_null() {
                     errors::invalid_node_content(here, cur, std::ptr::null(), "empty");
                     return -1;
@@ -1146,6 +1152,48 @@ unsafe fn read_enc_data(ctx: &mut XmlSecEncCtx, node: *mut XmlNode, add_base64: 
             return -1;
         }
         read_method_and_key(ctx, add_base64)
+    }
+}
+
+/// Reads the context's key through its read `KeyInfo` context unless the
+/// caller set one: under the revision the operation runs under, the one its
+/// chain and its core decryption use, counting on from what the operation
+/// spent; `false` after a report at `here`.
+///
+/// # Safety
+/// The context's element nodes were read and its method set.
+unsafe fn read_key(ctx: &mut XmlSecEncCtx, here: errors::Here) -> bool {
+    // SAFETY: the context's nodes and its own members.
+    unsafe {
+        let transforms = &raw mut ctx.transform_ctx;
+        let read = &raw mut ctx.key_info_read_ctx;
+        // Only the read below names a DerivedKey the key was derived by.
+        super::derived_key::forget_derivation(read);
+        if !ctx.enc_key.is_null() {
+            return true;
+        }
+        let Some(pinned) = run_policy(transforms, here) else {
+            return false;
+        };
+        let side = operation_side(ctx.operation).unwrap_or(Side::Decrypt);
+        let _read_pin = SlotPin::hold_pinned(
+            &raw mut (*read).reserved0,
+            pinned.clone(),
+            run_spent(transforms),
+            run_budget(transforms)
+                .key_candidates
+                .within(pinned.of(side).resources().max_key_candidates),
+        );
+        let mngr = (*read).keys_mngr;
+        if let Some(get_key) = mngr.as_ref().and_then(|mngr| mngr.get_key) {
+            ctx.enc_key = get_key(ctx.key_info_node, read);
+        }
+        charge_key_info(
+            transforms,
+            (*read).reserved0,
+            pinned.of(side).resources(),
+            here,
+        )
     }
 }
 
@@ -1205,34 +1253,8 @@ unsafe fn read_method_and_key(ctx: &mut XmlSecEncCtx, add_base64: bool) -> c_int
             return -1;
         }
         let read = &raw mut ctx.key_info_read_ctx;
-        if ctx.enc_key.is_null() {
-            // The key is read under the revision the operation runs under,
-            // the one its chain and its core decryption use, counting on from
-            // what the operation spent.
-            let Some(pinned) = run_policy(transforms, here) else {
-                return -1;
-            };
-            let side = operation_side(ctx.operation).unwrap_or(Side::Decrypt);
-            let _read_pin = SlotPin::hold_pinned(
-                &raw mut (*read).reserved0,
-                pinned.clone(),
-                run_spent(transforms),
-                run_budget(transforms)
-                    .key_candidates
-                    .within(pinned.of(side).resources().max_key_candidates),
-            );
-            let mngr = ctx.key_info_read_ctx.keys_mngr;
-            if let Some(get_key) = mngr.as_ref().and_then(|mngr| mngr.get_key) {
-                ctx.enc_key = get_key(ctx.key_info_node, read);
-            }
-            if !charge_key_info(
-                transforms,
-                (*read).reserved0,
-                pinned.of(side).resources(),
-                here,
-            ) {
-                return -1;
-            }
+        if !read_key(ctx, here) {
+            return -1;
         }
         if ctx.enc_key.is_null()
             || xmlSecKeyMatch(ctx.enc_key, std::ptr::null(), &raw mut (*read).key_req) == 0
@@ -1572,6 +1594,114 @@ unsafe fn settle_decryption(
     decrypted.map(|(audited, _)| audited)
 }
 
+/// Whether the context's key holds the octets `derivation` yielded.
+///
+/// # Safety
+/// The context's key is set.
+unsafe fn holds_derived(ctx: &XmlSecEncCtx, derivation: &super::derived_key::Derivation) -> bool {
+    // SAFETY: the key's value outlives the call.
+    unsafe {
+        let buffer = xmlSecKeyDataBinaryValueGetBuffer(xmlSecKeyGetValue(ctx.enc_key));
+        let data = xmlSecBufferGetData(buffer);
+        !data.is_null()
+            && derivation.yielded(std::slice::from_raw_parts(
+                data,
+                xmlSecBufferGetSize(buffer),
+            ))
+    }
+}
+
+/// The content key the context's key gives the core, offered once, for the
+/// source of the element's `KeyInfo` it came from.
+///
+/// The `KeyInfo` read is this library's, as libxmlsec1's is its own: it
+/// took the key from the first child that yields one, a `DerivedKey`
+/// derived by its klass under the library policy included (as an
+/// `EncryptedKey` recovered by its nested context is). A derived key is
+/// offered for its `DerivedKey` alone, so the core holds it to that
+/// element's `ReferenceList` and repeats no derivation; any other key, the
+/// caller's own included, is offered only where the core takes a key
+/// directly, so it never stands for a derivation or an agreement the
+/// `KeyInfo` declares.
+struct KeyInfoKey {
+    key: SymmetricKeyDecryptor,
+    derived: Option<xml_sec::xmlenc::DerivedKey>,
+    offered: std::cell::Cell<bool>,
+}
+
+impl KeyInfoKey {
+    fn new(key: SymmetricKeyDecryptor, derived: Option<xml_sec::xmlenc::DerivedKey>) -> Self {
+        Self {
+            key,
+            derived,
+            offered: std::cell::Cell::new(false),
+        }
+    }
+
+    /// The key as the one candidate of the operation; later asks find none.
+    fn offer(
+        &self,
+        provider: &dyn xml_sec::provider::CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        policy: &xml_sec::policy::DecryptionPolicy,
+        budget: &mut xml_sec::xmlenc::KeyCandidateBudget,
+    ) -> Result<Vec<xml_sec::provider::RecoveredContentKey>, xml_sec::xmlenc::XmlEncError> {
+        if self.offered.replace(true) {
+            return Err(xml_sec::xmlenc::XmlEncError::KeyNotFound);
+        }
+        self.key
+            .resolve_content_keys_with_policy(provider, algorithm, None, policy, budget)
+    }
+}
+
+impl xml_sec::xmlenc::DecryptionKeyResolver for KeyInfoKey {
+    fn consults_encrypted_keys(&self) -> bool {
+        false
+    }
+
+    fn resolve_content_keys_with_policy(
+        &self,
+        provider: &dyn xml_sec::provider::CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        encrypted_key: Option<&xml_sec::xmlenc::EncryptedKey>,
+        policy: &xml_sec::policy::DecryptionPolicy,
+        budget: &mut xml_sec::xmlenc::KeyCandidateBudget,
+    ) -> Result<Vec<xml_sec::provider::RecoveredContentKey>, xml_sec::xmlenc::XmlEncError> {
+        if encrypted_key.is_some() || self.derived.is_some() {
+            return Err(xml_sec::xmlenc::XmlEncError::KeyNotFound);
+        }
+        self.offer(provider, algorithm, policy, budget)
+    }
+
+    fn resolve_derived_content_keys_with_policy(
+        &self,
+        provider: &dyn xml_sec::provider::CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        descriptor: &xml_sec::xmlenc::DerivedKey,
+        policy: &xml_sec::policy::DecryptionPolicy,
+        budget: &mut xml_sec::xmlenc::KeyCandidateBudget,
+    ) -> Result<Vec<xml_sec::provider::RecoveredContentKey>, xml_sec::xmlenc::XmlEncError> {
+        // An element equal to the one derived from, ReferenceList included,
+        // derives the same key for the same data.
+        if self.derived.as_ref() != Some(descriptor) {
+            return Err(xml_sec::xmlenc::XmlEncError::KeyNotFound);
+        }
+        self.offer(provider, algorithm, policy, budget)
+    }
+
+    fn resolve_key(
+        &self,
+        provider: &dyn xml_sec::provider::CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        _encrypted_key: Option<&xml_sec::xmlenc::EncryptedKey>,
+    ) -> Result<Vec<u8>, xml_sec::xmlenc::XmlEncError> {
+        if self.derived.is_some() {
+            return Err(xml_sec::xmlenc::XmlEncError::KeyNotFound);
+        }
+        self.key.resolve_key(provider, algorithm, None)
+    }
+}
+
 /// Runs the core decryption of the `EncryptedData` element `node` and makes
 /// the plaintext the context's result, a buffer of its method.
 ///
@@ -1637,7 +1767,16 @@ unsafe fn run_decryption(ctx: &mut XmlSecEncCtx, node: *mut XmlNode) -> *mut Xml
             return std::ptr::null_mut();
         }
     };
-    let resolver = SymmetricKeyDecryptor::with_kind(key.to_vec(), algorithm.key_kind());
+    // SAFETY: the context's read KeyInfo context.
+    let derivation = unsafe { super::derived_key::take_derivation(&raw mut ctx.key_info_read_ctx) };
+    // SAFETY: the context's key was read.
+    let derived = derivation
+        .filter(|derivation| unsafe { holds_derived(ctx, derivation) })
+        .map(|derivation| derivation.descriptor);
+    let resolver = KeyInfoKey::new(
+        SymmetricKeyDecryptor::with_kind(key.to_vec(), algorithm.key_kind()),
+        derived,
+    );
     let mut context = DecryptContext::new(&resolver)
         .shared_policy(policy)
         .external_resources(&resources.by_key);

@@ -127,7 +127,7 @@ struct Terms<'a> {
 ///
 /// # Safety
 /// `ctx` is a context whose slot is null or a pin.
-unsafe fn read_side(ctx: *const XmlSecKeyInfoCtx) -> policy::Side {
+pub(super) unsafe fn read_side(ctx: *const XmlSecKeyInfoCtx) -> policy::Side {
     // SAFETY: by the caller's contract.
     let (operation, served) = unsafe {
         (

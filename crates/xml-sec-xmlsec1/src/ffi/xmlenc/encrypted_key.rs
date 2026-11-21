@@ -37,7 +37,7 @@ use super::{
 };
 
 /// `XMLSEC_KEYINFO_FLAGS_ENCKEY_STOP_ON_FAILED_DECRYPTION`.
-const FLAGS_ENCKEY_STOP_ON_FAILED_DECRYPTION: c_uint = 0x0000_1000;
+pub(super) const FLAGS_ENCKEY_STOP_ON_FAILED_DECRYPTION: c_uint = 0x0000_1000;
 /// `XMLSEC_ERRORS_R_MAX_ENCKEY_LEVEL`.
 const R_MAX_ENCKEY_LEVEL: c_int = 61;
 /// `xmlSecKeyDataTypeAny`.
@@ -352,7 +352,7 @@ macro_rules! method_arguments {
 ///
 /// # Safety
 /// `ctx` is an initialized context; `id` a klass.
-unsafe fn level_allowed(
+pub(super) unsafe fn level_allowed(
     ctx: *mut XmlSecKeyInfoCtx,
     id: *const XmlSecKeyDataKlass,
     here: errors::Here,
@@ -388,7 +388,7 @@ unsafe fn level_allowed(
 ///
 /// # Safety
 /// `ctx` is an initialized context; `id` a klass.
-unsafe fn level_open(
+pub(super) unsafe fn level_open(
     ctx: *mut XmlSecKeyInfoCtx,
     id: *const XmlSecKeyDataKlass,
     here: errors::Here,
