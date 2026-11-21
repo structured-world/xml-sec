@@ -1874,7 +1874,7 @@ impl KeyInventory {
         }
         self.check_material_capacity(named_material_length(&name, der.len(), 2)?, resources)?;
         #[cfg(feature = "xmlenc")]
-        match agreement_spki(&der) {
+        match agreement_spki(session, &der)? {
             Some(true) => return self.add_agreement_public_key(name, der, usages, resources),
             Some(false) => {
                 return Err(KeyStoreError::Selection("invalid key agreement public key"));
@@ -3093,24 +3093,27 @@ fn is_encapsulation_spki(
 /// id-X25519 or id-X448 with absent parameters and the raw u-coordinate of
 /// the curve's width (RFC 8410 section 4), or X9.42 DH with its domain
 /// parameters and INTEGER public value (RFC 3279 section 2.3.3). `None` for
-/// any other DER.
+/// any other DER; the shared reader pays from the import account.
 #[cfg(feature = "xmlenc")]
-fn agreement_spki(der: &[u8]) -> Option<bool> {
-    if let Some(value) = crate::xmldsig::keys::dh_key_value_from_spki_der(der) {
-        return Some(value.is_ok());
-    }
-    let spki = pkcs8::SubjectPublicKeyInfoRef::from_der(der).ok()?;
-    let width = if spki.algorithm.oid == der::asn1::ObjectIdentifier::new_unwrap("1.3.101.110") {
-        32
-    } else if spki.algorithm.oid == der::asn1::ObjectIdentifier::new_unwrap("1.3.101.111") {
-        56
-    } else {
-        return None;
+fn agreement_spki(
+    session: &crate::xmldsig::pkix::CertificateSession,
+    der: &[u8],
+) -> Result<Option<bool>, KeyStoreError> {
+    use crate::xmldsig::pkix::SpkiAlgorithm;
+    let resource = |error: structured_pkix::Error| certificate_import_error(session.error(error));
+    let valid = match session.spki_algorithm(der) {
+        Ok(SpkiAlgorithm::X25519 | SpkiAlgorithm::X448) => {
+            session.rfc8410_public_key(der).map_err(resource)?.is_some()
+        }
+        Ok(SpkiAlgorithm::Dh) => match session.read_dh_public_key(der) {
+            Ok(key) => crate::xmldsig::keys::dh_key_value(&key).is_ok(),
+            Err(error) if error.is_resource() => return Err(resource(error)),
+            Err(_) => false,
+        },
+        Err(error) if error.is_resource() => return Err(resource(error)),
+        Ok(_) | Err(_) => return Ok(None),
     };
-    Some(
-        spki.algorithm.parameters.is_none()
-            && spki.subject_public_key.as_bytes().map(<[u8]>::len) == Some(width),
-    )
+    Ok(Some(valid))
 }
 
 fn certificate_import_error(error: crate::xmldsig::X509ChainError) -> KeyStoreError {
@@ -3396,7 +3399,7 @@ impl<'a> PrivateKeyIdentity<'a> {
         algorithm: pkcs8::AlgorithmIdentifierRef<'a>,
         der: &[u8],
     ) -> Option<Result<Self, KeyStoreError>> {
-        if algorithm.oid == crate::xmldsig::keys::DH_PUBLIC_NUMBER {
+        if algorithm.oid.as_bytes() == structured_pkix::key::dh::IDENTIFIER.as_bytes() {
             return Some(
                 crate::provider::dh_pkcs8_public_value(der)
                     .map(|public| Self::Dh { algorithm, public })

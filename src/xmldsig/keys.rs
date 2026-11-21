@@ -2341,11 +2341,6 @@ fn dsa_key_value_to_spki_der(
     )
 }
 
-/// `dhpublicnumber`, the X9.42 Diffie-Hellman key algorithm (RFC 3279
-/// section 2.3.3).
-pub(crate) const DH_PUBLIC_NUMBER: pkcs8::der::asn1::ObjectIdentifier =
-    pkcs8::der::asn1::ObjectIdentifier::new_unwrap("1.2.840.10046.2.1");
-
 /// The unsigned magnitude of a DH component, nonzero and within the DH
 /// modulus safety ceiling.
 fn dh_component(bytes: &[u8]) -> Result<pkcs8::der::asn1::UintRef<'_>, KeyResolutionError> {
@@ -2358,25 +2353,6 @@ fn dh_component(bytes: &[u8]) -> Result<pkcs8::der::asn1::UintRef<'_>, KeyResolu
     pkcs8::der::asn1::UintRef::new(magnitude).map_err(|_| KeyResolutionError::InvalidPublicKey)
 }
 
-/// The p, g and q of X9.42 `DomainParameters` (RFC 3279 section 2.3.3); the
-/// optional j and validationParms are read and not used.
-pub(crate) fn x942_domain(parameters: Option<pkcs8::der::asn1::AnyRef<'_>>) -> Option<[&[u8]; 3]> {
-    use pkcs8::der::{
-        Reader as _,
-        asn1::{AnyRef, UintRef},
-    };
-    parameters?
-        .sequence(|reader| {
-            let p: UintRef<'_> = reader.decode()?;
-            let g: UintRef<'_> = reader.decode()?;
-            let q: UintRef<'_> = reader.decode()?;
-            let _j: Option<UintRef<'_>> = reader.decode()?;
-            let _validation: Option<AnyRef<'_>> = reader.decode()?;
-            Ok::<_, pkcs8::der::Error>([p.as_bytes(), g.as_bytes(), q.as_bytes()])
-        })
-        .ok()
-}
-
 /// The dhpublicnumber SPKI of `DHKeyValue` components: X9.42
 /// `DomainParameters` (p, g, q) as parameters and the INTEGER public value
 /// as key bits (RFC 3279 section 2.3.3). Whether they form a valid group is
@@ -2387,7 +2363,10 @@ fn dh_key_value_to_spki_der(
     generator: &[u8],
     public: &[u8],
 ) -> Result<Vec<u8>, KeyResolutionError> {
-    use pkcs8::der::{Encode as _, asn1::AnyRef};
+    use pkcs8::der::{
+        Encode as _,
+        asn1::{AnyRef, ObjectIdentifier},
+    };
     let invalid = |_| KeyResolutionError::InvalidPublicKey;
     // DomainParameters ::= SEQUENCE { p, g, q, ... } encodes as the
     // SEQUENCE OF its three INTEGERs.
@@ -2397,42 +2376,31 @@ fn dh_key_value_to_spki_der(
     let key = dh_component(public)?.to_der().map_err(invalid)?;
     spki_der(
         pkcs8::spki::AlgorithmIdentifierRef {
-            oid: DH_PUBLIC_NUMBER,
+            oid: ObjectIdentifier::from_bytes(structured_pkix::key::dh::IDENTIFIER.as_bytes())
+                .map_err(|_| KeyResolutionError::InvalidPublicKey)?,
             parameters: Some(AnyRef::try_from(parameters.as_slice()).map_err(invalid)?),
         },
         &key,
     )
 }
 
-/// The `DHKeyValue` of a dhpublicnumber SPKI (RFC 3279 section 2.3.3);
-/// `None` for an SPKI of another algorithm.
-pub(crate) fn dh_key_value_from_spki_der(
-    spki_der: &[u8],
-) -> Option<Result<KeyValueInfo, KeyResolutionError>> {
-    use pkcs8::der::{Decode as _, asn1::UintRef};
-    let spki = pkcs8::SubjectPublicKeyInfoRef::from_der(spki_der).ok()?;
-    if spki.algorithm.oid != DH_PUBLIC_NUMBER {
-        return None;
-    }
-    let decode = || {
-        let [p, generator, q] =
-            x942_domain(spki.algorithm.parameters).ok_or(KeyResolutionError::InvalidPublicKey)?;
-        let public = spki
-            .subject_public_key
-            .as_bytes()
-            .and_then(|bits| UintRef::from_der(bits).ok())
-            .ok_or(KeyResolutionError::InvalidPublicKey)?;
-        let [p, q, generator, public] = [p, q, generator, public.as_bytes()].map(dh_component);
-        Ok(KeyValueInfo::Dh {
-            p: Some(p?.as_bytes().to_vec()),
-            q: Some(q?.as_bytes().to_vec()),
-            generator: Some(generator?.as_bytes().to_vec()),
-            public: public?.as_bytes().to_vec(),
-            seed: None,
-            pgen_counter: None,
-        })
-    };
-    Some(decode())
+/// The `DHKeyValue` of a dhpublicnumber key read by the shared X.509
+/// reader (RFC 3279 section 2.3.3), each component nonzero and within the
+/// DH modulus safety ceiling; the group is the agreement's to validate.
+pub(crate) fn dh_key_value(
+    key: &structured_pkix::key::dh::PublicKey<'_>,
+) -> Result<KeyValueInfo, KeyResolutionError> {
+    let parameters = key.parameters();
+    let [p, q, generator, public] = [parameters.p(), parameters.q(), parameters.g(), key.y()]
+        .map(|component| dh_component(component.as_bytes()).map(|value| value.as_bytes().to_vec()));
+    Ok(KeyValueInfo::Dh {
+        p: Some(p?),
+        q: Some(q?),
+        generator: Some(generator?),
+        public: public?,
+        seed: None,
+        pgen_counter: None,
+    })
 }
 
 /// The id-ecPublicKey SPKI of an `ECKeyValue`: the named curve as parameters
@@ -2573,7 +2541,13 @@ pub(crate) fn supported_spki_is_rsa(
             validate_ec_spki_point(session, public_key_bytes)?;
             return Ok(false);
         }
-        SpkiAlgorithm::RsaPss | SpkiAlgorithm::Other => {
+        // Agreement-only keys (RFC 3279 section 2.3.3, RFC 8410 section 3)
+        // verify no signature.
+        SpkiAlgorithm::RsaPss
+        | SpkiAlgorithm::Dh
+        | SpkiAlgorithm::X25519
+        | SpkiAlgorithm::X448
+        | SpkiAlgorithm::Other => {
             return Err(KeyResolutionError::AlgorithmMismatch);
         }
     };
@@ -2745,8 +2719,7 @@ impl KeyValueInfo {
 
     /// The key value of an `rsaEncryption`, DSA, named-curve EC or X9.42 DH
     /// (`dhpublicnumber`) `SubjectPublicKeyInfo`, read within the X.509 work
-    /// and workspace budgets of `resources`; a DH key, decoded beside them,
-    /// is bounded by its own encoding.
+    /// and workspace budgets of `resources`.
     ///
     /// # Errors
     /// [`KeyResolutionError::InvalidPublicKey`] for another key family, a
@@ -2759,9 +2732,6 @@ impl KeyValueInfo {
         resources: &crate::policy::ResourcePolicy,
     ) -> Result<Self, KeyResolutionError> {
         use super::pkix::{PublicKey, SpkiAlgorithm};
-        if let Some(value) = dh_key_value_from_spki_der(spki_der) {
-            return value;
-        }
         let session = super::pkix::CertificateSession::new(resources);
         let algorithm = session
             .spki_algorithm(spki_der)
@@ -2829,6 +2799,11 @@ impl KeyValueInfo {
                     y,
                 })
             }
+            SpkiAlgorithm::Dh => dh_key_value(
+                &session
+                    .read_dh_public_key(spki_der)
+                    .map_err(|error| structured_key_error(&session, error))?,
+            ),
             _ => Err(KeyResolutionError::InvalidPublicKey),
         }
     }

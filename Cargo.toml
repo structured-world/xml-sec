@@ -368,9 +368,9 @@ ripemd = { version = "0.2.0", default-features = false, features = ["oid", "zero
 # X.509 certificates, the seeded hashing of every table keyed by document
 # content, and the incremental HMAC of the HMAC signature methods.
 structured-asn1 = { version = "0.23", default-features = false, features = ["alloc"] }
-structured-pkix = { version = "0.23", default-features = false, features = ["alloc"], optional = true }
+structured-pkix = { version = "0.23.2", default-features = false, features = ["alloc"], optional = true }
 # PKCS#12 containers and their password engine, OpenSSL traditional private keys.
-structured-cms = { version = "0.23", default-features = false, features = ["alloc"], optional = true }
+structured-cms = { version = "0.23.2", default-features = false, features = ["alloc"], optional = true }
 tinyvec = { version = "1.13", optional = true }
 # `pem` is RFC 7468 decoding of caller key and certificate text.
 der = { version = "0.8", default-features = false, features = ["alloc", "pem"], optional = true }

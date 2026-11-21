@@ -148,8 +148,9 @@ impl RustCryptoDhKey {
         budget: &mut KeyEstablishmentBudget<'_>,
         der: &[u8],
     ) -> Result<Self, XmlEncError> {
-        let key = pkcs8_components(der)?;
-        Self::from_components(provider, budget, key.p, key.q, key.generator, key.private)
+        with_pkcs8_components(der, |key| {
+            Self::from_components(provider, budget, key.p, key.q, key.generator, key.private)
+        })
     }
 
     /// Export the public value with the same fixed octet width as p.
@@ -220,23 +221,37 @@ struct Components<'a> {
     private: &'a [u8],
 }
 
-/// The components of an X9.42 DH PKCS#8 private key (RFC 3279 section
-/// 2.3.3: `DomainParameters` as the algorithm parameters, the INTEGER x as
-/// the private key).
-fn pkcs8_components(der: &[u8]) -> Result<Components<'_>, ProviderError> {
-    use der::{Decode as _, asn1::UintRef};
-    let info = pkcs8::PrivateKeyInfoRef::try_from(der).map_err(|_| invalid())?;
-    if info.algorithm.oid != crate::xmldsig::keys::DH_PUBLIC_NUMBER {
-        return Err(invalid());
+/// Visit the components of the single DER X9.42 DH PKCS#8 private key `der`
+/// (RFC 3279 section 2.3.3: `DomainParameters` as the algorithm parameters,
+/// the INTEGER x as the private key), read by the shared PKCS#8 reader under
+/// the standalone resource account a key constructor uses.
+fn with_pkcs8_components<R, E: From<ProviderError>>(
+    der: &[u8],
+    visit: impl FnOnce(Components<'_>) -> Result<R, E>,
+) -> Result<R, E> {
+    use structured_cms::personal::{Cause, PrivateKey, Source};
+    let parser = crate::xmldsig::pkix::CertificateSession::standalone().into_parser();
+    let mut reader = parser.read(der, 0).map_err(|_| invalid())?;
+    let element = reader
+        .next_element()
+        .map_err(|_| invalid())?
+        .ok_or_else(invalid)?;
+    if !reader.is_empty() {
+        return Err(invalid().into());
     }
-    let [p, generator, q] =
-        crate::xmldsig::keys::x942_domain(info.algorithm.parameters).ok_or_else(invalid)?;
-    let private = UintRef::from_der(info.private_key.as_bytes()).map_err(|_| invalid())?;
-    Ok(Components {
-        p,
-        q,
-        generator,
-        private: private.as_bytes(),
+    let key = PrivateKey::read(&reader, &element).map_err(|_| invalid())?;
+    key.with_dh(&reader, &Source::Document, |key, _| {
+        let parameters = key.parameters();
+        visit(Components {
+            p: parameters.p().as_bytes(),
+            q: parameters.q().as_bytes(),
+            generator: parameters.g().as_bytes(),
+            private: key.x().as_bytes(),
+        })
+    })
+    .map_err(|failure| match failure.cause {
+        Cause::Callback(error) => error,
+        Cause::Processing(_) => invalid().into(),
     })
 }
 
@@ -246,12 +261,17 @@ fn pkcs8_components(der: &[u8]) -> Result<Components<'_>, ProviderError> {
 /// (primality, subgroup order) and its strength is the agreement's, under the
 /// operation's policy.
 pub(crate) fn pkcs8_public_value(der: &[u8]) -> Result<Vec<u8>, ProviderError> {
-    let Components {
+    with_pkcs8_components(der, public_value)
+}
+
+fn public_value(
+    Components {
         p,
         q,
         generator,
         private,
-    } = pkcs8_components(der)?;
+    }: Components<'_>,
+) -> Result<Vec<u8>, ProviderError> {
     let ceiling = crate::hard_limits::DH_MODULUS_BIT_CEILING / 8;
     let p = significant(p);
     if p.is_empty()
