@@ -34,6 +34,7 @@ use super::encrypted_key::{
     FLAGS_ENCKEY_STOP_ON_FAILED_DECRYPTION, level_allowed, level_open, map_operation,
     within_key_info, xmlSecKeyInfoCtxCreateEncCtx,
 };
+use super::key_source::{self, Descriptor};
 use super::process::add_ids;
 
 /// libxmlsec1's assertions of the two `xmlSecEncCtxAgreementMethod*`
@@ -301,12 +302,16 @@ pub(crate) unsafe extern "C" fn xml_read(
                 xmlSecKeyDestroy(generated);
                 return 0;
             }
+            let source = key_source::of(ctx, node, generated, Descriptor::agreement);
             let copied = xmlSecKeyCopy(key, generated);
             xmlSecKeyDestroy(generated);
             if copied < 0 {
                 errors::internal(here, name, c"xmlSecKeyCopy");
                 return -1;
             }
+            // The decryption reading with this key takes it for this
+            // AgreementMethod alone.
+            key_source::record(ctx, source);
             // The parties' keys go with the key, so writing it reuses them.
             let parties =
                 xmlSecTransformCtxExtraKeyDataGet(&raw mut (*enc).transform_ctx, kam_klass_id());

@@ -709,6 +709,56 @@ static void dh_agreement_round_trip(void) {
     xsFreeDoc(doc);
 }
 
+/* An AES-128-GCM EncryptedData whose content key the AgreementMethod of
+ * its own KeyInfo agrees on, no EncryptedKey between them. */
+static const char direct_agreement_template[] =
+    "<xenc:EncryptedData xmlns:xenc=\"http://www.w3.org/2001/04/xmlenc#\""
+    " Type=\"http://www.w3.org/2001/04/xmlenc#Element\">"
+    "<xenc:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/>"
+    "<dsig:KeyInfo xmlns:dsig=\"http://www.w3.org/2000/09/xmldsig#\">"
+    "<xenc:AgreementMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#ECDH-ES\">"
+    "<xenc11:KeyDerivationMethod xmlns:xenc11=\"http://www.w3.org/2009/xmlenc11#\""
+    " Algorithm=\"http://www.w3.org/2009/xmlenc11#ConcatKDF\">"
+    "<xenc11:ConcatKDFParams AlgorithmID=\"00123456\" PartyUInfo=\"00123456\" PartyVInfo=\"00123456\">"
+    "<dsig:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>"
+    "</xenc11:ConcatKDFParams></xenc11:KeyDerivationMethod>"
+    "<xenc:OriginatorKeyInfo><dsig:KeyName>originator-key-name</dsig:KeyName></xenc:OriginatorKeyInfo>"
+    "<xenc:RecipientKeyInfo><dsig:KeyName>recipient-key-name</dsig:KeyName></xenc:RecipientKeyInfo>"
+    "</xenc:AgreementMethod></dsig:KeyInfo>"
+    "<xenc:CipherData><xenc:CipherValue/></xenc:CipherData></xenc:EncryptedData>";
+
+/* The direct agreement template encrypted by the originator, its content
+ * key found by its KeyInfo read, then decrypted by the recipient: with
+ * `wrong` set, the recipient holds a different originator key. */
+static void direct_agreement_round_trip(const char *label, int wrong) {
+    static const char bytes[] = "agreed content payload";
+    xmlDocPtr doc;
+    xmlSecEncCtxPtr ctx;
+    xmlSecKeysMngrPtr originator =
+        parties(EC_KEYS "ec-prime256v1-key.pem", "originator-key-name",
+                EC_KEYS "ec-prime256v1-second-pubkey.pem", "recipient-key-name");
+    xmlSecKeysMngrPtr recipient =
+        parties(EC_KEYS "ec-prime256v1-second-key.pem", "recipient-key-name",
+                wrong ? EC_KEYS "ec-prime256v1-second-pubkey.pem" : EC_KEYS "ec-prime256v1-pubkey.pem",
+                "originator-key-name");
+    printf("%s\n", label);
+    doc = xsReadMemory(direct_agreement_template, (int)strlen(direct_agreement_template),
+                       "template.xml", NULL, 0);
+    ctx = xmlSecEncCtxCreate(originator);
+    printf("  encrypt: %d\n", xmlSecEncCtxBinaryEncrypt(ctx, xsDocGetRootElement(doc),
+                                                        (const xmlSecByte *)bytes,
+                                                        sizeof(bytes) - 1));
+    xmlSecEncCtxDestroy(ctx);
+    if (wrong) {
+        quiet = 1;
+    }
+    decrypt_agreed(doc, recipient, (const xmlSecByte *)bytes, sizeof(bytes) - 1);
+    quiet = 0;
+    xmlSecKeysMngrDestroy(recipient);
+    xmlSecKeysMngrDestroy(originator);
+    xsFreeDoc(doc);
+}
+
 int main(void) {
     xmlDocPtr doc;
     xmlSecEncCtxPtr ctx;
@@ -780,6 +830,8 @@ int main(void) {
                          "enc_ecdh_p256_concatkdf_sha256_kw_aes256_aes128gcm", 1);
     dh_agreement_vector();
     dh_agreement_round_trip();
+    direct_agreement_round_trip("agreement in the data KeyInfo", 0);
+    direct_agreement_round_trip("agreement in the data KeyInfo with another originator key", 1);
 
     /* No key: the keys manager has none. */
     key = aes_key(0x11);

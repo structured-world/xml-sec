@@ -694,6 +694,85 @@ fn a_dh_peer_of_another_group_is_no_party() {
     });
 }
 
+/// An AES-128-GCM `EncryptedData` whose content key the `AgreementMethod`
+/// of its own `KeyInfo` agrees on, with no `EncryptedKey` between them, the
+/// parties named as in [`TEMPLATE`].
+const DIRECT_TEMPLATE: &str = "<?xml version=\"1.0\"?>\
+<xenc:EncryptedData xmlns:xenc=\"http://www.w3.org/2001/04/xmlenc#\" \
+ Type=\"http://www.w3.org/2001/04/xmlenc#Element\">\
+<xenc:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/>\
+<dsig:KeyInfo xmlns:dsig=\"http://www.w3.org/2000/09/xmldsig#\">\
+<xenc:AgreementMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#ECDH-ES\">\
+<xenc11:KeyDerivationMethod xmlns:xenc11=\"http://www.w3.org/2009/xmlenc11#\" \
+ Algorithm=\"http://www.w3.org/2009/xmlenc11#ConcatKDF\">\
+<xenc11:ConcatKDFParams AlgorithmID=\"00123456\" PartyUInfo=\"00123456\" PartyVInfo=\"00123456\">\
+<dsig:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>\
+</xenc11:ConcatKDFParams></xenc11:KeyDerivationMethod>\
+<xenc:OriginatorKeyInfo><dsig:KeyName>originator-key-name</dsig:KeyName></xenc:OriginatorKeyInfo>\
+<xenc:RecipientKeyInfo><dsig:KeyName>recipient-key-name</dsig:KeyName></xenc:RecipientKeyInfo>\
+</xenc:AgreementMethod></dsig:KeyInfo>\
+<xenc:CipherData><xenc:CipherValue/></xenc:CipherData></xenc:EncryptedData>";
+
+/// Encrypts `plaintext` into `doc` with the content key the `KeyInfo` read
+/// with `mngr` finds, no session key given; whether it succeeded.
+///
+/// # Safety
+/// The library is initialized; `doc` and `mngr` are live.
+unsafe fn encrypt_with_key_info(
+    doc: *mut XmlDoc,
+    mngr: *mut XmlSecKeysMngr,
+    plaintext: &[u8],
+) -> bool {
+    // SAFETY: by the caller's contract; a context created and released here.
+    unsafe {
+        let ctx = xmlSecEncCtxCreate(mngr);
+        let done = xmlSecEncCtxBinaryEncrypt(
+            ctx,
+            xsDocGetRootElement(doc.cast()),
+            plaintext.as_ptr(),
+            plaintext.len(),
+        ) == 0;
+        xmlSecEncCtxDestroy(ctx);
+        done
+    }
+}
+
+#[test]
+fn an_agreement_in_the_data_key_info_yields_the_content_key() {
+    // XML Encryption 1.1 section 5.5: an AgreementMethod in an
+    // EncryptedData's KeyInfo agrees on the content key itself. The
+    // originator's KeyInfo read agrees on it, and the recipient's read
+    // yields the same key, which the core takes for that AgreementMethod; a
+    // recipient holding another originator key agrees on another key, which
+    // fails the cipher's authentication.
+    with_library(|| {
+        let plaintext = b"agreed content";
+        let decrypt_with = |recipient: &[(&[u8], &CStr)]| {
+            // SAFETY: the library is initialized; every object is released.
+            unsafe {
+                let doc = document(DIRECT_TEMPLATE);
+                let sender = originator();
+                assert!(
+                    encrypt_with_key_info(doc, sender, plaintext),
+                    "the originator encrypts"
+                );
+                let receiver = manager(recipient);
+                let result = decrypted(doc, receiver);
+                xmlSecKeysMngrDestroy(receiver);
+                xmlSecKeysMngrDestroy(sender);
+                xsFreeDoc(doc.cast());
+                result
+            }
+        };
+        assert_eq!(decrypt_with(&RECIPIENT).as_deref(), Some(&plaintext[..]));
+        let wrong = [
+            (RECIPIENT_KEY, c"recipient-key-name"),
+            (RECIPIENT_PUBLIC, c"originator-key-name"),
+        ];
+        assert_eq!(decrypt_with(&wrong), None);
+    });
+}
+
 #[test]
 fn a_concat_kdf_defaults_to_its_digest_width() {
     // A reader that expects no width gets the ConcatKDF digest's output, as

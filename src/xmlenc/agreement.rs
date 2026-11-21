@@ -31,6 +31,49 @@ pub struct AgreementMethod {
 }
 
 impl AgreementMethod {
+    /// Parse the `AgreementMethod` element `node` as a decryption under
+    /// `policy` reads the descriptors of an `EncryptedData`'s `KeyInfo`: each
+    /// value within its `max_encryption_metadata_bytes`, the role `KeyInfo`s
+    /// within its key-information allowance, names under its
+    /// [`crate::policy::KeyNameSemantics`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use xml_sec::Document;
+    /// use xml_sec::policy::{DecryptionPolicy, KeyAgreementAlgorithm};
+    /// use xml_sec::xmlenc::AgreementMethod;
+    ///
+    /// let xml = r#"<xenc:AgreementMethod xmlns:xenc="http://www.w3.org/2001/04/xmlenc#"
+    ///     xmlns:dsig="http://www.w3.org/2000/09/xmldsig#"
+    ///     Algorithm="http://www.w3.org/2009/xmlenc11#ECDH-ES">
+    ///   <xenc:RecipientKeyInfo><dsig:KeyName>recipient</dsig:KeyName></xenc:RecipientKeyInfo>
+    /// </xenc:AgreementMethod>"#;
+    /// let document = Document::parse(xml)?;
+    /// let method = AgreementMethod::from_element(document.root_element(), &DecryptionPolicy::default())?;
+    /// assert_eq!(method.algorithm, KeyAgreementAlgorithm::EcdhEs);
+    /// assert!(method.recipient.is_some() && method.originator.is_none());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// # Errors
+    /// Returns a node that is no `AgreementMethod`, an unknown algorithm, a
+    /// malformed or unordered child, or a value beyond the limits of `policy`.
+    pub fn from_element(
+        node: Node<'_, '_>,
+        policy: &crate::policy::DecryptionPolicy,
+    ) -> Result<Self, XmlEncError> {
+        let mut session = KeyInfoParsingSession::new(&policy.resources)
+            .map_err(map_key_info_error)?
+            .with_key_names(policy.xml.key_names);
+        parse(
+            node,
+            &policy.resources,
+            &mut session,
+            crate::provider::default_provider(),
+        )
+    }
+
     /// Establish a consuming key with explicitly bound private and peer keys.
     /// The caller validates party identities before invoking this method.
     ///
