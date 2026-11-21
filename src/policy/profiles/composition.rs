@@ -1,10 +1,10 @@
 use super::{PolicySet, PolicyValidity, SignatureConstraints, configuration};
 use crate::policy::{
     CertificateSignatureAlgorithms, DetachedDigestAttestation, DsaKeyPolicy, EmptyDigestInput,
-    HmacPolicy, KemContentAuthentication, KeyDerivationAlgorithm, KeyEstablishmentPolicy,
-    KeySourcePolicy, KeyTrustPolicy, ManifestProcessing, PolicyViolation, ResourcePolicy,
-    RsaKeyPolicy, RsaPssPermission, SigningPolicy, TimestampTokenEncoding, TransformPolicy,
-    UriPolicy, VerificationPolicy, VerificationTrustMode, XmlInputPolicy,
+    HmacPolicy, KemContentAuthentication, KemSignatureTrust, KeyDerivationAlgorithm,
+    KeyEstablishmentPolicy, KeySourcePolicy, KeyTrustPolicy, ManifestProcessing, PolicyViolation,
+    ResourcePolicy, RsaKeyPolicy, RsaPssPermission, SigningPolicy, TimestampTokenEncoding,
+    TransformPolicy, UriPolicy, VerificationPolicy, VerificationTrustMode, XmlInputPolicy,
 };
 #[cfg(feature = "xmlenc")]
 use crate::policy::{
@@ -314,6 +314,13 @@ fn key_establishment(
             KemContentAuthentication::RequireAuthenticatedCipher
         } else {
             KemContentAuthentication::ExternalAuthenticated
+        },
+        kem_signature_trust: if a.kem_signature_trust == KemSignatureTrust::RequireCryptographicOnly
+            || b.kem_signature_trust == KemSignatureTrust::RequireCryptographicOnly
+        {
+            KemSignatureTrust::RequireCryptographicOnly
+        } else {
+            KemSignatureTrust::AcceptRecipientKey
         },
         agreement_algorithms: algorithms(
             a.agreement_algorithms.as_ref(),

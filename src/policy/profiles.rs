@@ -8,11 +8,11 @@ use super::{
     KeyWrapAlgorithm, OaepDigestAlgorithm,
 };
 use super::{
-    DigestAlgorithm, KemContentAuthentication, KeyAgreementAlgorithm, KeyDerivationAlgorithm,
-    KeyEstablishmentPolicy, KeySourceKind, KeySourcePolicy, PolicyViolation, RequestSelections,
-    RsaPssPermission, SameDocumentIdSemantics, SignatureAlgorithm, SigningPolicy, TransformPolicy,
-    UnknownX509CertificateSemantics, UriPolicy, UriTypeSet, VerificationPolicy,
-    XsltStylesheetSemantics,
+    DigestAlgorithm, KemContentAuthentication, KemSignatureTrust, KeyAgreementAlgorithm,
+    KeyDerivationAlgorithm, KeyEstablishmentPolicy, KeySourceKind, KeySourcePolicy,
+    PolicyViolation, RequestSelections, RsaPssPermission, SameDocumentIdSemantics,
+    SignatureAlgorithm, SigningPolicy, TransformPolicy, UnknownX509CertificateSemantics, UriPolicy,
+    UriTypeSet, VerificationPolicy, XsltStylesheetSemantics,
 };
 use crate::provider::{CryptoProvider, KeyEncapsulationAlgorithm, ProviderCapability};
 use alloc::{borrow::ToOwned, collections::BTreeSet, string::String, sync::Arc};
@@ -626,9 +626,11 @@ const OAEP_MGF_DIGESTS: [OaepDigestAlgorithm; 5] = [
 /// provider can do: ECDH-ES, X25519 and X448 (RFC 7748) with `ConcatKDF`,
 /// HKDF or PBKDF2 over SHA-2 for every profile, and with `compatibility` also
 /// what libxmlsec1 agrees, derives and transports keys with: DH-ES, SHA-1 and
-/// SHA-3 digests, and ML-KEM key transport whose secret may key CBC content,
-/// as libxmlsec1 decrypts it. A restricting layer narrows any of the sets and
-/// can require an authenticated content cipher again.
+/// SHA-3 digests, and ML-KEM key transport whose secret may key CBC content
+/// or an HMAC signature a trusted-key verification takes, as libxmlsec1 uses
+/// it. A restricting layer narrows any of the sets and can require an
+/// authenticated content cipher, or a cryptographic-only verification for
+/// KEM/HMAC, again.
 fn key_establishment_profile(
     provider: &dyn CryptoProvider,
     compatibility: bool,
@@ -698,6 +700,11 @@ fn key_establishment_profile(
             KemContentAuthentication::ExternalAuthenticated
         } else {
             KemContentAuthentication::RequireAuthenticatedCipher
+        },
+        kem_signature_trust: if compatibility {
+            KemSignatureTrust::AcceptRecipientKey
+        } else {
+            KemSignatureTrust::RequireCryptographicOnly
         },
         ..KeyEstablishmentPolicy::default()
     }

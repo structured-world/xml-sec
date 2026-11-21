@@ -482,6 +482,7 @@ pub enum SignatureSelection<'a> {
 pub struct VerifyContext<'a> {
     utc_facts: Option<structured_pkix::temporal::LeapTable<'a>>,
     decapsulation_key: Option<&'a dyn crate::provider::KeyDecapsulationKey>,
+    established_encapsulation: Option<crate::key_establishment::EstablishedEncapsulation<'a>>,
     key: Option<&'a dyn VerifyingKey>,
     key_resolver: Option<&'a dyn KeyResolver>,
     // Shared with the compiled snapshot it came from; copied only when a
@@ -509,6 +510,7 @@ impl<'a> VerifyContext<'a> {
         Self {
             utc_facts: None,
             decapsulation_key: None,
+            established_encapsulation: None,
             key: None,
             key_resolver: None,
             policy: Arc::new(crate::policy::VerificationPolicy::default()),
@@ -546,6 +548,24 @@ impl<'a> VerifyContext<'a> {
     pub fn decapsulation_key(mut self, key: &'a dyn crate::provider::KeyDecapsulationKey) -> Self {
         self.decapsulation_key = Some(key);
         self
+    }
+
+    /// Verify with the HMAC key set by [`Self::key`], which the caller already
+    /// recovered from the ML-KEM `EncryptedKey` named by `mechanism`. The
+    /// signature's `KeyInfo` must carry exactly that mechanism and policy must
+    /// grant its parameter set, as for [`Self::decapsulation_key`]; a valid
+    /// result is likewise not evidence of sender identity.
+    pub fn established_encapsulation(
+        mut self,
+        mechanism: crate::key_establishment::EstablishedEncapsulation<'a>,
+    ) -> Self {
+        self.established_encapsulation = Some(mechanism);
+        self
+    }
+
+    /// Whether the operation's key comes from a KEM rather than a sender key.
+    fn encapsulated(&self) -> bool {
+        self.decapsulation_key.is_some() || self.established_encapsulation.is_some()
     }
 
     /// Set a key resolver fallback used when `key()` is not provided.
@@ -3220,7 +3240,7 @@ fn materialize_verification_hints(
     if let Some(node) = key_info_node {
         // A pinned key ignores lookup hints, not mechanism instructions.
         // Apply the same bounded reference discovery before key work.
-        if ctx.decapsulation_key.is_some() {
+        if ctx.encapsulated() {
             discover_encapsulation_with_budget(
                 node,
                 resolver,
@@ -3441,18 +3461,13 @@ fn prepare_verification_signature<'a, C: VerificationCapture>(
     ctx.policy
         .signature_constraints
         .check(signature_node, &operation.budgets().transforms)?;
-    if ctx.decapsulation_key.is_some() {
+    if ctx.encapsulated() {
         // Public-key encapsulation establishes a recipient secret, not sender
         // identity. Reject an impossible trust requirement before key work.
-        if ctx.policy.key_trust.mode != crate::policy::VerificationTrustMode::CryptographicOnly {
-            return Err(crate::policy::PolicyViolation::KeyTrust {
-                reason: "KEM/HMAC does not authenticate sender identity",
-            }
-            .into());
-        }
+        check_kem_signature_trust(&ctx.policy)?;
     }
     let signed_info_node = signature_children.signed_info;
-    let should_parse_key_info = ctx.decapsulation_key.is_none()
+    let should_parse_key_info = !ctx.encapsulated()
         && match (key, ctx.key_resolver) {
             (Some(_), _) => false,
             (None, Some(resolver)) => resolver.consumes_document_key_info(),
@@ -3520,7 +3535,13 @@ fn check_verification_encapsulation(
     encapsulation: Option<&ResolvedEncapsulation>,
     ctx: &VerifyContext<'_>,
 ) -> Result<(), DsigError> {
-    if encapsulation.is_some() != ctx.decapsulation_key.is_some() {
+    if ctx.decapsulation_key.is_some() && ctx.established_encapsulation.is_some() {
+        return Err(crate::key_establishment::KeyEstablishmentError::Structure(
+            "ambiguous verification key request",
+        )
+        .into());
+    }
+    if encapsulation.is_some() != ctx.encapsulated() {
         return Err(crate::key_establishment::KeyEstablishmentError::Structure(
             "mechanism and explicit recipient key must be supplied together",
         )
@@ -3536,6 +3557,17 @@ fn check_verification_encapsulation(
         {
             return Err(crate::key_establishment::KeyEstablishmentError::Structure(
                 "recipient parameter set mismatch",
+            )
+            .into());
+        }
+        // The ciphertext is the encapsulation's own, so a key recovered from
+        // any other EncryptedKey never stands for this one.
+        if ctx
+            .established_encapsulation
+            .is_some_and(|established| !mechanism.is(established))
+        {
+            return Err(crate::key_establishment::KeyEstablishmentError::Structure(
+                "the established key belongs to another encapsulation",
             )
             .into());
         }
@@ -3610,6 +3642,36 @@ fn resolve_operation_verification_key<'k>(
             )?;
         let hmac = super::HmacVerificationKey::new(secret.to_vec())?;
         return Ok(Some(ResolvedVerifyingKey::Established(hmac)));
+    }
+    if ctx.established_encapsulation.is_some() {
+        // The caller recovered the secret and charged its establishment; the
+        // rest of the contract is the decapsulating one's: a permitted
+        // explicit key and HMAC with an admitted 256-bit key.
+        if key.is_none()
+            || !ctx
+                .policy
+                .key_sources
+                .contains(crate::policy::KeySourceKind::PresetKey)
+            || algorithm.hmac_output_bits().is_none()
+        {
+            return Err(crate::key_establishment::KeyEstablishmentError::Structure(
+                "encapsulation requires permitted explicit key and HMAC",
+            )
+            .into());
+        }
+        ctx.policy.hmac.validate_key_bits(256)?;
+        let resolved = resolve_verifying_key(
+            ctx,
+            key,
+            None,
+            algorithm,
+            &mut operation.budgets().key_candidates.borrow_mut(),
+        )?;
+        // The caller's key stands for the KEM secret, not for a sender.
+        return Ok(resolved.map(|resolved| match resolved {
+            ResolvedVerifyingKey::Borrowed(key) => ResolvedVerifyingKey::EstablishedBy(key),
+            resolved => resolved,
+        }));
     }
     resolve_verifying_key(
         ctx,
@@ -4109,9 +4171,24 @@ struct KeyInfoMaterializationState {
     unread: Option<Vec<(super::parse::KeyInfoSource, Option<SourceOrigin>)>>,
 }
 
-struct ResolvedEncapsulation {
+pub(crate) struct ResolvedEncapsulation {
     algorithm: crate::provider::KeyEncapsulationAlgorithm,
     ciphertext: [u8; 1568],
+    /// False for a signing template's empty `CipherValue`.
+    filled: bool,
+}
+
+impl ResolvedEncapsulation {
+    /// Whether this is the mechanism `established` names; an empty template
+    /// ciphertext names none.
+    pub(crate) fn is(
+        &self,
+        established: crate::key_establishment::EstablishedEncapsulation<'_>,
+    ) -> bool {
+        self.filled
+            && self.algorithm == established.algorithm
+            && self.ciphertext[..self.algorithm.ciphertext_len()] == *established.ciphertext
+    }
 }
 
 impl KeyInfoMaterializationState {
@@ -4160,6 +4237,7 @@ impl KeyInfoMaterializationState {
         }
         self.encapsulation = Some(ResolvedEncapsulation {
             algorithm: mechanism.algorithm,
+            filled: !mechanism.ciphertext().is_empty(),
             ciphertext: mechanism.into_ciphertext(),
         });
         Ok(())
@@ -4642,6 +4720,9 @@ pub struct SignatureKeyInfoMetadata {
     /// Signing fills this `CipherValue`; verification only validates its target.
     #[cfg(feature = "xmldsig-sign")]
     pub(crate) cipher_value: Option<NodeId>,
+    /// The mechanism as found, its ciphertext included.
+    #[cfg(feature = "xmldsig-sign")]
+    pub(crate) mechanism: Option<ResolvedEncapsulation>,
 }
 
 /// Discover operation instructions in local `KeyInfo` references without consuming
@@ -5138,6 +5219,8 @@ fn inspect_signature_key_info_with_budgets<P: KeyInfoReferencePolicy>(
         encapsulation,
         #[cfg(feature = "xmldsig-sign")]
         cipher_value,
+        #[cfg(feature = "xmldsig-sign")]
+        mechanism: materialization.encapsulation,
     })
 }
 
@@ -6363,9 +6446,28 @@ fn transform_preserves_manifest_structure(transform: &Transform) -> bool {
     reason = "single bounded authorization result avoids heap allocation"
 )]
 enum ResolvedVerifyingKey<'a> {
+    /// Decapsulated by the operation.
     Established(super::HmacVerificationKey),
+    /// Recovered by the caller from the operation's own encapsulation.
+    EstablishedBy(&'a dyn VerifyingKey),
     Borrowed(&'a dyn VerifyingKey),
     Owned(super::ResolvedVerificationKey<'a>),
+}
+
+/// A KEM/HMAC key authenticates no sender: a verification that requires a
+/// trusted key takes one only when policy lets the recipient key stand for it.
+fn check_kem_signature_trust(
+    policy: &crate::policy::VerificationPolicy,
+) -> Result<(), crate::policy::PolicyViolation> {
+    if policy.key_trust.mode != crate::policy::VerificationTrustMode::CryptographicOnly
+        && policy.key_establishment.kem_signature_trust
+            == crate::policy::KemSignatureTrust::RequireCryptographicOnly
+    {
+        return Err(crate::policy::PolicyViolation::KeyTrust {
+            reason: "KEM/HMAC does not authenticate sender identity",
+        });
+    }
+    Ok(())
 }
 
 impl ResolvedVerifyingKey<'_> {
@@ -6374,14 +6476,8 @@ impl ResolvedVerifyingKey<'_> {
         policy: &crate::policy::VerificationPolicy,
     ) -> Result<super::KeyTrustEvidence, DsigError> {
         match self {
-            Self::Established(_) => {
-                if policy.key_trust.mode != crate::policy::VerificationTrustMode::CryptographicOnly
-                {
-                    return Err(crate::policy::PolicyViolation::KeyTrust {
-                        reason: "KEM/HMAC does not authenticate sender identity",
-                    }
-                    .into());
-                }
+            Self::Established(_) | Self::EstablishedBy(_) => {
+                check_kem_signature_trust(policy)?;
                 Ok(super::KeyTrustEvidence::NotEstablished)
             }
             Self::Borrowed(_)
@@ -6397,7 +6493,7 @@ impl ResolvedVerifyingKey<'_> {
     fn as_ref(&self) -> &dyn VerifyingKey {
         match self {
             Self::Established(key) => key,
-            Self::Borrowed(key) => *key,
+            Self::EstablishedBy(key) | Self::Borrowed(key) => *key,
             Self::Owned(key) => key.as_ref(),
         }
     }

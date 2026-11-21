@@ -120,7 +120,7 @@ fn write_kem_store(directory: &std::path::Path, size: u16) -> std::path::PathBuf
 }
 
 /// Sign with the public store and require that only the protected private
-/// key, with its password and explicit `--insecure`, verifies the result.
+/// key, with its password, verifies the result.
 #[cfg(all(feature = "xmldsig", feature = "xmlenc", feature = "c14n"))]
 fn check_kem_signing(
     directory: &std::path::Path,
@@ -197,7 +197,9 @@ fn check_kem_signing(
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    let denied = std::process::Command::new(env!("CARGO_BIN_EXE_xmlsec1"))
+    // As libxmlsec1 above, the compatibility policy takes the recipient key
+    // for the trusted key, so no --insecure is needed.
+    let trusted = std::process::Command::new(env!("CARGO_BIN_EXE_xmlsec1"))
         .args(["verify", "--pkcs8-pem"])
         .arg(private)
         .args(["--pwd", "secret123"])
@@ -205,8 +207,9 @@ fn check_kem_signing(
         .output()
         .unwrap();
     assert!(
-        !denied.status.success(),
-        "KEM must not establish sender trust"
+        trusted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&trusted.stderr)
     );
     let wrong = std::process::Command::new(env!("CARGO_BIN_EXE_xmlsec1"))
         .args(["verify", "--insecure", "--pkcs8-pem"])
@@ -422,6 +425,248 @@ fn all_donor_hmac_encapsulation_ciphertexts_verify() {
             result.status,
             xml_sec::xmldsig::DsigStatus::Valid,
             "ML-KEM-{size}"
+        );
+    }
+}
+
+/// The donor KEM/HMAC signature of `size`, its recipient key and the
+/// ciphertext of the mechanism it carries.
+fn donor_hmac_encapsulation(size: u16) -> (String, RustCryptoMlKemPrivateKey, Vec<u8>) {
+    let xml = std::fs::read_to_string(fixture_path(&format!(
+        "xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-kt-ml-kem-{size}.xml"
+    )))
+    .expect("signed donor XML");
+    let key =
+        RustCryptoMlKemPrivateKey::from_pkcs8_der(&fixture(&format!("ml-kem-{size}-key.der")))
+            .unwrap();
+    let document = xml_sec::Document::parse(&xml).unwrap();
+    let node = document
+        .root_element()
+        .descendants()
+        .find(|node| xml_sec::key_establishment::encapsulation_algorithm(*node).is_some())
+        .expect("the donor's EncryptedKey");
+    let ciphertext = xml_sec::key_establishment::parse_encapsulation(node, false)
+        .unwrap()
+        .ciphertext()
+        .to_vec();
+    (xml, key, ciphertext)
+}
+
+/// A verification policy granting `algorithm` under `mode`.
+fn kem_verification(
+    algorithm: KeyEncapsulationAlgorithm,
+    mode: xml_sec::policy::VerificationTrustMode,
+) -> xml_sec::policy::VerificationPolicy {
+    let mut policy = xml_sec::policy::VerificationPolicy::default();
+    policy
+        .key_establishment
+        .encapsulation_algorithms
+        .insert(algorithm);
+    policy.key_trust.mode = mode;
+    policy
+}
+
+#[test]
+fn an_established_key_verifies_only_its_own_encapsulation() {
+    // A caller that already recovered the HMAC key (as the C library's
+    // KeyInfo read decapsulates it) names the mechanism it came from; the core
+    // takes the key for exactly that mechanism, never for another ciphertext
+    // or parameter set, and never as an ordinary key beside a mechanism.
+    use xml_sec::key_establishment::EstablishedEncapsulation;
+    for size in [512, 768, 1024] {
+        let (xml, private, ciphertext) = donor_hmac_encapsulation(size);
+        let algorithm = private.algorithm();
+        let policy = kem_verification(
+            algorithm,
+            xml_sec::policy::VerificationTrustMode::CryptographicOnly,
+        );
+        let secret = private.decapsulate(&ciphertext).unwrap();
+        let key = xml_sec::xmldsig::HmacVerificationKey::new(secret.to_vec()).unwrap();
+        let verify = |established: Option<EstablishedEncapsulation<'_>>| {
+            let mut context = xml_sec::xmldsig::VerifyContext::new()
+                .key(&key)
+                .policy(policy.clone());
+            if let Some(established) = established {
+                context = context.established_encapsulation(established);
+            }
+            context.verify(&xml)
+        };
+        let result = verify(Some(EstablishedEncapsulation {
+            algorithm,
+            ciphertext: &ciphertext,
+        }))
+        .expect("the key of its own encapsulation");
+        assert_eq!(
+            result.status,
+            xml_sec::xmldsig::DsigStatus::Valid,
+            "ML-KEM-{size}"
+        );
+        assert_eq!(
+            result.key_trust,
+            xml_sec::xmldsig::KeyTrustEvidence::NotEstablished
+        );
+        let mut other = ciphertext.clone();
+        other[0] ^= 1;
+        let other_set = KeyEncapsulationAlgorithm::all()
+            .into_iter()
+            .find(|candidate| *candidate != algorithm)
+            .unwrap();
+        for established in [
+            EstablishedEncapsulation {
+                algorithm,
+                ciphertext: &other,
+            },
+            EstablishedEncapsulation {
+                algorithm: other_set,
+                ciphertext: &ciphertext,
+            },
+        ] {
+            let error = verify(Some(established)).unwrap_err().to_string();
+            assert!(
+                error.contains("belongs to another encapsulation"),
+                "{error}"
+            );
+        }
+        let error = verify(None).unwrap_err().to_string();
+        assert!(error.contains("must be supplied together"), "{error}");
+        let error = xml_sec::xmldsig::VerifyContext::new()
+            .key(&key)
+            .decapsulation_key(&private)
+            .established_encapsulation(EstablishedEncapsulation {
+                algorithm,
+                ciphertext: &ciphertext,
+            })
+            .policy(policy.clone())
+            .verify(&xml)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("ambiguous verification key request"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn a_trusted_key_verification_takes_kem_hmac_only_by_policy() {
+    // KEM/HMAC authenticates no sender, so a verification requiring a trusted
+    // key refuses it by default, whether the core decapsulates or takes an
+    // established key; the compatibility permission lets the recipient key
+    // stand for trust, as libxmlsec1 takes it, still proving no sender.
+    use xml_sec::key_establishment::EstablishedEncapsulation;
+    use xml_sec::policy::KemSignatureTrust;
+    let (xml, private, ciphertext) = donor_hmac_encapsulation(512);
+    let algorithm = private.algorithm();
+    let secret = private.decapsulate(&ciphertext).unwrap();
+    let key = xml_sec::xmldsig::HmacVerificationKey::new(secret.to_vec()).unwrap();
+    let established = EstablishedEncapsulation {
+        algorithm,
+        ciphertext: &ciphertext,
+    };
+    let mut policy = kem_verification(
+        algorithm,
+        xml_sec::policy::VerificationTrustMode::RequireTrustedKey,
+    );
+    for trust in [
+        KemSignatureTrust::RequireCryptographicOnly,
+        KemSignatureTrust::AcceptRecipientKey,
+    ] {
+        policy.key_establishment.kem_signature_trust = trust;
+        let outcomes = [
+            xml_sec::xmldsig::VerifyContext::new()
+                .decapsulation_key(&private)
+                .policy(policy.clone())
+                .verify(&xml),
+            xml_sec::xmldsig::VerifyContext::new()
+                .key(&key)
+                .established_encapsulation(established)
+                .policy(policy.clone())
+                .verify(&xml),
+        ];
+        for outcome in outcomes {
+            match trust {
+                KemSignatureTrust::RequireCryptographicOnly => {
+                    let error = outcome.unwrap_err().to_string();
+                    assert!(
+                        error.contains("does not authenticate sender identity"),
+                        "{error}"
+                    );
+                }
+                KemSignatureTrust::AcceptRecipientKey => {
+                    let result = outcome.unwrap();
+                    assert_eq!(result.status, xml_sec::xmldsig::DsigStatus::Valid);
+                    assert_eq!(
+                        result.key_trust,
+                        xml_sec::xmldsig::KeyTrustEvidence::NotEstablished
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn an_established_key_signs_only_its_own_template_mechanism() {
+    // A caller that encapsulated and wrote the ciphertext itself (as the C
+    // library's KeyInfo write does) signs with the secret; the core signs only
+    // a template carrying exactly that ciphertext, and the recipient verifies.
+    use base64::Engine as _;
+    use xml_sec::key_establishment::EstablishedEncapsulation;
+    use xml_sec::provider::KeyEncapsulationKey as _;
+    let template = std::fs::read_to_string(fixture_path(
+        "xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-kt-ml-kem-512.tmpl",
+    ))
+    .unwrap();
+    let private =
+        RustCryptoMlKemPrivateKey::from_pkcs8_der(&fixture("ml-kem-512-key.der")).unwrap();
+    let algorithm = private.algorithm();
+    let encapsulated = private
+        .public_key()
+        .encapsulate_with_provider(xml_sec::provider::default_provider())
+        .unwrap();
+    let filled = template.replace(
+        "<enc:CipherValue/>",
+        &format!(
+            "<enc:CipherValue>{}</enc:CipherValue>",
+            base64::engine::general_purpose::STANDARD.encode(&encapsulated.ciphertext)
+        ),
+    );
+    let mut signing = xml_sec::policy::SigningPolicy::default();
+    signing
+        .key_establishment
+        .encapsulation_algorithms
+        .insert(algorithm);
+    let key = xml_sec::xmldsig::HmacSigningKey::new(encapsulated.shared_secret.to_vec()).unwrap();
+    let sign = |template: &str, ciphertext: &[u8]| {
+        xml_sec::xmldsig::SignContext::new(&key)
+            .policy(signing.clone())
+            .established_encapsulation(EstablishedEncapsulation {
+                algorithm,
+                ciphertext,
+            })
+            .sign_template(template)
+    };
+    let signed = sign(&filled, &encapsulated.ciphertext).unwrap().output;
+    let result = xml_sec::xmldsig::VerifyContext::new()
+        .decapsulation_key(&private)
+        .policy(kem_verification(
+            algorithm,
+            xml_sec::policy::VerificationTrustMode::CryptographicOnly,
+        ))
+        .verify(&signed)
+        .unwrap();
+    assert_eq!(result.status, xml_sec::xmldsig::DsigStatus::Valid);
+    let mut other = encapsulated.ciphertext.clone();
+    other[0] ^= 1;
+    // Another ciphertext, or a template whose ciphertext was never written.
+    for (template, ciphertext) in [
+        (&filled, &other[..]),
+        (&template, &encapsulated.ciphertext[..]),
+    ] {
+        let error = sign(template, ciphertext).unwrap_err().to_string();
+        assert!(
+            error.contains("belongs to another encapsulation"),
+            "{error}"
         );
     }
 }

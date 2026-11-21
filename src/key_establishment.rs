@@ -42,6 +42,17 @@ pub struct EncapsulationMechanism {
     pub ciphertext: Vec<u8>,
 }
 
+/// The ML-KEM `EncryptedKey` a caller already established its HMAC key from,
+/// named by parameter set and ciphertext: an operation takes that key only
+/// when the signature's `KeyInfo` carries exactly this mechanism.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EstablishedEncapsulation<'a> {
+    /// Exact parameter set.
+    pub algorithm: KeyEncapsulationAlgorithm,
+    /// The FIPS 203 ciphertext the key was encapsulated with.
+    pub ciphertext: &'a [u8],
+}
+
 /// Borrowed, fully framed mechanism. Public ciphertext is decoded into fixed
 /// storage, so parsing cannot allocate an attacker-selected temporary buffer.
 pub struct ParsedEncapsulation<'a, 'input> {

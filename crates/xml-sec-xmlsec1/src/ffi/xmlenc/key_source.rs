@@ -1,7 +1,8 @@
 //! The `KeyInfo` child a read derived, agreed or decapsulated its key by, with the octets
 //! it yielded, kept in the read context's `reserved1` until the decryption
 //! reading with that context takes the key: the core takes such a key for
-//! that element alone.
+//! that element alone. A signature operation takes an ML-KEM `EncryptedKey`
+//! its read decapsulated, or its write encapsulated, the same way.
 
 use xml_sec::Node;
 use xml_sec::policy::DecryptionPolicy;
@@ -150,6 +151,43 @@ pub(crate) unsafe fn forget(ctx: *mut XmlSecKeyInfoCtx) {
         if !slot.is_null() {
             drop(Box::from_raw(slot.cast::<KeySource>()));
             (*ctx).reserved1 = std::ptr::null_mut();
+        }
+    }
+}
+
+/// The ML-KEM `EncryptedKey` the read or write with `ctx` recorded `key`'s
+/// octets by, taken from it: the parameter set and ciphertext a signature
+/// operation hands the core with that key. `None` when it recorded no
+/// encapsulation, or another key's octets.
+///
+/// # Safety
+/// `ctx` is an initialized context; `key` is null or a key.
+pub(crate) unsafe fn take_encapsulation(
+    ctx: *mut XmlSecKeyInfoCtx,
+    key: *mut XmlSecKey,
+) -> Option<(KeyEncapsulationAlgorithm, Vec<u8>)> {
+    // SAFETY: by the caller's contract.
+    unsafe {
+        let source = take(ctx)?;
+        if key.is_null() {
+            return None;
+        }
+        let buffer = xmlSecKeyDataBinaryValueGetBuffer(xmlSecKeyGetValue(key));
+        let data = xmlSecBufferGetData(buffer);
+        if data.is_null()
+            || !source.yielded(std::slice::from_raw_parts(
+                data,
+                xmlSecBufferGetSize(buffer),
+            ))
+        {
+            return None;
+        }
+        match source.descriptor {
+            Descriptor::Encapsulation {
+                algorithm,
+                ciphertext,
+            } => Some((algorithm, ciphertext)),
+            Descriptor::Derived(_) | Descriptor::Agreement(_) => None,
         }
     }
 }

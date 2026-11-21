@@ -738,6 +738,12 @@ pub(crate) unsafe extern "C" fn xml_write(
                 errors::internal(here, name, c"xmlSecEncCtxEncryptedKeyXmlWrite");
                 return -1;
             }
+            // A key an ML-KEM EncryptedKey encapsulated is taken by the
+            // signing with this context for the ciphertext just written.
+            if !xmlSecKeyGetData(key, kem::kem_klass_id()).is_null() {
+                let source = key_source::of(ctx, node, key, Descriptor::encapsulation);
+                key_source::record(ctx, source);
+            }
         }
         0
     })

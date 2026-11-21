@@ -72,7 +72,18 @@ calling the encapsulation primitive.
 can create a new valid message. This path requires explicit
 `VerificationTrustMode::CryptographicOnly` and returns
 `KeyTrustEvidence::NotEstablished`; a trusted-key requirement fails before
-decapsulation. Use a genuine digital signature when sender identity matters.
+decapsulation. Only `key_establishment.kem_signature_trust =
+KemSignatureTrust::AcceptRecipientKey`, which the `XmlSecCompatible` profile
+sets as libxmlsec1 behaves, lets the recipient key stand for the trusted key;
+the result is still `NotEstablished`. Use a genuine digital signature when
+sender identity matters.
+
+A caller that recovers or encapsulates the HMAC key itself, as the C library's
+`KeyInfo` processing does, passes it with `VerifyContext::key` or
+`SignContext::new` and names its mechanism with `established_encapsulation`
+(parameter set and ciphertext). The core takes that key only when the
+signature's `KeyInfo` carries exactly that mechanism, under the same
+permission, HMAC and trust checks as its own decapsulation or encapsulation.
 
 ## Examples
 
