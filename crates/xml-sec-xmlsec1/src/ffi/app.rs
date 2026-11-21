@@ -11,7 +11,7 @@
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 
-use xml_sec::key_manager::{KeyInventory, KeyStoreError, KeyUsages, PrivateKeyContainer};
+use xml_sec::key_manager::{KeyInventory, KeyStoreError, PrivateKeyContainer};
 use xml_sec::policy::ResourcePolicy;
 use xml_sec::xmldsig::{KeyInfoSource, KeyValueInfo};
 use zeroize::Zeroizing;
@@ -103,10 +103,27 @@ impl Password {
 
 /// A key a file holds, as the key data of its klass will hold it.
 enum Loaded {
-    /// An RSA, DSA or EC key.
+    /// An RSA, DSA, EC or DH key.
     Asymmetric(Material),
     /// An X25519 or X448 key, which only agrees on keys.
     Xdh(XdhKey),
+}
+
+impl Loaded {
+    /// The key whose public key is the SPKI `spki`, with `private` PKCS#8:
+    /// an XDH key, or the key value of another family.
+    fn from_spki(
+        spki: Vec<u8>,
+        private: Option<Zeroizing<Vec<u8>>>,
+        resources: &ResourcePolicy,
+    ) -> Result<Self, KeyStoreError> {
+        if xdhkeys::public_of(&spki).is_some() {
+            return Ok(Self::Xdh(XdhKey { spki, private }));
+        }
+        let value = KeyValueInfo::from_spki_der(&spki, resources)
+            .map_err(|_| KeyStoreError::Selection("unsupported key family"))?;
+        Ok(Self::Asymmetric(Material { value, private }))
+    }
 }
 
 /// The private key `bytes` hold in `container`, asking `password` only when
@@ -143,12 +160,7 @@ fn private_key(
         .ok_or(KeyStoreError::Selection("no private key imported"))?;
     let spki = key.public_key_spki_der()?;
     let private = Some(Zeroizing::new(key.pkcs8_der().to_vec()));
-    if key.usages == KeyUsages::KEY_AGREEMENT {
-        return Ok(Loaded::Xdh(XdhKey { spki, private }));
-    }
-    let value = KeyValueInfo::from_spki_der(&spki, resources)
-        .map_err(|_| KeyStoreError::Selection("unsupported private key family"))?;
-    Ok(Loaded::Asymmetric(Material { value, private }))
+    Loaded::from_spki(spki, private, resources)
 }
 
 /// The public key in PEM (`pem`) or DER `bytes`.
@@ -167,38 +179,20 @@ fn public_key(
         .public_keys()
         .first()
         .ok_or(KeyStoreError::Selection("no public key imported"))?;
-    if key.usages == KeyUsages::KEY_AGREEMENT {
-        let spki = key
-            .key_info
-            .sources
-            .iter()
-            .find_map(|source| match source {
-                KeyInfoSource::DerEncodedKeyValue(spki) => Some(spki.clone()),
-                _ => None,
-            })
-            .ok_or(KeyStoreError::Selection("no public key imported"))?;
-        return Ok(Loaded::Xdh(XdhKey {
-            spki,
-            private: None,
-        }));
-    }
-    let value = key
-        .key_info
+    key.key_info
         .sources
         .iter()
         .find_map(|source| match source {
-            KeyInfoSource::KeyValue(value) => Some(Ok(value.clone())),
-            KeyInfoSource::DerEncodedKeyValue(spki) => Some(
-                KeyValueInfo::from_spki_der(spki, resources)
-                    .map_err(|_| KeyStoreError::Selection("unsupported public key family")),
-            ),
+            KeyInfoSource::KeyValue(value) => Some(Ok(Loaded::Asymmetric(Material {
+                value: value.clone(),
+                private: None,
+            }))),
+            KeyInfoSource::DerEncodedKeyValue(spki) => {
+                Some(Loaded::from_spki(spki.clone(), None, resources))
+            }
             _ => None,
         })
-        .ok_or(KeyStoreError::Selection("no public key imported"))??;
-    Ok(Loaded::Asymmetric(Material {
-        value,
-        private: None,
-    }))
+        .ok_or(KeyStoreError::Selection("no public key imported"))?
 }
 
 /// The key material `bytes` of `format` hold: for PEM and DER a private
@@ -414,15 +408,9 @@ pub(crate) unsafe extern "C" fn pkcs12_load_memory(
             return std::ptr::null_mut();
         };
         let private = Some(Zeroizing::new(key.pkcs8_der().to_vec()));
-        let spki = key.public_key_spki_der();
-        let loaded = spki.and_then(|spki| {
-            if key.usages == KeyUsages::KEY_AGREEMENT {
-                return Ok(Loaded::Xdh(XdhKey { spki, private }));
-            }
-            KeyValueInfo::from_spki_der(&spki, &policy.resources)
-                .map(|value| Loaded::Asymmetric(Material { value, private }))
-                .map_err(|_| KeyStoreError::Selection("unsupported private key family"))
-        });
+        let loaded = key
+            .public_key_spki_der()
+            .and_then(|spki| Loaded::from_spki(spki, private, &policy.resources));
         let loaded = match loaded {
             Ok(loaded) => loaded,
             Err(error) => {

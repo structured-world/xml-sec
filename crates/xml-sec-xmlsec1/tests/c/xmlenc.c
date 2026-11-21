@@ -609,6 +609,106 @@ static void agreement_round_trip(const char *label, const char *name, int wrong)
     xsFreeDoc(doc);
 }
 
+#define DHX_KEYS "tests/fixtures/xmlenc/keys/dhx/"
+
+/* Enables in `list` the klasses the donor's DH-ES recipe names
+ * (agreement-method,enc-key,key-value,key-name,dh): KeyValue is registered
+ * disabled. */
+static void enable_dh_recipe(xmlSecPtrListPtr list) {
+    xmlSecPtrListAdd(list, (void *)xmlSecKeyDataAgreementMethodId);
+    xmlSecPtrListAdd(list, (void *)xmlSecKeyDataEncryptedKeyId);
+    xmlSecPtrListAdd(list, (void *)xmlSecKeyDataValueId);
+    xmlSecPtrListAdd(list, (void *)xmlSecKeyDataNameId);
+    xmlSecPtrListAdd(list, (void *)xmlSecKeyDataDhId);
+}
+
+/* Decrypts the DH-ES `doc` with the recipient's manager `mngr` under the
+ * donor's recipe and compares the result with `expected`. */
+static void decrypt_dh(xmlDocPtr doc, xmlSecKeysMngrPtr mngr, const xmlSecByte *expected,
+                       size_t expected_size) {
+    xmlSecEncCtxPtr ctx = xmlSecEncCtxCreate(mngr);
+    xmlSecBufferPtr result;
+    ctx->keyInfoReadCtx.maxEncryptedKeyLevel = 3;
+    enable_dh_recipe(&(ctx->keyInfoReadCtx.enabledKeyData));
+    result = xmlSecEncCtxDecryptToBuffer(ctx, xsDocGetRootElement(doc));
+    printf("  decrypted: %d same=%d failure=%s\n",
+           result != NULL ? (int)xmlSecBufferGetSize(result) : -1,
+           result != NULL && expected != NULL && xmlSecBufferGetSize(result) == expected_size &&
+               memcmp(xmlSecBufferGetData(result), expected, expected_size) == 0,
+           xmlSecEncCtxGetFailureReasonString(ctx->failureReason));
+    xmlSecEncCtxDestroy(ctx);
+}
+
+/* The donor's DH-ES vector: the recipient holds only its private key and
+ * reads the originator's public key from the DHKeyValue of its role. */
+static void dh_agreement_vector(void) {
+    static const char name[] = "enc_dh_concatkdf_sha256_kw_aes128_aes128gcm";
+    char path[512];
+    static xmlSecByte expected[1 << 16];
+    size_t expected_size = 0;
+    xmlSecByte *data;
+    xmlDocPtr doc;
+    xmlSecKeysMngrPtr mngr;
+    printf("agreement dh-es concatkdf sha256\n");
+    snprintf(path, sizeof(path), VECTORS "%s.data", name);
+    data = file_bytes(path, &expected_size);
+    if (data != NULL) {
+        memcpy(expected, data, expected_size);
+    }
+    snprintf(path, sizeof(path), VECTORS "%s.xml", name);
+    data = file_bytes(path, &(size_t){0});
+    if (data == NULL) {
+        printf("  missing vector %s\n", name);
+        return;
+    }
+    doc = xsReadMemory((const char *)data, (int)strlen((const char *)data), "vector.xml", NULL, 0);
+    mngr = xmlSecKeysMngrCreate();
+    xmlSecCryptoAppDefaultKeysMngrInit(mngr);
+    adopt_pem(mngr, DHX_KEYS "dhx-rfc5114-3-second-key.pem", "dhx-rfc5114-3-second");
+    decrypt_dh(doc, mngr, expected, expected_size);
+    xmlSecKeysMngrDestroy(mngr);
+    xsFreeDoc(doc);
+}
+
+/* The donor's DH-ES template encrypted by the originator holding its
+ * private key and the recipient's public key, under the donor's recipe,
+ * then decrypted by the recipient holding only its private key. */
+static void dh_agreement_round_trip(void) {
+    static const char bytes[] = "agreed key payload";
+    char path[512];
+    xmlSecByte *data;
+    xmlDocPtr doc;
+    xmlSecEncCtxPtr ctx;
+    xmlSecKeysMngrPtr originator =
+        parties(DHX_KEYS "dhx-rfc5114-3-first-key.pem", "dhx-rfc5114-3-first",
+                DHX_KEYS "dhx-rfc5114-3-second-pubkey.pem", "dhx-rfc5114-3-second");
+    xmlSecKeysMngrPtr recipient = xmlSecKeysMngrCreate();
+    xmlSecCryptoAppDefaultKeysMngrInit(recipient);
+    adopt_pem(recipient, DHX_KEYS "dhx-rfc5114-3-second-key.pem", "dhx-rfc5114-3-second");
+    printf("agreement dh-es round trip\n");
+    snprintf(path, sizeof(path), VECTORS "enc_dh_concatkdf_sha256_kw_aes128_aes128gcm.tmpl");
+    data = file_bytes(path, &(size_t){0});
+    if (data == NULL) {
+        printf("  missing template\n");
+        return;
+    }
+    doc = xsReadMemory((const char *)data, (int)strlen((const char *)data), "template.xml", NULL, 0);
+    ctx = xmlSecEncCtxCreate(originator);
+    ctx->keyInfoReadCtx.maxEncryptedKeyLevel = 3;
+    ctx->keyInfoWriteCtx.maxEncryptedKeyLevel = 3;
+    enable_dh_recipe(&(ctx->keyInfoReadCtx.enabledKeyData));
+    enable_dh_recipe(&(ctx->keyInfoWriteCtx.enabledKeyData));
+    ctx->encKey = xmlSecKeyGenerate(xmlSecKeyDataAesId, 128, xmlSecKeyDataTypeSession);
+    printf("  encrypt: %d\n", xmlSecEncCtxBinaryEncrypt(ctx, xsDocGetRootElement(doc),
+                                                        (const xmlSecByte *)bytes,
+                                                        sizeof(bytes) - 1));
+    xmlSecEncCtxDestroy(ctx);
+    decrypt_dh(doc, recipient, (const xmlSecByte *)bytes, sizeof(bytes) - 1);
+    xmlSecKeysMngrDestroy(recipient);
+    xmlSecKeysMngrDestroy(originator);
+    xsFreeDoc(doc);
+}
+
 int main(void) {
     xmlDocPtr doc;
     xmlSecEncCtxPtr ctx;
@@ -678,6 +778,8 @@ int main(void) {
                          "enc_ecdh_p256_concatkdf_sha256_kw_aes256_aes128gcm", 0);
     agreement_round_trip("agreement ecdh-es with another originator key",
                          "enc_ecdh_p256_concatkdf_sha256_kw_aes256_aes128gcm", 1);
+    dh_agreement_vector();
+    dh_agreement_round_trip();
 
     /* No key: the keys manager has none. */
     key = aes_key(0x11);

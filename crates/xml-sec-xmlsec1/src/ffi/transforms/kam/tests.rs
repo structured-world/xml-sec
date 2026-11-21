@@ -401,8 +401,10 @@ fn the_policy_decides_whether_the_parties_may_agree() {
         .expect("the method parses");
         // SAFETY: the keys loaded above, released below.
         unsafe {
-            let mine_material = Party::Ec(material_of(xmlSecKeyGetValue(mine)).expect("an EC key"));
-            let peer_material = Party::Ec(material_of(xmlSecKeyGetValue(peer)).expect("an EC key"));
+            let mine_material =
+                Party::Value(material_of(xmlSecKeyGetValue(mine)).expect("an EC key"));
+            let peer_material =
+                Party::Value(material_of(xmlSecKeyGetValue(peer)).expect("an EC key"));
             let refusing = xml_sec::policy::KeyEstablishmentPolicy {
                 agreement_algorithms: Some(BTreeSet::new()),
                 ..xml_sec::policy::KeyEstablishmentPolicy::default()
@@ -528,6 +530,167 @@ fn x448_agrees_while_the_policy_admits_it() {
         )
         .expect("the library policy compiles");
         assert!(!encrypts_with(X448_TEMPLATE, &sender));
+    });
+}
+
+const DH_FIRST_KEY: &[u8] =
+    include_bytes!("../../../../../../tests/fixtures/xmlenc/keys/dhx/dhx-rfc5114-3-first-key.pem");
+const DH_SECOND_KEY: &[u8] =
+    include_bytes!("../../../../../../tests/fixtures/xmlenc/keys/dhx/dhx-rfc5114-3-second-key.pem");
+const DH_SECOND_PUBLIC: &[u8] = include_bytes!(
+    "../../../../../../tests/fixtures/xmlenc/keys/dhx/dhx-rfc5114-3-second-pubkey.pem"
+);
+const DH_FIRST_PUBLIC: &[u8] = include_bytes!(
+    "../../../../../../tests/fixtures/xmlenc/keys/dhx/dhx-rfc5114-3-first-pubkey.pem"
+);
+/// The donor's DH-ES template: the originator's `KeyValue` an empty
+/// `DHKeyValue` the encryption fills, the parties named by `KeyName`.
+const DH_TEMPLATE: &str = include_str!(
+    "../../../../../../tests/fixtures/xmlenc/aleksey-xmlenc-01/enc_dh_concatkdf_sha256_kw_aes128_aes128gcm.tmpl"
+);
+
+/// Enables in the `KeyInfo` context `ctx` the klasses the donor's DH-ES
+/// recipe names (`agreement-method,enc-key,key-value,key-name,dh`):
+/// libxmlsec1 registers `KeyValue` disabled.
+///
+/// # Safety
+/// `ctx` is an initialized `KeyInfo` context.
+unsafe fn enable_dh_recipe(ctx: *mut XmlSecKeyInfoCtx) {
+    use super::super::super::keysdata::{
+        xmlSecKeyDataAgreementMethodGetKlass, xmlSecKeyDataEncryptedKeyGetKlass,
+        xmlSecKeyDataNameGetKlass, xmlSecKeyDataValueGetKlass,
+    };
+    let klasses = [
+        xmlSecKeyDataAgreementMethodGetKlass(),
+        xmlSecKeyDataEncryptedKeyGetKlass(),
+        xmlSecKeyDataValueGetKlass(),
+        xmlSecKeyDataNameGetKlass(),
+        asymkeys::dh(),
+    ];
+    for klass in klasses {
+        // SAFETY: by the caller's contract; the klasses are static.
+        let added = unsafe {
+            super::super::super::list::xmlSecPtrListAdd(
+                &raw mut (*ctx).enabled_key_data,
+                klass.cast_mut().cast(),
+            )
+        };
+        assert_eq!(added, 0);
+    }
+}
+
+#[test]
+fn dh_parties_agree_through_the_originators_key_value() {
+    // DH-ES over RFC 5114 group 3 keys loaded from key files, with the
+    // donor's enabled klasses: the originator writes its public key as the
+    // DHKeyValue of its role (XML Encryption 1.1 section 5.6.1), and a
+    // recipient that holds only its own private key reads it from there and
+    // unwraps what the originator wrapped.
+    with_library(|| {
+        let plaintext = b"agreed content";
+        // SAFETY: the library is initialized; every object is released.
+        unsafe {
+            let doc = document(DH_TEMPLATE);
+            let sender = manager(&[
+                (DH_FIRST_KEY, c"dhx-rfc5114-3-first"),
+                (DH_SECOND_PUBLIC, c"dhx-rfc5114-3-second"),
+            ]);
+            let ctx = xmlSecEncCtxCreate(sender);
+            (*ctx).key_info_read_ctx.max_encrypted_key_level = 3;
+            (*ctx).key_info_write_ctx.max_encrypted_key_level = 3;
+            enable_dh_recipe(&raw mut (*ctx).key_info_read_ctx);
+            enable_dh_recipe(&raw mut (*ctx).key_info_write_ctx);
+            (*ctx).enc_key = xmlSecKeyGenerate(symkeys::aes(), 128, TYPE_SESSION);
+            let encrypted = xmlSecEncCtxBinaryEncrypt(
+                ctx,
+                xsDocGetRootElement(doc.cast()),
+                plaintext.as_ptr(),
+                plaintext.len(),
+            );
+            xmlSecEncCtxDestroy(ctx);
+            assert_eq!(encrypted, 0, "the originator encrypts");
+            let recipient = manager(&[(DH_SECOND_KEY, c"dhx-rfc5114-3-second")]);
+            let ctx = xmlSecEncCtxCreate(recipient);
+            (*ctx).key_info_read_ctx.max_encrypted_key_level = 3;
+            enable_dh_recipe(&raw mut (*ctx).key_info_read_ctx);
+            let result = xmlSecEncCtxDecryptToBuffer(ctx, xsDocGetRootElement(doc.cast()));
+            let decrypted = (!result.is_null()).then(|| {
+                std::slice::from_raw_parts(xmlSecBufferGetData(result), xmlSecBufferGetSize(result))
+                    .to_vec()
+            });
+            xmlSecEncCtxDestroy(ctx);
+            xmlSecKeysMngrDestroy(recipient);
+            xmlSecKeysMngrDestroy(sender);
+            xsFreeDoc(doc.cast());
+            assert_eq!(decrypted.as_deref(), Some(&plaintext[..]));
+        }
+    });
+}
+
+#[test]
+fn a_dh_peer_of_another_group_is_no_party() {
+    // DH-ES agrees only between keys of one group (RFC 2631 section 2.1.1):
+    // the peer of the recipient's own group derives the key under a policy
+    // admitting DH-ES, the same public value declared with another generator
+    // is no peer, and the default policy, which admits no DH-ES, refuses it.
+    with_library(|| {
+        let mine = pem_key(DH_SECOND_KEY);
+        let peer = pem_key(DH_FIRST_PUBLIC);
+        let method = xml_sec::xmlenc::parse_key_derivation_method(
+            "<xenc11:KeyDerivationMethod \
+             xmlns:xenc11=\"http://www.w3.org/2009/xmlenc11#\" \
+             xmlns:dsig=\"http://www.w3.org/2000/09/xmldsig#\" \
+             Algorithm=\"http://www.w3.org/2009/xmlenc11#ConcatKDF\">\
+             <xenc11:ConcatKDFParams AlgorithmID=\"00\" PartyUInfo=\"00\" PartyVInfo=\"00\">\
+             <dsig:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>\
+             </xenc11:ConcatKDFParams></xenc11:KeyDerivationMethod>",
+            &xml_sec::policy::DecryptionPolicy::default(),
+        )
+        .expect("the method parses");
+        let admitting = xml_sec::policy::KeyEstablishmentPolicy {
+            agreement_algorithms: Some(BTreeSet::from([KeyAgreementAlgorithm::DhEs])),
+            ..xml_sec::policy::KeyEstablishmentPolicy::default()
+        };
+        // SAFETY: the keys loaded above, released below.
+        unsafe {
+            let mine_material = material_of(xmlSecKeyGetValue(mine)).expect("a DH key");
+            let peer_material = material_of(xmlSecKeyGetValue(peer)).expect("a DH key");
+            let mut usage = xml_sec::key_establishment::KeyEstablishmentUsage::default();
+            let agree_with = |peer: &Material, policy, usage: &mut _| {
+                agree(
+                    KeyAgreementAlgorithm::DhEs,
+                    &method,
+                    16,
+                    Party::Value(mine_material),
+                    Party::Value(peer),
+                    policy,
+                    usage,
+                )
+            };
+            let derived = agree_with(peer_material, &admitting, &mut usage)
+                .expect("the parties share a group");
+            assert_eq!(derived.len(), 16);
+            let mut other = peer_material.clone();
+            let KeyValueInfo::Dh {
+                generator: Some(generator),
+                ..
+            } = &mut other.value
+            else {
+                panic!("a DH key value with its group");
+            };
+            generator[0] ^= 1;
+            assert!(matches!(
+                agree_with(&other, &admitting, &mut usage),
+                Err(XmlEncError::KeyNotFound)
+            ));
+            let default = xml_sec::policy::KeyEstablishmentPolicy::default();
+            assert!(matches!(
+                agree_with(peer_material, &default, &mut usage),
+                Err(XmlEncError::Policy(_))
+            ));
+            xmlSecKeyDestroy(mine);
+            xmlSecKeyDestroy(peer);
+        }
     });
 }
 

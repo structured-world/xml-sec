@@ -1,6 +1,6 @@
 //! The built-in provider's key agreement klasses, the transform an
-//! `AgreementMethod` element is: `ECDH-ES` over EC keys, `x25519` and
-//! `x448` over XDH keys.
+//! `AgreementMethod` element is: `ECDH-ES` over EC keys, `DH-ES` over X9.42
+//! DH keys, `x25519` and `x448` over XDH keys.
 //!
 //! Reading its `AgreementMethod` the transform takes the parameters of the
 //! `KeyDerivationMethod` the core parses there and finds the originator's
@@ -17,7 +17,7 @@ use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 
 use xml_sec::policy::{KeyAgreementAlgorithm, PolicyViolation};
 use xml_sec::provider::{
-    KeyAgreementKey, KeyAgreementParameters, RustCryptoEcdhKey, RustCryptoX448Key,
+    KeyAgreementKey, KeyAgreementParameters, RustCryptoDhKey, RustCryptoEcdhKey, RustCryptoX448Key,
     RustCryptoX25519Key,
 };
 use xml_sec::xmldsig::{DigestAlgorithm, KeyValueInfo};
@@ -37,9 +37,10 @@ use super::super::keys::{
 use super::super::keysdata::{XmlSecKeyData, XmlSecKeyDataKlass, check_id, data_valid};
 use super::super::policy::{Side, SlotPin};
 use super::super::strings::{
-    xmlSecAttrAlgorithm, xmlSecEnc11Ns, xmlSecEncNs, xmlSecHrefEcdh, xmlSecHrefX448,
-    xmlSecHrefX25519, xmlSecNameEcdh, xmlSecNameX448, xmlSecNameX25519, xmlSecNodeKANonce,
-    xmlSecNodeKeyDerivationMethod, xmlSecNodeOriginatorKeyInfo, xmlSecNodeRecipientKeyInfo,
+    xmlSecAttrAlgorithm, xmlSecEnc11Ns, xmlSecEncNs, xmlSecHrefDhEs, xmlSecHrefEcdh,
+    xmlSecHrefX448, xmlSecHrefX25519, xmlSecNameDhEs, xmlSecNameEcdh, xmlSecNameX448,
+    xmlSecNameX25519, xmlSecNodeKANonce, xmlSecNodeKeyDerivationMethod,
+    xmlSecNodeOriginatorKeyInfo, xmlSecNodeRecipientKeyInfo,
 };
 use super::super::tree::{XmlNode, nodes};
 use super::super::xdhkeys::{self, Curve, XdhKey};
@@ -101,12 +102,18 @@ const fn kam_klass(name: &'static [u8], href: &'static [u8]) -> XmlSecTransformK
 }
 
 static ECDH: XmlSecTransformKlass = kam_klass(&xmlSecNameEcdh, &xmlSecHrefEcdh);
+static DH_ES: XmlSecTransformKlass = kam_klass(&xmlSecNameDhEs, &xmlSecHrefDhEs);
 static X25519: XmlSecTransformKlass = kam_klass(&xmlSecNameX25519, &xmlSecHrefX25519);
 static X448: XmlSecTransformKlass = kam_klass(&xmlSecNameX448, &xmlSecHrefX448);
 
 /// The built-in table's `ECDH-ES` klass.
 pub(crate) extern "C" fn ecdh() -> *const XmlSecTransformKlass {
     &raw const ECDH
+}
+
+/// The built-in table's `DH-ES` klass.
+pub(crate) extern "C" fn dh_es() -> *const XmlSecTransformKlass {
+    &raw const DH_ES
 }
 
 /// The built-in table's `x25519` klass.
@@ -126,6 +133,8 @@ fn agreement(
 ) -> Option<(KeyAgreementAlgorithm, *const XmlSecKeyDataKlass)> {
     if std::ptr::eq(id, &raw const ECDH) {
         Some((KeyAgreementAlgorithm::EcdhEs, asymkeys::ec()))
+    } else if std::ptr::eq(id, &raw const DH_ES) {
+        Some((KeyAgreementAlgorithm::DhEs, asymkeys::dh()))
     } else if std::ptr::eq(id, &raw const X25519) {
         Some((KeyAgreementAlgorithm::X25519, xdhkeys::xdh()))
     } else if std::ptr::eq(id, &raw const X448) {
@@ -138,8 +147,8 @@ fn agreement(
 /// The key of one party of an agreement, as its key data holds it.
 #[derive(Clone, Copy)]
 enum Party<'a> {
-    /// An EC key, for ECDH-ES.
-    Ec(&'a Material),
+    /// An EC key, for ECDH-ES, or a DH key, for DH-ES.
+    Value(&'a Material),
     /// An X25519 or X448 key.
     Xdh(&'a XdhKey),
 }
@@ -148,9 +157,30 @@ impl<'a> Party<'a> {
     /// The PKCS#8 of the party's private key, when its key data holds one.
     fn private(self) -> Option<&'a [u8]> {
         match self {
-            Self::Ec(material) => material.private.as_deref().map(Vec::as_slice),
+            Self::Value(material) => material.private.as_deref().map(Vec::as_slice),
             Self::Xdh(key) => key.private.as_deref().map(Vec::as_slice),
         }
+    }
+
+    /// The p, q and g of a DH party's group, without leading zero octets.
+    fn dh_group(self) -> Option<[&'a [u8]; 3]> {
+        let Self::Value(Material {
+            value:
+                KeyValueInfo::Dh {
+                    p: Some(p),
+                    q: Some(q),
+                    generator: Some(generator),
+                    ..
+                },
+            ..
+        }) = self
+        else {
+            return None;
+        };
+        Some(
+            [p, q, generator]
+                .map(|bytes| &bytes[bytes.iter().take_while(|byte| **byte == 0).count()..]),
+        )
     }
 }
 
@@ -929,7 +959,7 @@ unsafe fn parties<'a>(
             *slot = if std::ptr::eq(key_id, xdhkeys::xdh()) {
                 xdhkeys::key_of(value).map(Party::Xdh)
             } else {
-                material_of(value).map(Party::Ec)
+                material_of(value).map(Party::Value)
             };
         }
         if let [Some(mine), Some(peer)] = found {
@@ -941,35 +971,57 @@ unsafe fn parties<'a>(
 }
 
 /// The private key of `party`, as the provider's key for `algorithm`; a
-/// key of another curve is refused by the import's algorithm check.
+/// key of another curve is refused by the import's algorithm check. A DH
+/// key's group is validated under `budget`, which its import charges.
 fn agreement_key(
     algorithm: KeyAgreementAlgorithm,
     party: Party<'_>,
+    budget: &mut KeyEstablishmentBudget<'_>,
 ) -> Result<Box<dyn KeyAgreementKey>, XmlEncError> {
     let private = party.private().ok_or(XmlEncError::KeyNotFound)?;
     match algorithm {
         KeyAgreementAlgorithm::EcdhEs => Ok(Box::new(RustCryptoEcdhKey::from_pkcs8_der(private)?)),
+        KeyAgreementAlgorithm::DhEs => Ok(Box::new(RustCryptoDhKey::from_pkcs8_der(
+            xml_sec::provider::default_provider(),
+            budget,
+            private,
+        )?)),
         KeyAgreementAlgorithm::X25519 => {
             Ok(Box::new(RustCryptoX25519Key::from_pkcs8_der(private)?))
         }
         KeyAgreementAlgorithm::X448 => Ok(Box::new(RustCryptoX448Key::from_pkcs8_der(private)?)),
-        _ => Err(XmlEncError::UnsupportedAlgorithm(
+        // XML Encryption 1.0's DH agreement has no klass of this library.
+        KeyAgreementAlgorithm::LegacyDh => Err(XmlEncError::UnsupportedAlgorithm(
             algorithm.uri().to_owned(),
         )),
     }
 }
 
-/// The public key of `party`, in the encoding `algorithm` agrees with; an
-/// X448 key for an X25519 agreement, or the other way, is no peer.
-fn peer_public(algorithm: KeyAgreementAlgorithm, party: Party<'_>) -> Result<&[u8], XmlEncError> {
+/// The public key of `party`, the peer of `mine`, in the encoding
+/// `algorithm` agrees with; an X448 key for an X25519 agreement, or the
+/// other way, or a DH key of another group, is no peer.
+fn peer_public<'a>(
+    algorithm: KeyAgreementAlgorithm,
+    mine: Party<'_>,
+    party: Party<'a>,
+) -> Result<&'a [u8], XmlEncError> {
     match (algorithm, party) {
         (
             KeyAgreementAlgorithm::EcdhEs,
-            Party::Ec(Material {
+            Party::Value(Material {
                 value: KeyValueInfo::Ec { public_key, .. },
                 ..
             }),
         ) => Ok(public_key),
+        // RFC 2631 section 2.1.1: both parties' keys are of the same group,
+        // as OpenSSL's derivation requires of its peer.
+        (
+            KeyAgreementAlgorithm::DhEs,
+            Party::Value(Material {
+                value: KeyValueInfo::Dh { public, .. },
+                ..
+            }),
+        ) if mine.dh_group().is_some() && party.dh_group() == mine.dh_group() => Ok(public),
         (KeyAgreementAlgorithm::X25519, Party::Xdh(key)) => match key.public() {
             Some((Curve::X25519, public)) => Ok(public),
             _ => Err(XmlEncError::KeyNotFound),
@@ -995,19 +1047,20 @@ fn agree(
     policy: &xml_sec::policy::KeyEstablishmentPolicy,
     usage: &mut xml_sec::key_establishment::KeyEstablishmentUsage,
 ) -> Result<zeroize::Zeroizing<Vec<u8>>, XmlEncError> {
-    let key = agreement_key(algorithm, mine)?;
     let agreement = KeyAgreementParameters {
         algorithm: algorithm.uri(),
-        peer_public_key: peer_public(algorithm, peer)?,
+        peer_public_key: peer_public(algorithm, mine, peer)?,
     };
     let parameters = method.parameters(width)?;
     let mut budget = KeyEstablishmentBudget::resume(policy, *usage)?;
-    let derived = budget.agree_and_derive(
-        xml_sec::provider::default_provider(),
-        key.as_ref(),
-        &agreement,
-        &parameters,
-    );
+    let derived = agreement_key(algorithm, mine, &mut budget).and_then(|key| {
+        budget.agree_and_derive(
+            xml_sec::provider::default_provider(),
+            key.as_ref(),
+            &agreement,
+            &parameters,
+        )
+    });
     *usage = budget.usage();
     derived
 }

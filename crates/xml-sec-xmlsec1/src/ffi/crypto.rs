@@ -193,6 +193,7 @@ static BUILTIN: Global<XmlSecCryptoDLFunctions> = Global::new(XmlSecCryptoDLFunc
     key_data_chacha20: Some(symkeys::chacha20),
     key_data_concat_kdf: Some(symkeys::concat_kdf),
     key_data_der_encoded_key_value: Some(asymkeys::der_encoded_key_value),
+    key_data_dh: Some(asymkeys::dh),
     key_data_dsa: Some(asymkeys::dsa),
     key_data_ec: Some(asymkeys::ec),
     key_data_rsa: Some(asymkeys::rsa),
@@ -212,6 +213,7 @@ static BUILTIN: Global<XmlSecCryptoDLFunctions> = Global::new(XmlSecCryptoDLFunc
     transform_pbkdf2: Some(kdf::pbkdf2),
     transform_hkdf: Some(kdf::hkdf),
     transform_ecdh: Some(kam::ecdh),
+    transform_dh_es: Some(kam::dh_es),
     transform_x25519: Some(kam::x25519),
     transform_x448: Some(kam::x448),
     #[cfg(feature = "legacy-algorithms")]
