@@ -3560,16 +3560,73 @@ fn only_agreement_keys_take_the_key_agreement_usage() {
 }
 
 #[test]
+fn a_dh_public_key_agrees_on_keys_only() {
+    // An X9.42 DH public key (RFC 3279 section 2.3.3) agrees on keys and
+    // nothing else, as an X25519 one: imported without a stated use it takes
+    // KEY_AGREEMENT, a request to verify or encrypt with it is refused, and
+    // an SPKI whose public value is no INTEGER is no DH key.
+    let der =
+        include_bytes!("../../tests/fixtures/xmlenc/keys/dhx/dhx-rfc5114-3-second-pubkey.der");
+    let resources = ResourcePolicy::default();
+    let mut inventory = KeyInventory::default();
+    inventory
+        .add_public_der("dh".into(), der.to_vec(), &resources)
+        .expect("a DH public key imports");
+    assert_eq!(inventory.public_keys[0].usages, KeyUsages::KEY_AGREEMENT);
+    for usages in [KeyUsages::VERIFY, KeyUsages::ENCRYPT] {
+        assert!(
+            KeyInventory::default()
+                .add_public_der_with_usages("dh".into(), der.to_vec(), usages, &resources)
+                .is_err(),
+            "{usages:?}"
+        );
+    }
+    // The BIT STRING holds INTEGER y after its unused-bits octet: turning
+    // the INTEGER tag into an OCTET STRING tag keeps every length.
+    let mut broken = der.to_vec();
+    // A four-octet header before the 256 octets of y ends the encoding.
+    let at = der.len() - 260;
+    assert_eq!(broken[at], 0x02, "the public INTEGER tag");
+    broken[at] = 0x04;
+    assert!(
+        KeyInventory::default()
+            .add_public_der("dh".into(), broken, &resources)
+            .is_err()
+    );
+}
+
+#[test]
 fn family_usages_follow_the_imported_key() {
-    // A caller that names no use gets the family's: X25519 and X448 keys
-    // agree on keys, from every container the inventory reads, the
+    // A caller that names no use gets the family's: X25519, X448 and X9.42
+    // DH keys agree on keys, from every container the inventory reads, the
     // password-protected PKCS#8 included; their public identity is the one
-    // the matching public key file holds.
+    // the matching public key file holds (a DH key's public value derived
+    // from the private one, RFC 3279 section 2.3.3).
     /// A private key file, its container and password, and the public key
     /// file of the same key.
     type Case<'a> = (&'a [u8], PrivateKeyContainer, Option<&'a [u8]>, &'a [u8]);
     let resources = ResourcePolicy::default();
-    let keys: [Case<'_>; 4] = [
+    let dh_public: &[u8] =
+        include_bytes!("../../tests/fixtures/xmlenc/keys/dhx/dhx-rfc5114-3-first-pubkey.der");
+    let keys: [Case<'_>; 7] = [
+        (
+            include_bytes!("../../tests/fixtures/xmlenc/keys/dhx/dhx-rfc5114-3-first-key.der"),
+            PrivateKeyContainer::Der,
+            None,
+            dh_public,
+        ),
+        (
+            include_bytes!("../../tests/fixtures/xmlenc/keys/dhx/dhx-rfc5114-3-first-key.pem"),
+            PrivateKeyContainer::Pem,
+            None,
+            dh_public,
+        ),
+        (
+            include_bytes!("../../tests/fixtures/xmlenc/keys/dhx/dhx-rfc5114-3-first-key.p8-der"),
+            PrivateKeyContainer::Pkcs8Der,
+            Some(b"secret123"),
+            dh_public,
+        ),
         (
             include_bytes!("../../tests/fixtures/xmlenc/keys/xdh/xdh-x25519-first-key.pem"),
             PrivateKeyContainer::Pem,

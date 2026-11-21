@@ -4,6 +4,7 @@
 mod bit_hash;
 mod dh;
 pub use dh::RustCryptoDhKey;
+pub(crate) use dh::pkcs8_public_value as dh_pkcs8_public_value;
 
 use crate::xmldsig::{DigestAlgorithm, SignatureAlgorithm};
 use p256::elliptic_curve::sec1::ToSec1Point;

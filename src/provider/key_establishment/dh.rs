@@ -121,6 +121,37 @@ impl RustCryptoDhKey {
         })
     }
 
+    /// Import an X9.42 DH (`dhpublicnumber`, RFC 3279 section 2.3.3) PKCS#8
+    /// private key, validated as [`Self::from_components`] validates it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use xml_sec::policy::{DecryptionPolicy, KeyAgreementAlgorithm};
+    /// use xml_sec::provider::{RUST_CRYPTO_PROVIDER, RustCryptoDhKey};
+    /// use xml_sec::xmlenc::KeyEstablishmentBudget;
+    ///
+    /// let der = include_bytes!("../../../tests/fixtures/xmlenc/keys/dhx/dhx-rfc5114-3-first-key.der");
+    /// let mut policy = DecryptionPolicy::default();
+    /// policy.key_establishment.agreement_algorithms = Some([KeyAgreementAlgorithm::DhEs].into());
+    /// let mut budget = KeyEstablishmentBudget::new(&policy.key_establishment)?;
+    /// let key = RustCryptoDhKey::from_pkcs8_der(&RUST_CRYPTO_PROVIDER, &mut budget, der)?;
+    /// assert_eq!(key.public_key().len(), 256);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// # Errors
+    /// Returns an error for a key of another algorithm or malformed encoding,
+    /// and as [`Self::from_components`] does.
+    pub fn from_pkcs8_der(
+        provider: &dyn CryptoProvider,
+        budget: &mut KeyEstablishmentBudget<'_>,
+        der: &[u8],
+    ) -> Result<Self, XmlEncError> {
+        let key = pkcs8_components(der)?;
+        Self::from_components(provider, budget, key.p, key.q, key.generator, key.private)
+    }
+
     /// Export the public value with the same fixed octet width as p.
     #[must_use]
     pub fn public_key(&self) -> Vec<u8> {
@@ -179,6 +210,79 @@ impl KeyAgreementKey for RustCryptoDhKey {
 
 fn invalid() -> ProviderError {
     ProviderError::InvalidInput(ProviderInputError::DhKey)
+}
+
+/// The unsigned big-endian components of an X9.42 DH private key.
+struct Components<'a> {
+    p: &'a [u8],
+    q: &'a [u8],
+    generator: &'a [u8],
+    private: &'a [u8],
+}
+
+/// The components of an X9.42 DH PKCS#8 private key (RFC 3279 section
+/// 2.3.3: `DomainParameters` as the algorithm parameters, the INTEGER x as
+/// the private key).
+fn pkcs8_components(der: &[u8]) -> Result<Components<'_>, ProviderError> {
+    use der::{Decode as _, asn1::UintRef};
+    let info = pkcs8::PrivateKeyInfoRef::try_from(der).map_err(|_| invalid())?;
+    if info.algorithm.oid != crate::xmldsig::keys::DH_PUBLIC_NUMBER {
+        return Err(invalid());
+    }
+    let [p, generator, q] =
+        crate::xmldsig::keys::x942_domain(info.algorithm.parameters).ok_or_else(invalid)?;
+    let private = UintRef::from_der(info.private_key.as_bytes()).map_err(|_| invalid())?;
+    Ok(Components {
+        p,
+        q,
+        generator,
+        private: private.as_bytes(),
+    })
+}
+
+/// The public value g^x mod p of an X9.42 DH PKCS#8 private key, at p's
+/// octet width, after the structural checks a key import makes: odd p within
+/// the safety ceiling, 1 < g < p-1 and 2 <= x <= q-2. Validating the group
+/// (primality, subgroup order) and its strength is the agreement's, under the
+/// operation's policy.
+pub(crate) fn pkcs8_public_value(der: &[u8]) -> Result<Vec<u8>, ProviderError> {
+    let Components {
+        p,
+        q,
+        generator,
+        private,
+    } = pkcs8_components(der)?;
+    let ceiling = crate::hard_limits::DH_MODULUS_BIT_CEILING / 8;
+    let p = significant(p);
+    if p.is_empty()
+        || p.len() > ceiling
+        || q.len() > p.len()
+        || generator.len() > p.len()
+        || private.len() > p.len()
+        || p.last().is_none_or(|v| v & 1 == 0)
+    {
+        return Err(invalid());
+    }
+    let precision = u32::try_from(bits(p).div_ceil(64)).map_err(|_| invalid())? * 64;
+    let modulus = decode(p, precision)?;
+    let order = decode(q, precision)?;
+    let generator = decode(generator, precision)?;
+    let private = Zeroizing::new(decode(private, precision)?);
+    let one = BoxedUint::one_with_precision(precision);
+    let two = decode(&[2], precision)?;
+    if generator <= one
+        || generator >= modulus.wrapping_sub(&one)
+        || *private < two
+        || order < two
+        || *private > order.wrapping_sub(&two)
+    {
+        return Err(invalid());
+    }
+    let params = BoxedMontyParams::new_vartime(Odd::new(modulus).ok_or_else(invalid)?);
+    let value = Zeroizing::new(BoxedMontyForm::new(generator, &params).pow(&private));
+    let integer = Zeroizing::new(value.retrieve());
+    let bytes = Zeroizing::new(integer.to_be_bytes());
+    Ok(bytes[bytes.len() - p.len()..].to_vec())
 }
 
 fn significant(bytes: &[u8]) -> &[u8] {
