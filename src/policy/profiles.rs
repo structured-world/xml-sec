@@ -8,8 +8,9 @@ use super::{
     KeyWrapAlgorithm, OaepDigestAlgorithm,
 };
 use super::{
-    DigestAlgorithm, KeySourceKind, KeySourcePolicy, PolicyViolation, RequestSelections,
-    RsaPssPermission, SameDocumentIdSemantics, SignatureAlgorithm, SigningPolicy, TransformPolicy,
+    DigestAlgorithm, KeyAgreementAlgorithm, KeyDerivationAlgorithm, KeyEstablishmentPolicy,
+    KeySourceKind, KeySourcePolicy, PolicyViolation, RequestSelections, RsaPssPermission,
+    SameDocumentIdSemantics, SignatureAlgorithm, SigningPolicy, TransformPolicy,
     UnknownX509CertificateSemantics, UriPolicy, UriTypeSet, VerificationPolicy,
     XsltStylesheetSemantics,
 };
@@ -383,7 +384,23 @@ fn profile_policies(
     #[cfg(feature = "xmlenc")]
     let decryption =
         (!legacy).then(|| decryption_profile(provider, compatibility, validity.clone()));
-    let signing = signing_profile(provider, constraints, validity, &verification, transforms);
+    let mut signing = signing_profile(provider, constraints, validity, &verification, transforms);
+    // Inbound operations admit the profile's key establishment ceiling;
+    // outbound ones produce only the modern set, as their other algorithm
+    // sets do.
+    let mut verification = verification;
+    verification.key_establishment = key_establishment_profile(provider, compatibility);
+    signing.key_establishment = key_establishment_profile(provider, false);
+    #[cfg(feature = "xmlenc")]
+    let (mut encryption, mut decryption) = (encryption, decryption);
+    #[cfg(feature = "xmlenc")]
+    if let Some(policy) = encryption.as_mut() {
+        policy.key_establishment = key_establishment_profile(provider, false);
+    }
+    #[cfg(feature = "xmlenc")]
+    if let Some(policy) = decryption.as_mut() {
+        policy.key_establishment = key_establishment_profile(provider, compatibility);
+    }
     PolicySet {
         verification: Some(verification),
         signing: (!legacy).then_some(signing),
@@ -604,6 +621,72 @@ const OAEP_MGF_DIGESTS: [OaepDigestAlgorithm; 5] = [
     OaepDigestAlgorithm::Sha384,
     OaepDigestAlgorithm::Sha512,
 ];
+
+/// The key establishment a profile admits, as explicit sets of what the
+/// provider can do: ECDH-ES and X25519 with `ConcatKDF`, HKDF or PBKDF2 over
+/// SHA-2 for every profile, and with `compatibility` also what libxmlsec1
+/// agrees and derives with: X448 and DH-ES, and SHA-1 and SHA-3 digests. A
+/// restricting layer narrows any of the sets.
+fn key_establishment_profile(
+    provider: &dyn CryptoProvider,
+    compatibility: bool,
+) -> KeyEstablishmentPolicy {
+    use KeyAgreementAlgorithm as A;
+    let agreements: &[A] = if compatibility {
+        &[A::EcdhEs, A::X25519, A::X448, A::DhEs]
+    } else {
+        &[A::EcdhEs, A::X25519]
+    };
+    let digests: &[DigestAlgorithm] = if compatibility {
+        &[
+            DigestAlgorithm::Sha1,
+            DigestAlgorithm::Sha224,
+            DigestAlgorithm::Sha256,
+            DigestAlgorithm::Sha384,
+            DigestAlgorithm::Sha512,
+            DigestAlgorithm::Sha3_224,
+            DigestAlgorithm::Sha3_256,
+            DigestAlgorithm::Sha3_384,
+            DigestAlgorithm::Sha3_512,
+        ]
+    } else {
+        &[
+            DigestAlgorithm::Sha224,
+            DigestAlgorithm::Sha256,
+            DigestAlgorithm::Sha384,
+            DigestAlgorithm::Sha512,
+        ]
+    };
+    KeyEstablishmentPolicy {
+        agreement_algorithms: Some(
+            agreements
+                .iter()
+                .copied()
+                .filter(|algorithm| {
+                    provider.supports(ProviderCapability::KeyAgreement(
+                        &crate::provider::KeyAgreementParameters {
+                            algorithm: algorithm.uri(),
+                            peer_public_key: &[],
+                        },
+                    ))
+                })
+                .collect(),
+        ),
+        derivation_algorithms: Some(BTreeSet::from([
+            KeyDerivationAlgorithm::ConcatKdf,
+            KeyDerivationAlgorithm::Hkdf,
+            KeyDerivationAlgorithm::Pbkdf2,
+        ])),
+        digest_algorithms: Some(
+            digests
+                .iter()
+                .copied()
+                .filter(|digest| provider.supports(ProviderCapability::Digest(*digest)))
+                .collect(),
+        ),
+        ..KeyEstablishmentPolicy::default()
+    }
+}
 
 #[cfg(feature = "xmlenc")]
 fn encryption_profile(

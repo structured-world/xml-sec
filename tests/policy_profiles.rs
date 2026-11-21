@@ -693,6 +693,101 @@ fn all_named_profiles_compile_and_legacy_requires_auditable_expiry() {
     assert!(compiled.encryption().is_none() && compiled.decryption().is_none());
 }
 
+#[cfg(feature = "xmlenc")]
+#[test]
+fn profiles_state_their_key_establishment_explicitly() {
+    // Every profile lists what it admits instead of leaving the core's
+    // implicit default: the effective policy names it, and a restricting
+    // layer intersects it element by element. The modern set is the one the
+    // implicit default meant; XmlSecCompatible's inbound ceiling adds what
+    // libxmlsec1 agrees and derives with, its outbound operations keep the
+    // modern set as their other algorithm sets do.
+    use xml_sec::policy::{KeyAgreementAlgorithm as A, KeyDerivationAlgorithm as K};
+    use xml_sec::xmldsig::DigestAlgorithm as D;
+    let modern_agreements = BTreeSet::from([A::EcdhEs, A::X25519]);
+    let derivations = BTreeSet::from([K::ConcatKdf, K::Hkdf, K::Pbkdf2]);
+    let sha2 = BTreeSet::from([D::Sha224, D::Sha256, D::Sha384, D::Sha512]);
+    let implicit = xml_sec::policy::KeyEstablishmentPolicy::default();
+    for profile in [
+        PolicyProfile::Modern,
+        PolicyProfile::SecureSaml,
+        PolicyProfile::WsSecurity,
+        PolicyProfile::Xades,
+        PolicyProfile::XmlSecCompatible,
+    ] {
+        let policies = compiler(profile).policies().clone();
+        let outbound = [
+            &policies.signing.as_ref().unwrap().key_establishment,
+            &policies.encryption.as_ref().unwrap().key_establishment,
+        ];
+        for policy in outbound {
+            assert_eq!(policy.agreement_algorithms, Some(modern_agreements.clone()));
+            assert_eq!(policy.derivation_algorithms, Some(derivations.clone()));
+            assert_eq!(policy.digest_algorithms, Some(sha2.clone()));
+            // The explicit modern set admits exactly what the implicit
+            // default admitted.
+            for algorithm in [A::EcdhEs, A::X25519, A::X448, A::DhEs, A::LegacyDh] {
+                assert_eq!(
+                    policy.check_agreement(algorithm).is_ok(),
+                    implicit.check_agreement(algorithm).is_ok(),
+                    "{profile:?} {algorithm:?}"
+                );
+            }
+        }
+        let inbound = [
+            &policies.verification.as_ref().unwrap().key_establishment,
+            &policies.decryption.as_ref().unwrap().key_establishment,
+        ];
+        for policy in inbound {
+            let compatible = profile == PolicyProfile::XmlSecCompatible;
+            let expected = if compatible {
+                BTreeSet::from([A::EcdhEs, A::X25519, A::X448, A::DhEs])
+            } else {
+                modern_agreements.clone()
+            };
+            assert_eq!(policy.agreement_algorithms, Some(expected), "{profile:?}");
+            assert_eq!(policy.derivation_algorithms, Some(derivations.clone()));
+            for digest in [D::Sha1, D::Sha3_256, D::Sha3_512] {
+                assert_eq!(
+                    policy.check_derivation_digest(digest).is_ok(),
+                    compatible,
+                    "{profile:?} {digest:?}"
+                );
+            }
+            // No profile admits the legacy DH derivation libxmlsec1 lacks.
+            assert!(policy.check_agreement(A::LegacyDh).is_err());
+        }
+    }
+}
+
+#[cfg(feature = "xmlenc")]
+#[test]
+fn a_layer_narrows_the_compatible_key_establishment_ceiling() {
+    // A deployment of the compatible profile switches off what it does not
+    // want: X448 and SHA-1 are refused once a layer lists the rest, and a
+    // layer naming more than the ceiling gains nothing.
+    use xml_sec::policy::KeyAgreementAlgorithm as A;
+    use xml_sec::xmldsig::DigestAlgorithm as D;
+    let initial = compiler(PolicyProfile::XmlSecCompatible);
+    let mut layer = initial.policies().clone();
+    let decryption = layer.decryption.as_mut().unwrap();
+    decryption.key_establishment.agreement_algorithms =
+        Some(BTreeSet::from([A::EcdhEs, A::X25519, A::DhEs, A::LegacyDh]));
+    decryption.key_establishment.digest_algorithms = Some(BTreeSet::from([D::Sha256, D::Sha3_256]));
+    let compiled = initial
+        .restrict(&layer)
+        .unwrap()
+        .compile(&context())
+        .unwrap();
+    let policy = &compiled.decryption().unwrap().key_establishment;
+    assert!(policy.check_agreement(A::DhEs).is_ok());
+    assert!(policy.check_agreement(A::X448).is_err());
+    assert!(policy.check_agreement(A::LegacyDh).is_err());
+    assert!(policy.check_derivation_digest(D::Sha3_256).is_ok());
+    assert!(policy.check_derivation_digest(D::Sha1).is_err());
+    assert!(policy.check_derivation_digest(D::Sha512).is_err());
+}
+
 #[test]
 fn layers_intersect_permissions_minima_and_resource_caps() {
     // An application cannot widen the inherited system policy even by naming

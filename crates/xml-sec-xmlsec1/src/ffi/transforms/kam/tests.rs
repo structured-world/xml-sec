@@ -498,60 +498,36 @@ fn an_x448_key_is_no_party_to_an_x25519_agreement() {
 }
 
 #[test]
-fn x448_agrees_only_where_the_policy_grants_it() {
-    // The library's profile admits ECDH-ES and X25519, not X448: the X448
-    // template is refused. Under a policy granting X448 the parties' keys
-    // agree on one secret from either side.
+fn x448_agrees_while_the_policy_admits_it() {
+    // The library's compatible profile admits X448, as libxmlsec1 agrees
+    // with it: both parties agree on the key encryption key. Once the
+    // published policy is narrowed to the other agreements, the same
+    // template is refused on either side.
     with_library(|| {
         let sender = [
             (X448_FIRST_KEY, c"originator-key-name"),
             (X448_SECOND_PUBLIC, c"recipient-key-name"),
         ];
-        assert!(!encrypts_with(X448_TEMPLATE, &sender));
-        let method = xml_sec::xmlenc::parse_key_derivation_method(
-            "<xenc11:KeyDerivationMethod xmlns:xenc11=\"http://www.w3.org/2009/xmlenc11#\" \
-             xmlns:dsig=\"http://www.w3.org/2000/09/xmldsig#\" \
-             Algorithm=\"http://www.w3.org/2009/xmlenc11#ConcatKDF\">\
-             <xenc11:ConcatKDFParams AlgorithmID=\"00\" PartyUInfo=\"00\" PartyVInfo=\"00\">\
-             <dsig:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>\
-             </xenc11:ConcatKDFParams></xenc11:KeyDerivationMethod>",
-            &xml_sec::policy::DecryptionPolicy::default(),
-        )
-        .expect("the method parses");
-        let granting = xml_sec::policy::KeyEstablishmentPolicy {
-            agreement_algorithms: Some(BTreeSet::from([KeyAgreementAlgorithm::X448])),
-            ..xml_sec::policy::KeyEstablishmentPolicy::default()
+        let recipient = [
+            (X448_SECOND_KEY, c"recipient-key-name"),
+            (X448_FIRST_PUBLIC, c"originator-key-name"),
+        ];
+        assert_eq!(
+            round_trip_between(X448_TEMPLATE, &sender, &recipient).as_deref(),
+            Some(&b"agreed content"[..])
+        );
+        let without_x448 = |policy: &mut xml_sec::policy::KeyEstablishmentPolicy| {
+            policy.agreement_algorithms = Some(BTreeSet::from([
+                KeyAgreementAlgorithm::EcdhEs,
+                KeyAgreementAlgorithm::X25519,
+            ]));
         };
-        let keys = [
-            X448_FIRST_KEY,
-            X448_SECOND_PUBLIC,
-            X448_SECOND_KEY,
-            X448_FIRST_PUBLIC,
-        ]
-        .map(pem_key);
-        // SAFETY: the keys loaded above, released below.
-        unsafe {
-            let party = |key| Party::Xdh(xdhkeys::key_of(xmlSecKeyGetValue(key)).expect("XDH"));
-            let mut usage = xml_sec::key_establishment::KeyEstablishmentUsage::default();
-            let mut derive = |mine, peer| {
-                agree(
-                    KeyAgreementAlgorithm::X448,
-                    &method,
-                    32,
-                    party(mine),
-                    party(peer),
-                    &granting,
-                    &mut usage,
-                )
-                .expect("X448 is granted")
-            };
-            let originator = derive(keys[0], keys[1]);
-            let recipient = derive(keys[2], keys[3]);
-            assert_eq!(originator, recipient);
-            for key in keys {
-                xmlSecKeyDestroy(key);
-            }
-        }
+        xml_sec_libxml2::policy::republish_encryption(
+            |encryption| without_x448(&mut encryption.key_establishment),
+            |decryption| without_x448(&mut decryption.key_establishment),
+        )
+        .expect("the library policy compiles");
+        assert!(!encrypts_with(X448_TEMPLATE, &sender));
     });
 }
 

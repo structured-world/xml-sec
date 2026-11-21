@@ -665,6 +665,15 @@ int main(void) {
     agreement_vector_with("agreement x25519 hkdf sha512",
                           "enc_xdh_x25519_hkdf_sha512_kw_aes256_aes128gcm",
                           XDH_KEYS "xdh-x25519-second-key.pem", XDH_KEYS "xdh-x25519-first-pubkey.pem");
+    agreement_vector_with("agreement x448 concatkdf sha384",
+                          "enc_xdh_x448_concatkdf_sha384_kw_aes256_aes128gcm",
+                          XDH_KEYS "xdh-x448-second-key.pem", XDH_KEYS "xdh-x448-first-pubkey.pem");
+    agreement_vector("agreement ecdh-es p256 concatkdf sha1",
+                     "enc_ecdh_p256_concatkdf_sha1_kw_aes256_aes128gcm", "256");
+    agreement_vector("agreement ecdh-es p256 concatkdf sha3-256",
+                     "enc_ecdh_p256_concatkdf_sha3_256_kw_aes256_aes128gcm", "256");
+    agreement_vector("agreement ecdh-es p256 pbkdf2 sha1",
+                     "enc_ecdh_p256_pbkdf2_1000_hmac_sha1_kw_aes256_aes128gcm", "256");
     agreement_round_trip("agreement ecdh-es round trip",
                          "enc_ecdh_p256_concatkdf_sha256_kw_aes256_aes128gcm", 0);
     agreement_round_trip("agreement ecdh-es with another originator key",
