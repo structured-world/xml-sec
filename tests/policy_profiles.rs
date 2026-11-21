@@ -698,13 +698,13 @@ fn all_named_profiles_compile_and_legacy_requires_auditable_expiry() {
 fn profiles_state_their_key_establishment_explicitly() {
     // Every profile lists what it admits instead of leaving the core's
     // implicit default: the effective policy names it, and a restricting
-    // layer intersects it element by element. The modern set is the one the
-    // implicit default meant; XmlSecCompatible's inbound ceiling adds what
-    // libxmlsec1 agrees and derives with, its outbound operations keep the
-    // modern set as their other algorithm sets do.
+    // layer intersects it element by element. The modern set is the implicit
+    // default plus X448 (RFC 7748); XmlSecCompatible's inbound ceiling adds
+    // what libxmlsec1 agrees and derives with, its outbound operations keep
+    // the modern set as their other algorithm sets do.
     use xml_sec::policy::{KeyAgreementAlgorithm as A, KeyDerivationAlgorithm as K};
     use xml_sec::xmldsig::DigestAlgorithm as D;
-    let modern_agreements = BTreeSet::from([A::EcdhEs, A::X25519]);
+    let modern_agreements = BTreeSet::from([A::EcdhEs, A::X25519, A::X448]);
     let derivations = BTreeSet::from([K::ConcatKdf, K::Hkdf, K::Pbkdf2]);
     let sha2 = BTreeSet::from([D::Sha224, D::Sha256, D::Sha384, D::Sha512]);
     let implicit = xml_sec::policy::KeyEstablishmentPolicy::default();
@@ -724,12 +724,12 @@ fn profiles_state_their_key_establishment_explicitly() {
             assert_eq!(policy.agreement_algorithms, Some(modern_agreements.clone()));
             assert_eq!(policy.derivation_algorithms, Some(derivations.clone()));
             assert_eq!(policy.digest_algorithms, Some(sha2.clone()));
-            // The explicit modern set admits exactly what the implicit
-            // default admitted.
+            // The explicit modern set admits what the implicit default
+            // admitted and X448, nothing else.
             for algorithm in [A::EcdhEs, A::X25519, A::X448, A::DhEs, A::LegacyDh] {
                 assert_eq!(
                     policy.check_agreement(algorithm).is_ok(),
-                    implicit.check_agreement(algorithm).is_ok(),
+                    algorithm == A::X448 || implicit.check_agreement(algorithm).is_ok(),
                     "{profile:?} {algorithm:?}"
                 );
             }
@@ -765,7 +765,8 @@ fn profiles_state_their_key_establishment_explicitly() {
 fn a_layer_narrows_the_compatible_key_establishment_ceiling() {
     // A deployment of the compatible profile switches off what it does not
     // want: X448 and SHA-1 are refused once a layer lists the rest, and a
-    // layer naming more than the ceiling gains nothing.
+    // layer naming more than the ceiling (the XML Encryption 1.0 DH) gains
+    // nothing.
     use xml_sec::policy::KeyAgreementAlgorithm as A;
     use xml_sec::xmldsig::DigestAlgorithm as D;
     let initial = compiler(PolicyProfile::XmlSecCompatible);

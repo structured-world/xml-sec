@@ -138,11 +138,10 @@ cannot override a fixed-method URI's semantics.
 
 Every named profile states these sets explicitly, so the effective output
 lists them and a layer narrows them element by element. Outbound operations
-(signing, encryption) admit ECDH-ES and X25519 with `ConcatKDF`, HKDF or
+(signing, encryption) admit ECDH-ES, X25519 and X448 with `ConcatKDF`, HKDF or
 PBKDF2 over SHA-2 in every profile. Inbound operations (verification,
 decryption) admit the same, except `XmlSecCompatible`, whose ceiling adds what
-libxmlsec1 agrees and derives with: X448, DH-ES, and SHA-1 and SHA-3 KDF
-digests. A layer switches any of them off by listing the rest; none of the
+libxmlsec1 agrees and derives with: DH-ES, and SHA-1 and SHA-3 KDF digests. A layer switches any of them off by listing the rest; none of the
 profiles admits the XML Encryption 1.0 `xmlenc#dh` agreement.
 
 `ExternalAuthenticated` asserts a caller-owned authenticity boundary; it does

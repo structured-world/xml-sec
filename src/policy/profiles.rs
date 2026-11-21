@@ -623,10 +623,10 @@ const OAEP_MGF_DIGESTS: [OaepDigestAlgorithm; 5] = [
 ];
 
 /// The key establishment a profile admits, as explicit sets of what the
-/// provider can do: ECDH-ES and X25519 with `ConcatKDF`, HKDF or PBKDF2 over
-/// SHA-2 for every profile, and with `compatibility` also what libxmlsec1
-/// agrees and derives with: X448 and DH-ES, and SHA-1 and SHA-3 digests. A
-/// restricting layer narrows any of the sets.
+/// provider can do: ECDH-ES, X25519 and X448 (RFC 7748) with `ConcatKDF`,
+/// HKDF or PBKDF2 over SHA-2 for every profile, and with `compatibility` also
+/// what libxmlsec1 agrees and derives with: DH-ES, and SHA-1 and SHA-3
+/// digests. A restricting layer narrows any of the sets.
 fn key_establishment_profile(
     provider: &dyn CryptoProvider,
     compatibility: bool,
@@ -635,7 +635,7 @@ fn key_establishment_profile(
     let agreements: &[A] = if compatibility {
         &[A::EcdhEs, A::X25519, A::X448, A::DhEs]
     } else {
-        &[A::EcdhEs, A::X25519]
+        &[A::EcdhEs, A::X25519, A::X448]
     };
     let digests: &[DigestAlgorithm] = if compatibility {
         &[
