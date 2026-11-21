@@ -57,6 +57,52 @@ enum Family {
 }
 
 impl KeyInventory {
+    /// Import the private key `bytes` hold in `container` under `name` for
+    /// every use its family permits: an RSA key signs and decrypts, an X25519
+    /// or X448 key only agrees on keys, any other key signs. For a caller
+    /// that loads a key without naming its use, as a libxmlsec1 application
+    /// does; otherwise [`KeyInventory::add_openssl_private_key`] states it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use xml_sec::key_manager::{KeyInventory, KeyUsage, PrivateKeyContainer};
+    /// use xml_sec::policy::ResourcePolicy;
+    ///
+    /// let pem = include_bytes!("../../tests/fixtures/keys/rsa/rsa-2048-key.pem");
+    /// let mut inventory = KeyInventory::default();
+    /// inventory.add_openssl_private_key_with_family_usages(
+    ///     "rsa".to_owned(),
+    ///     pem,
+    ///     PrivateKeyContainer::Pem,
+    ///     None,
+    ///     &ResourcePolicy::default(),
+    /// )?;
+    /// let usages = inventory.private_keys()[0].usages;
+    /// assert!(usages.allows(KeyUsage::Sign) && usages.allows(KeyUsage::Decrypt));
+    /// # Ok::<(), xml_sec::key_manager::KeyStoreError>(())
+    /// ```
+    ///
+    /// # Errors
+    /// As for [`KeyInventory::add_openssl_private_key`].
+    pub fn add_openssl_private_key_with_family_usages(
+        &mut self,
+        name: String,
+        bytes: &[u8],
+        container: PrivateKeyContainer,
+        password: Option<&[u8]>,
+        resources: &ResourcePolicy,
+    ) -> Result<(), KeyStoreError> {
+        self.add_openssl_private_key(
+            name,
+            bytes,
+            container,
+            password,
+            KeyUsages::FAMILY,
+            resources,
+        )
+    }
+
     /// Import the private key `bytes` hold in `container` under `name`.
     ///
     /// Passwords are consulted only for a structurally protected container:

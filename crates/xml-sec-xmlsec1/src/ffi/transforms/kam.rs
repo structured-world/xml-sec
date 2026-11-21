@@ -1,5 +1,6 @@
 //! The built-in provider's key agreement klasses, the transform an
-//! `AgreementMethod` element is: `ECDH-ES`.
+//! `AgreementMethod` element is: `ECDH-ES` over EC keys, `x25519` and
+//! `x448` over XDH keys.
 //!
 //! Reading its `AgreementMethod` the transform takes the parameters of the
 //! `KeyDerivationMethod` the core parses there and finds the originator's
@@ -15,7 +16,10 @@
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 
 use xml_sec::policy::{KeyAgreementAlgorithm, PolicyViolation};
-use xml_sec::provider::{KeyAgreementKey, KeyAgreementParameters, RustCryptoEcdhKey};
+use xml_sec::provider::{
+    KeyAgreementKey, KeyAgreementParameters, RustCryptoEcdhKey, RustCryptoX448Key,
+    RustCryptoX25519Key,
+};
 use xml_sec::xmldsig::{DigestAlgorithm, KeyValueInfo};
 use xml_sec::xmlenc::{KeyDerivationMethod, KeyEstablishmentBudget, XmlEncError};
 
@@ -33,11 +37,12 @@ use super::super::keys::{
 use super::super::keysdata::{XmlSecKeyData, XmlSecKeyDataKlass, check_id, data_valid};
 use super::super::policy::{Side, SlotPin};
 use super::super::strings::{
-    xmlSecAttrAlgorithm, xmlSecEnc11Ns, xmlSecEncNs, xmlSecHrefEcdh, xmlSecNameEcdh,
-    xmlSecNodeKANonce, xmlSecNodeKeyDerivationMethod, xmlSecNodeOriginatorKeyInfo,
-    xmlSecNodeRecipientKeyInfo,
+    xmlSecAttrAlgorithm, xmlSecEnc11Ns, xmlSecEncNs, xmlSecHrefEcdh, xmlSecHrefX448,
+    xmlSecHrefX25519, xmlSecNameEcdh, xmlSecNameX448, xmlSecNameX25519, xmlSecNodeKANonce,
+    xmlSecNodeKeyDerivationMethod, xmlSecNodeOriginatorKeyInfo, xmlSecNodeRecipientKeyInfo,
 };
 use super::super::tree::{XmlNode, nodes};
+use super::super::xdhkeys::{self, Curve, XdhKey};
 use super::super::xmltree::{next_element, xmlSecCheckNodeName};
 use super::super::{contain, write_stream};
 use super::builtin::klass;
@@ -96,10 +101,22 @@ const fn kam_klass(name: &'static [u8], href: &'static [u8]) -> XmlSecTransformK
 }
 
 static ECDH: XmlSecTransformKlass = kam_klass(&xmlSecNameEcdh, &xmlSecHrefEcdh);
+static X25519: XmlSecTransformKlass = kam_klass(&xmlSecNameX25519, &xmlSecHrefX25519);
+static X448: XmlSecTransformKlass = kam_klass(&xmlSecNameX448, &xmlSecHrefX448);
 
 /// The built-in table's `ECDH-ES` klass.
 pub(crate) extern "C" fn ecdh() -> *const XmlSecTransformKlass {
     &raw const ECDH
+}
+
+/// The built-in table's `x25519` klass.
+pub(crate) extern "C" fn x25519() -> *const XmlSecTransformKlass {
+    &raw const X25519
+}
+
+/// The built-in table's `x448` klass.
+pub(crate) extern "C" fn x448() -> *const XmlSecTransformKlass {
+    &raw const X448
 }
 
 /// The agreement of klass `id` and the key-data klass both parties' keys
@@ -107,7 +124,34 @@ pub(crate) extern "C" fn ecdh() -> *const XmlSecTransformKlass {
 fn agreement(
     id: *const XmlSecTransformKlass,
 ) -> Option<(KeyAgreementAlgorithm, *const XmlSecKeyDataKlass)> {
-    std::ptr::eq(id, &raw const ECDH).then(|| (KeyAgreementAlgorithm::EcdhEs, asymkeys::ec()))
+    if std::ptr::eq(id, &raw const ECDH) {
+        Some((KeyAgreementAlgorithm::EcdhEs, asymkeys::ec()))
+    } else if std::ptr::eq(id, &raw const X25519) {
+        Some((KeyAgreementAlgorithm::X25519, xdhkeys::xdh()))
+    } else if std::ptr::eq(id, &raw const X448) {
+        Some((KeyAgreementAlgorithm::X448, xdhkeys::xdh()))
+    } else {
+        None
+    }
+}
+
+/// The key of one party of an agreement, as its key data holds it.
+#[derive(Clone, Copy)]
+enum Party<'a> {
+    /// An EC key, for ECDH-ES.
+    Ec(&'a Material),
+    /// An X25519 or X448 key.
+    Xdh(&'a XdhKey),
+}
+
+impl<'a> Party<'a> {
+    /// The PKCS#8 of the party's private key, when its key data holds one.
+    fn private(self) -> Option<&'a [u8]> {
+        match self {
+            Self::Ec(material) => material.private.as_deref().map(Vec::as_slice),
+            Self::Xdh(key) => key.private.as_deref().map(Vec::as_slice),
+        }
+    }
 }
 
 /// The agreement object of a valid transform of these klasses, with its
@@ -852,7 +896,7 @@ unsafe fn parties<'a>(
     key_id: *const XmlSecKeyDataKlass,
     name: *const c_char,
     here: Here,
-) -> Option<(&'a Material, &'a Material)> {
+) -> Option<(Party<'a>, Party<'a>)> {
     // SAFETY: by the caller's contract.
     unsafe {
         if mine.is_null() || peer.is_null() {
@@ -882,7 +926,11 @@ unsafe fn parties<'a>(
                 );
                 return None;
             }
-            *slot = material_of(value);
+            *slot = if std::ptr::eq(key_id, xdhkeys::xdh()) {
+                xdhkeys::key_of(value).map(Party::Xdh)
+            } else {
+                material_of(value).map(Party::Ec)
+            };
         }
         if let [Some(mine), Some(peer)] = found {
             return Some((mine, peer));
@@ -892,30 +940,44 @@ unsafe fn parties<'a>(
     }
 }
 
-/// The private key `material` holds, as the provider's key for `algorithm`.
+/// The private key of `party`, as the provider's key for `algorithm`; a
+/// key of another curve is refused by the import's algorithm check.
 fn agreement_key(
     algorithm: KeyAgreementAlgorithm,
-    material: &Material,
+    party: Party<'_>,
 ) -> Result<Box<dyn KeyAgreementKey>, XmlEncError> {
-    let private = material
-        .private
-        .as_deref()
-        .ok_or(XmlEncError::KeyNotFound)?;
+    let private = party.private().ok_or(XmlEncError::KeyNotFound)?;
     match algorithm {
         KeyAgreementAlgorithm::EcdhEs => Ok(Box::new(RustCryptoEcdhKey::from_pkcs8_der(private)?)),
+        KeyAgreementAlgorithm::X25519 => {
+            Ok(Box::new(RustCryptoX25519Key::from_pkcs8_der(private)?))
+        }
+        KeyAgreementAlgorithm::X448 => Ok(Box::new(RustCryptoX448Key::from_pkcs8_der(private)?)),
         _ => Err(XmlEncError::UnsupportedAlgorithm(
             algorithm.uri().to_owned(),
         )),
     }
 }
 
-/// The public key `material` holds, in the encoding `algorithm` agrees with.
-fn peer_public(
-    algorithm: KeyAgreementAlgorithm,
-    material: &Material,
-) -> Result<&[u8], XmlEncError> {
-    match (algorithm, &material.value) {
-        (KeyAgreementAlgorithm::EcdhEs, KeyValueInfo::Ec { public_key, .. }) => Ok(public_key),
+/// The public key of `party`, in the encoding `algorithm` agrees with; an
+/// X448 key for an X25519 agreement, or the other way, is no peer.
+fn peer_public(algorithm: KeyAgreementAlgorithm, party: Party<'_>) -> Result<&[u8], XmlEncError> {
+    match (algorithm, party) {
+        (
+            KeyAgreementAlgorithm::EcdhEs,
+            Party::Ec(Material {
+                value: KeyValueInfo::Ec { public_key, .. },
+                ..
+            }),
+        ) => Ok(public_key),
+        (KeyAgreementAlgorithm::X25519, Party::Xdh(key)) => match key.public() {
+            Some((Curve::X25519, public)) => Ok(public),
+            _ => Err(XmlEncError::KeyNotFound),
+        },
+        (KeyAgreementAlgorithm::X448, Party::Xdh(key)) => match key.public() {
+            Some((Curve::X448, public)) => Ok(public),
+            _ => Err(XmlEncError::KeyNotFound),
+        },
         _ => Err(XmlEncError::KeyNotFound),
     }
 }
@@ -928,8 +990,8 @@ fn agree(
     algorithm: KeyAgreementAlgorithm,
     method: &KeyDerivationMethod,
     width: usize,
-    mine: &Material,
-    peer: &Material,
+    mine: Party<'_>,
+    peer: Party<'_>,
     policy: &xml_sec::policy::KeyEstablishmentPolicy,
     usage: &mut xml_sec::key_establishment::KeyEstablishmentUsage,
 ) -> Result<zeroize::Zeroizing<Vec<u8>>, XmlEncError> {

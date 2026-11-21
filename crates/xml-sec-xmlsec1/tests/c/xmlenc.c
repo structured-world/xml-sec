@@ -523,13 +523,13 @@ static void decrypt_agreed(xmlDocPtr doc, xmlSecKeysMngrPtr mngr, const xmlSecBy
     xmlSecEncCtxDestroy(ctx);
 }
 
-/* The donor vector `name`, encrypted to the recipient's P-`curve` key
- * under an ECDH-ES agreement with the originator's: decrypted by the
- * recipient holding its private key and the originator's public key. */
-static void agreement_vector(const char *label, const char *name, const char *curve) {
+/* The donor vector `name`, encrypted to the recipient's key under an
+ * agreement with the originator's: decrypted by the recipient holding its
+ * private key `private_path` and the originator's public key
+ * `public_path`. */
+static void agreement_vector_with(const char *label, const char *name, const char *private_path,
+                                  const char *public_path) {
     char path[512];
-    char private_path[256];
-    char public_path[256];
     static xmlSecByte expected[1 << 16];
     size_t expected_size = 0;
     xmlSecByte *data;
@@ -548,13 +548,22 @@ static void agreement_vector(const char *label, const char *name, const char *cu
         return;
     }
     doc = xsReadMemory((const char *)data, (int)strlen((const char *)data), "vector.xml", NULL, 0);
-    snprintf(private_path, sizeof(private_path), EC_KEYS "ec-prime%sv1-second-key.pem", curve);
-    snprintf(public_path, sizeof(public_path), EC_KEYS "ec-prime%sv1-pubkey.pem", curve);
     mngr = parties(private_path, "recipient-key-name", public_path, "originator-key-name");
     decrypt_agreed(doc, mngr, expected, expected_size);
     xmlSecKeysMngrDestroy(mngr);
     xsFreeDoc(doc);
 }
+
+/* An ECDH-ES donor vector over the P-`curve` keys. */
+static void agreement_vector(const char *label, const char *name, const char *curve) {
+    char private_path[256];
+    char public_path[256];
+    snprintf(private_path, sizeof(private_path), EC_KEYS "ec-prime%sv1-second-key.pem", curve);
+    snprintf(public_path, sizeof(public_path), EC_KEYS "ec-prime%sv1-pubkey.pem", curve);
+    agreement_vector_with(label, name, private_path, public_path);
+}
+
+#define XDH_KEYS "tests/fixtures/xmlenc/keys/xdh/"
 
 /* The donor template `name` encrypted by the originator holding its
  * private P-256 key and the recipient's public key, then decrypted by the
@@ -650,6 +659,12 @@ int main(void) {
                      "enc_ecdh_p384_concatkdf_sha384_kw_aes192_aes192gcm", "384");
     agreement_vector("agreement ecdh-es p521 concatkdf sha512",
                      "enc_ecdh_p521_concatkdf_sha512_kw_aes256_aes256gcm", "521");
+    agreement_vector_with("agreement x25519 concatkdf sha256",
+                          "enc_xdh_x25519_concatkdf_sha256_kw_aes256_aes128gcm",
+                          XDH_KEYS "xdh-x25519-second-key.pem", XDH_KEYS "xdh-x25519-first-pubkey.pem");
+    agreement_vector_with("agreement x25519 hkdf sha512",
+                          "enc_xdh_x25519_hkdf_sha512_kw_aes256_aes128gcm",
+                          XDH_KEYS "xdh-x25519-second-key.pem", XDH_KEYS "xdh-x25519-first-pubkey.pem");
     agreement_round_trip("agreement ecdh-es round trip",
                          "enc_ecdh_p256_concatkdf_sha256_kw_aes256_aes128gcm", 0);
     agreement_round_trip("agreement ecdh-es with another originator key",

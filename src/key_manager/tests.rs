@@ -3495,24 +3495,140 @@ fn eddsa_private_identity_matches_only_its_corresponding_spki() {
 }
 
 #[test]
-fn unsupported_spki_is_rejected_at_import() {
-    // A syntactically valid X25519 agreement key is not an Ed25519
-    // signing key and must not acquire VERIFY usage (RFC 8410 section 5).
+fn an_agreement_public_key_agrees_on_keys_only() {
+    // An X25519 key is no Ed25519 signing key and must not acquire VERIFY
+    // usage (RFC 8410 section 5): imported without a stated use it agrees on
+    // keys alone, and a request to verify or encrypt with it is refused.
     let mut agreement_spki = vec![
         0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x6e, 0x03, 0x21, 0x00,
     ];
     agreement_spki.extend_from_slice(&[1; 32]);
+    let resources = ResourcePolicy::default();
     let mut inventory = KeyInventory::default();
+    inventory
+        .add_public_der("agreement".into(), agreement_spki.clone(), &resources)
+        .expect("an X25519 public key imports");
+    assert_eq!(inventory.public_keys[0].usages, KeyUsages::KEY_AGREEMENT);
+    for usages in [
+        KeyUsages::VERIFY,
+        KeyUsages::ENCRYPT,
+        KeyUsages::KEY_AGREEMENT.union(KeyUsages::VERIFY),
+    ] {
+        let mut inventory = KeyInventory::default();
+        assert!(
+            inventory
+                .add_public_der_with_usages("a".into(), agreement_spki.clone(), usages, &resources)
+                .is_err(),
+            "{usages:?}"
+        );
+        assert!(inventory.public_keys.is_empty());
+    }
+    // A key of the wrong width for its curve is no X25519 key.
+    let mut short = agreement_spki[..agreement_spki.len() - 1].to_vec();
+    // The SEQUENCE length (octet 1) and BIT STRING length (octet 10).
+    short[1] -= 1;
+    short[10] -= 1;
     assert!(
-        inventory
-            .add_public_der(
-                "unsupported".into(),
-                agreement_spki,
-                &ResourcePolicy::default()
-            )
+        KeyInventory::default()
+            .add_public_der("short".into(), short, &resources)
             .is_err()
     );
-    assert!(inventory.public_keys.is_empty());
+}
+
+#[test]
+fn only_agreement_keys_take_the_key_agreement_usage() {
+    // KEY_AGREEMENT is the one use of an X25519 or X448 key and no use of
+    // any other family: an RSA key asked to agree is refused, an X25519 key
+    // asked to sign is refused, and the family's own use imports.
+    let resources = ResourcePolicy::default();
+    let rsa = include_bytes!("../../tests/fixtures/keys/rsa/rsa-2048-key.pem");
+    let x25519 = include_bytes!("../../tests/fixtures/xmlenc/keys/xdh/xdh-x25519-first-key.pem");
+    let import = |bytes: &[u8], usages| {
+        KeyInventory::default().add_openssl_private_key(
+            "key".into(),
+            bytes,
+            PrivateKeyContainer::Pem,
+            None,
+            usages,
+            &resources,
+        )
+    };
+    assert!(import(rsa, KeyUsages::KEY_AGREEMENT).is_err());
+    assert!(import(x25519, KeyUsages::SIGN).is_err());
+    assert!(import(x25519, KeyUsages::KEY_AGREEMENT.union(KeyUsages::SIGN)).is_err());
+    import(x25519, KeyUsages::KEY_AGREEMENT).expect("an X25519 key agrees");
+}
+
+#[test]
+fn family_usages_follow_the_imported_key() {
+    // A caller that names no use gets the family's: X25519 and X448 keys
+    // agree on keys, from every container the inventory reads, the
+    // password-protected PKCS#8 included; their public identity is the one
+    // the matching public key file holds.
+    /// A private key file, its container and password, and the public key
+    /// file of the same key.
+    type Case<'a> = (&'a [u8], PrivateKeyContainer, Option<&'a [u8]>, &'a [u8]);
+    let resources = ResourcePolicy::default();
+    let keys: [Case<'_>; 4] = [
+        (
+            include_bytes!("../../tests/fixtures/xmlenc/keys/xdh/xdh-x25519-first-key.pem"),
+            PrivateKeyContainer::Pem,
+            None,
+            include_bytes!("../../tests/fixtures/xmlenc/keys/xdh/xdh-x25519-first-pubkey.der"),
+        ),
+        (
+            include_bytes!("../../tests/fixtures/xmlenc/keys/xdh/xdh-x25519-first-key.p8-pem"),
+            PrivateKeyContainer::Pkcs8Pem,
+            Some(b"secret123"),
+            include_bytes!("../../tests/fixtures/xmlenc/keys/xdh/xdh-x25519-first-pubkey.der"),
+        ),
+        (
+            include_bytes!("../../tests/fixtures/xmlenc/keys/xdh/xdh-x448-first-key.der"),
+            PrivateKeyContainer::Der,
+            None,
+            include_bytes!("../../tests/fixtures/xmlenc/keys/xdh/xdh-x448-first-pubkey.der"),
+        ),
+        (
+            include_bytes!("../../tests/fixtures/xmlenc/keys/xdh/xdh-x448-first-key.p8-der"),
+            PrivateKeyContainer::Pkcs8Der,
+            Some(b"secret123"),
+            include_bytes!("../../tests/fixtures/xmlenc/keys/xdh/xdh-x448-first-pubkey.der"),
+        ),
+    ];
+    for (index, (bytes, container, password, public)) in keys.into_iter().enumerate() {
+        let mut inventory = KeyInventory::default();
+        inventory
+            .add_openssl_private_key_with_family_usages(
+                "key".into(),
+                bytes,
+                container,
+                password,
+                &resources,
+            )
+            .unwrap_or_else(|error| panic!("key {index}: {error}"));
+        let key = &inventory.private_keys()[0];
+        assert_eq!(key.usages, KeyUsages::KEY_AGREEMENT, "key {index}");
+        assert_eq!(
+            key.public_key_spki_der().expect("an identity"),
+            public,
+            "key {index}"
+        );
+    }
+    let rsa = include_bytes!("../../tests/fixtures/keys/rsa/rsa-2048-key.pem");
+    let mut inventory = KeyInventory::default();
+    inventory
+        .add_openssl_private_key_with_family_usages(
+            "rsa".into(),
+            rsa,
+            PrivateKeyContainer::Pem,
+            None,
+            &resources,
+        )
+        .expect("an RSA key imports");
+    assert_eq!(
+        inventory.private_keys()[0].usages,
+        KeyUsages::SIGN.union(KeyUsages::DECRYPT)
+    );
 }
 
 fn revoking_test_crl(root: &rcgen::Issuer<'_, rcgen::KeyPair>) -> rcgen::CertificateRevocationList {

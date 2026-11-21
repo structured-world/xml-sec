@@ -194,17 +194,79 @@ fn round_trip(template: &str, keys: &[(&[u8], &CStr)]) -> Option<Vec<u8>> {
 
 /// Whether the originator side ([`originator`]) encrypts into `template`.
 fn encrypts(template: &str) -> bool {
+    encrypts_with(
+        template,
+        &[
+            (ORIGINATOR_KEY, c"originator-key-name"),
+            (RECIPIENT_PUBLIC, c"recipient-key-name"),
+        ],
+    )
+}
+
+/// Whether the originator side `keys` holds encrypts into `template`.
+fn encrypts_with(template: &str, keys: &[(&[u8], &CStr)]) -> bool {
     // SAFETY: the library is initialized by the caller; every object is
     // released.
     unsafe {
         let doc = document(template);
-        let sender = originator();
+        let sender = manager(keys);
         let sent = encrypt(doc, sender, b"content");
         xmlSecKeysMngrDestroy(sender);
         xsFreeDoc(doc.cast());
         sent
     }
 }
+
+/// Encrypts with the side `sender` holds into `template`, which must
+/// succeed, then decrypts with the side `recipient` holds: the plaintext,
+/// `None` when the decryption fails.
+fn round_trip_between(
+    template: &str,
+    sender: &[(&[u8], &CStr)],
+    recipient: &[(&[u8], &CStr)],
+) -> Option<Vec<u8>> {
+    // SAFETY: the library is initialized by the caller; every object is
+    // released.
+    unsafe {
+        let doc = document(template);
+        let originator = manager(sender);
+        assert!(
+            encrypt(doc, originator, b"agreed content"),
+            "the originator encrypts"
+        );
+        let receiver = manager(recipient);
+        let result = decrypted(doc, receiver);
+        xmlSecKeysMngrDestroy(receiver);
+        xmlSecKeysMngrDestroy(originator);
+        xsFreeDoc(doc.cast());
+        result
+    }
+}
+
+const X25519_FIRST_KEY: &[u8] =
+    include_bytes!("../../../../../../tests/fixtures/xmlenc/keys/xdh/xdh-x25519-first-key.pem");
+const X25519_FIRST_PUBLIC: &[u8] =
+    include_bytes!("../../../../../../tests/fixtures/xmlenc/keys/xdh/xdh-x25519-first-pubkey.pem");
+const X25519_SECOND_KEY: &[u8] =
+    include_bytes!("../../../../../../tests/fixtures/xmlenc/keys/xdh/xdh-x25519-second-key.pem");
+const X25519_SECOND_PUBLIC: &[u8] =
+    include_bytes!("../../../../../../tests/fixtures/xmlenc/keys/xdh/xdh-x25519-second-pubkey.pem");
+const X448_FIRST_KEY: &[u8] =
+    include_bytes!("../../../../../../tests/fixtures/xmlenc/keys/xdh/xdh-x448-first-key.pem");
+const X448_SECOND_PUBLIC: &[u8] =
+    include_bytes!("../../../../../../tests/fixtures/xmlenc/keys/xdh/xdh-x448-second-pubkey.pem");
+const X448_SECOND_KEY: &[u8] =
+    include_bytes!("../../../../../../tests/fixtures/xmlenc/keys/xdh/xdh-x448-second-key.pem");
+const X448_FIRST_PUBLIC: &[u8] =
+    include_bytes!("../../../../../../tests/fixtures/xmlenc/keys/xdh/xdh-x448-first-pubkey.pem");
+/// The donor's X25519 template, its parties named as in [`TEMPLATE`].
+const X25519_TEMPLATE: &str = include_str!(
+    "../../../../../../tests/fixtures/xmlenc/aleksey-xmlenc-01/enc_xdh_x25519_concatkdf_sha256_kw_aes256_aes128gcm.tmpl"
+);
+/// The donor's X448 template.
+const X448_TEMPLATE: &str = include_str!(
+    "../../../../../../tests/fixtures/xmlenc/aleksey-xmlenc-01/enc_xdh_x448_concatkdf_sha256_kw_aes256_aes128gcm.tmpl"
+);
 
 /// The recipient's side: its private key and the originator's public key.
 const RECIPIENT: [(&[u8], &CStr); 2] = [
@@ -339,8 +401,8 @@ fn the_policy_decides_whether_the_parties_may_agree() {
         .expect("the method parses");
         // SAFETY: the keys loaded above, released below.
         unsafe {
-            let mine_material = material_of(xmlSecKeyGetValue(mine)).expect("an EC key");
-            let peer_material = material_of(xmlSecKeyGetValue(peer)).expect("an EC key");
+            let mine_material = Party::Ec(material_of(xmlSecKeyGetValue(mine)).expect("an EC key"));
+            let peer_material = Party::Ec(material_of(xmlSecKeyGetValue(peer)).expect("an EC key"));
             let refusing = xml_sec::policy::KeyEstablishmentPolicy {
                 agreement_algorithms: Some(BTreeSet::new()),
                 ..xml_sec::policy::KeyEstablishmentPolicy::default()
@@ -386,6 +448,109 @@ fn the_policy_decides_whether_the_parties_may_agree() {
             assert!(matches!(public_only, Err(XmlEncError::KeyNotFound)));
             xmlSecKeyDestroy(mine);
             xmlSecKeyDestroy(peer);
+        }
+    });
+}
+
+#[test]
+fn x25519_parties_agree_on_the_key_encryption_key() {
+    // X25519 keys loaded from key files agree as EC keys do (RFC 7748
+    // section 6.1): the recipient unwraps what the originator wrapped, and
+    // a recipient holding the wrong originator key unwraps nothing.
+    with_library(|| {
+        let sender = [
+            (X25519_FIRST_KEY, c"originator-key-name"),
+            (X25519_SECOND_PUBLIC, c"recipient-key-name"),
+        ];
+        let recipient = [
+            (X25519_SECOND_KEY, c"recipient-key-name"),
+            (X25519_FIRST_PUBLIC, c"originator-key-name"),
+        ];
+        assert_eq!(
+            round_trip_between(X25519_TEMPLATE, &sender, &recipient).as_deref(),
+            Some(&b"agreed content"[..])
+        );
+        let wrong = [
+            (X25519_SECOND_KEY, c"recipient-key-name"),
+            (X25519_SECOND_PUBLIC, c"originator-key-name"),
+        ];
+        assert_eq!(round_trip_between(X25519_TEMPLATE, &sender, &wrong), None);
+    });
+}
+
+#[test]
+fn an_x448_key_is_no_party_to_an_x25519_agreement() {
+    // Both curves are XDH key data, so the role lookup admits either; the
+    // agreement takes only a key of its own curve, as libxmlsec1 refuses
+    // the cross-curve pair by the secret's size.
+    with_library(|| {
+        let sender = [
+            (X448_FIRST_KEY, c"originator-key-name"),
+            (X25519_SECOND_PUBLIC, c"recipient-key-name"),
+        ];
+        assert!(!encrypts_with(X25519_TEMPLATE, &sender));
+        let mixed_peer = [
+            (X25519_FIRST_KEY, c"originator-key-name"),
+            (X448_SECOND_PUBLIC, c"recipient-key-name"),
+        ];
+        assert!(!encrypts_with(X25519_TEMPLATE, &mixed_peer));
+    });
+}
+
+#[test]
+fn x448_agrees_only_where_the_policy_grants_it() {
+    // The library's profile admits ECDH-ES and X25519, not X448: the X448
+    // template is refused. Under a policy granting X448 the parties' keys
+    // agree on one secret from either side.
+    with_library(|| {
+        let sender = [
+            (X448_FIRST_KEY, c"originator-key-name"),
+            (X448_SECOND_PUBLIC, c"recipient-key-name"),
+        ];
+        assert!(!encrypts_with(X448_TEMPLATE, &sender));
+        let method = xml_sec::xmlenc::parse_key_derivation_method(
+            "<xenc11:KeyDerivationMethod xmlns:xenc11=\"http://www.w3.org/2009/xmlenc11#\" \
+             xmlns:dsig=\"http://www.w3.org/2000/09/xmldsig#\" \
+             Algorithm=\"http://www.w3.org/2009/xmlenc11#ConcatKDF\">\
+             <xenc11:ConcatKDFParams AlgorithmID=\"00\" PartyUInfo=\"00\" PartyVInfo=\"00\">\
+             <dsig:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>\
+             </xenc11:ConcatKDFParams></xenc11:KeyDerivationMethod>",
+            &xml_sec::policy::DecryptionPolicy::default(),
+        )
+        .expect("the method parses");
+        let granting = xml_sec::policy::KeyEstablishmentPolicy {
+            agreement_algorithms: Some(BTreeSet::from([KeyAgreementAlgorithm::X448])),
+            ..xml_sec::policy::KeyEstablishmentPolicy::default()
+        };
+        let keys = [
+            X448_FIRST_KEY,
+            X448_SECOND_PUBLIC,
+            X448_SECOND_KEY,
+            X448_FIRST_PUBLIC,
+        ]
+        .map(pem_key);
+        // SAFETY: the keys loaded above, released below.
+        unsafe {
+            let party = |key| Party::Xdh(xdhkeys::key_of(xmlSecKeyGetValue(key)).expect("XDH"));
+            let mut usage = xml_sec::key_establishment::KeyEstablishmentUsage::default();
+            let mut derive = |mine, peer| {
+                agree(
+                    KeyAgreementAlgorithm::X448,
+                    &method,
+                    32,
+                    party(mine),
+                    party(peer),
+                    &granting,
+                    &mut usage,
+                )
+                .expect("X448 is granted")
+            };
+            let originator = derive(keys[0], keys[1]);
+            let recipient = derive(keys[2], keys[3]);
+            assert_eq!(originator, recipient);
+            for key in keys {
+                xmlSecKeyDestroy(key);
+            }
         }
     });
 }

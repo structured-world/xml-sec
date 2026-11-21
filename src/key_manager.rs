@@ -341,6 +341,7 @@ pub struct SigningLookupBudget {
 
 /// Operations for which a caller may authorize a key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum KeyUsage {
     /// `XMLDSig` signing.
     Sign,
@@ -350,6 +351,9 @@ pub enum KeyUsage {
     Encrypt,
     /// `XMLEnc` decryption or key unwrapping.
     Decrypt,
+    /// `XMLEnc` key agreement (`AgreementMethod`), the only use of an
+    /// X25519 or X448 key.
+    KeyAgreement,
 }
 
 /// Explicit, immutable allowed-use set for one imported key.
@@ -365,6 +369,12 @@ impl KeyUsages {
     pub const ENCRYPT: Self = Self(4);
     /// A key usable only for decryption.
     pub const DECRYPT: Self = Self(8);
+    /// A key usable only for key agreement.
+    pub const KEY_AGREEMENT: Self = Self(16);
+    /// Within the crate: the uses the imported key's family permits, resolved
+    /// once the key is decoded.
+    #[cfg(feature = "xmldsig-sign")]
+    const FAMILY: Self = Self(0x80);
 
     /// Combine disjoint permissions explicitly.
     #[must_use]
@@ -380,6 +390,7 @@ impl KeyUsages {
             KeyUsage::Verify => Self::VERIFY.0,
             KeyUsage::Encrypt => Self::ENCRYPT.0,
             KeyUsage::Decrypt => Self::DECRYPT.0,
+            KeyUsage::KeyAgreement => Self::KEY_AGREEMENT.0,
         };
         self.0 & bit != 0
     }
@@ -1806,6 +1817,48 @@ impl KeyInventory {
         Ok(())
     }
 
+    /// Store an RFC 8410 X25519 or X448 public key of `width` octets, which
+    /// only agrees on keys.
+    #[cfg(feature = "xmlenc")]
+    fn add_agreement_public_key(
+        &mut self,
+        name: String,
+        der: Vec<u8>,
+        width: usize,
+        usages: Option<KeyUsages>,
+        resources: &ResourcePolicy,
+    ) -> Result<(), KeyStoreError> {
+        let spki = pkcs8::SubjectPublicKeyInfoRef::from_der(&der)
+            .map_err(|_| KeyStoreError::Selection("invalid key agreement public key"))?;
+        // RFC 8410 section 4: absent parameters and the raw u-coordinate.
+        // https://www.rfc-editor.org/rfc/rfc8410.html#section-4
+        if spki.algorithm.parameters.is_some()
+            || spki.subject_public_key.as_bytes().map(<[u8]>::len) != Some(width)
+        {
+            return Err(KeyStoreError::Selection("invalid key agreement public key"));
+        }
+        let usages = usages.unwrap_or(KeyUsages::KEY_AGREEMENT);
+        if usages != KeyUsages::KEY_AGREEMENT {
+            return Err(KeyStoreError::Selection(
+                "X25519 and X448 public keys agree on keys, nothing else",
+            ));
+        }
+        self.reserve_material(named_material_length(&name, der.len(), 2)?, resources)?;
+        self.public_keys.push(StoredPublicKey {
+            key_info: KeyInfo {
+                sources: vec![
+                    KeyInfoSource::KeyName(name.clone()),
+                    KeyInfoSource::DerEncodedKeyValue(der),
+                ],
+                ..KeyInfo::default()
+            },
+            name,
+            usages,
+        });
+        self.entry_count += 1;
+        Ok(())
+    }
+
     fn add_public_der_payload(
         &mut self,
         name: String,
@@ -1817,7 +1870,9 @@ impl KeyInventory {
         session: &crate::xmldsig::pkix::CertificateSession,
     ) -> Result<(), KeyStoreError> {
         self.check_new_name(&name, resources)?;
-        let permitted = KeyUsages::VERIFY.union(KeyUsages::ENCRYPT);
+        let permitted = KeyUsages::VERIFY
+            .union(KeyUsages::ENCRYPT)
+            .union(KeyUsages::KEY_AGREEMENT);
         if usages.is_some_and(|usages| usages.0 == 0 || usages.0 & !permitted.0 != 0) {
             return Err(KeyStoreError::Selection("public key usage is incompatible"));
         }
@@ -1828,6 +1883,15 @@ impl KeyInventory {
             ));
         }
         self.check_material_capacity(named_material_length(&name, der.len(), 2)?, resources)?;
+        #[cfg(feature = "xmlenc")]
+        if let Some(width) = agreement_spki_width(&der) {
+            return self.add_agreement_public_key(name, der, width, usages, resources);
+        }
+        if usages.is_some_and(|usages| usages.allows(KeyUsage::KeyAgreement)) {
+            return Err(KeyStoreError::Selection(
+                "only X25519 and X448 keys can be used for key agreement",
+            ));
+        }
         #[cfg(feature = "experimental-pq")]
         if is_encapsulation_spki(session, &der)? {
             return self.add_encapsulation_public_key(name, der, usages, resources);
@@ -2062,10 +2126,14 @@ impl KeyInventory {
             ));
         }
         let identity = PrivateKeyIdentity::decode(&der)?;
+        let usages = if usages == KeyUsages::FAMILY {
+            identity.automatic_usages()
+        } else {
+            usages
+        };
         if usages.allows(KeyUsage::Decrypt) && !identity.can_decrypt() {
             return Err(KeyStoreError::Selection(CANNOT_DECRYPT));
         }
-        #[cfg(feature = "experimental-pq")]
         identity.validate_usages(usages)?;
         drop(identity);
         self.reserve_material(
@@ -2445,7 +2513,6 @@ impl KeyInventory {
                 "private key cannot recover encryption keys",
             ));
         }
-        #[cfg(feature = "experimental-pq")]
         identity.validate_usages(usages)?;
         let mut matching_leaf = None;
         let session = crate::xmldsig::pkix::CertificateSession::new(resources);
@@ -3022,6 +3089,20 @@ fn is_encapsulation_spki(
     }
 }
 
+/// The public key width of an SPKI naming id-X25519 (32 octets) or id-X448
+/// (56 octets), RFC 8410 section 3; `None` for any other DER.
+#[cfg(feature = "xmlenc")]
+fn agreement_spki_width(der: &[u8]) -> Option<usize> {
+    let spki = pkcs8::SubjectPublicKeyInfoRef::from_der(der).ok()?;
+    if spki.algorithm.oid == der::asn1::ObjectIdentifier::new_unwrap("1.3.101.110") {
+        Some(32)
+    } else if spki.algorithm.oid == der::asn1::ObjectIdentifier::new_unwrap("1.3.101.111") {
+        Some(56)
+    } else {
+        None
+    }
+}
+
 fn certificate_import_error(error: crate::xmldsig::X509ChainError) -> KeyStoreError {
     match error {
         crate::xmldsig::X509ChainError::Policy(error) => KeyStoreError::Policy(error),
@@ -3031,7 +3112,12 @@ fn certificate_import_error(error: crate::xmldsig::X509ChainError) -> KeyStoreEr
 
 #[cfg(feature = "xmldsig-sign")]
 fn validate_private_key_usages(usages: KeyUsages) -> Result<(), KeyStoreError> {
-    let permitted = KeyUsages::SIGN.union(KeyUsages::DECRYPT);
+    if usages == KeyUsages::FAMILY {
+        return Ok(());
+    }
+    let permitted = KeyUsages::SIGN
+        .union(KeyUsages::DECRYPT)
+        .union(KeyUsages::KEY_AGREEMENT);
     if usages.0 == 0 || usages.0 & !permitted.0 != 0 {
         return Err(KeyStoreError::Selection(
             "private key usage is incompatible",
@@ -3221,6 +3307,13 @@ enum PrivateKeyIdentity<'a> {
         public: [u8; 57],
         length: usize,
     },
+    /// An X25519 or X448 key (RFC 8410), which only agrees on keys.
+    #[cfg(feature = "xmlenc")]
+    Agreement {
+        algorithm: pkcs8::AlgorithmIdentifierRef<'a>,
+        public: [u8; 56],
+        length: usize,
+    },
     #[cfg(feature = "experimental-pq")]
     PostQuantum {
         algorithm: pkcs8::AlgorithmIdentifierRef<'a>,
@@ -3236,6 +3329,8 @@ impl<'a> PrivateKeyIdentity<'a> {
             Self::Rsa(_) => KeyUsages::SIGN.union(KeyUsages::DECRYPT),
             #[cfg(feature = "experimental-pq")]
             Self::Encapsulation { .. } => KeyUsages::DECRYPT,
+            #[cfg(feature = "xmlenc")]
+            Self::Agreement { .. } => KeyUsages::KEY_AGREEMENT,
             _ => KeyUsages::SIGN,
         }
     }
@@ -3249,14 +3344,65 @@ impl<'a> PrivateKeyIdentity<'a> {
         }
     }
 
-    #[cfg(feature = "experimental-pq")]
     fn validate_usages(&self, usages: KeyUsages) -> Result<(), KeyStoreError> {
+        #[cfg(feature = "experimental-pq")]
         if matches!(self, Self::Encapsulation { .. }) && usages != KeyUsages::DECRYPT {
             return Err(KeyStoreError::Selection(
                 "ML-KEM private keys require DECRYPT-only usage",
             ));
         }
+        // RFC 8410 section 5: an X25519 or X448 key agrees on keys and does
+        // nothing else; no other key family here is an agreement-only key.
+        let agreement = self.automatic_usages() == KeyUsages::KEY_AGREEMENT;
+        if agreement && usages != KeyUsages::KEY_AGREEMENT {
+            return Err(KeyStoreError::Selection(
+                "X25519 and X448 private keys require KEY_AGREEMENT-only usage",
+            ));
+        }
+        if !agreement && usages.allows(KeyUsage::KeyAgreement) {
+            return Err(KeyStoreError::Selection(
+                "only X25519 and X448 keys can be used for key agreement",
+            ));
+        }
         Ok(())
+    }
+
+    /// The identity of an RFC 8410 id-X25519 or id-X448 key `der` of
+    /// `algorithm`, decoded by the provider, which checks the absent
+    /// parameters, the nested octet string and any included public key
+    /// (sections 3 and 7); `None` for a key of any other algorithm.
+    #[cfg(feature = "xmlenc")]
+    fn decode_agreement(
+        algorithm: pkcs8::AlgorithmIdentifierRef<'a>,
+        der: &[u8],
+    ) -> Option<Result<Self, KeyStoreError>> {
+        if algorithm.oid == der::asn1::ObjectIdentifier::new_unwrap("1.3.101.110") {
+            return Some(
+                crate::provider::RustCryptoX25519Key::from_pkcs8_der(der)
+                    .map(|key| {
+                        let mut public = [0; 56];
+                        public[..32].copy_from_slice(&key.public_key());
+                        Self::Agreement {
+                            algorithm,
+                            public,
+                            length: 32,
+                        }
+                    })
+                    .map_err(|_| KeyStoreError::Selection("invalid X25519 private key")),
+            );
+        }
+        if algorithm.oid == der::asn1::ObjectIdentifier::new_unwrap("1.3.101.111") {
+            return Some(
+                crate::provider::RustCryptoX448Key::from_pkcs8_der(der)
+                    .map(|key| Self::Agreement {
+                        algorithm,
+                        public: key.public_key(),
+                        length: 56,
+                    })
+                    .map_err(|_| KeyStoreError::Selection("invalid X448 private key")),
+            );
+        }
+        None
     }
 
     fn decode(der: &'a [u8]) -> Result<Self, KeyStoreError> {
@@ -3317,6 +3463,10 @@ impl<'a> PrivateKeyIdentity<'a> {
                 public: key.verifying_key().to_bytes(),
                 length: 57,
             });
+        }
+        #[cfg(feature = "xmlenc")]
+        if let Some(agreement) = Self::decode_agreement(info.algorithm, der) {
+            return agreement;
         }
         if info.algorithm.oid == pkcs1::ALGORITHM_OID {
             preflight_rsa_pkcs1_components(info.private_key.as_bytes())?;
@@ -3393,6 +3543,12 @@ impl<'a> PrivateKeyIdentity<'a> {
                 public,
                 length,
             } => spki(*algorithm, &public[..*length]),
+            #[cfg(feature = "xmlenc")]
+            Self::Agreement {
+                algorithm,
+                public,
+                length,
+            } => spki(*algorithm, &public[..*length]),
             #[cfg(feature = "experimental-pq")]
             Self::Encapsulation {
                 algorithm,
@@ -3429,6 +3585,12 @@ impl<'a> PrivateKeyIdentity<'a> {
                 length,
             } => spki.algorithm == *algorithm && bytes == &public[..*length],
             Self::EdDsa {
+                algorithm,
+                public,
+                length,
+            } => spki.algorithm == *algorithm && bytes == &public[..*length],
+            #[cfg(feature = "xmlenc")]
+            Self::Agreement {
                 algorithm,
                 public,
                 length,

@@ -19,6 +19,7 @@ use zeroize::Zeroizing;
 use super::asymkeys::{self, Material};
 use super::errors::{self, Here, here};
 use super::keys::{XmlSecKey, xmlSecKeyCreate, xmlSecKeyDestroy, xmlSecKeySetValue};
+use super::xdhkeys::{self, XdhKey};
 use super::{contain, policy};
 
 /// `xmlSecKeyDataFormatPem`.
@@ -100,22 +101,30 @@ impl Password {
     }
 }
 
-/// The material of the private key `bytes` hold in `container`, asking
-/// `password` only when the container is protected.
+/// A key a file holds, as the key data of its klass will hold it.
+enum Loaded {
+    /// An RSA, DSA or EC key.
+    Asymmetric(Material),
+    /// An X25519 or X448 key, which only agrees on keys.
+    Xdh(XdhKey),
+}
+
+/// The private key `bytes` hold in `container`, asking `password` only when
+/// the container is protected. The key is imported for the uses its family
+/// permits, as a libxmlsec1 application loads a key without naming its use.
 fn private_key(
     bytes: &[u8],
     container: PrivateKeyContainer,
     password: &Password,
     resources: &ResourcePolicy,
-) -> Result<Material, KeyStoreError> {
+) -> Result<Loaded, KeyStoreError> {
     let import = |secret: Option<&[u8]>| {
         let mut inventory = KeyInventory::default();
-        inventory.add_openssl_private_key(
+        inventory.add_openssl_private_key_with_family_usages(
             "key".to_owned(),
             bytes,
             container,
             secret,
-            KeyUsages::SIGN,
             resources,
         )?;
         Ok::<_, KeyStoreError>(inventory)
@@ -133,20 +142,21 @@ fn private_key(
         .first()
         .ok_or(KeyStoreError::Selection("no private key imported"))?;
     let spki = key.public_key_spki_der()?;
+    let private = Some(Zeroizing::new(key.pkcs8_der().to_vec()));
+    if key.usages == KeyUsages::KEY_AGREEMENT {
+        return Ok(Loaded::Xdh(XdhKey { spki, private }));
+    }
     let value = KeyValueInfo::from_spki_der(&spki, resources)
         .map_err(|_| KeyStoreError::Selection("unsupported private key family"))?;
-    Ok(Material {
-        value,
-        private: Some(Zeroizing::new(key.pkcs8_der().to_vec())),
-    })
+    Ok(Loaded::Asymmetric(Material { value, private }))
 }
 
-/// The material of the public key in PEM (`pem`) or DER `bytes`.
+/// The public key in PEM (`pem`) or DER `bytes`.
 fn public_key(
     bytes: &[u8],
     pem: bool,
     resources: &ResourcePolicy,
-) -> Result<Material, KeyStoreError> {
+) -> Result<Loaded, KeyStoreError> {
     let mut inventory = KeyInventory::default();
     if pem {
         inventory.add_public_pem("key", bytes, resources)?;
@@ -157,6 +167,21 @@ fn public_key(
         .public_keys()
         .first()
         .ok_or(KeyStoreError::Selection("no public key imported"))?;
+    if key.usages == KeyUsages::KEY_AGREEMENT {
+        let spki = key
+            .key_info
+            .sources
+            .iter()
+            .find_map(|source| match source {
+                KeyInfoSource::DerEncodedKeyValue(spki) => Some(spki.clone()),
+                _ => None,
+            })
+            .ok_or(KeyStoreError::Selection("no public key imported"))?;
+        return Ok(Loaded::Xdh(XdhKey {
+            spki,
+            private: None,
+        }));
+    }
     let value = key
         .key_info
         .sources
@@ -170,10 +195,10 @@ fn public_key(
             _ => None,
         })
         .ok_or(KeyStoreError::Selection("no public key imported"))??;
-    Ok(Material {
+    Ok(Loaded::Asymmetric(Material {
         value,
         private: None,
-    })
+    }))
 }
 
 /// The key material `bytes` of `format` hold: for PEM and DER a private
@@ -183,10 +208,10 @@ fn material(
     format: c_int,
     password: &Password,
     resources: &ResourcePolicy,
-) -> Result<Option<Material>, KeyStoreError> {
+) -> Result<Option<Loaded>, KeyStoreError> {
     // A protected container or a policy refusal is the private key's own
     // failure: only bytes that hold no private key are read as a public one.
-    let or_public = |private: Result<Material, KeyStoreError>, pem: bool| match private {
+    let or_public = |private: Result<Loaded, KeyStoreError>, pem: bool| match private {
         Err(error @ (KeyStoreError::ProtectedContainer | KeyStoreError::Policy(_))) => Err(error),
         Err(_) => public_key(bytes, pem, resources),
         found => found,
@@ -219,8 +244,8 @@ unsafe fn load(
     resources: &ResourcePolicy,
 ) -> *mut c_void {
     let null = std::ptr::null_mut();
-    let material = match material(bytes, format, password, resources) {
-        Ok(Some(material)) => material,
+    let loaded = match material(bytes, format, password, resources) {
+        Ok(Some(loaded)) => loaded,
         Ok(None) => {
             errors::report(
                 here,
@@ -236,7 +261,10 @@ unsafe fn load(
             return null;
         }
     };
-    key_with(here, material, None)
+    match loaded {
+        Loaded::Asymmetric(material) => key_with(here, material, None),
+        Loaded::Xdh(key) => key_holding(here, xdhkeys::adopt(key), None),
+    }
 }
 
 /// A new key whose value holds `material`, with `x509` as its X.509 data
@@ -246,8 +274,17 @@ pub(crate) fn key_with(
     material: Material,
     x509: Option<super::x509::data::X509State>,
 ) -> *mut c_void {
+    key_holding(here, asymkeys::adopt(material), x509)
+}
+
+/// A new key whose value is the new key data `data`, with `x509` as its
+/// X.509 data when given; null after a report at `here`, `data` released.
+fn key_holding(
+    here: Here,
+    data: *mut super::keysdata::XmlSecKeyData,
+    x509: Option<super::x509::data::X509State>,
+) -> *mut c_void {
     let null = std::ptr::null_mut();
-    let data = asymkeys::adopt(material);
     if data.is_null() {
         errors::internal(here, std::ptr::null(), c"xmlSecKeyDataCreate");
         return null;
