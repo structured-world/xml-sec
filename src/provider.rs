@@ -17,6 +17,8 @@ mod key_establishment;
 #[cfg(feature = "pkcs11")]
 pub mod pkcs11;
 #[cfg(feature = "xmlenc")]
+pub(crate) use key_establishment::dh_pkcs8_public_value;
+#[cfg(feature = "xmlenc")]
 pub use key_establishment::{
     EcdhCurve, RustCryptoDhKey, RustCryptoEcdhKey, RustCryptoX448Key, RustCryptoX25519Key,
 };

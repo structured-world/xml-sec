@@ -1166,6 +1166,45 @@ unsafe fn node_read(
     })
 }
 
+/// The registered klass of algorithm `href` for `usage`, when `ctx` enables
+/// it; null after libxmlsec1's report at `here` otherwise.
+///
+/// # Safety
+/// `ctx` is an initialized context; `href` is NUL-terminated.
+pub(crate) unsafe fn enabled_klass(
+    href: *const u8,
+    usage: c_uint,
+    ctx: *mut XmlSecTransformCtx,
+    here: errors::Here,
+) -> *const XmlSecTransformKlass {
+    // SAFETY: by the caller's contract.
+    unsafe {
+        let algorithm = || format!("href={}", klass_text(href));
+        let id = xmlSecTransformIdListFindByHref(xmlSecTransformIdsGet(), href, usage);
+        if id.is_null() {
+            errors::internal_with(
+                here,
+                std::ptr::null(),
+                c"xmlSecTransformIdListFindByHref",
+                &algorithm(),
+            );
+            return std::ptr::null();
+        }
+        let enabled = &raw mut (*ctx).enabled_transforms;
+        if xmlSecPtrListGetSize(enabled) > 0 && xmlSecTransformIdListFind(enabled, id) != 1 {
+            errors::report(
+                here,
+                (*id).name.cast(),
+                std::ptr::null(),
+                errors::R_TRANSFORM_DISABLED,
+                &algorithm(),
+            );
+            return std::ptr::null();
+        }
+        id
+    }
+}
+
 /// The transform for algorithm `href` read from `node` for `operation`.
 ///
 /// # Safety
@@ -1180,29 +1219,11 @@ unsafe fn read_algorithm(
     // SAFETY: by the caller's contract.
     unsafe {
         let here = here!("xmlSecTransformNodeRead");
-        let algorithm = || format!("href={}", klass_text(href));
-        let id = xmlSecTransformIdListFindByHref(xmlSecTransformIdsGet(), href, usage);
+        let id = enabled_klass(href, usage, ctx, here);
         if id.is_null() {
-            errors::internal_with(
-                here,
-                std::ptr::null(),
-                c"xmlSecTransformIdListFindByHref",
-                &algorithm(),
-            );
             return std::ptr::null_mut();
         }
         let name = (*id).name.cast();
-        let enabled = &raw mut (*ctx).enabled_transforms;
-        if xmlSecPtrListGetSize(enabled) > 0 && xmlSecTransformIdListFind(enabled, id) != 1 {
-            errors::report(
-                here,
-                name,
-                std::ptr::null(),
-                errors::R_TRANSFORM_DISABLED,
-                &algorithm(),
-            );
-            return std::ptr::null_mut();
-        }
         let transform = xmlSecTransformCreate(id);
         let Some((_, klass)) = valid(transform) else {
             errors::internal(here, name, c"xmlSecTransformCreate(id)");

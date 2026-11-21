@@ -11,7 +11,7 @@
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 
-use xml_sec::key_manager::{KeyInventory, KeyStoreError, KeyUsages, PrivateKeyContainer};
+use xml_sec::key_manager::{KeyInventory, KeyStoreError, PrivateKeyContainer};
 use xml_sec::policy::ResourcePolicy;
 use xml_sec::xmldsig::{KeyInfoSource, KeyValueInfo};
 use zeroize::Zeroizing;
@@ -19,6 +19,7 @@ use zeroize::Zeroizing;
 use super::asymkeys::{self, Material};
 use super::errors::{self, Here, here};
 use super::keys::{XmlSecKey, xmlSecKeyCreate, xmlSecKeyDestroy, xmlSecKeySetValue};
+use super::xdhkeys::{self, XdhKey};
 use super::{contain, policy};
 
 /// `xmlSecKeyDataFormatPem`.
@@ -100,22 +101,47 @@ impl Password {
     }
 }
 
-/// The material of the private key `bytes` hold in `container`, asking
-/// `password` only when the container is protected.
+/// A key a file holds, as the key data of its klass will hold it.
+enum Loaded {
+    /// An RSA, DSA, EC or DH key.
+    Asymmetric(Material),
+    /// An X25519 or X448 key, which only agrees on keys.
+    Xdh(XdhKey),
+}
+
+impl Loaded {
+    /// The key whose public key is the SPKI `spki`, with `private` PKCS#8:
+    /// an XDH key, or the key value of another family.
+    fn from_spki(
+        spki: Vec<u8>,
+        private: Option<Zeroizing<Vec<u8>>>,
+        resources: &ResourcePolicy,
+    ) -> Result<Self, KeyStoreError> {
+        if xdhkeys::public_of(&spki).is_some() {
+            return Ok(Self::Xdh(XdhKey { spki, private }));
+        }
+        let value = KeyValueInfo::from_spki_der(&spki, resources)
+            .map_err(|_| KeyStoreError::Selection("unsupported key family"))?;
+        Ok(Self::Asymmetric(Material { value, private }))
+    }
+}
+
+/// The private key `bytes` hold in `container`, asking `password` only when
+/// the container is protected. The key is imported for the uses its family
+/// permits, as a libxmlsec1 application loads a key without naming its use.
 fn private_key(
     bytes: &[u8],
     container: PrivateKeyContainer,
     password: &Password,
     resources: &ResourcePolicy,
-) -> Result<Material, KeyStoreError> {
+) -> Result<Loaded, KeyStoreError> {
     let import = |secret: Option<&[u8]>| {
         let mut inventory = KeyInventory::default();
-        inventory.add_openssl_private_key(
+        inventory.add_openssl_private_key_with_family_usages(
             "key".to_owned(),
             bytes,
             container,
             secret,
-            KeyUsages::SIGN,
             resources,
         )?;
         Ok::<_, KeyStoreError>(inventory)
@@ -133,20 +159,16 @@ fn private_key(
         .first()
         .ok_or(KeyStoreError::Selection("no private key imported"))?;
     let spki = key.public_key_spki_der()?;
-    let value = KeyValueInfo::from_spki_der(&spki, resources)
-        .map_err(|_| KeyStoreError::Selection("unsupported private key family"))?;
-    Ok(Material {
-        value,
-        private: Some(Zeroizing::new(key.pkcs8_der().to_vec())),
-    })
+    let private = Some(Zeroizing::new(key.pkcs8_der().to_vec()));
+    Loaded::from_spki(spki, private, resources)
 }
 
-/// The material of the public key in PEM (`pem`) or DER `bytes`.
+/// The public key in PEM (`pem`) or DER `bytes`.
 fn public_key(
     bytes: &[u8],
     pem: bool,
     resources: &ResourcePolicy,
-) -> Result<Material, KeyStoreError> {
+) -> Result<Loaded, KeyStoreError> {
     let mut inventory = KeyInventory::default();
     if pem {
         inventory.add_public_pem("key", bytes, resources)?;
@@ -157,23 +179,20 @@ fn public_key(
         .public_keys()
         .first()
         .ok_or(KeyStoreError::Selection("no public key imported"))?;
-    let value = key
-        .key_info
+    key.key_info
         .sources
         .iter()
         .find_map(|source| match source {
-            KeyInfoSource::KeyValue(value) => Some(Ok(value.clone())),
-            KeyInfoSource::DerEncodedKeyValue(spki) => Some(
-                KeyValueInfo::from_spki_der(spki, resources)
-                    .map_err(|_| KeyStoreError::Selection("unsupported public key family")),
-            ),
+            KeyInfoSource::KeyValue(value) => Some(Ok(Loaded::Asymmetric(Material {
+                value: value.clone(),
+                private: None,
+            }))),
+            KeyInfoSource::DerEncodedKeyValue(spki) => {
+                Some(Loaded::from_spki(spki.clone(), None, resources))
+            }
             _ => None,
         })
-        .ok_or(KeyStoreError::Selection("no public key imported"))??;
-    Ok(Material {
-        value,
-        private: None,
-    })
+        .ok_or(KeyStoreError::Selection("no public key imported"))?
 }
 
 /// The key material `bytes` of `format` hold: for PEM and DER a private
@@ -183,10 +202,10 @@ fn material(
     format: c_int,
     password: &Password,
     resources: &ResourcePolicy,
-) -> Result<Option<Material>, KeyStoreError> {
+) -> Result<Option<Loaded>, KeyStoreError> {
     // A protected container or a policy refusal is the private key's own
     // failure: only bytes that hold no private key are read as a public one.
-    let or_public = |private: Result<Material, KeyStoreError>, pem: bool| match private {
+    let or_public = |private: Result<Loaded, KeyStoreError>, pem: bool| match private {
         Err(error @ (KeyStoreError::ProtectedContainer | KeyStoreError::Policy(_))) => Err(error),
         Err(_) => public_key(bytes, pem, resources),
         found => found,
@@ -219,8 +238,8 @@ unsafe fn load(
     resources: &ResourcePolicy,
 ) -> *mut c_void {
     let null = std::ptr::null_mut();
-    let material = match material(bytes, format, password, resources) {
-        Ok(Some(material)) => material,
+    let loaded = match material(bytes, format, password, resources) {
+        Ok(Some(loaded)) => loaded,
         Ok(None) => {
             errors::report(
                 here,
@@ -236,7 +255,10 @@ unsafe fn load(
             return null;
         }
     };
-    key_with(here, material, None)
+    match loaded {
+        Loaded::Asymmetric(material) => key_with(here, material, None),
+        Loaded::Xdh(key) => key_holding(here, xdhkeys::adopt(key), None),
+    }
 }
 
 /// A new key whose value holds `material`, with `x509` as its X.509 data
@@ -246,8 +268,17 @@ pub(crate) fn key_with(
     material: Material,
     x509: Option<super::x509::data::X509State>,
 ) -> *mut c_void {
+    key_holding(here, asymkeys::adopt(material), x509)
+}
+
+/// A new key whose value is the new key data `data`, with `x509` as its
+/// X.509 data when given; null after a report at `here`, `data` released.
+fn key_holding(
+    here: Here,
+    data: *mut super::keysdata::XmlSecKeyData,
+    x509: Option<super::x509::data::X509State>,
+) -> *mut c_void {
     let null = std::ptr::null_mut();
-    let data = asymkeys::adopt(material);
     if data.is_null() {
         errors::internal(here, std::ptr::null(), c"xmlSecKeyDataCreate");
         return null;
@@ -354,19 +385,20 @@ pub(crate) unsafe extern "C" fn pkcs12_load_memory(
                     .map(|secret| Zeroizing::new(secret.bytes().to_vec())),
             )
         };
+        // OpenSSL's PKCS12_parse reads a bundle without a password as one
+        // under the empty password. The key is imported for the uses its
+        // family permits, as the application names none.
+        let Ok(text) = std::str::from_utf8(secret.as_deref().map_or(&[][..], Vec::as_slice)) else {
+            errors::internal_with(
+                here,
+                std::ptr::null(),
+                c"PKCS12_parse",
+                "password is not UTF-8",
+            );
+            return std::ptr::null_mut();
+        };
         let mut inventory = KeyInventory::default();
-        let imported = inventory.add_pkcs12_with_password_callback(
-            "key".to_owned(),
-            bytes,
-            || {
-                secret
-                    .as_deref()
-                    .and_then(|secret| std::str::from_utf8(secret).ok())
-                    .map(|secret| Zeroizing::new(secret.to_owned()))
-            },
-            KeyUsages::SIGN,
-            &policy.resources,
-        );
+        let imported = inventory.add_pkcs12("key".to_owned(), bytes, text, &policy.resources);
         if let Err(error) = imported {
             errors::internal_with(here, std::ptr::null(), c"PKCS12_parse", &error.to_string());
             return std::ptr::null_mut();
@@ -375,12 +407,12 @@ pub(crate) unsafe extern "C" fn pkcs12_load_memory(
             errors::internal(here, std::ptr::null(), c"PKCS12_parse");
             return std::ptr::null_mut();
         };
-        let value = key.public_key_spki_der().and_then(|spki| {
-            KeyValueInfo::from_spki_der(&spki, &policy.resources)
-                .map_err(|_| KeyStoreError::Selection("unsupported private key family"))
-        });
-        let value = match value {
-            Ok(value) => value,
+        let private = Some(Zeroizing::new(key.pkcs8_der().to_vec()));
+        let loaded = key
+            .public_key_spki_der()
+            .and_then(|spki| Loaded::from_spki(spki, private, &policy.resources));
+        let loaded = match loaded {
+            Ok(loaded) => loaded,
             Err(error) => {
                 errors::internal_with(
                     here,
@@ -398,14 +430,10 @@ pub(crate) unsafe extern "C" fn pkcs12_load_memory(
         for (position, cert) in key.certificates().iter().enumerate() {
             x509.add_cert(cert.clone(), has_leaf && position == 0);
         }
-        key_with(
-            here,
-            Material {
-                value,
-                private: Some(Zeroizing::new(key.pkcs8_der().to_vec())),
-            },
-            Some(x509),
-        )
+        match loaded {
+            Loaded::Asymmetric(material) => key_with(here, material, Some(x509)),
+            Loaded::Xdh(xdh) => key_holding(here, xdhkeys::adopt(xdh), Some(x509)),
+        }
     })
 }
 

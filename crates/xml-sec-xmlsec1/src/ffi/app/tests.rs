@@ -5,7 +5,16 @@
 use xml_sec::key_manager::KeyStoreError;
 use xml_sec::policy::ResourcePolicy;
 
-use super::{FORMAT_PEM, Password, material};
+use super::{FORMAT_PEM, FORMAT_PKCS8_PEM, Loaded, Password, material};
+use crate::ffi::asymkeys::Material;
+
+/// The RSA, DSA or EC key `loaded` holds.
+fn asymmetric(loaded: Loaded) -> Material {
+    match loaded {
+        Loaded::Asymmetric(material) => material,
+        Loaded::Xdh(_) => panic!("an XDH key, not an asymmetric one"),
+    }
+}
 
 const RSA_ENCRYPTED: &[u8] =
     include_bytes!("../../../../../tests/fixtures/keys/rsa/rsa-2048-key-traditional-encrypted.pem");
@@ -37,7 +46,95 @@ fn a_protected_key_without_its_password_stays_a_protected_failure() {
     let public = material(RSA_PUBLIC, FORMAT_PEM, &password(None), &resources)
         .expect("a public key reads")
         .expect("a format it reads");
-    assert!(public.private.is_none());
+    assert!(asymmetric(public).private.is_none());
+}
+
+#[test]
+fn an_xdh_pkcs12_bundle_loads_as_xdh_key_data() {
+    // A PKCS#12 bundle of an X25519 key loads as XDH key data holding the
+    // private key, as libxmlsec1 loads it; a wrong password loads nothing.
+    use crate::ffi::keys::{xmlSecKeyDestroy, xmlSecKeyGetValue};
+    use crate::ffi::xdhkeys::key_of;
+    const BUNDLE: &[u8] =
+        include_bytes!("../../../../../tests/fixtures/xmlenc/keys/xdh/xdh-x25519-first-key.p12");
+    let load = |pwd: &std::ffi::CStr| {
+        // SAFETY: the fixture's bytes and a NUL-terminated password.
+        unsafe {
+            super::pkcs12_load_memory(
+                BUNDLE.as_ptr(),
+                BUNDLE.len(),
+                pwd.as_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        }
+        .cast::<crate::ffi::keys::XmlSecKey>()
+    };
+    let key = load(c"secret123");
+    assert!(!key.is_null(), "the bundle loads");
+    // SAFETY: the key loaded above, released here.
+    unsafe {
+        let xdh = key_of(xmlSecKeyGetValue(key)).expect("XDH key data");
+        assert!(xdh.private.is_some());
+        assert_eq!(xdh.public().map(|(_, public)| public.len()), Some(32));
+        xmlSecKeyDestroy(key);
+    }
+    assert!(load(c"wrong").is_null());
+}
+
+#[test]
+fn xdh_keys_load_as_xdh_key_data() {
+    // X25519 and X448 key files, the private key also in password-protected
+    // PKCS#8, load as XDH keys: the private key with its PKCS#8 and the
+    // public key the matching public file holds, the public file alone with
+    // no private key.
+    let resources = ResourcePolicy::default();
+    let xdh = |bytes: &[u8], format, pwd: Option<&std::ffi::CStr>| match material(
+        bytes,
+        format,
+        &password(pwd),
+        &resources,
+    )
+    .expect("the key reads")
+    .expect("a format it reads")
+    {
+        Loaded::Xdh(key) => key,
+        Loaded::Asymmetric(_) => panic!("an asymmetric key, not an XDH one"),
+    };
+    for (private, encrypted, public, width) in [
+        (
+            &include_bytes!(
+                "../../../../../tests/fixtures/xmlenc/keys/xdh/xdh-x25519-first-key.pem"
+            )[..],
+            &include_bytes!(
+                "../../../../../tests/fixtures/xmlenc/keys/xdh/xdh-x25519-first-key.p8-pem"
+            )[..],
+            &include_bytes!(
+                "../../../../../tests/fixtures/xmlenc/keys/xdh/xdh-x25519-first-pubkey.pem"
+            )[..],
+            32,
+        ),
+        (
+            &include_bytes!("../../../../../tests/fixtures/xmlenc/keys/xdh/xdh-x448-first-key.pem")
+                [..],
+            &include_bytes!(
+                "../../../../../tests/fixtures/xmlenc/keys/xdh/xdh-x448-first-key.p8-pem"
+            )[..],
+            &include_bytes!(
+                "../../../../../tests/fixtures/xmlenc/keys/xdh/xdh-x448-first-pubkey.pem"
+            )[..],
+            56,
+        ),
+    ] {
+        let from_private = xdh(private, FORMAT_PEM, None);
+        let from_encrypted = xdh(encrypted, FORMAT_PKCS8_PEM, Some(c"secret123"));
+        let from_public = xdh(public, FORMAT_PEM, None);
+        assert!(from_private.private.is_some() && from_encrypted.private.is_some());
+        assert!(from_public.private.is_none());
+        assert_eq!(from_private.spki, from_public.spki);
+        assert_eq!(from_encrypted.spki, from_public.spki);
+        assert_eq!(from_public.public().map(|(_, key)| key.len()), Some(width));
+    }
 }
 
 #[test]
@@ -54,14 +151,16 @@ fn a_private_key_value_is_refused_rather_than_written_public() {
     use xml_sec_libxml2::ffi::tree::{xsDocGetRootElement, xsFreeDoc, xsReadMemory};
     const RSA_PRIVATE: &[u8] =
         include_bytes!("../../../../../tests/fixtures/keys/rsa/rsa-2048-key.pem");
-    let private = material(
-        RSA_PRIVATE,
-        FORMAT_PEM,
-        &password(None),
-        &ResourcePolicy::default(),
-    )
-    .expect("a private key reads")
-    .expect("a format it reads");
+    let private = asymmetric(
+        material(
+            RSA_PRIVATE,
+            FORMAT_PEM,
+            &password(None),
+            &ResourcePolicy::default(),
+        )
+        .expect("a private key reads")
+        .expect("a format it reads"),
+    );
     assert!(private.private.is_some());
     let xml = "<RSAKeyValue xmlns=\"http://www.w3.org/2000/09/xmldsig#\"/>";
     // SAFETY: objects created and destroyed here.

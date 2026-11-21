@@ -36,8 +36,10 @@ use super::tree::{XmlNode, nodes};
 use super::xmltree::xmlSecPrintXmlString;
 use super::{contain, free, malloc, write_stream};
 
+pub(crate) mod agreement_method;
 pub(crate) mod derived_key;
 pub(crate) mod encrypted_key;
+pub(crate) mod key_source;
 mod process;
 #[cfg(test)]
 mod tests;

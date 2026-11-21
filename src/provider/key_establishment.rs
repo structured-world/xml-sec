@@ -4,6 +4,7 @@
 mod bit_hash;
 mod dh;
 pub use dh::RustCryptoDhKey;
+pub(crate) use dh::pkcs8_public_value as dh_pkcs8_public_value;
 
 use crate::xmldsig::{DigestAlgorithm, SignatureAlgorithm};
 use p256::elliptic_curve::sec1::ToSec1Point;
@@ -84,6 +85,27 @@ impl RustCryptoEcdhKey {
         }))
     }
 
+    /// Import an RFC 5915 EC private key in PKCS#8 (RFC 5208) on one of the
+    /// supported named curves, which its algorithm parameters select.
+    ///
+    /// # Errors
+    /// Returns an error for invalid DER, a curve other than P-256, P-384 or
+    /// P-521, or a scalar out of the curve's range.
+    pub fn from_pkcs8_der(bytes: &[u8]) -> Result<Self, ProviderError> {
+        use pkcs8::DecodePrivateKey as _;
+        // RFC 5480 section 2.1.1: the named curve travels in the algorithm
+        // parameters, so at most one curve decodes the key.
+        if let Ok(key) = p256::SecretKey::from_pkcs8_der(bytes) {
+            return Ok(Self(EcdhSecret::P256(key)));
+        }
+        if let Ok(key) = p384::SecretKey::from_pkcs8_der(bytes) {
+            return Ok(Self(EcdhSecret::P384(key)));
+        }
+        p521::SecretKey::from_pkcs8_der(bytes)
+            .map(|key| Self(EcdhSecret::P521(key)))
+            .map_err(|_| ProviderError::InvalidInput(ProviderInputError::EcdhKey))
+    }
+
     /// Export the public SEC1 uncompressed point, never private material.
     #[must_use]
     pub fn public_key(&self) -> Vec<u8> {
@@ -140,6 +162,19 @@ impl RustCryptoX25519Key {
     #[must_use]
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(x25519_dalek::StaticSecret::from(bytes))
+    }
+
+    /// Import RFC 8410 PKCS#8, validating any included public-key identity.
+    /// DER is borrowed; only the fixed-width scalar enters the zeroizing key.
+    ///
+    /// # Errors
+    /// Returns an error for invalid DER, the wrong algorithm or parameters,
+    /// an incorrect scalar width, or an inconsistent included public key.
+    pub fn from_pkcs8_der(bytes: &[u8]) -> Result<Self, ProviderError> {
+        let scalar = curve_private_scalar::<32>(bytes, "1.3.101.110")?;
+        let key = Self::from_bytes(*scalar);
+        check_included_public(bytes, &key.public_key())?;
+        Ok(key)
     }
 
     /// Return the public u-coordinate encoding defined by RFC 7748 section 5.
@@ -203,33 +238,9 @@ impl RustCryptoX448Key {
     /// Returns an error for invalid DER, the wrong algorithm or parameters,
     /// an incorrect scalar width, or an inconsistent included public key.
     pub fn from_pkcs8_der(bytes: &[u8]) -> Result<Self, ProviderError> {
-        use der::{Decode, asn1::OctetStringRef};
-        use pkcs8::{ObjectIdentifier, PrivateKeyInfoRef};
-        use subtle::ConstantTimeEq;
-        let invalid = || ProviderError::InvalidInput(ProviderInputError::EcdhKey);
-        let info = PrivateKeyInfoRef::try_from(bytes).map_err(|_| invalid())?;
-        // RFC 8410 sections 3 and 7: id-X448, absent parameters, and a
-        // CurvePrivateKey OCTET STRING nested inside PKCS#8 privateKey.
-        // https://www.rfc-editor.org/rfc/rfc8410.html#section-7
-        if info.algorithm.oid != ObjectIdentifier::new_unwrap("1.3.101.111")
-            || info.algorithm.parameters.is_some()
-        {
-            return Err(invalid());
-        }
-        let scalar =
-            <&OctetStringRef>::from_der(info.private_key.as_bytes()).map_err(|_| invalid())?;
-        let scalar = zeroize::Zeroizing::new(
-            <[u8; 56]>::try_from(scalar.as_bytes()).map_err(|_| invalid())?,
-        );
+        let scalar = curve_private_scalar::<56>(bytes, "1.3.101.111")?;
         let key = Self::from_bytes(*scalar);
-        // Section 7 allows carrying the public key. Binding it to the scalar
-        // is our import invariant, not an extra ASN.1 syntax requirement.
-        if let Some(public) = info.public_key {
-            let public = public.as_bytes().ok_or_else(invalid)?;
-            if !bool::from(key.public_key().as_slice().ct_eq(public)) {
-                return Err(invalid());
-            }
-        }
+        check_included_public(bytes, &key.public_key())?;
         Ok(key)
     }
 
@@ -268,6 +279,47 @@ impl KeyAgreementKey for RustCryptoX448Key {
         }
         Ok(secret.as_bytes().to_vec())
     }
+}
+
+/// The `N`-octet scalar of the RFC 8410 PKCS#8 key `bytes` of the curve
+/// whose OID is `oid`.
+fn curve_private_scalar<const N: usize>(
+    bytes: &[u8],
+    oid: &str,
+) -> Result<zeroize::Zeroizing<[u8; N]>, ProviderError> {
+    use der::{Decode, asn1::OctetStringRef};
+    use pkcs8::{ObjectIdentifier, PrivateKeyInfoRef};
+    let invalid = || ProviderError::InvalidInput(ProviderInputError::EcdhKey);
+    let info = PrivateKeyInfoRef::try_from(bytes).map_err(|_| invalid())?;
+    // RFC 8410 sections 3 and 7: the curve's OID, absent parameters, and a
+    // CurvePrivateKey OCTET STRING nested inside PKCS#8 privateKey.
+    // https://www.rfc-editor.org/rfc/rfc8410.html#section-7
+    if info.algorithm.oid != ObjectIdentifier::new_unwrap(oid)
+        || info.algorithm.parameters.is_some()
+    {
+        return Err(invalid());
+    }
+    let scalar = <&OctetStringRef>::from_der(info.private_key.as_bytes()).map_err(|_| invalid())?;
+    Ok(zeroize::Zeroizing::new(
+        <[u8; N]>::try_from(scalar.as_bytes()).map_err(|_| invalid())?,
+    ))
+}
+
+/// Checks that the public key the RFC 8410 PKCS#8 key `bytes` may carry is
+/// `public`, the one its scalar gives.
+fn check_included_public(bytes: &[u8], public: &[u8]) -> Result<(), ProviderError> {
+    use subtle::ConstantTimeEq;
+    let invalid = || ProviderError::InvalidInput(ProviderInputError::EcdhKey);
+    let info = pkcs8::PrivateKeyInfoRef::try_from(bytes).map_err(|_| invalid())?;
+    // Section 7 allows carrying the public key. Binding it to the scalar is
+    // our import invariant, not an extra ASN.1 syntax requirement.
+    if let Some(included) = info.public_key {
+        let included = included.as_bytes().ok_or_else(invalid)?;
+        if !bool::from(public.ct_eq(included)) {
+            return Err(invalid());
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn supports_kdf(parameters: &KdfParameters<'_>) -> bool {

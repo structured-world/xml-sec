@@ -1330,8 +1330,8 @@ static AGREEMENT_METHOD: XmlSecKeyDataKlass = key_info_child(
     xmlSecHrefAgreementMethod.as_ptr(),
     xmlSecNodeAgreementMethod.as_ptr(),
     xmlSecEncNs.as_ptr(),
-    None,
-    None,
+    Some(super::xmlenc::agreement_method::xml_read),
+    Some(super::xmlenc::agreement_method::xml_write),
 );
 
 macro_rules! key_data_getter {
