@@ -2341,6 +2341,68 @@ fn dsa_key_value_to_spki_der(
     )
 }
 
+/// The unsigned magnitude of a DH component, nonzero and within the DH
+/// modulus safety ceiling.
+fn dh_component(bytes: &[u8]) -> Result<pkcs8::der::asn1::UintRef<'_>, KeyResolutionError> {
+    let magnitude = &bytes[bytes.iter().take_while(|byte| **byte == 0).count()..];
+    if magnitude.is_empty()
+        || magnitude.len() > crate::hard_limits::DH_MODULUS_BIT_CEILING.div_ceil(8)
+    {
+        return Err(KeyResolutionError::InvalidPublicKey);
+    }
+    pkcs8::der::asn1::UintRef::new(magnitude).map_err(|_| KeyResolutionError::InvalidPublicKey)
+}
+
+/// The dhpublicnumber SPKI of `DHKeyValue` components: X9.42
+/// `DomainParameters` (p, g, q) as parameters and the INTEGER public value
+/// as key bits (RFC 3279 section 2.3.3). Whether they form a valid group is
+/// the agreement's decision, under the operation's policy.
+fn dh_key_value_to_spki_der(
+    p: &[u8],
+    q: &[u8],
+    generator: &[u8],
+    public: &[u8],
+) -> Result<Vec<u8>, KeyResolutionError> {
+    use pkcs8::der::{
+        Encode as _,
+        asn1::{AnyRef, ObjectIdentifier},
+    };
+    let invalid = |_| KeyResolutionError::InvalidPublicKey;
+    // DomainParameters ::= SEQUENCE { p, g, q, ... } encodes as the
+    // SEQUENCE OF its three INTEGERs.
+    let parameters = [dh_component(p)?, dh_component(generator)?, dh_component(q)?]
+        .to_der()
+        .map_err(invalid)?;
+    let key = dh_component(public)?.to_der().map_err(invalid)?;
+    spki_der(
+        pkcs8::spki::AlgorithmIdentifierRef {
+            oid: ObjectIdentifier::from_bytes(structured_pkix::key::dh::IDENTIFIER.as_bytes())
+                .map_err(|_| KeyResolutionError::InvalidPublicKey)?,
+            parameters: Some(AnyRef::try_from(parameters.as_slice()).map_err(invalid)?),
+        },
+        &key,
+    )
+}
+
+/// The `DHKeyValue` of a dhpublicnumber key read by the shared X.509
+/// reader (RFC 3279 section 2.3.3), each component nonzero and within the
+/// DH modulus safety ceiling; the group is the agreement's to validate.
+pub(crate) fn dh_key_value(
+    key: &structured_pkix::key::dh::PublicKey<'_>,
+) -> Result<KeyValueInfo, KeyResolutionError> {
+    let parameters = key.parameters();
+    let [p, q, generator, public] = [parameters.p(), parameters.q(), parameters.g(), key.y()]
+        .map(|component| dh_component(component.as_bytes()).map(|value| value.as_bytes().to_vec()));
+    Ok(KeyValueInfo::Dh {
+        p: Some(p?),
+        q: Some(q?),
+        generator: Some(generator?),
+        public: public?,
+        seed: None,
+        pgen_counter: None,
+    })
+}
+
 /// The id-ecPublicKey SPKI of an `ECKeyValue`: the named curve as parameters
 /// and the uncompressed SEC1 point as key bits (RFC 5480 sections 2.1.1 and
 /// 2.2). Only an arithmetic backend can decompress a point or place it on
@@ -2479,7 +2541,13 @@ pub(crate) fn supported_spki_is_rsa(
             validate_ec_spki_point(session, public_key_bytes)?;
             return Ok(false);
         }
-        SpkiAlgorithm::RsaPss | SpkiAlgorithm::Other => {
+        // Agreement-only keys (RFC 3279 section 2.3.3, RFC 8410 section 3)
+        // verify no signature.
+        SpkiAlgorithm::RsaPss
+        | SpkiAlgorithm::Dh
+        | SpkiAlgorithm::X25519
+        | SpkiAlgorithm::X448
+        | SpkiAlgorithm::Other => {
             return Err(KeyResolutionError::AlgorithmMismatch);
         }
     };
@@ -2602,12 +2670,14 @@ fn validate_ec_spki_point(
 
 impl KeyValueInfo {
     /// The DER `SubjectPublicKeyInfo` (RFC 5280 section 4.1.2.7) of an RSA,
-    /// DSA or EC key value, with its components validated as key resolution
-    /// validates them; key strength is the operation policy's decision.
+    /// DSA, EC or DH key value, with its components validated as key
+    /// resolution validates them; key strength is the operation policy's
+    /// decision, and a DH group is validated by the agreement that uses it.
+    /// A DH value's `seed` and `pgenCounter` are not carried.
     ///
     /// # Errors
-    /// [`KeyResolutionError::InvalidPublicKey`] for a DSA value without its
-    /// domain parameters, a DH, invalid or unsupported value, or components
+    /// [`KeyResolutionError::InvalidPublicKey`] for a DSA or DH value without
+    /// its domain parameters, an invalid or unsupported value, or components
     /// that do not form a key.
     ///
     /// # Examples
@@ -2634,17 +2704,26 @@ impl KeyValueInfo {
                 curve_oid,
                 public_key,
             } => ec_key_value_to_spki_der(curve_oid, public_key),
+            // XMLEnc 1.1 section 5.6.1: a value without its group takes it
+            // from application state, which an SPKI cannot name.
+            Self::Dh {
+                p: Some(p),
+                q: Some(q),
+                generator: Some(generator),
+                public,
+                ..
+            } => dh_key_value_to_spki_der(p, q, generator, public),
             _ => Err(KeyResolutionError::InvalidPublicKey),
         }
     }
 
-    /// The key value of an `rsaEncryption`, DSA or named-curve EC
-    /// `SubjectPublicKeyInfo`, read within the X.509 work and workspace
-    /// budgets of `resources`.
+    /// The key value of an `rsaEncryption`, DSA, named-curve EC or X9.42 DH
+    /// (`dhpublicnumber`) `SubjectPublicKeyInfo`, read within the X.509 work
+    /// and workspace budgets of `resources`.
     ///
     /// # Errors
     /// [`KeyResolutionError::InvalidPublicKey`] for another key family, a
-    /// DSA key without domain parameters or malformed encoding;
+    /// DSA or DH key without domain parameters or malformed encoding;
     /// [`KeyResolutionError::AlgorithmMismatch`] for an unsupported curve or
     /// an `id-RSASSA-PSS` key, whose PSS restriction a key value cannot
     /// carry; a resource error when the budgets are exhausted.
@@ -2720,6 +2799,11 @@ impl KeyValueInfo {
                     y,
                 })
             }
+            SpkiAlgorithm::Dh => dh_key_value(
+                &session
+                    .read_dh_public_key(spki_der)
+                    .map_err(|error| structured_key_error(&session, error))?,
+            ),
             _ => Err(KeyResolutionError::InvalidPublicKey),
         }
     }

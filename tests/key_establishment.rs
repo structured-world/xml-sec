@@ -33,6 +33,60 @@ fn ecdh_all_nist_curves_preserve_fixed_width_and_validate_peers() {
     }
 }
 
+#[test]
+fn ecdh_pkcs8_import_selects_the_curve_of_its_parameters() {
+    use der::Encode as _;
+    use pkcs8::EncodePrivateKey as _;
+    use xml_sec::provider::{EcdhCurve, RustCryptoEcdhKey};
+    // A key file holds the curve in the PKCS#8 algorithm parameters (RFC 5480
+    // section 2.1.1): the import must land on that curve, so its public point
+    // equals the one the scalar gives on it, for every supported width.
+    let keys = [
+        (
+            EcdhCurve::P256,
+            vec![3; 32],
+            p256::SecretKey::from_slice(&[3; 32])
+                .unwrap()
+                .to_pkcs8_der()
+                .unwrap(),
+        ),
+        (
+            EcdhCurve::P384,
+            vec![3; 48],
+            p384::SecretKey::from_slice(&[3; 48])
+                .unwrap()
+                .to_pkcs8_der()
+                .unwrap(),
+        ),
+        (
+            EcdhCurve::P521,
+            [vec![1], vec![3; 65]].concat(),
+            p521::SecretKey::from_slice(&[[1].as_slice(), &[3; 65]].concat())
+                .unwrap()
+                .to_pkcs8_der()
+                .unwrap(),
+        ),
+    ];
+    for (curve, scalar, der) in &keys {
+        let imported = RustCryptoEcdhKey::from_pkcs8_der(der.as_bytes()).unwrap();
+        let expected = RustCryptoEcdhKey::from_scalar(*curve, scalar).unwrap();
+        assert_eq!(imported.public_key(), expected.public_key());
+    }
+    // Not a key at all, and a curve key whose DER is cut short.
+    assert!(RustCryptoEcdhKey::from_pkcs8_der(b"not DER").is_err());
+    let truncated = &keys[0].2.as_bytes()[..keys[0].2.as_bytes().len() - 1];
+    assert!(RustCryptoEcdhKey::from_pkcs8_der(truncated).is_err());
+    // An X25519 key is no ECDH-ES key.
+    let x25519 = pkcs8::PrivateKeyInfoRef::new(
+        pkcs8::AlgorithmIdentifierRef {
+            oid: pkcs8::ObjectIdentifier::new_unwrap("1.3.101.110"),
+            parameters: None,
+        },
+        der::asn1::OctetStringRef::new(&[4, 32, 7, 7, 7, 7]).unwrap(),
+    );
+    assert!(RustCryptoEcdhKey::from_pkcs8_der(&x25519.to_der().unwrap()).is_err());
+}
+
 fn hex(value: &str) -> Vec<u8> {
     let (pairs, remainder) = value.as_bytes().as_chunks::<2>();
     assert!(remainder.is_empty(), "odd test hex width");
@@ -785,6 +839,47 @@ fn x448_reduces_noncanonical_peers_and_rejects_zero_secrets() {
             Err(ProviderError::InvalidKeySize { expected: 56, .. })
         ));
     }
+}
+
+#[test]
+fn x25519_pkcs8_import_checks_oid_wrapping_and_public_identity() {
+    use der::{
+        Encode,
+        asn1::{BitStringRef, OctetStringRef},
+    };
+    use pkcs8::{AlgorithmIdentifierRef, ObjectIdentifier, PrivateKeyInfoRef};
+    // RFC 8410 sections 3 and 7 for id-X25519: absent parameters, a nested
+    // CurvePrivateKey OCTET STRING, and a carried public key matching the
+    // scalar; an X448 OID or a bare scalar is no X25519 key.
+    let scalar = [9; 32];
+    let raw_key = RustCryptoX25519Key::from_bytes(scalar);
+    let nested = OctetStringRef::new(&scalar).unwrap().to_der().unwrap();
+    let mut info = PrivateKeyInfoRef::new(
+        AlgorithmIdentifierRef {
+            oid: ObjectIdentifier::new_unwrap("1.3.101.110"),
+            parameters: None,
+        },
+        OctetStringRef::new(&nested).unwrap(),
+    );
+    assert_eq!(
+        RustCryptoX25519Key::from_pkcs8_der(&info.to_der().unwrap())
+            .unwrap()
+            .public_key(),
+        raw_key.public_key()
+    );
+    let public = raw_key.public_key();
+    info.public_key = Some(BitStringRef::from_bytes(&public).unwrap());
+    assert!(RustCryptoX25519Key::from_pkcs8_der(&info.to_der().unwrap()).is_ok());
+    let mut wrong_public = public;
+    wrong_public[0] ^= 1;
+    info.public_key = Some(BitStringRef::from_bytes(&wrong_public).unwrap());
+    assert!(RustCryptoX25519Key::from_pkcs8_der(&info.to_der().unwrap()).is_err());
+    info.public_key = None;
+    info.algorithm.oid = ObjectIdentifier::new_unwrap("1.3.101.111");
+    assert!(RustCryptoX25519Key::from_pkcs8_der(&info.to_der().unwrap()).is_err());
+    info.algorithm.oid = ObjectIdentifier::new_unwrap("1.3.101.110");
+    info.private_key = OctetStringRef::new(&scalar).unwrap();
+    assert!(RustCryptoX25519Key::from_pkcs8_der(&info.to_der().unwrap()).is_err());
 }
 
 #[test]

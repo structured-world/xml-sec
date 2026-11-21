@@ -44,6 +44,7 @@ use super::super::xmltree::{
     xmlSecGetNextElementNode, xmlSecGetNodeContentAndTrim, xmlSecReplaceContentAndReturn,
     xmlSecReplaceNodeAndReturn,
 };
+use super::key_source::Descriptor;
 use super::{
     FAILURE_KEY_NOT_FOUND, FAILURE_UNKNOWN, FLAGS_RETURN_REPLACED_NODE, MODE_ENCRYPTED_DATA,
     MODE_ENCRYPTED_KEY, XmlSecEncCtx,
@@ -1167,8 +1168,9 @@ unsafe fn read_key(ctx: &mut XmlSecEncCtx, here: errors::Here) -> bool {
     unsafe {
         let transforms = &raw mut ctx.transform_ctx;
         let read = &raw mut ctx.key_info_read_ctx;
-        // Only the read below names a DerivedKey the key was derived by.
-        super::derived_key::forget_derivation(read);
+        // Only the read below names the DerivedKey or AgreementMethod the
+        // key came from.
+        super::key_source::forget(read);
         if !ctx.enc_key.is_null() {
             return true;
         }
@@ -1594,17 +1596,17 @@ unsafe fn settle_decryption(
     decrypted.map(|(audited, _)| audited)
 }
 
-/// Whether the context's key holds the octets `derivation` yielded.
+/// Whether the context's key holds the octets `source` yielded.
 ///
 /// # Safety
 /// The context's key is set.
-unsafe fn holds_derived(ctx: &XmlSecEncCtx, derivation: &super::derived_key::Derivation) -> bool {
+unsafe fn holds_key_of(ctx: &XmlSecEncCtx, source: &super::key_source::KeySource) -> bool {
     // SAFETY: the key's value outlives the call.
     unsafe {
         let buffer = xmlSecKeyDataBinaryValueGetBuffer(xmlSecKeyGetValue(ctx.enc_key));
         let data = xmlSecBufferGetData(buffer);
         !data.is_null()
-            && derivation.yielded(std::slice::from_raw_parts(
+            && source.yielded(std::slice::from_raw_parts(
                 data,
                 xmlSecBufferGetSize(buffer),
             ))
@@ -1616,24 +1618,24 @@ unsafe fn holds_derived(ctx: &XmlSecEncCtx, derivation: &super::derived_key::Der
 ///
 /// The `KeyInfo` read is this library's, as libxmlsec1's is its own: it
 /// took the key from the first child that yields one, a `DerivedKey`
-/// derived by its klass under the library policy included (as an
-/// `EncryptedKey` recovered by its nested context is). A derived key is
-/// offered for its `DerivedKey` alone, so the core holds it to that
-/// element's `ReferenceList` and repeats no derivation; any other key, the
-/// caller's own included, is offered only where the core takes a key
-/// directly, so it never stands for a derivation or an agreement the
-/// `KeyInfo` declares.
+/// derived or an `AgreementMethod` agreed by its klass under the library
+/// policy included (as an `EncryptedKey` recovered by its nested context
+/// is). Such a key is offered for its own element alone, so the core holds
+/// a derived key to that `DerivedKey`'s `ReferenceList` and repeats no
+/// derivation or agreement; any other key, the caller's own included, is
+/// offered only where the core takes a key directly, so it never stands for
+/// a derivation or an agreement the `KeyInfo` declares.
 struct KeyInfoKey {
     key: SymmetricKeyDecryptor,
-    derived: Option<xml_sec::xmlenc::DerivedKey>,
+    source: Option<Descriptor>,
     offered: std::cell::Cell<bool>,
 }
 
 impl KeyInfoKey {
-    fn new(key: SymmetricKeyDecryptor, derived: Option<xml_sec::xmlenc::DerivedKey>) -> Self {
+    fn new(key: SymmetricKeyDecryptor, source: Option<Descriptor>) -> Self {
         Self {
             key,
-            derived,
+            source,
             offered: std::cell::Cell::new(false),
         }
     }
@@ -1667,7 +1669,7 @@ impl xml_sec::xmlenc::DecryptionKeyResolver for KeyInfoKey {
         policy: &xml_sec::policy::DecryptionPolicy,
         budget: &mut xml_sec::xmlenc::KeyCandidateBudget,
     ) -> Result<Vec<xml_sec::provider::RecoveredContentKey>, xml_sec::xmlenc::XmlEncError> {
-        if encrypted_key.is_some() || self.derived.is_some() {
+        if encrypted_key.is_some() || self.source.is_some() {
             return Err(xml_sec::xmlenc::XmlEncError::KeyNotFound);
         }
         self.offer(provider, algorithm, policy, budget)
@@ -1683,7 +1685,23 @@ impl xml_sec::xmlenc::DecryptionKeyResolver for KeyInfoKey {
     ) -> Result<Vec<xml_sec::provider::RecoveredContentKey>, xml_sec::xmlenc::XmlEncError> {
         // An element equal to the one derived from, ReferenceList included,
         // derives the same key for the same data.
-        if self.derived.as_ref() != Some(descriptor) {
+        if !matches!(&self.source, Some(Descriptor::Derived(derived)) if derived == descriptor) {
+            return Err(xml_sec::xmlenc::XmlEncError::KeyNotFound);
+        }
+        self.offer(provider, algorithm, policy, budget)
+    }
+
+    fn resolve_agreement_content_keys_with_policy(
+        &self,
+        provider: &dyn xml_sec::provider::CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        descriptor: &xml_sec::xmlenc::AgreementMethod,
+        policy: &xml_sec::policy::DecryptionPolicy,
+        budget: &mut xml_sec::xmlenc::KeyCandidateBudget,
+    ) -> Result<Vec<xml_sec::provider::RecoveredContentKey>, xml_sec::xmlenc::XmlEncError> {
+        // An element equal to the one agreed by, both roles included, names
+        // the same parties and derivation.
+        if !matches!(&self.source, Some(Descriptor::Agreement(agreed)) if agreed == descriptor) {
             return Err(xml_sec::xmlenc::XmlEncError::KeyNotFound);
         }
         self.offer(provider, algorithm, policy, budget)
@@ -1695,7 +1713,7 @@ impl xml_sec::xmlenc::DecryptionKeyResolver for KeyInfoKey {
         algorithm: DataEncryptionAlgorithm,
         _encrypted_key: Option<&xml_sec::xmlenc::EncryptedKey>,
     ) -> Result<Vec<u8>, xml_sec::xmlenc::XmlEncError> {
-        if self.derived.is_some() {
+        if self.source.is_some() {
             return Err(xml_sec::xmlenc::XmlEncError::KeyNotFound);
         }
         self.key.resolve_key(provider, algorithm, None)
@@ -1768,14 +1786,14 @@ unsafe fn run_decryption(ctx: &mut XmlSecEncCtx, node: *mut XmlNode) -> *mut Xml
         }
     };
     // SAFETY: the context's read KeyInfo context.
-    let derivation = unsafe { super::derived_key::take_derivation(&raw mut ctx.key_info_read_ctx) };
+    let source = unsafe { super::key_source::take(&raw mut ctx.key_info_read_ctx) };
     // SAFETY: the context's key was read.
-    let derived = derivation
-        .filter(|derivation| unsafe { holds_derived(ctx, derivation) })
-        .map(|derivation| derivation.descriptor);
+    let source = source
+        .filter(|source| unsafe { holds_key_of(ctx, source) })
+        .map(|source| source.descriptor);
     let resolver = KeyInfoKey::new(
         SymmetricKeyDecryptor::with_kind(key.to_vec(), algorithm.key_kind()),
-        derived,
+        source,
     );
     let mut context = DecryptContext::new(&resolver)
         .shared_policy(policy)

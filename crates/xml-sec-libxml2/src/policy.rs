@@ -91,6 +91,10 @@ fn compile() -> Option<Published> {
         .clone_from(&verification.digest_algorithms);
     signing.parameterized_rsa_pss = verification.parameterized_rsa_pss;
     signing.hmac = verification.hmac;
+    // An AgreementMethod yielding an HMAC key agrees as its verification does.
+    signing
+        .key_establishment
+        .clone_from(&verification.key_establishment);
     // libxmlsec1 signs a template as written: a node set is left to the
     // implicit Canonical XML 1.0 conversion (XMLDSig 1.1 section 4.4.3.2), and
     // a bare-name fragment is looked up as its verification looks it up.
@@ -121,6 +125,10 @@ fn compile() -> Option<Published> {
         .key_transport_algorithms
         .clone_from(&decryption.key_transport_algorithms);
     encryption.oaep_digests.clone_from(&decryption.oaep_digests);
+    // An encryption agrees on keys as the decryption does.
+    encryption
+        .key_establishment
+        .clone_from(&decryption.key_establishment);
     // A resource named to xmlSecEncCtxUriEncrypt is read from the bytes the
     // caller's input callbacks supply, as a CipherReference is; the key's
     // references keep the decryption's classes.

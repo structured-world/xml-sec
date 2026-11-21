@@ -959,6 +959,9 @@ fn critical_extension_text(
 
 /// `id-dsa`, 1.2.840.10040.4.1 (RFC 3279 section 2.3.2), as content octets.
 pub(crate) const ID_DSA: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x38, 0x04, 0x01];
+/// id-X25519 and id-X448 (RFC 8410 section 3).
+const ID_X25519: &[u8] = &[0x2b, 0x65, 0x6e];
+const ID_X448: &[u8] = &[0x2b, 0x65, 0x6f];
 
 fn materialize_effective_spki<W: Work>(
     key: structured_pkix::path::EffectiveKey<'_>,
@@ -1502,9 +1505,13 @@ pub(crate) enum SpkiAlgorithm {
     RsaEncryption,
     RsaPss,
     Dsa,
+    /// X9.42 `dhpublicnumber` (RFC 3279 section 2.3.3).
+    Dh,
     Ec,
     Ed25519,
     Ed448,
+    X25519,
+    X448,
     PostQuantum(super::PqAlgorithm),
     Other,
 }
@@ -1627,6 +1634,17 @@ impl CertificateSession {
         })
     }
 
+    /// X9.42 DH key of a standalone SPKI with its written domain parameters
+    /// (RFC 3279 section 2.3.3); group validity is the agreement's decision.
+    pub(crate) fn read_dh_public_key<'a>(
+        &'a self,
+        spki: &'a [u8],
+    ) -> Result<structured_pkix::key::dh::PublicKey<'a>, structured_pkix::Error> {
+        self.with_public_key_info(spki, |info, execution| {
+            structured_pkix::key::dh::read(info, execution)
+        })
+    }
+
     /// RSA key of a standalone SPKI whose algorithm admits the signature
     /// scheme: PKCS#1 v1.5 when `pss` is `None`, otherwise RSASSA-PSS with
     /// `pss`. `None` is a non-matching or malformed key.
@@ -1710,6 +1728,12 @@ impl CertificateSession {
                 SpkiAlgorithm::Ed25519
             } else if algorithm == structured_pkix::oid::ED448 {
                 SpkiAlgorithm::Ed448
+            } else if algorithm == structured_pkix::key::dh::IDENTIFIER {
+                SpkiAlgorithm::Dh
+            } else if algorithm.as_bytes() == ID_X25519 {
+                SpkiAlgorithm::X25519
+            } else if algorithm.as_bytes() == ID_X448 {
+                SpkiAlgorithm::X448
             } else if let Some(parameter) = super::PqAlgorithm::from_oid(algorithm.as_bytes()) {
                 SpkiAlgorithm::PostQuantum(parameter)
             } else {

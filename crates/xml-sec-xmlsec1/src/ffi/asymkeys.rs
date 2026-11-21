@@ -1,12 +1,14 @@
-//! The built-in provider's asymmetric key-data klasses: RSA, DSA and EC
+//! The built-in provider's asymmetric key-data klasses: RSA, DSA, EC and DH
 //! public keys in their `KeyValue` children (`RSAKeyValue`, `DSAKeyValue`,
-//! `dsig11:ECKeyValue`), members of the built-in crypto table.
+//! `dsig11:ECKeyValue`, `xenc:DHKeyValue`), members of the built-in crypto
+//! table.
 //!
 //! An object holds the key as the core's provider-neutral key value. The
 //! XML is read by the core's key-value reader over the element's projected
 //! subtree and the components are validated as key resolution validates
 //! them; key strength is the operation policy's decision when the key is
-//! used. libxmlsec1's `PrivateExponent`/`X` extension children are not read:
+//! used, and a DH group is validated by the agreement that uses it.
+//! libxmlsec1's `PrivateExponent`/`X` extension children are not read:
 //! private keys come from key files, never from XML.
 
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
@@ -32,12 +34,14 @@ use super::keysdata::{
     xmlSecKeyDataCreate, xmlSecKeyDataDestroy, xmlSecKeyDataGetSize, xmlSecKeyDataGetType,
 };
 use super::strings::{
-    xmlSecAttrURI, xmlSecDSig11Ns, xmlSecDSigNs, xmlSecHrefDSAKeyValue, xmlSecHrefECKeyValue,
-    xmlSecHrefRSAKeyValue, xmlSecNameDEREncodedKeyValue, xmlSecNameDSAKeyValue,
-    xmlSecNameECKeyValue, xmlSecNameRSAKeyValue, xmlSecNodeDEREncodedKeyValue, xmlSecNodeDSAG,
-    xmlSecNodeDSAKeyValue, xmlSecNodeDSAP, xmlSecNodeDSAQ, xmlSecNodeDSAY, xmlSecNodeECKeyValue,
-    xmlSecNodeNamedCurve, xmlSecNodePublicKey, xmlSecNodeRSAExponent, xmlSecNodeRSAKeyValue,
-    xmlSecNodeRSAModulus,
+    xmlSecAttrURI, xmlSecDSig11Ns, xmlSecDSigNs, xmlSecEncNs, xmlSecHrefDHKeyValue,
+    xmlSecHrefDSAKeyValue, xmlSecHrefECKeyValue, xmlSecHrefRSAKeyValue,
+    xmlSecNameDEREncodedKeyValue, xmlSecNameDHKeyValue, xmlSecNameDSAKeyValue,
+    xmlSecNameECKeyValue, xmlSecNameRSAKeyValue, xmlSecNodeDEREncodedKeyValue,
+    xmlSecNodeDHGenerator, xmlSecNodeDHKeyValue, xmlSecNodeDHP, xmlSecNodeDHPgenCounter,
+    xmlSecNodeDHPublic, xmlSecNodeDHQ, xmlSecNodeDHSeed, xmlSecNodeDSAG, xmlSecNodeDSAKeyValue,
+    xmlSecNodeDSAP, xmlSecNodeDSAQ, xmlSecNodeDSAY, xmlSecNodeECKeyValue, xmlSecNodeNamedCurve,
+    xmlSecNodePublicKey, xmlSecNodeRSAExponent, xmlSecNodeRSAKeyValue, xmlSecNodeRSAModulus,
 };
 use super::transforms::klass_text;
 use super::tree::{XmlNode, c_text, nodes};
@@ -67,6 +71,7 @@ enum Family {
     Rsa,
     Dsa,
     Ec,
+    Dh,
 }
 
 impl Family {
@@ -77,6 +82,7 @@ impl Family {
             Self::Rsa => here!("xmlSecKeyDataRsaXmlRead"),
             Self::Dsa => here!("xmlSecKeyDataDsaXmlRead"),
             Self::Ec => here!("xmlSecKeyDataEcXmlRead"),
+            Self::Dh => here!("xmlSecKeyDataDhXmlRead"),
         }
     }
 
@@ -85,6 +91,7 @@ impl Family {
             Self::Rsa => here!("xmlSecKeyDataRsaXmlWrite"),
             Self::Dsa => here!("xmlSecKeyDataDsaXmlWrite"),
             Self::Ec => here!("xmlSecKeyDataEcXmlWrite"),
+            Self::Dh => here!("xmlSecKeyDataDhXmlWrite"),
         }
     }
 
@@ -95,6 +102,7 @@ impl Family {
             (Self::Rsa, KeyValueInfo::Rsa { .. })
                 | (Self::Dsa, KeyValueInfo::Dsa { .. })
                 | (Self::Ec, KeyValueInfo::Ec { .. })
+                | (Self::Dh, KeyValueInfo::Dh { .. })
         )
     }
 }
@@ -151,12 +159,23 @@ static EC: XmlSecKeyDataKlass = klass(
     &xmlSecNodeECKeyValue,
     &xmlSecDSig11Ns,
 );
+static DH: XmlSecKeyDataKlass = klass(
+    &xmlSecNameDHKeyValue,
+    &xmlSecHrefDHKeyValue,
+    &xmlSecNodeDHKeyValue,
+    &xmlSecEncNs,
+);
 
 /// The family of klass `id`, `None` for any other klass.
 fn family(id: *const XmlSecKeyDataKlass) -> Option<Family> {
-    [(&RSA, Family::Rsa), (&DSA, Family::Dsa), (&EC, Family::Ec)]
-        .into_iter()
-        .find_map(|(klass, family)| std::ptr::eq(klass, id).then_some(family))
+    [
+        (&RSA, Family::Rsa),
+        (&DSA, Family::Dsa),
+        (&EC, Family::Ec),
+        (&DH, Family::Dh),
+    ]
+    .into_iter()
+    .find_map(|(klass, family)| std::ptr::eq(klass, id).then_some(family))
 }
 
 /// The object of valid key data of one of these klasses.
@@ -197,6 +216,7 @@ pub(crate) fn adopt(material: Material) -> *mut XmlSecKeyData {
     let klass: &XmlSecKeyDataKlass = match material.value {
         KeyValueInfo::Rsa { .. } => &RSA,
         KeyValueInfo::Dsa { .. } => &DSA,
+        KeyValueInfo::Dh { .. } => &DH,
         _ => &EC,
     };
     // SAFETY: a klass of this module.
@@ -302,13 +322,15 @@ fn bit_length(bytes: &[u8]) -> usize {
     }
 }
 
-/// `getSize`: the RSA modulus, DSA prime or EC curve size in bits.
+/// `getSize`: the RSA modulus, DSA or DH prime or EC curve size in bits.
 unsafe extern "C" fn get_size(data: *mut XmlSecKeyData) -> usize {
     contain(0, || {
         // SAFETY: the registry passes key data of these klasses.
         match unsafe { value_of(data) } {
             Some(KeyValueInfo::Rsa { modulus, .. }) => bit_length(modulus),
-            Some(KeyValueInfo::Dsa { p: Some(p), .. }) => bit_length(p),
+            Some(KeyValueInfo::Dsa { p: Some(p), .. } | KeyValueInfo::Dh { p: Some(p), .. }) => {
+                bit_length(p)
+            }
             // A named curve's size is its order's (SEC 2 section 2).
             Some(KeyValueInfo::Ec { curve_oid, .. }) => match curve_oid.as_str() {
                 "1.2.840.10045.3.1.7" => 256,
@@ -519,6 +541,30 @@ unsafe fn write_value(node: *mut XmlNode, value: &KeyValueInfo) -> Result<(), &'
                 }
                 write_component(node, &xmlSecNodePublicKey, &xmlSecDSig11Ns, public_key)
             }
+            // XMLEnc 1.1 section 5.6.1 orders the group, the public value,
+            // then the generation parameters, each written when present.
+            KeyValueInfo::Dh {
+                p,
+                q,
+                generator,
+                public,
+                seed,
+                pgen_counter,
+            } => {
+                for (name, bytes) in [
+                    (&xmlSecNodeDHP[..], p.as_deref()),
+                    (&xmlSecNodeDHQ[..], q.as_deref()),
+                    (&xmlSecNodeDHGenerator[..], generator.as_deref()),
+                    (&xmlSecNodeDHPublic[..], Some(public.as_slice())),
+                    (&xmlSecNodeDHSeed[..], seed.as_deref()),
+                    (&xmlSecNodeDHPgenCounter[..], pgen_counter.as_deref()),
+                ] {
+                    if let Some(bytes) = bytes.filter(|bytes| !bytes.is_empty()) {
+                        write_component(node, name, &xmlSecEncNs, bytes)?;
+                    }
+                }
+                Ok(())
+            }
             _ => Err(c"KeyValueInfo"),
         }
     }
@@ -579,10 +625,14 @@ unsafe extern "C" fn xml_write(
         // libxmlsec1 writes RSA's PrivateExponent and DSA's X when the
         // context asks for the private key and the key holds one. Those
         // components are not written here, so the request fails before the
-        // node is edited instead of producing a public-only value.
+        // node is edited instead of producing a public-only value. EC and DH
+        // values carry no private component in libxmlsec1 either.
         // SAFETY: a context.
         let private_requested = unsafe { (*ctx).key_req.key_type } & TYPE_PRIVATE != 0;
-        if private_requested && material.private.is_some() && family != Family::Ec {
+        if private_requested
+            && material.private.is_some()
+            && matches!(family, Family::Rsa | Family::Dsa)
+        {
             errors::other(
                 here,
                 errors::R_INVALID_KEY_DATA,
@@ -922,5 +972,6 @@ getters! {
     rsa => RSA;
     dsa => DSA;
     ec => EC;
+    dh => DH;
     der_encoded_key_value => DER_ENCODED_KEY_VALUE;
 }

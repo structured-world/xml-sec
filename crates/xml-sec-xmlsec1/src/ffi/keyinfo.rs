@@ -39,7 +39,7 @@ use super::transforms::{
     },
 };
 use super::tree::{XmlNode, nodes, xmlStrEqual};
-use super::xmlenc::derived_key::forget_derivation;
+use super::xmlenc::key_source;
 use super::xmlenc::{
     xmlSecEncCtxDebugDump, xmlSecEncCtxDebugXmlDump, xmlSecEncCtxDestroy, xmlSecEncCtxReset,
 };
@@ -616,7 +616,7 @@ pub(crate) unsafe extern "C" fn xmlSecKeyInfoCtxFinalize(ctx: *mut XmlSecKeyInfo
             // A read's guard releases its pin on return, so none is left
             // here; the slot is emptied the same way should one be.
             policy::release(&raw mut context.reserved0);
-            forget_derivation(ctx);
+            key_source::forget(ctx);
             ctx.cast::<u8>()
                 .write_bytes(0, size_of::<XmlSecKeyInfoCtx>());
         }
@@ -650,7 +650,7 @@ pub(crate) unsafe extern "C" fn xmlSecKeyInfoCtxReset(ctx: *mut XmlSecKeyInfoCtx
             // xmlSecTransformOperationNone.
             context.operation = 0;
             xmlSecKeyReqReset(&raw mut context.key_req);
-            forget_derivation(ctx);
+            key_source::forget(ctx);
         }
     });
 }

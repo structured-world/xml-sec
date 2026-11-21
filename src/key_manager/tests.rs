@@ -3494,25 +3494,277 @@ fn eddsa_private_identity_matches_only_its_corresponding_spki() {
     assert!(!identity.matches_spki(wrong.as_bytes()));
 }
 
+#[cfg(feature = "xmlenc")]
 #[test]
-fn unsupported_spki_is_rejected_at_import() {
-    // A syntactically valid X25519 agreement key is not an Ed25519
-    // signing key and must not acquire VERIFY usage (RFC 8410 section 5).
+fn an_agreement_public_key_agrees_on_keys_only() {
+    // An X25519 key is no Ed25519 signing key and must not acquire VERIFY
+    // usage (RFC 8410 section 5): imported without a stated use it agrees on
+    // keys alone, and a request to verify or encrypt with it is refused.
     let mut agreement_spki = vec![
         0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x6e, 0x03, 0x21, 0x00,
     ];
     agreement_spki.extend_from_slice(&[1; 32]);
+    let resources = ResourcePolicy::default();
     let mut inventory = KeyInventory::default();
+    inventory
+        .add_public_der("agreement".into(), agreement_spki.clone(), &resources)
+        .expect("an X25519 public key imports");
+    assert_eq!(inventory.public_keys[0].usages, KeyUsages::KEY_AGREEMENT);
+    for usages in [
+        KeyUsages::VERIFY,
+        KeyUsages::ENCRYPT,
+        KeyUsages::KEY_AGREEMENT.union(KeyUsages::VERIFY),
+    ] {
+        let mut inventory = KeyInventory::default();
+        assert!(
+            inventory
+                .add_public_der_with_usages("a".into(), agreement_spki.clone(), usages, &resources)
+                .is_err(),
+            "{usages:?}"
+        );
+        assert!(inventory.public_keys.is_empty());
+    }
+    // A key of the wrong width for its curve is no X25519 key.
+    let mut short = agreement_spki[..agreement_spki.len() - 1].to_vec();
+    // The SEQUENCE length (octet 1) and BIT STRING length (octet 10).
+    short[1] -= 1;
+    short[10] -= 1;
     assert!(
-        inventory
-            .add_public_der(
-                "unsupported".into(),
-                agreement_spki,
-                &ResourcePolicy::default()
+        KeyInventory::default()
+            .add_public_der("short".into(), short, &resources)
+            .is_err()
+    );
+}
+
+#[cfg(feature = "xmlenc")]
+#[test]
+fn only_agreement_keys_take_the_key_agreement_usage() {
+    // KEY_AGREEMENT is the one use of an X25519 or X448 key: an X25519 key
+    // asked to sign is refused, and the family's own use imports.
+    let resources = ResourcePolicy::default();
+    let x25519 = include_bytes!("../../tests/fixtures/xmlenc/keys/xdh/xdh-x25519-first-key.pem");
+    let import = |usages| {
+        KeyInventory::default().add_openssl_private_key(
+            "key".into(),
+            x25519,
+            PrivateKeyContainer::Pem,
+            None,
+            usages,
+            &resources,
+        )
+    };
+    assert!(import(KeyUsages::SIGN).is_err());
+    assert!(import(KeyUsages::KEY_AGREEMENT.union(KeyUsages::SIGN)).is_err());
+    import(KeyUsages::KEY_AGREEMENT).expect("an X25519 key agrees");
+}
+
+#[test]
+fn an_rsa_key_takes_its_family_usages_and_never_agrees() {
+    // KEY_AGREEMENT is no use of an RSA key in any build: asked for it the
+    // import is refused, and a caller naming no use gets RSA's own, signing
+    // and decryption.
+    let resources = ResourcePolicy::default();
+    let rsa = include_bytes!("../../tests/fixtures/keys/rsa/rsa-2048-key.pem");
+    assert!(
+        KeyInventory::default()
+            .add_openssl_private_key(
+                "rsa".into(),
+                rsa,
+                PrivateKeyContainer::Pem,
+                None,
+                KeyUsages::KEY_AGREEMENT,
+                &resources,
             )
             .is_err()
     );
-    assert!(inventory.public_keys.is_empty());
+    let mut inventory = KeyInventory::default();
+    inventory
+        .add_openssl_private_key_with_family_usages(
+            "rsa".into(),
+            rsa,
+            PrivateKeyContainer::Pem,
+            None,
+            &resources,
+        )
+        .expect("an RSA key imports");
+    assert_eq!(
+        inventory.private_keys()[0].usages,
+        KeyUsages::SIGN.union(KeyUsages::DECRYPT)
+    );
+}
+
+#[test]
+fn an_rsa_public_key_without_a_stated_use_verifies_and_encrypts_only() {
+    // A public RSA key imported without a stated use takes RSA's own uses,
+    // verification and encryption, never KEY_AGREEMENT, which the import
+    // refuses when it is asked for.
+    let pem = include_bytes!("../../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    let resources = ResourcePolicy::default();
+    let mut inventory = KeyInventory::default();
+    inventory
+        .add_public_pem("rsa", pem, &resources)
+        .expect("an RSA public key imports");
+    assert_eq!(
+        inventory.public_keys[0].usages,
+        KeyUsages::VERIFY.union(KeyUsages::ENCRYPT)
+    );
+}
+
+#[cfg(not(feature = "xmlenc"))]
+#[test]
+fn agreement_keys_need_the_encryption_feature() {
+    // Key agreement is an XML Encryption mechanism: a build without it
+    // imports no X25519 or DH key, private or public, rather than storing
+    // one it cannot use.
+    let resources = ResourcePolicy::default();
+    for (bytes, container) in [
+        (
+            &include_bytes!("../../tests/fixtures/xmlenc/keys/xdh/xdh-x25519-first-key.pem")[..],
+            PrivateKeyContainer::Pem,
+        ),
+        (
+            &include_bytes!("../../tests/fixtures/xmlenc/keys/dhx/dhx-rfc5114-3-first-key.der")[..],
+            PrivateKeyContainer::Der,
+        ),
+    ] {
+        assert!(
+            KeyInventory::default()
+                .add_openssl_private_key_with_family_usages(
+                    "key".into(),
+                    bytes,
+                    container,
+                    None,
+                    &resources,
+                )
+                .is_err()
+        );
+    }
+    for public in [
+        &include_bytes!("../../tests/fixtures/xmlenc/keys/xdh/xdh-x25519-first-pubkey.der")[..],
+        &include_bytes!("../../tests/fixtures/xmlenc/keys/dhx/dhx-rfc5114-3-first-pubkey.der")[..],
+    ] {
+        assert!(
+            KeyInventory::default()
+                .add_public_der("key".into(), public.to_vec(), &resources)
+                .is_err()
+        );
+    }
+}
+
+#[cfg(feature = "xmlenc")]
+#[test]
+fn a_dh_public_key_agrees_on_keys_only() {
+    // An X9.42 DH public key (RFC 3279 section 2.3.3) agrees on keys and
+    // nothing else, as an X25519 one: imported without a stated use it takes
+    // KEY_AGREEMENT, a request to verify or encrypt with it is refused, and
+    // an SPKI whose public value is no INTEGER is no DH key.
+    let der =
+        include_bytes!("../../tests/fixtures/xmlenc/keys/dhx/dhx-rfc5114-3-second-pubkey.der");
+    let resources = ResourcePolicy::default();
+    let mut inventory = KeyInventory::default();
+    inventory
+        .add_public_der("dh".into(), der.to_vec(), &resources)
+        .expect("a DH public key imports");
+    assert_eq!(inventory.public_keys[0].usages, KeyUsages::KEY_AGREEMENT);
+    for usages in [KeyUsages::VERIFY, KeyUsages::ENCRYPT] {
+        assert!(
+            KeyInventory::default()
+                .add_public_der_with_usages("dh".into(), der.to_vec(), usages, &resources)
+                .is_err(),
+            "{usages:?}"
+        );
+    }
+    // The BIT STRING holds INTEGER y after its unused-bits octet: turning
+    // the INTEGER tag into an OCTET STRING tag keeps every length.
+    let mut broken = der.to_vec();
+    // A four-octet header before the 256 octets of y ends the encoding.
+    let at = der.len() - 260;
+    assert_eq!(broken[at], 0x02, "the public INTEGER tag");
+    broken[at] = 0x04;
+    assert!(
+        KeyInventory::default()
+            .add_public_der("dh".into(), broken, &resources)
+            .is_err()
+    );
+}
+
+#[cfg(feature = "xmlenc")]
+#[test]
+fn family_usages_follow_the_imported_key() {
+    // A caller that names no use gets the family's: X25519, X448 and X9.42
+    // DH keys agree on keys, from every container the inventory reads, the
+    // password-protected PKCS#8 included; their public identity is the one
+    // the matching public key file holds (a DH key's public value derived
+    // from the private one, RFC 3279 section 2.3.3).
+    /// A private key file, its container and password, and the public key
+    /// file of the same key.
+    type Case<'a> = (&'a [u8], PrivateKeyContainer, Option<&'a [u8]>, &'a [u8]);
+    let resources = ResourcePolicy::default();
+    let dh_public: &[u8] =
+        include_bytes!("../../tests/fixtures/xmlenc/keys/dhx/dhx-rfc5114-3-first-pubkey.der");
+    let keys: [Case<'_>; 7] = [
+        (
+            include_bytes!("../../tests/fixtures/xmlenc/keys/dhx/dhx-rfc5114-3-first-key.der"),
+            PrivateKeyContainer::Der,
+            None,
+            dh_public,
+        ),
+        (
+            include_bytes!("../../tests/fixtures/xmlenc/keys/dhx/dhx-rfc5114-3-first-key.pem"),
+            PrivateKeyContainer::Pem,
+            None,
+            dh_public,
+        ),
+        (
+            include_bytes!("../../tests/fixtures/xmlenc/keys/dhx/dhx-rfc5114-3-first-key.p8-der"),
+            PrivateKeyContainer::Pkcs8Der,
+            Some(b"secret123"),
+            dh_public,
+        ),
+        (
+            include_bytes!("../../tests/fixtures/xmlenc/keys/xdh/xdh-x25519-first-key.pem"),
+            PrivateKeyContainer::Pem,
+            None,
+            include_bytes!("../../tests/fixtures/xmlenc/keys/xdh/xdh-x25519-first-pubkey.der"),
+        ),
+        (
+            include_bytes!("../../tests/fixtures/xmlenc/keys/xdh/xdh-x25519-first-key.p8-pem"),
+            PrivateKeyContainer::Pkcs8Pem,
+            Some(b"secret123"),
+            include_bytes!("../../tests/fixtures/xmlenc/keys/xdh/xdh-x25519-first-pubkey.der"),
+        ),
+        (
+            include_bytes!("../../tests/fixtures/xmlenc/keys/xdh/xdh-x448-first-key.der"),
+            PrivateKeyContainer::Der,
+            None,
+            include_bytes!("../../tests/fixtures/xmlenc/keys/xdh/xdh-x448-first-pubkey.der"),
+        ),
+        (
+            include_bytes!("../../tests/fixtures/xmlenc/keys/xdh/xdh-x448-first-key.p8-der"),
+            PrivateKeyContainer::Pkcs8Der,
+            Some(b"secret123"),
+            include_bytes!("../../tests/fixtures/xmlenc/keys/xdh/xdh-x448-first-pubkey.der"),
+        ),
+    ];
+    for (index, (bytes, container, password, public)) in keys.into_iter().enumerate() {
+        let mut inventory = KeyInventory::default();
+        inventory
+            .add_openssl_private_key_with_family_usages(
+                "key".into(),
+                bytes,
+                container,
+                password,
+                &resources,
+            )
+            .unwrap_or_else(|error| panic!("key {index}: {error}"));
+        let key = &inventory.private_keys()[0];
+        assert_eq!(key.usages, KeyUsages::KEY_AGREEMENT, "key {index}");
+        assert_eq!(
+            key.public_key_spki_der().expect("an identity"),
+            public,
+            "key {index}"
+        );
+    }
 }
 
 fn revoking_test_crl(root: &rcgen::Issuer<'_, rcgen::KeyPair>) -> rcgen::CertificateRevocationList {

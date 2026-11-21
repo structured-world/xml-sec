@@ -55,7 +55,7 @@ fn an_rsa_spki_with_parameters_other_than_null_is_refused() {
 
 #[test]
 fn key_value_families_without_an_spki_are_refused() {
-    // DSA without its domain parameters, DH and unsupported elements carry
+    // DSA or DH without its domain parameters and unsupported elements carry
     // no complete public key; reporting one would invent key material.
     let refused = [
         KeyValueInfo::Dsa {
@@ -89,6 +89,35 @@ fn key_value_families_without_an_spki_are_refused() {
             Err(KeyResolutionError::InvalidPublicKey)
         ));
     }
+}
+
+#[test]
+fn a_dh_key_value_round_trips_through_its_x942_spki() {
+    // RFC 3279 section 2.3.3 orders DomainParameters p, g, q while
+    // DHKeyValue orders P, Q, Generator: the SPKI of the RFC 5114 group 3
+    // fixture must decode to the components in their own places and encode
+    // back to the same DER.
+    let der =
+        include_bytes!("../../../tests/fixtures/xmlenc/keys/dhx/dhx-rfc5114-3-first-pubkey.der");
+    let value =
+        KeyValueInfo::from_spki_der(der, &ResourcePolicy::default()).expect("a DH key value");
+    let KeyValueInfo::Dh {
+        p: Some(p),
+        q: Some(q),
+        generator: Some(generator),
+        public,
+        seed: None,
+        pgen_counter: None,
+    } = &value
+    else {
+        panic!("a DH key value with its group: {value:?}");
+    };
+    assert_eq!((p.len(), q.len(), generator.len()), (256, 32, 256));
+    assert_eq!(p[0], 0x87);
+    assert_eq!(q[0], 0x8c);
+    assert_eq!(generator[0], 0x3f);
+    assert!(!public.is_empty() && public[0] != 0);
+    assert_eq!(value.to_spki_der().expect("an X9.42 SPKI"), der);
 }
 
 #[test]
