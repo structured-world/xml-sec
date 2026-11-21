@@ -66,13 +66,13 @@ declarations.
 Verification only, with no private-key import, password derivation or randomness source:
 
 ```toml
-xml-sec = { version = "0.6", default-features = false, features = ["xmldsig", "c14n", "xml-backend-xmloxide"] }
+xml-sec = { version = "0.7", default-features = false, features = ["xmldsig", "c14n", "xml-backend-xmloxide"] }
 ```
 
 Verification and signing:
 
 ```toml
-xml-sec = { version = "0.6", default-features = false, features = ["xmldsig-sign", "c14n", "xml-backend-xmloxide"] }
+xml-sec = { version = "0.7", default-features = false, features = ["xmldsig-sign", "c14n", "xml-backend-xmloxide"] }
 ```
 
 See [feature and provider qualification](docs/features.md) for supported combinations,
@@ -180,7 +180,7 @@ Use `xml-backend-roxmltree` for a thin alternative build, or compile `xml-backen
 `Xmloxide`, `Roxmltree`, or fail-closed `Differential` parsing per operation:
 
 ```toml
-xml-sec = { version = "0.6", default-features = false, features = ["xmldsig", "xmlenc", "c14n", "xml-backends-all"] }
+xml-sec = { version = "0.7", default-features = false, features = ["xmldsig", "xmlenc", "c14n", "xml-backends-all"] }
 ```
 
 ```rust
