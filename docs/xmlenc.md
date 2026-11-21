@@ -75,7 +75,10 @@ for authenticated content and a separate signature for sender authentication.
 Direct KEM-to-CBC content is denied by default, independently of algorithm
 permission. `key_establishment.kem_content_authentication` must explicitly be
 `KemContentAuthentication::ExternalAuthenticated` to enable compatibility with
-the donor's CBC vectors. The caller must authenticate the complete encrypted
+the donor's CBC vectors. The `XmlSecCompatible` profile's inbound ceiling
+grants it together with the three ML-KEM parameter sets, as libxmlsec1 decrypts
+such content; a restricting layer that sets `RequireAuthenticatedCipher` takes
+it back, and no other profile admits KEM. The caller must authenticate the complete encrypted
 input before decryption and bind external integrity protection of generated
 ciphertext to its encryption key (`XMLEnc` 1.1 §6.1.1). This grant
 does not validate that authentication: CBC padding can succeed for an ML-KEM

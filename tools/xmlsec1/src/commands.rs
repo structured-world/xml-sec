@@ -5683,23 +5683,23 @@ struct EncryptionTemplateMetadata {
     recipients: Vec<EncryptionTemplateRecipient>,
 }
 
+/// The key establishment of the `XmlSecCompatible` profile's inbound
+/// ceiling, which every command of this compatibility boundary uses in both
+/// directions, as libxmlsec1 agrees, derives and transports keys alike when
+/// it signs, verifies, encrypts and decrypts.
 fn xmlsec_compatibility_key_establishment_policy() -> xml_sec::policy::KeyEstablishmentPolicy {
-    let policy = xml_sec::policy::KeyEstablishmentPolicy::default();
-    #[cfg(feature = "experimental-pq")]
-    let policy = xml_sec::policy::KeyEstablishmentPolicy {
-        // The compatibility CLI preserves donor CBC semantics. It cannot
-        // establish external authentication; callers must supply that boundary.
-        kem_content_authentication:
-            xml_sec::policy::KemContentAuthentication::ExternalAuthenticated,
-        encapsulation_algorithms: [
-            xml_sec::provider::KeyEncapsulationAlgorithm::MlKem512,
-            xml_sec::provider::KeyEncapsulationAlgorithm::MlKem768,
-            xml_sec::provider::KeyEncapsulationAlgorithm::MlKem1024,
-        ]
-        .into(),
-        ..policy
-    };
-    policy
+    xml_sec::policy::PolicyCompiler::new(
+        xml_sec::policy::PolicyProfile::XmlSecCompatible,
+        &xml_sec::provider::RustCryptoProvider,
+        None,
+    )
+    .expect("the compatible profile needs no grant")
+    .policies()
+    .verification
+    .as_ref()
+    .expect("every profile verifies")
+    .key_establishment
+    .clone()
 }
 
 /// The first named key-store entry that yields an encapsulation key; lax
