@@ -213,6 +213,8 @@ static BUILTIN: Global<XmlSecCryptoDLFunctions> = Global::new(XmlSecCryptoDLFunc
     transform_camellia128_cbc: Some(ciphers::camellia128_cbc),
     transform_camellia192_cbc: Some(ciphers::camellia192_cbc),
     transform_camellia256_cbc: Some(ciphers::camellia256_cbc),
+    transform_chacha20: Some(ciphers::chacha20),
+    transform_chacha20_poly1305: Some(ciphers::chacha20_poly1305),
     transform_concat_kdf: Some(kdf::concat_kdf),
     transform_pbkdf2: Some(kdf::pbkdf2),
     transform_hkdf: Some(kdf::hkdf),

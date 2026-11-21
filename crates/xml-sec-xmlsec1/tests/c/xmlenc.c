@@ -880,6 +880,94 @@ static void mlkem_round_trip(const char *name, const char *public, const char *p
     xsFreeDoc(doc);
 }
 
+/* The donor's keys.xml ChaCha20 keys, by name. */
+#define CHACHA20_KEY "zAKV37t4gV9srAUvRFjxERSJ13wGpDwoIMkcJxlD0MU="
+#define CHACHA20_POLY1305_KEY "rSyWevC59TMmFuoDBdEC4VvlwiJOqalHn3GffX4CcPA="
+
+/* A keys manager holding the ChaCha20 key whose Base64 value is `value`
+ * under `name`. */
+static xmlSecKeysMngrPtr chacha_manager(const char *value, const char *name) {
+    xmlSecByte bytes[32];
+    xmlSecSize written = 0;
+    xmlSecKeysMngrPtr mngr = xmlSecKeysMngrCreate();
+    xmlSecKeyInfoCtxPtr info = xmlSecKeyInfoCtxCreate(NULL);
+    xmlSecKeyPtr key = xmlSecKeyCreate();
+    xmlSecCryptoAppDefaultKeysMngrInit(mngr);
+    if (xmlSecBase64Decode_ex(BAD_CAST value, bytes, sizeof(bytes), &written) < 0 ||
+        xmlSecKeyDataBinRead(xmlSecKeyDataChaCha20Id, key, bytes, written, info) < 0) {
+        printf("  key %s not read\n", name);
+        xmlSecKeyDestroy(key);
+    } else {
+        xmlSecKeySetName(key, BAD_CAST name);
+        xmlSecCryptoAppDefaultKeysMngrAdoptKey(mngr, key);
+    }
+    xmlSecKeyInfoCtxDestroy(info);
+    return mngr;
+}
+
+/* The donor's ChaCha vector `name`, decrypted with the key `value` under
+ * `key_name`. */
+static void chacha_vector(const char *name, const char *value, const char *key_name) {
+    char path[512];
+    static xmlSecByte expected[1 << 16];
+    size_t expected_size = 0;
+    xmlSecByte *data;
+    xmlDocPtr doc;
+    xmlSecKeysMngrPtr mngr;
+    printf("chacha vector %s\n", name);
+    snprintf(path, sizeof(path), VECTORS "%s.data", name);
+    data = file_bytes(path, &expected_size);
+    if (data != NULL) {
+        memcpy(expected, data, expected_size);
+    }
+    snprintf(path, sizeof(path), VECTORS "%s.xml", name);
+    data = file_bytes(path, &(size_t){0});
+    if (data == NULL) {
+        printf("  missing vector %s\n", name);
+        return;
+    }
+    doc = xsReadMemory((const char *)data, (int)strlen((const char *)data), "vector.xml", NULL, 0);
+    mngr = chacha_manager(value, key_name);
+    decrypt_kem(doc, mngr, expected, expected_size);
+    xmlSecKeysMngrDestroy(mngr);
+    xsFreeDoc(doc);
+}
+
+/* The donor's ChaCha template `name` encrypted with the key `value` under
+ * `key_name` and decrypted again; whether the method then names a nonce, as
+ * the encryption writes the one it drew when the template has none. The
+ * nonce is fresh when drawn, so only outcomes print. */
+static void chacha_round_trip(const char *name, const char *value, const char *key_name) {
+    static const char bytes[] = "stream cipher content";
+    char path[512];
+    xmlSecByte *data;
+    xmlDocPtr doc;
+    xmlSecEncCtxPtr ctx;
+    xmlSecKeysMngrPtr mngr;
+    xmlNodePtr method;
+    printf("chacha round trip %s\n", name);
+    snprintf(path, sizeof(path), VECTORS "%s.tmpl", name);
+    data = file_bytes(path, &(size_t){0});
+    if (data == NULL) {
+        printf("  missing template %s\n", name);
+        return;
+    }
+    doc = xsReadMemory((const char *)data, (int)strlen((const char *)data), "template.xml", NULL, 0);
+    mngr = chacha_manager(value, key_name);
+    ctx = xmlSecEncCtxCreate(mngr);
+    printf("  encrypt: %d\n", xmlSecEncCtxBinaryEncrypt(ctx, xsDocGetRootElement(doc),
+                                                        (const xmlSecByte *)bytes,
+                                                        sizeof(bytes) - 1));
+    xmlSecEncCtxDestroy(ctx);
+    method = xmlSecFindChild(xsDocGetRootElement(doc), xmlSecNodeEncryptionMethod, xmlSecEncNs);
+    printf("  nonce written: %d\n",
+           method != NULL && xmlSecFindChild(method, BAD_CAST "Nonce",
+                                             BAD_CAST "http://www.w3.org/2021/04/xmldsig-more#") != NULL);
+    decrypt_kem(doc, mngr, (const xmlSecByte *)bytes, sizeof(bytes) - 1);
+    xmlSecKeysMngrDestroy(mngr);
+    xsFreeDoc(doc);
+}
+
 int main(void) {
     xmlDocPtr doc;
     xmlSecEncCtxPtr ctx;
@@ -967,6 +1055,18 @@ int main(void) {
                      "TestKeyName-ml-kem-768");
     mlkem_round_trip("enc-aes256gcm-kt-ml-kem-1024", "ml-kem-1024-pubkey.pem",
                      "ml-kem-1024-key.pem", "TestKeyName-ml-kem-1024");
+    chacha_vector("enc-chacha20-keyname", CHACHA20_KEY, "test-chacha20");
+    chacha_vector("enc-chacha20poly1305-keyname", CHACHA20_POLY1305_KEY, "test-chacha20poly1305");
+    chacha_vector("enc-chacha20poly1305-aad-keyname", CHACHA20_POLY1305_KEY,
+                  "test-chacha20poly1305");
+    chacha_round_trip("enc-chacha20-keyname", CHACHA20_KEY, "test-chacha20");
+    chacha_round_trip("enc-chacha20-keyname-missing-nonce", CHACHA20_KEY, "test-chacha20");
+    chacha_round_trip("enc-chacha20poly1305-keyname", CHACHA20_POLY1305_KEY,
+                      "test-chacha20poly1305");
+    chacha_round_trip("enc-chacha20poly1305-keyname-missing-nonce", CHACHA20_POLY1305_KEY,
+                      "test-chacha20poly1305");
+    chacha_round_trip("enc-chacha20poly1305-aad-keyname", CHACHA20_POLY1305_KEY,
+                      "test-chacha20poly1305");
 
     /* No key: the keys manager has none. */
     key = aes_key(0x11);

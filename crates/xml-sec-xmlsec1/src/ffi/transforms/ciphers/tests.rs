@@ -197,6 +197,65 @@ fn decryption_refuses_plaintext_beyond_the_policy_limit() {
     unsafe { xmlSecKeyDestroy(key) };
 }
 
+/// A `ChaCha20` key holding `bytes`.
+fn chacha_key(bytes: &[u8]) -> *mut XmlSecKey {
+    // SAFETY: a key and key data created here.
+    unsafe {
+        let data = xmlSecKeyDataCreate(symkeys::chacha20());
+        assert_eq!(
+            xmlSecKeyDataBinaryValueSetBuffer(data, bytes.as_ptr(), bytes.len()),
+            0
+        );
+        let key = xmlSecKeyCreate();
+        assert_eq!(xmlSecKeySetValue(key, data), 0);
+        key
+    }
+}
+
+#[test]
+fn a_chacha_chain_without_its_method_draws_a_nonce_only_to_encrypt() {
+    // A ChaCha20-Poly1305 chain read from no EncryptionMethod draws the nonce
+    // it encrypts with, as libxmlsec1 does; decrypting needs the nonce the
+    // method carries, so the same chain cannot decrypt without one. ChaCha20
+    // without its method has no counter and encrypts nothing.
+    let key = chacha_key(&[0x66; 32]);
+    let sealed = run(chacha20_poly1305(), OPERATION_ENCRYPT, key, b"payload").expect("encrypts");
+    // The Poly1305 tag follows the ciphertext; the nonce stays out of it.
+    assert_eq!(sealed.len(), b"payload".len() + 16);
+    assert_eq!(
+        run(chacha20_poly1305(), OPERATION_DECRYPT, key, &sealed),
+        None
+    );
+    assert_eq!(run(chacha20(), OPERATION_ENCRYPT, key, b"payload"), None);
+    // SAFETY: the key created above.
+    unsafe { xmlSecKeyDestroy(key) };
+}
+
+#[test]
+fn the_policy_decides_the_chacha_ciphers() {
+    // A deployment that drops ChaCha20-Poly1305 from its encryption ciphers
+    // refuses the klass before any work. Republishing runs in this test's own
+    // process.
+    crate::ffi::tests::own_process();
+    let key = chacha_key(&[0x77; 32]);
+    assert!(run(chacha20_poly1305(), OPERATION_ENCRYPT, key, b"payload").is_some());
+    xml_sec_libxml2::policy::republish_encryption(
+        |encryption| {
+            if let Some(ciphers) = encryption.data_algorithms.as_mut() {
+                ciphers.remove(&DataEncryptionAlgorithm::ChaCha20Poly1305);
+            }
+        },
+        |_| {},
+    )
+    .expect("the library policy compiles");
+    assert_eq!(
+        run(chacha20_poly1305(), OPERATION_ENCRYPT, key, b"payload"),
+        None
+    );
+    // SAFETY: the key created above.
+    unsafe { xmlSecKeyDestroy(key) };
+}
+
 #[test]
 fn a_short_key_is_refused_and_requirements_name_the_family_and_size() {
     // SAFETY: a context, a transform and a key created and destroyed here.
