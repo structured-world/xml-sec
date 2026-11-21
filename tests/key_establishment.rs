@@ -33,6 +33,60 @@ fn ecdh_all_nist_curves_preserve_fixed_width_and_validate_peers() {
     }
 }
 
+#[test]
+fn ecdh_pkcs8_import_selects_the_curve_of_its_parameters() {
+    use der::Encode as _;
+    use pkcs8::EncodePrivateKey as _;
+    use xml_sec::provider::{EcdhCurve, RustCryptoEcdhKey};
+    // A key file holds the curve in the PKCS#8 algorithm parameters (RFC 5480
+    // section 2.1.1): the import must land on that curve, so its public point
+    // equals the one the scalar gives on it, for every supported width.
+    let keys = [
+        (
+            EcdhCurve::P256,
+            vec![3; 32],
+            p256::SecretKey::from_slice(&[3; 32])
+                .unwrap()
+                .to_pkcs8_der()
+                .unwrap(),
+        ),
+        (
+            EcdhCurve::P384,
+            vec![3; 48],
+            p384::SecretKey::from_slice(&[3; 48])
+                .unwrap()
+                .to_pkcs8_der()
+                .unwrap(),
+        ),
+        (
+            EcdhCurve::P521,
+            [vec![1], vec![3; 65]].concat(),
+            p521::SecretKey::from_slice(&[[1].as_slice(), &[3; 65]].concat())
+                .unwrap()
+                .to_pkcs8_der()
+                .unwrap(),
+        ),
+    ];
+    for (curve, scalar, der) in &keys {
+        let imported = RustCryptoEcdhKey::from_pkcs8_der(der.as_bytes()).unwrap();
+        let expected = RustCryptoEcdhKey::from_scalar(*curve, scalar).unwrap();
+        assert_eq!(imported.public_key(), expected.public_key());
+    }
+    // Not a key at all, and a curve key whose DER is cut short.
+    assert!(RustCryptoEcdhKey::from_pkcs8_der(b"not DER").is_err());
+    let truncated = &keys[0].2.as_bytes()[..keys[0].2.as_bytes().len() - 1];
+    assert!(RustCryptoEcdhKey::from_pkcs8_der(truncated).is_err());
+    // An X25519 key is no ECDH-ES key.
+    let x25519 = pkcs8::PrivateKeyInfoRef::new(
+        pkcs8::AlgorithmIdentifierRef {
+            oid: pkcs8::ObjectIdentifier::new_unwrap("1.3.101.110"),
+            parameters: None,
+        },
+        der::asn1::OctetStringRef::new(&[4, 32, 7, 7, 7, 7]).unwrap(),
+    );
+    assert!(RustCryptoEcdhKey::from_pkcs8_der(&x25519.to_der().unwrap()).is_err());
+}
+
 fn hex(value: &str) -> Vec<u8> {
     let (pairs, remainder) = value.as_bytes().as_chunks::<2>();
     assert!(remainder.is_empty(), "odd test hex width");

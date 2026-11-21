@@ -66,6 +66,19 @@ impl KeyDerivationMethod {
         parse_node(node, resources.max_encryption_metadata_bytes)
     }
 
+    /// The derivation's algorithm URI (`ConcatKDF`, PBKDF2 or HKDF).
+    #[must_use]
+    pub fn algorithm(&self) -> &str {
+        &self.algorithm
+    }
+
+    /// The URI of the digest (`ConcatKDF`) or PRF (PBKDF2, HKDF) the
+    /// derivation runs.
+    #[must_use]
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
     pub(super) fn validate_metadata(&self, maximum: usize) -> Result<(), XmlEncError> {
         serialize::validate_metadata(self, maximum)
     }

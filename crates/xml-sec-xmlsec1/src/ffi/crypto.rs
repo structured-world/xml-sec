@@ -25,7 +25,7 @@ use super::list::{
     XmlSecPtrList, XmlSecPtrListKlass, xmlSecPtrListAdd, xmlSecPtrListFinalize, xmlSecPtrListRemove,
 };
 use super::transforms::{Global, XmlSecTransformKlass, xmlSecTransformIdsRegister, zero_list};
-use super::transforms::{ciphers, digests, hmac, kdf, signatures, transport};
+use super::transforms::{ciphers, digests, hmac, kam, kdf, signatures, transport};
 use super::{app, asymkeys, symkeys, x509};
 
 /// An opaque `xmlSecKeysMngrPtr`, `xmlSecKeyPtr` or `xmlSecKeyInfoCtxPtr`.
@@ -210,6 +210,7 @@ static BUILTIN: Global<XmlSecCryptoDLFunctions> = Global::new(XmlSecCryptoDLFunc
     transform_concat_kdf: Some(kdf::concat_kdf),
     transform_pbkdf2: Some(kdf::pbkdf2),
     transform_hkdf: Some(kdf::hkdf),
+    transform_ecdh: Some(kam::ecdh),
     #[cfg(feature = "legacy-algorithms")]
     transform_rsa_pkcs1: Some(transport::rsa_pkcs1),
     transform_rsa_oaep: Some(transport::rsa_oaep),

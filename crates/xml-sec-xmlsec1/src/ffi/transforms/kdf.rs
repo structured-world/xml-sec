@@ -194,7 +194,7 @@ unsafe extern "C" fn finalize(transform: *mut XmlSecTransform) {
 ///
 /// # Safety
 /// `ctx` is an initialized context whose chain is live.
-unsafe fn scope(
+pub(super) unsafe fn scope(
     transform: &XmlSecTransform,
     ctx: *mut XmlSecTransformCtx,
     here: Here,
@@ -210,7 +210,7 @@ unsafe fn scope(
 
 /// The parameters of the `KeyDerivationMethod` element `node`, as the core
 /// parses them under `operation`'s policy; the reason otherwise.
-fn parse_method(
+pub(super) fn parse_method(
     node: *mut XmlNode,
     operation: OperationPolicy<'_>,
 ) -> Result<KeyDerivationMethod, String> {
@@ -232,7 +232,7 @@ fn parse_method(
 /// The read `method` under the policy of `side`, `operation`: a method read
 /// before its operation was known is read again from its element `node`;
 /// `None` after a report at `here`.
-fn method_under<'a>(
+pub(super) fn method_under<'a>(
     method: &'a mut Option<(KeyDerivationMethod, Side)>,
     node: *mut XmlNode,
     operation: OperationPolicy<'_>,

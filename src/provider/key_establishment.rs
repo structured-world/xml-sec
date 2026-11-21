@@ -84,6 +84,27 @@ impl RustCryptoEcdhKey {
         }))
     }
 
+    /// Import an RFC 5915 EC private key in PKCS#8 (RFC 5208) on one of the
+    /// supported named curves, which its algorithm parameters select.
+    ///
+    /// # Errors
+    /// Returns an error for invalid DER, a curve other than P-256, P-384 or
+    /// P-521, or a scalar out of the curve's range.
+    pub fn from_pkcs8_der(bytes: &[u8]) -> Result<Self, ProviderError> {
+        use pkcs8::DecodePrivateKey as _;
+        // RFC 5480 section 2.1.1: the named curve travels in the algorithm
+        // parameters, so at most one curve decodes the key.
+        if let Ok(key) = p256::SecretKey::from_pkcs8_der(bytes) {
+            return Ok(Self(EcdhSecret::P256(key)));
+        }
+        if let Ok(key) = p384::SecretKey::from_pkcs8_der(bytes) {
+            return Ok(Self(EcdhSecret::P384(key)));
+        }
+        p521::SecretKey::from_pkcs8_der(bytes)
+            .map(|key| Self(EcdhSecret::P521(key)))
+            .map_err(|_| ProviderError::InvalidInput(ProviderInputError::EcdhKey))
+    }
+
     /// Export the public SEC1 uncompressed point, never private material.
     #[must_use]
     pub fn public_key(&self) -> Vec<u8> {
