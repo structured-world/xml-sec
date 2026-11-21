@@ -1047,6 +1047,14 @@ pub(super) unsafe fn encrypted_key_write(
             errors::internal(here, std::ptr::null(), c"xmlSecEncCtxEncDataNodeRead");
             return -1;
         }
+        if !super::encrypted_key::kem_data_to_context(ctx, key, here) {
+            errors::internal(
+                here,
+                std::ptr::null(),
+                c"xmlSecEncCtxEncryptedKeyAppendKemDataIfPresentToTransformCtx",
+            );
+            return -1;
+        }
         let Some(value) = super::encrypted_key::key_binary(key, key_info) else {
             errors::internal(
                 here,
@@ -1254,6 +1262,15 @@ unsafe fn read_method_and_key(ctx: &mut XmlSecEncCtx, add_base64: bool) -> c_int
             errors::internal(here, method_name, c"xmlSecTransformSetKeyReq");
             return -1;
         }
+        // A decryption read for a KeyInfo expects the key width that KeyInfo
+        // requires; a key transport (ML-KEM) cuts its secret to it.
+        let parent = ctx
+            .transform_ctx
+            .parent_key_info_ctx
+            .cast::<super::super::keyinfo::XmlSecKeyInfoCtx>();
+        if ctx.operation == OPERATION_DECRYPT && !parent.is_null() {
+            (*ctx.enc_method).expected_output_size = (*parent).key_req.key_bits_size / 8;
+        }
         let read = &raw mut ctx.key_info_read_ctx;
         if !read_key(ctx, here) {
             return -1;
@@ -1326,6 +1343,14 @@ unsafe fn admit_key_method(ctx: &mut XmlSecEncCtx, here: errors::Here) -> bool {
             pinned.encryption.check_key_wrap_algorithm(wrap)
         } else {
             pinned.decryption.check_key_wrap_algorithm(wrap)
+        }
+    } else if let Some(kem) = xml_sec::provider::KeyEncapsulationAlgorithm::from_uri(href) {
+        // An ML-KEM EncryptedKey transports its key by encapsulation, which
+        // the key establishment policy admits.
+        if encrypting {
+            pinned.encryption.key_establishment.check_encapsulation(kem)
+        } else {
+            pinned.decryption.key_establishment.check_encapsulation(kem)
         }
     } else {
         errors::invalid_data(
@@ -1618,13 +1643,14 @@ unsafe fn holds_key_of(ctx: &XmlSecEncCtx, source: &super::key_source::KeySource
 ///
 /// The `KeyInfo` read is this library's, as libxmlsec1's is its own: it
 /// took the key from the first child that yields one, a `DerivedKey`
-/// derived or an `AgreementMethod` agreed by its klass under the library
-/// policy included (as an `EncryptedKey` recovered by its nested context
-/// is). Such a key is offered for its own element alone, so the core holds
-/// a derived key to that `DerivedKey`'s `ReferenceList` and repeats no
-/// derivation or agreement; any other key, the caller's own included, is
-/// offered only where the core takes a key directly, so it never stands for
-/// a derivation or an agreement the `KeyInfo` declares.
+/// derived, an `AgreementMethod` agreed or an ML-KEM `EncryptedKey`
+/// decapsulated by its klass under the library policy included (as an
+/// `EncryptedKey` recovered by its nested context is). Such a key is offered
+/// for its own element alone, so the core holds a derived key to that
+/// `DerivedKey`'s `ReferenceList` and repeats no derivation, agreement or
+/// decapsulation; any other key, the caller's own included, is offered only
+/// where the core takes a key directly, so it never stands for a key
+/// establishment the `KeyInfo` declares.
 struct KeyInfoKey {
     key: SymmetricKeyDecryptor,
     source: Option<Descriptor>,
@@ -1702,6 +1728,27 @@ impl xml_sec::xmlenc::DecryptionKeyResolver for KeyInfoKey {
         // An element equal to the one agreed by, both roles included, names
         // the same parties and derivation.
         if !matches!(&self.source, Some(Descriptor::Agreement(agreed)) if agreed == descriptor) {
+            return Err(xml_sec::xmlenc::XmlEncError::KeyNotFound);
+        }
+        self.offer(provider, algorithm, policy, budget)
+    }
+
+    fn resolve_encapsulation_content_keys_with_policy(
+        &self,
+        provider: &dyn xml_sec::provider::CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        descriptor: &xml_sec::key_establishment::EncapsulationMechanism,
+        policy: &xml_sec::policy::DecryptionPolicy,
+        budget: &mut xml_sec::xmlenc::KeyCandidateBudget,
+    ) -> Result<Vec<xml_sec::provider::RecoveredContentKey>, xml_sec::xmlenc::XmlEncError> {
+        // An ML-KEM EncryptedKey of the same ciphertext decapsulates to the
+        // same secret; the core admitted the parameter set and the content
+        // cipher before asking.
+        if !self
+            .source
+            .as_ref()
+            .is_some_and(|source| source.is_encapsulation(descriptor))
+        {
             return Err(xml_sec::xmlenc::XmlEncError::KeyNotFound);
         }
         self.offer(provider, algorithm, policy, budget)

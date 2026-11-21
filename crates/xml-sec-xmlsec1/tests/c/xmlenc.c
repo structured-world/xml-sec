@@ -759,6 +759,127 @@ static void direct_agreement_round_trip(const char *label, int wrong) {
     xsFreeDoc(doc);
 }
 
+#define MLKEM_KEYS "tests/fixtures/xmldsig/keys/ml-kem/"
+
+/* A keys manager holding the ML-KEM key file `path` under `name`, with the
+ * key data's klass name and size printed, and its type for a private key
+ * file: libxmlsec1 reports every OpenSSL 3 key as private, which this
+ * library does only for a key that holds its private part. */
+static xmlSecKeysMngrPtr mlkem_manager(const char *path, const char *name) {
+    xmlSecKeysMngrPtr mngr = xmlSecKeysMngrCreate();
+    size_t size = 0;
+    xmlSecByte *bytes = file_bytes(path, &size);
+    xmlSecKeyPtr key;
+    xmlSecCryptoAppDefaultKeysMngrInit(mngr);
+    if (bytes == NULL) {
+        printf("  missing key file %s\n", path);
+        return mngr;
+    }
+    key = xmlSecCryptoAppKeyLoadMemory(bytes, (xmlSecSize)size, xmlSecKeyDataFormatPem, NULL, NULL,
+                                       NULL);
+    if (key == NULL) {
+        printf("  key %s not loaded\n", name);
+        return mngr;
+    }
+    printf("  key: %s size=%d", xmlSecKeyDataGetName(xmlSecKeyGetValue(key)),
+           (int)xmlSecKeyDataGetSize(xmlSecKeyGetValue(key)));
+    if (strstr(path, "pubkey") == NULL) {
+        printf(" type=%u", xmlSecKeyDataGetType(xmlSecKeyGetValue(key)));
+    }
+    printf("\n");
+    xmlSecKeySetName(key, BAD_CAST name);
+    xmlSecCryptoAppDefaultKeysMngrAdoptKey(mngr, key);
+    return mngr;
+}
+
+/* Decrypts the EncryptedData of `doc` with `mngr` and prints the size of the
+ * content and whether `expected` holds it. */
+static void decrypt_kem(xmlDocPtr doc, xmlSecKeysMngrPtr mngr, const xmlSecByte *expected,
+                        size_t expected_size) {
+    xmlSecEncCtxPtr ctx = xmlSecEncCtxCreate(mngr);
+    xmlNodePtr node = xmlSecFindNode(xsDocGetRootElement(doc), xmlSecNodeEncryptedData, xmlSecEncNs);
+    xmlSecBufferPtr result = xmlSecEncCtxDecryptToBuffer(ctx, node);
+    int found = 0;
+    if (result != NULL && expected != NULL) {
+        size_t size = xmlSecBufferGetSize(result);
+        for (size_t at = 0; size > 0 && at + size <= expected_size; at++) {
+            if (memcmp(expected + at, xmlSecBufferGetData(result), size) == 0) {
+                found = 1;
+                break;
+            }
+        }
+    }
+    printf("  decrypted: %d found=%d failure=%s\n",
+           result != NULL ? (int)xmlSecBufferGetSize(result) : -1, found,
+           xmlSecEncCtxGetFailureReasonString(ctx->failureReason));
+    xmlSecEncCtxDestroy(ctx);
+}
+
+/* The donor's ML-KEM vector `name`, decrypted with the private key file
+ * `key` of the recipient named `key_name`. */
+static void mlkem_vector(const char *name, const char *key, const char *key_name) {
+    char path[512];
+    static xmlSecByte expected[1 << 16];
+    size_t expected_size = 0;
+    xmlSecByte *data;
+    xmlDocPtr doc;
+    xmlSecKeysMngrPtr mngr;
+    printf("ml-kem vector %s\n", name);
+    snprintf(path, sizeof(path), VECTORS "%s.data", name);
+    data = file_bytes(path, &expected_size);
+    if (data != NULL) {
+        memcpy(expected, data, expected_size);
+    }
+    snprintf(path, sizeof(path), VECTORS "%s.xml", name);
+    data = file_bytes(path, &(size_t){0});
+    if (data == NULL) {
+        printf("  missing vector %s\n", name);
+        return;
+    }
+    doc = xsReadMemory((const char *)data, (int)strlen((const char *)data), "vector.xml", NULL, 0);
+    snprintf(path, sizeof(path), MLKEM_KEYS "%s", key);
+    mngr = mlkem_manager(path, key_name);
+    decrypt_kem(doc, mngr, expected, expected_size);
+    xmlSecKeysMngrDestroy(mngr);
+    xsFreeDoc(doc);
+}
+
+/* The donor's ML-KEM template `name` encrypted for the public key file
+ * `public` of the recipient named `key_name`, the content key the secret its
+ * EncryptedKey encapsulates, then decrypted with the private key file
+ * `private`. The ciphertext is fresh each time, so only outcomes print. */
+static void mlkem_round_trip(const char *name, const char *public, const char *private,
+                             const char *key_name) {
+    static const char bytes[] = "encapsulated content";
+    char path[512];
+    xmlSecByte *data;
+    xmlDocPtr doc;
+    xmlSecEncCtxPtr ctx;
+    xmlSecKeysMngrPtr sender;
+    xmlSecKeysMngrPtr recipient;
+    printf("ml-kem round trip %s\n", name);
+    snprintf(path, sizeof(path), VECTORS "%s.tmpl", name);
+    data = file_bytes(path, &(size_t){0});
+    if (data == NULL) {
+        printf("  missing template %s\n", name);
+        return;
+    }
+    doc = xsReadMemory((const char *)data, (int)strlen((const char *)data), "template.xml", NULL, 0);
+    snprintf(path, sizeof(path), MLKEM_KEYS "%s", public);
+    sender = mlkem_manager(path, key_name);
+    ctx = xmlSecEncCtxCreate(sender);
+    printf("  encrypt: %d\n", xmlSecEncCtxBinaryEncrypt(ctx, xsDocGetRootElement(doc),
+                                                        (const xmlSecByte *)bytes,
+                                                        sizeof(bytes) - 1));
+    xmlSecEncCtxDestroy(ctx);
+    snprintf(path, sizeof(path), MLKEM_KEYS "%s", private);
+    recipient = mlkem_manager(path, key_name);
+    decrypt_kem(doc, recipient, (const xmlSecByte *)bytes, sizeof(bytes) - 1);
+    xmlSecKeysMngrDestroy(recipient);
+    xmlSecKeysMngrDestroy(sender);
+    xsFreeDoc(doc);
+}
+
 int main(void) {
     xmlDocPtr doc;
     xmlSecEncCtxPtr ctx;
@@ -832,6 +953,20 @@ int main(void) {
     dh_agreement_round_trip();
     direct_agreement_round_trip("agreement in the data KeyInfo", 0);
     direct_agreement_round_trip("agreement in the data KeyInfo with another originator key", 1);
+    mlkem_vector("enc-aes128gcm-kt-ml-kem-512", "ml-kem-512-key.pem", "TestKeyName-ml-kem-512");
+    mlkem_vector("enc-aes256gcm-kt-ml-kem-1024", "ml-kem-1024-key.pem", "TestKeyName-ml-kem-1024");
+    mlkem_vector("enc-aes256-kt-ml-kem-512", "ml-kem-512-key.pem", "TestKeyName-ml-kem-512");
+    mlkem_vector("enc-aes256-kt-ml-kem-768", "ml-kem-768-key.pem", "TestKeyName-ml-kem-768");
+    mlkem_vector("enc-aes256-kt-ml-kem-1024", "ml-kem-1024-key.pem", "TestKeyName-ml-kem-1024");
+    quiet = 1;
+    mlkem_vector("enc-aes128gcm-kt-ml-kem-512", "ml-kem-768-key.pem", "TestKeyName-ml-kem-512");
+    quiet = 0;
+    mlkem_round_trip("enc-aes128gcm-kt-ml-kem-512", "ml-kem-512-pubkey.pem", "ml-kem-512-key.pem",
+                     "TestKeyName-ml-kem-512");
+    mlkem_round_trip("enc-aes256-kt-ml-kem-768", "ml-kem-768-pubkey.pem", "ml-kem-768-key.pem",
+                     "TestKeyName-ml-kem-768");
+    mlkem_round_trip("enc-aes256gcm-kt-ml-kem-1024", "ml-kem-1024-pubkey.pem",
+                     "ml-kem-1024-key.pem", "TestKeyName-ml-kem-1024");
 
     /* No key: the keys manager has none. */
     key = aes_key(0x11);

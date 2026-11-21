@@ -21,6 +21,7 @@ pub(crate) mod keysdata;
 pub(crate) mod keysmngr;
 pub(crate) mod library;
 pub(crate) mod list;
+pub(crate) mod mlkemkeys;
 pub(crate) mod nodeset;
 pub(crate) mod parser;
 pub(crate) mod policy;

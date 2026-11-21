@@ -25,8 +25,8 @@ use super::list::{
     XmlSecPtrList, XmlSecPtrListKlass, xmlSecPtrListAdd, xmlSecPtrListFinalize, xmlSecPtrListRemove,
 };
 use super::transforms::{Global, XmlSecTransformKlass, xmlSecTransformIdsRegister, zero_list};
-use super::transforms::{ciphers, digests, hmac, kam, kdf, signatures, transport};
-use super::{app, asymkeys, symkeys, x509, xdhkeys};
+use super::transforms::{ciphers, digests, hmac, kam, kdf, kem, signatures, transport};
+use super::{app, asymkeys, mlkemkeys, symkeys, x509, xdhkeys};
 
 /// An opaque `xmlSecKeysMngrPtr`, `xmlSecKeyPtr` or `xmlSecKeyInfoCtxPtr`.
 type Opaque = *mut c_void;
@@ -198,6 +198,10 @@ static BUILTIN: Global<XmlSecCryptoDLFunctions> = Global::new(XmlSecCryptoDLFunc
     key_data_ec: Some(asymkeys::ec),
     key_data_rsa: Some(asymkeys::rsa),
     key_data_xdh: Some(xdhkeys::xdh),
+    key_data_mlkem: Some(mlkemkeys::mlkem),
+    transform_mlkem512: Some(kem::mlkem512),
+    transform_mlkem768: Some(kem::mlkem768),
+    transform_mlkem1024: Some(kem::mlkem1024),
     transform_aes128_cbc: Some(ciphers::aes128_cbc),
     #[cfg(feature = "legacy-algorithms")]
     transform_aes192_cbc: Some(ciphers::aes192_cbc),

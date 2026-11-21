@@ -1,10 +1,11 @@
-//! The `KeyInfo` child a read derived or agreed its key by, with the octets
+//! The `KeyInfo` child a read derived, agreed or decapsulated its key by, with the octets
 //! it yielded, kept in the read context's `reserved1` until the decryption
 //! reading with that context takes the key: the core takes such a key for
 //! that element alone.
 
 use xml_sec::Node;
 use xml_sec::policy::DecryptionPolicy;
+use xml_sec::provider::KeyEncapsulationAlgorithm;
 use xml_sec::xmlenc::{AgreementMethod, DerivedKey};
 use zeroize::Zeroizing;
 
@@ -22,6 +23,15 @@ pub(super) enum Descriptor {
     Derived(DerivedKey),
     /// An `AgreementMethod` that yields the content key itself.
     Agreement(AgreementMethod),
+    /// An ML-KEM `EncryptedKey`, named by its parameter set and ciphertext:
+    /// the ciphertext is the encapsulation's own, so no other element
+    /// decapsulates to the same key.
+    Encapsulation {
+        /// The parameter set.
+        algorithm: KeyEncapsulationAlgorithm,
+        /// The FIPS 203 ciphertext.
+        ciphertext: Vec<u8>,
+    },
 }
 
 impl Descriptor {
@@ -37,6 +47,26 @@ impl Descriptor {
         AgreementMethod::from_element(node, policy)
             .ok()
             .map(Self::Agreement)
+    }
+
+    /// The ML-KEM `EncryptedKey` element `node`, as the core reads it among
+    /// an `EncryptedData`'s key sources; `None` for any other element.
+    pub(super) fn encapsulation(node: Node<'_, '_>, _policy: &DecryptionPolicy) -> Option<Self> {
+        xml_sec::key_establishment::parse_encapsulation(node, false)
+            .ok()
+            .map(|parsed| Self::Encapsulation {
+                algorithm: parsed.algorithm,
+                ciphertext: parsed.ciphertext().to_vec(),
+            })
+    }
+
+    /// Whether this is the encapsulation `descriptor` the core reads.
+    pub(super) fn is_encapsulation(
+        &self,
+        descriptor: &xml_sec::key_establishment::EncapsulationMechanism,
+    ) -> bool {
+        matches!(self, Self::Encapsulation { algorithm, ciphertext }
+            if *algorithm == descriptor.algorithm && *ciphertext == descriptor.ciphertext)
     }
 }
 

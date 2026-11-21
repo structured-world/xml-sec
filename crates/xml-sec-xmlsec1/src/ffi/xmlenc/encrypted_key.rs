@@ -18,19 +18,24 @@ use super::super::keyinfo::{
     xmlSecKeyInfoCtxFinalize, xmlSecKeyInfoCtxInitialize,
 };
 use super::super::keyinfo::{next_reference_depth, read_policy};
-use super::super::keys::{XmlSecKey, key_valid};
+use super::super::keys::{XmlSecKey, key_valid, xmlSecKeyAdoptData, xmlSecKeyGetData};
 use super::super::keysdata::{
-    XmlSecKeyDataKlass, xmlSecKeyDataBinRead, xmlSecKeyDataBinWrite,
-    xmlSecKeyDataEncryptedKeyGetKlass,
+    XmlSecKeyDataKlass, xmlSecKeyDataBinRead, xmlSecKeyDataBinWrite, xmlSecKeyDataDestroy,
+    xmlSecKeyDataDuplicate, xmlSecKeyDataEncryptedKeyGetKlass,
 };
 use super::super::list::xmlSecPtrListEmpty;
 use super::super::transforms::ctx::{operation_side, run_budget, run_spent, seed_run};
+use super::super::transforms::ctx::{
+    xmlSecTransformCtxExtraKeyDataAdopt, xmlSecTransformCtxExtraKeyDataGet,
+};
+use super::super::transforms::kem;
 use super::super::transforms::{
     OPERATION_DECRYPT, OPERATION_ENCRYPT, OPERATION_SIGN, OPERATION_VERIFY,
 };
 use super::super::tree::{XmlNode, nodes};
 use super::super::xmltree::{trimmed_content, xmlSecFindChild};
 use super::super::{contain, free, policy};
+use super::key_source::{self, Descriptor};
 use super::{
     MODE_ENCRYPTED_KEY, XmlSecEncCtx, process, xmlSecEncCtxCreate, xmlSecEncCtxDestroy,
     xmlSecEncCtxReset,
@@ -89,6 +94,89 @@ pub(super) unsafe fn key_binary(
         xmlSecKeyInfoCtxFinalize(local);
         value
     }
+}
+
+/// libxmlsec1's `xmlSecEncCtxEncryptedKeyAppendKemDataIfPresentToKey`: a
+/// copy of the KEM ciphertext the context's encapsulation kept goes with
+/// `key`, so writing the key serializes it; `false` after a report at
+/// `here`.
+///
+/// The ciphertext rides on the content key, not on one `EncryptedKey`, so,
+/// as in libxmlsec1, a `KeyInfo` with several ML-KEM recipients writes the
+/// first recipient's ciphertext into every one of them.
+///
+/// # Safety
+/// `ctx` is an initialized context; `key` a key.
+pub(super) unsafe fn kem_data_to_key(
+    ctx: *mut XmlSecEncCtx,
+    key: *mut XmlSecKey,
+    here: errors::Here,
+) -> bool {
+    // SAFETY: by the caller's contract; a copy is owned by the key or
+    // destroyed.
+    unsafe {
+        let data =
+            xmlSecTransformCtxExtraKeyDataGet(&raw mut (*ctx).transform_ctx, kem::kem_klass_id());
+        if data.is_null() {
+            return true;
+        }
+        let copy = xmlSecKeyDataDuplicate(data);
+        if copy.is_null() {
+            errors::internal(
+                here,
+                std::ptr::null(),
+                c"xmlSecKeyDataDuplicate(kemKeyData)",
+            );
+            return false;
+        }
+        if xmlSecKeyAdoptData(key, copy) < 0 {
+            errors::internal(here, std::ptr::null(), c"xmlSecKeyAdoptData");
+            xmlSecKeyDataDestroy(copy);
+            return false;
+        }
+    }
+    true
+}
+
+/// libxmlsec1's `xmlSecEncCtxEncryptedKeyAppendKemDataIfPresentToTransformCtx`:
+/// a copy of the KEM ciphertext `key` carries goes to the context, so its
+/// key transport writes that ciphertext rather than encapsulating again;
+/// `false` after a report at `here`.
+///
+/// # Safety
+/// `ctx` is an initialized context; `key` a key.
+pub(super) unsafe fn kem_data_to_context(
+    ctx: &mut XmlSecEncCtx,
+    key: *mut XmlSecKey,
+    here: errors::Here,
+) -> bool {
+    // SAFETY: by the caller's contract; a copy is owned by the context or
+    // destroyed.
+    unsafe {
+        let data = xmlSecKeyGetData(key, kem::kem_klass_id());
+        if data.is_null() {
+            return true;
+        }
+        let copy = xmlSecKeyDataDuplicate(data);
+        if copy.is_null() {
+            errors::internal(
+                here,
+                std::ptr::null(),
+                c"xmlSecKeyDataDuplicate(kemKeyData)",
+            );
+            return false;
+        }
+        if xmlSecTransformCtxExtraKeyDataAdopt(&raw mut ctx.transform_ctx, copy) < 0 {
+            errors::internal(
+                here,
+                std::ptr::null(),
+                c"xmlSecTransformCtxExtraKeyDataAdopt",
+            );
+            xmlSecKeyDataDestroy(copy);
+            return false;
+        }
+    }
+    true
 }
 
 /// Empties the user lists of `ctx`, as libxmlsec1's
@@ -268,6 +356,14 @@ pub(crate) unsafe extern "C" fn xmlSecEncCtxEncryptedKeyXmlRead(
             ) < 0
             {
                 errors::internal(here, std::ptr::null(), c"xmlSecKeyDataBinRead");
+                return -1;
+            }
+            if !kem_data_to_key(ctx, key, here) {
+                errors::internal(
+                    here,
+                    std::ptr::null(),
+                    c"xmlSecEncCtxEncryptedKeyAppendKemDataIfPresentToKey",
+                );
                 return -1;
             }
         }
@@ -494,6 +590,16 @@ pub(crate) unsafe extern "C" fn xml_read(
             );
             if read < 0 {
                 errors::internal(here, name, c"xmlSecEncCtxEncryptedKeyXmlRead");
+                return read;
+            }
+            // A key an ML-KEM EncryptedKey decapsulated is taken by the
+            // decryption reading with this context for that encapsulation
+            // alone, as the core reads it among the key sources.
+            if recovers
+                && !(*key).value.is_null()
+                && let Some(source) = key_source::of(ctx, node, key, Descriptor::encapsulation)
+            {
+                key_source::record(ctx, Some(source));
             }
             read
         }

@@ -34,6 +34,7 @@ pub(crate) mod hmac;
 pub(crate) mod io;
 pub(crate) mod kam;
 pub(crate) mod kdf;
+pub(crate) mod kem;
 pub(crate) mod parser;
 pub(crate) mod relationship;
 pub(crate) mod signatures;

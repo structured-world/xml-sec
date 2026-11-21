@@ -19,6 +19,7 @@ use zeroize::Zeroizing;
 use super::asymkeys::{self, Material};
 use super::errors::{self, Here, here};
 use super::keys::{XmlSecKey, xmlSecKeyCreate, xmlSecKeyDestroy, xmlSecKeySetValue};
+use super::mlkemkeys::{self, MlKemKey};
 use super::xdhkeys::{self, XdhKey};
 use super::{contain, policy};
 
@@ -107,11 +108,13 @@ enum Loaded {
     Asymmetric(Material),
     /// An X25519 or X448 key, which only agrees on keys.
     Xdh(XdhKey),
+    /// An ML-KEM key, which only transports keys.
+    MlKem(MlKemKey),
 }
 
 impl Loaded {
     /// The key whose public key is the SPKI `spki`, with `private` PKCS#8:
-    /// an XDH key, or the key value of another family.
+    /// an XDH or ML-KEM key, or the key value of another family.
     fn from_spki(
         spki: Vec<u8>,
         private: Option<Zeroizing<Vec<u8>>>,
@@ -119,6 +122,13 @@ impl Loaded {
     ) -> Result<Self, KeyStoreError> {
         if xdhkeys::public_of(&spki).is_some() {
             return Ok(Self::Xdh(XdhKey { spki, private }));
+        }
+        if let Some(algorithm) = mlkemkeys::algorithm_of(&spki) {
+            return Ok(Self::MlKem(MlKemKey {
+                algorithm,
+                spki,
+                private,
+            }));
         }
         let value = KeyValueInfo::from_spki_der(&spki, resources)
             .map_err(|_| KeyStoreError::Selection("unsupported key family"))?;
@@ -258,6 +268,7 @@ unsafe fn load(
     match loaded {
         Loaded::Asymmetric(material) => key_with(here, material, None),
         Loaded::Xdh(key) => key_holding(here, xdhkeys::adopt(key), None),
+        Loaded::MlKem(key) => key_holding(here, mlkemkeys::adopt(key), None),
     }
 }
 
@@ -433,6 +444,7 @@ pub(crate) unsafe extern "C" fn pkcs12_load_memory(
         match loaded {
             Loaded::Asymmetric(material) => key_with(here, material, Some(x509)),
             Loaded::Xdh(xdh) => key_holding(here, xdhkeys::adopt(xdh), Some(x509)),
+            Loaded::MlKem(key) => key_holding(here, mlkemkeys::adopt(key), Some(x509)),
         }
     })
 }
