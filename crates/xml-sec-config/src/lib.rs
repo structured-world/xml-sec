@@ -229,23 +229,47 @@ impl Configuration {
         context: &PolicyCompileContext,
         authorization: Option<PolicyValidity>,
     ) -> Result<EffectivePolicy, Error> {
-        let chain = self.chain(name)?;
-        let base = chain[0]
-            .base
-            .ok_or_else(|| Error::Schema("inheritance root has no base".into()))?
-            .policy();
-        let mut compiler = PolicyCompiler::new(base, provider, authorization)?;
-        for profile in chain {
-            let mut layer = compiler.policies().clone();
-            settings::apply(profile, &mut layer)?;
-            compiler = compiler.restrict(&layer)?;
-        }
-        let policies = compiler.compile(context)?;
+        let compiler = PolicyCompiler::new(self.base(name)?, provider, authorization)?;
+        let policies = self.restrict(name, compiler)?.compile(context)?;
         let document = settings::snapshot(&policies)?;
         Ok(EffectivePolicy {
             compiled: policies,
             document,
         })
+    }
+
+    /// The named profile at the root of `name`'s inheritance chain.
+    fn base(&self, name: &str) -> Result<PolicyProfile, Error> {
+        Ok(self.chain(name)?[0]
+            .base
+            .ok_or_else(|| Error::Schema("inheritance root has no base".into()))?
+            .policy())
+    }
+
+    /// Narrow `compiler` by profile `name`: by its base profile when the
+    /// compiler started from another one, then by every layer of its chain.
+    /// Nothing is granted, so a ceiling the caller holds (a compatibility
+    /// boundary's snapshots, [`PolicyCompiler::from_policies`]) only shrinks.
+    ///
+    /// # Errors
+    /// Returns an unknown or cyclic profile, invalid layer settings, a base
+    /// that needs an authorization, and every composition refusal.
+    pub fn restrict<'a>(
+        &self,
+        name: &str,
+        mut compiler: PolicyCompiler<'a>,
+    ) -> Result<PolicyCompiler<'a>, Error> {
+        let base = self.base(name)?;
+        if base != compiler.profile() {
+            let base = PolicyCompiler::new(base, compiler.provider(), None)?;
+            compiler = compiler.restrict(base.policies())?;
+        }
+        for profile in self.chain(name)? {
+            let mut layer = compiler.policies().clone();
+            settings::apply(profile, &mut layer)?;
+            compiler = compiler.restrict(&layer)?;
+        }
+        Ok(compiler)
     }
 }
 

@@ -244,5 +244,26 @@ pub fn republish_encryption(
     Some(())
 }
 
+/// Publishes the snapshots `replace` builds from the current ones, every
+/// operation's in one revision, so no run sees some replaced and some not.
+/// A refusal publishes nothing. `None` when the profile cannot be compiled.
+pub fn republish_all<E>(
+    replace: impl FnOnce(&Snapshots) -> Result<Snapshots, E>,
+) -> Option<Result<(), E>> {
+    let _turn = WRITER.lock().unwrap_or_else(PoisonError::into_inner);
+    let current = snapshots()?;
+    let next = match replace(&current) {
+        Ok(next) => next,
+        Err(error) => return Some(Err(error)),
+    };
+    *PUBLISHED.write().ok()? = Some(Published {
+        verification: next.verification,
+        signing: next.signing,
+        encryption: next.encryption,
+        decryption: next.decryption,
+    });
+    Some(Ok(()))
+}
+
 #[cfg(test)]
 mod tests;
