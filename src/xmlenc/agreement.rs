@@ -35,7 +35,9 @@ impl AgreementMethod {
     /// `policy` reads the descriptors of an `EncryptedData`'s `KeyInfo`: each
     /// value within its `max_encryption_metadata_bytes`, the role `KeyInfo`s
     /// within its key-information allowance, names under its
-    /// [`crate::policy::KeyNameSemantics`].
+    /// [`crate::policy::KeyNameSemantics`]. A successful parse authorizes
+    /// nothing: whether the agreement and its derivation may run is checked
+    /// against the policy's key establishment sets when they execute.
     ///
     /// # Examples
     ///

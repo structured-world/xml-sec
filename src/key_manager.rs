@@ -1944,7 +1944,13 @@ impl KeyInventory {
             }));
             is_rsa
         };
-        let usages = usages.unwrap_or(if is_rsa { permitted } else { KeyUsages::VERIFY });
+        // `permitted` is what a caller may ask for; an RSA key's own uses are
+        // verification and encryption, never key agreement.
+        let usages = usages.unwrap_or(if is_rsa {
+            KeyUsages::VERIFY.union(KeyUsages::ENCRYPT)
+        } else {
+            KeyUsages::VERIFY
+        });
         if usages.allows(KeyUsage::Encrypt) && !is_rsa {
             return Err(KeyStoreError::Selection(
                 "only RSA public keys can be used for encryption",

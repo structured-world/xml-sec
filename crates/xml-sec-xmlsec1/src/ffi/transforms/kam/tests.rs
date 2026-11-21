@@ -504,7 +504,8 @@ fn x448_agrees_while_the_policy_admits_it() {
     // The library's compatible profile admits X448, as libxmlsec1 agrees
     // with it: both parties agree on the key encryption key. Once the
     // published policy is narrowed to the other agreements, the same
-    // template is refused on either side.
+    // template is refused on either side: no new encryption, and no
+    // decryption of what was encrypted before.
     with_library(|| {
         let sender = [
             (X448_FIRST_KEY, c"originator-key-name"),
@@ -518,6 +519,18 @@ fn x448_agrees_while_the_policy_admits_it() {
             round_trip_between(X448_TEMPLATE, &sender, &recipient).as_deref(),
             Some(&b"agreed content"[..])
         );
+        // SAFETY: the library is initialized; the document and the
+        // originator's manager are released below.
+        let earlier = unsafe {
+            let doc = document(X448_TEMPLATE);
+            let originator = manager(&sender);
+            assert!(
+                encrypt(doc, originator, b"agreed content"),
+                "the originator encrypts"
+            );
+            xmlSecKeysMngrDestroy(originator);
+            doc
+        };
         let without_x448 = |policy: &mut xml_sec::policy::KeyEstablishmentPolicy| {
             policy.agreement_algorithms = Some(BTreeSet::from([
                 KeyAgreementAlgorithm::EcdhEs,
@@ -530,6 +543,13 @@ fn x448_agrees_while_the_policy_admits_it() {
         )
         .expect("the library policy compiles");
         assert!(!encrypts_with(X448_TEMPLATE, &sender));
+        // SAFETY: the document encrypted above and a manager released here.
+        unsafe {
+            let receiver = manager(&recipient);
+            assert_eq!(decrypted(earlier, receiver), None);
+            xmlSecKeysMngrDestroy(receiver);
+            xsFreeDoc(earlier.cast());
+        }
     });
 }
 
@@ -770,6 +790,37 @@ fn an_agreement_in_the_data_key_info_yields_the_content_key() {
             (RECIPIENT_PUBLIC, c"originator-key-name"),
         ];
         assert_eq!(decrypt_with(&wrong), None);
+    });
+}
+
+#[test]
+fn an_agreement_takes_no_input() {
+    // An agreement consumes no input, as a derivation: data pushed into it
+    // is the caller's error, refused before the transform starts working or
+    // agrees on anything, on its first call as on any later one.
+    with_library(|| {
+        use super::super::super::buffer::xmlSecBufferAppend;
+        use super::super::ctx::{xmlSecTransformCtxCreate, xmlSecTransformCtxDestroy};
+        use super::super::{xmlSecTransformCreate, xmlSecTransformDestroy};
+        // SAFETY: a context and a transform created and released here.
+        unsafe {
+            let ctx = xmlSecTransformCtxCreate();
+            let transform = xmlSecTransformCreate(ecdh());
+            assert!(!transform.is_null());
+            (*transform).operation = OPERATION_DECRYPT;
+            assert_eq!(
+                xmlSecBufferAppend(&raw mut (*transform).in_buf, b"x".as_ptr(), 1),
+                0
+            );
+            assert_eq!(execute(transform, 1, ctx), -1);
+            assert_eq!((*transform).status, STATUS_NONE, "refused before working");
+            assert_eq!(
+                super::super::super::buffer::xmlSecBufferGetSize(&raw mut (*transform).out_buf),
+                0
+            );
+            xmlSecTransformDestroy(transform);
+            xmlSecTransformCtxDestroy(ctx);
+        }
     });
 }
 

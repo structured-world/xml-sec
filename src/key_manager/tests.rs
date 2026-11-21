@@ -3494,6 +3494,7 @@ fn eddsa_private_identity_matches_only_its_corresponding_spki() {
     assert!(!identity.matches_spki(wrong.as_bytes()));
 }
 
+#[cfg(feature = "xmlenc")]
 #[test]
 fn an_agreement_public_key_agrees_on_keys_only() {
     // An X25519 key is no Ed25519 signing key and must not acquire VERIFY
@@ -3535,30 +3536,122 @@ fn an_agreement_public_key_agrees_on_keys_only() {
     );
 }
 
+#[cfg(feature = "xmlenc")]
 #[test]
 fn only_agreement_keys_take_the_key_agreement_usage() {
-    // KEY_AGREEMENT is the one use of an X25519 or X448 key and no use of
-    // any other family: an RSA key asked to agree is refused, an X25519 key
+    // KEY_AGREEMENT is the one use of an X25519 or X448 key: an X25519 key
     // asked to sign is refused, and the family's own use imports.
     let resources = ResourcePolicy::default();
-    let rsa = include_bytes!("../../tests/fixtures/keys/rsa/rsa-2048-key.pem");
     let x25519 = include_bytes!("../../tests/fixtures/xmlenc/keys/xdh/xdh-x25519-first-key.pem");
-    let import = |bytes: &[u8], usages| {
+    let import = |usages| {
         KeyInventory::default().add_openssl_private_key(
             "key".into(),
-            bytes,
+            x25519,
             PrivateKeyContainer::Pem,
             None,
             usages,
             &resources,
         )
     };
-    assert!(import(rsa, KeyUsages::KEY_AGREEMENT).is_err());
-    assert!(import(x25519, KeyUsages::SIGN).is_err());
-    assert!(import(x25519, KeyUsages::KEY_AGREEMENT.union(KeyUsages::SIGN)).is_err());
-    import(x25519, KeyUsages::KEY_AGREEMENT).expect("an X25519 key agrees");
+    assert!(import(KeyUsages::SIGN).is_err());
+    assert!(import(KeyUsages::KEY_AGREEMENT.union(KeyUsages::SIGN)).is_err());
+    import(KeyUsages::KEY_AGREEMENT).expect("an X25519 key agrees");
 }
 
+#[test]
+fn an_rsa_key_takes_its_family_usages_and_never_agrees() {
+    // KEY_AGREEMENT is no use of an RSA key in any build: asked for it the
+    // import is refused, and a caller naming no use gets RSA's own, signing
+    // and decryption.
+    let resources = ResourcePolicy::default();
+    let rsa = include_bytes!("../../tests/fixtures/keys/rsa/rsa-2048-key.pem");
+    assert!(
+        KeyInventory::default()
+            .add_openssl_private_key(
+                "rsa".into(),
+                rsa,
+                PrivateKeyContainer::Pem,
+                None,
+                KeyUsages::KEY_AGREEMENT,
+                &resources,
+            )
+            .is_err()
+    );
+    let mut inventory = KeyInventory::default();
+    inventory
+        .add_openssl_private_key_with_family_usages(
+            "rsa".into(),
+            rsa,
+            PrivateKeyContainer::Pem,
+            None,
+            &resources,
+        )
+        .expect("an RSA key imports");
+    assert_eq!(
+        inventory.private_keys()[0].usages,
+        KeyUsages::SIGN.union(KeyUsages::DECRYPT)
+    );
+}
+
+#[test]
+fn an_rsa_public_key_without_a_stated_use_verifies_and_encrypts_only() {
+    // A public RSA key imported without a stated use takes RSA's own uses,
+    // verification and encryption, never KEY_AGREEMENT, which the import
+    // refuses when it is asked for.
+    let pem = include_bytes!("../../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    let resources = ResourcePolicy::default();
+    let mut inventory = KeyInventory::default();
+    inventory
+        .add_public_pem("rsa", pem, &resources)
+        .expect("an RSA public key imports");
+    assert_eq!(
+        inventory.public_keys[0].usages,
+        KeyUsages::VERIFY.union(KeyUsages::ENCRYPT)
+    );
+}
+
+#[cfg(not(feature = "xmlenc"))]
+#[test]
+fn agreement_keys_need_the_encryption_feature() {
+    // Key agreement is an XML Encryption mechanism: a build without it
+    // imports no X25519 or DH key, private or public, rather than storing
+    // one it cannot use.
+    let resources = ResourcePolicy::default();
+    for (bytes, container) in [
+        (
+            &include_bytes!("../../tests/fixtures/xmlenc/keys/xdh/xdh-x25519-first-key.pem")[..],
+            PrivateKeyContainer::Pem,
+        ),
+        (
+            &include_bytes!("../../tests/fixtures/xmlenc/keys/dhx/dhx-rfc5114-3-first-key.der")[..],
+            PrivateKeyContainer::Der,
+        ),
+    ] {
+        assert!(
+            KeyInventory::default()
+                .add_openssl_private_key_with_family_usages(
+                    "key".into(),
+                    bytes,
+                    container,
+                    None,
+                    &resources,
+                )
+                .is_err()
+        );
+    }
+    for public in [
+        &include_bytes!("../../tests/fixtures/xmlenc/keys/xdh/xdh-x25519-first-pubkey.der")[..],
+        &include_bytes!("../../tests/fixtures/xmlenc/keys/dhx/dhx-rfc5114-3-first-pubkey.der")[..],
+    ] {
+        assert!(
+            KeyInventory::default()
+                .add_public_der("key".into(), public.to_vec(), &resources)
+                .is_err()
+        );
+    }
+}
+
+#[cfg(feature = "xmlenc")]
 #[test]
 fn a_dh_public_key_agrees_on_keys_only() {
     // An X9.42 DH public key (RFC 3279 section 2.3.3) agrees on keys and
@@ -3595,6 +3688,7 @@ fn a_dh_public_key_agrees_on_keys_only() {
     );
 }
 
+#[cfg(feature = "xmlenc")]
 #[test]
 fn family_usages_follow_the_imported_key() {
     // A caller that names no use gets the family's: X25519, X448 and X9.42
@@ -3671,21 +3765,6 @@ fn family_usages_follow_the_imported_key() {
             "key {index}"
         );
     }
-    let rsa = include_bytes!("../../tests/fixtures/keys/rsa/rsa-2048-key.pem");
-    let mut inventory = KeyInventory::default();
-    inventory
-        .add_openssl_private_key_with_family_usages(
-            "rsa".into(),
-            rsa,
-            PrivateKeyContainer::Pem,
-            None,
-            &resources,
-        )
-        .expect("an RSA key imports");
-    assert_eq!(
-        inventory.private_keys()[0].usages,
-        KeyUsages::SIGN.union(KeyUsages::DECRYPT)
-    );
 }
 
 fn revoking_test_crl(root: &rcgen::Issuer<'_, rcgen::KeyPair>) -> rcgen::CertificateRevocationList {

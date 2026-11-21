@@ -791,15 +791,18 @@ unsafe extern "C" fn execute(
             errors::assertion(here, c"transformCtx != NULL");
             return -1;
         }
+        // An agreement consumes no input: data pushed into it is the caller's
+        // error, refused before anything is agreed, not only once finished
+        // as libxmlsec1 asserts it.
+        // SAFETY: the transform's own input buffer.
+        if unsafe { super::super::buffer::xmlSecBufferGetSize(&raw mut object.in_buf) } != 0 {
+            errors::assertion(here, c"xmlSecBufferGetSize(in) == 0");
+            return -1;
+        }
         if object.status == STATUS_NONE {
             object.status = STATUS_WORKING;
         }
         if object.status == STATUS_FINISHED {
-            // SAFETY: the transform's own input buffer.
-            if unsafe { super::super::buffer::xmlSecBufferGetSize(&raw mut object.in_buf) } != 0 {
-                errors::assertion(here, c"xmlSecBufferGetSize(in) == 0");
-                return -1;
-            }
             return 0;
         }
         if object.status != STATUS_WORKING {
