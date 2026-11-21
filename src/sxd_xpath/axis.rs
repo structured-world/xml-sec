@@ -104,9 +104,10 @@ impl<'c, 'd, R: Runtime> CompleteNodeTest<'c, 'd, R> {
         let runtime = self.runtime;
         if let Node::Element(ref e) = context.node {
             nodeset::visit_namespace_bindings_in(*e, context, runtime, |prefix, uri| {
-                if cfg!(feature = "no-unsafe") && !R::ACCOUNTED {
+                if !R::ACCOUNTED {
+                    // Two slice lengths, each at most isize::MAX, cannot overflow usize.
                     context
-                        .reserve_temporary_allocation(prefix.len().saturating_add(uri.len()))
+                        .reserve_temporary_allocation(prefix.len() + uri.len())
                         .map_err(|source| Error::FunctionEvaluation { source })?;
                 }
                 self.run(Node::Namespace(nodeset::Namespace {

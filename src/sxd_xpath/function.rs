@@ -660,7 +660,7 @@ mod test {
                 .evaluate(
                     document.root(),
                     NumberFn,
-                    vec![Value::Nodeset(nodeset![first.clone()])],
+                    vec![Value::Nodeset(nodeset![first])],
                 )
                 .expect_err("four-byte numeric workspace must exceed a three-byte budget");
             assert!(error.to_string().contains("string allocation budget"));

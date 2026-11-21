@@ -66,7 +66,6 @@ aws-lc-fips = ["std", "xmldsig", "xml-sec/aws-lc-fips"]
 pkcs11 = ["std", "xmlenc", "xml-sec/pkcs11"]
 benchmark-internals = ["xml-sec/benchmark-internals"]
 benchmark-alloc = ["xml-sec/benchmark-alloc"]
-no-unsafe = ["xml-sec/no-unsafe"]
 embedded = ["xml-sec/embedded"]
 
 [dev-dependencies]

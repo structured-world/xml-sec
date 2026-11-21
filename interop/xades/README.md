@@ -10,7 +10,7 @@ All validation runs are local; fixtures are never uploaded to online validators.
   records that commit, its tool versions and the resolved dependency versions and
   features in the output directory, outside Git.
 - Probe: `cargo build -p xml-sec-xades --example interop_probe`, default XAdES features.
-  Core features: `std,xmldsig,c14n,xml-backend-xmloxide,embedded,no-unsafe`.
+  Core features: `std,xmldsig,c14n,xml-backend-xmloxide,embedded`.
   This probe does not enable XMLEnc, XSLT, FIPS, PKCS#11 or legacy crypto.
 - Independent oracle: native **libxmlsec1 1.3.14 (openssl)** built from the pinned
   upstream commit (`compatibility/libxmlsec1-donor-commit.txt`) by `install-xmlsec1`,

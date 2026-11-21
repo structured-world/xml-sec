@@ -1,6 +1,6 @@
 # xml-sec SXD-XPath
 
-An XML XPath library in Rust, modified to use a `no-unsafe` flag which uses the modified sxd-document XML library.
+An XML XPath library in Rust over the safe indexed DOM of the modified sxd-document XML library.
 
 [![Current Version](https://img.shields.io/crates/v/xml-sec-sxd-xpath.svg)](https://crates.io/crates/xml-sec-sxd-xpath)
 [![Documentation](https://docs.rs/xml-sec-sxd-xpath/badge.svg)](https://docs.rs/xml-sec-sxd-xpath/)
@@ -15,9 +15,6 @@ Keep these changes when refreshing the upstream source.
 `context::ScopedContext` registers borrowed function state independently of document lifetimes.
 The ordinary `Context` remains its owned-function specialization; both share evaluation and
 budget enforcement without an extra dispatch layer or ownership wrapper.
-
-The safe indexed DOM is selected by default. The legacy pointer backend requires
-`--no-default-features --features raw-pointer-backend` explicitly.
 
 The project is broken into two crates:
 

@@ -107,8 +107,6 @@ the differential backend. The alloc-only job lints the separate XML-input crate
 without default features, and C14N and XMLDSig verification without `std` for
 `thumbv7em-none-eabihf` with each XML backend.
 
-The standalone legacy `raw-pointer-backend` is not selected by the product or by
-the safe workspace all-feature graph and is not claimed as pedantic-qualified.
 Performance regression reports compare only matching runs and apply no threshold;
 see [benchmarks](benchmarks.md#regression-report).
 

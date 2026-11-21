@@ -53,22 +53,15 @@
 
 #![deny(rust_2018_idioms)]
 
-#[cfg(not(any(feature = "no-unsafe", feature = "raw-pointer-backend")))]
-compile_error!("select either `no-unsafe` or `raw-pointer-backend`");
-
-// Cargo's all-feature verification enables both selectors. Safe precedence keeps that profile
-// free of raw pointers; selecting the legacy backend requires disabling default features.
-
 #[cfg(not(feature = "embedded"))]
 #[macro_use]
 extern crate peresil;
-#[cfg(all(feature = "no-unsafe", not(feature = "embedded")))]
+#[cfg(not(feature = "embedded"))]
 extern crate alloc;
 
 // The standalone crate always has std; embedded, the tables follow xml-sec's build.
 #[cfg(not(feature = "embedded"))]
 mod collections {
-    #[cfg(feature = "no-unsafe")]
     pub(crate) use std::collections::HashSet as Set;
     pub(crate) use std::collections::{HashMap as Map, hash_map as map};
 
@@ -78,7 +71,6 @@ mod collections {
 
 #[cfg(feature = "embedded")]
 use alloc::borrow::ToOwned;
-#[cfg(any(feature = "no-unsafe", feature = "embedded"))]
 use alloc::string::String;
 use core::{
     fmt,
@@ -162,58 +154,27 @@ pub fn estimated_storage_bytes(requirements: StorageRequirements) -> usize {
 }
 
 mod lazy_hash_map;
-#[cfg(feature = "no-unsafe")]
 mod namespace_storage;
 // XML character classes, shared with the XPath tokenizer.
 #[doc(hidden)]
 pub mod str;
 mod str_ext;
 
-#[cfg(not(feature = "no-unsafe"))]
-pub mod dom;
-#[cfg(not(feature = "no-unsafe"))]
 mod raw;
-#[cfg(not(feature = "no-unsafe"))]
-pub(crate) mod string_pool;
-#[cfg(not(feature = "no-unsafe"))]
-#[doc(hidden)]
-pub mod thindom;
-#[cfg(not(feature = "no-unsafe"))]
-pub mod writer;
-
-#[cfg(feature = "no-unsafe")]
-#[path = "raw_no_unsafe.rs"]
-mod raw;
-#[cfg(feature = "no-unsafe")]
 mod storage;
-#[cfg(feature = "no-unsafe")]
-#[path = "string_pool_no_unsafe.rs"]
 pub(crate) mod string_pool;
-#[cfg(feature = "no-unsafe")]
 pub use string_pool::{AccountedStringPool, InternedString};
-#[cfg(feature = "no-unsafe")]
-#[path = "dom_no_unsafe.rs"]
 pub mod dom;
-#[cfg(feature = "no-unsafe")]
-#[path = "thindom_no_unsafe.rs"]
 #[doc(hidden)]
 pub mod thindom;
 // Embedded in xml-sec, the writer and the XML parser only serve tests;
 // documents under verification come from xml-sec's own parsers.
-#[cfg(all(feature = "no-unsafe", any(test, not(feature = "embedded"))))]
-#[path = "writer_no_unsafe.rs"]
+#[cfg(any(test, not(feature = "embedded")))]
 pub mod writer;
 
 #[cfg(any(test, not(feature = "embedded")))]
 pub mod parser;
 
-#[cfg(not(feature = "no-unsafe"))]
-#[cfg(feature = "__internal_expose_string_pool")]
-pub mod __internal {
-    pub use super::string_pool::StringPool;
-}
-
-#[cfg(feature = "no-unsafe")]
 #[cfg(feature = "__internal_expose_string_pool")]
 pub mod __internal {
     pub use super::string_pool::StringPool;
@@ -223,31 +184,6 @@ pub use crate::str::XmlChar;
 #[cfg(feature = "embedded")]
 pub use crate::{as_opt_str, as_qname, as_str, to_ns_str};
 
-#[cfg(not(feature = "no-unsafe"))]
-#[macro_export]
-macro_rules! as_str {
-    ($e:expr) => {
-        $e
-    };
-}
-
-#[cfg(not(feature = "no-unsafe"))]
-#[macro_export]
-macro_rules! as_opt_str {
-    ($e:expr) => {
-        $e
-    };
-}
-
-#[cfg(not(feature = "no-unsafe"))]
-#[macro_export]
-macro_rules! as_qname {
-    ($e:expr) => {
-        $e
-    };
-}
-
-#[cfg(feature = "no-unsafe")]
 #[macro_export]
 macro_rules! as_str {
     ($e:expr) => {
@@ -255,7 +191,6 @@ macro_rules! as_str {
     };
 }
 
-#[cfg(feature = "no-unsafe")]
 #[macro_export]
 macro_rules! as_opt_str {
     ($e:expr) => {
@@ -263,7 +198,6 @@ macro_rules! as_opt_str {
     };
 }
 
-#[cfg(feature = "no-unsafe")]
 #[macro_export]
 macro_rules! as_qname {
     ($e:expr) => {
@@ -271,15 +205,6 @@ macro_rules! as_qname {
     };
 }
 
-#[cfg(not(feature = "no-unsafe"))]
-#[macro_export]
-macro_rules! to_ns_str {
-    ($e:expr) => {
-        $e
-    };
-}
-
-#[cfg(feature = "no-unsafe")]
 #[macro_export]
 macro_rules! to_ns_str {
     ($e:expr) => {
@@ -288,15 +213,10 @@ macro_rules! to_ns_str {
 }
 
 /// String type used for namespace prefix/URI storage.
-/// `&'d str` in default mode, `String` in no-unsafe mode.
-#[cfg(not(feature = "no-unsafe"))]
-pub type NsStr<'d> = &'d str;
-/// String type used for namespace prefix/URI storage.
-/// `&'d str` in default mode, `String` in no-unsafe mode.
-#[cfg(all(feature = "no-unsafe", not(feature = "embedded")))]
 ///
-/// The lifetime is intentionally retained so cfg-independent generic code has one public type
-/// signature; owned storage does not borrow from `'d` in this mode.
+/// The lifetime is intentionally retained so generic code has one public type
+/// signature; owned storage does not borrow from `'d`.
+#[cfg(not(feature = "embedded"))]
 pub type NsStr<'d> = String;
 
 #[cfg(feature = "embedded")]
@@ -536,9 +456,6 @@ impl Package {
         // for rejecting nodes created by a different arena before index or pointer access.
         let identity = core::ptr::from_ref(self).addr();
         let s = thindom::Storage::new(&self.storage, identity);
-        #[cfg(not(feature = "no-unsafe"))]
-        let c = thindom::Connections::new(&self.connections, identity);
-        #[cfg(feature = "no-unsafe")]
         let c = thindom::Connections::new(&self.connections, &self.storage, identity);
         (s, c)
     }

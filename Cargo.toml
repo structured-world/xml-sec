@@ -56,7 +56,7 @@ resolver = "3"
 # enforces it on its own toolchain and feature graph.
 [workspace.lints.rust]
 # Sources shared through `#[path]` test features that only some members declare.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("embedded", "raw-pointer-backend", "__internal_expose_string_pool"))'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("embedded", "__internal_expose_string_pool"))'] }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
@@ -464,7 +464,6 @@ xml-backend-differential = ["xml-backends-all"]
 # cryptographic operation goes through the caller-selected `CryptoProvider`;
 # without `rustcrypto` none is built in, so a provider must be supplied.
 xmldsig = [
-    "no-unsafe",
     "embedded",
     "dep:der",
     "dep:winnow",
@@ -561,7 +560,6 @@ xslt = ["xmldsig", "std", "dep:icu_collator", "dep:icu_locale", "dep:md-5", "dep
 experimental-pq = ["xmldsig", "rustcrypto", "der/derive", "dep:slh-dsa", "dep:ml-kem", "dep:common", "dep:ctutils", "dep:hybrid-array", "dep:module-lattice", "dep:shake", "dep:const-oid", "signature/digest", "signature/alloc", "signature/rand_core"]
 # DSTU 4145 verification with GOST 34.311 and DSTU 7564; build capability is not policy permission.
 dstu4145 = ["xmldsig", "rustcrypto", "dep:structured-dstu4145", "dep:once_cell"]
-no-unsafe = []
 embedded = []
 
 [lints]

@@ -8,8 +8,8 @@ resource budgets can reject wide traversals before child handles are allocated.
 The crate is an implementation dependency. Applications should normally use
 `xml-sec-xslt` rather than depending on it directly.
 
-The safe indexed arena is the default backend. The legacy pointer backend is
-available only through `--no-default-features --features raw-pointer-backend`.
+Nodes live in a safe indexed arena; the upstream raw-pointer backend is not
+carried.
 
 ## Provenance
 
