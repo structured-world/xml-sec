@@ -63,6 +63,10 @@ features = ["parser"]
 [dependencies.snafu]
 version = "0.9"
 
+# IEEE floor and ceiling of the XPath number functions; core has none.
+[dependencies.libm]
+version = "0.2.16"
+
 [dependencies.sxd-document-no-unsafe]
 package = "xml-sec-sxd-document"
 version = "0.1.0"

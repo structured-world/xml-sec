@@ -345,20 +345,11 @@ pub fn string_argument_view<'a>(
     }
 }
 
-// IEEE 754 floor and ceiling; core has no float rounding without std.
-#[cfg(any(feature = "std", not(feature = "embedded")))]
-fn ieee_floor(x: f64) -> f64 {
-    x.floor()
-}
-#[cfg(any(feature = "std", not(feature = "embedded")))]
-fn ieee_ceil(x: f64) -> f64 {
-    x.ceil()
-}
-#[cfg(all(feature = "embedded", not(feature = "std")))]
+// IEEE 754 floor and ceiling; core has no float rounding, so every build
+// takes libm's, one implementation with or without std.
 fn ieee_floor(x: f64) -> f64 {
     libm::floor(x)
 }
-#[cfg(all(feature = "embedded", not(feature = "std")))]
 fn ieee_ceil(x: f64) -> f64 {
     libm::ceil(x)
 }
