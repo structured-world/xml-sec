@@ -391,19 +391,20 @@ pub(crate) unsafe extern "C" fn pkcs12_load_memory(
                     .map(|secret| Zeroizing::new(secret.bytes().to_vec())),
             )
         };
+        // OpenSSL's PKCS12_parse reads a bundle without a password as one
+        // under the empty password. The key is imported for the uses its
+        // family permits, as the application names none.
+        let Ok(text) = std::str::from_utf8(secret.as_deref().map_or(&[][..], Vec::as_slice)) else {
+            errors::internal_with(
+                here,
+                std::ptr::null(),
+                c"PKCS12_parse",
+                "password is not UTF-8",
+            );
+            return std::ptr::null_mut();
+        };
         let mut inventory = KeyInventory::default();
-        let imported = inventory.add_pkcs12_with_password_callback(
-            "key".to_owned(),
-            bytes,
-            || {
-                secret
-                    .as_deref()
-                    .and_then(|secret| std::str::from_utf8(secret).ok())
-                    .map(|secret| Zeroizing::new(secret.to_owned()))
-            },
-            KeyUsages::SIGN,
-            &policy.resources,
-        );
+        let imported = inventory.add_pkcs12("key".to_owned(), bytes, text, &policy.resources);
         if let Err(error) = imported {
             errors::internal_with(here, std::ptr::null(), c"PKCS12_parse", &error.to_string());
             return std::ptr::null_mut();
@@ -412,12 +413,18 @@ pub(crate) unsafe extern "C" fn pkcs12_load_memory(
             errors::internal(here, std::ptr::null(), c"PKCS12_parse");
             return std::ptr::null_mut();
         };
-        let value = key.public_key_spki_der().and_then(|spki| {
+        let private = Some(Zeroizing::new(key.pkcs8_der().to_vec()));
+        let spki = key.public_key_spki_der();
+        let loaded = spki.and_then(|spki| {
+            if key.usages == KeyUsages::KEY_AGREEMENT {
+                return Ok(Loaded::Xdh(XdhKey { spki, private }));
+            }
             KeyValueInfo::from_spki_der(&spki, &policy.resources)
+                .map(|value| Loaded::Asymmetric(Material { value, private }))
                 .map_err(|_| KeyStoreError::Selection("unsupported private key family"))
         });
-        let value = match value {
-            Ok(value) => value,
+        let loaded = match loaded {
+            Ok(loaded) => loaded,
             Err(error) => {
                 errors::internal_with(
                     here,
@@ -435,14 +442,10 @@ pub(crate) unsafe extern "C" fn pkcs12_load_memory(
         for (position, cert) in key.certificates().iter().enumerate() {
             x509.add_cert(cert.clone(), has_leaf && position == 0);
         }
-        key_with(
-            here,
-            Material {
-                value,
-                private: Some(Zeroizing::new(key.pkcs8_der().to_vec())),
-            },
-            Some(x509),
-        )
+        match loaded {
+            Loaded::Asymmetric(material) => key_with(here, material, Some(x509)),
+            Loaded::Xdh(xdh) => key_holding(here, xdhkeys::adopt(xdh), Some(x509)),
+        }
     })
 }
 

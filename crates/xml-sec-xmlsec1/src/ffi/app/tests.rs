@@ -50,6 +50,39 @@ fn a_protected_key_without_its_password_stays_a_protected_failure() {
 }
 
 #[test]
+fn an_xdh_pkcs12_bundle_loads_as_xdh_key_data() {
+    // A PKCS#12 bundle of an X25519 key loads as XDH key data holding the
+    // private key, as libxmlsec1 loads it; a wrong password loads nothing.
+    use crate::ffi::keys::{xmlSecKeyDestroy, xmlSecKeyGetValue};
+    use crate::ffi::xdhkeys::key_of;
+    const BUNDLE: &[u8] =
+        include_bytes!("../../../../../tests/fixtures/xmlenc/keys/xdh/xdh-x25519-first-key.p12");
+    let load = |pwd: &std::ffi::CStr| {
+        // SAFETY: the fixture's bytes and a NUL-terminated password.
+        unsafe {
+            super::pkcs12_load_memory(
+                BUNDLE.as_ptr(),
+                BUNDLE.len(),
+                pwd.as_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        }
+        .cast::<crate::ffi::keys::XmlSecKey>()
+    };
+    let key = load(c"secret123");
+    assert!(!key.is_null(), "the bundle loads");
+    // SAFETY: the key loaded above, released here.
+    unsafe {
+        let xdh = key_of(xmlSecKeyGetValue(key)).expect("XDH key data");
+        assert!(xdh.private.is_some());
+        assert_eq!(xdh.public().map(|(_, public)| public.len()), Some(32));
+        xmlSecKeyDestroy(key);
+    }
+    assert!(load(c"wrong").is_null());
+}
+
+#[test]
 fn xdh_keys_load_as_xdh_key_data() {
     // X25519 and X448 key files, the private key also in password-protected
     // PKCS#8, load as XDH keys: the private key with its PKCS#8 and the
