@@ -1376,7 +1376,11 @@ pub(crate) fn shared_certificate_signature_outcome(
     session: &super::pkix::CertificateSession,
 ) -> Result<structured_pkix::path::Verified, X509ChainError> {
     use structured_pkix::path::{EffectiveKey, Verify as _};
-    let verifier = super::pkix::ProviderVerifier { provider, allowed };
+    let verifier = super::pkix::ProviderVerifier {
+        provider,
+        allowed,
+        edges: Some(session.edges()),
+    };
     verifier
         .verify(
             &certificate.tbs().signature(),

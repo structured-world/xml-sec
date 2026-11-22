@@ -4511,12 +4511,13 @@ mod tests {
             assert_eq!(provider.verification_calls.load(Ordering::Relaxed), 1);
         }
 
-        // A provider rejection after path construction proves complete-path
-        // validation does not switch back to the crate-global provider.
+        // Path discovery and complete-path validation check the same edge with
+        // the operation provider: it computes the signature once, and
+        // validation reuses that answer rather than verifying it again.
         let provider = RejectSecondSha512Provider {
             sha512_calls: AtomicUsize::new(0),
             verification_calls: AtomicUsize::new(0),
-            reject_verification_call: Some(1),
+            reject_verification_call: None,
             rejected_verification_data: None,
         };
         let resolver = DefaultKeyResolver::new(KeyResolverConfig {
@@ -4529,21 +4530,15 @@ mod tests {
                 0,
             ))],
         };
-        let Err(error) = resolver.resolve_with_policy_and_provider(
-            Some(&key_info),
-            SignatureAlgorithm::EcdsaSha256,
-            &policy,
-            &provider,
-        ) else {
-            panic!("complete-path validation must retain the operation provider");
-        };
-        assert!(matches!(
-            error,
-            DsigError::KeyResolution(KeyResolutionError::Chain(
-                super::super::X509ChainError::Provider(_)
-            ))
-        ));
-        assert_eq!(provider.verification_calls.load(Ordering::Relaxed), 2);
+        resolver
+            .resolve_with_policy_and_provider(
+                Some(&key_info),
+                SignatureAlgorithm::EcdsaSha256,
+                &policy,
+                &provider,
+            )
+            .expect("the leaf chains to the trusted root");
+        assert_eq!(provider.verification_calls.load(Ordering::Relaxed), 1);
     }
 
     /// A trusted root (index 0), a purpose-free (1) and a server-only (2)

@@ -3074,7 +3074,11 @@ pub(crate) fn build_x509_certificate_paths_to_trusted_prefix(
         |index| index < trusted_prefix_len,
         false,
         bounds,
-        super::pkix::ProviderVerifier { provider, allowed },
+        super::pkix::ProviderVerifier {
+            provider,
+            allowed,
+            edges: Some(certificates.edges()),
+        },
         certificates,
     )
 }
@@ -3103,7 +3107,11 @@ pub(crate) fn build_x509_certificate_paths_to_selector_targets(
         |index| targets.contains(&index),
         true,
         bounds,
-        super::pkix::ProviderVerifier { provider, allowed },
+        super::pkix::ProviderVerifier {
+            provider,
+            allowed,
+            edges: Some(certificates.edges()),
+        },
         certificates,
     )
 }

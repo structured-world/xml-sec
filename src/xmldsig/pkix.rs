@@ -294,6 +294,7 @@ pub(crate) fn verify_crls<'a>(
     let verifier = ProviderVerifier {
         provider,
         allowed: options.certificate_signature_algorithms,
+        edges: Some(session.edges()),
     };
     let now = options.verification_time.into();
     let mut issuer_key = EffectiveKey::standing(anchor.tbs().public_key());
@@ -834,9 +835,12 @@ pub(crate) fn validate_supplied_path<'a>(
         Anchor, BuildError, Interval, Policy, Validation, ValidationContext,
     };
     let verifier = CertificatePathVerifier {
+        // Discovery verified these edges in the same session: validation
+        // reuses its answers and still applies the key policy to each.
         signatures: ProviderVerifier {
             provider,
             allowed: options.certificate_signature_algorithms,
+            edges: Some(session.edges()),
         },
         chain,
         anchor,
@@ -1074,6 +1078,116 @@ pub(crate) fn effective_target_spki(
 pub struct ProviderVerifier<'a> {
     pub(crate) provider: &'a dyn crate::provider::CryptoProvider,
     pub(crate) allowed: Option<&'a crate::policy::CertificateSignatureAlgorithms>,
+    /// The operation's provider answers, shared by path discovery and path
+    /// validation; `None` verifies every edge afresh.
+    pub(crate) edges: Option<&'a VerifiedEdges>,
+}
+
+/// One signature the provider already answered in this operation.
+struct VerifiedEdge {
+    /// Address of the provider that answered, as an identity.
+    provider: usize,
+    algorithm: crate::provider::X509SignatureAlgorithm,
+    signed: OwnedVec<u8>,
+    signature: OwnedVec<u8>,
+    spki: OwnedVec<u8>,
+    valid: bool,
+}
+
+/// Provider answers for certificate and CRL signatures already verified in one
+/// operation. Path discovery and RFC 5280 section 6.1 validation check the
+/// same edges; a repeated edge reuses the provider's answer instead of a second
+/// public-key operation. An answer is reused only for the same provider,
+/// algorithm, signed bytes, signature bytes and effective issuer SPKI, compared
+/// by content. Permission, capability and key-policy checks run on every use,
+/// and failures are never kept.
+pub(crate) struct VerifiedEdges {
+    memory: Memory,
+    edges: core::cell::RefCell<OwnedVec<VerifiedEdge>>,
+}
+
+impl core::fmt::Debug for VerifiedEdges {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("VerifiedEdges")
+            .field(
+                "edges",
+                &self.edges.try_borrow().map_or(0, |edges| edges.len()),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl VerifiedEdges {
+    fn new(memory: Memory) -> Self {
+        let edges = core::cell::RefCell::new(memory.vector().into_owned());
+        Self { memory, edges }
+    }
+
+    /// The kept answer for this exact signature, after charging the
+    /// comparisons it costs.
+    fn lookup(
+        &self,
+        provider: usize,
+        algorithm: crate::provider::X509SignatureAlgorithm,
+        signed: &[u8],
+        signature: &[u8],
+        spki: &[u8],
+    ) -> Result<Option<bool>, MemoryError> {
+        let Ok(edges) = self.edges.try_borrow() else {
+            return Ok(None);
+        };
+        for edge in edges.iter() {
+            if edge.provider != provider
+                || edge.algorithm != algorithm
+                || edge.signed.len() != signed.len()
+                || edge.signature.len() != signature.len()
+                || edge.spki.len() != spki.len()
+            {
+                continue;
+            }
+            // Compared octets are data-dependent work of this operation.
+            self.memory
+                .charge_work((signed.len() + signature.len() + spki.len()) as u64)?;
+            if *edge.signed == *signed && *edge.signature == *signature && *edge.spki == *spki {
+                return Ok(Some(edge.valid));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Keeps the provider's answer. Storage the account refuses only leaves
+    /// the answer unkept: a later use verifies again.
+    fn record(
+        &self,
+        provider: usize,
+        algorithm: crate::provider::X509SignatureAlgorithm,
+        signed: &[u8],
+        signature: &[u8],
+        spki: &[u8],
+        valid: bool,
+    ) {
+        let copy = |bytes: &[u8]| -> Result<OwnedVec<u8>, MemoryError> {
+            let mut copy = self.memory.vector();
+            copy.try_extend_from_slice(bytes)?;
+            Ok(copy.into_owned())
+        };
+        let (Ok(signed), Ok(signature), Ok(spki)) = (copy(signed), copy(signature), copy(spki))
+        else {
+            return;
+        };
+        let Ok(mut edges) = self.edges.try_borrow_mut() else {
+            return;
+        };
+        let _refused = edges.try_push(VerifiedEdge {
+            provider,
+            algorithm,
+            signed,
+            signature,
+            spki,
+            valid,
+        });
+    }
 }
 
 impl<W: Work> structured_pkix::path::Verify<W> for ProviderVerifier<'_> {
@@ -1178,11 +1292,31 @@ impl ProviderVerifier<'_> {
         } else {
             signature
         };
+        // The provider's identity: answers of another provider are never reused.
+        let provider = core::ptr::from_ref(self.provider).cast::<()>() as usize;
         let verify = |spki: &[u8]| {
             check(spki)?;
-            self.provider
+            if let Some(edges) = self.edges
+                && let Some(valid) = edges
+                    .lookup(provider, algorithm, signed, signature, spki)
+                    .map_err(|reason| {
+                        X509ChainError::Processing(structured_pkix::Error::resource(
+                            reason,
+                            "certificate.signature",
+                            0,
+                        ))
+                    })?
+            {
+                return Ok(valid);
+            }
+            let valid = self
+                .provider
                 .verify_x509_signature(algorithm, signed, signature, spki)
-                .map_err(X509ChainError::from)
+                .map_err(X509ChainError::from)?;
+            if let Some(edges) = self.edges {
+                edges.record(provider, algorithm, signed, signature, spki, valid);
+            }
+            Ok(valid)
         };
         // RFC 5280 6.1.4(e): inherit only the effective working-key parameters.
         // Shared framing retains source provenance; the provider buffer is paid.
@@ -1377,6 +1511,7 @@ impl<'a, 'p> CertificatePathVerifier<'a, 'p> {
             signatures: ProviderVerifier {
                 provider,
                 allowed: trust.certificate_signature_algorithms.as_ref(),
+                edges: None,
             },
             chain,
             anchor,
@@ -1461,6 +1596,7 @@ impl<'p> RevocationVerifier<'p> {
             signatures: ProviderVerifier {
                 provider,
                 allowed: trust.certificate_signature_algorithms.as_ref(),
+                edges: None,
             },
             rsa_keys: trust.rsa_keys,
             dsa_keys: trust.dsa_keys,
@@ -1528,6 +1664,8 @@ pub(crate) struct CertificateSession {
     parser: Parser,
     work_limit: usize,
     memory_limit: usize,
+    /// Signatures this session's operation already verified.
+    edges: VerifiedEdges,
 }
 
 impl CertificateSession {
@@ -1561,6 +1699,7 @@ impl CertificateSession {
 
     fn with_account(work_limit: usize, memory_limit: usize, memory: Memory) -> Self {
         Self {
+            edges: VerifiedEdges::new(memory.clone()),
             parser: Parser::new(
                 Encoding::Der,
                 Limits {
@@ -1595,6 +1734,11 @@ impl CertificateSession {
 
     pub(crate) fn memory(&self) -> &Memory {
         self.parser.memory()
+    }
+
+    /// The signatures this session's operation already verified.
+    pub(crate) fn edges(&self) -> &VerifiedEdges {
+        &self.edges
     }
 
     pub(crate) fn read<'a>(&'a self, bytes: &'a [u8]) -> Result<Certificate<'a>, X509ChainError> {
@@ -2577,6 +2721,7 @@ mod tests {
         let verifier = ProviderVerifier {
             provider: crate::provider::default_provider(),
             allowed: None,
+            edges: None,
         };
         assert_eq!(
             verifier
@@ -2607,6 +2752,36 @@ mod tests {
     }
 
     #[test]
+    fn a_kept_signature_answer_serves_only_the_same_edge_and_provider() {
+        // An answer is reused only for the provider that gave it and the exact
+        // algorithm, signed bytes, signature and issuer key; any difference
+        // verifies again, so a provider switch or an altered certificate never
+        // inherits another edge's verdict.
+        use crate::provider::X509SignatureAlgorithm;
+        use crate::xmldsig::DigestAlgorithm;
+        let session = CertificateSession::new(&ResourcePolicy::default());
+        let edges = session.edges();
+        let algorithm = X509SignatureAlgorithm::RsaPkcs1v15(DigestAlgorithm::Sha256);
+        let (signed, signature, spki) = (&b"tbs"[..], &b"sig"[..], &b"spki"[..]);
+        edges.record(1, algorithm, signed, signature, spki, true);
+        let lookup = |provider, algorithm, signed, signature, spki| {
+            edges
+                .lookup(provider, algorithm, signed, signature, spki)
+                .expect("funded comparison")
+        };
+        assert_eq!(lookup(1, algorithm, signed, signature, spki), Some(true));
+        assert_eq!(lookup(2, algorithm, signed, signature, spki), None);
+        let other = X509SignatureAlgorithm::RsaPkcs1v15(DigestAlgorithm::Sha384);
+        assert_eq!(lookup(1, other, signed, signature, spki), None);
+        assert_eq!(lookup(1, algorithm, b"tbt", signature, spki), None);
+        assert_eq!(lookup(1, algorithm, signed, b"sih", spki), None);
+        assert_eq!(lookup(1, algorithm, signed, signature, b"spkj"), None);
+        // A rejected signature is kept as rejected, not as missing.
+        edges.record(1, algorithm, b"bad", signature, spki, false);
+        assert_eq!(lookup(1, algorithm, b"bad", signature, spki), Some(false));
+    }
+
+    #[test]
     fn published_scoped_verifier_preserves_both_current_work_ceilings() {
         // Actual registry Verify<Execution>, not Verify<Memory>: either the
         // caller's local ceiling or aggregate account can refuse before crypto.
@@ -2622,6 +2797,7 @@ mod tests {
         let verifier = ProviderVerifier {
             provider: crate::provider::default_provider(),
             allowed: None,
+            edges: None,
         };
         for (local, aggregate) in [(0, 100_000), (100_000, 0), (100_000, 100_000)] {
             let memory = Memory::new(Arc::new(MemoryAccount::new(1 << 20, aggregate)));
@@ -2735,6 +2911,7 @@ mod tests {
         let verifier = ProviderVerifier {
             provider: crate::provider::default_provider(),
             allowed: None,
+            edges: None,
         };
         let checked = core::cell::Cell::new(false);
         let result = verifier.verify_with_key_check(
