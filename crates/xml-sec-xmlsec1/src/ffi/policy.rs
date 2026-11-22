@@ -428,20 +428,15 @@ pub(crate) unsafe extern "C" fn xsPolicyRestrict(
     })
 }
 
-/// The snapshots of `current` narrowed by profile `name` of `config`.
-///
-/// The composition only intersects, so the result is the library's ceiling
-/// or less; each operation's own validation (limits against the hard
-/// ceilings, consistent trust and key settings) runs on it, as every
-/// operation runs it before work. The profile compiler's checks are not
-/// rerun: the ceiling deliberately signs with what it verifies, SHA-1
-/// methods included, as libxmlsec1 does, which a compiled profile refuses.
+/// The snapshots of `current` narrowed by profile `name` of `config`, and
+/// compiled by the core as any composed policy is. The composition only
+/// intersects, so the result is the library's ceiling or less.
 fn restricted(
     config: &xml_sec_config::Configuration,
     name: &str,
     current: &xml_sec_libxml2::policy::Snapshots,
 ) -> Result<xml_sec_libxml2::policy::Snapshots, String> {
-    use xml_sec::policy::{PolicyCompiler, PolicyProfile, PolicySet};
+    use xml_sec::policy::{PolicyCompileContext, PolicyCompiler, PolicyProfile, PolicySet};
     let ceiling = PolicySet {
         verification: Some(VerificationPolicy::clone(&current.verification)),
         signing: Some(SigningPolicy::clone(&current.signing)),
@@ -453,30 +448,32 @@ fn restricted(
         xml_sec::provider::default_provider(),
         ceiling,
     );
-    let narrowed = config
+    // The library's runs resolve external URIs from caller-supplied bytes
+    // and receive no expected targets, as its own ceiling was compiled.
+    let context = PolicyCompileContext {
+        external_resources: true,
+        target_evidence: false,
+    };
+    let policies = config
         .restrict(name, compiler)
+        .map_err(|error| error.to_string())?
+        .compile(&context)
         .map_err(|error| error.to_string())?;
-    let PolicySet {
-        verification: Some(verification),
-        signing: Some(signing),
-        encryption: Some(encryption),
-        decryption: Some(decryption),
-    } = narrowed.policies().clone()
-    else {
+    let (Some(verification), Some(signing), Some(encryption), Some(decryption)) = (
+        policies.verification(),
+        policies.signing(),
+        policies.encryption(),
+        policies.decryption(),
+    ) else {
         return Err(format!(
             "profile {name} disables an operation the library runs"
         ));
     };
-    let invalid = |error: xml_sec::policy::PolicyViolation| error.to_string();
-    verification.validate().map_err(invalid)?;
-    signing.validate().map_err(invalid)?;
-    encryption.validate().map_err(invalid)?;
-    decryption.validate().map_err(invalid)?;
     Ok(xml_sec_libxml2::policy::Snapshots {
-        verification: Arc::new(verification),
-        signing: Arc::new(signing),
-        encryption: Arc::new(encryption),
-        decryption: Arc::new(decryption),
+        verification: Arc::new(verification.clone()),
+        signing: Arc::new(signing.clone()),
+        encryption: Arc::new(encryption.clone()),
+        decryption: Arc::new(decryption.clone()),
     })
 }
 

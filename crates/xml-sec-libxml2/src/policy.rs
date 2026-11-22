@@ -14,7 +14,8 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use xml_sec::policy::{
     DecryptionPolicy, EncryptionPolicy, GeneratedCanonicalization, ManifestProcessing,
-    PolicyCompileContext, PolicyCompiler, PolicyProfile, SigningPolicy, VerificationPolicy,
+    PolicyCompileContext, PolicyCompiler, PolicyProfile, PolicySet, SigningPolicy,
+    VerificationPolicy,
 };
 use xml_sec::provider::ProviderCapability;
 use xml_sec::xmldsig::UriTypeSet;
@@ -99,6 +100,15 @@ fn compile() -> Option<Published> {
             .filter(|method| provider.supports(ProviderCapability::Sign(*method)))
             .collect()
     });
+    // The verify-only ones among them (SHA-1 and weaker) are signed with by
+    // explicit permission, as libxmlsec1 signs with them.
+    signing.verify_only_signature_algorithms = signing
+        .signature_algorithms
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|method| !method.signing_allowed())
+        .collect();
     signing
         .digest_algorithms
         .clone_from(&verification.digest_algorithms);
@@ -146,11 +156,25 @@ fn compile() -> Option<Published> {
     // caller's input callbacks supply, as a CipherReference is; the key's
     // references keep the decryption's classes.
     encryption.uris = decryption.uris;
+    // The boundary's own grants are compiled as every policy is, so the
+    // ceiling it publishes holds the core's consistency rules.
+    let compiled = PolicyCompiler::from_policies(
+        PolicyProfile::XmlSecCompatible,
+        provider,
+        PolicySet {
+            verification: Some(verification),
+            signing: Some(signing),
+            encryption: Some(encryption),
+            decryption: Some(decryption),
+        },
+    )
+    .compile(&context)
+    .ok()?;
     Some(Published {
-        verification: Arc::new(verification),
-        signing: Arc::new(signing),
-        encryption: Arc::new(encryption),
-        decryption: Arc::new(decryption),
+        verification: Arc::new(compiled.verification()?.clone()),
+        signing: Arc::new(compiled.signing()?.clone()),
+        encryption: Arc::new(compiled.encryption()?.clone()),
+        decryption: Arc::new(compiled.decryption()?.clone()),
     })
 }
 

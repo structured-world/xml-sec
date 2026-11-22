@@ -1031,6 +1031,10 @@ fn xmlsec_compatibility_signing_policy(invocation: &Invocation) -> SigningPolicy
         key_establishment: xmlsec_compatibility_key_establishment_policy(),
         parameterized_rsa_pss: xml_sec::policy::RsaPssPermission::AllSupported,
         signature_algorithms: Some(BTreeSet::from(SignatureAlgorithm::ALL)),
+        verify_only_signature_algorithms: SignatureAlgorithm::ALL
+            .into_iter()
+            .filter(|method| !method.signing_allowed())
+            .collect(),
         digest_algorithms: Some(BTreeSet::from(DigestAlgorithm::ALL)),
         manifest_processing: if invocation.flag("ignore-manifests") {
             ManifestProcessing::Ignore

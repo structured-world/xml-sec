@@ -43,14 +43,14 @@ schema_version = 1
 base = "XmlSecCompatible"
 [profiles.deployment.verification.hmac]
 minimum_key_bits = 256
-minimum_output_bits = 160
+minimum_output_bits = 128
 [profiles.deployment.decryption.key_establishment]
 kem_content_authentication = "RequireAuthenticatedCipher"
 "#;
     assert_eq!(restrict(toml, c"deployment"), 0);
     let after = current();
     assert_eq!(after.verification.hmac.minimum_key_bits, 256);
-    assert_eq!(after.verification.hmac.minimum_output_bits, 160);
+    assert_eq!(after.verification.hmac.minimum_output_bits, 128);
     assert_eq!(
         after
             .decryption
@@ -75,7 +75,7 @@ schema_version = 1
 base = "XmlSecCompatible"
 [profiles.strict.verification.hmac]
 minimum_key_bits = 256
-minimum_output_bits = 160
+minimum_output_bits = 128
 [profiles.strict.decryption.key_establishment]
 kem_content_authentication = "RequireAuthenticatedCipher"
 "#;
@@ -93,7 +93,7 @@ kem_content_authentication = "ExternalAuthenticated"
     assert_eq!(restrict(lax, c"lax"), 0);
     let after = current();
     assert_eq!(after.verification.hmac.minimum_key_bits, 256);
-    assert_eq!(after.verification.hmac.minimum_output_bits, 160);
+    assert_eq!(after.verification.hmac.minimum_output_bits, 128);
     assert_eq!(
         after
             .decryption
@@ -107,25 +107,59 @@ kem_content_authentication = "ExternalAuthenticated"
 fn a_setter_cannot_undo_a_restriction() {
     // A libxmlsec1 setter called after the restriction changes the library's
     // own value, but the deployment's ceiling still applies on top of it: a
-    // lower HMAC minimum leaves the restricted 256, a higher one is kept.
+    // lower HMAC minimum leaves the restricted 256, a higher one is kept, and
+    // one no permitted HMAC method can meet fails compilation and publishes
+    // nothing. The layer keeps HMAC-SHA512 only, so 384 bits are consistent.
     own_process();
     let toml = r#"
 schema_version = 1
 [profiles.deployment]
 base = "XmlSecCompatible"
+[profiles.deployment.verification]
+signature_algorithms = [
+  "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+  "http://www.w3.org/2001/04/xmldsig-more#hmac-sha512",
+]
 [profiles.deployment.verification.hmac]
 minimum_output_bits = 256
+[profiles.deployment.signing]
+signature_algorithms = [
+  "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+  "http://www.w3.org/2001/04/xmldsig-more#hmac-sha512",
+]
 "#;
+    let hmac_minimum = super::super::transforms::hmac::xmlSecTransformHmacSetMinOutputBitsSize;
     assert_eq!(restrict(toml, c"deployment"), 0);
-    super::super::transforms::hmac::xmlSecTransformHmacSetMinOutputBitsSize(80);
-    let after = current();
-    assert_eq!(after.verification.hmac.minimum_output_bits, 256);
-    super::super::transforms::hmac::xmlSecTransformHmacSetMinOutputBitsSize(384);
+    hmac_minimum(80);
+    assert_eq!(current().verification.hmac.minimum_output_bits, 256);
+    hmac_minimum(384);
     assert_eq!(current().verification.hmac.minimum_output_bits, 384);
     // The setter's own value stays the library's, so a lower one returns to
     // the deployment's ceiling, not below it.
-    super::super::transforms::hmac::xmlSecTransformHmacSetMinOutputBitsSize(128);
+    hmac_minimum(128);
     assert_eq!(current().verification.hmac.minimum_output_bits, 256);
+    let before = current();
+    hmac_minimum(1024);
+    assert!(Arc::ptr_eq(&before.verification, &current().verification));
+}
+
+#[test]
+fn a_layer_compiles_as_any_composed_policy() {
+    // The restricted policy goes through the core's compilation: a layer
+    // that leaves verification no digest method is refused, as a core
+    // caller's profile would be, and nothing is published. (An empty
+    // signature list is still supplemented by the RSA-PSS family permission.)
+    own_process();
+    let before = current();
+    let toml = r#"
+schema_version = 1
+[profiles.empty]
+base = "XmlSecCompatible"
+[profiles.empty.verification]
+digest_algorithms = []
+"#;
+    assert_eq!(restrict(toml, c"empty"), -1);
+    assert!(Arc::ptr_eq(&before.verification, &current().verification));
 }
 
 #[test]
