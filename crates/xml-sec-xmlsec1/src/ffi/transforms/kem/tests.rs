@@ -463,35 +463,89 @@ fn a_kept_ciphertext_is_written_for_its_own_recipient_only() {
     });
 }
 
+/// The octets the `test:content` resource still holds.
+static CONTENT_LEFT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+unsafe extern "C" fn content_matches(uri: *const std::ffi::c_char) -> c_int {
+    // SAFETY: the transform passes a NUL-terminated URI.
+    c_int::from(unsafe { CStr::from_ptr(uri) } == c"test:content")
+}
+
+unsafe extern "C" fn content_open(_uri: *const std::ffi::c_char) -> *mut std::ffi::c_void {
+    CONTENT_LEFT.store(7, std::sync::atomic::Ordering::Relaxed);
+    std::ptr::NonNull::<u8>::dangling().as_ptr().cast()
+}
+
+unsafe extern "C" fn content_read(
+    _context: *mut std::ffi::c_void,
+    buffer: *mut std::ffi::c_char,
+    len: c_int,
+) -> c_int {
+    let left = CONTENT_LEFT.load(std::sync::atomic::Ordering::Relaxed);
+    let count = left.min(usize::try_from(len).expect("a non-negative length"));
+    CONTENT_LEFT.store(left - count, std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: the transform passes `len` writable bytes.
+    unsafe { buffer.cast::<u8>().write_bytes(b'c', count) };
+    c_int::try_from(count).expect("at most `len` octets")
+}
+
+unsafe extern "C" fn content_close(_context: *mut std::ffi::c_void) -> c_int {
+    0
+}
+
+/// Whether the ML-KEM template `xml` encrypts for the public key `public`
+/// under `name`: its content from a buffer, or with `by_uri` the resource
+/// `test:content` read through the caller's input callbacks.
+fn kem_encrypts(xml: &[u8], public: &[u8], name: &CStr, by_uri: bool) -> bool {
+    // SAFETY: the library is initialized by the caller; every object is
+    // released.
+    unsafe {
+        let doc = document(xml);
+        let sender = manager(&[(public, name)]);
+        let ctx = xmlSecEncCtxCreate(sender);
+        let tmpl = xsDocGetRootElement(doc.cast());
+        let plaintext = b"content";
+        let encrypted = if by_uri {
+            super::super::super::xmlenc::xmlSecEncCtxUriEncrypt(
+                ctx,
+                tmpl,
+                c"test:content".as_ptr().cast(),
+            )
+        } else {
+            xmlSecEncCtxBinaryEncrypt(ctx, tmpl, plaintext.as_ptr(), plaintext.len())
+        };
+        xmlSecEncCtxDestroy(ctx);
+        xmlSecKeysMngrDestroy(sender);
+        xsFreeDoc(doc.cast());
+        encrypted == 0
+    }
+}
+
 #[test]
 fn an_encryption_keys_cbc_content_by_kem_only_when_the_policy_lets_it() {
     // The encryption policy decides whether an ML-KEM secret may key CBC
     // content on the way out, as the decryption policy decides it on the
     // way in: requiring an authenticated cipher refuses the CBC template
-    // before anything is written, and leaves the GCM one encrypting.
+    // before anything is written, whether the content comes from a buffer or
+    // from a resource the caller names, and leaves the GCM one encrypting.
     with_library(|| {
-        let encrypts = |xml: &[u8], public: &[u8], name: &CStr| {
-            // SAFETY: the library is initialized; every object is released.
-            unsafe {
-                let doc = document(xml);
-                let sender = manager(&[(public, name)]);
-                let ctx = xmlSecEncCtxCreate(sender);
-                let plaintext = b"content";
-                let encrypted = xmlSecEncCtxBinaryEncrypt(
-                    ctx,
-                    xsDocGetRootElement(doc.cast()),
-                    plaintext.as_ptr(),
-                    plaintext.len(),
-                );
-                xmlSecEncCtxDestroy(ctx);
-                xmlSecKeysMngrDestroy(sender);
-                xsFreeDoc(doc.cast());
-                encrypted == 0
-            }
+        // SAFETY: the callback list belongs to this test's process.
+        let registered = unsafe {
+            crate::ffi::transforms::io::xmlSecIORegisterCallbacks(
+                Some(content_matches),
+                Some(content_open),
+                Some(content_read),
+                Some(content_close),
+            )
         };
+        assert_eq!(registered, 0);
+        let encrypts =
+            |xml: &[u8], public: &[u8], name: &CStr| kem_encrypts(xml, public, name, false);
         let cbc: &[u8] = fixture!("xmlenc/aleksey-xmlenc-01/enc-aes256-kt-ml-kem-768.tmpl");
         let gcm: &[u8] = fixture!("xmlenc/aleksey-xmlenc-01/enc-aes128gcm-kt-ml-kem-512.tmpl");
-        assert!(encrypts(cbc, PUBLIC_768, c"TestKeyName-ml-kem-768"));
+        let name_768 = c"TestKeyName-ml-kem-768";
+        assert!(encrypts(cbc, PUBLIC_768, name_768));
+        assert!(kem_encrypts(cbc, PUBLIC_768, name_768, true));
         xml_sec_libxml2::policy::republish_encryption(
             |encryption| {
                 encryption.key_establishment.kem_content_authentication =
@@ -500,7 +554,8 @@ fn an_encryption_keys_cbc_content_by_kem_only_when_the_policy_lets_it() {
             |_| {},
         )
         .expect("the library policy compiles");
-        assert!(!encrypts(cbc, PUBLIC_768, c"TestKeyName-ml-kem-768"));
+        assert!(!encrypts(cbc, PUBLIC_768, name_768));
+        assert!(!kem_encrypts(cbc, PUBLIC_768, name_768, true));
         assert!(encrypts(gcm, PUBLIC_512, c"TestKeyName-ml-kem-512"));
     });
 }
@@ -562,6 +617,39 @@ fn a_signature_spends_its_own_kem_allowance() {
         assert!(verifies_kem_signature(KEM_SIGNATURE, KEY_512, name));
         crate::ffi::policy::republish(
             |verification| verification.key_establishment.max_encapsulation_operations = 0,
+            |_| {},
+        )
+        .expect("the library policy compiles");
+        assert!(!verifies_kem_signature(KEM_SIGNATURE, KEY_512, name));
+    });
+}
+
+#[test]
+fn a_signature_admits_its_kem_parameter_set_by_its_own_policy() {
+    // The EncryptedKey of a KEM/HMAC signature runs in the decryption
+    // direction, but its method is admitted by the verification it serves:
+    // dropping ML-KEM-512 from decryption alone leaves the signature
+    // verifying, dropping it from verification refuses it.
+    with_library(|| {
+        let name = c"TestKeyName-ml-kem-512";
+        xml_sec_libxml2::policy::republish_encryption(
+            |_| {},
+            |decryption| {
+                decryption
+                    .key_establishment
+                    .encapsulation_algorithms
+                    .remove(&KeyEncapsulationAlgorithm::MlKem512);
+            },
+        )
+        .expect("the library policy compiles");
+        assert!(verifies_kem_signature(KEM_SIGNATURE, KEY_512, name));
+        crate::ffi::policy::republish(
+            |verification| {
+                verification
+                    .key_establishment
+                    .encapsulation_algorithms
+                    .remove(&KeyEncapsulationAlgorithm::MlKem512);
+            },
             |_| {},
         )
         .expect("the library policy compiles");

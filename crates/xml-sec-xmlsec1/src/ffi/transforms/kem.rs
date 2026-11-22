@@ -485,26 +485,32 @@ unsafe fn write_kept(
     let name = name_of(object);
     // SAFETY: by the caller's contract.
     unsafe {
-        let held = xmlSecBufferGetSize(ciphertext);
-        if held != algorithm.ciphertext_len() {
-            invalid_size(here, "KEM ciphertext", held, algorithm.ciphertext_len());
-            return false;
-        }
-        let kept = xmlSecBufferGetData(recipient);
-        let encapsulated_to = if kept.is_null() {
-            &[][..]
-        } else {
-            std::slice::from_raw_parts(kept, xmlSecBufferGetSize(recipient))
+        let bytes = |buffer: *mut XmlSecBuffer| {
+            let data = xmlSecBufferGetData(buffer);
+            if data.is_null() {
+                &[][..]
+            } else {
+                std::slice::from_raw_parts(data, xmlSecBufferGetSize(buffer))
+            }
         };
-        if kem.spki.as_deref() != Some(encapsulated_to) {
-            errors::invalid_data(
-                here,
-                name,
-                "an ML-KEM secret keys content for its own recipient only",
-            );
-            return false;
-        }
-        if xmlSecBufferSetData(output, xmlSecBufferGetData(ciphertext), held) < 0 {
+        // The context keeps what its encapsulation produced; the core decides
+        // whether this recipient's EncryptedKey may carry it. The kept
+        // recipient key names its parameter set, so a matching recipient
+        // also means the parameter set this transform runs.
+        let kept = xml_sec::key_establishment::KeptEncapsulation {
+            algorithm,
+            ciphertext: bytes(ciphertext),
+            recipient: bytes(recipient),
+        };
+        let written = match kept.ciphertext_for(algorithm, kem.spki.as_deref().unwrap_or_default())
+        {
+            Ok(written) => written,
+            Err(error) => {
+                errors::invalid_data(here, name, &error.to_string());
+                return false;
+            }
+        };
+        if xmlSecBufferSetData(output, written.as_ptr(), written.len()) < 0 {
             return false;
         }
         xmlSecBufferEmpty(&raw mut object.in_buf);

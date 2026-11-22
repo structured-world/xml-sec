@@ -130,9 +130,6 @@ unsafe fn begin_encryption(
             errors::internal(here, std::ptr::null(), c"xmlSecEncCtxEncDataNodeRead");
             return -1;
         }
-        if !admit_kem_content(ctx, here) {
-            return -1;
-        }
     }
     0
 }
@@ -1339,6 +1336,11 @@ unsafe fn read_method_and_key(ctx: &mut XmlSecEncCtx, add_base64: bool) -> c_int
             }
             return -1;
         }
+        // Every encryption entry (template, buffer, URI) reads its key here,
+        // so the KEM content rule is enforced once for all of them.
+        if ctx.operation == OPERATION_ENCRYPT && !admit_kem_content(ctx, here) {
+            return -1;
+        }
         if xmlSecTransformSetKey(ctx.enc_method, ctx.enc_key.cast()) < 0 {
             errors::internal(here, method_name, c"xmlSecTransformSetKey");
             return -1;
@@ -1395,12 +1397,20 @@ unsafe fn admit_key_method(ctx: &mut XmlSecEncCtx, here: errors::Here) -> bool {
         }
     } else if let Some(kem) = xml_sec::provider::KeyEncapsulationAlgorithm::from_uri(href) {
         // An ML-KEM EncryptedKey transports its key by encapsulation, which
-        // the key establishment policy admits.
-        if encrypting {
-            pinned.encryption.key_establishment.check_encapsulation(kem)
+        // the key establishment policy of the operation the key serves
+        // admits: a signature's HMAC key is the verification's or signing's,
+        // whatever direction the nested EncryptedKey runs in, as its
+        // transport's allowance is.
+        let direction = if encrypting {
+            Side::Encrypt
         } else {
-            pinned.decryption.key_establishment.check_encapsulation(kem)
-        }
+            Side::Decrypt
+        };
+        // SAFETY: the context's own transform context.
+        let side = unsafe { run_budget(&raw mut ctx.transform_ctx) }
+            .serves
+            .unwrap_or(direction);
+        pinned.of(side).key_establishment().check_encapsulation(kem)
     } else {
         errors::invalid_data(
             here,

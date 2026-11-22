@@ -438,6 +438,8 @@ mod test {
             let pool = super::AccountedStringPool::new(&memory);
             assert_eq!(pool.intern("namespace"), Err(MemoryError::LimitExceeded));
             assert_eq!(pool.find("namespace", &memory).expect("lookup"), None);
+            // The refusal itself gives the charge back, not the pool's drop.
+            assert_eq!(memory.used(), 0, "rollback at limit {limit}");
             drop(pool);
             assert_eq!(memory.used(), 0, "limit {limit}");
         }

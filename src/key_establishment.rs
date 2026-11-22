@@ -53,6 +53,47 @@ pub struct EstablishedEncapsulation<'a> {
     pub ciphertext: &'a [u8],
 }
 
+/// The ciphertext of an encapsulation a caller keeps to serialize later, with
+/// the recipient it was encapsulated to. The shared secret is that recipient's
+/// alone, so the ciphertext keys content for no other recipient: a second
+/// recipient of the same content cannot recover a key from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeptEncapsulation<'a> {
+    /// Exact parameter set the ciphertext was produced under.
+    pub algorithm: KeyEncapsulationAlgorithm,
+    /// The FIPS 203 ciphertext.
+    pub ciphertext: &'a [u8],
+    /// DER `SubjectPublicKeyInfo` of the recipient (RFC 9935 section 4).
+    pub recipient: &'a [u8],
+}
+
+impl<'a> KeptEncapsulation<'a> {
+    /// The ciphertext to write into the `EncryptedKey` of `recipient` (its DER
+    /// `SubjectPublicKeyInfo`) under `algorithm`, whole.
+    ///
+    /// # Errors
+    /// Returns a structure error when the ciphertext does not have the
+    /// parameter set's width, or when `algorithm` or `recipient` is not the
+    /// one the ciphertext was encapsulated for.
+    pub fn ciphertext_for(
+        &self,
+        algorithm: KeyEncapsulationAlgorithm,
+        recipient: &[u8],
+    ) -> Result<&'a [u8], KeyEstablishmentError> {
+        if self.ciphertext.len() != self.algorithm.ciphertext_len() {
+            return Err(KeyEstablishmentError::Structure(
+                "kept ciphertext size does not match its parameter set",
+            ));
+        }
+        if algorithm != self.algorithm || recipient != self.recipient {
+            return Err(KeyEstablishmentError::Structure(
+                "an ML-KEM secret keys content for its own recipient only",
+            ));
+        }
+        Ok(self.ciphertext)
+    }
+}
+
 /// Borrowed, fully framed mechanism. Public ciphertext is decoded into fixed
 /// storage, so parsing cannot allocate an attacker-selected temporary buffer.
 pub struct ParsedEncapsulation<'a, 'input> {
@@ -358,6 +399,42 @@ pub(crate) fn reserve(
 mod tests {
     use super::*;
     use crate::provider::RustCryptoProvider;
+
+    #[test]
+    fn a_kept_ciphertext_serves_only_its_own_recipient() {
+        // The secret is the encapsulation recipient's alone: the same
+        // recipient and parameter set get the ciphertext whole, another
+        // recipient or parameter set gets nothing, and a ciphertext of the
+        // wrong width is refused for everyone.
+        let ciphertext = [0x11_u8; 768];
+        let kept = KeptEncapsulation {
+            algorithm: KeyEncapsulationAlgorithm::MlKem512,
+            ciphertext: &ciphertext,
+            recipient: b"first",
+        };
+        assert_eq!(
+            kept.ciphertext_for(KeyEncapsulationAlgorithm::MlKem512, b"first")
+                .expect("its own recipient"),
+            &ciphertext[..]
+        );
+        for (algorithm, recipient) in [
+            (KeyEncapsulationAlgorithm::MlKem512, &b"second"[..]),
+            (KeyEncapsulationAlgorithm::MlKem768, &b"first"[..]),
+        ] {
+            assert!(matches!(
+                kept.ciphertext_for(algorithm, recipient),
+                Err(KeyEstablishmentError::Structure(_))
+            ));
+        }
+        let cut = KeptEncapsulation {
+            ciphertext: &ciphertext[..767],
+            ..kept
+        };
+        assert!(matches!(
+            cut.ciphertext_for(KeyEncapsulationAlgorithm::MlKem512, b"first"),
+            Err(KeyEstablishmentError::Structure(_))
+        ));
+    }
 
     #[cfg(feature = "experimental-pq")]
     struct FailedRandom;
