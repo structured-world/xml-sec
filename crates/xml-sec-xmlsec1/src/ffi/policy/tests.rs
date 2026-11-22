@@ -108,8 +108,9 @@ fn a_setter_cannot_undo_a_restriction() {
     // A libxmlsec1 setter called after the restriction changes the library's
     // own value, but the deployment's ceiling still applies on top of it: a
     // lower HMAC minimum leaves the restricted 256, a higher one is kept, and
-    // one no permitted HMAC method can meet fails compilation and publishes
-    // nothing. The layer keeps HMAC-SHA512 only, so 384 bits are consistent.
+    // one no permitted HMAC method can meet leaves those methods out, as
+    // libxmlsec1's minimum refuses them when they run. The layer keeps
+    // HMAC-SHA512 only, so 384 bits keep it.
     own_process();
     let toml = r#"
 schema_version = 1
@@ -138,9 +139,16 @@ signature_algorithms = [
     // the deployment's ceiling, not below it.
     hmac_minimum(128);
     assert_eq!(current().verification.hmac.minimum_output_bits, 256);
-    let before = current();
     hmac_minimum(1024);
-    assert!(Arc::ptr_eq(&before.verification, &current().verification));
+    let published = current();
+    assert_eq!(published.verification.hmac.minimum_output_bits, 1024);
+    let methods = published
+        .verification
+        .signature_algorithms
+        .clone()
+        .expect("the layer lists its methods");
+    assert!(methods.contains(&xml_sec::xmldsig::SignatureAlgorithm::RsaSha256));
+    assert!(!methods.contains(&xml_sec::xmldsig::SignatureAlgorithm::HmacSha512));
 }
 
 #[test]

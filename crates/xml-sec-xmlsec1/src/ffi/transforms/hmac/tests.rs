@@ -18,7 +18,6 @@ use super::super::ctx::{
 };
 use super::super::{OPERATION_SIGN, OPERATION_VERIFY, xmlSecTransformSetKey};
 use super::{hmac_sha256, read_node, xmlSecTransformHmacSetMinOutputBitsSize};
-use xml_sec::policy::{Instant, PolicyValidity};
 use xml_sec::xmldsig::SignatureAlgorithm;
 use xml_sec_libxml2::ffi::tree::{xsDocGetRootElement, xsFreeDoc, xsReadMemory};
 
@@ -82,20 +81,7 @@ fn an_hmac_key_under_an_expired_policy_is_refused() {
     // A snapshot whose authorized lifetime has ended admits no key, as a core
     // operation checks the lifetime at entry.
     own_process();
-    let expired = || {
-        Some(PolicyValidity {
-            authorization_id: "test".to_owned(),
-            authority: "test".to_owned(),
-            reason: "an ended authorization".to_owned(),
-            not_before: Instant::new(0, 0).expect("the epoch"),
-            expires_at: Instant::new(1, 0).expect("one second later"),
-        })
-    };
-    policy::republish(
-        |verification| verification.validity = expired(),
-        |signing| signing.validity = expired(),
-    )
-    .expect("the library policy compiles");
+    crate::ffi::tests::end_signature_authorization();
     for operation in [OPERATION_SIGN, OPERATION_VERIFY] {
         assert_eq!(set_key(operation, &[0x42; 32]), -1, "operation {operation}");
     }
@@ -182,19 +168,21 @@ fn a_key_is_admitted_under_the_revision_its_method_was_read_with() {
 }
 
 #[test]
-fn a_verification_profile_needing_targets_refuses_the_key() {
-    // A transform run checks no expected targets: a profile that needs
-    // them refuses the verification key, as signature-value verification
-    // refuses it. Signing has no target rule.
+fn a_verification_profile_needing_targets_is_not_published() {
+    // The library's runs check no expected targets, so the core refuses to
+    // compile a profile that needs them and the library keeps the revision
+    // in force: its keys are admitted as before.
     own_process();
-    policy::republish(
-        |verification| {
-            verification.signature_constraints = xml_sec::policy::SignatureConstraints::Saml;
-        },
-        |_| {},
-    )
-    .expect("the library policy compiles");
-    assert_eq!(set_key(OPERATION_VERIFY, &[0x42; 32]), -1);
+    assert_eq!(
+        policy::republish(
+            |verification| {
+                verification.signature_constraints = xml_sec::policy::SignatureConstraints::Saml;
+            },
+            |_| {},
+        ),
+        None
+    );
+    assert_eq!(set_key(OPERATION_VERIFY, &[0x42; 32]), 0);
     assert_eq!(set_key(OPERATION_SIGN, &[0x42; 32]), 0);
 }
 

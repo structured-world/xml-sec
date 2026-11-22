@@ -271,6 +271,56 @@ fn template_round_trip(xml: &str, key: *mut XmlSecKey, plaintext: &[u8]) -> Opti
 }
 
 #[test]
+fn a_template_without_its_method_refuses_a_default_method_with_parameters() {
+    // A default ChaCha20-Poly1305 method draws a nonce the decryption needs,
+    // and only an EncryptionMethod carries it: a template without one is
+    // refused before anything is encrypted, rather than written with a
+    // ciphertext no one can decrypt. The transform list is process-wide.
+    use crate::ffi::xmlenc::{xmlSecEncCtxBinaryEncrypt, xmlSecEncCtxCreate, xmlSecEncCtxDestroy};
+    use xml_sec_libxml2::ffi::tree::{xsDocGetRootElement, xsFreeDoc, xsReadMemory};
+    crate::ffi::tests::own_process();
+    // SAFETY: the library initialized on this test's own thread.
+    unsafe {
+        assert_eq!(crate::ffi::library::xmlSecInit(), 0);
+        assert_eq!(
+            crate::ffi::crypto::xmlSecCryptoDLLoadLibrary(std::ptr::null()),
+            0
+        );
+        assert_eq!(crate::ffi::crypto::xmlSecCryptoAppInit(std::ptr::null()), 0);
+        assert_eq!(crate::ffi::crypto::xmlSecCryptoInit(), 0);
+    }
+    let key = chacha_key(&[0x99; 32]);
+    let xml = "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\">\
+               <CipherData><CipherValue/></CipherData></EncryptedData>";
+    // SAFETY: a document and a context created and released here; the key
+    // outlives the context.
+    unsafe {
+        let doc = xsReadMemory(
+            xml.as_ptr().cast(),
+            c_int::try_from(xml.len()).expect("a short template"),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        assert!(!doc.is_null(), "the template parses");
+        let root = xsDocGetRootElement(doc);
+        let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
+        (*ctx).enc_key = xmlSecKeyDuplicate(key);
+        (*ctx).def_enc_method_id = chacha20_poly1305();
+        let plaintext = b"payload";
+        let encrypted =
+            xmlSecEncCtxBinaryEncrypt(ctx, root.cast(), plaintext.as_ptr(), plaintext.len());
+        xmlSecEncCtxDestroy(ctx);
+        let left = crate::ffi::tree::nodes::dump(root.cast::<crate::ffi::tree::XmlNode>());
+        xsFreeDoc(doc);
+        assert_eq!(encrypted, -1);
+        // The refused template is left as the caller wrote it.
+        assert_eq!(left.as_deref(), Some(xml));
+        xmlSecKeyDestroy(key);
+    }
+}
+
+#[test]
 fn a_chacha_encryption_writes_parameters_its_decryption_reads() {
     // The written method must parse again: a parameter the template carries
     // in its unqualified RFC 9231 form is replaced, not duplicated by a

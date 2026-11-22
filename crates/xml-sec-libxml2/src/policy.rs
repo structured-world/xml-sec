@@ -48,18 +48,19 @@ static PUBLISHED: RwLock<Option<Published>> = RwLock::new(None);
 /// the library's own snapshots, or why it refuses them.
 pub type Restriction = dyn Fn(&Snapshots) -> Result<Snapshots, String> + Send + Sync;
 
-/// What the published revision is made of once a deployment narrowed it:
-/// the library's own snapshots, which its setters edit, and the narrowing
-/// applied on top of them, so no setter reaches past the deployment.
-struct Restricted {
+/// What the published revision is made of: the library's own snapshots,
+/// which its setters edit, and the deployment's narrowing applied on top of
+/// them once there is one, so no setter reaches past the deployment.
+struct Layers {
     own: Snapshots,
-    restriction: Arc<Restriction>,
+    restriction: Option<Arc<Restriction>>,
 }
 
 /// The turn of a republishing caller, held from reading the current
-/// snapshots to publishing their replacements, and the restriction in force.
+/// snapshots to publishing their replacements, and the layers they are made
+/// of, taken from the first published revision on the first turn.
 // no-std: spin::Mutex
-static WRITER: Mutex<Option<Restricted>> = Mutex::new(None);
+static WRITER: Mutex<Option<Layers>> = Mutex::new(None);
 
 /// The profile compiled for the default provider; `None` when it cannot be
 /// compiled.
@@ -253,14 +254,15 @@ pub fn republish(
     // panicked published nothing and left the restriction as it was, so its
     // poison is cleared.
     let mut turn = WRITER.lock().unwrap_or_else(PoisonError::into_inner);
-    let mut own = own(turn.as_ref())?;
+    let layers = layers(&mut turn)?;
+    let mut own = layers.own.clone();
     let mut verification = VerificationPolicy::clone(&own.verification);
     let mut signing = SigningPolicy::clone(&own.signing);
     edit_verification(&mut verification);
     edit_signing(&mut signing);
     own.verification = Arc::new(verification);
     own.signing = Arc::new(signing);
-    publish(&mut turn, own)?.ok()
+    publish(layers, own)?.ok()
 }
 
 /// [`republish`] for the encryption and decryption snapshots.
@@ -269,14 +271,15 @@ pub fn republish_encryption(
     edit_decryption: impl FnOnce(&mut DecryptionPolicy),
 ) -> Option<()> {
     let mut turn = WRITER.lock().unwrap_or_else(PoisonError::into_inner);
-    let mut own = own(turn.as_ref())?;
+    let layers = layers(&mut turn)?;
+    let mut own = layers.own.clone();
     let mut encryption = EncryptionPolicy::clone(&own.encryption);
     let mut decryption = DecryptionPolicy::clone(&own.decryption);
     edit_encryption(&mut encryption);
     edit_decryption(&mut decryption);
     own.encryption = Arc::new(encryption);
     own.decryption = Arc::new(decryption);
-    publish(&mut turn, own)?.ok()
+    publish(layers, own)?.ok()
 }
 
 /// Narrows the library by `restriction` from now on: every operation's
@@ -286,51 +289,115 @@ pub fn republish_encryption(
 /// compiled.
 pub fn restrict(restriction: Arc<Restriction>) -> Option<Result<(), String>> {
     let mut turn = WRITER.lock().unwrap_or_else(PoisonError::into_inner);
-    let own = own(turn.as_ref())?;
-    let composed: Arc<Restriction> = match turn.as_ref() {
+    let layers = layers(&mut turn)?;
+    let composed: Arc<Restriction> = match &layers.restriction {
         Some(earlier) => {
-            let earlier = Arc::clone(&earlier.restriction);
+            let earlier = Arc::clone(earlier);
             Arc::new(move |own: &Snapshots| restriction(&earlier(own)?))
         }
         None => restriction,
     };
-    let narrowed = match composed(&own) {
+    let narrowed = match composed(&effective(&layers.own)) {
         Ok(narrowed) => narrowed,
         Err(error) => return Some(Err(error)),
     };
     *PUBLISHED.write().ok()? = Some(Published::from(narrowed));
-    *turn = Some(Restricted {
-        own,
-        restriction: composed,
-    });
+    layers.restriction = Some(composed);
     Some(Ok(()))
 }
 
-/// The library's own snapshots under the turn `layers`: the current ones
-/// until a deployment restricts them.
-fn own(layers: Option<&Restricted>) -> Option<Snapshots> {
-    match layers {
-        Some(restricted) => Some(restricted.own.clone()),
-        None => snapshots(),
+/// The layers of the turn `turn` holds, the library's own snapshots taken
+/// from the published revision on the first turn; `None` when the profile
+/// cannot be compiled.
+fn layers(turn: &mut Option<Layers>) -> Option<&mut Layers> {
+    if turn.is_none() {
+        *turn = Some(Layers {
+            own: snapshots()?,
+            restriction: None,
+        });
     }
+    turn.as_mut()
 }
 
-/// Publishes the library's own snapshots `own` under the turn `layers`,
-/// narrowed by the restriction in force; a refusal publishes nothing.
-fn publish(layers: &mut Option<Restricted>, own: Snapshots) -> Option<Result<(), String>> {
-    let published = match layers {
-        Some(restricted) => {
-            let narrowed = match (restricted.restriction)(&own) {
-                Ok(narrowed) => narrowed,
-                Err(error) => return Some(Err(error)),
-            };
-            restricted.own = own;
-            narrowed
-        }
-        None => own,
+/// Publishes the library's own snapshots `own` as the layers make them: the
+/// restriction in force narrows them, or the core compiles them as it
+/// compiled the ceiling, so every published revision holds the core's
+/// consistency rules; a refusal publishes nothing and keeps the layers.
+fn publish(layers: &mut Layers, own: Snapshots) -> Option<Result<(), String>> {
+    let effective = effective(&own);
+    let published = match &layers.restriction {
+        Some(restriction) => restriction(&effective),
+        None => compile_snapshots(&effective),
     };
+    let published = match published {
+        Ok(published) => published,
+        Err(error) => return Some(Err(error)),
+    };
+    layers.own = own;
     *PUBLISHED.write().ok()? = Some(Published::from(published));
     Some(Ok(()))
+}
+
+/// The snapshots a revision publishes for the library's own `own`: a
+/// signature method whose full HMAC output falls short of its operation's
+/// minimum output length is left out of the operation's methods, as
+/// libxmlsec1's minimum refuses it when it runs. The own snapshots keep it,
+/// so a lower minimum set later admits it again.
+fn effective(own: &Snapshots) -> Snapshots {
+    let mut effective = own.clone();
+    let meets = |minimum: usize| {
+        move |method: &xml_sec::xmldsig::SignatureAlgorithm| {
+            method.hmac_output_bits().is_none_or(|bits| bits >= minimum)
+        }
+    };
+    let minimum = own.verification.hmac.minimum_output_bits;
+    if let Some(methods) = &own.verification.signature_algorithms
+        && !methods.iter().all(meets(minimum))
+    {
+        let mut verification = VerificationPolicy::clone(&own.verification);
+        verification.signature_algorithms =
+            Some(methods.iter().copied().filter(meets(minimum)).collect());
+        effective.verification = Arc::new(verification);
+    }
+    let minimum = own.signing.hmac.minimum_output_bits;
+    if let Some(methods) = &own.signing.signature_algorithms
+        && !methods.iter().all(meets(minimum))
+    {
+        let mut signing = SigningPolicy::clone(&own.signing);
+        signing.signature_algorithms =
+            Some(methods.iter().copied().filter(meets(minimum)).collect());
+        effective.signing = Arc::new(signing);
+    }
+    effective
+}
+
+/// `snapshots` compiled as the library's ceiling is: under its profile, for
+/// the default provider, with the caller-owned resources it declares; why
+/// the core refuses them otherwise.
+fn compile_snapshots(snapshots: &Snapshots) -> Result<Snapshots, String> {
+    let context = PolicyCompileContext {
+        external_resources: true,
+        target_evidence: false,
+    };
+    let compiled = PolicyCompiler::from_policies(
+        PolicyProfile::XmlSecCompatible,
+        xml_sec::provider::default_provider(),
+        PolicySet {
+            verification: Some(VerificationPolicy::clone(&snapshots.verification)),
+            signing: Some(SigningPolicy::clone(&snapshots.signing)),
+            encryption: Some(EncryptionPolicy::clone(&snapshots.encryption)),
+            decryption: Some(DecryptionPolicy::clone(&snapshots.decryption)),
+        },
+    )
+    .compile(&context)
+    .map_err(|error| error.to_string())?;
+    let missing = || "the compiled policy lacks an operation".to_owned();
+    Ok(Snapshots {
+        verification: Arc::new(compiled.verification().ok_or_else(missing)?.clone()),
+        signing: Arc::new(compiled.signing().ok_or_else(missing)?.clone()),
+        encryption: Arc::new(compiled.encryption().ok_or_else(missing)?.clone()),
+        decryption: Arc::new(compiled.decryption().ok_or_else(missing)?.clone()),
+    })
 }
 
 impl From<Snapshots> for Published {

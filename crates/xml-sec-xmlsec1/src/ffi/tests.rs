@@ -134,6 +134,40 @@ pub(super) fn own_process() {
     );
 }
 
+/// Publishes the verification and signing snapshots under an authorization
+/// that ends a moment later, and returns once it has ended. A published
+/// revision is compiled, and compilation refuses an authorization already
+/// over, so a run meets an ended one only when it ends after publication.
+pub(super) fn end_signature_authorization() {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use xml_sec::policy::{Instant, PolicyValidity};
+    let ends = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("a clock after the epoch")
+        + Duration::from_secs(1);
+    let validity = || {
+        Some(PolicyValidity {
+            authorization_id: "test".to_owned(),
+            authority: "test".to_owned(),
+            reason: "an authorization about to end".to_owned(),
+            not_before: Instant::new(0, 0).expect("the epoch"),
+            expires_at: Instant::new(
+                ends.as_secs().try_into().expect("a near instant"),
+                ends.subsec_nanos(),
+            )
+            .expect("a second from now"),
+        })
+    };
+    super::policy::republish(
+        |verification| verification.validity = validity(),
+        |signing| signing.validity = validity(),
+    )
+    .expect("the library policy compiles");
+    while SystemTime::now() <= UNIX_EPOCH + ends {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// A panic inside an exported function's body becomes its failure value
 /// instead of unwinding across the C boundary, which is undefined behavior.
 #[test]
