@@ -22,6 +22,7 @@ a disabled operation. Encryption tables require an encryption-enabled build.
 | Field | Applicable operations | Value |
 | --- | --- | --- |
 | `signature_algorithms` | verify, sign | Algorithm URI array or `"default"`; parameterized RSA-PSS descriptors described below |
+| `verify_only_signature_algorithms` | sign | Algorithm URI array: the verify-only methods (SHA-1 and weaker families) that `signature_algorithms` may list for signing; compilation refuses one listed there but not here. Empty by default; layers intersect |
 | `digest_algorithms` | verify, sign | Digest URI array or `"default"` |
 | `parameterized_rsa_pss` | verify, sign | `ExactOnly`, `SecureSupported`, `AllSupported` |
 | `signature_constraints` | verify, sign | `General`, `Saml`, `WsSecurity`, `Xades` |

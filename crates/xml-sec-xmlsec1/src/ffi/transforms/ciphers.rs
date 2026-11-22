@@ -1,17 +1,24 @@
 //! The built-in provider's symmetric cipher transform klasses: the AES-CBC,
-//! AES-GCM and Camellia-CBC content ciphers and the AES and Camellia key
-//! wraps.
+//! AES-GCM, Camellia-CBC, `ChaCha20` and `ChaCha20-Poly1305` content ciphers and
+//! the AES and Camellia key wraps.
 //!
 //! A transform collects its binary input. On the final chunk it encrypts or
 //! decrypts it as one `XMLEnc` cipher value (the IV or nonce in front, CBC
-//! padding as `XMLEnc` defines it, the GCM tag behind), or wraps or unwraps
-//! it as a key, through the selected provider, after the run's policy
-//! admitted the algorithm, with the symmetric key of the klass's family.
+//! padding as `XMLEnc` defines it, the GCM or Poly1305 tag behind), or wraps
+//! or unwraps it as a key, through the selected provider, after the run's
+//! policy admitted the algorithm, with the symmetric key of the klass's
+//! family. The `ChaCha` klasses carry their nonce, counter and AAD in the
+//! `EncryptionMethod` (draft-eastlake-rfc9231bis sections 2.6.7 and 2.6.8):
+//! they read them as the core parses them, an encryption whose template
+//! names no nonce draws one, and writing the method puts it there, as
+//! libxmlsec1 does.
 
 use std::ffi::{c_int, c_uint, c_void};
 
 use xml_sec::policy::PolicyViolation;
-use xml_sec::xmlenc::{DataEncryptionAlgorithm, KeyWrapAlgorithm};
+use xml_sec::xmlenc::{
+    ChaChaParameters, DataEncryptionAlgorithm, EncryptionMethod, KeyWrapAlgorithm,
+};
 use zeroize::Zeroizing;
 
 use super::super::buffer::{
@@ -77,6 +84,9 @@ struct Cipher {
     /// The run's method carries a key, taken with the policy: a block
     /// cipher is then admitted as a CBC key wrap, not as content.
     wraps_key: bool,
+    /// A `ChaCha` klass's parameters, as `readNode` read them; an encryption
+    /// that drew the nonce keeps it here for `writeNode`.
+    chacha: Option<ChaChaParameters>,
 }
 
 /// A cipher klass of `name` and `href`.
@@ -98,12 +108,22 @@ const fn cipher_klass(name: &'static [u8], href: &'static [u8]) -> XmlSecTransfo
     }
 }
 
+/// A `ChaCha` klass of `name` and `href`, which reads and writes its
+/// `EncryptionMethod` parameters.
+const fn chacha_klass(name: &'static [u8], href: &'static [u8]) -> XmlSecTransformKlass {
+    XmlSecTransformKlass {
+        read_node: Some(read_node),
+        write_node: Some(write_node),
+        ..cipher_klass(name, href)
+    }
+}
+
 macro_rules! ciphers {
-    ($($(#[$meta:meta])* $klass:ident, $getter:ident, $name:ident, $href:ident, $method:expr;)*) => {
+    ($($(#[$meta:meta])* $klass:ident, $getter:ident, $make:ident($name:ident, $href:ident), $method:expr;)*) => {
         $(
             $(#[$meta])*
             static $klass: XmlSecTransformKlass =
-                cipher_klass(&strings::$name, &strings::$href);
+                $make(&strings::$name, &strings::$href);
 
             $(#[$meta])*
             #[doc = concat!("The built-in table's `", stringify!($klass), "` klass.")]
@@ -126,32 +146,44 @@ macro_rules! ciphers {
 }
 
 ciphers! {
-    AES128_CBC, aes128_cbc, xmlSecNameAes128Cbc, xmlSecHrefAes128Cbc, Method::Data(DataEncryptionAlgorithm::Aes128Cbc);
+    AES128_CBC, aes128_cbc, cipher_klass(xmlSecNameAes128Cbc, xmlSecHrefAes128Cbc), Method::Data(DataEncryptionAlgorithm::Aes128Cbc);
     #[cfg(feature = "legacy-algorithms")]
-    AES192_CBC, aes192_cbc, xmlSecNameAes192Cbc, xmlSecHrefAes192Cbc, Method::Data(DataEncryptionAlgorithm::Aes192Cbc);
-    AES256_CBC, aes256_cbc, xmlSecNameAes256Cbc, xmlSecHrefAes256Cbc, Method::Data(DataEncryptionAlgorithm::Aes256Cbc);
-    AES128_GCM, aes128_gcm, xmlSecNameAes128Gcm, xmlSecHrefAes128Gcm, Method::Data(DataEncryptionAlgorithm::Aes128Gcm);
+    AES192_CBC, aes192_cbc, cipher_klass(xmlSecNameAes192Cbc, xmlSecHrefAes192Cbc), Method::Data(DataEncryptionAlgorithm::Aes192Cbc);
+    AES256_CBC, aes256_cbc, cipher_klass(xmlSecNameAes256Cbc, xmlSecHrefAes256Cbc), Method::Data(DataEncryptionAlgorithm::Aes256Cbc);
+    AES128_GCM, aes128_gcm, cipher_klass(xmlSecNameAes128Gcm, xmlSecHrefAes128Gcm), Method::Data(DataEncryptionAlgorithm::Aes128Gcm);
     #[cfg(feature = "legacy-algorithms")]
-    AES192_GCM, aes192_gcm, xmlSecNameAes192Gcm, xmlSecHrefAes192Gcm, Method::Data(DataEncryptionAlgorithm::Aes192Gcm);
-    AES256_GCM, aes256_gcm, xmlSecNameAes256Gcm, xmlSecHrefAes256Gcm, Method::Data(DataEncryptionAlgorithm::Aes256Gcm);
-    CAMELLIA128_CBC, camellia128_cbc, xmlSecNameCamellia128Cbc, xmlSecHrefCamellia128Cbc, Method::Data(DataEncryptionAlgorithm::Camellia128Cbc);
-    CAMELLIA192_CBC, camellia192_cbc, xmlSecNameCamellia192Cbc, xmlSecHrefCamellia192Cbc, Method::Data(DataEncryptionAlgorithm::Camellia192Cbc);
-    CAMELLIA256_CBC, camellia256_cbc, xmlSecNameCamellia256Cbc, xmlSecHrefCamellia256Cbc, Method::Data(DataEncryptionAlgorithm::Camellia256Cbc);
-    KW_AES128, kw_aes128, xmlSecNameKWAes128, xmlSecHrefKWAes128, Method::Wrap(KeyWrapAlgorithm::AesKw128);
+    AES192_GCM, aes192_gcm, cipher_klass(xmlSecNameAes192Gcm, xmlSecHrefAes192Gcm), Method::Data(DataEncryptionAlgorithm::Aes192Gcm);
+    AES256_GCM, aes256_gcm, cipher_klass(xmlSecNameAes256Gcm, xmlSecHrefAes256Gcm), Method::Data(DataEncryptionAlgorithm::Aes256Gcm);
+    CAMELLIA128_CBC, camellia128_cbc, cipher_klass(xmlSecNameCamellia128Cbc, xmlSecHrefCamellia128Cbc), Method::Data(DataEncryptionAlgorithm::Camellia128Cbc);
+    CAMELLIA192_CBC, camellia192_cbc, cipher_klass(xmlSecNameCamellia192Cbc, xmlSecHrefCamellia192Cbc), Method::Data(DataEncryptionAlgorithm::Camellia192Cbc);
+    CAMELLIA256_CBC, camellia256_cbc, cipher_klass(xmlSecNameCamellia256Cbc, xmlSecHrefCamellia256Cbc), Method::Data(DataEncryptionAlgorithm::Camellia256Cbc);
+    CHACHA20, chacha20, chacha_klass(xmlSecNameChaCha20, xmlSecHrefChaCha20), Method::Data(DataEncryptionAlgorithm::ChaCha20);
+    CHACHA20_POLY1305, chacha20_poly1305, chacha_klass(xmlSecNameChaCha20Poly1305, xmlSecHrefChaCha20Poly1305), Method::Data(DataEncryptionAlgorithm::ChaCha20Poly1305);
+    KW_AES128, kw_aes128, cipher_klass(xmlSecNameKWAes128, xmlSecHrefKWAes128), Method::Wrap(KeyWrapAlgorithm::AesKw128);
     #[cfg(feature = "legacy-algorithms")]
-    KW_AES192, kw_aes192, xmlSecNameKWAes192, xmlSecHrefKWAes192, Method::Wrap(KeyWrapAlgorithm::AesKw192);
-    KW_AES256, kw_aes256, xmlSecNameKWAes256, xmlSecHrefKWAes256, Method::Wrap(KeyWrapAlgorithm::AesKw256);
-    KW_CAMELLIA128, kw_camellia128, xmlSecNameKWCamellia128, xmlSecHrefKWCamellia128, Method::Wrap(KeyWrapAlgorithm::CamelliaKw128);
-    KW_CAMELLIA192, kw_camellia192, xmlSecNameKWCamellia192, xmlSecHrefKWCamellia192, Method::Wrap(KeyWrapAlgorithm::CamelliaKw192);
-    KW_CAMELLIA256, kw_camellia256, xmlSecNameKWCamellia256, xmlSecHrefKWCamellia256, Method::Wrap(KeyWrapAlgorithm::CamelliaKw256);
+    KW_AES192, kw_aes192, cipher_klass(xmlSecNameKWAes192, xmlSecHrefKWAes192), Method::Wrap(KeyWrapAlgorithm::AesKw192);
+    KW_AES256, kw_aes256, cipher_klass(xmlSecNameKWAes256, xmlSecHrefKWAes256), Method::Wrap(KeyWrapAlgorithm::AesKw256);
+    KW_CAMELLIA128, kw_camellia128, cipher_klass(xmlSecNameKWCamellia128, xmlSecHrefKWCamellia128), Method::Wrap(KeyWrapAlgorithm::CamelliaKw128);
+    KW_CAMELLIA192, kw_camellia192, cipher_klass(xmlSecNameKWCamellia192, xmlSecHrefKWCamellia192), Method::Wrap(KeyWrapAlgorithm::CamelliaKw192);
+    KW_CAMELLIA256, kw_camellia256, cipher_klass(xmlSecNameKWCamellia256, xmlSecHrefKWCamellia256), Method::Wrap(KeyWrapAlgorithm::CamelliaKw256);
 }
 
 /// The key-data klass of the family `method` takes its key from.
 fn key_klass(method: Method) -> *const XmlSecKeyDataKlass {
     match method.key_kind() {
         xml_sec::key_manager::SymmetricKeyKind::Camellia => symkeys::camellia(),
+        xml_sec::key_manager::SymmetricKeyKind::ChaCha20 => symkeys::chacha20(),
         _ => symkeys::aes(),
     }
+}
+
+/// Whether `method` is a `ChaCha` profile, whose parameters live in its
+/// `EncryptionMethod`.
+fn is_chacha(method: Method) -> bool {
+    matches!(
+        method,
+        Method::Data(DataEncryptionAlgorithm::ChaCha20 | DataEncryptionAlgorithm::ChaCha20Poly1305)
+    )
 }
 
 /// The cipher object of a valid transform of these klasses, after
@@ -219,6 +251,7 @@ unsafe extern "C" fn initialize(transform: *mut XmlSecTransform) -> c_int {
                 data: Zeroizing::new(Vec::new()),
                 policy: None,
                 wraps_key: false,
+                chacha: None,
             });
         }
         0
@@ -439,12 +472,25 @@ fn collect(
     let provider = xml_sec::provider::default_provider();
     let encrypting = object.operation == OPERATION_ENCRYPT;
     let output = match method {
-        Method::Data(algorithm) if encrypting => {
-            provider.encrypt_data(algorithm, key, &cipher.data)
-        }
-        Method::Data(algorithm) => provider.decrypt_data(algorithm, key, &cipher.data),
-        Method::Wrap(algorithm) if encrypting => provider.wrap_key(algorithm, key, &cipher.data),
-        Method::Wrap(algorithm) => provider.unwrap_key(algorithm, key, &cipher.data),
+        Method::Data(algorithm) if is_chacha(method) => chacha_crypt(
+            algorithm,
+            key,
+            (&mut cipher.chacha, &cipher.data),
+            encrypting,
+            provider,
+        ),
+        Method::Data(algorithm) if encrypting => provider
+            .encrypt_data(algorithm, key, &cipher.data)
+            .map_err(|error| error.to_string()),
+        Method::Data(algorithm) => provider
+            .decrypt_data(algorithm, key, &cipher.data)
+            .map_err(|error| error.to_string()),
+        Method::Wrap(algorithm) if encrypting => provider
+            .wrap_key(algorithm, key, &cipher.data)
+            .map_err(|error| error.to_string()),
+        Method::Wrap(algorithm) => provider
+            .unwrap_key(algorithm, key, &cipher.data)
+            .map_err(|error| error.to_string()),
     };
     let output = match output {
         Ok(output) => Zeroizing::new(output),
@@ -454,7 +500,7 @@ fn collect(
                 name,
                 std::ptr::null(),
                 errors::R_CRYPTO_FAILED,
-                &error.to_string(),
+                &error,
             );
             return -1;
         }
@@ -485,6 +531,204 @@ fn collect(
     }
     object.status = STATUS_FINISHED;
     0
+}
+
+/// `ChaCha` encryption or decryption of `data` with the method's `parameters`.
+/// An encryption whose parameters name no nonce draws one from the provider
+/// and keeps it in `parameters` for `writeNode`, as libxmlsec1 draws it; a
+/// decryption needs the nonce its `EncryptionMethod` carries. An encryption
+/// context refuses a template without an `EncryptionMethod` for these klasses
+/// before they run, so no drawn nonce is lost with the context.
+fn chacha_crypt(
+    algorithm: DataEncryptionAlgorithm,
+    key: &[u8],
+    (parameters, data): (&mut Option<ChaChaParameters>, &[u8]),
+    encrypting: bool,
+    provider: &dyn xml_sec::provider::CryptoProvider,
+) -> Result<Vec<u8>, String> {
+    let parameters = parameters.get_or_insert_with(ChaChaParameters::default);
+    if parameters.nonce.is_none() {
+        if !encrypting {
+            return Err("the nonce is expected in the EncryptionMethod".to_owned());
+        }
+        let mut nonce = [0; 12];
+        provider
+            .fill_random(&mut nonce)
+            .map_err(|error| error.to_string())?;
+        parameters.nonce = Some(nonce);
+    }
+    let parameters = Some(parameters.borrowed());
+    if encrypting {
+        provider.encrypt_data_with_parameters(algorithm, key, data, parameters)
+    } else {
+        provider.decrypt_data_with_parameters(algorithm, key, data, parameters)
+    }
+    .map_err(|error| error.to_string())
+}
+
+/// `readNode` of the `ChaCha` klasses (libxmlsec1's
+/// `xmlSecOpenSSLChaCha20NodeRead`): the nonce, counter and AAD of the
+/// `EncryptionMethod` element `node`, as the core parses them under the
+/// run's policy.
+unsafe extern "C" fn read_node(
+    transform: *mut XmlSecTransform,
+    node: *mut super::super::tree::XmlNode,
+    ctx: *mut XmlSecTransformCtx,
+) -> c_int {
+    contain(-1, || {
+        let here = here!("xmlSecOpenSSLChaCha20NodeRead");
+        // SAFETY: the dispatcher passes a transform.
+        let Some((object, _, cipher)) = (unsafe { object(transform, here) }) else {
+            return -1;
+        };
+        if node.is_null() || ctx.is_null() {
+            errors::assertion(here, c"node != NULL");
+            return -1;
+        }
+        // SAFETY: a non-null, initialized context.
+        let Some(pinned) = (unsafe { run_policy(ctx, here) }) else {
+            return -1;
+        };
+        let parsed = if object.operation == OPERATION_ENCRYPT {
+            parse_method(node, &*pinned.encryption, &pinned.encryption.resources)
+        } else {
+            parse_method(node, &*pinned.decryption, &pinned.decryption.resources)
+        };
+        match parsed {
+            Ok(method) => {
+                cipher.chacha = method.chacha;
+                0
+            }
+            Err(error) => {
+                errors::report(
+                    here,
+                    name_of(object),
+                    std::ptr::null(),
+                    errors::R_INVALID_TRANSFORM,
+                    &error,
+                );
+                -1
+            }
+        }
+    })
+}
+
+/// The `EncryptionMethod` element `node` as the core parses it, read under
+/// the operation's `policy` and bounded by its `resources`.
+fn parse_method(
+    node: *mut super::super::tree::XmlNode,
+    policy: &impl xml_sec::XmlDocumentPolicy,
+    resources: &xml_sec::policy::ResourcePolicy,
+) -> Result<EncryptionMethod, String> {
+    let document =
+        xml_sec_libxml2::document::subtree(node, policy).map_err(|error| error.to_string())?;
+    document.with_view(|view| {
+        EncryptionMethod::from_element(view.document().root_element(), resources)
+            .map_err(|error| error.to_string())
+    })
+}
+
+/// `writeNode` of the `ChaCha` klasses (libxmlsec1's
+/// `xmlSecTransformChaCha20ParamsWrite` and its Poly1305 sibling): the nonce
+/// the encryption used, and the `ChaCha20` counter after it, as the first
+/// children of the `EncryptionMethod` element `node`, replacing ones there
+/// and leaving an AAD in place.
+unsafe extern "C" fn write_node(
+    transform: *mut XmlSecTransform,
+    node: *mut super::super::tree::XmlNode,
+    _ctx: *mut XmlSecTransformCtx,
+) -> c_int {
+    contain(-1, || {
+        let here = here!("xmlSecOpenSSLChaCha20NodeWrite");
+        // SAFETY: the dispatcher passes a transform.
+        let Some((object, method, cipher)) = (unsafe { object(transform, here) }) else {
+            return -1;
+        };
+        if node.is_null() {
+            errors::assertion(here, c"node != NULL");
+            return -1;
+        }
+        let Some(parameters) = cipher.chacha.as_ref() else {
+            errors::assertion(here, c"ctx->ivInitialized != 0");
+            return -1;
+        };
+        let Some(nonce) = parameters.nonce else {
+            errors::assertion(here, c"ctx->ivInitialized != 0");
+            return -1;
+        };
+        let mut fields: Vec<(&[u8], &[u8])> = vec![(&strings::xmlSecNodeChaCha20Nonce, &nonce)];
+        let counter;
+        if matches!(method, Method::Data(DataEncryptionAlgorithm::ChaCha20)) {
+            let Some(value) = parameters.counter else {
+                errors::assertion(here, c"ctx->ivInitialized != 0");
+                return -1;
+            };
+            counter = value;
+            fields.push((&strings::xmlSecNodeChaCha20Counter, &counter));
+        }
+        // SAFETY: the caller's live element.
+        if unsafe { write_parameters(node, &fields) } {
+            0
+        } else {
+            errors::internal(here, name_of(object), c"xmlSecTransformChaCha20ParamsWrite");
+            -1
+        }
+    })
+}
+
+/// Writes each `(name, value)` of `fields` as a hexBinary child of `node`:
+/// a parameter already there, in either form the reader accepts (RFC 9231's
+/// unqualified one or the 2021 xmldsig-more namespace), is overwritten in
+/// place, so it is never duplicated; a missing one is added in the 2021
+/// namespace, in order, after any `KeySize`, which the reader requires first.
+///
+/// # Safety
+/// `node` is a live element.
+unsafe fn write_parameters(
+    node: *mut super::super::tree::XmlNode,
+    fields: &[(&[u8], &[u8])],
+) -> bool {
+    use super::super::tree::nodes;
+    use super::super::xmltree::{
+        xmlSecAddChild, xmlSecAddPrevSibling, xmlSecCheckNodeName, xmlSecGetNextElementNode,
+        xmlSecSetNodeContentAsHex,
+    };
+    let namespace = strings::xmlSecDSig2021MoreNs.as_ptr();
+    // SAFETY: by the caller's contract; every node handled is a live child
+    // of `node` or a node just added to it.
+    unsafe {
+        let children = || {
+            std::iter::successors(
+                Some(xmlSecGetNextElementNode(nodes::first_child(node))).filter(|n| !n.is_null()),
+                |&cur| Some(xmlSecGetNextElementNode(nodes::next(cur))).filter(|n| !n.is_null()),
+            )
+        };
+        // New parameters go before the first child that is not a KeySize.
+        let anchor = children().find(|&child| {
+            xmlSecCheckNodeName(
+                child,
+                c"KeySize".as_ptr().cast(),
+                strings::xmlSecEncNs.as_ptr(),
+            ) == 0
+        });
+        for (name, value) in fields {
+            let existing = children().find(|&child| {
+                xmlSecCheckNodeName(child, name.as_ptr(), namespace) != 0
+                    || xmlSecCheckNodeName(child, name.as_ptr(), std::ptr::null()) != 0
+            });
+            let target = match (existing, anchor) {
+                (Some(existing), _) => existing,
+                (None, Some(anchor)) => xmlSecAddPrevSibling(anchor, name.as_ptr(), namespace),
+                (None, None) => xmlSecAddChild(node, name.as_ptr(), namespace),
+            };
+            if target.is_null()
+                || xmlSecSetNodeContentAsHex(target, value.as_ptr(), value.len()) < 0
+            {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// `execute`: libxmlsec1's state machine over [`collect`]; the key must

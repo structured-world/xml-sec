@@ -1283,6 +1283,20 @@ unsafe fn read_method_and_key(ctx: &mut XmlSecEncCtx, add_base64: bool) -> c_int
                 return -1;
             }
         } else if !ctx.def_enc_method_id.is_null() {
+            // A method that writes parameters (a ChaCha nonce) writes them
+            // into the EncryptionMethod; without one the decryptor could not
+            // recover them, so the encryption is refused before it runs.
+            if ctx.operation == OPERATION_ENCRYPT && (*ctx.def_enc_method_id).write_node.is_some() {
+                let method = c_text((*ctx.def_enc_method_id).name).unwrap_or("NULL");
+                errors::invalid_data(
+                    here,
+                    std::ptr::null(),
+                    &format!(
+                        "the method {method} writes parameters into an EncryptionMethod the template does not have"
+                    ),
+                );
+                return -1;
+            }
             ctx.enc_method = xmlSecTransformCtxCreateAndAppend(transforms, ctx.def_enc_method_id);
             if ctx.enc_method.is_null() {
                 errors::internal(here, std::ptr::null(), c"xmlSecTransformCtxCreateAndAppend");

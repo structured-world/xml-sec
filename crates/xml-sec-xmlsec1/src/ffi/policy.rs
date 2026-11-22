@@ -357,6 +357,129 @@ pub(crate) unsafe fn key_candidates<'a>(slot: *mut c_void) -> Option<&'a Cell<Ke
     unsafe { slot.cast::<Operation>().as_ref() }.map(|operation| &operation.key_candidates)
 }
 
+/// `xsPolicyRestrict`: narrows the library's published snapshots by profile
+/// `profile` of the `xml-sec-config` document in the `dataSize` bytes at
+/// `data`, every operation's in one republish. Each call narrows what the
+/// previous ones left; nothing widens the `XmlSecCompatible` ceiling, and a
+/// context's enabled transforms and key data narrow further on top. Returns 0,
+/// or -1 after a report, publishing nothing.
+///
+/// # Safety
+/// `data` holds `size` bytes; `profile` is a NUL-terminated string.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn xsPolicyRestrict(
+    data: *const u8,
+    size: usize,
+    profile: *const c_char,
+) -> std::ffi::c_int {
+    super::contain(-1, || {
+        let here = super::errors::here!("xsPolicyRestrict");
+        for (failed, expression) in [
+            (data.is_null(), c"data != NULL"),
+            (size == 0, c"dataSize > 0"),
+            (profile.is_null(), c"profile != NULL"),
+        ] {
+            if failed {
+                errors::assertion(here, expression);
+                return -1;
+            }
+        }
+        // SAFETY: the caller's `size` bytes and string.
+        let (bytes, name) = unsafe {
+            (
+                std::slice::from_raw_parts(data, size),
+                std::ffi::CStr::from_ptr(profile),
+            )
+        };
+        let refuse = |message: &str| {
+            errors::report(
+                here,
+                std::ptr::null(),
+                std::ptr::null(),
+                errors::R_INVALID_DATA,
+                message,
+            );
+            -1
+        };
+        let Ok(name) = name.to_str() else {
+            return refuse("the profile name is not UTF-8");
+        };
+        let config = match xml_sec_config::Configuration::from_reader(
+            bytes,
+            xml_sec_config::LoadLimits::default(),
+        ) {
+            Ok(config) => config,
+            Err(error) => return refuse(&error.to_string()),
+        };
+        // The deployment's layer stays in force: every later setter's
+        // snapshots are narrowed by it again before they are published.
+        let name = name.to_owned();
+        let restriction = Arc::new(move |own: &xml_sec_libxml2::policy::Snapshots| {
+            restricted(&config, &name, own)
+        });
+        match xml_sec_libxml2::policy::restrict(restriction) {
+            Some(Ok(())) => 0,
+            Some(Err(error)) => refuse(&error),
+            None => {
+                errors::policy_unavailable(here);
+                -1
+            }
+        }
+    })
+}
+
+/// The snapshots of `current` narrowed by profile `name` of `config`, and
+/// compiled by the core as any composed policy is. The composition only
+/// intersects, so the result is the library's ceiling or less.
+fn restricted(
+    config: &xml_sec_config::Configuration,
+    name: &str,
+    current: &xml_sec_libxml2::policy::Snapshots,
+) -> Result<xml_sec_libxml2::policy::Snapshots, String> {
+    use xml_sec::policy::{PolicyCompileContext, PolicyCompiler, PolicyProfile, PolicySet};
+    let ceiling = PolicySet {
+        verification: Some(VerificationPolicy::clone(&current.verification)),
+        signing: Some(SigningPolicy::clone(&current.signing)),
+        encryption: Some(EncryptionPolicy::clone(&current.encryption)),
+        decryption: Some(DecryptionPolicy::clone(&current.decryption)),
+    };
+    let compiler = PolicyCompiler::from_policies(
+        PolicyProfile::XmlSecCompatible,
+        xml_sec::provider::default_provider(),
+        ceiling,
+    );
+    // The library's runs resolve external URIs from caller-supplied bytes
+    // and receive no expected targets, as its own ceiling was compiled.
+    let context = PolicyCompileContext {
+        external_resources: true,
+        target_evidence: false,
+    };
+    let policies = config
+        .restrict(name, compiler)
+        .map_err(|error| error.to_string())?
+        .compile(&context)
+        .map_err(|error| error.to_string())?;
+    let (Some(verification), Some(signing), Some(encryption), Some(decryption)) = (
+        policies.verification(),
+        policies.signing(),
+        policies.encryption(),
+        policies.decryption(),
+    ) else {
+        return Err(format!(
+            "profile {name} disables an operation the library runs"
+        ));
+    };
+    Ok(xml_sec_libxml2::policy::Snapshots {
+        verification: Arc::new(verification.clone()),
+        signing: Arc::new(signing.clone()),
+        encryption: Arc::new(encryption.clone()),
+        decryption: Arc::new(decryption.clone()),
+    })
+}
+
+#[cfg(test)]
+mod tests;
+
 /// Publishes the current snapshots with the edits applied, as a libxmlsec1
 /// setter of a policy value does; `None` when the profile cannot be
 /// compiled.

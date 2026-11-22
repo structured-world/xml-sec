@@ -591,6 +591,11 @@ fn signing(a: &SigningPolicy, b: &SigningPolicy) -> Result<SigningPolicy, Policy
             |v| a.check_signature_algorithm(v).is_ok(),
             |v| b.check_signature_algorithm(v).is_ok(),
         ),
+        // A verify-only method is signed with only when every layer lets it.
+        verify_only_signature_algorithms: set(
+            &a.verify_only_signature_algorithms,
+            &b.verify_only_signature_algorithms,
+        ),
         digest_algorithms: algorithms(
             a.digest_algorithms.as_ref(),
             b.digest_algorithms.as_ref(),
@@ -724,6 +729,48 @@ mod tests {
             salt_len: 17,
         });
         assert!(composed.check_signature_algorithm(algorithm).is_ok());
+    }
+
+    #[cfg(feature = "rustcrypto")]
+    #[test]
+    fn a_verify_only_signing_method_needs_its_own_permission() {
+        // HMAC-SHA1 is verify-only: a signing policy listing it compiles only
+        // when it also names it as permitted, and composition keeps that
+        // permission only where every layer grants it.
+        use crate::policy::{HmacPolicy, PolicyCompileContext, PolicyCompiler, PolicyProfile};
+        let signing = |verify_only: &[SignatureAlgorithm]| SigningPolicy {
+            signature_algorithms: Some(BTreeSet::from([
+                SignatureAlgorithm::HmacSha1,
+                SignatureAlgorithm::HmacSha256,
+            ])),
+            verify_only_signature_algorithms: verify_only.iter().copied().collect(),
+            hmac: HmacPolicy {
+                minimum_output_bits: 80,
+                ..HmacPolicy::default()
+            },
+            ..SigningPolicy::default()
+        };
+        let compiles = |policy: SigningPolicy| {
+            PolicyCompiler::from_policies(
+                PolicyProfile::XmlSecCompatible,
+                &crate::provider::RustCryptoProvider,
+                super::super::PolicySet {
+                    signing: Some(policy),
+                    ..super::super::PolicySet::default()
+                },
+            )
+            .compile(&PolicyCompileContext {
+                external_resources: false,
+                target_evidence: false,
+            })
+            .is_ok()
+        };
+        assert!(!compiles(signing(&[])));
+        let permitted = signing(&[SignatureAlgorithm::HmacSha1]);
+        assert!(compiles(permitted.clone()));
+        let composed = super::signing(&permitted, &signing(&[])).expect("compatible policies");
+        assert!(composed.verify_only_signature_algorithms.is_empty());
+        assert!(!compiles(composed));
     }
 
     #[test]

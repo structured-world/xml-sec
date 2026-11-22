@@ -637,6 +637,9 @@ fn signing(p: &mut SigningPolicy, t: &Table, syntax_only: bool) -> Result<(), Er
         match key.as_str() {
             "rsa_keys" => rsa(&mut p.rsa_keys, value)?,
             "dsa_keys" => dsa(&mut p.dsa_keys, value)?,
+            "verify_only_signature_algorithms" => {
+                p.verify_only_signature_algorithms = selected(value, key, signature)?;
+            }
             _ => signature_fields!(p, key, value, TransformTable::Signing),
         }
     }
@@ -1236,6 +1239,7 @@ fn signing_snapshot(p: &SigningPolicy) -> Result<Value, Error> {
         key_establishment: _,
         parameterized_rsa_pss: _,
         signature_algorithms: _,
+        verify_only_signature_algorithms: _,
         digest_algorithms: _,
         hmac: _,
         ecdsa_signature_value_encoding: _,
@@ -1249,6 +1253,13 @@ fn signing_snapshot(p: &SigningPolicy) -> Result<Value, Error> {
         resources: _,
     } = p;
     let mut t = signature_snapshot!(p, TransformTable::Signing);
+    t.insert(
+        "verify_only_signature_algorithms".into(),
+        sorted(
+            p.verify_only_signature_algorithms.iter().copied(),
+            signature_value,
+        ),
+    );
     t.insert("rsa_keys".into(), rsa_snapshot(p.rsa_keys));
     t.insert("dsa_keys".into(), dsa_snapshot(p.dsa_keys));
     Ok(Value::Table(t))

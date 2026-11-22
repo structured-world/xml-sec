@@ -291,6 +291,34 @@ impl<'a> PolicyCompiler<'a> {
         })
     }
 
+    /// Start from a ceiling the caller already holds for `profile`, such as a
+    /// compatibility boundary's published snapshots of it; later layers only
+    /// narrow it, as they narrow a named profile.
+    #[must_use]
+    pub fn from_policies(
+        profile: PolicyProfile,
+        provider: &'a dyn CryptoProvider,
+        policies: PolicySet,
+    ) -> Self {
+        Self {
+            provider,
+            profile,
+            policies,
+        }
+    }
+
+    /// The profile this compiler started from.
+    #[must_use]
+    pub const fn profile(&self) -> PolicyProfile {
+        self.profile
+    }
+
+    /// The engine whose capabilities the policies are compiled against.
+    #[must_use]
+    pub fn provider(&self) -> &'a dyn CryptoProvider {
+        self.provider
+    }
+
     /// Intersect another complete layer without granting any new permission.
     /// `None` operation fields mean disabled, not unspecified inheritance.
     ///

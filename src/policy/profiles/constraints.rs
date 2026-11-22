@@ -26,7 +26,7 @@ impl PolicyView<'_> {
                 policy.signature_algorithms.as_ref(),
                 policy.hmac,
                 provider,
-                false,
+                None,
                 |algorithm| policy.check_signature_algorithm(algorithm),
             )?;
             digest_methods(policy.digest_algorithms.as_ref(), provider)?;
@@ -47,7 +47,7 @@ impl PolicyView<'_> {
                 policy.signature_algorithms.as_ref(),
                 policy.hmac,
                 provider,
-                true,
+                Some(&policy.verify_only_signature_algorithms),
                 |algorithm| policy.check_signature_algorithm(algorithm),
             )?;
             digest_methods(policy.digest_algorithms.as_ref(), provider)?;
@@ -92,13 +92,16 @@ impl PolicyView<'_> {
     }
 }
 
+/// `verify_only` is the signing policy's permission for verify-only
+/// methods; `None` checks a verification policy.
 fn signature_methods(
     methods: Option<&BTreeSet<SignatureAlgorithm>>,
     hmac: HmacPolicy,
     provider: &dyn CryptoProvider,
-    signing: bool,
+    verify_only: Option<&BTreeSet<SignatureAlgorithm>>,
     check: impl Fn(SignatureAlgorithm) -> Result<(), PolicyViolation>,
 ) -> Result<(), PolicyViolation> {
+    let signing = verify_only.is_some();
     if let Some(methods) = methods {
         if methods.is_empty() {
             return Err(configuration(
@@ -106,10 +109,12 @@ fn signature_methods(
             ));
         }
         for &algorithm in methods {
-            check(algorithm)?;
-            if signing && !algorithm.signing_allowed() {
+            if verify_only.is_some_and(|permitted| {
+                !algorithm.signing_allowed() && !permitted.contains(&algorithm)
+            }) {
                 return Err(configuration("verify-only algorithm enabled for signing"));
             }
+            check(algorithm)?;
             if algorithm
                 .hmac_output_bits()
                 .is_some_and(|bits| hmac.minimum_output_bits > bits)

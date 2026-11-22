@@ -13,6 +13,13 @@ those headers hand out the backend's own objects, and the library consumes no
 C library. C code reaches the same algorithms and key loading through the
 generic `xmlSecCrypto*`, `xmlSecCryptoApp*` and klass identity entry points.
 
+The library runs every operation under its libxmlsec1-compatible policy. A C
+deployment narrows it with `xsPolicyRestrict` (`xmlsec/xs_policy.h`), passing
+the bytes of an [`xml-sec-config` document](policy-configuration.md) and the
+name of a profile whose inheritance root is `base = "XmlSecCompatible"`: every
+operation's policy is replaced at once, only ever narrowed, and the enabled
+transforms and key data of a context narrow further on top.
+
 ## Choose A Migration Boundary
 
 | Existing integration | Current migration |

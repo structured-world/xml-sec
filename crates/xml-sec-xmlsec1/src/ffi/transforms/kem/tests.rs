@@ -715,3 +715,50 @@ fn the_policy_decides_parameter_sets_and_kem_content_ciphers() {
         assert_eq!(decrypt_vector(gcm, KEY_512, name), None);
     });
 }
+
+#[test]
+fn a_restricting_layer_takes_kem_content_ciphers_and_parameter_sets_back() {
+    // A C deployment applying its xml-sec-config layer with
+    // xsPolicyRestrict gets what the layer states for every later
+    // operation: CBC content keyed by ML-KEM refused, GCM still decrypting,
+    // and a dropped parameter set refused.
+    with_library(|| {
+        let gcm: &[u8] = fixture!("xmlenc/aleksey-xmlenc-01/enc-aes128gcm-kt-ml-kem-512.xml");
+        let cbc: &[u8] = fixture!("xmlenc/aleksey-xmlenc-01/enc-aes256-kt-ml-kem-512.xml");
+        let name = c"TestKeyName-ml-kem-512";
+        assert!(decrypt_vector(cbc, KEY_512, name).is_some());
+        let restrict = |toml: &str| {
+            // SAFETY: the document's bytes and a NUL-terminated name.
+            unsafe {
+                super::super::super::policy::xsPolicyRestrict(
+                    toml.as_ptr(),
+                    toml.len(),
+                    c"deployment".as_ptr(),
+                )
+            }
+        };
+        let authenticated = r#"
+schema_version = 1
+[profiles.deployment]
+base = "XmlSecCompatible"
+[profiles.deployment.decryption.key_establishment]
+kem_content_authentication = "RequireAuthenticatedCipher"
+"#;
+        assert_eq!(restrict(authenticated), 0);
+        assert_eq!(decrypt_vector(cbc, KEY_512, name), None);
+        assert!(decrypt_vector(gcm, KEY_512, name).is_some());
+        let without_512 = format!(
+            r#"
+schema_version = 1
+[profiles.deployment]
+base = "XmlSecCompatible"
+[profiles.deployment.decryption.key_establishment]
+encapsulation_algorithms = ["{}", "{}"]
+"#,
+            KeyEncapsulationAlgorithm::MlKem768.uri(),
+            KeyEncapsulationAlgorithm::MlKem1024.uri()
+        );
+        assert_eq!(restrict(&without_512), 0);
+        assert_eq!(decrypt_vector(gcm, KEY_512, name), None);
+    });
+}

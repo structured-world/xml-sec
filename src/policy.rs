@@ -1863,6 +1863,11 @@ pub struct SigningPolicy {
     /// Exact signing methods, supplemented by `parameterized_rsa_pss`.
     /// `None` uses the implemented secure defaults.
     pub signature_algorithms: Option<BTreeSet<SignatureAlgorithm>>,
+    /// Verify-only methods (SHA-1 and weaker families) that policy
+    /// compilation accepts in `signature_algorithms`: a compiled policy lists
+    /// one for signing only when it is named here too. Empty by default; a
+    /// compatibility boundary that signs as libxmlsec1 does names them here.
+    pub verify_only_signature_algorithms: BTreeSet<SignatureAlgorithm>,
     /// Allowed reference digest methods; `None` uses the implemented secure defaults.
     pub digest_algorithms: Option<BTreeSet<DigestAlgorithm>>,
     /// HMAC secret and output-length requirements.

@@ -19,7 +19,6 @@ use super::super::{
     xmlSecTransformSetKey, xmlSecTransformVerify,
 };
 use super::rsa_sha256;
-use xml_sec::policy::{Instant, PolicyValidity};
 use xml_sec::xmldsig::SignatureAlgorithm;
 
 /// `xmlSecKeyDataFormatPem`.
@@ -170,20 +169,7 @@ fn a_run_under_a_policy_not_in_force_takes_no_input() {
     // A run whose policy has expired is refused at its first chunk, before
     // any byte is collected, as a digest run is.
     own_process();
-    let expired = || {
-        Some(PolicyValidity {
-            authorization_id: "test".to_owned(),
-            authority: "test".to_owned(),
-            reason: "an ended authorization".to_owned(),
-            not_before: Instant::new(0, 0).expect("the epoch"),
-            expires_at: Instant::new(1, 0).expect("one second later"),
-        })
-    };
-    policy::republish(
-        |verification| verification.validity = expired(),
-        |signing| signing.validity = expired(),
-    )
-    .expect("the library policy compiles");
+    crate::ffi::tests::end_signature_authorization();
     for (operation, key) in [
         (OPERATION_SIGN, private_key()),
         (OPERATION_VERIFY, public_key()),

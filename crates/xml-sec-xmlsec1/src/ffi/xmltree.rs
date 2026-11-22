@@ -12,7 +12,7 @@ mod qname;
 
 pub(crate) use content::{
     xmlSecGetNodeContentAsSize, xmlSecIsEmptyNode, xmlSecNodeEncodeAndSetContent,
-    xmlSecPrintXmlString,
+    xmlSecPrintXmlString, xmlSecSetNodeContentAsHex,
 };
 pub(crate) use edit::{
     replace_node_buffer_under, xmlSecAddChild, xmlSecAddIDs, xmlSecAddNextSibling,

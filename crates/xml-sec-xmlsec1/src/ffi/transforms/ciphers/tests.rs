@@ -3,7 +3,7 @@ use super::*;
 use crate::ffi::buffer::{
     XmlSecBuffer, xmlSecBufferGetData, xmlSecBufferGetSize, xmlSecBufferIsSecure,
 };
-use crate::ffi::keys::{xmlSecKeyCreate, xmlSecKeyDestroy, xmlSecKeySetValue};
+use crate::ffi::keys::{xmlSecKeyCreate, xmlSecKeyDestroy, xmlSecKeyDuplicate, xmlSecKeySetValue};
 use crate::ffi::keysdata::{xmlSecKeyDataBinaryValueSetBuffer, xmlSecKeyDataCreate};
 use crate::ffi::transforms::ctx::{
     xmlSecTransformCtxBinaryExecute, xmlSecTransformCtxCreate, xmlSecTransformCtxCreateAndAppend,
@@ -192,6 +192,198 @@ fn decryption_refuses_plaintext_beyond_the_policy_limit() {
     assert_eq!(
         run(aes128_gcm(), OPERATION_DECRYPT, key, &encrypted),
         Some(vec![0x55; 17])
+    );
+    // SAFETY: the key created above.
+    unsafe { xmlSecKeyDestroy(key) };
+}
+
+/// A `ChaCha20` key holding `bytes`.
+fn chacha_key(bytes: &[u8]) -> *mut XmlSecKey {
+    // SAFETY: a key and key data created here.
+    unsafe {
+        let data = xmlSecKeyDataCreate(symkeys::chacha20());
+        assert_eq!(
+            xmlSecKeyDataBinaryValueSetBuffer(data, bytes.as_ptr(), bytes.len()),
+            0
+        );
+        let key = xmlSecKeyCreate();
+        assert_eq!(xmlSecKeySetValue(key, data), 0);
+        key
+    }
+}
+
+#[test]
+fn a_chacha_chain_without_its_method_draws_a_nonce_only_to_encrypt() {
+    // A ChaCha20-Poly1305 chain read from no EncryptionMethod draws the nonce
+    // it encrypts with, as libxmlsec1 does; decrypting needs the nonce the
+    // method carries, so the same chain cannot decrypt without one. ChaCha20
+    // without its method has no counter and encrypts nothing.
+    let key = chacha_key(&[0x66; 32]);
+    let sealed = run(chacha20_poly1305(), OPERATION_ENCRYPT, key, b"payload").expect("encrypts");
+    // The Poly1305 tag follows the ciphertext; the nonce stays out of it.
+    assert_eq!(sealed.len(), b"payload".len() + 16);
+    assert_eq!(
+        run(chacha20_poly1305(), OPERATION_DECRYPT, key, &sealed),
+        None
+    );
+    assert_eq!(run(chacha20(), OPERATION_ENCRYPT, key, b"payload"), None);
+    // SAFETY: the key created above.
+    unsafe { xmlSecKeyDestroy(key) };
+}
+
+/// Encrypts `plaintext` into the `EncryptedData` template `xml` with `key`
+/// and decrypts what that writes: the plaintext recovered, `None` when either
+/// step fails.
+fn template_round_trip(xml: &str, key: *mut XmlSecKey, plaintext: &[u8]) -> Option<Vec<u8>> {
+    use crate::ffi::xmlenc::{
+        xmlSecEncCtxBinaryEncrypt, xmlSecEncCtxCreate, xmlSecEncCtxDecryptToBuffer,
+        xmlSecEncCtxDestroy,
+    };
+    use xml_sec_libxml2::ffi::tree::{xsDocGetRootElement, xsFreeDoc, xsReadMemory};
+    // SAFETY: a document and contexts created and released here; the key is
+    // the caller's and outlives both contexts.
+    unsafe {
+        let doc = xsReadMemory(
+            xml.as_ptr().cast(),
+            c_int::try_from(xml.len()).expect("a short template"),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        assert!(!doc.is_null(), "the template parses");
+        let root = xsDocGetRootElement(doc);
+        let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
+        (*ctx).enc_key = xmlSecKeyDuplicate(key);
+        let encrypted =
+            xmlSecEncCtxBinaryEncrypt(ctx, root.cast(), plaintext.as_ptr(), plaintext.len()) == 0;
+        xmlSecEncCtxDestroy(ctx);
+        let recovered = encrypted.then(|| {
+            let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
+            (*ctx).enc_key = xmlSecKeyDuplicate(key);
+            let result = xmlSecEncCtxDecryptToBuffer(ctx, xsDocGetRootElement(doc).cast());
+            let recovered = (!result.is_null()).then(|| bytes(result));
+            xmlSecEncCtxDestroy(ctx);
+            recovered
+        });
+        xsFreeDoc(doc);
+        recovered.flatten()
+    }
+}
+
+#[test]
+fn a_template_without_its_method_refuses_a_default_method_with_parameters() {
+    // A default ChaCha20-Poly1305 method draws a nonce the decryption needs,
+    // and only an EncryptionMethod carries it: a template without one is
+    // refused before anything is encrypted, rather than written with a
+    // ciphertext no one can decrypt. The transform list is process-wide.
+    use crate::ffi::xmlenc::{xmlSecEncCtxBinaryEncrypt, xmlSecEncCtxCreate, xmlSecEncCtxDestroy};
+    use xml_sec_libxml2::ffi::tree::{xsDocGetRootElement, xsFreeDoc, xsReadMemory};
+    crate::ffi::tests::own_process();
+    // SAFETY: the library initialized on this test's own thread.
+    unsafe {
+        assert_eq!(crate::ffi::library::xmlSecInit(), 0);
+        assert_eq!(
+            crate::ffi::crypto::xmlSecCryptoDLLoadLibrary(std::ptr::null()),
+            0
+        );
+        assert_eq!(crate::ffi::crypto::xmlSecCryptoAppInit(std::ptr::null()), 0);
+        assert_eq!(crate::ffi::crypto::xmlSecCryptoInit(), 0);
+    }
+    let key = chacha_key(&[0x99; 32]);
+    let xml = "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\">\
+               <CipherData><CipherValue/></CipherData></EncryptedData>";
+    // SAFETY: a document and a context created and released here; the key
+    // outlives the context.
+    unsafe {
+        let doc = xsReadMemory(
+            xml.as_ptr().cast(),
+            c_int::try_from(xml.len()).expect("a short template"),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        assert!(!doc.is_null(), "the template parses");
+        let root = xsDocGetRootElement(doc);
+        let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
+        (*ctx).enc_key = xmlSecKeyDuplicate(key);
+        (*ctx).def_enc_method_id = chacha20_poly1305();
+        let plaintext = b"payload";
+        let encrypted =
+            xmlSecEncCtxBinaryEncrypt(ctx, root.cast(), plaintext.as_ptr(), plaintext.len());
+        xmlSecEncCtxDestroy(ctx);
+        let left = crate::ffi::tree::nodes::dump(root.cast::<crate::ffi::tree::XmlNode>());
+        xsFreeDoc(doc);
+        assert_eq!(encrypted, -1);
+        // The refused template is left as the caller wrote it.
+        assert_eq!(left.as_deref(), Some(xml));
+        xmlSecKeyDestroy(key);
+    }
+}
+
+#[test]
+fn a_chacha_encryption_writes_parameters_its_decryption_reads() {
+    // The written method must parse again: a parameter the template carries
+    // in its unqualified RFC 9231 form is replaced, not duplicated by a
+    // namespaced one, and a KeySize stays the method's first child, where the
+    // reader requires it. The transform list is process-wide.
+    crate::ffi::tests::own_process();
+    // SAFETY: the library initialized on this test's own thread.
+    unsafe {
+        assert_eq!(crate::ffi::library::xmlSecInit(), 0);
+        assert_eq!(
+            crate::ffi::crypto::xmlSecCryptoDLLoadLibrary(std::ptr::null()),
+            0
+        );
+        assert_eq!(crate::ffi::crypto::xmlSecCryptoAppInit(std::ptr::null()), 0);
+        assert_eq!(crate::ffi::crypto::xmlSecCryptoInit(), 0);
+    }
+    let key = chacha_key(&[0x88; 32]);
+    let method = |children: &str| {
+        format!(
+            "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\">\
+             <EncryptionMethod Algorithm=\"http://www.w3.org/2021/04/xmldsig-more#{children}\
+             </EncryptionMethod><CipherData><CipherValue/></CipherData></EncryptedData>"
+        )
+    };
+    for template in [
+        method("chacha20poly1305\"><KeySize>256</KeySize>"),
+        method("chacha20poly1305\"><Nonce xmlns=\"\">000102030405060708090a0b</Nonce>"),
+        method(
+            "chacha20\"><KeySize>256</KeySize>\
+             <Nonce xmlns=\"\">000102030405060708090a0b</Nonce>\
+             <Counter xmlns=\"\">01000000</Counter>",
+        ),
+    ] {
+        assert_eq!(
+            template_round_trip(&template, key, b"payload").as_deref(),
+            Some(&b"payload"[..]),
+            "{template}"
+        );
+    }
+    // SAFETY: the key created above.
+    unsafe { xmlSecKeyDestroy(key) };
+}
+
+#[test]
+fn the_policy_decides_the_chacha_ciphers() {
+    // A deployment that drops ChaCha20-Poly1305 from its encryption ciphers
+    // refuses the klass before any work. Republishing runs in this test's own
+    // process.
+    crate::ffi::tests::own_process();
+    let key = chacha_key(&[0x77; 32]);
+    assert!(run(chacha20_poly1305(), OPERATION_ENCRYPT, key, b"payload").is_some());
+    xml_sec_libxml2::policy::republish_encryption(
+        |encryption| {
+            if let Some(ciphers) = encryption.data_algorithms.as_mut() {
+                ciphers.remove(&DataEncryptionAlgorithm::ChaCha20Poly1305);
+            }
+        },
+        |_| {},
+    )
+    .expect("the library policy compiles");
+    assert_eq!(
+        run(chacha20_poly1305(), OPERATION_ENCRYPT, key, b"payload"),
+        None
     );
     // SAFETY: the key created above.
     unsafe { xmlSecKeyDestroy(key) };

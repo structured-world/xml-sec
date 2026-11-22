@@ -50,34 +50,76 @@ static xmlSecKeyPtr aes_key(xmlSecByte fill) {
     return key;
 }
 
-/* The Base64 text of `plaintext` encrypted with AES-128-CBC under `key`. */
-static xmlChar *cipher_value(const char *plaintext, xmlSecKeyPtr key) {
-    xmlChar *encoded = NULL;
+/* AES-128-CBC with `operation` under `key` over `size` octets of `data`, the
+ * result copied into `out`; -1 when the transform fails. */
+static int cbc(xmlSecTransformOperation operation, xmlSecKeyPtr key, const xmlSecByte *data,
+               xmlSecSize size, xmlSecBufferPtr out) {
+    int ret = -1;
     xmlSecTransformCtxPtr ctx = xmlSecTransformCtxCreate();
     xmlSecTransformPtr transform = xmlSecTransformCtxCreateAndAppend(ctx, xmlSecTransformAes128CbcId);
-    transform->operation = xmlSecTransformOperationEncrypt;
+    transform->operation = operation;
     if (xmlSecTransformSetKey(transform, key) == 0 &&
-        xmlSecTransformCtxBinaryExecute(ctx, (const xmlSecByte *)plaintext, strlen(plaintext)) == 0) {
-        encoded = xmlSecBase64Encode(xmlSecBufferGetData(ctx->result),
-                                     xmlSecBufferGetSize(ctx->result), 0);
+        xmlSecTransformCtxBinaryExecute(ctx, data, size) == 0 &&
+        xmlSecBufferSetData(out, xmlSecBufferGetData(ctx->result),
+                            xmlSecBufferGetSize(ctx->result)) == 0) {
+        ret = 0;
     }
     xmlSecTransformCtxDestroy(ctx);
+    return ret;
+}
+
+/* The Base64 text of `plaintext` encrypted with AES-128-CBC under `key`.
+ * With `wrong` set, only a value whose padding `wrong` refuses is taken: the
+ * IV is random, and a wrong key that happens to meet valid padding yields a
+ * garbage plaintext whose handling is not the case under test. */
+static xmlChar *cipher_value_refused_by(const char *plaintext, xmlSecKeyPtr key,
+                                        xmlSecKeyPtr wrong) {
+    xmlChar *encoded = NULL;
+    xmlSecBufferPtr value = xmlSecBufferCreate(0);
+    xmlSecBufferPtr scratch = xmlSecBufferCreate(0);
+    int attempt;
+    int was_quiet = quiet;
+    /* The trial decryptions' reports are each library's own. */
+    quiet = 1;
+    for (attempt = 0; attempt < 1000; attempt++) {
+        if (cbc(xmlSecTransformOperationEncrypt, key, (const xmlSecByte *)plaintext,
+                (xmlSecSize)strlen(plaintext), value) < 0) {
+            break;
+        }
+        if (wrong == NULL || cbc(xmlSecTransformOperationDecrypt, wrong,
+                                 xmlSecBufferGetData(value), xmlSecBufferGetSize(value),
+                                 scratch) < 0) {
+            encoded = xmlSecBase64Encode(xmlSecBufferGetData(value),
+                                         xmlSecBufferGetSize(value), 0);
+            break;
+        }
+    }
+    quiet = was_quiet;
+    xmlSecBufferDestroy(scratch);
+    xmlSecBufferDestroy(value);
     return encoded;
 }
 
 /* A document whose `data` element holds an EncryptedData of `type` over
- * `plaintext`. */
-static xmlDocPtr encrypted(const xmlChar *type, const char *plaintext, xmlSecKeyPtr key) {
+ * `plaintext`, refused by `wrong` as for `cipher_value_refused_by`. */
+static xmlDocPtr encrypted_refused_by(const xmlChar *type, const char *plaintext,
+                                      xmlSecKeyPtr key, xmlSecKeyPtr wrong) {
     static const char xml[] = "<Envelope xmlns=\"urn:envelope\"><data/></Envelope>";
     xmlDocPtr doc = xsReadMemory(xml, (int)strlen(xml), "doc.xml", NULL, 0);
     xmlNodePtr data = xmlSecFindNode(xsDocGetRootElement(doc), BAD_CAST "data", BAD_CAST "urn:envelope");
     xmlNodePtr enc = xmlSecTmplEncDataCreate(doc, xmlSecTransformAes128CbcId, NULL, type, NULL, NULL);
     xmlNodePtr value = xmlSecTmplEncDataEnsureCipherValue(enc);
-    xmlChar *text = cipher_value(plaintext, key);
+    xmlChar *text = cipher_value_refused_by(plaintext, key, wrong);
     xsNodeSetContent(value, text);
     xsFree(text);
     xmlSecAddChildNode(data, enc);
     return doc;
+}
+
+/* A document whose `data` element holds an EncryptedData of `type` over
+ * `plaintext`. */
+static xmlDocPtr encrypted(const xmlChar *type, const char *plaintext, xmlSecKeyPtr key) {
+    return encrypted_refused_by(type, plaintext, key, NULL);
 }
 
 static xmlNodePtr enc_data(xmlDocPtr doc) {
@@ -880,11 +922,100 @@ static void mlkem_round_trip(const char *name, const char *public, const char *p
     xsFreeDoc(doc);
 }
 
+/* The donor's keys.xml ChaCha20 keys, by name. */
+#define CHACHA20_KEY "zAKV37t4gV9srAUvRFjxERSJ13wGpDwoIMkcJxlD0MU="
+#define CHACHA20_POLY1305_KEY "rSyWevC59TMmFuoDBdEC4VvlwiJOqalHn3GffX4CcPA="
+
+/* A keys manager holding the ChaCha20 key whose Base64 value is `value`
+ * under `name`. */
+static xmlSecKeysMngrPtr chacha_manager(const char *value, const char *name) {
+    xmlSecByte bytes[32];
+    xmlSecSize written = 0;
+    xmlSecKeysMngrPtr mngr = xmlSecKeysMngrCreate();
+    xmlSecKeyInfoCtxPtr info = xmlSecKeyInfoCtxCreate(NULL);
+    xmlSecKeyPtr key = xmlSecKeyCreate();
+    xmlSecCryptoAppDefaultKeysMngrInit(mngr);
+    if (xmlSecBase64Decode_ex(BAD_CAST value, bytes, sizeof(bytes), &written) < 0 ||
+        xmlSecKeyDataBinRead(xmlSecKeyDataChaCha20Id, key, bytes, written, info) < 0) {
+        printf("  key %s not read\n", name);
+        xmlSecKeyDestroy(key);
+    } else {
+        xmlSecKeySetName(key, BAD_CAST name);
+        xmlSecCryptoAppDefaultKeysMngrAdoptKey(mngr, key);
+    }
+    xmlSecKeyInfoCtxDestroy(info);
+    return mngr;
+}
+
+/* The donor's ChaCha vector `name`, decrypted with the key `value` under
+ * `key_name`. */
+static void chacha_vector(const char *name, const char *value, const char *key_name) {
+    char path[512];
+    static xmlSecByte expected[1 << 16];
+    size_t expected_size = 0;
+    xmlSecByte *data;
+    xmlDocPtr doc;
+    xmlSecKeysMngrPtr mngr;
+    printf("chacha vector %s\n", name);
+    snprintf(path, sizeof(path), VECTORS "%s.data", name);
+    data = file_bytes(path, &expected_size);
+    if (data != NULL) {
+        memcpy(expected, data, expected_size);
+    }
+    snprintf(path, sizeof(path), VECTORS "%s.xml", name);
+    data = file_bytes(path, &(size_t){0});
+    if (data == NULL) {
+        printf("  missing vector %s\n", name);
+        return;
+    }
+    doc = xsReadMemory((const char *)data, (int)strlen((const char *)data), "vector.xml", NULL, 0);
+    mngr = chacha_manager(value, key_name);
+    decrypt_kem(doc, mngr, expected, expected_size);
+    xmlSecKeysMngrDestroy(mngr);
+    xsFreeDoc(doc);
+}
+
+/* The donor's ChaCha template `name` encrypted with the key `value` under
+ * `key_name` and decrypted again; whether the method then names a nonce, as
+ * the encryption writes the one it drew when the template has none. The
+ * nonce is fresh when drawn, so only outcomes print. */
+static void chacha_round_trip(const char *name, const char *value, const char *key_name) {
+    static const char bytes[] = "stream cipher content";
+    char path[512];
+    xmlSecByte *data;
+    xmlDocPtr doc;
+    xmlSecEncCtxPtr ctx;
+    xmlSecKeysMngrPtr mngr;
+    xmlNodePtr method;
+    printf("chacha round trip %s\n", name);
+    snprintf(path, sizeof(path), VECTORS "%s.tmpl", name);
+    data = file_bytes(path, &(size_t){0});
+    if (data == NULL) {
+        printf("  missing template %s\n", name);
+        return;
+    }
+    doc = xsReadMemory((const char *)data, (int)strlen((const char *)data), "template.xml", NULL, 0);
+    mngr = chacha_manager(value, key_name);
+    ctx = xmlSecEncCtxCreate(mngr);
+    printf("  encrypt: %d\n", xmlSecEncCtxBinaryEncrypt(ctx, xsDocGetRootElement(doc),
+                                                        (const xmlSecByte *)bytes,
+                                                        sizeof(bytes) - 1));
+    xmlSecEncCtxDestroy(ctx);
+    method = xmlSecFindChild(xsDocGetRootElement(doc), xmlSecNodeEncryptionMethod, xmlSecEncNs);
+    printf("  nonce written: %d\n",
+           method != NULL && xmlSecFindChild(method, BAD_CAST "Nonce",
+                                             BAD_CAST "http://www.w3.org/2021/04/xmldsig-more#") != NULL);
+    decrypt_kem(doc, mngr, (const xmlSecByte *)bytes, sizeof(bytes) - 1);
+    xmlSecKeysMngrDestroy(mngr);
+    xsFreeDoc(doc);
+}
+
 int main(void) {
     xmlDocPtr doc;
     xmlSecEncCtxPtr ctx;
     xmlSecKeysMngrPtr mngr;
     xmlSecKeyPtr key;
+    xmlSecKeyPtr wrong;
 
     xmlSecErrorsSetCallback(record);
     if (xmlSecInit() < 0 || xmlSecCryptoDLLoadLibrary(xmlSecGetDefaultCrypto()) < 0) {
@@ -967,10 +1098,24 @@ int main(void) {
                      "TestKeyName-ml-kem-768");
     mlkem_round_trip("enc-aes256gcm-kt-ml-kem-1024", "ml-kem-1024-pubkey.pem",
                      "ml-kem-1024-key.pem", "TestKeyName-ml-kem-1024");
+    chacha_vector("enc-chacha20-keyname", CHACHA20_KEY, "test-chacha20");
+    chacha_vector("enc-chacha20poly1305-keyname", CHACHA20_POLY1305_KEY, "test-chacha20poly1305");
+    chacha_vector("enc-chacha20poly1305-aad-keyname", CHACHA20_POLY1305_KEY,
+                  "test-chacha20poly1305");
+    chacha_round_trip("enc-chacha20-keyname", CHACHA20_KEY, "test-chacha20");
+    chacha_round_trip("enc-chacha20-keyname-missing-nonce", CHACHA20_KEY, "test-chacha20");
+    chacha_round_trip("enc-chacha20poly1305-keyname", CHACHA20_POLY1305_KEY,
+                      "test-chacha20poly1305");
+    chacha_round_trip("enc-chacha20poly1305-keyname-missing-nonce", CHACHA20_POLY1305_KEY,
+                      "test-chacha20poly1305");
+    chacha_round_trip("enc-chacha20poly1305-aad-keyname", CHACHA20_POLY1305_KEY,
+                      "test-chacha20poly1305");
 
     /* No key: the keys manager has none. */
     key = aes_key(0x11);
-    doc = encrypted(xmlSecTypeEncElement, "<secret/>", key);
+    wrong = aes_key(0x22);
+    doc = encrypted_refused_by(xmlSecTypeEncElement, "<secret/>", key, wrong);
+    xmlSecKeyDestroy(wrong);
     xmlSecKeyDestroy(key);
     mngr = xmlSecKeysMngrCreate();
     xmlSecCryptoAppDefaultKeysMngrInit(mngr);
@@ -980,8 +1125,9 @@ int main(void) {
     printf(" failure=%s\n", xmlSecEncCtxGetFailureReasonString(ctx->failureReason));
     xmlSecEncCtxDestroy(ctx);
 
-    /* A wrong key fails the padding or, rarely, the plaintext: which one
-     * depends on the IV, so the reports are not compared. */
+    /* A wrong key fails the padding: the value was taken so that it does.
+     * The reports name each crypto library's own padding check, so they are
+     * not compared. */
     ctx = xmlSecEncCtxCreate(NULL);
     ctx->encKey = aes_key(0x22);
     printf("wrong key\n");
