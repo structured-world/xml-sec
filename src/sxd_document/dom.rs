@@ -1077,6 +1077,30 @@ mod test {
     }
 
     #[test]
+    fn an_arena_slot_names_its_node_through_growth_and_detachment() {
+        // A slot is a node's identity in the arena, not its position among
+        // siblings: it still names the node after the arena grows and the node
+        // moves and is detached, and a slot past the arena names nothing.
+        let package = Package::new();
+        let doc = package.as_document();
+        let parent = doc.create_element("parent");
+        let node = doc.create_element("node");
+        doc.root().append_child(parent);
+        parent.append_child(node);
+        let (_, _, slot) = node.identity_key();
+        for index in 0..64 {
+            parent.append_child(doc.create_element(format!("sibling-{index}").as_str()));
+        }
+        let other = doc.create_element("other");
+        parent.append_child(other);
+        other.append_child(node);
+        assert_eq!(doc.element_at_slot(slot), Some(node));
+        node.remove_from_parent();
+        assert_eq!(doc.element_at_slot(slot), Some(node));
+        assert_eq!(doc.element_at_slot(usize::MAX), None);
+    }
+
+    #[test]
     #[should_panic(expected = "node belongs to a different document")]
     fn root_rejects_a_child_from_another_document() {
         let first = Package::new();

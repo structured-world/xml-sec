@@ -54,6 +54,8 @@ const KEY_USAGE_KEY_ENCAPSULATE: c_uint = 0x0000_0080;
 const DATA_USAGE_UNKNOWN: c_uint = 0;
 /// libxmlsec1's initial size of the `kem-cipher-value` buffer.
 const CIPHER_VALUE_INITIAL_SIZE: usize = 256;
+/// The ML-KEM shared secret's size (FIPS 203 section 7, every parameter set).
+const SHARED_SECRET_LEN: usize = 32;
 
 /// The keys of a key transport, from `setKey`.
 #[derive(Default)]
@@ -272,6 +274,18 @@ unsafe extern "C" fn set_key(transform: *mut XmlSecTransform, key: *mut c_void) 
                 );
                 return -1;
             }
+            // A public key cannot decapsulate: it is refused before it is
+            // taken, so the caller can set the private key instead.
+            if object.operation == OPERATION_DECRYPT && found.private.is_none() {
+                errors::report(
+                    here,
+                    name_of(object),
+                    std::ptr::null(),
+                    errors::R_INVALID_TYPE,
+                    "decapsulation requires the ML-KEM private key",
+                );
+                return -1;
+            }
             kem.spki = Some(found.spki.clone());
             kem.private.clone_from(&found.private);
         }
@@ -300,6 +314,14 @@ unsafe extern "C" fn execute(
         }
         if object.status == STATUS_WORKING {
             if last == 0 {
+                // A ciphertext has the parameter set's exact width, so a
+                // decryption holds no more input than that until the end.
+                // SAFETY: the transform's own input buffer.
+                let held = unsafe { xmlSecBufferGetSize(&raw mut object.in_buf) };
+                if object.operation == OPERATION_DECRYPT && held > algorithm.ciphertext_len() {
+                    invalid_size(here, "Input ciphertext", held, algorithm.ciphertext_len());
+                    return -1;
+                }
                 return 0;
             }
             if ctx.is_null() {
@@ -365,6 +387,7 @@ unsafe fn process(
                 return false;
             };
             let ciphertext = &raw mut stored.ciphertext;
+            let recipient = &raw mut stored.recipient;
             let held = xmlSecBufferGetSize(ciphertext);
             if held == 0 {
                 // An encapsulation takes no input; its ciphertext is kept for
@@ -377,15 +400,16 @@ unsafe fn process(
                     );
                     return false;
                 }
-                encapsulate(object, algorithm, kem, ctx, ciphertext, output, name)
+                encapsulate(
+                    object,
+                    (algorithm, kem),
+                    ctx,
+                    (ciphertext, recipient),
+                    output,
+                    name,
+                )
             } else {
-                // The write phase outputs the ciphertext of the earlier
-                // encapsulation, whatever the input.
-                if held != algorithm.ciphertext_len() {
-                    invalid_size(here, "KEM ciphertext", held, algorithm.ciphertext_len());
-                    return false;
-                }
-                xmlSecBufferSetData(output, xmlSecBufferGetData(ciphertext), held) >= 0
+                return write_kept(object, (algorithm, kem), (ciphertext, recipient), output);
             }
         } else {
             if input_size == 0 {
@@ -441,6 +465,53 @@ unsafe fn process(
     }
 }
 
+/// The write phase of an encryption: the ciphertext of the earlier
+/// encapsulation into `output`, whatever the input, and whole: the expected
+/// width is the key's, and a cut ciphertext decapsulates to nothing
+/// (libxmlsec1 cuts it too). Only the recipient it was encapsulated to takes
+/// it: another recipient's `EncryptedKey` carrying it would yield a key that
+/// recipient cannot recover, so it is refused (libxmlsec1 writes it).
+/// `false` after a report.
+///
+/// # Safety
+/// The buffers are live: the transform's own and its context's KEM data.
+unsafe fn write_kept(
+    object: &mut XmlSecTransform,
+    (algorithm, kem): (KeyEncapsulationAlgorithm, &Kem),
+    (ciphertext, recipient): (*mut XmlSecBuffer, *mut XmlSecBuffer),
+    output: *mut XmlSecBuffer,
+) -> bool {
+    let here = here!("xmlSecOpenSSLMLKEMProcess");
+    let name = name_of(object);
+    // SAFETY: by the caller's contract.
+    unsafe {
+        let held = xmlSecBufferGetSize(ciphertext);
+        if held != algorithm.ciphertext_len() {
+            invalid_size(here, "KEM ciphertext", held, algorithm.ciphertext_len());
+            return false;
+        }
+        let kept = xmlSecBufferGetData(recipient);
+        let encapsulated_to = if kept.is_null() {
+            &[][..]
+        } else {
+            std::slice::from_raw_parts(kept, xmlSecBufferGetSize(recipient))
+        };
+        if kem.spki.as_deref() != Some(encapsulated_to) {
+            errors::invalid_data(
+                here,
+                name,
+                "an ML-KEM secret keys content for its own recipient only",
+            );
+            return false;
+        }
+        if xmlSecBufferSetData(output, xmlSecBufferGetData(ciphertext), held) < 0 {
+            return false;
+        }
+        xmlSecBufferEmpty(&raw mut object.in_buf);
+    }
+    true
+}
+
 /// libxmlsec1's `xmlSecInvalidSizeError`.
 fn invalid_size(here: Here, name: &str, actual: usize, expected: usize) {
     errors::report(
@@ -453,17 +524,17 @@ fn invalid_size(here: Here, name: &str, actual: usize, expected: usize) {
 }
 
 /// Encapsulates to the recipient's public key in the core under the run's
-/// key establishment policy and allowance, the ciphertext into `ciphertext`
-/// and the secret into `output`; `false` after a report.
+/// key establishment policy and allowance, the ciphertext into `ciphertext`,
+/// the recipient's key into `recipient` and the secret into `output`;
+/// `false` after a report.
 ///
 /// # Safety
 /// `ctx` is the chain's initialized context; the buffers are live.
 unsafe fn encapsulate(
     object: &XmlSecTransform,
-    algorithm: KeyEncapsulationAlgorithm,
-    kem: &Kem,
+    (algorithm, kem): (KeyEncapsulationAlgorithm, &Kem),
     ctx: *mut XmlSecTransformCtx,
-    ciphertext: *mut XmlSecBuffer,
+    (ciphertext, recipient): (*mut XmlSecBuffer, *mut XmlSecBuffer),
     output: *mut XmlSecBuffer,
     name: *const c_char,
 ) -> bool {
@@ -486,6 +557,9 @@ unsafe fn encapsulate(
     // SAFETY: by the caller's contract.
     let encapsulated = unsafe {
         with_allowance(object, ctx, here, |policy, usage| {
+            // The secret and the ciphertext the context keeps are this
+            // transform's copies, reserved before they are made.
+            usage.reserve_owned_bytes(policy, SHARED_SECRET_LEN + algorithm.ciphertext_len())?;
             usage.encapsulate(policy, xml_sec::provider::default_provider(), &key)
         })
     };
@@ -503,8 +577,16 @@ unsafe fn encapsulate(
             errors::internal(here, name, c"xmlSecBufferSetData(ct)");
             return false;
         }
+        if xmlSecBufferSetData(recipient, spki.as_ptr(), spki.len()) < 0 {
+            xmlSecBufferEmpty(ciphertext);
+            errors::internal(here, name, c"xmlSecBufferSetData(recipient)");
+            return false;
+        }
         let secret = encapsulated.shared_secret;
         if xmlSecBufferAppend(output, secret.as_ptr(), secret.len()) < 0 {
+            // A retry must encapsulate again, not write this ciphertext,
+            // whose secret was lost.
+            xmlSecBufferEmpty(ciphertext);
             errors::internal(here, name, c"xmlSecBufferSetData(ss)");
             return false;
         }
@@ -539,6 +621,8 @@ unsafe fn decapsulate(
     // SAFETY: by the caller's contract.
     let secret = unsafe {
         with_allowance(object, ctx, here, |policy, usage| {
+            // The secret written to the output is this transform's copy.
+            usage.reserve_owned_bytes(policy, SHARED_SECRET_LEN)?;
             usage.decapsulate(
                 policy,
                 xml_sec::provider::default_provider(),
@@ -579,6 +663,11 @@ unsafe fn with_allowance<T>(
     let (pinned, side) = unsafe { scope(object, ctx, here) }?;
     // SAFETY: by the caller's contract.
     let run = unsafe { run_budget(ctx) };
+    // The secret is the key of the operation the reading KeyInfo serves (a
+    // signature's HMAC key, an EncryptedData's content key), so that
+    // operation's policy and allowance bound the encapsulation, not the
+    // decryption direction the nested EncryptedKey runs in.
+    let side = run.serves.unwrap_or(side);
     if let Some(limit) = run.refused_by {
         errors::limit_exceeded(here, name, limit.name, limit.max);
         return None;
@@ -623,6 +712,9 @@ unsafe fn with_allowance<T>(
 struct KemData {
     data: XmlSecKeyData,
     ciphertext: XmlSecBuffer,
+    /// The DER `SubjectPublicKeyInfo` of the recipient the ciphertext was
+    /// encapsulated to; the secret keys content for that recipient alone.
+    recipient: XmlSecBuffer,
 }
 
 static KEM_DATA: XmlSecKeyDataKlass = XmlSecKeyDataKlass {
@@ -687,6 +779,15 @@ unsafe extern "C" fn kem_initialize(data: *mut XmlSecKeyData) -> c_int {
                 return -1;
             }
             xmlSecBufferMakeSecure(&raw mut object.ciphertext);
+            if xmlSecBufferInitialize(&raw mut object.recipient, 0) < 0 {
+                xmlSecBufferFinalize(&raw mut object.ciphertext);
+                errors::internal(
+                    here,
+                    c"kem-cipher-value".as_ptr(),
+                    c"xmlSecBufferInitialize(recipient)",
+                );
+                return -1;
+            }
         }
         0
     })
@@ -706,19 +807,19 @@ unsafe extern "C" fn kem_duplicate(dst: *mut XmlSecKeyData, src: *mut XmlSecKeyD
         };
         // SAFETY: both objects' own buffers.
         unsafe {
-            let from = &raw mut source.ciphertext;
-            if xmlSecBufferSetData(
-                &raw mut target.ciphertext,
-                xmlSecBufferGetData(from),
-                xmlSecBufferGetSize(from),
-            ) < 0
-            {
-                errors::internal(
-                    here,
-                    c"kem-cipher-value".as_ptr(),
-                    c"xmlSecBufferSetData(ciphertext)",
-                );
-                return -1;
+            for (to, from) in [
+                (&raw mut target.ciphertext, &raw mut source.ciphertext),
+                (&raw mut target.recipient, &raw mut source.recipient),
+            ] {
+                if xmlSecBufferSetData(to, xmlSecBufferGetData(from), xmlSecBufferGetSize(from)) < 0
+                {
+                    errors::internal(
+                        here,
+                        c"kem-cipher-value".as_ptr(),
+                        c"xmlSecBufferSetData(ciphertext)",
+                    );
+                    return -1;
+                }
             }
         }
         0
@@ -729,8 +830,11 @@ unsafe extern "C" fn kem_finalize(data: *mut XmlSecKeyData) {
     contain((), || {
         // SAFETY: the registry passes key data of this klass.
         if let Some(object) = unsafe { kem_data(data) } {
-            // SAFETY: the object's own buffer, finalized once.
-            unsafe { xmlSecBufferFinalize(&raw mut object.ciphertext) };
+            // SAFETY: the object's own buffers, finalized once.
+            unsafe {
+                xmlSecBufferFinalize(&raw mut object.ciphertext);
+                xmlSecBufferFinalize(&raw mut object.recipient);
+            }
         }
     });
 }

@@ -1514,6 +1514,7 @@ fn direction(field: &str, old: Option<&Value>, new: Option<&Value>) -> Direction
                 "RequireTrustedKey"
                 | "Process"
                 | "RequireAuthenticatedCipher"
+                | "RequireCryptographicOnly"
                 | "ExactOnly"
                 | "Forbidden"
                 | "Declared"

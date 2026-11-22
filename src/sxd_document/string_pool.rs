@@ -422,6 +422,25 @@ mod test {
         assert_eq!(pool.intern("namespace"), Err(MemoryError::LimitExceeded));
         assert_eq!(pool.find("namespace", &memory).expect("empty lookup"), None);
         assert_eq!(memory.used(), 0);
+        // Every limit below the first that admits the string and its table
+        // entry refuses at some step, the string's own allocation or a later
+        // one; each refusal leaves nothing inserted and nothing charged.
+        let admitted = (1..=65536)
+            .find(|&limit| {
+                let memory = Memory::new(std::sync::Arc::new(MemoryAccount::new(limit, 65536)));
+                super::AccountedStringPool::new(&memory)
+                    .intern("namespace")
+                    .is_ok()
+            })
+            .expect("some limit admits one string");
+        for limit in 1..admitted {
+            let memory = Memory::new(std::sync::Arc::new(MemoryAccount::new(limit, 65536)));
+            let pool = super::AccountedStringPool::new(&memory);
+            assert_eq!(pool.intern("namespace"), Err(MemoryError::LimitExceeded));
+            assert_eq!(pool.find("namespace", &memory).expect("lookup"), None);
+            drop(pool);
+            assert_eq!(memory.used(), 0, "limit {limit}");
+        }
     }
 
     #[test]
@@ -436,7 +455,8 @@ mod test {
         let s = StringPool::new();
         let interned1 = s.intern("world");
         let interned2 = s.intern("world");
-        assert_eq!(&*interned1, &*interned2);
+        // One allocation: equal text alone would also pass for two.
+        assert!(std::ptr::eq(interned1.as_ptr(), interned2.as_ptr()));
     }
 
     #[test]

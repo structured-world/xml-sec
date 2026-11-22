@@ -280,6 +280,231 @@ fn every_parameter_set_round_trips() {
     });
 }
 
+/// The PEM key `pem` loaded as a key.
+///
+/// # Safety
+/// The library and its crypto are initialized.
+unsafe fn load_key(pem: &[u8]) -> *mut XmlSecKey {
+    // SAFETY: by the caller's contract.
+    let key = unsafe {
+        key_load_memory(
+            pem.as_ptr(),
+            pem.len(),
+            FORMAT_PEM,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    }
+    .cast::<XmlSecKey>();
+    assert!(!key.is_null(), "the fixture loads");
+    key
+}
+
+#[test]
+fn a_decapsulation_takes_no_public_only_key() {
+    // A public key cannot decapsulate, so a decrypting transport refuses it
+    // without taking it, and the private key that follows is taken; an
+    // encrypting transport takes the public key.
+    use super::super::super::keys::xmlSecKeyDestroy;
+    use super::super::super::transforms::ctx::{
+        xmlSecTransformCtxCreate, xmlSecTransformCtxCreateAndAppend, xmlSecTransformCtxDestroy,
+    };
+    use super::super::super::transforms::xmlSecTransformSetKey;
+    with_library(|| {
+        // SAFETY: contexts and keys created and released here.
+        unsafe {
+            let public = load_key(PUBLIC_512);
+            let private = load_key(KEY_512);
+            for (operation, first, expected) in [
+                (OPERATION_DECRYPT, public, -1),
+                (OPERATION_ENCRYPT, public, 0),
+            ] {
+                let ctx = xmlSecTransformCtxCreate();
+                let transform = xmlSecTransformCtxCreateAndAppend(ctx, mlkem512());
+                (*transform).operation = operation;
+                assert_eq!(xmlSecTransformSetKey(transform, first.cast()), expected);
+                if expected < 0 {
+                    assert_eq!(xmlSecTransformSetKey(transform, private.cast()), 0);
+                }
+                xmlSecTransformCtxDestroy(ctx);
+            }
+            xmlSecKeyDestroy(public);
+            xmlSecKeyDestroy(private);
+        }
+    });
+}
+
+#[test]
+fn a_decapsulation_buffers_no_more_than_one_ciphertext() {
+    // A ciphertext has the parameter set's exact width, so input beyond it is
+    // refused as it arrives rather than held until the final call; input up
+    // to the width is kept for it.
+    use super::super::super::keys::xmlSecKeyDestroy;
+    use super::super::super::transforms::ctx::{
+        xmlSecTransformCtxCreate, xmlSecTransformCtxCreateAndAppend, xmlSecTransformCtxDestroy,
+    };
+    use super::super::super::transforms::{xmlSecTransformPushBin, xmlSecTransformSetKey};
+    with_library(|| {
+        let width = KeyEncapsulationAlgorithm::MlKem512.ciphertext_len();
+        // SAFETY: contexts and a key created and released here.
+        unsafe {
+            let private = load_key(KEY_512);
+            for (size, expected) in [(width, 0), (width + 1, -1)] {
+                let ctx = xmlSecTransformCtxCreate();
+                let transform = xmlSecTransformCtxCreateAndAppend(ctx, mlkem512());
+                (*transform).operation = OPERATION_DECRYPT;
+                assert_eq!(xmlSecTransformSetKey(transform, private.cast()), 0);
+                let input = vec![0x5a; size];
+                assert_eq!(
+                    xmlSecTransformPushBin(transform, input.as_ptr(), input.len(), 0, ctx),
+                    expected,
+                    "{size} octets"
+                );
+                xmlSecTransformCtxDestroy(ctx);
+            }
+            xmlSecKeyDestroy(private);
+        }
+    });
+}
+
+#[test]
+fn a_kept_ciphertext_is_written_whole_whatever_the_expected_width() {
+    // The expected width is the width of the key the secret becomes; a
+    // ciphertext the context keeps for the EncryptedKey write is written
+    // whole, since a cut ciphertext decapsulates to nothing.
+    use super::super::super::buffer::xmlSecBufferSetData;
+    use super::super::super::keys::xmlSecKeyDestroy;
+    use super::super::super::transforms::ctx::{
+        xmlSecTransformCtxBinaryExecute, xmlSecTransformCtxCreate,
+        xmlSecTransformCtxCreateAndAppend, xmlSecTransformCtxDestroy,
+    };
+    use super::super::super::transforms::xmlSecTransformSetKey;
+    with_library(|| {
+        let width = KeyEncapsulationAlgorithm::MlKem512.ciphertext_len();
+        // SAFETY: a context and a key created and released here.
+        unsafe {
+            let public = load_key(PUBLIC_512);
+            let ctx = xmlSecTransformCtxCreate();
+            let kept = kem_data(xmlSecTransformCtxExtraKeyDataEnsure(
+                ctx,
+                &raw const KEM_DATA,
+            ))
+            .expect("the context keeps KEM data");
+            let ciphertext = vec![0x3c; width];
+            assert_eq!(
+                xmlSecBufferSetData(&raw mut kept.ciphertext, ciphertext.as_ptr(), width),
+                0
+            );
+            let spki = &mlkemkeys::key_of(xmlSecKeyGetValue(public))
+                .expect("an ML-KEM key")
+                .spki;
+            assert_eq!(
+                xmlSecBufferSetData(&raw mut kept.recipient, spki.as_ptr(), spki.len()),
+                0
+            );
+            let transform = xmlSecTransformCtxCreateAndAppend(ctx, mlkem512());
+            (*transform).operation = OPERATION_ENCRYPT;
+            (*transform).expected_output_size = 16;
+            assert_eq!(xmlSecTransformSetKey(transform, public.cast()), 0);
+            assert_eq!(xmlSecTransformCtxBinaryExecute(ctx, [].as_ptr(), 0), 0);
+            assert_eq!(
+                xmlSecBufferGetSize((*ctx).result),
+                width,
+                "the whole ciphertext"
+            );
+            xmlSecTransformCtxDestroy(ctx);
+            xmlSecKeyDestroy(public);
+        }
+    });
+}
+
+#[test]
+fn a_kept_ciphertext_is_written_for_its_own_recipient_only() {
+    // An ML-KEM secret keys the content for the one recipient it was
+    // encapsulated to; writing its ciphertext into another recipient's
+    // EncryptedKey would hand that recipient a key it cannot recover, so the
+    // write is refused (libxmlsec1 writes it and reports success).
+    use super::super::super::buffer::xmlSecBufferSetData;
+    use super::super::super::keys::xmlSecKeyDestroy;
+    use super::super::super::transforms::ctx::{
+        xmlSecTransformCtxBinaryExecute, xmlSecTransformCtxCreate,
+        xmlSecTransformCtxCreateAndAppend, xmlSecTransformCtxDestroy,
+    };
+    use super::super::super::transforms::xmlSecTransformSetKey;
+    with_library(|| {
+        let width = KeyEncapsulationAlgorithm::MlKem512.ciphertext_len();
+        // SAFETY: a context and a key created and released here.
+        unsafe {
+            let public = load_key(PUBLIC_512);
+            let ctx = xmlSecTransformCtxCreate();
+            let kept = kem_data(xmlSecTransformCtxExtraKeyDataEnsure(
+                ctx,
+                &raw const KEM_DATA,
+            ))
+            .expect("the context keeps KEM data");
+            let ciphertext = vec![0x3c; width];
+            let another = [0x11; 64];
+            assert_eq!(
+                xmlSecBufferSetData(&raw mut kept.ciphertext, ciphertext.as_ptr(), width),
+                0
+            );
+            assert_eq!(
+                xmlSecBufferSetData(&raw mut kept.recipient, another.as_ptr(), another.len()),
+                0
+            );
+            let transform = xmlSecTransformCtxCreateAndAppend(ctx, mlkem512());
+            (*transform).operation = OPERATION_ENCRYPT;
+            assert_eq!(xmlSecTransformSetKey(transform, public.cast()), 0);
+            assert_eq!(xmlSecTransformCtxBinaryExecute(ctx, [].as_ptr(), 0), -1);
+            xmlSecTransformCtxDestroy(ctx);
+            xmlSecKeyDestroy(public);
+        }
+    });
+}
+
+#[test]
+fn an_encryption_keys_cbc_content_by_kem_only_when_the_policy_lets_it() {
+    // The encryption policy decides whether an ML-KEM secret may key CBC
+    // content on the way out, as the decryption policy decides it on the
+    // way in: requiring an authenticated cipher refuses the CBC template
+    // before anything is written, and leaves the GCM one encrypting.
+    with_library(|| {
+        let encrypts = |xml: &[u8], public: &[u8], name: &CStr| {
+            // SAFETY: the library is initialized; every object is released.
+            unsafe {
+                let doc = document(xml);
+                let sender = manager(&[(public, name)]);
+                let ctx = xmlSecEncCtxCreate(sender);
+                let plaintext = b"content";
+                let encrypted = xmlSecEncCtxBinaryEncrypt(
+                    ctx,
+                    xsDocGetRootElement(doc.cast()),
+                    plaintext.as_ptr(),
+                    plaintext.len(),
+                );
+                xmlSecEncCtxDestroy(ctx);
+                xmlSecKeysMngrDestroy(sender);
+                xsFreeDoc(doc.cast());
+                encrypted == 0
+            }
+        };
+        let cbc: &[u8] = fixture!("xmlenc/aleksey-xmlenc-01/enc-aes256-kt-ml-kem-768.tmpl");
+        let gcm: &[u8] = fixture!("xmlenc/aleksey-xmlenc-01/enc-aes128gcm-kt-ml-kem-512.tmpl");
+        assert!(encrypts(cbc, PUBLIC_768, c"TestKeyName-ml-kem-768"));
+        xml_sec_libxml2::policy::republish_encryption(
+            |encryption| {
+                encryption.key_establishment.kem_content_authentication =
+                    xml_sec::policy::KemContentAuthentication::RequireAuthenticatedCipher;
+            },
+            |_| {},
+        )
+        .expect("the library policy compiles");
+        assert!(!encrypts(cbc, PUBLIC_768, c"TestKeyName-ml-kem-768"));
+        assert!(encrypts(gcm, PUBLIC_512, c"TestKeyName-ml-kem-512"));
+    });
+}
+
 #[test]
 fn a_key_of_another_parameter_set_decapsulates_nothing() {
     // An ML-KEM-768 private key named as the ML-KEM-512 recipient is refused
@@ -294,6 +519,78 @@ fn a_key_of_another_parameter_set_decapsulates_nothing() {
             ),
             None
         );
+    });
+}
+
+/// Whether the donor ML-KEM HMAC signature `xml` verifies with a signature
+/// context whose keys manager holds the recipient key `key` under `name`.
+fn verifies_kem_signature(xml: &[u8], key: &[u8], name: &CStr) -> bool {
+    use super::super::super::xmldsig::{
+        STATUS_SUCCEEDED, xmlSecDSigCtxCreate, xmlSecDSigCtxDestroy, xmlSecDSigCtxVerify,
+    };
+    // SAFETY: the library is initialized by the caller; every object is
+    // released.
+    unsafe {
+        let doc = document(xml);
+        let mngr = manager(&[(key, name)]);
+        let ctx = xmlSecDSigCtxCreate(mngr);
+        let node = super::super::super::xmltree::xmlSecFindNode(
+            xsDocGetRootElement(doc.cast()).cast(),
+            c"Signature".as_ptr().cast(),
+            c"http://www.w3.org/2000/09/xmldsig#".as_ptr().cast(),
+        );
+        assert!(!node.is_null(), "the document holds a Signature");
+        let verified =
+            xmlSecDSigCtxVerify(ctx, node.cast()) == 0 && (*ctx).status == STATUS_SUCCEEDED;
+        xmlSecDSigCtxDestroy(ctx);
+        xmlSecKeysMngrDestroy(mngr);
+        xsFreeDoc(doc.cast());
+        verified
+    }
+}
+
+const KEM_SIGNATURE: &[u8] =
+    fixture!("xmldsig/aleksey-xmldsig-01/enveloping-sha256-hmac-sha256-kt-ml-kem-512.xml");
+
+#[test]
+fn a_signature_spends_its_own_kem_allowance() {
+    // The EncryptedKey of a KEM/HMAC signature decapsulates for the
+    // verification, so the verification's encapsulation allowance bounds it,
+    // whatever the decryption policy admits.
+    with_library(|| {
+        let name = c"TestKeyName-ml-kem-512";
+        assert!(verifies_kem_signature(KEM_SIGNATURE, KEY_512, name));
+        crate::ffi::policy::republish(
+            |verification| verification.key_establishment.max_encapsulation_operations = 0,
+            |_| {},
+        )
+        .expect("the library policy compiles");
+        assert!(!verifies_kem_signature(KEM_SIGNATURE, KEY_512, name));
+    });
+}
+
+#[test]
+fn the_recovered_secret_is_reserved_before_it_is_copied() {
+    // The secret a transport copies out is owned key establishment storage:
+    // with no owned bytes allowed, neither a decryption nor a verification
+    // recovers it, as the core refuses its own decapsulation.
+    with_library(|| {
+        let name = c"TestKeyName-ml-kem-512";
+        let gcm: &[u8] = fixture!("xmlenc/aleksey-xmlenc-01/enc-aes128gcm-kt-ml-kem-512.xml");
+        assert!(decrypt_vector(gcm, KEY_512, name).is_some());
+        xml_sec_libxml2::policy::republish_encryption(
+            |_| {},
+            |decryption| decryption.key_establishment.max_owned_bytes = 0,
+        )
+        .expect("the library policy compiles");
+        assert_eq!(decrypt_vector(gcm, KEY_512, name), None);
+        assert!(verifies_kem_signature(KEM_SIGNATURE, KEY_512, name));
+        crate::ffi::policy::republish(
+            |verification| verification.key_establishment.max_owned_bytes = 0,
+            |_| {},
+        )
+        .expect("the library policy compiles");
+        assert!(!verifies_kem_signature(KEM_SIGNATURE, KEY_512, name));
     });
 }
 

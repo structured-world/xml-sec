@@ -171,9 +171,15 @@ impl Default for KeyEstablishmentPolicy {
 }
 
 impl KeyEstablishmentPolicy {
-    /// Enforce the direct-content boundary independently of KEM capability.
+    /// Enforce the direct-content boundary independently of KEM capability:
+    /// whether content `algorithm` may be keyed directly by a KEM secret, on
+    /// encryption and decryption alike.
+    ///
+    /// # Errors
+    /// Returns a permission violation for unauthenticated content unless the
+    /// policy delegates its authentication to the caller.
     #[cfg(feature = "xmlenc")]
-    pub(crate) fn check_kem_content(
+    pub fn check_kem_content(
         &self,
         algorithm: crate::xmlenc::DataEncryptionAlgorithm,
     ) -> Result<(), PolicyViolation> {

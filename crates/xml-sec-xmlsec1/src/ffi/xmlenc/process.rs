@@ -130,8 +130,57 @@ unsafe fn begin_encryption(
             errors::internal(here, std::ptr::null(), c"xmlSecEncCtxEncDataNodeRead");
             return -1;
         }
+        if !admit_kem_content(ctx, here) {
+            return -1;
+        }
     }
     0
+}
+
+/// Whether the encryption policy lets the content key keep the template's
+/// cipher: a key an ML-KEM `EncryptedKey` encapsulated (it carries the KEM
+/// ciphertext) keys only the ciphers the policy lets a KEM secret key, as the
+/// decryption policy decides on the way in; `false` after a report.
+///
+/// # Safety
+/// The context's template was read.
+unsafe fn admit_kem_content(ctx: &mut XmlSecEncCtx, here: errors::Here) -> bool {
+    use super::super::transforms::kem::kem_klass_id;
+    // SAFETY: by the caller's contract; the context's key and method.
+    unsafe {
+        let key = ctx.enc_key;
+        if key.is_null()
+            || super::super::keys::xmlSecKeyGetData(key, kem_klass_id()).is_null()
+            || ctx.enc_method.is_null()
+        {
+            return true;
+        }
+        let Some(algorithm) = c_text((*(*ctx.enc_method).id).href)
+            .and_then(|href| xml_sec::xmlenc::DataEncryptionAlgorithm::from_uri(href).ok())
+        else {
+            return true;
+        };
+        let Some(pinned) = run_policy(&raw mut ctx.transform_ctx, here) else {
+            return false;
+        };
+        match pinned
+            .encryption
+            .key_establishment
+            .check_kem_content(algorithm)
+        {
+            Ok(()) => true,
+            Err(violation) => {
+                errors::report(
+                    here,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    errors::R_TRANSFORM_DISABLED,
+                    &violation.to_string(),
+                );
+                false
+            }
+        }
+    }
 }
 
 /// Runs `encrypt`, which writes an encryption into the template `tmpl` and

@@ -710,7 +710,7 @@ impl Connections {
     pub fn remove_attribute_from_parent(storage: &Storage, child: Index<Attribute>) {
         let parent = storage.attributes.borrow()[child.idx].parent;
         if let Some(parent_idx) = parent {
-            Self::remove_attribute_x(storage, parent_idx, |idx| idx == child);
+            Self::remove_attribute_x(storage, parent_idx, |idx, _| idx == child);
         }
     }
 
@@ -960,26 +960,26 @@ impl Connections {
         N: Into<QName<'n>>,
     {
         let name = name.into();
-        Self::remove_attribute_x(storage, element, |a_idx| {
-            storage.attributes.borrow()[a_idx.idx].name.as_qname() == name
+        Self::remove_attribute_x(storage, element, |_, attribute| {
+            attribute.name.as_qname() == name
         });
     }
 
+    /// Detaches the attributes of `element` that `pred` selects, given each
+    /// attribute's index and node, keeping the others in order in place.
     pub fn remove_attribute_x<F>(storage: &Storage, element: Index<Element>, mut pred: F)
     where
-        F: FnMut(Index<Attribute>) -> bool,
+        F: FnMut(Index<Attribute>, &Attribute) -> bool,
     {
-        let attr_indices: Vec<Index<Attribute>> =
-            storage.elements.borrow()[element.idx].attributes.clone();
-        let mut to_keep = Vec::new();
-        for a_idx in attr_indices {
-            if pred(a_idx) {
-                storage.attributes.borrow_mut()[a_idx.idx].parent = None;
-            } else {
-                to_keep.push(a_idx);
+        let mut elements = storage.elements.borrow_mut();
+        let mut attributes = storage.attributes.borrow_mut();
+        elements[element.idx].attributes.retain(|&a_idx| {
+            let remove = pred(a_idx, &attributes[a_idx.idx]);
+            if remove {
+                attributes[a_idx.idx].parent = None;
             }
-        }
-        storage.elements.borrow_mut()[element.idx].attributes = to_keep.into();
+            !remove
+        });
     }
 
     pub fn set_attribute(storage: &Storage, parent: Index<Element>, attribute: Index<Attribute>) {

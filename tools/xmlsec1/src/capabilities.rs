@@ -207,8 +207,12 @@ pub fn transform_available(name: &str, provider: &dyn xml_sec::provider::CryptoP
         xml_sec::provider::KeyEncapsulationAlgorithm::MlKem1024,
     ] {
         if algorithm.uri().rsplit('#').next() == Some(name) {
-            return provider.supports(C::Encapsulate(algorithm))
-                || provider.supports(C::Decapsulate(algorithm));
+            // The command's own build decides whether it offers ML-KEM: a
+            // core built with it for another crate of the build does not
+            // give this command the options that use it.
+            return cfg!(feature = "experimental-pq")
+                && (provider.supports(C::Encapsulate(algorithm))
+                    || provider.supports(C::Decapsulate(algorithm)));
         }
     }
     for algorithm in D::ALL {

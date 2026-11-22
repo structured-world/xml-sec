@@ -291,6 +291,21 @@ impl KeyEstablishmentUsage {
         Ok(())
     }
 
+    /// Reserve `bytes` of owned storage a consumer allocates for a secret it
+    /// keeps, such as its copy of a decapsulated secret, before allocating
+    /// it: the primitives reserve only their own allocations.
+    ///
+    /// # Errors
+    /// Returns an invalid policy or the owned-byte limit's refusal.
+    pub fn reserve_owned_bytes(
+        &mut self,
+        policy: &KeyEstablishmentPolicy,
+        bytes: usize,
+    ) -> Result<(), KeyEstablishmentError> {
+        policy.validate()?;
+        Ok(self.commit_all(policy, 0, 0, bytes as u128)?)
+    }
+
     pub(crate) fn commit_all(
         &mut self,
         policy: &KeyEstablishmentPolicy,

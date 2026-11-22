@@ -150,10 +150,12 @@ not implement that authenticator or turn CBC padding into key confirmation.
 The selected provider and immutable operation allowance still govern execution.
 `AcceptRecipientKey` lets a verification that requires a trusted key take a
 KEM/HMAC signature, the recipient key standing for that trust; the result still
-establishes no sender identity. `XmlSecCompatible` admits the ML-KEM parameter
-sets the provider supports with `ExternalAuthenticated` and
-`AcceptRecipientKey`, as libxmlsec1 behaves; the other profiles admit no KEM and
-keep both defaults. Composition keeps the stricter value of each.
+establishes no sender identity. The inbound operations of `XmlSecCompatible`
+(verification and decryption) and the verification of `LegacyVerify` admit the
+ML-KEM parameter sets the provider supports with `ExternalAuthenticated` and
+`AcceptRecipientKey`, as libxmlsec1 behaves; outbound operations and the other
+profiles admit no KEM and keep both defaults. Composition keeps the stricter
+value of each.
 
 ## XML And Resource Tables
 

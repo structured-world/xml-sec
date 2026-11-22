@@ -419,6 +419,7 @@ static void kem_signature_round_trip(const char *name, const char *public, const
     xmlDocPtr doc;
     xmlSecKeysMngrPtr mngr;
     xmlSecDSigCtxPtr ctx;
+    int signed_;
     printf("ml-kem signature round trip %s\n", name);
     snprintf(file, sizeof(file), "%s.tmpl", name);
     doc = kem_document(file);
@@ -427,8 +428,10 @@ static void kem_signature_round_trip(const char *name, const char *public, const
     }
     mngr = mlkem_manager(public, key_name);
     ctx = xmlSecDSigCtxCreate(mngr);
-    printf("  sign: %d status=%s\n", xmlSecDSigCtxSign(ctx, signature_of(doc)),
-           xmlSecDSigCtxGetStatusString(ctx->status));
+    /* The status is read after the signing, not in an argument list whose
+     * order of evaluation C leaves open. */
+    signed_ = xmlSecDSigCtxSign(ctx, signature_of(doc));
+    printf("  sign: %d status=%s\n", signed_, xmlSecDSigCtxGetStatusString(ctx->status));
     xmlSecDSigCtxDestroy(ctx);
     xmlSecKeysMngrDestroy(mngr);
     kem_verify(doc, private, key_name);

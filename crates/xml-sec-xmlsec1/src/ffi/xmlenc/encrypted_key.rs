@@ -101,9 +101,11 @@ pub(super) unsafe fn key_binary(
 /// `key`, so writing the key serializes it; `false` after a report at
 /// `here`.
 ///
-/// The ciphertext rides on the content key, not on one `EncryptedKey`, so,
-/// as in libxmlsec1, a `KeyInfo` with several ML-KEM recipients writes the
-/// first recipient's ciphertext into every one of them.
+/// The ciphertext rides on the content key, not on one `EncryptedKey`, with
+/// the recipient it was encapsulated to: a `KeyInfo` with a second ML-KEM
+/// recipient is refused when that recipient's entry is written, since the
+/// secret keys the content for one recipient only (libxmlsec1 writes the
+/// first recipient's ciphertext into every entry).
 ///
 /// # Safety
 /// `ctx` is an initialized context; `key` a key.

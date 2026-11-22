@@ -94,13 +94,28 @@ unsafe fn object<'a>(data: *mut XmlSecKeyData) -> Option<&'a mut MlKemData> {
     }
 }
 
+/// The object of valid key data of this klass, for reading only.
+///
+/// # Safety
+/// As for [`object`]; no exclusive reference to the object is live while
+/// the shared one is.
+unsafe fn object_ref<'a>(data: *const XmlSecKeyData) -> Option<&'a MlKemData> {
+    // SAFETY: by the caller's contract; a valid object of the klass has the
+    // ML-KEM layout, and only the initialize, duplicate and finalize paths
+    // take it exclusively, never while a query reads it.
+    unsafe {
+        (data_valid(data.cast_mut()) && std::ptr::eq((*data).id, &raw const MLKEM))
+            .then(|| &*data.cast::<MlKemData>())
+    }
+}
+
 /// The key `data` holds, if it is ML-KEM key data holding one.
 ///
 /// # Safety
-/// As for [`object`].
+/// As for [`object_ref`].
 pub(crate) unsafe fn key_of<'a>(data: *mut XmlSecKeyData) -> Option<&'a MlKemKey> {
     // SAFETY: by the caller's contract; a non-null key is the object's.
-    unsafe { object(data).and_then(|object| object.key.as_ref()) }
+    unsafe { object_ref(data).and_then(|object| object.key.as_ref()) }
 }
 
 /// New ML-KEM key data holding `key`; null when it cannot be created.
