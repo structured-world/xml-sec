@@ -137,32 +137,44 @@ pub(super) fn own_process() {
 /// Publishes the verification and signing snapshots under an authorization
 /// that ends a moment later, and returns once it has ended. A published
 /// revision is compiled, and compilation refuses an authorization already
-/// over, so a run meets an ended one only when it ends after publication.
+/// over, so a run meets an ended one only when it ends after publication. A
+/// publication the clock overtook (the process paused past the end) is
+/// tried again with a new end, a few times; any other refusal fails.
 pub(super) fn end_signature_authorization() {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use xml_sec::policy::{Instant, PolicyValidity};
-    let ends = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("a clock after the epoch")
-        + Duration::from_secs(1);
-    let validity = || {
-        Some(PolicyValidity {
-            authorization_id: "test".to_owned(),
-            authority: "test".to_owned(),
-            reason: "an authorization about to end".to_owned(),
-            not_before: Instant::new(0, 0).expect("the epoch"),
-            expires_at: Instant::new(
-                ends.as_secs().try_into().expect("a near instant"),
-                ends.subsec_nanos(),
-            )
-            .expect("a second from now"),
-        })
+    let since_epoch = || {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("a clock after the epoch")
     };
-    super::policy::republish(
-        |verification| verification.validity = validity(),
-        |signing| signing.validity = validity(),
-    )
-    .expect("the library policy compiles");
+    let mut attempts = 0;
+    let ends = loop {
+        let ends = since_epoch() + Duration::from_secs(1);
+        let validity = || {
+            Some(PolicyValidity {
+                authorization_id: "test".to_owned(),
+                authority: "test".to_owned(),
+                reason: "an authorization about to end".to_owned(),
+                not_before: Instant::new(0, 0).expect("the epoch"),
+                expires_at: Instant::new(
+                    ends.as_secs().try_into().expect("a near instant"),
+                    ends.subsec_nanos(),
+                )
+                .expect("a second from now"),
+            })
+        };
+        let published = super::policy::republish(
+            |verification| verification.validity = validity(),
+            |signing| signing.validity = validity(),
+        );
+        attempts += 1;
+        match published {
+            Some(()) => break ends,
+            None if since_epoch() >= ends && attempts < 5 => {}
+            None => panic!("the library policy compiles"),
+        }
+    };
     while SystemTime::now() <= UNIX_EPOCH + ends {
         std::thread::sleep(Duration::from_millis(50));
     }
