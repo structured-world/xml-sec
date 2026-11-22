@@ -104,6 +104,31 @@ kem_content_authentication = "ExternalAuthenticated"
 }
 
 #[test]
+fn a_setter_cannot_undo_a_restriction() {
+    // A libxmlsec1 setter called after the restriction changes the library's
+    // own value, but the deployment's ceiling still applies on top of it: a
+    // lower HMAC minimum leaves the restricted 256, a higher one is kept.
+    own_process();
+    let toml = r#"
+schema_version = 1
+[profiles.deployment]
+base = "XmlSecCompatible"
+[profiles.deployment.verification.hmac]
+minimum_output_bits = 256
+"#;
+    assert_eq!(restrict(toml, c"deployment"), 0);
+    super::super::transforms::hmac::xmlSecTransformHmacSetMinOutputBitsSize(80);
+    let after = current();
+    assert_eq!(after.verification.hmac.minimum_output_bits, 256);
+    super::super::transforms::hmac::xmlSecTransformHmacSetMinOutputBitsSize(384);
+    assert_eq!(current().verification.hmac.minimum_output_bits, 384);
+    // The setter's own value stays the library's, so a lower one returns to
+    // the deployment's ceiling, not below it.
+    super::super::transforms::hmac::xmlSecTransformHmacSetMinOutputBitsSize(128);
+    assert_eq!(current().verification.hmac.minimum_output_bits, 256);
+}
+
+#[test]
 fn a_layer_removes_algorithms_from_verification_and_signing() {
     // A layer listing only RSA-SHA256 takes RSA-SHA1, which libxmlsec1 signs
     // and verifies with, away from both operations.

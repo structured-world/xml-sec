@@ -3,7 +3,7 @@ use super::*;
 use crate::ffi::buffer::{
     XmlSecBuffer, xmlSecBufferGetData, xmlSecBufferGetSize, xmlSecBufferIsSecure,
 };
-use crate::ffi::keys::{xmlSecKeyCreate, xmlSecKeyDestroy, xmlSecKeySetValue};
+use crate::ffi::keys::{xmlSecKeyCreate, xmlSecKeyDestroy, xmlSecKeyDuplicate, xmlSecKeySetValue};
 use crate::ffi::keysdata::{xmlSecKeyDataBinaryValueSetBuffer, xmlSecKeyDataCreate};
 use crate::ffi::transforms::ctx::{
     xmlSecTransformCtxBinaryExecute, xmlSecTransformCtxCreate, xmlSecTransformCtxCreateAndAppend,
@@ -227,6 +227,89 @@ fn a_chacha_chain_without_its_method_draws_a_nonce_only_to_encrypt() {
         None
     );
     assert_eq!(run(chacha20(), OPERATION_ENCRYPT, key, b"payload"), None);
+    // SAFETY: the key created above.
+    unsafe { xmlSecKeyDestroy(key) };
+}
+
+/// Encrypts `plaintext` into the `EncryptedData` template `xml` with `key`
+/// and decrypts what that writes: the plaintext recovered, `None` when either
+/// step fails.
+fn template_round_trip(xml: &str, key: *mut XmlSecKey, plaintext: &[u8]) -> Option<Vec<u8>> {
+    use crate::ffi::xmlenc::{
+        xmlSecEncCtxBinaryEncrypt, xmlSecEncCtxCreate, xmlSecEncCtxDecryptToBuffer,
+        xmlSecEncCtxDestroy,
+    };
+    use xml_sec_libxml2::ffi::tree::{xsDocGetRootElement, xsFreeDoc, xsReadMemory};
+    // SAFETY: a document and contexts created and released here; the key is
+    // the caller's and outlives both contexts.
+    unsafe {
+        let doc = xsReadMemory(
+            xml.as_ptr().cast(),
+            c_int::try_from(xml.len()).expect("a short template"),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        assert!(!doc.is_null(), "the template parses");
+        let root = xsDocGetRootElement(doc);
+        let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
+        (*ctx).enc_key = xmlSecKeyDuplicate(key);
+        let encrypted =
+            xmlSecEncCtxBinaryEncrypt(ctx, root.cast(), plaintext.as_ptr(), plaintext.len()) == 0;
+        xmlSecEncCtxDestroy(ctx);
+        let recovered = encrypted.then(|| {
+            let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
+            (*ctx).enc_key = xmlSecKeyDuplicate(key);
+            let result = xmlSecEncCtxDecryptToBuffer(ctx, xsDocGetRootElement(doc).cast());
+            let recovered = (!result.is_null()).then(|| bytes(result));
+            xmlSecEncCtxDestroy(ctx);
+            recovered
+        });
+        xsFreeDoc(doc);
+        recovered.flatten()
+    }
+}
+
+#[test]
+fn a_chacha_encryption_writes_parameters_its_decryption_reads() {
+    // The written method must parse again: a parameter the template carries
+    // in its unqualified RFC 9231 form is replaced, not duplicated by a
+    // namespaced one, and a KeySize stays the method's first child, where the
+    // reader requires it. The transform list is process-wide.
+    crate::ffi::tests::own_process();
+    // SAFETY: the library initialized on this test's own thread.
+    unsafe {
+        assert_eq!(crate::ffi::library::xmlSecInit(), 0);
+        assert_eq!(
+            crate::ffi::crypto::xmlSecCryptoDLLoadLibrary(std::ptr::null()),
+            0
+        );
+        assert_eq!(crate::ffi::crypto::xmlSecCryptoAppInit(std::ptr::null()), 0);
+        assert_eq!(crate::ffi::crypto::xmlSecCryptoInit(), 0);
+    }
+    let key = chacha_key(&[0x88; 32]);
+    let method = |children: &str| {
+        format!(
+            "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\">\
+             <EncryptionMethod Algorithm=\"http://www.w3.org/2021/04/xmldsig-more#{children}\
+             </EncryptionMethod><CipherData><CipherValue/></CipherData></EncryptedData>"
+        )
+    };
+    for template in [
+        method("chacha20poly1305\"><KeySize>256</KeySize>"),
+        method("chacha20poly1305\"><Nonce xmlns=\"\">000102030405060708090a0b</Nonce>"),
+        method(
+            "chacha20\"><KeySize>256</KeySize>\
+             <Nonce xmlns=\"\">000102030405060708090a0b</Nonce>\
+             <Counter xmlns=\"\">01000000</Counter>",
+        ),
+    ] {
+        assert_eq!(
+            template_round_trip(&template, key, b"payload").as_deref(),
+            Some(&b"payload"[..]),
+            "{template}"
+        );
+    }
     // SAFETY: the key created above.
     unsafe { xmlSecKeyDestroy(key) };
 }

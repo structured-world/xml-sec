@@ -674,9 +674,11 @@ unsafe extern "C" fn write_node(
     })
 }
 
-/// Writes each `(name, value)` of `fields` in order as a hexBinary child of
-/// `node` in the 2021 xmldsig-more namespace: an element of that name where
-/// the walk stands is overwritten, otherwise one is inserted there.
+/// Writes each `(name, value)` of `fields` as a hexBinary child of `node`:
+/// a parameter already there, in either form the reader accepts (RFC 9231's
+/// unqualified one or the 2021 xmldsig-more namespace), is overwritten in
+/// place, so it is never duplicated; a missing one is added in the 2021
+/// namespace, in order, after any `KeySize`, which the reader requires first.
 ///
 /// # Safety
 /// `node` is a live element.
@@ -684,6 +686,7 @@ unsafe fn write_parameters(
     node: *mut super::super::tree::XmlNode,
     fields: &[(&[u8], &[u8])],
 ) -> bool {
+    use super::super::tree::nodes;
     use super::super::xmltree::{
         xmlSecAddChild, xmlSecAddPrevSibling, xmlSecCheckNodeName, xmlSecGetNextElementNode,
         xmlSecSetNodeContentAsHex,
@@ -692,22 +695,35 @@ unsafe fn write_parameters(
     // SAFETY: by the caller's contract; every node handled is a live child
     // of `node` or a node just added to it.
     unsafe {
-        let mut cur = xmlSecGetNextElementNode(super::super::tree::nodes::first_child(node));
+        let children = || {
+            std::iter::successors(
+                Some(xmlSecGetNextElementNode(nodes::first_child(node))).filter(|n| !n.is_null()),
+                |&cur| Some(xmlSecGetNextElementNode(nodes::next(cur))).filter(|n| !n.is_null()),
+            )
+        };
+        // New parameters go before the first child that is not a KeySize.
+        let anchor = children().find(|&child| {
+            xmlSecCheckNodeName(
+                child,
+                c"KeySize".as_ptr().cast(),
+                strings::xmlSecEncNs.as_ptr(),
+            ) == 0
+        });
         for (name, value) in fields {
-            if cur.is_null() || xmlSecCheckNodeName(cur, name.as_ptr(), namespace) == 0 {
-                cur = if cur.is_null() {
-                    xmlSecAddChild(node, name.as_ptr(), namespace)
-                } else {
-                    xmlSecAddPrevSibling(cur, name.as_ptr(), namespace)
-                };
-                if cur.is_null() {
-                    return false;
-                }
-            }
-            if xmlSecSetNodeContentAsHex(cur, value.as_ptr(), value.len()) < 0 {
+            let existing = children().find(|&child| {
+                xmlSecCheckNodeName(child, name.as_ptr(), namespace) != 0
+                    || xmlSecCheckNodeName(child, name.as_ptr(), std::ptr::null()) != 0
+            });
+            let target = match (existing, anchor) {
+                (Some(existing), _) => existing,
+                (None, Some(anchor)) => xmlSecAddPrevSibling(anchor, name.as_ptr(), namespace),
+                (None, None) => xmlSecAddChild(node, name.as_ptr(), namespace),
+            };
+            if target.is_null()
+                || xmlSecSetNodeContentAsHex(target, value.as_ptr(), value.len()) < 0
+            {
                 return false;
             }
-            cur = xmlSecGetNextElementNode(super::super::tree::nodes::next(cur));
         }
     }
     true

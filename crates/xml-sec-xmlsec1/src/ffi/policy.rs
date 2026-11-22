@@ -411,7 +411,13 @@ pub(crate) unsafe extern "C" fn xsPolicyRestrict(
             Ok(config) => config,
             Err(error) => return refuse(&error.to_string()),
         };
-        match xml_sec_libxml2::policy::republish_all(|current| restricted(&config, name, current)) {
+        // The deployment's layer stays in force: every later setter's
+        // snapshots are narrowed by it again before they are published.
+        let name = name.to_owned();
+        let restriction = Arc::new(move |own: &xml_sec_libxml2::policy::Snapshots| {
+            restricted(&config, &name, own)
+        });
+        match xml_sec_libxml2::policy::restrict(restriction) {
             Some(Ok(())) => 0,
             Some(Err(error)) => refuse(&error),
             None => {

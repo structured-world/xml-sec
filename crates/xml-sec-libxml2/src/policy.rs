@@ -28,6 +28,7 @@ struct Published {
 }
 
 /// One revision of every operation's snapshot, taken together.
+#[derive(Clone)]
 pub struct Snapshots {
     /// The verification snapshot.
     pub verification: Arc<VerificationPolicy>,
@@ -42,10 +43,22 @@ pub struct Snapshots {
 // no-std: spin::RwLock
 static PUBLISHED: RwLock<Option<Published>> = RwLock::new(None);
 
+/// A deployment's narrowing of the library: the snapshots it publishes for
+/// the library's own snapshots, or why it refuses them.
+pub type Restriction = dyn Fn(&Snapshots) -> Result<Snapshots, String> + Send + Sync;
+
+/// What the published revision is made of once a deployment narrowed it:
+/// the library's own snapshots, which its setters edit, and the narrowing
+/// applied on top of them, so no setter reaches past the deployment.
+struct Restricted {
+    own: Snapshots,
+    restriction: Arc<Restriction>,
+}
+
 /// The turn of a republishing caller, held from reading the current
-/// snapshots to publishing their replacements.
+/// snapshots to publishing their replacements, and the restriction in force.
 // no-std: spin::Mutex
-static WRITER: Mutex<()> = Mutex::new(());
+static WRITER: Mutex<Option<Restricted>> = Mutex::new(None);
 
 /// The profile compiled for the default provider; `None` when it cannot be
 /// compiled.
@@ -203,25 +216,27 @@ pub fn snapshot() -> Option<(Arc<VerificationPolicy>, Arc<SigningPolicy>)> {
 /// read the current snapshots, and one that panics leaves them published
 /// unchanged. An edit must not republish itself, which would wait for its
 /// own turn.
+///
+/// After [`restrict`], the edits change the library's own snapshots and the
+/// restriction is applied again on top of them, so a setter never reaches
+/// past the deployment; a restriction that refuses the result publishes
+/// nothing, and `None` is returned for it too.
 pub fn republish(
     edit_verification: impl FnOnce(&mut VerificationPolicy),
     edit_signing: impl FnOnce(&mut SigningPolicy),
 ) -> Option<()> {
-    // The lock guards no data, only the turn: a turn whose edit panicked
-    // published nothing, so its poison is cleared.
-    let _turn = WRITER.lock().unwrap_or_else(PoisonError::into_inner);
-    let current = snapshots()?;
-    let mut verification = VerificationPolicy::clone(&current.verification);
-    let mut signing = SigningPolicy::clone(&current.signing);
+    // The lock guards the restriction and the turn: a turn whose edit
+    // panicked published nothing and left the restriction as it was, so its
+    // poison is cleared.
+    let mut turn = WRITER.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut own = own(turn.as_ref())?;
+    let mut verification = VerificationPolicy::clone(&own.verification);
+    let mut signing = SigningPolicy::clone(&own.signing);
     edit_verification(&mut verification);
     edit_signing(&mut signing);
-    *PUBLISHED.write().ok()? = Some(Published {
-        verification: Arc::new(verification),
-        signing: Arc::new(signing),
-        encryption: current.encryption,
-        decryption: current.decryption,
-    });
-    Some(())
+    own.verification = Arc::new(verification);
+    own.signing = Arc::new(signing);
+    publish(&mut turn, own)?.ok()
 }
 
 /// [`republish`] for the encryption and decryption snapshots.
@@ -229,40 +244,80 @@ pub fn republish_encryption(
     edit_encryption: impl FnOnce(&mut EncryptionPolicy),
     edit_decryption: impl FnOnce(&mut DecryptionPolicy),
 ) -> Option<()> {
-    let _turn = WRITER.lock().unwrap_or_else(PoisonError::into_inner);
-    let current = snapshots()?;
-    let mut encryption = EncryptionPolicy::clone(&current.encryption);
-    let mut decryption = DecryptionPolicy::clone(&current.decryption);
+    let mut turn = WRITER.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut own = own(turn.as_ref())?;
+    let mut encryption = EncryptionPolicy::clone(&own.encryption);
+    let mut decryption = DecryptionPolicy::clone(&own.decryption);
     edit_encryption(&mut encryption);
     edit_decryption(&mut decryption);
-    *PUBLISHED.write().ok()? = Some(Published {
-        verification: current.verification,
-        signing: current.signing,
-        encryption: Arc::new(encryption),
-        decryption: Arc::new(decryption),
-    });
-    Some(())
+    own.encryption = Arc::new(encryption);
+    own.decryption = Arc::new(decryption);
+    publish(&mut turn, own)?.ok()
 }
 
-/// Publishes the snapshots `replace` builds from the current ones, every
-/// operation's in one revision, so no run sees some replaced and some not.
-/// A refusal publishes nothing. `None` when the profile cannot be compiled.
-pub fn republish_all<E>(
-    replace: impl FnOnce(&Snapshots) -> Result<Snapshots, E>,
-) -> Option<Result<(), E>> {
-    let _turn = WRITER.lock().unwrap_or_else(PoisonError::into_inner);
-    let current = snapshots()?;
-    let next = match replace(&current) {
-        Ok(next) => next,
+/// Narrows the library by `restriction` from now on: every operation's
+/// snapshot in one revision, and again after every later setter, on top of
+/// any earlier restriction. A refusal publishes nothing and keeps the
+/// restriction in force as it was. `None` when the profile cannot be
+/// compiled.
+pub fn restrict(restriction: Arc<Restriction>) -> Option<Result<(), String>> {
+    let mut turn = WRITER.lock().unwrap_or_else(PoisonError::into_inner);
+    let own = own(turn.as_ref())?;
+    let composed: Arc<Restriction> = match turn.as_ref() {
+        Some(earlier) => {
+            let earlier = Arc::clone(&earlier.restriction);
+            Arc::new(move |own: &Snapshots| restriction(&earlier(own)?))
+        }
+        None => restriction,
+    };
+    let narrowed = match composed(&own) {
+        Ok(narrowed) => narrowed,
         Err(error) => return Some(Err(error)),
     };
-    *PUBLISHED.write().ok()? = Some(Published {
-        verification: next.verification,
-        signing: next.signing,
-        encryption: next.encryption,
-        decryption: next.decryption,
+    *PUBLISHED.write().ok()? = Some(Published::from(narrowed));
+    *turn = Some(Restricted {
+        own,
+        restriction: composed,
     });
     Some(Ok(()))
+}
+
+/// The library's own snapshots under the turn `layers`: the current ones
+/// until a deployment restricts them.
+fn own(layers: Option<&Restricted>) -> Option<Snapshots> {
+    match layers {
+        Some(restricted) => Some(restricted.own.clone()),
+        None => snapshots(),
+    }
+}
+
+/// Publishes the library's own snapshots `own` under the turn `layers`,
+/// narrowed by the restriction in force; a refusal publishes nothing.
+fn publish(layers: &mut Option<Restricted>, own: Snapshots) -> Option<Result<(), String>> {
+    let published = match layers {
+        Some(restricted) => {
+            let narrowed = match (restricted.restriction)(&own) {
+                Ok(narrowed) => narrowed,
+                Err(error) => return Some(Err(error)),
+            };
+            restricted.own = own;
+            narrowed
+        }
+        None => own,
+    };
+    *PUBLISHED.write().ok()? = Some(Published::from(published));
+    Some(Ok(()))
+}
+
+impl From<Snapshots> for Published {
+    fn from(snapshots: Snapshots) -> Self {
+        Self {
+            verification: snapshots.verification,
+            signing: snapshots.signing,
+            encryption: snapshots.encryption,
+            decryption: snapshots.decryption,
+        }
+    }
 }
 
 #[cfg(test)]
