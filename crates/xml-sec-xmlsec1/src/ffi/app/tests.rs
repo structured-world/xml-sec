@@ -13,6 +13,113 @@ fn asymmetric(loaded: Loaded) -> Material {
     match loaded {
         Loaded::Asymmetric(material) => material,
         Loaded::Xdh(_) => panic!("an XDH key, not an asymmetric one"),
+        Loaded::MlKem(_) => panic!("an ML-KEM key, not an asymmetric one"),
+    }
+}
+
+#[test]
+fn a_public_ml_kem_key_is_no_private_key() {
+    // Departure: libxmlsec1 reports every OpenSSL 3 key as private and
+    // public (its issue 588), so a public key file passes a private key
+    // requirement and fails only when used. Here the type says what the key
+    // holds: public for the public file, both for the private one.
+    use crate::ffi::keys::{TYPE_PRIVATE, TYPE_PUBLIC, xmlSecKeyDestroy, xmlSecKeyGetValue};
+    use crate::ffi::keysdata::xmlSecKeyDataGetType;
+    for (bytes, expected) in [
+        (
+            &include_bytes!(
+                "../../../../../tests/fixtures/xmldsig/keys/ml-kem/ml-kem-512-pubkey.pem"
+            )[..],
+            TYPE_PUBLIC,
+        ),
+        (
+            &include_bytes!("../../../../../tests/fixtures/xmldsig/keys/ml-kem/ml-kem-512-key.pem")
+                [..],
+            TYPE_PUBLIC | TYPE_PRIVATE,
+        ),
+    ] {
+        // SAFETY: the fixture's bytes; the key is released here.
+        unsafe {
+            let key = super::key_load_memory(
+                bytes.as_ptr(),
+                bytes.len(),
+                FORMAT_PEM,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+            .cast::<crate::ffi::keys::XmlSecKey>();
+            assert!(!key.is_null(), "the key loads");
+            assert_eq!(xmlSecKeyDataGetType(xmlSecKeyGetValue(key)), expected);
+            xmlSecKeyDestroy(key);
+        }
+    }
+}
+
+#[test]
+fn ml_kem_keys_load_as_ml_kem_key_data() {
+    // ML-KEM key files of every parameter set load as ML-KEM keys: the
+    // private key in PEM, DER and password-protected PKCS#8 with its PKCS#8
+    // and the public key of the matching public file, the public file alone
+    // with no private key; the parameter set is the key's own.
+    use xml_sec::provider::KeyEncapsulationAlgorithm as A;
+    let resources = ResourcePolicy::default();
+    let load = |bytes: &[u8], format| match material(
+        bytes,
+        format,
+        &password(Some(c"secret123")),
+        &resources,
+    )
+    .expect("the key reads")
+    .expect("a format it reads")
+    {
+        Loaded::MlKem(key) => key,
+        Loaded::Asymmetric(_) | Loaded::Xdh(_) => panic!("not an ML-KEM key"),
+    };
+    macro_rules! key_files {
+        ($size:literal) => {
+            (
+                &include_bytes!(concat!(
+                    "../../../../../tests/fixtures/xmldsig/keys/ml-kem/ml-kem-",
+                    $size,
+                    "-key.pem"
+                ))[..],
+                &include_bytes!(concat!(
+                    "../../../../../tests/fixtures/xmldsig/keys/ml-kem/ml-kem-",
+                    $size,
+                    "-key.der"
+                ))[..],
+                &include_bytes!(concat!(
+                    "../../../../../tests/fixtures/xmldsig/keys/ml-kem/ml-kem-",
+                    $size,
+                    "-key.p8-der"
+                ))[..],
+                &include_bytes!(concat!(
+                    "../../../../../tests/fixtures/xmldsig/keys/ml-kem/ml-kem-",
+                    $size,
+                    "-pubkey.pem"
+                ))[..],
+            )
+        };
+    }
+    for (algorithm, (pem, der, pkcs8, public)) in [
+        (A::MlKem512, key_files!("512")),
+        (A::MlKem768, key_files!("768")),
+        (A::MlKem1024, key_files!("1024")),
+    ] {
+        let public = load(public, FORMAT_PEM);
+        assert_eq!(public.algorithm, algorithm);
+        assert!(public.private.is_none());
+        for (bytes, format) in [
+            (pem, FORMAT_PEM),
+            (der, super::FORMAT_DER),
+            (pkcs8, super::FORMAT_PKCS8_DER),
+        ] {
+            let private = load(bytes, format);
+            assert_eq!(private.algorithm, algorithm, "{algorithm:?} {format}");
+            assert!(private.private.is_some());
+            assert_eq!(private.spki, public.spki, "{algorithm:?} {format}");
+        }
     }
 }
 
@@ -99,7 +206,7 @@ fn xdh_keys_load_as_xdh_key_data() {
     .expect("a format it reads")
     {
         Loaded::Xdh(key) => key,
-        Loaded::Asymmetric(_) => panic!("an asymmetric key, not an XDH one"),
+        Loaded::Asymmetric(_) | Loaded::MlKem(_) => panic!("not an XDH key"),
     };
     for (private, encrypted, public, width) in [
         (

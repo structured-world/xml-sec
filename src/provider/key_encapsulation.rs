@@ -28,10 +28,16 @@ impl KeyEncapsulationAlgorithm {
         }
     }
 
+    /// Every parameter set, in ascending security category.
+    #[must_use]
+    pub const fn all() -> [Self; 3] {
+        [Self::MlKem512, Self::MlKem768, Self::MlKem1024]
+    }
+
     /// Recognize only the exact parameter-set URI.
     #[must_use]
     pub fn from_uri(uri: &str) -> Option<Self> {
-        [Self::MlKem512, Self::MlKem768, Self::MlKem1024]
+        Self::all()
             .into_iter()
             .find(|algorithm| algorithm.uri() == uri)
     }
@@ -84,7 +90,7 @@ impl KeyEncapsulationAlgorithm {
 
     /// Parameter set named by the contents octets of an OBJECT IDENTIFIER.
     pub(crate) fn from_oid_bytes(oid: &[u8]) -> Option<Self> {
-        [Self::MlKem512, Self::MlKem768, Self::MlKem1024]
+        Self::all()
             .into_iter()
             .find(|algorithm| algorithm.oid().as_bytes() == oid)
     }

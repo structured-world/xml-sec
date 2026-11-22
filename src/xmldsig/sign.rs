@@ -1650,6 +1650,7 @@ pub enum SignatureTemplateSelection {
 pub struct SignContext<'a> {
     signing_key: Option<&'a dyn SigningKey>,
     encapsulation_key: Option<&'a dyn crate::provider::KeyEncapsulationKey>,
+    established_encapsulation: Option<crate::key_establishment::EstablishedEncapsulation<'a>>,
     key_info_writer: Option<&'a dyn KeyInfoWriter>,
     start_node_id: Option<&'a str>,
     id_attributes: &'a [crate::IdAttributeRegistration],
@@ -1669,6 +1670,7 @@ impl<'a> SignContext<'a> {
         Self {
             signing_key: Some(signing_key),
             encapsulation_key: None,
+            established_encapsulation: None,
             key_info_writer: None,
             start_node_id: None,
             id_attributes: &[],
@@ -1689,6 +1691,7 @@ impl<'a> SignContext<'a> {
         Self {
             signing_key: None,
             encapsulation_key: Some(key),
+            established_encapsulation: None,
             key_info_writer: None,
             start_node_id: None,
             id_attributes: &[],
@@ -1700,6 +1703,21 @@ impl<'a> SignContext<'a> {
             provider: crate::provider::default_provider(),
             xml_backend: crate::XmlBackend::default(),
         }
+    }
+
+    /// Sign with the HMAC key of [`Self::new`], which the caller already
+    /// encapsulated as the ML-KEM `EncryptedKey` named by `mechanism` and wrote
+    /// into the template's `KeyInfo`. The template must carry exactly that
+    /// mechanism and policy must grant its parameter set, as for
+    /// [`Self::new_encapsulation`]; KEM/HMAC alone does not authenticate the
+    /// sender.
+    #[must_use]
+    pub fn established_encapsulation(
+        mut self,
+        mechanism: crate::key_establishment::EstablishedEncapsulation<'a>,
+    ) -> Self {
+        self.established_encapsulation = Some(mechanism);
+        self
     }
 
     /// Replace the complete immutable signing policy snapshot.
@@ -2045,7 +2063,9 @@ impl<'a> SignContext<'a> {
                 self.id_attributes,
                 self.policy.transforms.same_document_id_semantics,
             );
-            if self.encapsulation_key.is_none() {
+            let encapsulated =
+                self.encapsulation_key.is_some() || self.established_encapsulation.is_some();
+            if !encapsulated {
                 if let Some(info) = children.key_info
                     && super::verify::has_signing_encapsulation_with_budget(
                         info,
@@ -2078,16 +2098,19 @@ impl<'a> SignContext<'a> {
                 })
                 .transpose()
                 .map_err(metadata_error)?;
-            let mechanism =
-                metadata.and_then(|metadata| metadata.encapsulation.zip(metadata.cipher_value));
-            if mechanism.is_some() != self.encapsulation_key.is_some() {
+            let mechanism = metadata.and_then(|metadata| {
+                metadata
+                    .mechanism
+                    .zip(metadata.encapsulation.zip(metadata.cipher_value))
+            });
+            if mechanism.is_some() != encapsulated {
                 return Err(crate::key_establishment::KeyEstablishmentError::Structure(
                     "mechanism and explicit recipient key must be supplied together",
                 )
                 .into());
             }
             mechanism
-                .map(|(algorithm, target)| {
+                .map(|(found, (algorithm, target))| {
                     self.policy
                         .key_establishment
                         .check_encapsulation(algorithm)?;
@@ -2097,6 +2120,17 @@ impl<'a> SignContext<'a> {
                     {
                         return Err(crate::key_establishment::KeyEstablishmentError::Structure(
                             "recipient parameter set mismatch",
+                        )
+                        .into());
+                    }
+                    // The caller wrote its ciphertext into this template, so
+                    // a key encapsulated for any other EncryptedKey is refused.
+                    if self
+                        .established_encapsulation
+                        .is_some_and(|established| !found.is(established))
+                    {
+                        return Err(crate::key_establishment::KeyEstablishmentError::Structure(
+                            "the established key belongs to another encapsulation",
                         )
                         .into());
                     }
@@ -2158,6 +2192,24 @@ impl<'a> SignContext<'a> {
                 key,
             )?;
             return Ok((None, Some((target, result))));
+        }
+        if self.established_encapsulation.is_some() {
+            // The caller encapsulated and wrote the ciphertext; the rest of the
+            // contract is the encapsulating one's.
+            if self.key_info_writer.is_some() {
+                return Err(crate::key_establishment::KeyEstablishmentError::Structure(
+                    "KeyInfo writer cannot overwrite the ML-KEM EncryptedKey",
+                )
+                .into());
+            }
+            if signing_algorithm.hmac_output_bits().is_none() {
+                return Err(crate::key_establishment::KeyEstablishmentError::Structure(
+                    "encapsulation requires HMAC",
+                )
+                .into());
+            }
+            self.policy.hmac.validate_key_bits(256)?;
+            return Ok((None, None));
         }
         let Some(writer) = self.key_info_writer else {
             return Ok::<_, SigningError>((None, None));

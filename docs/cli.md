@@ -489,9 +489,11 @@ Certificate public-key options and `--pkcs12` are not supported by these CLI KEM
 selectors; diagnostics name the option and command before reading key files.
 Mixing ordinary signing keys with a KEM template is rejected,
 and recipient-only options without a mechanism report which option is
-inapplicable. KEM/HMAC verification needs explicit `--insecure`: it validates
-message integrity but cannot establish sender identity. These are experimental
-libxmlsec1 bindings, not standardized W3C algorithms.
+inapplicable. KEM/HMAC verification validates message integrity but cannot
+establish sender identity; as libxmlsec1 does, the compatibility CLI takes the
+recipient key for the trusted key through
+`KemSignatureTrust::AcceptRecipientKey`, so it needs no `--insecure`. These are
+experimental libxmlsec1 bindings, not standardized W3C algorithms.
 The compatibility CLI explicitly enables direct KEM-to-CBC through
 `KemContentAuthentication::ExternalAuthenticated`; unlike the Rust API's safe
 default, it preserves the donor's CBC behavior. The CLI does not verify an

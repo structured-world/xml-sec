@@ -133,6 +133,7 @@ cannot override a fixed-method URI's semantics.
 | `agreement_algorithms`, `derivation_algorithms`, `digest_algorithms` | Applicable URI array or `"default"` |
 | `encapsulation_algorithms` | KEM URI array; no `"default"` shorthand |
 | `kem_content_authentication` | `RequireAuthenticatedCipher`, `ExternalAuthenticated` |
+| `kem_signature_trust` | `RequireCryptographicOnly`, `AcceptRecipientKey` |
 | `max_encapsulation_operations`, `max_hash_blocks`, `max_owned_bytes` | Nonnegative integer |
 | `max_dh_modulus_bits`, `minimum_dh_modulus_bits`, `minimum_dh_subgroup_bits`, `max_modular_work` | Nonnegative integer |
 
@@ -147,6 +148,14 @@ profiles admits the XML Encryption 1.0 `xmlenc#dh` agreement.
 `ExternalAuthenticated` asserts a caller-owned authenticity boundary; it does
 not implement that authenticator or turn CBC padding into key confirmation.
 The selected provider and immutable operation allowance still govern execution.
+`AcceptRecipientKey` lets a verification that requires a trusted key take a
+KEM/HMAC signature, the recipient key standing for that trust; the result still
+establishes no sender identity. The inbound operations of `XmlSecCompatible`
+(verification and decryption) and the verification of `LegacyVerify` admit the
+ML-KEM parameter sets the provider supports with `ExternalAuthenticated` and
+`AcceptRecipientKey`, as libxmlsec1 behaves; outbound operations and the other
+profiles admit no KEM and keep both defaults. Composition keeps the stricter
+value of each.
 
 ## XML And Resource Tables
 

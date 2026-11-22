@@ -324,6 +324,120 @@ static void tamper(xmlDocPtr doc, const xmlChar *name, const xmlChar *ns, const 
     xsNodeSetContent(node, BAD_CAST text);
 }
 
+#define KEM_VECTORS "tests/fixtures/xmldsig/aleksey-xmldsig-01/"
+#define MLKEM_KEYS "tests/fixtures/xmldsig/keys/ml-kem/"
+
+/* The NUL-terminated bytes of the file at `path`; NULL when unreadable. */
+static xmlSecByte *file_bytes(const char *path, size_t *size) {
+    static xmlSecByte bytes[1 << 16];
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) {
+        return NULL;
+    }
+    *size = fread(bytes, 1, sizeof(bytes) - 1, file);
+    fclose(file);
+    bytes[*size] = 0;
+    return bytes;
+}
+
+/* A keys manager holding the ML-KEM key file `key` under `name`. */
+static xmlSecKeysMngrPtr mlkem_manager(const char *key, const char *name) {
+    char path[512];
+    size_t size = 0;
+    xmlSecByte *bytes;
+    xmlSecKeyPtr loaded;
+    xmlSecKeysMngrPtr mngr = xmlSecKeysMngrCreate();
+    xmlSecCryptoAppDefaultKeysMngrInit(mngr);
+    snprintf(path, sizeof(path), MLKEM_KEYS "%s", key);
+    bytes = file_bytes(path, &size);
+    if (bytes == NULL) {
+        printf("  missing key file %s\n", key);
+        return mngr;
+    }
+    loaded = xmlSecCryptoAppKeyLoadMemory(bytes, (xmlSecSize)size, xmlSecKeyDataFormatPem, NULL,
+                                          NULL, NULL);
+    if (loaded == NULL) {
+        printf("  key %s not loaded\n", key);
+        return mngr;
+    }
+    xmlSecKeySetName(loaded, BAD_CAST name);
+    xmlSecCryptoAppDefaultKeysMngrAdoptKey(mngr, loaded);
+    return mngr;
+}
+
+/* `file` of the donor's KEM signature vectors, read as a document with its
+ * Object Id registered. */
+static xmlDocPtr kem_document(const char *file) {
+    static const xmlChar *ids[] = {BAD_CAST "Id", NULL};
+    char path[512];
+    xmlSecByte *bytes;
+    xmlDocPtr doc;
+    snprintf(path, sizeof(path), KEM_VECTORS "%s", file);
+    bytes = file_bytes(path, &(size_t){0});
+    if (bytes == NULL) {
+        printf("  missing vector %s\n", file);
+        return NULL;
+    }
+    doc = xsReadMemory((const char *)bytes, (int)strlen((const char *)bytes), "vector.xml", NULL, 0);
+    xmlSecAddIDs(doc, NULL, ids);
+    return doc;
+}
+
+/* Verifies `doc` with the recipient's private key `key` named `name`: the
+ * HMAC key is the secret its ML-KEM EncryptedKey decapsulates. */
+static void kem_verify(xmlDocPtr doc, const char *key, const char *name) {
+    xmlSecKeysMngrPtr mngr = mlkem_manager(key, name);
+    xmlSecDSigCtxPtr ctx = xmlSecDSigCtxCreate(mngr);
+    int ret = xmlSecDSigCtxVerify(ctx, signature_of(doc));
+    printf("  verify: %d status=%s reason=%s\n", ret, xmlSecDSigCtxGetStatusString(ctx->status),
+           xmlSecDSigCtxGetFailureReasonString(ctx->failureReason));
+    xmlSecDSigCtxDestroy(ctx);
+    xmlSecKeysMngrDestroy(mngr);
+}
+
+/* The donor's KEM signature vector `name`, verified with `key`. */
+static void kem_signature_vector(const char *name, const char *key, const char *key_name) {
+    char file[256];
+    xmlDocPtr doc;
+    printf("ml-kem signature vector %s\n", name);
+    snprintf(file, sizeof(file), "%s.xml", name);
+    doc = kem_document(file);
+    if (doc == NULL) {
+        return;
+    }
+    kem_verify(doc, key, key_name);
+    xsFreeDoc(doc);
+}
+
+/* The donor's KEM signature template `name` signed for the recipient's
+ * public key `public`, the HMAC key the secret its EncryptedKey
+ * encapsulates, then verified with the private key `private`. The
+ * ciphertext is fresh each time, so only outcomes print. */
+static void kem_signature_round_trip(const char *name, const char *public, const char *private,
+                                     const char *key_name) {
+    char file[256];
+    xmlDocPtr doc;
+    xmlSecKeysMngrPtr mngr;
+    xmlSecDSigCtxPtr ctx;
+    int signed_;
+    printf("ml-kem signature round trip %s\n", name);
+    snprintf(file, sizeof(file), "%s.tmpl", name);
+    doc = kem_document(file);
+    if (doc == NULL) {
+        return;
+    }
+    mngr = mlkem_manager(public, key_name);
+    ctx = xmlSecDSigCtxCreate(mngr);
+    /* The status is read after the signing, not in an argument list whose
+     * order of evaluation C leaves open. */
+    signed_ = xmlSecDSigCtxSign(ctx, signature_of(doc));
+    printf("  sign: %d status=%s\n", signed_, xmlSecDSigCtxGetStatusString(ctx->status));
+    xmlSecDSigCtxDestroy(ctx);
+    xmlSecKeysMngrDestroy(mngr);
+    kem_verify(doc, private, key_name);
+    xsFreeDoc(doc);
+}
+
 int main(void) {
     xmlDocPtr doc;
     xmlSecDSigCtxPtr ctx;
@@ -344,6 +458,14 @@ int main(void) {
     callbacks();
     detached();
     manifest();
+    kem_signature_vector("enveloping-sha256-hmac-sha256-kt-ml-kem-512", "ml-kem-512-key.pem",
+                         "TestKeyName-ml-kem-512");
+    kem_signature_vector("enveloping-sha256-hmac-sha256-kt-ml-kem-768", "ml-kem-768-key.pem",
+                         "TestKeyName-ml-kem-768");
+    kem_signature_vector("enveloping-sha256-hmac-sha256-kt-ml-kem-1024", "ml-kem-1024-key.pem",
+                         "TestKeyName-ml-kem-1024");
+    kem_signature_round_trip("enveloping-sha256-hmac-sha256-kt-ml-kem-512", "ml-kem-512-pubkey.pem",
+                             "ml-kem-512-key.pem", "TestKeyName-ml-kem-512");
 
     doc = sign("hmac sign", xmlSecTransformHmacSha256Id, hmac_key());
     verify("hmac verify", doc, hmac_key(), 0);

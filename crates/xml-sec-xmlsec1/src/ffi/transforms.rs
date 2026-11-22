@@ -34,6 +34,7 @@ pub(crate) mod hmac;
 pub(crate) mod io;
 pub(crate) mod kam;
 pub(crate) mod kdf;
+pub(crate) mod kem;
 pub(crate) mod parser;
 pub(crate) mod relationship;
 pub(crate) mod signatures;
@@ -1545,7 +1546,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformDefaultPushBin(
     ctx: *mut XmlSecTransformCtx,
 ) -> c_int {
     contain(-1, || {
-        let (object, klass) = valid_or!(transform, "xmlSecTransformDefaultPushBin", -1);
+        let (_, klass) = valid_or!(transform, "xmlSecTransformDefaultPushBin", -1);
         check!(
             !ctx.is_null(),
             "xmlSecTransformDefaultPushBin",
@@ -1568,6 +1569,10 @@ pub(crate) unsafe extern "C" fn xmlSecTransformDefaultPushBin(
             );
             let (mut data, mut remaining) = (data, size);
             loop {
+                // `execute` takes the transform exclusively, so no reference
+                // to it lives across that call: each phase derives its own
+                // from the live transform the caller passed.
+                let object = &mut *transform;
                 if remaining > 0 {
                     check!(
                         !data.is_null(),
@@ -1599,6 +1604,8 @@ pub(crate) unsafe extern "C" fn xmlSecTransformDefaultPushBin(
                     );
                     return -1;
                 }
+                // The transform is still live; `execute` has returned it.
+                let object = &mut *transform;
                 let in_size = xmlSecBufferGetSize(&raw mut object.in_buf);
                 let mut out_size = xmlSecBufferGetSize(&raw mut object.out_buf);
                 if in_size > 0 {
@@ -1720,7 +1727,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformDefaultPopBin(
     ctx: *mut XmlSecTransformCtx,
 ) -> c_int {
     contain(-1, || {
-        let (object, klass) = valid_or!(transform, "xmlSecTransformDefaultPopBin", -1);
+        let (_, klass) = valid_or!(transform, "xmlSecTransformDefaultPopBin", -1);
         check!(
             !data.is_null(),
             "xmlSecTransformDefaultPopBin",
@@ -1747,7 +1754,11 @@ pub(crate) unsafe extern "C" fn xmlSecTransformDefaultPopBin(
         unsafe {
             let chunk = (*ctx).binary_chunk_size;
             let mut is_final = false;
-            while xmlSecBufferGetSize(&raw mut object.out_buf) == 0 && !is_final {
+            // `execute` takes the transform exclusively, so no reference to
+            // it lives across that call: each phase derives its own from the
+            // live transform the caller passed.
+            while xmlSecBufferGetSize(&raw mut (*transform).out_buf) == 0 && !is_final {
+                let object = &mut *transform;
                 if object.prev.is_null() {
                     // Without a previous transform the input never grows.
                     is_final = true;
@@ -1762,6 +1773,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformDefaultPopBin(
                     return -1;
                 }
             }
+            let object = &mut *transform;
             let out_size = xmlSecBufferGetSize(&raw mut object.out_buf)
                 .min(max_size)
                 .min(chunk);

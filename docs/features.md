@@ -47,7 +47,7 @@ key/container codecs and does not make the whole build FIPS approved. There is
 no ordinary AWS-LC adapter and no missing-operation fallback between providers.
 `legacy-algorithms` alone does not enable XMLDSig or XMLEnc. Canonicalization
 helpers remain available with an XML backend even without the `c14n` marker.
-`no-unsafe` and `embedded` are compatibility markers, not separate security modes.
+`embedded` is a compatibility marker, not a separate security mode.
 
 ### Builds without `std`
 

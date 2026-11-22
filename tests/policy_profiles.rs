@@ -724,6 +724,16 @@ fn profiles_state_their_key_establishment_explicitly() {
             assert_eq!(policy.agreement_algorithms, Some(modern_agreements.clone()));
             assert_eq!(policy.derivation_algorithms, Some(derivations.clone()));
             assert_eq!(policy.digest_algorithms, Some(sha2.clone()));
+            // Outbound operations transport no key by ML-KEM in any profile.
+            assert!(policy.encapsulation_algorithms.is_empty(), "{profile:?}");
+            assert_eq!(
+                policy.kem_content_authentication,
+                xml_sec::policy::KemContentAuthentication::RequireAuthenticatedCipher
+            );
+            assert_eq!(
+                policy.kem_signature_trust,
+                xml_sec::policy::KemSignatureTrust::RequireCryptographicOnly
+            );
             // The explicit modern set admits what the implicit default
             // admitted and X448, nothing else.
             for algorithm in [A::EcdhEs, A::X25519, A::X448, A::DhEs, A::LegacyDh] {
@@ -756,7 +766,140 @@ fn profiles_state_their_key_establishment_explicitly() {
             }
             // No profile admits the legacy DH derivation libxmlsec1 lacks.
             assert!(policy.check_agreement(A::LegacyDh).is_err());
+            // libxmlsec1 transports keys by ML-KEM and keys CBC content with
+            // the secret; the compatible ceiling admits both where the
+            // provider decapsulates, the other profiles neither.
+            for algorithm in xml_sec::provider::KeyEncapsulationAlgorithm::all() {
+                assert_eq!(
+                    policy.check_encapsulation(algorithm).is_ok(),
+                    compatible
+                        && RustCryptoProvider.supports(
+                            xml_sec::provider::ProviderCapability::Decapsulate(algorithm)
+                        ),
+                    "{profile:?} {algorithm:?}"
+                );
+            }
+            assert_eq!(
+                policy.kem_content_authentication,
+                if compatible {
+                    xml_sec::policy::KemContentAuthentication::ExternalAuthenticated
+                } else {
+                    xml_sec::policy::KemContentAuthentication::RequireAuthenticatedCipher
+                },
+                "{profile:?}"
+            );
+            // libxmlsec1 verifies a KEM/HMAC signature with the recipient key
+            // its manager holds; only the compatible ceiling lets that key
+            // stand for a trusted one.
+            assert_eq!(
+                policy.kem_signature_trust,
+                if compatible {
+                    xml_sec::policy::KemSignatureTrust::AcceptRecipientKey
+                } else {
+                    xml_sec::policy::KemSignatureTrust::RequireCryptographicOnly
+                },
+                "{profile:?}"
+            );
         }
+    }
+}
+
+#[test]
+fn a_layer_requires_cryptographic_only_kem_signatures_again() {
+    // The compatible ceiling takes the recipient key for a trusted key on a
+    // KEM/HMAC signature, as libxmlsec1 does; a deployment layer that
+    // requires a cryptographic-only verification for it takes that back, and
+    // one that grants it to a profile whose ceiling refuses it gains nothing.
+    use xml_sec::policy::KemSignatureTrust as Trust;
+    for (profile, layer_value, expected) in [
+        (
+            PolicyProfile::XmlSecCompatible,
+            Trust::RequireCryptographicOnly,
+            Trust::RequireCryptographicOnly,
+        ),
+        (
+            PolicyProfile::XmlSecCompatible,
+            Trust::AcceptRecipientKey,
+            Trust::AcceptRecipientKey,
+        ),
+        (
+            PolicyProfile::Modern,
+            Trust::AcceptRecipientKey,
+            Trust::RequireCryptographicOnly,
+        ),
+    ] {
+        let initial = compiler(profile);
+        let mut layer = initial.policies().clone();
+        layer
+            .verification
+            .as_mut()
+            .unwrap()
+            .key_establishment
+            .kem_signature_trust = layer_value;
+        let compiled = initial
+            .restrict(&layer)
+            .unwrap()
+            .compile(&context())
+            .unwrap();
+        assert_eq!(
+            compiled
+                .verification()
+                .unwrap()
+                .key_establishment
+                .kem_signature_trust,
+            expected,
+            "{profile:?} {layer_value:?}"
+        );
+    }
+}
+
+#[cfg(feature = "xmlenc")]
+#[test]
+fn a_layer_requires_authenticated_kem_content_again() {
+    // The compatible ceiling keys CBC content with an ML-KEM secret, as
+    // libxmlsec1 does; a deployment layer that requires an authenticated
+    // content cipher takes that back, and one that grants it to a profile
+    // whose ceiling refuses it gains nothing.
+    use xml_sec::policy::KemContentAuthentication as Kem;
+    for (profile, layer_value, expected) in [
+        (
+            PolicyProfile::XmlSecCompatible,
+            Kem::RequireAuthenticatedCipher,
+            Kem::RequireAuthenticatedCipher,
+        ),
+        (
+            PolicyProfile::XmlSecCompatible,
+            Kem::ExternalAuthenticated,
+            Kem::ExternalAuthenticated,
+        ),
+        (
+            PolicyProfile::Modern,
+            Kem::ExternalAuthenticated,
+            Kem::RequireAuthenticatedCipher,
+        ),
+    ] {
+        let initial = compiler(profile);
+        let mut layer = initial.policies().clone();
+        layer
+            .decryption
+            .as_mut()
+            .unwrap()
+            .key_establishment
+            .kem_content_authentication = layer_value;
+        let compiled = initial
+            .restrict(&layer)
+            .unwrap()
+            .compile(&context())
+            .unwrap();
+        assert_eq!(
+            compiled
+                .decryption()
+                .unwrap()
+                .key_establishment
+                .kem_content_authentication,
+            expected,
+            "{profile:?} {layer_value:?}"
+        );
     }
 }
 

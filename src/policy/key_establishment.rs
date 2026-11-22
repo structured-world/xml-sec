@@ -94,6 +94,21 @@ pub enum KemContentAuthentication {
     ExternalAuthenticated,
 }
 
+/// What a verification that requires a trusted key makes of an HMAC key a
+/// KEM established, which authenticates no sender: anyone holding the
+/// recipient's public key can produce a signature that verifies with it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum KemSignatureTrust {
+    /// Refuse it; only a cryptographic-only verification takes a KEM/HMAC
+    /// signature.
+    #[default]
+    RequireCryptographicOnly,
+    /// Compatibility permission: the caller's recipient private key stands
+    /// for the trusted key, as libxmlsec1 takes the key its manager holds.
+    /// A valid result still proves no sender identity.
+    AcceptRecipientKey,
+}
+
 /// Immutable permission and limits shared by encryption and decryption.
 ///
 /// These are deployment decisions, not specification requirements. Requests
@@ -105,6 +120,9 @@ pub struct KeyEstablishmentPolicy {
     pub encapsulation_algorithms: BTreeSet<crate::provider::KeyEncapsulationAlgorithm>,
     /// Separate permission for unauthenticated direct KEM content composition.
     pub kem_content_authentication: KemContentAuthentication,
+    /// Separate permission for a KEM/HMAC signature under a verification that
+    /// requires a trusted key.
+    pub kem_signature_trust: KemSignatureTrust,
     /// Cumulative KEM attempts; failed provider calls consume allowance too.
     pub max_encapsulation_operations: usize,
     /// Exact agreement permissions. None permits only ECDH-ES and X25519.
@@ -137,6 +155,7 @@ impl Default for KeyEstablishmentPolicy {
         Self {
             encapsulation_algorithms: BTreeSet::new(),
             kem_content_authentication: KemContentAuthentication::default(),
+            kem_signature_trust: KemSignatureTrust::default(),
             max_encapsulation_operations: 64,
             agreement_algorithms: None,
             derivation_algorithms: None,
@@ -152,9 +171,15 @@ impl Default for KeyEstablishmentPolicy {
 }
 
 impl KeyEstablishmentPolicy {
-    /// Enforce the direct-content boundary independently of KEM capability.
+    /// Enforce the direct-content boundary independently of KEM capability:
+    /// whether content `algorithm` may be keyed directly by a KEM secret, on
+    /// encryption and decryption alike.
+    ///
+    /// # Errors
+    /// Returns a permission violation for unauthenticated content unless the
+    /// policy delegates its authentication to the caller.
     #[cfg(feature = "xmlenc")]
-    pub(crate) fn check_kem_content(
+    pub fn check_kem_content(
         &self,
         algorithm: crate::xmlenc::DataEncryptionAlgorithm,
     ) -> Result<(), PolicyViolation> {

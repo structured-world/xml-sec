@@ -21,22 +21,10 @@ pub(crate) mod storage;
 use crate::collections::{Set, set};
 use storage::Storage;
 
-#[cfg(feature = "no-unsafe")]
 use crate::OwnedQName;
 
-#[cfg(not(feature = "no-unsafe"))]
-pub type ExpandedName<'d> = QName<'d>;
-#[cfg(feature = "no-unsafe")]
 pub type ExpandedName<'d> = OwnedQName;
 
-#[cfg(not(feature = "no-unsafe"))]
-macro_rules! to_expanded_name {
-    ($e:expr) => {
-        $e
-    };
-}
-
-#[cfg(feature = "no-unsafe")]
 macro_rules! to_expanded_name {
     ($e:expr) => {
         OwnedQName::from($e)
@@ -81,9 +69,6 @@ pub struct Namespace<'d> {
     pub uri: NsStr<'d>,
 }
 
-#[cfg(not(feature = "no-unsafe"))]
-impl<'d> Copy for Namespace<'d> {}
-
 impl<'d> Namespace<'d> {
     #[must_use]
     pub fn document(&self) -> dom::Document<'d> {
@@ -109,10 +94,8 @@ impl<'d> Namespace<'d> {
 
 #[cfg(feature = "embedded")]
 pub(crate) type DeclarationText<'a, 'd> = sxd_document_no_unsafe::string_pool::Label<'a>;
-#[cfg(all(feature = "no-unsafe", not(feature = "embedded")))]
+#[cfg(not(feature = "embedded"))]
 pub(crate) type DeclarationText<'a, 'd> = &'a str;
-#[cfg(not(feature = "no-unsafe"))]
-pub(crate) type DeclarationText<'a, 'd> = &'d str;
 
 fn declaration_str<'a, 'd: 'a>(text: DeclarationText<'a, 'd>) -> &'a str {
     #[cfg(feature = "embedded")]
@@ -214,9 +197,6 @@ pub enum Node<'d> {
     ProcessingInstruction(dom::ProcessingInstruction<'d>),
 }
 
-#[cfg(not(feature = "no-unsafe"))]
-impl<'d> Copy for Node<'d> {}
-
 #[cfg(feature = "embedded")]
 impl structured_asn1::memory::HashWork for Node<'_> {
     fn hash_work(&self) -> Result<u64, structured_asn1::memory::MemoryError> {
@@ -311,13 +291,9 @@ impl<'d> Node<'d> {
         {
             return Ok(self.clone());
         }
-        if cfg!(feature = "no-unsafe")
-            && let Self::Namespace(namespace) = self
-        {
-            let bytes = namespace
-                .prefix()
-                .len()
-                .saturating_add(namespace.uri().len());
+        if let Self::Namespace(namespace) = self {
+            // Two string lengths, each at most isize::MAX, cannot overflow usize.
+            let bytes = namespace.prefix().len() + namespace.uri().len();
             context.charge_work(bytes)?;
             context.reserve_temporary_allocation(bytes)?;
         }
@@ -1592,9 +1568,8 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "no-unsafe")]
     fn first_namespace_identity_reserves_its_returned_copy() {
-        // Even a singleton namespace set owns strings in the safe DOM backend.
+        // Even a singleton namespace set owns its strings.
         let package = Package::new();
         let doc = package.as_document();
         let owner = doc.create_element("root");
@@ -1747,11 +1722,11 @@ mod test {
         let package = Package::new();
         let doc = package.as_document();
         let root = doc.create_element("root");
-        doc.root().append_child(root.clone());
-        let mut parent = root.clone();
+        doc.root().append_child(root);
+        let mut parent = root;
         for _ in 0..16_384 {
             let child = doc.create_element("node");
-            parent.append_child(child.clone());
+            parent.append_child(child);
             parent = child;
         }
         parent.append_child(doc.create_text("deep"));
@@ -1774,7 +1749,7 @@ mod test {
         let package = Package::new();
         let doc = package.as_document();
         let root = doc.create_element("root");
-        doc.root().append_child(root.clone());
+        doc.root().append_child(root);
         root.append_child(doc.create_text(&"x".repeat(1_024)));
         for _ in 0..1_024 {
             root.append_child(doc.create_element("unrelated"));
@@ -1837,7 +1812,7 @@ mod test {
         let package = Package::new();
         let doc = package.as_document();
         let root = doc.create_element("root");
-        doc.root().append_child(root.clone());
+        doc.root().append_child(root);
         for _ in 0..1_024 {
             root.append_child(doc.create_element("empty"));
         }
@@ -1857,7 +1832,7 @@ mod test {
         let package = Package::new();
         let doc = package.as_document();
         let root = doc.create_element("root");
-        doc.root().append_child(root.clone());
+        doc.root().append_child(root);
         root.append_child(doc.create_text("x"));
         root.append_child(doc.create_text(&"y".repeat(1_024)));
         let mut context = crate::context::Context::new();

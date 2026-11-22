@@ -13,14 +13,15 @@ use std::sync::Arc;
 
 use xml_sec::XmlDocument;
 use xml_sec::document::external::ExternalNode;
+use xml_sec::key_establishment::EstablishedEncapsulation;
 use xml_sec::policy::{
     EcdsaSignatureValueEncoding, EmptyDigestInput, ManifestProcessing, PolicyViolation,
     SameDocumentIdSemantics, SigningPolicy, VerificationPolicy,
 };
 use xml_sec::xmldsig::{
     DsigStatus, FailureReason, HmacSigningKey, HmacVerificationKey, KeptInputs, ReferenceResult,
-    SignContext, SignatureAlgorithm, SignatureTemplateSelection, SigningKey, VerificationKey,
-    VerifyContext, VerifyResult, VerifyingKey, uri::LazyExternalResources,
+    SignContext, SignatureAlgorithm, SignatureTemplateSelection, SigningInputs, SigningKey,
+    VerificationKey, VerifyContext, VerifyResult, VerifyingKey, uri::LazyExternalResources,
 };
 use xml_sec_libxml2::ffi::tree::{xsNodeGetChildren, xsNodeGetDoc};
 
@@ -52,6 +53,7 @@ use super::super::transforms::{
     xmlSecTransformSetKeyReq, xmlSecTransformVerifyNodeContent,
 };
 use super::super::tree::{XmlDoc, XmlNode, give, nodes};
+use super::super::xmlenc::key_source::take_encapsulation;
 use super::super::xmltree::{
     xmlSecAddIDs, xmlSecCheckNodeName, xmlSecFindChild, xmlSecGetNextElementNode,
 };
@@ -1368,13 +1370,23 @@ unsafe fn run_verification(
     if ctx.flags & FLAGS_STORE_MANIFEST_REFERENCES != 0 {
         kept = kept.with_manifest_references();
     }
-    let outcome = VerifyContext::new()
+    // A key the KeyInfo read decapsulated is offered for its own
+    // encapsulation alone.
+    // SAFETY: the context's own read context and key.
+    let established = unsafe { take_encapsulation(&raw mut ctx.key_info_read_ctx, ctx.sign_key) };
+    let mut context = VerifyContext::new()
         .shared_policy(policy)
         .key(key.as_ref())
         .signature(signature)
         .lazy_external_resources(&resources)
-        .keep_inputs(kept)
-        .verify_document(&document);
+        .keep_inputs(kept);
+    if let Some((algorithm, ciphertext)) = &established {
+        context = context.established_encapsulation(EstablishedEncapsulation {
+            algorithm: *algorithm,
+            ciphertext,
+        });
+    }
+    let outcome = context.verify_document(&document);
     let result = match outcome {
         Ok(result) => result,
         Err(error) => {
@@ -1620,18 +1632,28 @@ unsafe fn run_signing(
     let manifests = policy.manifest_processing == ManifestProcessing::Process;
     // SAFETY: the context's own reference contexts.
     let kept = unsafe { kept_inputs(ctx, manifests) };
+    // A key the KeyInfo write encapsulated is offered for the ciphertext it
+    // wrote alone.
+    // SAFETY: the context's own write context and key.
+    let established = unsafe { take_encapsulation(&raw mut ctx.key_info_write_ctx, ctx.sign_key) };
     let signed = xml_sec_libxml2::document::with_document(node, &**policy, |document, _| {
         let Some(template) = identity_in(document, external) else {
             return Err("the template is not in its document".to_owned());
         };
         let resources = resources.into_keyed(document, &policy.resources)?;
-        let context = SignContext::new(key.as_ref())
+        let mut context = SignContext::new(key.as_ref())
             .shared_policy(Arc::clone(policy))
             .external_resources(&resources.by_key)
             // libxmlsec1 writes the values through Base64 transforms of the
             // default line size.
             .base64_line_size(line_size)
             .signature_template_selection(SignatureTemplateSelection::Exact(template));
+        if let Some((algorithm, ciphertext)) = &established {
+            context = context.established_encapsulation(EstablishedEncapsulation {
+                algorithm: *algorithm,
+                ciphertext,
+            });
+        }
         // The storage flags keep the bytes the core digested and signed, as
         // libxmlsec1 keeps them from its one run of each chain: nothing runs
         // again, and the work stays within the operation's own budgets.
@@ -1667,6 +1689,21 @@ unsafe fn run_signing(
         }
     };
     // SAFETY: the context's own lists and its signature value element.
+    unsafe { report_signing(ctx, inputs, manifests) }
+}
+
+/// The contexts' reference statuses, kept buffers and result after the core
+/// signed the template, with the `inputs` it kept; Manifest references only
+/// when it processed `manifests`.
+///
+/// # Safety
+/// The context's reference lists hold the references read for the signing.
+unsafe fn report_signing(
+    ctx: &mut XmlSecDSigCtx,
+    inputs: Option<SigningInputs>,
+    manifests: bool,
+) -> c_int {
+    // SAFETY: by the caller's contract.
     unsafe {
         let mut kept = true;
         for reference in references(&raw mut ctx.signed_info_references) {

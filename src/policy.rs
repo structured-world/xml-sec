@@ -30,7 +30,8 @@ pub use clock::instant_from_system_time;
 mod key_establishment;
 #[cfg(feature = "xmldsig")]
 pub use key_establishment::{
-    KemContentAuthentication, KeyAgreementAlgorithm, KeyDerivationAlgorithm, KeyEstablishmentPolicy,
+    KemContentAuthentication, KemSignatureTrust, KeyAgreementAlgorithm, KeyDerivationAlgorithm,
+    KeyEstablishmentPolicy,
 };
 
 #[cfg(feature = "xmldsig")]

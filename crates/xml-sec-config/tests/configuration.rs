@@ -193,6 +193,40 @@ fn directional_diff_covers_minima_limits_and_disabled_operations() {
 }
 
 #[test]
+fn requiring_cryptographic_only_kem_signatures_is_restrictive() {
+    // Taking back the recipient key's stand-in trust for KEM/HMAC removes a
+    // permission, so operators see it as restrictive; granting it again is
+    // relaxing.
+    let compatible = |extra: &str| {
+        Configuration::from_str(
+            &format!("schema_version = 1\n[profiles.team]\nbase = 'XmlSecCompatible'\n{extra}"),
+            LoadLimits::default(),
+        )
+        .expect("strict config")
+    };
+    let field = "verification.key_establishment.kem_signature_trust";
+    let granted = effective(&compatible(""), "team");
+    let required = effective(
+        &compatible(
+            "[profiles.team.verification.key_establishment]\nkem_signature_trust='RequireCryptographicOnly'",
+        ),
+        "team",
+    );
+    for (old, new, expected) in [
+        (&granted, &required, Direction::Restrictive),
+        (&required, &granted, Direction::Relaxing),
+    ] {
+        let changes = old.diff(new);
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.field == field && c.direction == expected),
+            "{changes:?}"
+        );
+    }
+}
+
+#[test]
 fn detached_payload_settings_compose_restrictively() {
     // An ordinary layer only restricts: it cannot accept caller-attested
     // digests the base profile forbids, just as it cannot enable external URIs.

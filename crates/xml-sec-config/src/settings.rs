@@ -12,12 +12,13 @@ use xml_sec::{
         CertificateSignatureAlgorithms, CompiledPolicies, DetachedDigestAttestation, DsaKeyPolicy,
         EcdsaSignatureValueEncoding, EmptyDigestInput, ExtendedKeyPurpose,
         GeneratedCanonicalization, HmacPolicy, Instant, KemContentAuthentication,
-        KeyAgreementAlgorithm, KeyDerivationAlgorithm, KeyEstablishmentPolicy, KeyNameSemantics,
-        KeySourceKind, KeySourcePolicy, KeyTrustPolicy, ManifestProcessing, OpcRelationshipEdition,
-        PolicySet, PolicyValidity, RequestSelections, ResourcePolicy, RsaKeyPolicy,
-        RsaPssPermission, SameDocumentIdSemantics, SignatureConstraints, SigningPolicy,
-        TimestampTokenEncoding, TransformPolicy, UnknownX509CertificateSemantics, UriPolicy,
-        VerificationPolicy, VerificationTrustMode, XmlInputPolicy, XsltStylesheetSemantics,
+        KemSignatureTrust, KeyAgreementAlgorithm, KeyDerivationAlgorithm, KeyEstablishmentPolicy,
+        KeyNameSemantics, KeySourceKind, KeySourcePolicy, KeyTrustPolicy, ManifestProcessing,
+        OpcRelationshipEdition, PolicySet, PolicyValidity, RequestSelections, ResourcePolicy,
+        RsaKeyPolicy, RsaPssPermission, SameDocumentIdSemantics, SignatureConstraints,
+        SigningPolicy, TimestampTokenEncoding, TransformPolicy, UnknownX509CertificateSemantics,
+        UriPolicy, VerificationPolicy, VerificationTrustMode, XmlInputPolicy,
+        XsltStylesheetSemantics,
     },
     provider::{KeyEncapsulationAlgorithm, X509SignatureAlgorithm},
     xmldsig::{
@@ -335,6 +336,14 @@ fn key_establishment(p: &mut KeyEstablishmentPolicy, v: &Value) -> Result<(), Er
                     key,
                     KemContentAuthentication::RequireAuthenticatedCipher,
                     KemContentAuthentication::ExternalAuthenticated
+                );
+            }
+            "kem_signature_trust" => {
+                p.kem_signature_trust = choice!(
+                    value,
+                    key,
+                    KemSignatureTrust::RequireCryptographicOnly,
+                    KemSignatureTrust::AcceptRecipientKey
                 );
             }
             "max_encapsulation_operations" => p.max_encapsulation_operations = number(value, key)?,
@@ -912,6 +921,7 @@ fn establishment_snapshot(p: &KeyEstablishmentPolicy) -> Value {
     let KeyEstablishmentPolicy {
         encapsulation_algorithms: _,
         kem_content_authentication: _,
+        kem_signature_trust: _,
         max_encapsulation_operations: _,
         agreement_algorithms: _,
         derivation_algorithms: _,
@@ -934,6 +944,7 @@ fn establishment_snapshot(p: &KeyEstablishmentPolicy) -> Value {
             "kem_content_authentication".into(),
             named(p.kem_content_authentication),
         ),
+        ("kem_signature_trust".into(), named(p.kem_signature_trust)),
         (
             "agreement_algorithms".into(),
             optional_value(p.agreement_algorithms.as_ref(), |v| text(v.uri())),
@@ -1503,6 +1514,7 @@ fn direction(field: &str, old: Option<&Value>, new: Option<&Value>) -> Direction
                 "RequireTrustedKey"
                 | "Process"
                 | "RequireAuthenticatedCipher"
+                | "RequireCryptographicOnly"
                 | "ExactOnly"
                 | "Forbidden"
                 | "Declared"

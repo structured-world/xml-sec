@@ -53,6 +53,31 @@ Before completion, inspect the diff for newly introduced policy-like fields and 
 limits and prove each is correctly classified. Public-path tests must demonstrate that
 the compiled policy reaches every affected enforcement point.
 
+## Conformance First, Compatibility as Policy (CRITICAL)
+
+The product is built in two layers, and every change states which one it touches.
+
+1. **Conformant core.** The Rust core implements the normative specifications with the
+   safest behavior they allow. Its defaults and every profile other than the compatibility
+   ones are that behavior. How another implementation behaves never shapes a core default.
+2. **Compatibility as policy.** Compatibility with libxmlsec1 is a separate layer expressed
+   in typed policy: the `XmlSecCompatible` and `LegacyVerify` profiles, and named policy
+   values, override the canonical behavior where libxmlsec1 differs. Each override is one
+   policy field or set whose canonical value stays the default everywhere else. There is no
+   compatibility branch keyed on the caller, the API, the crate or a build flag. Where the
+   compatibility layer keeps the conformant behavior anyway (a libxmlsec1 defect or a
+   threat-model conflict), the departure is recorded with its reason.
+3. **Both behaviors through the C ABI.** The libxmlsec1-compatible C library and the
+   `xmlsec1` command run under the compatibility profile out of the box, so a libxmlsec1
+   program behaves as it does with libxmlsec1. The stricter behavior of the conformant core
+   is reachable from C through additional `xs`-prefixed entry points that narrow the
+   library's policy; it is the same core behavior selected by policy, never reimplemented.
+4. **No logic in the C layer.** `xml-sec-xmlsec1` and the `xmlsec1` command only map
+   libxmlsec1's structures, klasses, callbacks, flags and error reports onto the Rust API,
+   profiles and policy values. They decide no acceptance, parse no security structure
+   themselves and keep no policy constant or private policy of their own. A behavior they
+   need is added to the core first (Rust API, profile or policy field), then exposed.
+
 ## `no_std + alloc` Compatibility Gate (CRITICAL)
 
 The `no_std + alloc` configuration is a required product path, not an optional follow-up.

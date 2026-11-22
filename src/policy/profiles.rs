@@ -8,13 +8,13 @@ use super::{
     KeyWrapAlgorithm, OaepDigestAlgorithm,
 };
 use super::{
-    DigestAlgorithm, KeyAgreementAlgorithm, KeyDerivationAlgorithm, KeyEstablishmentPolicy,
-    KeySourceKind, KeySourcePolicy, PolicyViolation, RequestSelections, RsaPssPermission,
-    SameDocumentIdSemantics, SignatureAlgorithm, SigningPolicy, TransformPolicy,
-    UnknownX509CertificateSemantics, UriPolicy, UriTypeSet, VerificationPolicy,
-    XsltStylesheetSemantics,
+    DigestAlgorithm, KemContentAuthentication, KemSignatureTrust, KeyAgreementAlgorithm,
+    KeyDerivationAlgorithm, KeyEstablishmentPolicy, KeySourceKind, KeySourcePolicy,
+    PolicyViolation, RequestSelections, RsaPssPermission, SameDocumentIdSemantics,
+    SignatureAlgorithm, SigningPolicy, TransformPolicy, UnknownX509CertificateSemantics, UriPolicy,
+    UriTypeSet, VerificationPolicy, XsltStylesheetSemantics,
 };
-use crate::provider::{CryptoProvider, ProviderCapability};
+use crate::provider::{CryptoProvider, KeyEncapsulationAlgorithm, ProviderCapability};
 use alloc::{borrow::ToOwned, collections::BTreeSet, string::String, sync::Arc};
 
 mod composition;
@@ -625,8 +625,12 @@ const OAEP_MGF_DIGESTS: [OaepDigestAlgorithm; 5] = [
 /// The key establishment a profile admits, as explicit sets of what the
 /// provider can do: ECDH-ES, X25519 and X448 (RFC 7748) with `ConcatKDF`,
 /// HKDF or PBKDF2 over SHA-2 for every profile, and with `compatibility` also
-/// what libxmlsec1 agrees and derives with: DH-ES, and SHA-1 and SHA-3
-/// digests. A restricting layer narrows any of the sets.
+/// what libxmlsec1 agrees, derives and transports keys with: DH-ES, SHA-1 and
+/// SHA-3 digests, and ML-KEM key transport whose secret may key CBC content
+/// or an HMAC signature a trusted-key verification takes, as libxmlsec1 uses
+/// it. A restricting layer narrows any of the sets and can require an
+/// authenticated content cipher, or a cryptographic-only verification for
+/// KEM/HMAC, again.
 fn key_establishment_profile(
     provider: &dyn CryptoProvider,
     compatibility: bool,
@@ -684,6 +688,24 @@ fn key_establishment_profile(
                 .filter(|digest| provider.supports(ProviderCapability::Digest(*digest)))
                 .collect(),
         ),
+        encapsulation_algorithms: if compatibility {
+            KeyEncapsulationAlgorithm::all()
+                .into_iter()
+                .filter(|algorithm| provider.supports(ProviderCapability::Decapsulate(*algorithm)))
+                .collect()
+        } else {
+            BTreeSet::new()
+        },
+        kem_content_authentication: if compatibility {
+            KemContentAuthentication::ExternalAuthenticated
+        } else {
+            KemContentAuthentication::RequireAuthenticatedCipher
+        },
+        kem_signature_trust: if compatibility {
+            KemSignatureTrust::AcceptRecipientKey
+        } else {
+            KemSignatureTrust::RequireCryptographicOnly
+        },
         ..KeyEstablishmentPolicy::default()
     }
 }

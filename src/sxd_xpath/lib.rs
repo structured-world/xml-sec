@@ -105,15 +105,8 @@
 #![allow(
     clippy::legacy_numeric_constants,
     clippy::match_like_matches_macro,
-    clippy::option_as_ref_deref,
-    clippy::clone_on_copy // Node, Namespace, Evaluation are Copy only in default build
+    clippy::option_as_ref_deref
 )]
-
-#[cfg(not(any(feature = "no-unsafe", feature = "raw-pointer-backend")))]
-compile_error!("select either `no-unsafe` or `raw-pointer-backend`");
-
-// Cargo's all-feature verification enables both selectors. Safe precedence keeps that profile
-// free of raw pointers; selecting the legacy backend requires disabling default features.
 
 #[cfg(not(feature = "embedded"))]
 extern crate alloc;
