@@ -536,7 +536,9 @@ fn collect(
 /// `ChaCha` encryption or decryption of `data` with the method's `parameters`.
 /// An encryption whose parameters name no nonce draws one from the provider
 /// and keeps it in `parameters` for `writeNode`, as libxmlsec1 draws it; a
-/// decryption needs the nonce its `EncryptionMethod` carries.
+/// decryption needs the nonce its `EncryptionMethod` carries. An encryption
+/// context refuses a template without an `EncryptionMethod` for these klasses
+/// before they run, so no drawn nonce is lost with the context.
 fn chacha_crypt(
     algorithm: DataEncryptionAlgorithm,
     key: &[u8],
