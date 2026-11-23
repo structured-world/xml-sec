@@ -41,8 +41,8 @@ rsa = { version = "0.10", default-features = false, features = ["sha1", "hazmat"
 der = "0.8"
 pkcs8 = { version = "0.11", features = ["encryption", "pem"] }
 x509-parser = "0.18"
-structured-asn1 = { version = "0.23", default-features = false, features = ["alloc", "std"] }
-structured-pkix = { version = "0.23", default-features = false, features = ["alloc", "std"] }
+structured-asn1 = { version = "0.24", default-features = false, features = ["alloc", "std"] }
+structured-pkix = { version = "0.24", default-features = false, features = ["alloc", "std"] }
 zeroize = "1"
 base64 = "0.23"
 thiserror = "2"
