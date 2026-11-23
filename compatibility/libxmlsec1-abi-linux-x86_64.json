@@ -2773,12 +2773,6 @@
           "declaration": "export-variable"
         },
         {
-          "name": "xmlSecNameConcatKdfKey",
-          "kind": "data",
-          "size": 10,
-          "declaration": "export-variable"
-        },
-        {
           "name": "xmlSecNameDEREncodedKeyValue",
           "kind": "data",
           "size": 22,
@@ -3031,12 +3025,6 @@
           "declaration": "export-variable"
         },
         {
-          "name": "xmlSecNameHkdfKey",
-          "kind": "data",
-          "size": 5,
-          "declaration": "export-variable"
-        },
-        {
           "name": "xmlSecNameHmacMd5",
           "kind": "data",
           "size": 9,
@@ -3206,12 +3194,6 @@
         },
         {
           "name": "xmlSecNamePbkdf2",
-          "kind": "data",
-          "size": 7,
-          "declaration": "export-variable"
-        },
-        {
-          "name": "xmlSecNamePbkdf2Key",
           "kind": "data",
           "size": 7,
           "declaration": "export-variable"
@@ -4244,12 +4226,6 @@
           "declaration": "export-variable"
         },
         {
-          "name": "xmlSecNsExcC14NWithComments",
-          "kind": "data",
-          "size": 52,
-          "declaration": "export-variable"
-        },
-        {
           "name": "xmlSecNsMLDSAContextString",
           "kind": "data",
           "size": 40,
@@ -5054,6 +5030,11 @@
           "declaration": "export-function"
         },
         {
+          "name": "xmlSecTransformCtxGetDefaultXpathOpsLimit",
+          "kind": "function",
+          "declaration": "export-function"
+        },
+        {
           "name": "xmlSecTransformCtxInitialize",
           "kind": "function",
           "declaration": "export-function"
@@ -5090,6 +5071,11 @@
         },
         {
           "name": "xmlSecTransformCtxSetDefaultMaxDepth",
+          "kind": "function",
+          "declaration": "export-function"
+        },
+        {
+          "name": "xmlSecTransformCtxSetDefaultXpathOpsLimit",
           "kind": "function",
           "declaration": "export-function"
         },
@@ -7880,7 +7866,7 @@
     },
     {
       "name": "_xmlSecDSigCtx",
-      "size": 1488,
+      "size": 1544,
       "align": 8,
       "fields": [
         {
@@ -7901,123 +7887,123 @@
         {
           "name": "keyInfoReadCtx",
           "offset": 16,
-          "size": 552
+          "size": 576
         },
         {
           "name": "keyInfoWriteCtx",
-          "offset": 568,
-          "size": 552
+          "offset": 592,
+          "size": 576
         },
         {
           "name": "transformCtx",
-          "offset": 1120,
-          "size": 152
+          "offset": 1168,
+          "size": 160
         },
         {
           "name": "enabledReferenceUris",
-          "offset": 1272,
-          "size": 4
-        },
-        {
-          "name": "enabledReferenceTransforms",
-          "offset": 1280,
-          "size": 8
-        },
-        {
-          "name": "referencePreExecuteCallback",
-          "offset": 1288,
-          "size": 8
-        },
-        {
-          "name": "defSignMethodId",
-          "offset": 1296,
-          "size": 8
-        },
-        {
-          "name": "defC14NMethodId",
-          "offset": 1304,
-          "size": 8
-        },
-        {
-          "name": "defDigestMethodId",
-          "offset": 1312,
-          "size": 8
-        },
-        {
-          "name": "signKey",
-          "offset": 1320,
-          "size": 8
-        },
-        {
-          "name": "operation",
           "offset": 1328,
           "size": 4
         },
         {
-          "name": "result",
+          "name": "enabledReferenceTransforms",
           "offset": 1336,
           "size": 8
         },
         {
-          "name": "status",
+          "name": "referencePreExecuteCallback",
           "offset": 1344,
-          "size": 4
+          "size": 8
         },
         {
-          "name": "failureReason",
-          "offset": 1348,
-          "size": 4
-        },
-        {
-          "name": "signMethod",
+          "name": "defSignMethodId",
           "offset": 1352,
           "size": 8
         },
         {
-          "name": "c14nMethod",
+          "name": "defC14NMethodId",
           "offset": 1360,
           "size": 8
         },
         {
-          "name": "preSignMemBufMethod",
+          "name": "defDigestMethodId",
           "offset": 1368,
           "size": 8
         },
         {
-          "name": "signValueNode",
+          "name": "signKey",
           "offset": 1376,
           "size": 8
         },
         {
-          "name": "id",
+          "name": "operation",
           "offset": 1384,
+          "size": 4
+        },
+        {
+          "name": "result",
+          "offset": 1392,
+          "size": 8
+        },
+        {
+          "name": "status",
+          "offset": 1400,
+          "size": 4
+        },
+        {
+          "name": "failureReason",
+          "offset": 1404,
+          "size": 4
+        },
+        {
+          "name": "signMethod",
+          "offset": 1408,
+          "size": 8
+        },
+        {
+          "name": "c14nMethod",
+          "offset": 1416,
+          "size": 8
+        },
+        {
+          "name": "preSignMemBufMethod",
+          "offset": 1424,
+          "size": 8
+        },
+        {
+          "name": "signValueNode",
+          "offset": 1432,
+          "size": 8
+        },
+        {
+          "name": "id",
+          "offset": 1440,
           "size": 8
         },
         {
           "name": "signedInfoReferences",
-          "offset": 1392,
+          "offset": 1448,
           "size": 40
         },
         {
           "name": "manifestReferences",
-          "offset": 1432,
+          "offset": 1488,
           "size": 40
         },
         {
           "name": "reserved0",
-          "offset": 1472,
+          "offset": 1528,
           "size": 8
         },
         {
           "name": "reserved1",
-          "offset": 1480,
+          "offset": 1536,
           "size": 8
         }
       ]
     },
     {
       "name": "_xmlSecDSigReferenceCtx",
-      "size": 248,
+      "size": 256,
       "align": 8,
       "fields": [
         {
@@ -8038,58 +8024,58 @@
         {
           "name": "transformCtx",
           "offset": 24,
-          "size": 152
+          "size": 160
         },
         {
           "name": "digestMethod",
-          "offset": 176,
-          "size": 8
-        },
-        {
-          "name": "result",
           "offset": 184,
           "size": 8
         },
         {
-          "name": "status",
+          "name": "result",
           "offset": 192,
+          "size": 8
+        },
+        {
+          "name": "status",
+          "offset": 200,
           "size": 4
         },
         {
           "name": "preDigestMemBufMethod",
-          "offset": 200,
-          "size": 8
-        },
-        {
-          "name": "id",
           "offset": 208,
           "size": 8
         },
         {
-          "name": "uri",
+          "name": "id",
           "offset": 216,
           "size": 8
         },
         {
-          "name": "type",
+          "name": "uri",
           "offset": 224,
           "size": 8
         },
         {
-          "name": "reserved0",
+          "name": "type",
           "offset": 232,
           "size": 8
         },
         {
-          "name": "reserved1",
+          "name": "reserved0",
           "offset": 240,
+          "size": 8
+        },
+        {
+          "name": "reserved1",
+          "offset": 248,
           "size": 8
         }
       ]
     },
     {
       "name": "_xmlSecEncCtx",
-      "size": 1432,
+      "size": 1488,
       "align": 8,
       "fields": [
         {
@@ -8115,116 +8101,116 @@
         {
           "name": "keyInfoReadCtx",
           "offset": 24,
-          "size": 552
+          "size": 576
         },
         {
           "name": "keyInfoWriteCtx",
-          "offset": 576,
-          "size": 552
+          "offset": 600,
+          "size": 576
         },
         {
           "name": "transformCtx",
-          "offset": 1128,
-          "size": 152
+          "offset": 1176,
+          "size": 160
         },
         {
           "name": "defEncMethodId",
-          "offset": 1280,
-          "size": 8
-        },
-        {
-          "name": "encKey",
-          "offset": 1288,
-          "size": 8
-        },
-        {
-          "name": "operation",
-          "offset": 1296,
-          "size": 4
-        },
-        {
-          "name": "result",
-          "offset": 1304,
-          "size": 8
-        },
-        {
-          "name": "resultBase64Encoded",
-          "offset": 1312,
-          "size": 4
-        },
-        {
-          "name": "resultReplaced",
-          "offset": 1316,
-          "size": 4
-        },
-        {
-          "name": "encMethod",
-          "offset": 1320,
-          "size": 8
-        },
-        {
-          "name": "failureReason",
-          "offset": 1328,
-          "size": 4
-        },
-        {
-          "name": "id",
           "offset": 1336,
           "size": 8
         },
         {
-          "name": "type",
+          "name": "encKey",
           "offset": 1344,
           "size": 8
         },
         {
-          "name": "mimeType",
+          "name": "operation",
           "offset": 1352,
-          "size": 8
+          "size": 4
         },
         {
-          "name": "encoding",
+          "name": "result",
           "offset": 1360,
           "size": 8
         },
         {
-          "name": "recipient",
+          "name": "resultBase64Encoded",
           "offset": 1368,
-          "size": 8
+          "size": 4
         },
         {
-          "name": "carriedKeyName",
+          "name": "resultReplaced",
+          "offset": 1372,
+          "size": 4
+        },
+        {
+          "name": "encMethod",
           "offset": 1376,
           "size": 8
         },
         {
-          "name": "encDataNode",
+          "name": "failureReason",
           "offset": 1384,
-          "size": 8
+          "size": 4
         },
         {
-          "name": "encMethodNode",
+          "name": "id",
           "offset": 1392,
           "size": 8
         },
         {
-          "name": "keyInfoNode",
+          "name": "type",
           "offset": 1400,
           "size": 8
         },
         {
-          "name": "cipherValueNode",
+          "name": "mimeType",
           "offset": 1408,
           "size": 8
         },
         {
-          "name": "replacedNodeList",
+          "name": "encoding",
           "offset": 1416,
           "size": 8
         },
         {
-          "name": "reserved1",
+          "name": "recipient",
           "offset": 1424,
+          "size": 8
+        },
+        {
+          "name": "carriedKeyName",
+          "offset": 1432,
+          "size": 8
+        },
+        {
+          "name": "encDataNode",
+          "offset": 1440,
+          "size": 8
+        },
+        {
+          "name": "encMethodNode",
+          "offset": 1448,
+          "size": 8
+        },
+        {
+          "name": "keyInfoNode",
+          "offset": 1456,
+          "size": 8
+        },
+        {
+          "name": "cipherValueNode",
+          "offset": 1464,
+          "size": 8
+        },
+        {
+          "name": "replacedNodeList",
+          "offset": 1472,
+          "size": 8
+        },
+        {
+          "name": "reserved1",
+          "offset": 1480,
           "size": 8
         }
       ]
@@ -8471,7 +8457,7 @@
     },
     {
       "name": "_xmlSecKeyInfoCtx",
-      "size": 552,
+      "size": 576,
       "align": 8,
       "fields": [
         {
@@ -8510,83 +8496,88 @@
           "size": 4
         },
         {
-          "name": "retrievalMethodCtx",
+          "name": "maxKeyInfoChildren",
           "offset": 80,
-          "size": 152
+          "size": 8
+        },
+        {
+          "name": "retrievalMethodCtx",
+          "offset": 88,
+          "size": 160
         },
         {
           "name": "maxRetrievalMethodLevel",
-          "offset": 232,
+          "offset": 248,
           "size": 4
         },
         {
           "name": "keyInfoReferenceCtx",
-          "offset": 240,
-          "size": 152
+          "offset": 256,
+          "size": 160
         },
         {
           "name": "maxKeyInfoReferenceLevel",
-          "offset": 392,
+          "offset": 416,
           "size": 4
         },
         {
           "name": "encCtx",
-          "offset": 400,
+          "offset": 424,
           "size": 8
         },
         {
           "name": "maxEncryptedKeyLevel",
-          "offset": 408,
+          "offset": 432,
           "size": 4
         },
         {
           "name": "certsVerificationTime",
-          "offset": 416,
+          "offset": 440,
           "size": 8
         },
         {
           "name": "certsVerificationDepth",
-          "offset": 424,
-          "size": 4
-        },
-        {
-          "name": "deprecated0",
-          "offset": 432,
-          "size": 8
-        },
-        {
-          "name": "curRetrievalMethodLevel",
-          "offset": 440,
-          "size": 4
-        },
-        {
-          "name": "curKeyInfoReferenceLevel",
-          "offset": 444,
-          "size": 4
-        },
-        {
-          "name": "curEncryptedKeyLevel",
           "offset": 448,
           "size": 4
         },
         {
+          "name": "deprecated0",
+          "offset": 456,
+          "size": 8
+        },
+        {
+          "name": "curRetrievalMethodLevel",
+          "offset": 464,
+          "size": 4
+        },
+        {
+          "name": "curKeyInfoReferenceLevel",
+          "offset": 468,
+          "size": 4
+        },
+        {
+          "name": "curEncryptedKeyLevel",
+          "offset": 472,
+          "size": 4
+        },
+        {
           "name": "operation",
-          "offset": 452,
+          "offset": 476,
           "size": 4
         },
         {
           "name": "keyReq",
-          "offset": 456,
+          "offset": 480,
           "size": 80
         },
         {
           "name": "reserved0",
-          "offset": 536,
+          "offset": 560,
           "size": 8
         },
         {
           "name": "reserved1",
-          "offset": 544,
+          "offset": 568,
           "size": 8
         }
       ]
@@ -9032,7 +9023,7 @@
     },
     {
       "name": "_xmlSecTransformCtx",
-      "size": 152,
+      "size": 160,
       "align": 8,
       "fields": [
         {
@@ -9056,63 +9047,68 @@
           "size": 8
         },
         {
-          "name": "enabledUris",
+          "name": "xpathOpsLimit",
           "offset": 24,
+          "size": 8
+        },
+        {
+          "name": "enabledUris",
+          "offset": 32,
           "size": 4
         },
         {
           "name": "enabledTransforms",
-          "offset": 32,
+          "offset": 40,
           "size": 40
         },
         {
           "name": "preExecCallback",
-          "offset": 72,
-          "size": 8
-        },
-        {
-          "name": "parentKeyInfoCtx",
           "offset": 80,
           "size": 8
         },
         {
-          "name": "result",
+          "name": "parentKeyInfoCtx",
           "offset": 88,
           "size": 8
         },
         {
-          "name": "status",
+          "name": "result",
           "offset": 96,
+          "size": 8
+        },
+        {
+          "name": "status",
+          "offset": 104,
           "size": 4
         },
         {
           "name": "uri",
-          "offset": 104,
-          "size": 8
-        },
-        {
-          "name": "xptrExpr",
           "offset": 112,
           "size": 8
         },
         {
-          "name": "first",
+          "name": "xptrExpr",
           "offset": 120,
           "size": 8
         },
         {
-          "name": "last",
+          "name": "first",
           "offset": 128,
           "size": 8
         },
         {
-          "name": "extraKeyData",
+          "name": "last",
           "offset": 136,
           "size": 8
         },
         {
-          "name": "reserved0",
+          "name": "extraKeyData",
           "offset": 144,
+          "size": 8
+        },
+        {
+          "name": "reserved0",
+          "offset": 152,
           "size": 8
         }
       ]
@@ -13968,6 +13964,12 @@
       }
     },
     {
+      "name": "xmlSecTransformCtxGetDefaultXpathOpsLimit",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
       "name": "xmlSecTransformCtxInitialize",
       "returns": {
         "kind": "value"
@@ -14015,6 +14017,12 @@
     },
     {
       "name": "xmlSecTransformCtxSetDefaultMaxDepth",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecTransformCtxSetDefaultXpathOpsLimit",
       "returns": {
         "kind": "value"
       }

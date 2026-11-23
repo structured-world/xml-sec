@@ -6868,8 +6868,10 @@ BA== </Modulus>
 
     #[test]
     fn key_info_children_follow_the_policy() {
-        // `max_key_info_children` counts every child element, known or not,
-        // and the compatible profile reads ten as libxmlsec1 does.
+        // `max_key_info_children` counts every child element, known or not.
+        // The compatible profile keeps the canonical limit: the core reads
+        // every child before it selects a key, where libxmlsec1 stops
+        // counting at the one that yields it.
         let children = r#"<KeyName>a</KeyName><extension xmlns="urn:test"/>"#;
         let xml =
             format!(r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">{children}</KeyInfo>"#);
@@ -6916,7 +6918,7 @@ BA== </Modulus>
                 .unwrap()
                 .resources
                 .max_key_info_children,
-            10
+            crate::policy::ResourcePolicy::default().max_key_info_children
         );
     }
 

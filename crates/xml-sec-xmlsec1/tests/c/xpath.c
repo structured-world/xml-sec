@@ -133,6 +133,10 @@ int main(void) {
            xmlSecTransformXPointerSetExpr(transform, BAD_CAST "xpointer(/)", xmlSecNodeSetTree,
                                           root));
     xmlSecTransformDestroy(transform);
+    /* The Visa3D hack is deprecated upstream but still exported, so its
+     * behavior stays under comparison. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     transform = xmlSecTransformCreate(xmlSecTransformVisa3DHackId);
     printf("set id: %d again: %d\n", xmlSecTransformVisa3DHackSetID(transform, BAD_CAST "k"),
            xmlSecTransformVisa3DHackSetID(transform, BAD_CAST "k"));
@@ -143,6 +147,7 @@ int main(void) {
            xmlSecTransformXPath2Id->objSize == xmlSecTransformXPathId->objSize,
            xmlSecTransformXPointerId->objSize == xmlSecTransformXPathId->objSize,
            xmlSecTransformVisa3DHackId->objSize == sizeof(xmlSecTransform) + sizeof(void *));
+#pragma GCC diagnostic pop
 
     xmlSecTransformIdsShutdown();
     xsFreeDoc(doc);

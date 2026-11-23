@@ -12,9 +12,10 @@ fn project_root() -> &'static Path {
 
 #[test]
 fn resource_options_set_the_compatible_limits_as_libxmlsec1_reads_them() {
-    // Without options the command reads libxmlsec1's ten KeyInfo children;
-    // a count sets that limit up to the core's canonical value, zero lifts it
-    // there, and the XPath operations limit only narrows the evaluation work.
+    // Without options the command keeps the profile's canonical limits; a
+    // count sets the KeyInfo child limit up to the core's canonical value,
+    // zero lifts it there, and the XPath operations limit only narrows the
+    // evaluation work.
     let canonical = ResourcePolicy::default();
     let resources = |options: &[&str]| {
         let mut arguments = vec!["xmlsec1", "verify"];
@@ -23,7 +24,10 @@ fn resource_options_set_the_compatible_limits_as_libxmlsec1_reads_them() {
         xmlsec_compatibility_resources(&invocation(&arguments))
     };
     let defaults = resources(&[]);
-    assert_eq!(defaults.max_key_info_children, 10);
+    assert_eq!(
+        defaults.max_key_info_children,
+        canonical.max_key_info_children
+    );
     assert_eq!(
         defaults.max_xpath_evaluation_work,
         canonical.max_xpath_evaluation_work

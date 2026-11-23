@@ -5728,12 +5728,13 @@ fn validate_resource_options(invocation: &Invocation) -> Result<(), CommandError
     Ok(())
 }
 
-/// The resource limits of the `XmlSecCompatible` profile, which follow
-/// libxmlsec1's defaults where they differ, set by this invocation's
-/// `--max-key-info-children` and narrowed by its `--xpath-ops-limit`. Zero
-/// lifts a limit as libxmlsec1 does, up to the core's canonical value, which
-/// a larger count cannot pass either; the operations limit bounds the core's
-/// own `XPath` evaluation work rather than libxml2's operations.
+/// The resource limits of the `XmlSecCompatible` profile, set by this
+/// invocation's `--max-key-info-children` and narrowed by its
+/// `--xpath-ops-limit`. Zero lifts a limit as libxmlsec1 does, up to the
+/// core's canonical value, which a larger count cannot pass either. The core
+/// counts every `KeyInfo` child before it selects a key, where libxmlsec1
+/// stops at the one that yields it, and the operations limit bounds the
+/// core's own `XPath` evaluation work rather than libxml2's operations.
 fn xmlsec_compatibility_resources(invocation: &Invocation) -> xml_sec::policy::ResourcePolicy {
     let canonical = xml_sec::policy::ResourcePolicy::default();
     let mut resources = xml_sec::policy::PolicyCompiler::new(

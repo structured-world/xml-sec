@@ -430,19 +430,11 @@ fn profile_policies(
     if let Some(policy) = decryption.as_mut() {
         policy.key_establishment = key_establishment_profile(provider, compatibility);
     }
-    if compatibility {
-        compatible_resources(&mut verification.resources);
-        compatible_resources(&mut signing.resources);
-        #[cfg(feature = "xmlenc")]
-        {
-            if let Some(policy) = encryption.as_mut() {
-                compatible_resources(&mut policy.resources);
-            }
-            if let Some(policy) = decryption.as_mut() {
-                compatible_resources(&mut policy.resources);
-            }
-        }
-    }
+    // The compatibility profiles keep the canonical `max_key_info_children`
+    // rather than libxmlsec1's ten: libxmlsec1 stops counting at the child
+    // that yields the key, while the core reads every child before selecting
+    // one, so ten would refuse a document with many recipients that
+    // libxmlsec1 decrypts with the first.
     PolicySet {
         verification: Some(verification),
         signing: (!legacy).then_some(signing),
@@ -451,16 +443,6 @@ fn profile_policies(
         #[cfg(feature = "xmlenc")]
         decryption,
     }
-}
-
-/// The child elements of one `KeyInfo` libxmlsec1 reads by default
-/// (`XMLSEC_KEYINFO_DEFAULT_MAX_KEYINFO_CHILDREN`).
-const LIBXMLSEC1_KEY_INFO_CHILDREN: usize = 10;
-
-/// The resource limits on which the compatibility profiles follow
-/// libxmlsec1's defaults; every other limit keeps the canonical value.
-fn compatible_resources(resources: &mut crate::policy::ResourcePolicy) {
-    resources.max_key_info_children = LIBXMLSEC1_KEY_INFO_CHILDREN;
 }
 
 fn verification_profile(
