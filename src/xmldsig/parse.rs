@@ -4198,6 +4198,29 @@ fn parse_x509_issuer_serial(node: Node<'_, '_>) -> Result<(String, String), Pars
 ///
 /// `XMLDSig` allows whitespace within base64 content (line-wrapped encodings).
 fn base64_decode_digest(b64: &str, digest_method: DigestAlgorithm) -> Result<Vec<u8>, ParseError> {
+    decode_digest_text(b64, digest_method, [b64.as_bytes()])
+}
+
+/// A Base64 decoding failure of the text `texts` hold, as a parse error that
+/// locates it in that text.
+fn located_base64_error<'t>(
+    error: structured_base64::OwnedError,
+    texts: impl IntoIterator<Item = &'t [u8]>,
+) -> ParseError {
+    ParseError::Base64(match error {
+        structured_base64::OwnedError::Codec(error) => {
+            super::whitespace::locate_in_xml_text(error, texts).to_string()
+        }
+        error @ structured_base64::OwnedError::Reserve(_) => error.to_string(),
+    })
+}
+
+/// Decode `b64`, the whitespace-normalized or raw text of `texts`.
+fn decode_digest_text<'t>(
+    b64: &str,
+    digest_method: DigestAlgorithm,
+    texts: impl IntoIterator<Item = &'t [u8]>,
+) -> Result<Vec<u8>, ParseError> {
     let expected = digest_method.output_len();
     let max_base64_len = expected.div_ceil(3) * 4;
     let mut cleaned = String::with_capacity(b64.len().min(max_base64_len));
@@ -4214,7 +4237,7 @@ fn base64_decode_digest(b64: &str, digest_method: DigestAlgorithm) -> Result<Vec
     }
     let digest = structured_base64::STANDARD
         .decode(cleaned.as_bytes())
-        .map_err(|e| ParseError::Base64(e.to_string()))?;
+        .map_err(|error| located_base64_error(error, texts))?;
     let actual = digest.len();
     if actual != expected {
         return Err(ParseError::DigestLengthMismatch {
@@ -4254,7 +4277,14 @@ fn decode_digest_value_children(
         }
     }
 
-    base64_decode_digest(&cleaned, digest_method)
+    decode_digest_text(
+        &cleaned,
+        digest_method,
+        digest_value_node
+            .children()
+            .filter_map(Node::text)
+            .map(str::as_bytes),
+    )
 }
 
 fn decode_der_encoded_key_value_base64(node: Node<'_, '_>) -> Result<Vec<u8>, ParseError> {
@@ -4282,7 +4312,15 @@ fn decode_der_encoded_key_value_base64(node: Node<'_, '_>) -> Result<Vec<u8>, Pa
 
     let der = structured_base64::STANDARD
         .decode(cleaned.as_bytes())
-        .map_err(|e| ParseError::Base64(e.to_string()))?;
+        .map_err(|error| {
+            located_base64_error(
+                error,
+                node.children()
+                    .filter(Node::is_text)
+                    .filter_map(Node::text)
+                    .map(str::as_bytes),
+            )
+        })?;
     if der.is_empty() {
         return Err(ParseError::InvalidStructure(
             "DEREncodedKeyValue must not be empty".into(),
@@ -7524,6 +7562,34 @@ BA== </Modulus>
         )
         .expect_err("form-feed/vertical-tab in DigestValue must be rejected");
         assert!(matches!(err, ParseError::Base64(_)));
+    }
+
+    #[test]
+    fn base64_failures_are_located_in_the_element_text() {
+        // XML whitespace is removed before decoding, and comments split the
+        // text into nodes; offsets still count every byte of the element's text.
+        let located = |error: structured_base64::Base64Error| ParseError::Base64(error.to_string());
+        let digest = Document::parse("<DigestValue>AAAA \n!AAA</DigestValue>").unwrap();
+        assert_eq!(
+            decode_digest_value_children(digest.root_element(), DigestAlgorithm::Sha1)
+                .unwrap_err()
+                .to_string(),
+            located(structured_base64::Base64Error::InvalidByte(6, b'!')).to_string()
+        );
+        let der =
+            Document::parse("<DEREncodedKeyValue>MI <!--c-->\n!A</DEREncodedKeyValue>").unwrap();
+        assert_eq!(
+            decode_der_encoded_key_value_base64(der.root_element())
+                .unwrap_err()
+                .to_string(),
+            located(structured_base64::Base64Error::InvalidByte(4, b'!')).to_string()
+        );
+        assert_eq!(
+            base64_decode_digest("AAAA\tQ R==", DigestAlgorithm::Sha1)
+                .unwrap_err()
+                .to_string(),
+            located(structured_base64::Base64Error::InvalidLastSymbol(7, b'R')).to_string()
+        );
     }
 
     #[test]

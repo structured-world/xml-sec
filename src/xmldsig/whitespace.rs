@@ -234,6 +234,44 @@ fn decode_chunk(
     Ok(written + length)
 }
 
+/// `error` of the strict decoder over `texts` with XML whitespace removed,
+/// located in the concatenated `texts`: a symbol offset counts the removed
+/// whitespace too, and an incomplete quantum ends where the text ends.
+///
+/// The walk repeats the removal only on this failure path, so decoding keeps
+/// no per-byte position map.
+#[cold]
+pub(crate) fn locate_in_xml_text<'t>(
+    error: structured_base64::Base64Error,
+    texts: impl IntoIterator<Item = &'t [u8]>,
+) -> structured_base64::Base64Error {
+    use structured_base64::Base64Error;
+    let original = |normalized: usize| {
+        let mut kept = 0_usize;
+        let mut position = 0_usize;
+        for text in texts {
+            for &byte in text {
+                if !matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
+                    if kept == normalized {
+                        return position;
+                    }
+                    kept += 1;
+                }
+                position += 1;
+            }
+        }
+        position
+    };
+    match error {
+        Base64Error::InvalidByte(offset, byte) => Base64Error::InvalidByte(original(offset), byte),
+        Base64Error::InvalidLastSymbol(offset, byte) => {
+            Base64Error::InvalidLastSymbol(original(offset), byte)
+        }
+        Base64Error::InvalidLength(_) => Base64Error::InvalidLength(original(usize::MAX)),
+        Base64Error::Invalid | Base64Error::OutputFull => error,
+    }
+}
+
 /// Return `true` when the text contains only XML 1.0 whitespace chars.
 #[inline]
 pub(crate) fn is_xml_whitespace_only(text: &str) -> bool {

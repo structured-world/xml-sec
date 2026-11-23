@@ -80,9 +80,7 @@ fn export(directory: &std::path::Path) -> Result<(), Box<dyn Error>> {
         directory.join("public.pem"),
         include_bytes!("../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"),
     )?;
-    let aes = structured_base64::STANDARD
-        .encode(&[0x42; 32])
-        .expect("test encoding");
+    let aes = structured_base64::STANDARD.encode(&[0x42; 32])?;
     std::fs::write(
         directory.join("keys.xml"),
         format!(

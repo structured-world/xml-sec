@@ -1248,10 +1248,15 @@ fn base64_projection<S: Scratch, K: super::types::projection::Keys, D: DomStorag
     scratch: &S,
 ) -> Result<S::Bytes, TransformError> {
     let mut normalized = scratch.bytes();
+    let mut origin = super::base64_stream::Base64Origin::default();
     for_each_base64_input(binary, nodes, scratch, |encoded| {
+        origin.observe(encoded);
         append_normalized_base64(encoded, &mut normalized, &budget.base64, scratch)
     })?;
-    decode_base64_transform(&normalized, &budget.base64, scratch)
+    decode_base64_transform(&normalized, &budget.base64, scratch).map_err(|error| match error {
+        TransformError::Base64(error) => TransformError::Base64(origin.locate(error)),
+        other => other,
+    })
 }
 
 /// Visit the Base64 input in order: octets, or the selected text nodes in
@@ -4469,6 +4474,37 @@ mod tests {
                         at, b'='
                     ))) if at == offset
                 ),
+                "{input:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn base64_transform_locates_failures_in_the_unfiltered_input() {
+        // RFC 2045 section 6.8 filtering removes bytes before decoding; the
+        // reported offset still counts them, as the streaming decoder does.
+        let doc = Document::parse("<root/>").unwrap();
+        for (input, expected) in [
+            (
+                &b" \n=AAA"[..],
+                structured_base64::Base64Error::InvalidByte(2, b'='),
+            ),
+            (
+                b"Q R==",
+                structured_base64::Base64Error::InvalidLastSymbol(2, b'R'),
+            ),
+            (
+                b"QUJD Q\n",
+                structured_base64::Base64Error::InvalidLength(7),
+            ),
+        ] {
+            let result = apply_transform(
+                doc.root_element(),
+                &Transform::Base64Decode,
+                TransformData::Binary(input.to_vec()),
+            );
+            assert!(
+                matches!(result, Err(TransformError::Base64(error)) if error == expected),
                 "{input:?}: {result:?}"
             );
         }

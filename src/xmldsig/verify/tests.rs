@@ -5789,6 +5789,45 @@ fn fragmented_pq_signature_value_decodes_at_exact_wire_limit() {
 }
 
 #[test]
+fn signature_value_failures_are_located_in_the_element_text() {
+    // XML whitespace is removed before decoding, and comments split the text
+    // into nodes; offsets still count every byte of the element's text.
+    for (xml, expected) in [
+        (
+            "<SignatureValue>QUJD \n!AAA</SignatureValue>",
+            structured_base64::Base64Error::InvalidByte(6, b'!'),
+        ),
+        (
+            "<SignatureValue>QU <!--c-->\n!A</SignatureValue>",
+            structured_base64::Base64Error::InvalidByte(4, b'!'),
+        ),
+        (
+            "<SignatureValue>QUJD\nQ R==</SignatureValue>",
+            structured_base64::Base64Error::InvalidLastSymbol(7, b'R'),
+        ),
+        (
+            "<SignatureValue>QUJD Q\n</SignatureValue>",
+            structured_base64::Base64Error::InvalidLength(7),
+        ),
+    ] {
+        let document = Document::parse(xml).unwrap();
+        let result = decode_signature_value(
+            document.root_element(),
+            SignatureAlgorithm::RsaSha256,
+            &crate::policy::ResourcePolicy::default(),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(SignatureVerificationPipelineError::SignatureValueBase64(error))
+                    if error == expected
+            ),
+            "{xml}: {result:?}"
+        );
+    }
+}
+
+#[test]
 fn push_normalized_signature_text_rejects_form_feed() {
     let mut normalized = Vec::new();
     let mut raw_text_len = 0usize;

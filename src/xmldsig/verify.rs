@@ -6835,6 +6835,16 @@ fn decode_signature_value(
             }
         }
     }
+    let located = |error| {
+        let texts = signature_value_node
+            .children()
+            .filter(Node::is_text)
+            .filter_map(Node::text)
+            .map(str::as_bytes);
+        SignatureVerificationPipelineError::SignatureValueBase64(
+            super::whitespace::locate_in_xml_text(error, texts),
+        )
+    };
     let mut normalized = Vec::with_capacity(normalized_len);
     let mut raw_text_len = 0usize;
     for child in signature_value_node.children().filter(Node::is_text) {
@@ -6845,14 +6855,18 @@ fn decode_signature_value(
                 &mut normalized,
                 algorithm,
                 resources,
-            )?;
+            )
+            .map_err(|error| match error {
+                SignatureVerificationPipelineError::SignatureValueBase64(error) => located(error),
+                other => other,
+            })?;
         }
     }
 
     structured_base64::STANDARD
         .decode(&normalized)
         .map_err(|error| match error {
-            structured_base64::OwnedError::Codec(error) => error.into(),
+            structured_base64::OwnedError::Codec(error) => located(error),
             structured_base64::OwnedError::Reserve(_) => {
                 structured_asn1::memory::MemoryError::OutOfMemory.into()
             }
