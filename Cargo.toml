@@ -384,8 +384,8 @@ roxmltree = { version = "0.21", features = ["positions"], optional = true }
 time = { version = "0.3.55", features = ["local-offset"], optional = true }
 url = { version = "2", optional = true }
 
-# Base64 encoding/decoding
-structured-base64 = { version = "0.25", features = ["alloc"] }
+# Base64 of XMLDSig and XMLEnc values and the Base64 transform.
+structured-base64 = { version = "0.25", features = ["alloc"], optional = true }
 
 # Error handling
 thiserror = { version = "2", default-features = false }
@@ -471,6 +471,7 @@ xmldsig = [
     "dep:pkcs1",
     "dep:snafu",
     "dep:structured-pkix",
+    "dep:structured-base64",
     # SHA-256 identities of certificate paths, resources and evidence: an
     # identity lookup, not a document digest, so no provider computes them.
     "dep:sha2",

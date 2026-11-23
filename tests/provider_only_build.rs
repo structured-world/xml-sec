@@ -187,7 +187,7 @@ fn spki(pem_text: &str) -> Vec<u8> {
 
 fn b64(bytes: &[u8]) -> String {
     structured_base64::STANDARD
-        .encode(&bytes)
+        .encode(bytes)
         .expect("test encoding")
 }
 
