@@ -515,6 +515,45 @@ fn relationship_target_mode_policy_reaches_cipher_reference() {
     );
 }
 
+#[test]
+#[cfg(feature = "xmlenc")]
+fn the_compatible_decryption_profile_reads_target_mode_as_libxmlsec1() {
+    // The C library and the xmlsec1 command decrypt under the compatible
+    // profile's decryption policy, so a CipherReference's Relationship
+    // transform reads rel:TargetMode there as libxmlsec1 does.
+    let compiled = xml_sec::policy::PolicyCompiler::new(
+        xml_sec::policy::PolicyProfile::XmlSecCompatible,
+        &xml_sec::provider::RustCryptoProvider,
+        None,
+    )
+    .unwrap();
+    let mut policy = compiled.policies().decryption.clone().unwrap();
+    policy.uris.references = UriTypeSet::ALL;
+    let xml = format!(
+        "<CipherReference xmlns=\"http://www.w3.org/2001/04/xmlenc#\" URI=\"part.rels\"><Transforms><ds:Transform xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\" Algorithm=\"{URI}\"><RelationshipReference xmlns=\"{PARAM}\" SourceId=\"rid\"/></ds:Transform><ds:Transform xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\" Algorithm=\"http://www.w3.org/TR/2001/REC-xml-c14n-20010315\"/></Transforms></CipherReference>"
+    );
+    let document = Document::parse(&xml).unwrap();
+    let resources = std::collections::BTreeMap::from([(
+        "part.rels".to_owned(),
+        qualified_target_mode_part().into_bytes(),
+    )]);
+    let resolved = xml_sec::xmlenc::CipherReferenceContext::new(
+        &policy,
+        Some(&resources),
+        xml_sec::XmlBackend::default(),
+        &[],
+    )
+    .unwrap()
+    .resolve(document.root_element());
+    assert_eq!(
+        resolved.unwrap(),
+        format!(
+            "<Relationships xmlns=\"{REL}\"><Relationship Id=\"rid\" Target=\"a\" TargetMode=\"External\" Type=\"urn:t\"></Relationship></Relationships>"
+        )
+        .as_bytes()
+    );
+}
+
 #[path = "common/xmlsec1.rs"]
 mod xmlsec1;
 

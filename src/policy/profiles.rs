@@ -518,8 +518,9 @@ fn verification_profile(
 
 fn profile_transforms(compatibility: bool) -> TransformPolicy {
     if compatibility {
-        // Signers and verifiers in this profile must agree with libxmlsec1 on the
-        // digested output of XSLT transforms. Signing otherwise writes what
+        // Signers, verifiers and decryptors in this profile must agree with
+        // libxmlsec1 on the output of XSLT and Relationship transforms. Signing
+        // otherwise writes what
         // the specification recommends; byte-for-byte libxmlsec1 templates
         // are the business of the C library and the xmlsec1 command.
         TransformPolicy {
@@ -829,6 +830,12 @@ fn decryption_profile(
                 .collect(),
         ),
         oaep_digests: Some(oaep_digests),
+        // A CipherReference's transforms read as the profile's signatures do.
+        transforms: if compatibility {
+            profile_transforms(true)
+        } else {
+            DecryptionPolicy::default().transforms
+        },
         ..DecryptionPolicy::default()
     }
 }
