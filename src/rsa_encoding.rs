@@ -226,6 +226,10 @@ impl RsaPrivateKeyEncoding for RsaPrivateKey {
             uint(key.prime1.as_bytes(), bits)?,
             uint(key.prime2.as_bytes(), bits)?,
         ];
+        // NIST SP 800-56B Rev. 2 section 6.4.1.2.1 steps 5(a) and 5(b): each
+        // prime of a valid key pair is at most 2^(nBits/2) - 1, so a factor
+        // wider than half the modulus marks an invalid key, not one to import
+        // through slower full-width CRT arithmetic.
         Self::from_components(n, e, d, primes).map_err(|_| pkcs1::Error::KeyMalformed)
     }
 

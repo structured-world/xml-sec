@@ -183,6 +183,55 @@ fn public_key_codecs_leave_the_size_floor_to_policy() {
 }
 
 #[test]
+fn a_private_key_with_a_prime_wider_than_half_the_modulus_is_invalid() {
+    // NIST SP 800-56B Rev. 2 section 6.4.1.2.1 steps 5(a)-(b) bound each
+    // prime by 2^(nBits/2) - 1. Here p = 2^61 - 1 and q = 2^19 - 1 give an
+    // 80-bit modulus with a 61-bit factor: consistent RSA components that
+    // only a full-width import admits, and the decoder refuses.
+    use crypto_bigint::{BoxedUint, ConcatenatingMul as _, NonZero, Resize as _};
+    let wide = BoxedUint::from((1_u64 << 61) - 1);
+    let narrow = BoxedUint::from((1_u64 << 19) - 1);
+    let exponent = BoxedUint::from(65_537_u64);
+    let modulus = wide.concatenating_mul(&narrow);
+    let one = BoxedUint::one();
+    let totient = NonZero::new(
+        wide.wrapping_sub(&one)
+            .concatenating_mul(&narrow.wrapping_sub(&one)),
+    )
+    .unwrap();
+    let private = (&exponent)
+        .resize_unchecked(totient.bits_precision())
+        .invert_mod(&totient)
+        .unwrap();
+    assert!(
+        RsaPrivateKey::from_components_with_wide_primes(
+            modulus.clone(),
+            exponent.clone(),
+            private.clone(),
+            vec![wide.clone(), narrow.clone()]
+        )
+        .is_ok(),
+        "the components form a consistent key"
+    );
+    let bytes = |value: &BoxedUint| value.to_be_bytes_trimmed_vartime().into_vec();
+    let encoded = [&modulus, &exponent, &private, &wide, &narrow].map(bytes);
+    let encoded = pkcs1::RsaPrivateKeyRef {
+        modulus: pkcs1::UintRef::new(&encoded[0]).unwrap(),
+        public_exponent: pkcs1::UintRef::new(&encoded[1]).unwrap(),
+        private_exponent: pkcs1::UintRef::new(&encoded[2]).unwrap(),
+        prime1: pkcs1::UintRef::new(&encoded[3]).unwrap(),
+        prime2: pkcs1::UintRef::new(&encoded[4]).unwrap(),
+        exponent1: pkcs1::UintRef::new(&[1]).unwrap(),
+        exponent2: pkcs1::UintRef::new(&[1]).unwrap(),
+        coefficient: pkcs1::UintRef::new(&[1]).unwrap(),
+        other_prime_infos: None,
+    }
+    .to_der()
+    .unwrap();
+    assert!(<RsaPrivateKey as RsaPrivateKeyEncoding>::from_pkcs1_der(&encoded).is_err());
+}
+
+#[test]
 fn rsa_encoding_rejects_invalid_key_components() {
     // Codec parsing is not validation: the existing RSA engine must reject
     // invalid exponents and inconsistent private components after DER decode.
