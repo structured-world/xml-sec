@@ -1310,7 +1310,7 @@ fn nested_implicit_rejection_reaches_final_content_authentication() {
     // A nested RSA-1.5 rejection must not become an early AES-KW oracle.
     // Even a failed intermediate unwrap carries fallback bytes to final GCM.
     let private =
-        rsa::RsaPrivateKey::from_pkcs8_pem(include_str!("fixtures/keys/rsa/rsa-2048-key.pem"))
+        rsa::PrivateKey::from_pkcs8_pem(include_str!("fixtures/keys/rsa/rsa-2048-key.pem"))
             .unwrap();
     let resolver = xml_sec::xmlenc::PrivateKeyDecryptor::new(private);
     let inner = key("").replace("kw-aes128", "rsa-1_5").replace(

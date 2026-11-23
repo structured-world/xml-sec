@@ -203,9 +203,9 @@ fn pss_family_permission_preserves_independent_legacy_gate() {
 
 #[test]
 fn pss_signatures_cross_verify_with_dependency() {
-    // Independent sad-rsa padding checks our PSS implementation in both directions.
-    let private = rsa::RsaPrivateKey::from_pkcs8_pem(PRIVATE).unwrap();
-    let public = rsa::RsaPublicKey::from(&private);
+    // Independent RustCrypto rsa padding checks our PSS implementation in both directions.
+    let private = rsa::PrivateKey::from_pkcs8_pem(PRIVATE).unwrap();
+    let public = rsa::PublicKey::from(&private);
     let key = RsaSigningKey::from_pkcs8_pem(PRIVATE).unwrap();
     for salt_len in [0, 1, 32, 222] {
         let method = SignatureAlgorithm::RsaPss(RsaPssParameters {
@@ -244,8 +244,8 @@ fn pss_signatures_cross_verify_with_dependency() {
 fn pss_rejects_modular_alias_of_valid_signature() {
     // RSAVP1 must reject s+n, even when it fits the signature width and
     // modular exponentiation would recover exactly the valid encoded message.
-    let private = rsa::RsaPrivateKey::from_pkcs8_pem(PRIVATE).unwrap();
-    let public = rsa::RsaPublicKey::from(&private);
+    let private = rsa::PrivateKey::from_pkcs8_pem(PRIVATE).unwrap();
+    let public = rsa::PublicKey::from(&private);
     let modulus = public.n().to_be_bytes();
     let method = SignatureAlgorithm::RsaPss(RsaPssParameters {
         salt_len: 0,
@@ -277,8 +277,8 @@ fn pss_rejects_modular_alias_of_valid_signature() {
 fn pss_rejects_malformed_encoded_messages_and_modulus_boundary() {
     // RFC 8017 section 9.1.2 requires trailer, high bits, zero padding,
     // separator and hash to agree; raw RSA gives independent malformed EMs.
-    let private = rsa::RsaPrivateKey::from_pkcs8_pem(PRIVATE).unwrap();
-    let public = rsa::RsaPublicKey::from(&private);
+    let private = rsa::PrivateKey::from_pkcs8_pem(PRIVATE).unwrap();
+    let public = rsa::PublicKey::from(&private);
     let key = RsaSigningKey::from_pkcs8_pem(PRIVATE).unwrap();
     let algorithm = SignatureAlgorithm::RsaPssSha256;
     let signature = key.sign(algorithm, b"padding").unwrap();
@@ -325,8 +325,8 @@ fn pss_non_byte_aligned_modulus_preserves_representative_width() {
     // For modBits == 1 mod 8, emLen is one octet smaller than the signature:
     // RFC 8017 section 8.1.2 must reject a nonzero discarded leading octet.
     use xml_sec::rsa_encoding::RsaPublicKeyEncoding as _;
-    let private = rsa::RsaPrivateKey::new(&mut ChaCha8Rng::seed_from_u64(2049), 2049).unwrap();
-    let public = rsa::RsaPublicKey::from(&private);
+    let private = rsa::PrivateKey::new(&mut ChaCha8Rng::seed_from_u64(2049), 2049).unwrap();
+    let public = rsa::PublicKey::from(&private);
     let method = SignatureAlgorithm::RsaPssSha256;
     let signature = private
         .sign_with_rng(

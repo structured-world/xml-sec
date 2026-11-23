@@ -1,6 +1,6 @@
 # Parameterized RSA-PSS Adaptation
 
-`src/provider/rsa_pss.rs` adapts sad-rsa 0.10.2's PSS encoding and MGF1 from
+`src/provider/rsa_pss.rs` adapts the RustCrypto `rsa` PSS encoding and MGF1 from
 `src/pss.rs` and `src/algorithms/{pss,mgf}.rs`. RSA arithmetic, blinding and
 fault checking remain in that dependency's `hazmat` primitives. No additional
 RSA engine or separately published crate is introduced.
@@ -22,6 +22,6 @@ exponentiation, as required by [RFC 8017 section 5.2.2](https://www.rfc-editor.o
 raw modular exponentiation would otherwise accept aliases of a valid signature.
 The signing padding buffer, including its random salt, is zeroized on drop.
 
-When updating sad-rsa, compare the named donor functions and hazmat interfaces
+When updating `rsa`, compare the named donor functions and hazmat interfaces
 with this module. Independent dependency and XML-security oracle tests protect
 the standard encodings and the parameterized extension.

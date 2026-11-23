@@ -206,7 +206,7 @@ pub(crate) fn rsa_public_key_der<'a>(
 fn software_rsa_public_key(
     session: &CertificateSession,
     spki: &[u8],
-) -> Result<rsa::RsaPublicKey, SignatureVerificationError> {
+) -> Result<rsa::PublicKey, SignatureVerificationError> {
     crate::rsa_encoding::read_spki_public_key(session, spki)
         .map_err(|error| key_read_error(session, &error))?
         .ok_or(SignatureVerificationError::InvalidKeyDer)

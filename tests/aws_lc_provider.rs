@@ -49,7 +49,7 @@ fn rsa_verifier_size_limit_is_unsupported_not_signature_mismatch() {
         VerificationKey,
     };
     let mut rng = ChaCha8Rng::seed_from_u64(17);
-    let private = rsa::RsaPrivateKey::new(&mut rng, 1024).unwrap();
+    let private = rsa::PrivateKey::new(&mut rng, 1024).unwrap();
     let spki = private.to_public_key().to_public_key_der().unwrap();
     let signer = RsaSigningKey::from_pkcs8_der(private.to_pkcs8_der().unwrap().as_bytes()).unwrap();
     let algorithm = SignatureAlgorithm::RsaSha256;
@@ -473,7 +473,7 @@ fn rsa_recipient_xml_pipeline_interoperates_with_native_recovery() {
         EncryptedDataBuilder, EncryptionRecipient, PrivateKeyDecryptor,
     };
     let pem = pem::parse(include_bytes!("fixtures/keys/rsa/rsa-2048-key.pem")).unwrap();
-    let rust = rsa::RsaPrivateKey::from_pkcs8_der(pem.contents()).unwrap();
+    let rust = rsa::PrivateKey::from_pkcs8_der(pem.contents()).unwrap();
     let public = rust.to_public_key();
     let native = PrivateKeyDecryptor::provider_key(Arc::new(
         AwsLcRsaPrivateKey::from_pkcs8_der(pem.contents()).unwrap(),
@@ -652,7 +652,7 @@ fn native_oaep_interoperates_and_rejects_wrong_label() {
     use xml_sec::rsa_encoding::RsaPrivateKeyEncoding as _;
     use xml_sec::xmlenc::{OaepDigestAlgorithm as D, RsaOaepParameters};
     let pem = pem::parse(include_bytes!("fixtures/keys/rsa/rsa-2048-key.pem")).unwrap();
-    let key = rsa::RsaPrivateKey::from_pkcs8_der(pem.contents()).unwrap();
+    let key = rsa::PrivateKey::from_pkcs8_der(pem.contents()).unwrap();
     let public = RustCryptoRsaPublicKey::new(key.to_public_key());
     let rust = RustCryptoRsaPrivateKey::new(key);
     let aws = AwsLcRsaPrivateKey::from_pkcs8_der(pem.contents()).unwrap();

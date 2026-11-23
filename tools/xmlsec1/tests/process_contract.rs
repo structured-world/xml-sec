@@ -17,7 +17,7 @@ use rcgen::{
     BasicConstraints, CertificateParams, CertificateRevocationListParams, IsCa, Issuer,
     KeyIdMethod, KeyPair, KeyUsagePurpose, RevokedCertParams, SerialNumber,
 };
-use rsa::{RsaPrivateKey, RsaPublicKey, traits::PublicKeyParts as _};
+use rsa::{PrivateKey as RsaPrivateKey, PublicKey as RsaPublicKey, traits::PublicKeyParts as _};
 use time::{Duration, OffsetDateTime};
 use x509_parser::{extensions::ParsedExtension, prelude::FromDer as _};
 use xml_sec::rsa_encoding::{RsaPrivateKeyEncoding as _, RsaPublicKeyEncoding as _};

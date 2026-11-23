@@ -23,7 +23,7 @@ use cryptoki::{
     session::{Session, UserType},
     types::AuthPin,
 };
-use rsa::{RsaPublicKey, traits::PublicKeyParts};
+use rsa::{PublicKey as RsaPublicKey, traits::PublicKeyParts};
 
 use super::{
     ContentDecryptionKey, CryptoProvider, ExternalProviderError, KeyAgreementKey,

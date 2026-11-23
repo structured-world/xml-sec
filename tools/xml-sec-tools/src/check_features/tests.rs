@@ -109,7 +109,7 @@ fn a_provider_only_graph_with_any_built_in_backend_fails_before_lint() {
     execute(
         &built_in,
         &mut Recorded {
-            output: "xml-sec v0.2.0\nsad-rsa v0.10.2\np256 v0.14.0\n".into(),
+            output: "xml-sec v0.2.0\nrsa v0.10.0\np256 v0.14.0\n".into(),
             ..Recorded::default()
         },
     )

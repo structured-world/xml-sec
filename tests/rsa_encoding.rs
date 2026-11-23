@@ -1,7 +1,7 @@
 #![cfg(feature = "xmldsig-sign")]
 
 use der::{Decode, Encode};
-use rsa::{RsaPrivateKey, RsaPublicKey, traits::PublicKeyParts};
+use rsa::{PrivateKey as RsaPrivateKey, PublicKey as RsaPublicKey, traits::PublicKeyParts};
 use xml_sec::rsa_encoding::{RsaPrivateKeyEncoding, RsaPublicKeyEncoding};
 
 const PRIVATE: &str = include_str!("fixtures/keys/rsa/rsa-2048-key.pem");

@@ -111,15 +111,14 @@ PKCS#8 and PKCS#12 password-based container processing uses RustCrypto MAC, KDF
 and cipher primitives, with PKCS#12 framing read by the shared container reader. Selecting AWS-LC does not turn that importer into an approved FIPS service.
 RSA key-container codecs use current RustCrypto `pkcs1`/`pkcs8` types through
 `rsa_encoding::{RsaPrivateKeyEncoding, RsaPublicKeyEncoding}` extension traits.
-These traits operate on the existing `sad-rsa` keys; its bundled encoding feature
-is disabled until its codec supports the current dependency API. RSA validation,
-arithmetic, blinding, and implicit rejection remain in `sad-rsa`; operation
+These traits operate on the RustCrypto `rsa` keys, whose bundled encoding feature
+stays disabled: public keys are read by the shared PKIX reader under the
+operation's resource account, and explicit PSS key parameters, which the bare
+key type cannot retain, are refused rather than discarded. RSA validation,
+arithmetic, blinding, and implicit rejection remain in `rsa`; operation
 dispatch still belongs to `CryptoProvider`. Private serialized-component buffers
 and DER/PEM output documents are zeroized. This narrow adaptation does not fork
 the RSA engine or introduce a second cryptographic implementation.
-The corresponding upstream fix is proposed in
-[sad-rsa #61](https://github.com/sadco-io/sad-rsa/pull/61); published xml-sec builds
-do not depend on that PR being accepted or on a consumer-side Cargo patch.
 The CLI's generic `--privkey-pem`/`--privkey-der` options also preserve traditional
 RSA PKCS#1 and EC SEC1 containers independently of the provider. Traditional
 OpenSSL encrypted PEM is decrypted at this same container boundary. Normalization
@@ -459,7 +458,7 @@ and must fit the RSA modulus. XML defaults are SHA-256, digest-sized salt and
 trailer 1 ([RFC 9231 section 2.3.9](https://www.rfc-editor.org/rfc/rfc9231.html#section-2.3.9)).
 SHA-1 in either hash requires explicit legacy policy permission. Fixed URI
 variants reject parameters rather than silently overriding their contract.
-The narrow [local padding adaptation](rsa-pss-patch.md) retains sad-rsa arithmetic.
+The narrow [local padding adaptation](rsa-pss-patch.md) retains `rsa` arithmetic.
 
 `legacy-algorithms` adds RustCrypto MD5/RIPEMD-160 signatures and digests, AES-192
 content encryption and key wrap, TripleDES content encryption and CMS wrap, and RSA-1.5

@@ -34,7 +34,7 @@ mod pkcs12_import;
 #[cfg(feature = "xmldsig-sign")]
 mod pkcs8_import;
 #[cfg(feature = "xmldsig-sign")]
-use crate::rsa_encoding::RsaPrivateKeyEncoding as _;
+use crate::rsa_encoding::RsaPrivateKeyEncoding;
 #[cfg(feature = "xmldsig-sign")]
 pub use openssl::PrivateKeyContainer;
 #[cfg(feature = "xmldsig-sign")]
@@ -42,9 +42,9 @@ use pkcs8::{DecodePrivateKey as _, PrivateKeyInfoRef};
 #[cfg(feature = "xmldsig-sign")]
 use pkcs12_import::Limits as Pkcs12Limits;
 #[cfg(feature = "xmldsig-sign")]
-use rsa::RsaPrivateKey;
+use rsa::PrivateKey as RsaPrivateKey;
 #[cfg(feature = "xmlenc")]
-use rsa::RsaPublicKey;
+use rsa::PublicKey as RsaPublicKey;
 #[cfg(all(test, feature = "xmldsig-sign"))]
 use x509_parser::prelude::FromDer as _;
 #[cfg(all(test, feature = "xmldsig-sign"))]
@@ -3500,7 +3500,9 @@ impl<'a> PrivateKeyIdentity<'a> {
         }
         if info.algorithm.oid == pkcs1::ALGORITHM_OID {
             preflight_rsa_pkcs1_components(info.private_key.as_bytes())?;
-            RsaPrivateKey::from_pkcs8_der(der)
+            // Qualified: a consumer enabling `rsa`'s own codecs puts a
+            // same-named `pkcs8::DecodePrivateKey` method on this type.
+            <RsaPrivateKey as RsaPrivateKeyEncoding>::from_pkcs8_der(der)
                 .map_err(|_| KeyStoreError::Selection("invalid RSA private key"))?;
             return pkcs1::RsaPrivateKeyRef::from_der(info.private_key.as_bytes())
                 .map(Self::Rsa)

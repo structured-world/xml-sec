@@ -5,7 +5,7 @@ use std::{fmt, io::Write, sync::Arc};
 
 use crate::xml::dom::{Document, Node};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use rsa::RsaPublicKey;
+use rsa::PublicKey as RsaPublicKey;
 use xml_sec_xml_input::lexical::Writer;
 
 use crate::document::{
@@ -2029,7 +2029,7 @@ mod tests {
     use crate::rsa_encoding::RsaPublicKeyEncoding as _;
     use getrandom::SysRng;
     use getrandom::rand_core::UnwrapErr;
-    use rsa::{RsaPrivateKey, RsaPublicKey};
+    use rsa::{PrivateKey as RsaPrivateKey, PublicKey as RsaPublicKey};
 
     use super::*;
     use crate::hard_limits::{

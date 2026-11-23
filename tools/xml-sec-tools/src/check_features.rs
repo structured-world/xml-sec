@@ -43,7 +43,7 @@ pub(crate) const PROVIDER_ONLY_FORBIDDEN: [&str; 22] = [
     "x509-parser",
     "getrandom",
     "structured-cms",
-    "sad-rsa",
+    "rsa",
     "dsa",
     "p256",
     "p384",

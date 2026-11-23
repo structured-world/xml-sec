@@ -3635,7 +3635,7 @@ mod tests {
         format!("{}{}{}", &xml[..start], replacement, &xml[end..])
     }
 
-    fn rsa_key_value_parts(public_key: &rsa::RsaPublicKey) -> (String, String) {
+    fn rsa_key_value_parts(public_key: &rsa::PublicKey) -> (String, String) {
         (
             STANDARD.encode(public_key.n().to_be_bytes_trimmed_vartime()),
             STANDARD.encode(public_key.e().to_be_bytes_trimmed_vartime()),
@@ -5653,7 +5653,7 @@ mod tests {
     #[test]
     fn resolves_rsa_key_value_end_to_end() {
         // Embedded CryptoBinary parameters must verify the original RSA-2048 donor signature.
-        let public_key = rsa::RsaPublicKey::from_public_key_pem(RSA_PUBLIC_KEY)
+        let public_key = rsa::PublicKey::from_public_key_pem(RSA_PUBLIC_KEY)
             .expect("fixture must contain an RSA public key");
         let (modulus, exponent) = rsa_key_value_parts(&public_key);
         let key_info = format!(
@@ -6350,7 +6350,7 @@ mod tests {
         let (_, parsed_certificate) = X509Certificate::from_der(&certificate)
             .expect("the Phaos fixture is a DER certificate");
         let public_key = parsed_certificate.public_key().raw.to_vec();
-        let rsa_public_key = rsa::RsaPublicKey::from_public_key_der(&public_key)
+        let rsa_public_key = rsa::PublicKey::from_public_key_der(&public_key)
             .expect("the Phaos certificate contains an RSA public key");
         let certificate_metadata = parse_x509_certificate(&certificate)
             .expect("the Phaos fixture has supported X.509 metadata");
@@ -6408,7 +6408,7 @@ mod tests {
     #[test]
     fn rsa_key_value_rejects_ecdsa_signature_method() {
         // Embedded RSA parameters must not be relabeled for an ECDSA SignatureMethod.
-        let public_key = rsa::RsaPublicKey::from_public_key_pem(RSA_PUBLIC_KEY)
+        let public_key = rsa::PublicKey::from_public_key_pem(RSA_PUBLIC_KEY)
             .expect("fixture must contain an RSA public key");
         let (modulus, exponent) = rsa_key_value_parts(&public_key);
         let key_info = format!(
@@ -6473,7 +6473,7 @@ mod tests {
     #[test]
     fn incompatible_ec_key_value_falls_back_to_later_rsa_key_value() {
         // Mixed KeyInfo should keep scanning after an incompatible ECKeyValue source.
-        let public_key = rsa::RsaPublicKey::from_public_key_pem(RSA_PUBLIC_KEY)
+        let public_key = rsa::PublicKey::from_public_key_pem(RSA_PUBLIC_KEY)
             .expect("fixture must contain an RSA public key");
         let (modulus, exponent) = rsa_key_value_parts(&public_key);
         let key_info = format!(

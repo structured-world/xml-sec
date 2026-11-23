@@ -5,7 +5,9 @@
 //! instead of [`crate::xmldsig::parse::parse_signed_info`], because verification
 //! must continue to reject empty or malformed stored digest values.
 
-use crate::rsa_encoding::{RsaPrivateKeyEncoding as _, RsaPublicKeyEncoding as _};
+// Our codec calls are qualified: a consumer enabling `rsa`'s own codecs puts
+// same-named `pkcs8`/`spki` trait methods on these key types.
+use crate::rsa_encoding::{RsaPrivateKeyEncoding, RsaPublicKeyEncoding};
 use crate::xml::dom::{Document, Node, NodeId};
 use base64::Engine;
 use p256::ecdsa::{
@@ -18,7 +20,7 @@ use p384::ecdsa::{
 use p521::ecdsa::{
     Signature as P521Signature, SigningKey as P521SigningKey, VerifyingKey as P521VerifyingKey,
 };
-use rsa::RsaPrivateKey;
+use rsa::PrivateKey as RsaPrivateKey;
 use rsa::pkcs1v15::Signature as RsaPkcs1v15Signature;
 use rsa::pkcs1v15::SigningKey as RsaPkcs1v15SigningKey;
 use rsa::signature::{RandomizedSigner, SignatureEncoding};
@@ -848,7 +850,7 @@ impl RsaSigningKey {
     /// Returns `InvalidKeyDer` for malformed containers, unsupported algorithm
     /// parameters or invalid RSA private components.
     pub fn from_pkcs8_der(private_key_der: &[u8]) -> Result<Self, SigningKeyError> {
-        let key = RsaPrivateKey::from_pkcs8_der(private_key_der)
+        let key = <RsaPrivateKey as RsaPrivateKeyEncoding>::from_pkcs8_der(private_key_der)
             .map_err(|_| SigningKeyError::InvalidKeyDer)?;
         Ok(Self { key })
     }
@@ -862,8 +864,11 @@ impl RsaSigningKey {
         private_key_pem: &str,
         password: impl AsRef<[u8]>,
     ) -> Result<Self, SigningKeyError> {
-        let key = RsaPrivateKey::from_pkcs8_encrypted_pem(private_key_pem, password)
-            .map_err(|_| SigningKeyError::InvalidKeyDer)?;
+        let key = <RsaPrivateKey as RsaPrivateKeyEncoding>::from_pkcs8_encrypted_pem(
+            private_key_pem,
+            password,
+        )
+        .map_err(|_| SigningKeyError::InvalidKeyDer)?;
         Ok(Self { key })
     }
 
@@ -876,8 +881,11 @@ impl RsaSigningKey {
         private_key_der: &[u8],
         password: impl AsRef<[u8]>,
     ) -> Result<Self, SigningKeyError> {
-        let key = RsaPrivateKey::from_pkcs8_encrypted_der(private_key_der, password)
-            .map_err(|_| SigningKeyError::InvalidKeyDer)?;
+        let key = <RsaPrivateKey as RsaPrivateKeyEncoding>::from_pkcs8_encrypted_der(
+            private_key_der,
+            password,
+        )
+        .map_err(|_| SigningKeyError::InvalidKeyDer)?;
         Ok(Self { key })
     }
 }
@@ -955,8 +963,7 @@ impl SigningKey for RsaSigningKey {
 
     fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {
         let public_key = self.key.to_public_key();
-        let spki_der = public_key
-            .to_public_key_der()
+        let spki_der = RsaPublicKeyEncoding::to_public_key_der(&public_key)
             .map(|doc| doc.as_bytes().to_vec())
             .map_err(|_| SigningKeyError::PublicKeyEncodingFailed)?;
         Ok(SigningPublicKeyInfo::Rsa {

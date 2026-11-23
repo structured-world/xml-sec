@@ -315,7 +315,7 @@ structured-dstu4145 = { version = "0.23", default-features = false, features = [
 once_cell = { version = "1", default-features = false, features = ["alloc", "race"], optional = true }
 cryptoki = { version = "0.12.1", optional = true }
 aws-lc-rs = { version = "1.19", default-features = false, features = ["fips"], optional = true }
-rsa = { package = "sad-rsa", version = "0.10.2", default-features = false, features = ["sha1", "sha2", "hazmat"], optional = true }
+rsa = { version = "0.10", default-features = false, features = ["sha1", "hazmat", "pkcs1v15"], optional = true }
 sha1 = { version = "0.11", features = ["oid", "zeroize"], optional = true }
 sha2 = { version = "0.11", features = ["oid", "zeroize"], optional = true }
 # Dependencies of the embedded RustCrypto SHA-3 bit-tail adaptation.

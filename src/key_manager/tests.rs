@@ -3,7 +3,7 @@ use pkcs8::EncodePublicKey as _;
 #[cfg(feature = "xmldsig-sign")]
 use pkcs8::EncryptedPrivateKeyInfoRef;
 use rand_chacha::{ChaCha8Rng, rand_core::SeedableRng as _};
-use rsa::RsaPublicKey;
+use rsa::PublicKey as RsaPublicKey;
 
 use super::*;
 use std::fmt::Write as _;

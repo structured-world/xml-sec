@@ -12,7 +12,7 @@ use std::{
 #[path = "../../../tests/common/xmlsec1.rs"]
 mod xmlsec1;
 
-use rsa::RsaPublicKey;
+use rsa::PublicKey as RsaPublicKey;
 use xml_sec::rsa_encoding::{RsaPrivateKeyEncoding as _, RsaPublicKeyEncoding as _};
 use xml_sec::xmlenc::{
     DataEncryptionAlgorithm, EncryptedDataBuilder, EncryptionRecipient, OaepDigestAlgorithm,
@@ -447,7 +447,7 @@ mod merlin {
         let direct;
         let resolver: &dyn DecryptionKeyResolver = if case.rsa() {
             private = PrivateKeyDecryptor::new(
-                rsa::RsaPrivateKey::from_pkcs8_pem(
+                rsa::PrivateKey::from_pkcs8_pem(
                     &fs::read_to_string(fixture_name!("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
                         .unwrap(),
                 )
@@ -639,7 +639,7 @@ fn extended_oaep_hashes_have_reciprocal_oracle_coverage() {
     use xml_sec::xmlenc::KeyTransportAlgorithm;
     require_key_establishment_oracle();
     let path = Path::new(fixture_name!("tests/fixtures/keys/rsa/rsa-4096-key.pem"));
-    let private = rsa::RsaPrivateKey::from_pkcs8_pem(&fs::read_to_string(path).unwrap()).unwrap();
+    let private = rsa::PrivateKey::from_pkcs8_pem(&fs::read_to_string(path).unwrap()).unwrap();
     let public = RsaPublicKey::from(&private);
     let hashes = [
         OaepDigestAlgorithm::Sha224,

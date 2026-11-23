@@ -1,6 +1,6 @@
 //! xml-sec through its Rust API, configured as the competitors are for each workload.
 
-use rsa::{RsaPrivateKey, RsaPublicKey};
+use rsa::{PrivateKey as RsaPrivateKey, PublicKey as RsaPublicKey};
 use std::collections::BTreeSet;
 use std::process::ExitCode;
 use xml_sec::policy::{

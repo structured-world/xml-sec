@@ -4,7 +4,7 @@ use rand_chacha::{ChaCha8Rng, rand_core::SeedableRng as _};
 #[test]
 fn signs_non_byte_aligned_modulus_with_dependency_verification() {
     // Exercise our signing encoder at modBits == 1 mod 8 without relying
-    // on sad-rsa's unrelated odd-width private DER exporter.
+    // on an odd-width private DER exporter.
     let private = RsaPrivateKey::new(&mut ChaCha8Rng::seed_from_u64(2049), 2049)
         .expect("deterministic odd-width RSA key");
     let signature = sign(

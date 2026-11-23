@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use rsa::{RsaPublicKey, traits::PublicKeyParts as _};
+use rsa::{PublicKey as RsaPublicKey, traits::PublicKeyParts as _};
 use xml_sec::rsa_encoding::RsaPublicKeyEncoding as _;
 use xml_sec::xml_input as xml_sec_xml_input;
 use xml_sec::{
@@ -6274,7 +6274,7 @@ fn encryption_template(
 
 fn ensure_leaf_certificate_matches_rsa_key(
     certificate_der: &[u8],
-    private_key: &rsa::RsaPrivateKey,
+    private_key: &rsa::PrivateKey,
     parsing: &mut xml_sec::xmldsig::parse::KeyInfoParsingSession<'_>,
 ) -> Result<(), CommandError> {
     let public_key = RsaPublicKey::from(private_key)

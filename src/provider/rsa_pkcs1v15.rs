@@ -1,13 +1,14 @@
-//! Fixed-width session-key adaptation of sad-rsa 0.10.2 PKCS#1 v1.5 recovery.
+//! Fixed-width session-key adaptation of `rsa` PKCS#1 v1.5 recovery.
 //!
-//! Source: sadco-io/sad-rsa, src/pkcs1v15.rs and
-//! `src/algorithms/pkcs1v15.rs::decrypt_inner` (MIT OR Apache-2.0).
+//! Source: `RustCrypto` `rsa`, src/pkcs1v15.rs and
+//! `src/algorithms/pkcs1v15.rs` (MIT OR Apache-2.0), first adapted from the
+//! sadco-io/sad-rsa 0.10.2 fork of it.
 //! RSA arithmetic, blinding and fault checking remain in that dependency.
 //! Unlike its general-message API, this adapter retains padding validity for
 //! the enclosing content operation and never exposes a variable-length result.
 
 use crypto_bigint::{BoxedUint, CtAssign, CtLt};
-use rsa::{RsaPrivateKey, traits::PublicKeyParts};
+use rsa::{PrivateKey as RsaPrivateKey, traits::PublicKeyParts};
 use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
 use zeroize::Zeroizing;
 

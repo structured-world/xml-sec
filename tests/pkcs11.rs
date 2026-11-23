@@ -687,7 +687,7 @@ fn assert_token_oaep(
         panic!("RSA metadata");
     };
     let recipient = xml_sec::xmlenc::EncryptionRecipient::rsa_oaep(
-        rsa::RsaPublicKey::from_public_key_der(&spki_der).unwrap(),
+        rsa::PublicKey::from_public_key_der(&spki_der).unwrap(),
     )
     .oaep_parameters(parameters);
     let encrypted = xml_sec::xmlenc::EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)

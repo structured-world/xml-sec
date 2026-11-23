@@ -25,7 +25,7 @@ allocation-profile = []
 
 [dependencies]
 xml-sec = { path = "../..", features = ["xslt"] }
-rsa = { package = "sad-rsa", version = "0.10.2", default-features = false }
+rsa = { version = "0.10", default-features = false }
 pem = "4"
 serde_json = "1"
 # The competitor's current code: each comparison run moves these to the
