@@ -106,6 +106,10 @@ pub(crate) const DSA_KEY_COMPONENT_BYTE_CEILING: usize = 512;
 /// Maximum nested `KeyInfoReference` dereference depth.
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const KEY_INFO_REFERENCE_DEPTH_CEILING: usize = 8;
+/// Maximum child elements of one `KeyInfo` read: lax extensions are parsed
+/// before key selection, so their count stays bounded.
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub(crate) const KEY_INFO_CHILD_CEILING: usize = 64;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const ENCRYPTION_METADATA_BYTE_CEILING: usize = 4 * 1024;
 

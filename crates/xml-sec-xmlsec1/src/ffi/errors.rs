@@ -90,6 +90,8 @@ pub(crate) const R_INVALID_KEY_DATA_SIZE: c_int = 44;
 pub(crate) const R_KEY_NOT_FOUND: c_int = 45;
 /// `XMLSEC_ERRORS_R_KEYDATA_DISABLED`.
 pub(crate) const R_KEYDATA_DISABLED: c_int = 46;
+/// `XMLSEC_ERRORS_R_MAX_KEYINFO_CHILDREN`.
+pub(crate) const R_MAX_KEYINFO_CHILDREN: c_int = 54;
 /// `XMLSEC_ERRORS_R_DSIG_NO_REFERENCES`.
 pub(crate) const R_DSIG_NO_REFERENCES: c_int = 81;
 /// `XMLSEC_ERRORS_R_ASSERTION`.
@@ -99,7 +101,7 @@ pub(crate) const R_CAST_IMPOSSIBLE: c_int = 101;
 
 /// libxmlsec1's reason table, in its order; positions past it hold no code
 /// and no message.
-static TABLE: [(c_int, &CStr); 55] = [
+static TABLE: [(c_int, &CStr); 56] = [
     (1, c"xmlsec library function failed"),
     (2, c"malloc function failed"),
     (3, c"strdup function failed"),
@@ -141,6 +143,7 @@ static TABLE: [(c_int, &CStr); 55] = [
     (51, c"maximum key retrieval level"),
     (52, c"key retrieval type mismatch"),
     (53, c"maximum KeyInfoReference level"),
+    (54, c"maximum number of KeyInfo children"),
     (61, c"maximum encrypted key level"),
     (71, c"certificate verification failed"),
     (72, c"certificate is not found"),

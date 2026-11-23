@@ -996,7 +996,9 @@ fn parse_key_info<'doc>(
     }
     budget.ancestry.push(node.id());
     let mut parsed = ParsedKeyInfo::default();
-    for child in node.children().filter(Node::is_element) {
+    for (index, child) in node.children().filter(Node::is_element).enumerate() {
+        // Every child is read before a key is selected, so each one counts.
+        policy.resources.validate_key_info_children(index + 1)?;
         // An ML-KEM EncryptedKey carries a KEM ciphertext, not a wrapped or
         // RSA-encrypted key, so it is decapsulated rather than decrypted.
         if crate::key_establishment::encapsulation_algorithm(child).is_some() {

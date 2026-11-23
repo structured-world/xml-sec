@@ -11,6 +11,56 @@ fn project_root() -> &'static Path {
 }
 
 #[test]
+fn resource_options_set_the_compatible_limits_as_libxmlsec1_reads_them() {
+    // Without options the command reads libxmlsec1's ten KeyInfo children;
+    // a count sets that limit up to the core's canonical value, zero lifts it
+    // there, and the XPath operations limit only narrows the evaluation work.
+    let canonical = ResourcePolicy::default();
+    let resources = |options: &[&str]| {
+        let mut arguments = vec!["xmlsec1", "verify"];
+        arguments.extend_from_slice(options);
+        arguments.push("input.xml");
+        xmlsec_compatibility_resources(&invocation(&arguments))
+    };
+    let defaults = resources(&[]);
+    assert_eq!(defaults.max_key_info_children, 10);
+    assert_eq!(
+        defaults.max_xpath_evaluation_work,
+        canonical.max_xpath_evaluation_work
+    );
+    assert_eq!(
+        resources(&["--max-key-info-children", "1"]).max_key_info_children,
+        1
+    );
+    for lifted in ["0", "100000"] {
+        assert_eq!(
+            resources(&["--max-key-info-children", lifted]).max_key_info_children,
+            canonical.max_key_info_children
+        );
+    }
+    assert_eq!(
+        resources(&["--xpath-ops-limit", "3"]).max_xpath_evaluation_work,
+        3
+    );
+    assert_eq!(
+        resources(&["--xpath-ops-limit", "0"]).max_xpath_evaluation_work,
+        canonical.max_xpath_evaluation_work
+    );
+    for invalid in ["-1", "many"] {
+        assert!(matches!(
+            validate_resource_options(&invocation(&[
+                "xmlsec1",
+                "verify",
+                "--max-key-info-children",
+                invalid,
+                "input.xml"
+            ])),
+            Err(CommandError::Usage(_))
+        ));
+    }
+}
+
+#[test]
 fn signing_certificate_failure_has_signature_category() {
     // A malformed embedded certificate is a signing-input failure, not encryption.
     let key = xml_sec::xmldsig::RsaSigningKey::from_pkcs8_pem(include_str!(

@@ -365,6 +365,38 @@ fn encrypted_key_nesting_counts_as_key_reference_depth() {
 }
 
 #[test]
+fn a_read_reaches_at_most_the_contexts_key_info_children() {
+    // Every child the read reaches counts, known or not, against the
+    // context's maxKeyInfoChildren (10 initially); zero lifts the limit, and
+    // the limit is a user preference a copy carries.
+    own_process();
+    let xml = "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\">\
+               <a xmlns=\"urn:test\"/><b xmlns=\"urn:test\"/><c xmlns=\"urn:test\"/>\
+               </KeyInfo>";
+    // SAFETY: contexts created and destroyed here.
+    unsafe {
+        assert_eq!(xmlSecKeyDataIdsInit(), 0);
+        let ctx = xmlSecKeyInfoCtxCreate(std::ptr::null_mut());
+        // libxmlsec1 reports each unknown child it reads and goes on.
+        let unknown = errors::R_UNEXPECTED_NODE;
+        assert_eq!((*ctx).max_key_info_children, 10);
+        assert_eq!(read_reported(xml, ctx), (0, vec![unknown; 3]));
+        (*ctx).max_key_info_children = 2;
+        assert_eq!(
+            read_reported(xml, ctx),
+            (-1, vec![unknown, unknown, errors::R_MAX_KEYINFO_CHILDREN])
+        );
+        let copy = xmlSecKeyInfoCtxCreate(std::ptr::null_mut());
+        assert_eq!(super::xmlSecKeyInfoCtxCopyUserPref(copy, ctx), 0);
+        assert_eq!((*copy).max_key_info_children, 2);
+        (*ctx).max_key_info_children = 0;
+        assert_eq!(read_reported(xml, ctx), (0, vec![unknown; 3]));
+        xmlSecKeyInfoCtxDestroy(copy);
+        xmlSecKeyInfoCtxDestroy(ctx);
+    }
+}
+
+#[test]
 fn an_encrypted_key_after_the_key_has_its_value_is_skipped() {
     // An earlier EncryptedKey in the same KeyInfo already gave the key its
     // value: libxmlsec1 skips a later one without reading or reporting it,

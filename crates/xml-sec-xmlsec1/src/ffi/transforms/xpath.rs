@@ -783,9 +783,11 @@ unsafe extern "C" fn execute(
             .get_or_insert(limit);
         return -1;
     }
+    // SAFETY: an initialized context.
+    let ops_limit = unsafe { (*ctx).xpath_ops_limit };
     // SAFETY: an expression transform read from a live element.
     let Some(output) = policy::with_document_policy!(operation, |policy| unsafe {
-        evaluate_list(expressions, object.in_nodes, doc, policy)
+        evaluate_list(expressions, object.in_nodes, doc, policy, ops_limit)
     }) else {
         // SAFETY: a valid transform.
         let name = unsafe { name_of(transform) };
@@ -798,7 +800,10 @@ unsafe extern "C" fn execute(
 
 /// The node set the expressions of `list` make from `input` over `doc`
 /// under `policy` (libxmlsec1's `xmlSecXPathDataListExecute`, whose failures
-/// it reports).
+/// it reports). The context's `xpathOpsLimit`, unless zero, narrows the
+/// policy's `max_xpath_evaluation_work` for the transform's expressions: the
+/// core counts its own evaluation work rather than libxml2's operations, and
+/// never above the policy.
 ///
 /// # Safety
 /// `list` is a data list; `input` is null or a live node set over the live
@@ -808,6 +813,7 @@ unsafe fn evaluate_list(
     input: *mut XmlSecNodeSet,
     doc: *mut XmlDoc,
     policy: &impl xml_sec::document::XmlDocumentPolicy,
+    ops_limit: usize,
 ) -> Option<*mut XmlSecNodeSet> {
     let here = here!("xmlSecXPathDataListExecute");
     // The core evaluates over a snapshot of the tree in place of libxml2's
@@ -828,10 +834,14 @@ unsafe fn evaluate_list(
             .map(|position| &*xmlSecPtrListGetItem(list, position).cast::<Data>())
             .collect()
     };
+    let mut resources = policy.resource_policy().clone();
+    if ops_limit != 0 {
+        resources.max_xpath_evaluation_work = resources.max_xpath_evaluation_work.min(ops_limit);
+    }
     // One selector for the whole transform: its expressions charge the same
     // budgets, each with its own here().
     document.with_view(|view| {
-        let mut selector = match Selector::new(view, None, &[], policy.resource_policy()) {
+        let mut selector = match Selector::new(view, None, &[], &resources) {
             Ok(selector) => selector,
             Err(error) => {
                 failed(&error.to_string());

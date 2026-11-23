@@ -372,7 +372,8 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetAddList(
 }
 
 /// `xmlSecNodeSetGetChildren`: the subtree of `parent` (the whole document
-/// when null), with or without comments, or everything else when `invert`.
+/// when null or the document node), with or without comments, or everything
+/// else when `invert`.
 ///
 /// # Safety
 /// Callable with any pointers.
@@ -397,6 +398,13 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetGetChildren(
             std::ptr::null_mut()
         );
         let here = here!("xmlSecNodeSetGetChildren");
+        // The subtree of the document node is the whole document, as with
+        // no parent.
+        let parent = if !parent.is_null() && nodes::kind(parent) == XML_DOCUMENT_NODE {
+            std::ptr::null_mut()
+        } else {
+            parent
+        };
         let set = nodes::node_set(parent);
         if set.is_null() {
             errors::xml_failed(here, std::ptr::null(), c"xmlXPathNodeSetCreate");

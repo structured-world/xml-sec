@@ -104,6 +104,48 @@ fn the_expression_count_follows_the_policy_of_the_operation() {
     }
 }
 
+/// The context's `xpathOpsLimit` narrows the evaluation work of its
+/// expressions: a limit below the transform's work refuses it, while the
+/// initial limit and zero, which lifts it, leave the policy's.
+#[test]
+fn the_xpath_ops_limit_narrows_the_evaluation_work() {
+    let xml = b"<r xmlns:ds='http://www.w3.org/2000/09/xmldsig#'><a>x<b/><c/></a>\
+                <ds:Transform><ds:XPath>count(ancestor-or-self::*) &gt; 0</ds:XPath></ds:Transform></r>";
+    for (limit, expected) in [(None, 0), (Some(1), -1), (Some(0), 0)] {
+        // SAFETY: the document, node sets, transform and context are used
+        // while live and released here.
+        unsafe {
+            let doc = xmlSecParseMemory(xml.as_ptr(), xml.len(), 0);
+            assert!(!doc.is_null());
+            let root = nodes::first_child(doc);
+            let a = xmlSecFindNode(root, c"a".as_ptr().cast(), std::ptr::null());
+            let t = xmlSecFindNode(
+                root,
+                c"Transform".as_ptr().cast(),
+                c"http://www.w3.org/2000/09/xmldsig#".as_ptr().cast(),
+            );
+            let ctx = xmlSecTransformCtxCreate();
+            assert_eq!((*ctx).xpath_ops_limit, 1_000_000);
+            if let Some(limit) = limit {
+                (*ctx).xpath_ops_limit = limit;
+            }
+            let transform = xmlSecTransformCreate(super::xpath());
+            let read = (*super::xpath())
+                .read_node
+                .expect("XPath reads its element");
+            assert_eq!(read(transform, t, ctx), 0);
+            let input = xmlSecNodeSetGetChildren(doc, a, 1, 0);
+            (*transform).here_node = t;
+            (*transform).in_nodes = input;
+            assert_eq!(execute(transform, 1, ctx), expected, "limit {limit:?}");
+            xmlSecTransformDestroy(transform);
+            xmlSecNodeSetDestroy(input);
+            xmlSecTransformCtxDestroy(ctx);
+            xmlFreeDoc(doc);
+        }
+    }
+}
+
 /// `here()` is the element bearing the expression (`XMLDSig` 1.1 section
 /// 6.6.3: the parent of the text node holding it), the `ds:XPath` child, not
 /// the enclosing transform element, as libxmlsec1 also binds it.

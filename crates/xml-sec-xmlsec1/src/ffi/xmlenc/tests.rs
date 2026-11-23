@@ -2936,6 +2936,39 @@ fn a_cipher_reference_is_found_under_the_uri_the_core_resolves() {
     }
 }
 
+#[test]
+fn a_cipher_reference_without_a_uri_is_refused() {
+    // XML Encryption 1.1 section 3.3.1: `URI` is required, so the core's
+    // reading of the element refuses it, as libxmlsec1 does too.
+    own_process();
+    // SAFETY: the library, document and context set up and released here.
+    unsafe {
+        start_up();
+        let referenced = concat!(
+            "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\">",
+            "<EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#aes128-cbc\"/>",
+            "<CipherData><CipherReference/></CipherData>",
+            "</EncryptedData>"
+        );
+        let doc = xml_sec_libxml2::ffi::tree::xsReadMemory(
+            referenced.as_ptr().cast(),
+            std::ffi::c_int::try_from(referenced.len()).expect("a short document"),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        assert!(!doc.is_null());
+        let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
+        (*ctx).enc_key = aes_key();
+        let result =
+            xmlSecEncCtxDecryptToBuffer(ctx, xml_sec_libxml2::ffi::tree::xsDocGetRootElement(doc));
+        assert!(result.is_null());
+        xmlSecEncCtxDestroy(ctx);
+        xsFreeDoc(doc);
+        shut_down();
+    }
+}
+
 /// Octets a key lookup charges as read from an external key reference.
 const KEY_READ_OCTETS: usize = 16;
 

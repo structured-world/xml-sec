@@ -495,6 +495,42 @@ fn base64_input_is_bounded_per_run() {
     assert_eq!(run(&vec![b'\n'; limit + 1]), -1);
 }
 
+/// The `XPointer` transform a fragment implies is held to the context's
+/// enabled list as a `Transform` element's is: refused while the list leaves
+/// it out, selected while the list is empty or names it.
+#[test]
+fn a_fragment_needs_the_xpointer_transform_enabled() {
+    let xml = b"<r/>";
+    // SAFETY: the document and contexts are used while live.
+    unsafe {
+        let doc = crate::ffi::parser::xmlSecParseMemory(xml.as_ptr(), xml.len(), 0);
+        assert!(!doc.is_null());
+        let set = |enabled: &[*const super::XmlSecTransformKlass]| {
+            let ctx = xmlSecTransformCtxCreate();
+            for klass in enabled {
+                assert_eq!(
+                    crate::ffi::list::xmlSecPtrListAdd(
+                        &raw mut (*ctx).enabled_transforms,
+                        klass.cast_mut().cast()
+                    ),
+                    0
+                );
+            }
+            let status = super::ctx::xmlSecTransformCtxSetUri(
+                ctx,
+                c"#xpointer(id('x'))".as_ptr().cast(),
+                nodes::first_child(doc),
+            );
+            xmlSecTransformCtxDestroy(ctx);
+            status
+        };
+        assert_eq!(set(&[]), 0);
+        assert_eq!(set(&[super::xpath::xpointer()]), 0);
+        assert_eq!(set(&[super::xpath::xpath()]), -1);
+        xml_sec_libxml2::document::free(doc);
+    }
+}
+
 /// A bare-name fragment is an id inside an `id('...')` literal, so a name
 /// that would close the literal or change the pointer's scheme data is
 /// refused instead of selecting more than one element; numeric ids, which

@@ -54,6 +54,7 @@ const GENERIC_OPTIONS: &[&str] = &[
     // authorizes the core library to discover configuration or external data.
     "crypto",
     "crypto-config",
+    "xpath-ops-limit",
     "verbose",
     "print-crypto-library-errors",
     "help",
@@ -83,6 +84,7 @@ const SIGN_OPTIONS: &[&str] = &[
     "url-map",
     "enable-visa3d-hack",
     "enable-asn1-signatures-hack",
+    "max-key-info-children",
 ];
 const VERIFY_OPTIONS: &[&str] = &[
     "privkey-pem",
@@ -122,6 +124,7 @@ const VERIFY_OPTIONS: &[&str] = &[
     "url-map",
     "enable-visa3d-hack",
     "enable-asn1-signatures-hack",
+    "max-key-info-children",
 ];
 const ENCRYPT_OPTIONS: &[&str] = &[
     #[cfg(feature = "legacy-algorithms")]
@@ -145,6 +148,7 @@ const ENCRYPT_OPTIONS: &[&str] = &[
     "id-attr",
     "add-id-attr",
     "session-key",
+    "max-key-info-children",
 ];
 const DECRYPT_OPTIONS: &[&str] = &[
     #[cfg(feature = "legacy-algorithms")]
@@ -167,6 +171,7 @@ const DECRYPT_OPTIONS: &[&str] = &[
     "node-xpath",
     "id-attr",
     "add-id-attr",
+    "max-key-info-children",
 ];
 const KEYS_OPTIONS: &[&str] = &["gen-key"];
 const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
@@ -242,6 +247,7 @@ pub fn execute(
     }
     validate_provider(invocation)?;
     validate_crypto_config(invocation)?;
+    validate_resource_options(invocation)?;
     match invocation.command {
         Command::Help => match invocation.help_target {
             Some(HelpTarget::Command(command)) => command_help(command, stdout),
@@ -1058,6 +1064,7 @@ fn xmlsec_compatibility_signing_policy(invocation: &Invocation) -> SigningPolicy
             minimum_output_bits: 40,
         },
         ecdsa_signature_value_encoding: ecdsa_signature_value_encoding(invocation),
+        resources: xmlsec_compatibility_resources(invocation),
         ..SigningPolicy::default()
     };
     policy.dsa_keys.minimum_modulus_bits = 1024;
@@ -1594,6 +1601,7 @@ fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> Verifica
             ..TransformPolicy::default()
         },
         ecdsa_signature_value_encoding: ecdsa_signature_value_encoding(invocation),
+        resources: xmlsec_compatibility_resources(invocation),
         ..VerificationPolicy::default()
     };
     policy.key_trust.allowed_legacy_signature_algorithms = BTreeSet::from([
@@ -3360,7 +3368,8 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             "encrypt requires exactly one of --binary-data or --xml-data".into(),
         ));
     }
-    let policy = xmlsec_compatibility_encryption_policy();
+    let mut policy = xmlsec_compatibility_encryption_policy();
+    policy.resources = xmlsec_compatibility_resources(invocation);
     let maximum_document_bytes = policy.resources.max_xml_document_bytes;
     let maximum_plaintext_bytes = policy.resources.max_encryption_plaintext_bytes;
     let template = read_input(invocation, policy.resources.max_xml_document_bytes)?;
@@ -5151,7 +5160,8 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     validate_options(invocation, DECRYPT_OPTIONS)?;
     let xml_backend = selected_xml_backend(invocation)?;
     validate_supported_selectors(invocation, &["node-id", "id-attr", "add-id-attr"])?;
-    let policy = xmlsec_compatibility_decryption_policy();
+    let mut policy = xmlsec_compatibility_decryption_policy();
+    policy.resources = xmlsec_compatibility_resources(invocation);
     let xml = read_input(invocation, policy.resources.max_xml_document_bytes)?;
     let encrypted_data_id = option_text(invocation, "node-id")?;
     let id_attributes = id_attribute_registrations(invocation)?;
@@ -5690,6 +5700,67 @@ struct EncryptionTemplateMetadata {
     has_encrypted_key_recipient: bool,
     content_key_name: Option<String>,
     recipients: Vec<EncryptionTemplateRecipient>,
+}
+
+/// The non-negative count `--option` gives, as libxmlsec1 reads it; `None`
+/// when the option is absent.
+fn count_option(invocation: &Invocation, option: &str) -> Result<Option<usize>, CommandError> {
+    invocation
+        .last_value(option)
+        .map(|value| {
+            value
+                .to_str()
+                .and_then(|text| text.parse::<usize>().ok())
+                .ok_or_else(|| {
+                    CommandError::Usage(format!(
+                        "--{option} should be a number greater than or equal to zero"
+                    ))
+                })
+        })
+        .transpose()
+}
+
+/// Refuses a `--max-key-info-children` or `--xpath-ops-limit` that is not a
+/// count, before any input is read.
+fn validate_resource_options(invocation: &Invocation) -> Result<(), CommandError> {
+    count_option(invocation, "max-key-info-children")?;
+    count_option(invocation, "xpath-ops-limit")?;
+    Ok(())
+}
+
+/// The resource limits of the `XmlSecCompatible` profile, which follow
+/// libxmlsec1's defaults where they differ, set by this invocation's
+/// `--max-key-info-children` and narrowed by its `--xpath-ops-limit`. Zero
+/// lifts a limit as libxmlsec1 does, up to the core's canonical value, which
+/// a larger count cannot pass either; the operations limit bounds the core's
+/// own `XPath` evaluation work rather than libxml2's operations.
+fn xmlsec_compatibility_resources(invocation: &Invocation) -> xml_sec::policy::ResourcePolicy {
+    let canonical = xml_sec::policy::ResourcePolicy::default();
+    let mut resources = xml_sec::policy::PolicyCompiler::new(
+        xml_sec::policy::PolicyProfile::XmlSecCompatible,
+        &xml_sec::provider::RustCryptoProvider,
+        None,
+    )
+    .expect("the compatible profile needs no grant")
+    .policies()
+    .verification
+    .as_ref()
+    .expect("every profile verifies")
+    .resources
+    .clone();
+    // Validated before the command ran.
+    if let Ok(Some(children)) = count_option(invocation, "max-key-info-children") {
+        resources.max_key_info_children = match children {
+            0 => canonical.max_key_info_children,
+            count => count.min(canonical.max_key_info_children),
+        };
+    }
+    if let Ok(Some(limit)) = count_option(invocation, "xpath-ops-limit")
+        && limit != 0
+    {
+        resources.max_xpath_evaluation_work = resources.max_xpath_evaluation_work.min(limit);
+    }
+    resources
 }
 
 /// The key establishment of the `XmlSecCompatible` profile's inbound

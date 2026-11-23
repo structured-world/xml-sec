@@ -179,7 +179,7 @@ raise a hard safety ceiling. Their complete names are grouped here for lookup:
 | External bytes | `max_external_resource_bytes`, `max_external_resource_total_bytes` |
 | Streamed detached payloads | `max_detached_payload_bytes`, `max_detached_payload_total_bytes` |
 | Encryption | `max_encryption_plaintext_bytes`, `max_encryption_recipients`, `max_encryption_metadata_bytes` |
-| Keys and certificates | `max_key_candidates`, `max_x509_work`, `max_x509_workspace_bytes`, `max_key_import_kdf_work`, `max_key_import_kdf_memory_bytes`, `max_key_info_reference_depth` |
+| Keys and certificates | `max_key_candidates`, `max_x509_work`, `max_x509_workspace_bytes`, `max_key_import_kdf_work`, `max_key_import_kdf_memory_bytes`, `max_key_info_reference_depth`, `max_key_info_children` |
 | Base64 | `max_base64_transform_input_bytes`, `max_base64_transform_output_bytes` |
 | XPath | `max_xpath_expressions`, `max_xpath_expression_bytes`, `max_xpath_expression_complexity`, `max_xpath_context_evaluations`, `max_xpath_evaluation_work`, `max_xpath_mirror_string_bytes`, `max_xpath_string_work_bytes`, `max_xpath_namespace_bindings`, `max_xpath_namespace_bytes`, `max_xpath_filters` |
 | Node sets | `max_node_set_filter_work`, `max_node_set_entries`, `max_node_set_owned_string_bytes`, `max_node_set_cumulative_owned_string_bytes` |

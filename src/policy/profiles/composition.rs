@@ -393,6 +393,7 @@ fn resources(a: &ResourcePolicy, b: &ResourcePolicy) -> ResourcePolicy {
         max_key_import_kdf_work,
         max_key_import_kdf_memory_bytes,
         max_key_info_reference_depth,
+        max_key_info_children,
         max_base64_transform_input_bytes,
         max_base64_transform_output_bytes,
         max_xpath_expressions,

@@ -242,6 +242,8 @@ pub(crate) const OPTION_SPECS: &[OptionSpec] = &[
         SINGLE
     ),
     option_spec!("depth", [], VALUE, false, SINGLE),
+    option_spec!("max-key-info-children", [], VALUE, false, SINGLE),
+    option_spec!("xpath-ops-limit", [], VALUE, false, SINGLE),
     option_spec!("node-id", [], VALUE, false, SINGLE),
     option_spec!("node-name", [], VALUE, false, SINGLE),
     option_spec!("node-xpath", [], VALUE, false, SINGLE),

@@ -110,6 +110,9 @@ fn version_check_follows_libxmlsec1() {
         assert_eq!(xmlSecCheckVersionExt(major, minor + 1, 0, 1), 0);
         assert_eq!(xmlSecCheckVersionExt(major + 1, minor, subminor, 1), 0);
         assert_eq!(xmlSecCheckVersionExt(major, minor, subminor, 7), 0);
+        // A negative component is no older version.
+        assert_eq!(xmlSecCheckVersionExt(major, -1, 0, 1), 0);
+        assert_eq!(xmlSecCheckVersionExt(major, minor, -1, 1), 0);
     }
 }
 

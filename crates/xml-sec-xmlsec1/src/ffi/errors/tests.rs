@@ -95,10 +95,15 @@ fn reason_table_matches_libxmlsec1() {
             text(xmlSecErrorsGetMsg(40)).as_deref(),
             Some("maximum KeyInfoReference level")
         );
-        assert_eq!(xmlSecErrorsGetCode(53), 100);
-        assert_eq!(xmlSecErrorsGetCode(54), 101);
-        assert_eq!(xmlSecErrorsGetCode(55), 0);
-        assert!(xmlSecErrorsGetMsg(55).is_null());
+        assert_eq!(xmlSecErrorsGetCode(41), 54);
+        assert_eq!(
+            text(xmlSecErrorsGetMsg(41)).as_deref(),
+            Some("maximum number of KeyInfo children")
+        );
+        assert_eq!(xmlSecErrorsGetCode(54), 100);
+        assert_eq!(xmlSecErrorsGetCode(55), 101);
+        assert_eq!(xmlSecErrorsGetCode(56), 0);
+        assert!(xmlSecErrorsGetMsg(56).is_null());
         assert_eq!(xmlSecErrorsGetCode(usize::MAX), 0);
     }
 }
