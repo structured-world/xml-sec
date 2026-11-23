@@ -3056,8 +3056,43 @@ pub(crate) fn build_x509_certificate_chain_from(
 /// Enumerate signature-valid certificate paths that terminate at a certificate
 /// in the trusted prefix. Trust and certificate policy are intentionally not
 /// assigned here; callers must fully validate every returned candidate.
+/// Production callers read the pool once and use the `_in` form.
+#[cfg(test)]
 pub(crate) fn build_x509_certificate_paths_to_trusted_prefix(
     info: &impl X509DataSource,
+    signing_idx: usize,
+    trusted_prefix_len: usize,
+    bounds: X509PathBounds,
+    provider: &dyn crate::provider::CryptoProvider,
+    allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
+    certificates: &super::pkix::CertificateSession,
+) -> Result<X509CandidatePaths, X509ChainBuildError> {
+    check_trusted_prefix_request(info, signing_idx, trusted_prefix_len, bounds)?;
+    let source = certificates
+        .read_sources(info.encoded_certificates())
+        .map_err(X509ChainBuildError::from)?;
+    build_x509_certificate_paths_to_trusted_prefix_in(
+        info,
+        &source,
+        signing_idx,
+        trusted_prefix_len,
+        bounds,
+        provider,
+        allowed,
+        certificates,
+    )
+}
+
+/// [`build_x509_certificate_paths_to_trusted_prefix`] over `source`, the
+/// operation's already-read certificates of `info` in pool order, so a caller
+/// that validates every candidate reads each certificate once.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the pool, its read certificates and the operation's execution"
+)]
+pub(crate) fn build_x509_certificate_paths_to_trusted_prefix_in(
+    info: &impl X509DataSource,
+    source: &[structured_pkix::Certificate<'_>],
     signing_idx: usize,
     trusted_prefix_len: usize,
     bounds: X509PathBounds,
@@ -3070,6 +3105,7 @@ pub(crate) fn build_x509_certificate_paths_to_trusted_prefix(
     }
     build_x509_certificate_paths(
         info,
+        source,
         signing_idx,
         |index| index < trusted_prefix_len,
         false,
@@ -3101,8 +3137,13 @@ pub(crate) fn build_x509_certificate_paths_to_selector_targets(
     {
         return Err(X509ChainBuildError::InconsistentMetadata);
     }
+    check_path_request(info, signing_idx, bounds)?;
+    let source = certificates
+        .read_sources(info.encoded_certificates())
+        .map_err(X509ChainBuildError::from)?;
     build_x509_certificate_paths(
         info,
+        &source,
         signing_idx,
         |index| targets.contains(&index),
         true,
@@ -3125,8 +3166,42 @@ pub(crate) struct X509PathBounds {
 type X509CandidatePaths =
     structured_asn1::memory::OwnedVec<structured_asn1::memory::OwnedVec<usize>>;
 
+/// The refusals discovery of paths to a trusted prefix makes before reading
+/// any certificate.
+pub(crate) fn check_trusted_prefix_request(
+    info: &impl X509DataSource,
+    signing_idx: usize,
+    trusted_prefix_len: usize,
+    bounds: X509PathBounds,
+) -> Result<(), X509ChainBuildError> {
+    if trusted_prefix_len > info.certificate_count() {
+        return Err(X509ChainBuildError::InconsistentMetadata);
+    }
+    check_path_request(info, signing_idx, bounds)
+}
+
+/// The refusals path discovery makes before reading any certificate.
+fn check_path_request(
+    info: &impl X509DataSource,
+    signing_idx: usize,
+    bounds: X509PathBounds,
+) -> Result<(), X509ChainBuildError> {
+    if signing_idx >= info.certificate_count() {
+        return Err(X509ChainBuildError::InconsistentMetadata);
+    }
+    if bounds.max_candidate_paths == 0 {
+        return Err(X509ChainBuildError::AmbiguousIssuer);
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the pool, its read certificates, the terminal rule and the operation's execution"
+)]
 fn build_x509_certificate_paths(
     info: &impl X509DataSource,
+    source: &[structured_pkix::Certificate<'_>],
     signing_idx: usize,
     is_terminal: impl Fn(usize) -> bool,
     continue_after_terminal: bool,
@@ -3138,15 +3213,10 @@ fn build_x509_certificate_paths(
         max_depth,
         max_candidate_paths,
     } = bounds;
-    if signing_idx >= info.certificate_count() {
+    check_path_request(info, signing_idx, bounds)?;
+    if source.len() != info.certificate_count() {
         return Err(X509ChainBuildError::InconsistentMetadata);
     }
-    if max_candidate_paths == 0 {
-        return Err(X509ChainBuildError::AmbiguousIssuer);
-    }
-    let source = certificates
-        .read_sources(info.encoded_certificates())
-        .map_err(X509ChainBuildError::from)?;
 
     let memory = certificates.memory();
     let allocation_error = |reason| {
@@ -3198,7 +3268,7 @@ fn build_x509_certificate_paths(
         if issuer_cache[current_idx].is_none() {
             issuer_cache[current_idx] = Some(verified_issuers(
                 &source[current_idx],
-                &source,
+                source,
                 verifier,
                 certificates,
                 &mut rejections,

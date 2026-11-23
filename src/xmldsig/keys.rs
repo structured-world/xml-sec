@@ -34,10 +34,11 @@ use super::{
     X509ChainOptions, X509DataInfo,
     parse::{
         ParseError, X509ChainBuildError, build_x509_certificate_paths_to_selector_targets,
-        build_x509_certificate_paths_to_trusted_prefix, x509_certificate_matches_any_selector,
-        x509_data_has_lookup_identifiers, x509_selector_categories_match_candidates,
+        build_x509_certificate_paths_to_trusted_prefix_in, check_trusted_prefix_request,
+        x509_certificate_matches_any_selector, x509_data_has_lookup_identifiers,
+        x509_selector_categories_match_candidates,
     },
-    x509::verify_x509_certificate_chain_in_session,
+    x509::{verify_read_x509_chain, verify_x509_certificate_chain_in_session},
 };
 use super::{ResolvedVerificationKey, TrustedPublicKey, X509TrustEvidence};
 
@@ -1403,7 +1404,23 @@ impl DefaultKeyResolver {
         provider: &dyn crate::provider::CryptoProvider,
         budget: &InspectedKeyCandidateBudget<'_>,
     ) -> Result<super::pkix::ValidatedX509Key, KeyResolutionError> {
-        let options = X509ChainOptions {
+        let options = self.x509_chain_options(trust, budget)?;
+        Ok(verify_x509_certificate_chain_in_session(
+            info,
+            &options,
+            provider,
+            &self.config.crls,
+            &budget.certificates,
+        )?)
+    }
+
+    /// The chain options of one operation under `trust`.
+    fn x509_chain_options<'c>(
+        &'c self,
+        trust: &'c crate::policy::KeyTrustPolicy,
+        budget: &'c InspectedKeyCandidateBudget<'_>,
+    ) -> Result<X509ChainOptions<'c>, KeyResolutionError> {
+        Ok(X509ChainOptions {
             utc_facts: budget.utc_facts().copied(),
             trusted_certs: &self.config.trusted_certs,
             verification_time: trust
@@ -1416,14 +1433,7 @@ impl DefaultKeyResolver {
             rsa_keys: trust.rsa_keys,
             dsa_keys: trust.dsa_keys,
             certificate_signature_algorithms: trust.certificate_signature_algorithms.as_ref(),
-        };
-        Ok(verify_x509_certificate_chain_in_session(
-            info,
-            &options,
-            provider,
-            &self.config.crls,
-            &budget.certificates,
-        )?)
+        })
     }
 
     fn prepare_embedded_x509<'a>(
@@ -1490,19 +1500,7 @@ impl DefaultKeyResolver {
     ) -> Result<Option<super::pkix::ValidatedX509Key>, KeyResolutionError> {
         let (provider, budget) = execution;
         let certificates = &budget.certificates;
-        let candidates = build_x509_certificate_paths_to_trusted_prefix(
-            available,
-            signing_index,
-            trusted_prefix_len,
-            super::parse::X509PathBounds {
-                max_depth: trust.max_x509_chain_depth,
-                max_candidate_paths: trust.max_x509_candidate_paths,
-            },
-            provider,
-            trust.certificate_signature_algorithms.as_ref(),
-            certificates,
-        )
-        .map_err(|error| match error {
+        let build_error = |error| match error {
             X509ChainBuildError::AmbiguousIssuer => KeyResolutionError::AmbiguousCertificate,
             X509ChainBuildError::Certificate(error) => KeyResolutionError::Chain(error),
             X509ChainBuildError::Policy(error) => {
@@ -1517,12 +1515,47 @@ impl DefaultKeyResolver {
                 })
             }
             _ => KeyResolutionError::InvalidCertificate,
-        })?;
+        };
+        let bounds = super::parse::X509PathBounds {
+            max_depth: trust.max_x509_chain_depth,
+            max_candidate_paths: trust.max_x509_candidate_paths,
+        };
+        check_trusted_prefix_request(available, signing_index, trusted_prefix_len, bounds)
+            .map_err(build_error)?;
+        // The pool is read once: discovery and the validation of every
+        // candidate path use these certificates rather than reading again.
+        let sources = certificates
+            .read_sources(available.certificates.iter().copied())
+            .map_err(|error| build_error(X509ChainBuildError::from(error)))?;
+        let candidates = build_x509_certificate_paths_to_trusted_prefix_in(
+            available,
+            &sources,
+            signing_index,
+            trusted_prefix_len,
+            bounds,
+            provider,
+            trust.certificate_signature_algorithms.as_ref(),
+            certificates,
+        )
+        .map_err(build_error)?;
+        let options = self.x509_chain_options(trust, budget)?;
+        // The configured anchors lead the pool, already read with it.
+        let anchors = &sources[..trusted_prefix_len];
         let mut first_error = None;
         let mut valid_path_without_selector_match = false;
         for candidate in candidates {
+            let path = read_path(&sources, &candidate, certificates)?;
             available.certificate_chain = candidate;
-            match self.verify_x509_policy(available, trust, provider, budget) {
+            let validated = verify_read_x509_chain(
+                &path,
+                anchors,
+                available.crls(),
+                &options,
+                (provider, certificates),
+                &self.config.crls,
+            )
+            .map_err(KeyResolutionError::from);
+            match validated {
                 Ok(effective_key) => {
                     if match selectors {
                         Some(selectors) => selected_x509_path_matches_selectors(
@@ -2840,8 +2873,37 @@ pub(crate) fn supported_key_value_is_rsa(
     Ok(is_rsa)
 }
 
+/// The certificates of the candidate path `indices`, borrowed from the pool's
+/// already-read `sources`.
+fn read_path<'s, 'c>(
+    sources: &'s [structured_pkix::Certificate<'c>],
+    indices: &[usize],
+    certificates: &super::pkix::CertificateSession,
+) -> Result<
+    structured_asn1::memory::OwnedVec<&'s structured_pkix::Certificate<'c>>,
+    KeyResolutionError,
+> {
+    let storage = |reason| {
+        certificate_resolution_error(certificates.error(structured_pkix::Error::resource(
+            reason,
+            "certificate.path",
+            0,
+        )))
+    };
+    let mut path = certificates.memory().vector();
+    path.try_reserve_exact(indices.len()).map_err(storage)?;
+    for &index in indices {
+        let certificate = sources
+            .get(index)
+            .ok_or(KeyResolutionError::InvalidCertificate)?;
+        path.try_push(certificate).map_err(storage)?;
+    }
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::parse::build_x509_certificate_paths_to_trusted_prefix;
     // Codec calls are qualified: `rsa`'s own codecs add same-named methods.
     #[cfg(feature = "rustcrypto")]
     use crate::rsa_encoding::RsaPublicKeyEncoding;
@@ -4588,10 +4650,22 @@ mod tests {
         let mut trust = chain_policy();
         trust.allowed_extended_key_usages =
             BTreeSet::from([crate::policy::ExtendedKeyPurpose::CodeSigning]);
+        // Measure the work the resolver spends up to the end of the first
+        // candidate, as it spends it: the pool and anchors read once,
+        // discovery, then the first path's validation.
         let measured =
             super::super::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default());
-        let candidates = build_x509_certificate_paths_to_trusted_prefix(
-            &available,
+        let mut pool = BorrowedX509Pool::new(&available.crls, &measured);
+        for certificate in &available.certificates {
+            pool.insert(certificate, &measured)
+                .expect("measured certificate pool");
+        }
+        let sources = measured
+            .read_sources(pool.certificates.iter().copied())
+            .expect("read pool");
+        let candidates = super::super::parse::build_x509_certificate_paths_to_trusted_prefix_in(
+            &pool,
+            &sources,
             3,
             1,
             super::super::parse::X509PathBounds {
@@ -4615,16 +4689,20 @@ mod tests {
             &measured,
             None,
         );
+        let options = resolver
+            .x509_chain_options(&trust, &measured_budget)
+            .expect("chain options");
+        let path = read_path(&sources, &candidates[0], &measured).expect("first path");
         assert!(matches!(
-            resolver.verify_x509_policy(
-                &available,
-                &trust,
-                crate::provider::default_provider(),
-                &measured_budget,
+            verify_read_x509_chain(
+                &path,
+                &sources[..1],
+                pool.crls(),
+                &options,
+                (crate::provider::default_provider(), &measured),
+                &resolver.config.crls,
             ),
-            Err(KeyResolutionError::Chain(
-                super::super::X509ChainError::InvalidKeyUsage { position: 1, .. }
-            ))
+            Err(super::super::X509ChainError::InvalidKeyUsage { position: 1, .. })
         ));
         let maximum = measured.memory().work_used() + 1;
         let resources = crate::policy::ResourcePolicy {

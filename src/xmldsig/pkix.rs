@@ -274,7 +274,7 @@ pub(crate) fn test_utc_facts() -> structured_pkix::temporal::LeapTable<'static> 
 
 /// Consume only original sources and the already authenticated leaf-first path.
 pub(crate) fn verify_crls<'a>(
-    path: &'a [Certificate<'a>],
+    path: &[&'a Certificate<'a>],
     embedded: &'a [Vec<u8>],
     additional: &'a [Vec<u8>],
     options: &super::x509::X509ChainOptions<'_>,
@@ -286,7 +286,7 @@ pub(crate) fn verify_crls<'a>(
     if embedded.is_empty() && additional.is_empty() {
         return Ok(());
     }
-    let Some(anchor) = path.last() else {
+    let Some(&anchor) = path.last() else {
         return Ok(());
     };
     let execution = session.memory();
@@ -302,8 +302,8 @@ pub(crate) fn verify_crls<'a>(
     // anchor toward its subjects. Original SPKI/TBS bytes are never rewritten.
     // https://www.rfc-editor.org/rfc/rfc5280#section-6.1.4
     for position in (0..path.len() - 1).rev() {
-        let issuer = &path[position + 1];
-        let target = &path[position];
+        let issuer = path[position + 1];
+        let target = path[position];
         let mut reasons = structured_pkix::crl::Reasons::NONE;
         let lists = authenticated_crls(&crls, issuer, issuer_key, position, &verifier, session)?;
         for list in lists.iter().filter(|list| !list.delta) {
