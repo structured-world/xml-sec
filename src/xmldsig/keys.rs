@@ -1152,14 +1152,20 @@ impl DefaultKeyResolver {
         candidate_budget: &mut InspectedKeyCandidateBudget,
     ) -> Result<Option<ResolvedVerificationKey<'static>>, DsigError> {
         candidate_budget.bind_policy(policy)?;
-        self.resolve_with_trust(
+        // Kept signature answers belong to the provider borrowed for one
+        // call: a later call with the same budget may pass another provider,
+        // even one at the same address.
+        candidate_budget.certificates().edges().forget();
+        let resolved = self.resolve_with_trust(
             key_info,
             algorithm,
             policy,
             provider,
             candidate_budget,
             ResolutionScope::Document,
-        )
+        );
+        candidate_budget.certificates().edges().forget();
+        resolved
     }
 
     pub(crate) fn resolve_trusted_material_with_candidate_budget(
@@ -5371,6 +5377,74 @@ mod tests {
                 super::super::X509ChainError::Provider(_)
             ))
         ));
+    }
+
+    #[test]
+    fn a_provider_replaced_in_place_answers_its_own_certificate_signatures() {
+        // One budget may serve several resolver calls, each with the provider
+        // the caller passes. A provider value replaced at the same address
+        // must verify the certificate signatures itself, not receive the
+        // answers its predecessor gave.
+        let (mut info, root) = authorized_revoked_chain();
+        let issuer = info.certificates[1].clone();
+        info.crls.clear();
+        let policy = verification_policy_with_trust(crate::policy::KeyTrustPolicy {
+            max_x509_chain_depth: 3,
+            ..chain_policy_at(hours_after_epoch(492_768))
+        });
+        let session = super::super::pkix::CertificateSession::new(&policy.resources);
+        let leaf_signed_data = session
+            .read(&info.certificates[0])
+            .expect("test leaf parses")
+            .signed_bytes()
+            .to_vec();
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            lookup_certs: vec![issuer],
+            trusted_certs: vec![root],
+            ..KeyResolverConfig::default()
+        });
+        let key_info = KeyInfo {
+            sources: vec![KeyInfoSource::X509Data(info)],
+        };
+        let mut budget = InspectedKeyCandidateBudget::new_with_utc_facts(
+            &policy,
+            super::super::pkix::test_utc_facts(),
+        );
+        let mut provider = RejectSecondSha512Provider {
+            sha512_calls: AtomicUsize::new(0),
+            verification_calls: AtomicUsize::new(0),
+            reject_verification_call: None,
+            rejected_verification_data: None,
+        };
+        resolver
+            .resolve_for_verification_with_budget(
+                Some(&key_info),
+                SignatureAlgorithm::EcdsaSha256,
+                &policy,
+                &provider,
+                &mut budget,
+            )
+            .expect("the first provider accepts the chain");
+        provider.rejected_verification_data = Some(leaf_signed_data);
+        let result = resolver
+            .resolve_for_verification_with_budget(
+                Some(&key_info),
+                SignatureAlgorithm::EcdsaSha256,
+                &policy,
+                &provider,
+                &mut budget,
+            )
+            .map(|resolved| resolved.is_some());
+        // Path discovery reports the replacement's refusal of the leaf edge.
+        assert!(
+            matches!(
+                result,
+                Err(DsigError::KeyResolution(KeyResolutionError::Chain(
+                    super::super::X509ChainError::UnsupportedSignatureAlgorithm { .. }
+                )))
+            ),
+            "{result:?}"
+        );
     }
 
     #[test]

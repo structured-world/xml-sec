@@ -1124,6 +1124,14 @@ impl VerifiedEdges {
         Self { memory, edges }
     }
 
+    /// Drops every kept answer, when the provider that gave them may no
+    /// longer be the one in use.
+    pub(crate) fn forget(&self) {
+        if let Ok(mut edges) = self.edges.try_borrow_mut() {
+            edges.clear();
+        }
+    }
+
     /// The kept answer for this exact signature, after charging the
     /// comparisons it costs.
     fn lookup(

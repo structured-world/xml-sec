@@ -227,6 +227,23 @@ fn an_over_depth_anchored_path_fails_before_its_intermediates_are_read() {
 }
 
 #[test]
+fn an_over_depth_path_an_anchor_completes_fails_before_its_intermediates_are_read() {
+    // The anchor appended to the supplied path counts toward its depth, so a
+    // completed path that is too long is refused before a malformed
+    // intermediate is decoded.
+    let info = supplied_path(vec![
+        fixture("rsa/rsa-2048-cert.pem"),
+        vec![0x30, 0x00],
+        fixture("ca2cert.pem"),
+    ]);
+    let anchors = [fixture("cacert.pem")];
+    assert_eq!(
+        verify_x509_certificate_chain(&info, &options(&anchors, false)),
+        Err(X509ChainError::DepthExceeded(3))
+    );
+}
+
+#[test]
 fn an_unanchored_path_no_anchor_completes_is_untrusted_before_its_target_is_read() {
     // Without an anchor that can complete the path from its last
     // certificate, the path is untrusted; the earlier target is not decoded.

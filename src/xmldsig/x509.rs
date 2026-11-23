@@ -559,8 +559,14 @@ pub(crate) fn verify_x509_certificate_chain_in_session(
         {
             issued = Some(session.read(der)?);
         }
-        if !anchor_completes(issued.as_ref(), &last, &anchors, options, provider, session)? {
+        let Some(replaces_root) =
+            anchor_completes(issued.as_ref(), &last, &anchors, options, provider, session)?
+        else {
             return Err(X509ChainError::UntrustedRoot);
+        };
+        // The anchor joins the path, in place of a replaced root.
+        if path_der.len() - usize::from(replaces_root) + 1 > options.max_chain_depth {
+            return Err(X509ChainError::DepthExceeded(options.max_chain_depth));
         }
     }
     let mut decoded = session.memory().vector();
@@ -727,7 +733,8 @@ fn malformed_anchor(error: X509ChainError) -> X509ChainError {
 
 /// Whether a trust anchor can complete a supplied path that does not end at
 /// one: an anchor issues its `last` certificate, or the `issued` certificate
-/// before a replaceable self-signed root.
+/// before a replaceable self-signed root. `Some` tells whether the anchor
+/// replaces that root.
 fn anchor_completes(
     issued: Option<&structured_pkix::Certificate<'_>>,
     last: &structured_pkix::Certificate<'_>,
@@ -735,11 +742,11 @@ fn anchor_completes(
     options: &X509ChainOptions<'_>,
     provider: &dyn crate::provider::CryptoProvider,
     session: &super::pkix::CertificateSession,
-) -> Result<bool, X509ChainError> {
+) -> Result<Option<bool>, X509ChainError> {
     // `issued` is read only after `last` proved a self-signed root.
-    let child = match issued {
-        Some(child) if issued_by(child, last, options, provider, session)? => child,
-        _ => last,
+    let (child, replaces_root) = match issued {
+        Some(child) if issued_by(child, last, options, provider, session)? => (child, true),
+        _ => (last, false),
     };
     for cert in anchors {
         if !session.source_names_equal(cert.tbs().subject(), child.tbs().issuer())? {
@@ -755,10 +762,10 @@ fn anchor_completes(
             )?,
             structured_pkix::path::Verified::Yes | structured_pkix::path::Verified::Unsupported
         ) {
-            return Ok(true);
+            return Ok(Some(replaces_root));
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 /// Whether the supplied path ends in a self-signed root that a trusted anchor
