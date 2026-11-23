@@ -34,6 +34,14 @@ Both editions order Ids case-sensitively, reject duplicate identifiers, remove
 namespace prefixes and unused namespace declarations, and insert an absent
 `TargetMode="Internal"`. The CLI selects the 2012 compatibility contract.
 
+`TransformPolicy::relationship_target_mode_semantics` decides how a
+`TargetMode` bound to the Relationships namespace (`rel:TargetMode`) is read.
+`Specification`, the default, refuses it: the Part 2 schema declares the
+`Relationship` attributes unqualified and admits no other attribute. `Libxmlsec1`
+reads it as `TargetMode`, an unprefixed `TargetMode` on the same element taking
+precedence, and the output carries one unprefixed `TargetMode`. The
+`XmlSecCompatible` profile, the C library and the CLI select `Libxmlsec1`.
+
 ## Building a Reference
 
 ```rust

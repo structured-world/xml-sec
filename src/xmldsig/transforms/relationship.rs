@@ -12,7 +12,7 @@ use crate::c14n::scratch::Native;
 use crate::c14n::scratch::{List, Scratch};
 use crate::{
     c14n::C14nMode,
-    policy::OpcRelationshipEdition,
+    policy::{OpcRelationshipEdition, RelationshipTargetModeSemantics},
     xml::dom::{Document, Node},
 };
 
@@ -319,6 +319,14 @@ impl<S: Scratch> core::ops::Deref for CurrentBudget<'_, S> {
     }
 }
 
+/// How a Relationships part is read: the trusted edition and the policy's
+/// reading of a Relationships-namespace `TargetMode`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct Reading {
+    pub(super) edition: OpcRelationshipEdition,
+    pub(super) target_mode: RelationshipTargetModeSemantics,
+}
+
 /// No intermediate DOM or copied attribute strings: retained records borrow
 /// the input arena; only the bounded traversal stack and sorted records allocate.
 #[cfg(test)]
@@ -328,16 +336,21 @@ pub(super) fn normalize<'a>(
     edition: OpcRelationshipEdition,
     budget: &TransformExecutionBudget,
 ) -> Result<Vec<u8>, TransformError> {
-    normalize_in(document, selectors, edition, budget, &Native)
+    let reading = Reading {
+        edition,
+        ..Reading::default()
+    };
+    normalize_in(document, selectors, reading, budget, &Native)
 }
 
 pub(super) fn normalize_in<'a, S: Scratch, D: crate::xml::dom::storage::Storage>(
     document: &'a Document<'a, D>,
     selectors: &[impl Selector],
-    edition: OpcRelationshipEdition,
+    reading: Reading,
     budget: &TransformExecutionBudget,
     scratch: &S,
 ) -> Result<S::Bytes, TransformError> {
+    let edition = reading.edition;
     let current = CurrentBudget {
         original: budget,
         node_filter: CurrentFilter {
@@ -346,7 +359,7 @@ pub(super) fn normalize_in<'a, S: Scratch, D: crate::xml::dom::storage::Storage>
         },
     };
     let budget = &current;
-    let mut scan = scan_relationships(document, edition, budget, scratch)?;
+    let mut scan = scan_relationships(document, reading, budget, scratch)?;
     sort_records(&mut scan.records, scan.padded_ids, budget, scratch)?;
     let selected = select_records(&mut scan.records, selectors, edition, budget)?;
     write_normalized(&scan, selected, edition, budget, scratch)
@@ -415,11 +428,16 @@ fn compatibility<'a, S: Scratch, D: crate::xml::dom::storage::Storage>(
 /// Validate one `Relationship` element; also reports whether its Id is padded.
 fn read_relationship<'a, S: Scratch, D: crate::xml::dom::storage::Storage>(
     node: Node<'a, 'a, D>,
-    edition: OpcRelationshipEdition,
+    reading: Reading,
     budget: &CurrentBudget<'_, S>,
     scratch: &S,
 ) -> Result<(Relationship<'a, S, D>, bool), TransformError> {
-    validate_attributes(node, &["Id", "Type", "Target", "TargetMode"], budget)?;
+    let edition = reading.edition;
+    // ECMA-376 Part 2 opc-relationships.xsd declares the CT_Relationship
+    // attributes unqualified, with no anyAttribute: a Relationships-namespace
+    // TargetMode is foreign unless the policy reads it as libxmlsec1 does.
+    let qualified_mode = reading.target_mode == RelationshipTargetModeSemantics::Libxmlsec1;
+    validate_relationship_attributes(node, qualified_mode, budget)?;
     let id = budget
         .attribute(node, None, "Id")?
         .ok_or_else(|| invalid("missing relationship Id"))?;
@@ -440,9 +458,14 @@ fn read_relationship<'a, S: Scratch, D: crate::xml::dom::storage::Storage>(
     let target = budget
         .attribute(node, None, "Target")?
         .ok_or_else(|| invalid("missing relationship Target"))?;
-    let mode = budget
-        .attribute(node, None, "TargetMode")?
-        .unwrap_or("Internal");
+    // libxmlsec1 prefers the unprefixed TargetMode and otherwise takes the
+    // Relationships-namespace one; normalization writes it unprefixed.
+    let mode = match budget.attribute(node, None, "TargetMode")? {
+        Some(mode) => Some(mode),
+        None if qualified_mode => budget.attribute(node, Some(REL), "TargetMode")?,
+        None => None,
+    }
+    .unwrap_or("Internal");
     if mode != "Internal" && mode != "External" {
         return Err(invalid("invalid relationship TargetMode"));
     }
@@ -489,10 +512,11 @@ fn check_text<S: Scratch, D: crate::xml::dom::storage::Storage>(
 
 fn scan_relationships<'a, S: Scratch, D: crate::xml::dom::storage::Storage>(
     document: &'a Document<'a, D>,
-    edition: OpcRelationshipEdition,
+    reading: Reading,
     budget: &CurrentBudget<'_, S>,
     scratch: &S,
 ) -> Result<Scan<'a, S, D>, TransformError> {
+    let edition = reading.edition;
     let mut frames = scratch.values();
     let mut scan: Scan<'a, S, D> = Scan {
         records: scratch.values(),
@@ -562,7 +586,7 @@ fn scan_relationships<'a, S: Scratch, D: crate::xml::dom::storage::Storage>(
                 Parent::Relationships
             }
             (Parent::Relationships, Some(REL), "Relationship") => {
-                let (record, padded) = read_relationship(node, edition, budget, scratch)?;
+                let (record, padded) = read_relationship(node, reading, budget, scratch)?;
                 scan.padded_ids |= padded;
                 let index = scan.records.len();
                 budget.opc_workspace.push(&mut scan.records, record)?;
@@ -1026,6 +1050,29 @@ fn validate_attributes<S: Scratch, D: crate::xml::dom::storage::Storage>(
     Ok(())
 }
 
+/// [`validate_attributes`] for a `Relationship` element, also admitting a
+/// Relationships-namespace `TargetMode` when `qualified_mode` is set.
+fn validate_relationship_attributes<S: Scratch, D: crate::xml::dom::storage::Storage>(
+    node: Node<'_, '_, D>,
+    qualified_mode: bool,
+    budget: &CurrentBudget<'_, S>,
+) -> Result<(), TransformError> {
+    if !qualified_mode {
+        return validate_attributes(node, &["Id", "Type", "Target", "TargetMode"], budget);
+    }
+    for attribute in node.attributes() {
+        budget.node_filter.charge(1)?;
+        match attribute.namespace() {
+            Some(MC) => {}
+            Some(REL) if attribute.name() == "TargetMode" => {}
+            Some(uri) if uri != REL && ignorable(node, Some(uri), budget)? => {}
+            None if matches!(attribute.name(), "Id" | "Type" | "Target" | "TargetMode") => {}
+            _ => return Err(invalid("unexpected Relationships part attribute")),
+        }
+    }
+    Ok(())
+}
+
 fn alternate_content<'a, S: Scratch, D: crate::xml::dom::storage::Storage>(
     node: Node<'a, 'a, D>,
     edition: OpcRelationshipEdition,
@@ -1336,10 +1383,14 @@ mod tests {
             let baseline_reader = baseline.read(&[], 0).expect("empty baseline input");
             let baseline_work = baseline_reader.execution();
             let before = memory.work_used();
+            let reading = Reading {
+                edition,
+                ..Reading::default()
+            };
             let output = normalize_in(
                 &document,
                 &selectors,
-                edition,
+                reading,
                 &TransformExecutionBudget::default(),
                 &crate::c14n::scratch::Accounted(&baseline_work),
             )
@@ -1364,7 +1415,7 @@ mod tests {
                 let result = normalize_in(
                     &document,
                     &selectors,
-                    edition,
+                    reading,
                     &TransformExecutionBudget::default(),
                     &crate::c14n::scratch::Accounted(&work),
                 );
@@ -1385,7 +1436,7 @@ mod tests {
             let result = normalize_in(
                 &document,
                 &selectors,
-                edition,
+                reading,
                 &TransformExecutionBudget::default(),
                 &crate::c14n::scratch::Accounted(&small),
             );

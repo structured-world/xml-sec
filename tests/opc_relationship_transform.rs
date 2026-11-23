@@ -327,6 +327,70 @@ fn public_executor_can_select_2012_policy() {
     );
 }
 
+#[test]
+fn a_relationships_namespace_target_mode_follows_the_policy() {
+    // ECMA-376 Part 2 declares the Relationship attributes unqualified, so
+    // the specification reading refuses rel:TargetMode; the libxmlsec1
+    // reading takes it as TargetMode, prefers an unprefixed one present on
+    // the same element, and writes a single unprefixed TargetMode. Inputs are
+    // libxmlsec1's targetmode and targetmode-both fixtures.
+    use xml_sec::policy::RelationshipTargetModeSemantics;
+    let kind = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument";
+    let part = |modes: &str| {
+        format!(
+            "<Relationships xmlns=\"{REL}\" xmlns:rel=\"{REL}\"><Relationship Id=\"rId1\" {modes} Type=\"{kind}\" Target=\"word/document.xml\"/></Relationships>"
+        )
+    };
+    let normalized = |mode: &str| {
+        format!(
+            "<Relationships xmlns=\"{REL}\"><Relationship Id=\"rId1\" Target=\"word/document.xml\" TargetMode=\"{mode}\" Type=\"{kind}\"></Relationship></Relationships>"
+        )
+    };
+    let run = |xml: &str, semantics| {
+        let document = Document::parse(xml).unwrap();
+        let mut policy = VerificationPolicy::default();
+        policy.transforms.relationship_target_mode_semantics = semantics;
+        xml_sec::xmldsig::execute_transforms_with_policy(
+            document.root_element(),
+            TransformData::NodeSet(NodeSet::entire_document_with_comments(&document).unwrap()),
+            &[
+                Transform::Relationship(vec![RelationshipSelector::SourceId("rId1".into())]),
+                Transform::C14n(C14nAlgorithm::new(C14nMode::Inclusive1_0, false)),
+            ],
+            &policy,
+        )
+        .map_err(|error| error.to_string())
+    };
+    let prefixed = part("rel:TargetMode=\"External\"");
+    let both = part("TargetMode=\"Internal\" rel:TargetMode=\"External\"");
+    for xml in [&prefixed, &both] {
+        let error = run(xml, RelationshipTargetModeSemantics::Specification)
+            .expect_err("the schema has no qualified TargetMode");
+        assert!(
+            error.contains("unexpected Relationships part attribute"),
+            "{error}"
+        );
+    }
+    assert_eq!(
+        run(&prefixed, RelationshipTargetModeSemantics::Libxmlsec1).unwrap(),
+        normalized("External").as_bytes()
+    );
+    assert_eq!(
+        run(&both, RelationshipTargetModeSemantics::Libxmlsec1).unwrap(),
+        normalized("Internal").as_bytes()
+    );
+    // An unprefixed TargetMode alone reads the same under either policy.
+    for semantics in [
+        RelationshipTargetModeSemantics::Specification,
+        RelationshipTargetModeSemantics::Libxmlsec1,
+    ] {
+        assert_eq!(
+            run(&part("TargetMode=\"External\""), semantics).unwrap(),
+            normalized("External").as_bytes()
+        );
+    }
+}
+
 #[path = "common/xmlsec1.rs"]
 mod xmlsec1;
 

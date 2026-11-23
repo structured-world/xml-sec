@@ -703,6 +703,55 @@ fn library_policy_runs_the_relationship_transform() {
     );
 }
 
+/// The library reads a Relationships-namespace `TargetMode` as libxmlsec1
+/// does: as `TargetMode`, written unprefixed, an unprefixed one winning.
+#[test]
+fn library_policy_reads_a_qualified_target_mode_as_libxmlsec1() {
+    use xml_sec::xmldsig::transforms::{
+        RelationshipSelector, Transform, execute_transforms_with_policy,
+    };
+    use xml_sec::xmldsig::types::{NodeSet, TransformData};
+
+    let policy = crate::ffi::policy::verification().expect("the library policy compiles");
+    let run = |modes: &str| {
+        let document = xml_sec::XmlDocument::parse(&format!(
+            "<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships' \
+             xmlns:rel='http://schemas.openxmlformats.org/package/2006/relationships'>\
+             <Relationship Id='rId1' {modes} Type='urn:t:a' Target='a.xml'/></Relationships>"
+        ))
+        .expect("parse");
+        let transforms = [
+            Transform::Relationship(vec![RelationshipSelector::SourceId("rId1".into())]),
+            Transform::C14n(xml_sec::c14n::C14nAlgorithm::new(
+                xml_sec::c14n::C14nMode::Inclusive1_0,
+                false,
+            )),
+        ];
+        let output = document.with_view(|view| {
+            let document = view.document();
+            execute_transforms_with_policy(
+                document.root(),
+                TransformData::NodeSet(NodeSet::entire_document_without_comments(document)?),
+                &transforms,
+                &*policy,
+            )
+        });
+        String::from_utf8(output.expect("relationship transform")).expect("UTF-8")
+    };
+    let expected = |mode: &str| {
+        format!(
+            "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+             <Relationship Id=\"rId1\" Target=\"a.xml\" TargetMode=\"{mode}\" Type=\"urn:t:a\">\
+             </Relationship></Relationships>"
+        )
+    };
+    assert_eq!(run("rel:TargetMode='External'"), expected("External"));
+    assert_eq!(
+        run("TargetMode='Internal' rel:TargetMode='External'"),
+        expected("Internal")
+    );
+}
+
 #[test]
 fn key_derivation_and_agreement_transforms_hold_secrets_in_both_buffers() {
     // libxmlsec1 creates a key derivation or agreement transform with both

@@ -1044,6 +1044,8 @@ fn xmlsec_compatibility_signing_policy(invocation: &Invocation) -> SigningPolicy
         transforms: TransformPolicy {
             xpath_here_semantics: XMLSEC_COMPATIBILITY_HERE_SEMANTICS,
             opc_relationship_edition: xml_sec::policy::OpcRelationshipEdition::Ecma2012,
+            relationship_target_mode_semantics:
+                xml_sec::policy::RelationshipTargetModeSemantics::Libxmlsec1,
             same_document_id_semantics: same_document_id_semantics(invocation),
             xslt_stylesheet_semantics: XMLSEC_COMPATIBILITY_XSLT_STYLESHEETS,
             // xmlsec1 writes no conversion for a node set and digests it
@@ -1585,6 +1587,8 @@ fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> Verifica
         transforms: TransformPolicy {
             xpath_here_semantics: XMLSEC_COMPATIBILITY_HERE_SEMANTICS,
             opc_relationship_edition: xml_sec::policy::OpcRelationshipEdition::Ecma2012,
+            relationship_target_mode_semantics:
+                xml_sec::policy::RelationshipTargetModeSemantics::Libxmlsec1,
             same_document_id_semantics: same_document_id_semantics(invocation),
             xslt_stylesheet_semantics: XMLSEC_COMPATIBILITY_XSLT_STYLESHEETS,
             ..TransformPolicy::default()

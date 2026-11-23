@@ -10,9 +10,10 @@ use super::{
 use super::{
     DigestAlgorithm, KemContentAuthentication, KemSignatureTrust, KeyAgreementAlgorithm,
     KeyDerivationAlgorithm, KeyEstablishmentPolicy, KeySourceKind, KeySourcePolicy,
-    PolicyViolation, RequestSelections, RsaPssPermission, SameDocumentIdSemantics,
-    SignatureAlgorithm, SigningPolicy, TransformPolicy, UnknownX509CertificateSemantics, UriPolicy,
-    UriTypeSet, VerificationPolicy, XsltStylesheetSemantics,
+    PolicyViolation, RelationshipTargetModeSemantics, RequestSelections, RsaPssPermission,
+    SameDocumentIdSemantics, SignatureAlgorithm, SigningPolicy, TransformPolicy,
+    UnknownX509CertificateSemantics, UriPolicy, UriTypeSet, VerificationPolicy,
+    XsltStylesheetSemantics,
 };
 use crate::provider::{CryptoProvider, KeyEncapsulationAlgorithm, ProviderCapability};
 use alloc::{borrow::ToOwned, collections::BTreeSet, string::String, sync::Arc};
@@ -523,6 +524,7 @@ fn profile_transforms(compatibility: bool) -> TransformPolicy {
         // are the business of the C library and the xmlsec1 command.
         TransformPolicy {
             xslt_stylesheet_semantics: XsltStylesheetSemantics::Libxmlsec1,
+            relationship_target_mode_semantics: RelationshipTargetModeSemantics::Libxmlsec1,
             ..TransformPolicy::default()
         }
     } else {

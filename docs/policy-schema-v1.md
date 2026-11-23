@@ -67,6 +67,7 @@ two bound the key references of its key.
 | `xpath_here_semantics` | `Specification`, `XmlSecLegacy` |
 | `same_document_id_semantics` | `Specification`, `XmlSecBarename`, `XmlSecVisa3d` |
 | `opc_relationship_edition` | `Ecma2012`, `Ecma2021` |
+| `relationship_target_mode_semantics` | `Specification`, `Libxmlsec1` |
 | `xslt_stylesheet_semantics` | `Specification`, `Libxmlsec1` |
 | `empty_digest_input` | `Accept`, `Refuse` |
 | `generated_canonicalization` | `ExplicitExclusiveC14n`, `Implicit` |

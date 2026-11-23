@@ -261,6 +261,10 @@ fn transforms(
             b.same_document_id_semantics,
         )?,
         opc_relationship_edition: equal(a.opc_relationship_edition, b.opc_relationship_edition)?,
+        relationship_target_mode_semantics: equal(
+            a.relationship_target_mode_semantics,
+            b.relationship_target_mode_semantics,
+        )?,
         xslt_stylesheet_semantics: equal(a.xslt_stylesheet_semantics, b.xslt_stylesheet_semantics)?,
         // A layer that refuses empty digest input keeps refusing it.
         empty_digest_input: if a.empty_digest_input == EmptyDigestInput::Refuse

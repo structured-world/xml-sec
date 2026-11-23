@@ -1226,6 +1226,22 @@ pub enum XsltStylesheetSemantics {
     Libxmlsec1,
 }
 
+/// How the Relationship transform reads a `TargetMode` attribute bound to the
+/// Relationships namespace (`rel:TargetMode`).
+#[cfg(feature = "xmldsig")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RelationshipTargetModeSemantics {
+    /// ECMA-376 Part 2 schema: the attributes of `CT_Relationship` are
+    /// unqualified and no `anyAttribute` is declared, so a qualified
+    /// `TargetMode` is an unexpected attribute and the part is refused.
+    #[default]
+    Specification,
+    /// libxmlsec1: a Relationships-namespace `TargetMode` is the
+    /// `TargetMode` attribute; an unprefixed one present on the same element
+    /// takes precedence, and the output carries one unprefixed `TargetMode`.
+    Libxmlsec1,
+}
+
 /// Wire representation used for ECDSA `SignatureValue` bytes.
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -1283,6 +1299,8 @@ pub struct TransformPolicy {
     pub same_document_id_semantics: SameDocumentIdSemantics,
     /// Trusted normalization edition, not package validation; never inferred from XML.
     pub opc_relationship_edition: OpcRelationshipEdition,
+    /// How a Relationships-namespace `TargetMode` is read.
+    pub relationship_target_mode_semantics: RelationshipTargetModeSemantics,
     /// How XSLT stylesheets are read; applies to builds with `xslt`.
     pub xslt_stylesheet_semantics: XsltStylesheetSemantics,
     /// Whether a Reference whose transforms produce no octets is digested.

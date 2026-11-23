@@ -814,6 +814,66 @@ fn xslt_stylesheet_semantics_comes_from_the_base_profile() {
 }
 
 #[test]
+fn relationship_target_mode_semantics_comes_from_the_base_profile() {
+    // Like the stylesheet reading: the libxmlsec1-compatible base reads a
+    // Relationships-namespace TargetMode as libxmlsec1 does, a layer may only
+    // restate its base, and unknown names are schema errors.
+    use xml_sec::policy::{PolicyViolation, RelationshipTargetModeSemantics};
+    let base = |base: &str, extra: &str| {
+        Configuration::from_str(
+            &format!("schema_version = 1\n[profiles.team]\nbase = '{base}'\n{extra}"),
+            LoadLimits::default(),
+        )
+    };
+    let semantics = |config: &Configuration| {
+        effective(config, "team")
+            .compiled()
+            .verification()
+            .unwrap()
+            .transforms
+            .relationship_target_mode_semantics
+    };
+    assert_eq!(
+        semantics(&base("XmlSecCompatible", "").expect("strict config")),
+        RelationshipTargetModeSemantics::Libxmlsec1
+    );
+    assert_eq!(
+        semantics(&base("Modern", "").expect("strict config")),
+        RelationshipTargetModeSemantics::Specification
+    );
+    let layer = |value: &str| {
+        format!(
+            "[profiles.team.verification.transforms]\nrelationship_target_mode_semantics='{value}'"
+        )
+    };
+    assert_eq!(
+        semantics(&base("XmlSecCompatible", &layer("Libxmlsec1")).expect("strict config")),
+        RelationshipTargetModeSemantics::Libxmlsec1
+    );
+    let compiled = base("Modern", &layer("Libxmlsec1"))
+        .expect("strict config")
+        .compile(
+            "team",
+            default_provider(),
+            &PolicyCompileContext {
+                external_resources: false,
+                target_evidence: true,
+            },
+            None,
+        );
+    assert!(matches!(
+        compiled,
+        Err(xml_sec_config::Error::Policy(PolicyViolation::Configuration { reason }))
+            if reason.contains("incompatible interpretation semantics")
+    ));
+    assert!(matches!(
+        base("Modern", &layer("Lenient")),
+        Err(xml_sec_config::Error::Schema(message))
+            if message.contains("relationship_target_mode_semantics")
+    ));
+}
+
+#[test]
 fn unknown_x509_certificate_semantics_comes_from_the_base_profile() {
     // Like the transform interpretations: the libxmlsec1-compatible base
     // selects libxmlsec1's reading, a layer may only restate its base, and an
