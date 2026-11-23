@@ -714,7 +714,7 @@ fn library_policy_reads_a_qualified_target_mode_as_libxmlsec1() {
 
     let policy = crate::ffi::policy::verification().expect("the library policy compiles");
     let run = |modes: &str| {
-        let document = xml_sec::XmlDocument::parse(&format!(
+        let document = xml_sec::XmlDocument::parse(format!(
             "<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships' \
              xmlns:rel='http://schemas.openxmlformats.org/package/2006/relationships'>\
              <Relationship Id='rId1' {modes} Type='urn:t:a' Target='a.xml'/></Relationships>"
