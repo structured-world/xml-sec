@@ -6135,6 +6135,14 @@ fn xmlsec_compatibility_decryption_policy() -> DecryptionPolicy {
         data_algorithms: compatibility.data_algorithms,
         key_transport_algorithms: compatibility.key_transport_algorithms,
         key_wrap_algorithms: compatibility.key_wrap_algorithms,
+        // A CipherReference's Relationship transform follows the same
+        // command contract as signing and verification.
+        transforms: TransformPolicy {
+            opc_relationship_edition: xml_sec::policy::OpcRelationshipEdition::Ecma2012,
+            relationship_target_mode_semantics:
+                xml_sec::policy::RelationshipTargetModeSemantics::Libxmlsec1,
+            ..TransformPolicy::default()
+        },
         ..DecryptionPolicy::default()
     }
 }

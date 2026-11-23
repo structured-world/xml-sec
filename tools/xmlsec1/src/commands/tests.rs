@@ -1562,6 +1562,22 @@ fn compatibility_verification_uses_libxmlsec_here_semantics() {
 }
 
 #[test]
+fn compatibility_decryption_reads_relationships_as_libxmlsec1() {
+    // A CipherReference's Relationship transform follows the same command
+    // contract as signing and verification: the 2012 edition and a
+    // Relationships-namespace TargetMode read as libxmlsec1 reads it.
+    let policy = xmlsec_compatibility_decryption_policy();
+    assert_eq!(
+        policy.transforms.opc_relationship_edition,
+        xml_sec::policy::OpcRelationshipEdition::Ecma2012
+    );
+    assert_eq!(
+        policy.transforms.relationship_target_mode_semantics,
+        xml_sec::policy::RelationshipTargetModeSemantics::Libxmlsec1
+    );
+}
+
+#[test]
 fn openssl_compatibility_strict_check_flag_does_not_weaken_trust_policy() {
     // The pinned donor uses OpenSSL, where this backend-specific flag is a
     // no-op; accepting it must not disable Rust certificate/path checks.
