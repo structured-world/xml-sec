@@ -129,12 +129,11 @@ impl<'a, 'input> XmlBase64Payload<'a, 'input> {
     /// Validate padding bits without allocating a decoded ciphertext copy.
     #[cfg(feature = "xmlenc")]
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
-        use base64::Engine as _;
         // Lexical preflight already checked every character and frame length.
         // Only the final quartet can contain padding or unused trailing bits.
         if self.normalized_len != 0 {
-            base64::engine::general_purpose::STANDARD
-                .decode_slice(self.tail, &mut [0; 3])
+            structured_base64::STANDARD
+                .decode_slice(&self.tail, &mut [0; 3])
                 .map_err(|_| "invalid base64 padding or trailing bits")?;
         }
         Ok(())
@@ -224,17 +223,53 @@ fn decode_chunk(
     output: &mut [u8],
     written: usize,
 ) -> Result<usize, Base64DecodeError> {
-    use base64::Engine as _;
-    let mut decoded = [0_u8; 1024 / 4 * 3];
-    let length = base64::engine::general_purpose::STANDARD
-        .decode_slice(input, &mut decoded)
-        .map_err(|_| Base64DecodeError::Invalid)?;
-    let end = written + length;
-    output
-        .get_mut(written..end)
-        .ok_or(Base64DecodeError::Length)?
-        .copy_from_slice(&decoded[..length]);
-    Ok(end)
+    // `written` never passes the end: each call stores at most what remains.
+    let length = structured_base64::STANDARD
+        .decode_slice(input, &mut output[written..])
+        .map_err(|error| match error {
+            // The profile checks the room before writing a byte.
+            structured_base64::Base64Error::OutputFull => Base64DecodeError::Length,
+            _ => Base64DecodeError::Invalid,
+        })?;
+    Ok(written + length)
+}
+
+/// `error` of the strict decoder over `texts` with XML whitespace removed,
+/// located in the concatenated `texts`: a symbol offset counts the removed
+/// whitespace too, and an incomplete quantum ends where the text ends.
+///
+/// The walk repeats the removal only on this failure path, so decoding keeps
+/// no per-byte position map.
+#[cold]
+pub(crate) fn locate_in_xml_text<'t>(
+    error: structured_base64::Base64Error,
+    texts: impl IntoIterator<Item = &'t [u8]>,
+) -> structured_base64::Base64Error {
+    use structured_base64::Base64Error;
+    let original = |normalized: usize| {
+        let mut kept = 0_usize;
+        let mut position = 0_usize;
+        for text in texts {
+            for &byte in text {
+                if !matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
+                    if kept == normalized {
+                        return position;
+                    }
+                    kept += 1;
+                }
+                position += 1;
+            }
+        }
+        position
+    };
+    match error {
+        Base64Error::InvalidByte(offset, byte) => Base64Error::InvalidByte(original(offset), byte),
+        Base64Error::InvalidLastSymbol(offset, byte) => {
+            Base64Error::InvalidLastSymbol(original(offset), byte)
+        }
+        Base64Error::InvalidLength(_) => Base64Error::InvalidLength(original(usize::MAX)),
+        Base64Error::Invalid | Base64Error::OutputFull => error,
+    }
 }
 
 /// Return `true` when the text contains only XML 1.0 whitespace chars.
@@ -366,9 +401,8 @@ mod tests {
     fn borrowed_base64_stream_crosses_text_and_decoder_buffer_boundaries() {
         // Text/comment boundaries and the decoder's internal chunk size must
         // not become Base64 framing boundaries or require a normalized copy.
-        use base64::Engine as _;
         let bytes = vec![7; 4097];
-        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let encoded = crate::base64::encode(&bytes);
         let xml = format!(
             "<value> {}<!--boundary-->{}\n</value>",
             &encoded[..3],

@@ -10,8 +10,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
 use structured_asn1::memory::{Memory, MemoryAccount};
 use structured_pkix::algorithm::digest::Algorithm;
 use structured_pkix::temporal::LeapTable;
@@ -464,7 +462,9 @@ fn values(xml: &str, local: &str) -> Vec<Vec<u8>> {
     for (start, _) in xml.match_indices(&open) {
         let start = start + open.len();
         let end = start + xml[start..].find(&close).expect("closed value");
-        let value = STANDARD.decode(&xml[start..end]).expect("base64 value");
+        let value = structured_base64::STANDARD
+            .decode(&xml.as_bytes()[start..end])
+            .expect("base64 value");
         if !values.contains(&value) {
             values.push(value);
         }

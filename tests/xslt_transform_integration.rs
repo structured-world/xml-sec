@@ -6,7 +6,6 @@ use std::fs;
 #[path = "support/cryptographic.rs"]
 mod cryptographic;
 
-use base64::Engine as _;
 use xml_sec::XmlDomParseError;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::document::XmlDocumentError;
@@ -299,8 +298,9 @@ fn a_document_of_16384_items_signs_and_verifies_under_the_default_policy() {
 fn base64_output_feeds_the_stylesheet_and_xpath_reads_its_result() {
     // Binary input is used as is; a following XPath transform reparses the
     // serialized result tree into a node-set.
-    let encoded =
-        base64::engine::general_purpose::STANDARD.encode("<doc><item>z</item><item>y</item></doc>");
+    let encoded = structured_base64::STANDARD
+        .encode("<doc><item>z</item><item>y</item></doc>".as_bytes())
+        .expect("test encoding");
     let document = format!(r#"<root><data ID="payload">{encoded}</data></root>"#);
     let reference = ReferenceBuilder::new(DigestAlgorithm::Sha256)
         .uri("#payload")
@@ -1029,8 +1029,9 @@ fn binary_input_document_type_follows_the_xml_input_policy() {
     // Internal entities and attribute defaults change the transformed data, so a
     // DOCTYPE in decoded input is refused unless the operation allows internal DTDs,
     // with the same error as the binary-to-node-set adapter.
-    let encoded = base64::engine::general_purpose::STANDARD
-        .encode(r#"<!DOCTYPE doc [<!ENTITY e "y">]><doc><item>&e;</item></doc>"#);
+    let encoded = structured_base64::STANDARD
+        .encode(br#"<!DOCTYPE doc [<!ENTITY e "y">]><doc><item>&e;</item></doc>"#)
+        .expect("test encoding");
     let document = format!(r#"<root><data ID="payload">{encoded}</data></root>"#);
     let reference = ReferenceBuilder::new(DigestAlgorithm::Sha256)
         .uri("#payload")

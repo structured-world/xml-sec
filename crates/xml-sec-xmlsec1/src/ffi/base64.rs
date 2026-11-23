@@ -80,6 +80,8 @@ impl XmlSecBase64Ctx {
             position: self.in_pos,
             line_position: self.line_pos,
             finished: self.finished != 0,
+            // libxmlsec1 reports no input offsets.
+            input_offset: 0,
         }
     }
 
@@ -162,12 +164,12 @@ fn decode_stop(before: Base64Codec, input: &[u8]) -> DecodeStop {
         let position = codec.position;
         match codec.update(&[byte], &mut room) {
             Ok(_) => {}
-            Err(Base64Error::Invalid) if byte == b'=' => {
+            Err(Base64Error::InvalidByte(_, b'=')) => {
                 return DecodeStop::Refused(format!(
                     "invalid data for 'ctx->inPos': actual={position} and expected 2,3"
                 ));
             }
-            Err(Base64Error::Invalid) => {
+            Err(Base64Error::InvalidByte(..)) => {
                 return DecodeStop::Refused(format!(
                     "invalid data for 'inByte': actual={byte} and expected base64 character"
                 ));

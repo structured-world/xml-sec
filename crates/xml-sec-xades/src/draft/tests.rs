@@ -1,7 +1,5 @@
 use super::{Draft, DraftError};
 use alloc::sync::Arc;
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
 use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
 use structured_xades::produce::{Datatype, Event, Value, Writer};
 use structured_xades::xml::Name;
@@ -84,7 +82,9 @@ fn text_and_attributes_are_escaped_and_binary_is_base64() {
         Event::End,
         Event::End,
     ]);
-    let encoded = STANDARD.encode(&bytes);
+    let encoded = structured_base64::STANDARD
+        .encode(&bytes)
+        .expect("test encoding");
     assert_eq!(
         markup,
         format!(
@@ -105,7 +105,9 @@ fn long_binary_values_cross_chunk_boundaries_unchanged() {
         Event::Binary(&bytes),
         Event::End,
     ]);
-    let encoded = STANDARD.encode(&bytes);
+    let encoded = structured_base64::STANDARD
+        .encode(&bytes)
+        .expect("test encoding");
     assert!(markup.contains(&encoded));
 }
 

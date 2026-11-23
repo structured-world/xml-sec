@@ -5,7 +5,6 @@ use std::fs;
 #[path = "support/cryptographic.rs"]
 mod cryptographic;
 
-use base64::Engine;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::policy::{PolicyViolation, SigningPolicy};
 use xml_sec::xmldsig::{
@@ -272,7 +271,9 @@ fn decoded_utf16_xml_is_adapted_to_a_node_set() {
     let resolver = DefaultKeyResolver::default();
 
     for bytes in encoded_inputs {
-        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let encoded = structured_base64::STANDARD
+            .encode(&bytes)
+            .expect("test encoding");
         let document = format!(r#"<root><Encoded ID="payload">{encoded}</Encoded></root>"#);
         let signed = SignContext::new(&key)
             .key_info_writer(&key_info)

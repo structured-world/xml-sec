@@ -1,6 +1,6 @@
 #![cfg(feature = "xmlenc")]
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use structured_base64::STANDARD;
 use xml_sec::policy::{DecryptionPolicy, KeyAgreementAlgorithm};
 use xml_sec::provider::{CryptoProvider, EcdhCurve, RUST_CRYPTO_PROVIDER, RustCryptoEcdhKey};
 use xml_sec::xmlenc::{
@@ -422,7 +422,7 @@ fn xml_recipient_agreement_derives_a_kek_before_unwrapping_content() {
             .unwrap()
             .to_xml(&policy.resources)
             .unwrap(),
-        STANDARD.encode(wrapped)
+        STANDARD.encode(&wrapped).expect("test encoding")
     );
     let wire = generated.encrypted_data_xml.replacen(
         "<xenc:CipherData>",

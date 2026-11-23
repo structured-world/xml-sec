@@ -1,9 +1,9 @@
 use super::{Base64Stream, is_rfc2045_base64_byte};
 use alloc::{format, string::String, vec::Vec};
-use base64::Engine as _;
+use structured_base64::{Base64Error, OwnedError};
 
 /// The decoded bytes and error of one streamed input.
-fn streamed(input: &[u8], chunk: usize) -> (Vec<u8>, Option<base64::DecodeError>) {
+fn streamed(input: &[u8], chunk: usize) -> (Vec<u8>, Option<Base64Error>) {
     let mut output = Vec::new();
     let mut sink = |decoded: &[u8]| -> Result<(), ()> {
         output.extend_from_slice(decoded);
@@ -19,13 +19,28 @@ fn streamed(input: &[u8], chunk: usize) -> (Vec<u8>, Option<base64::DecodeError>
     (output, failure)
 }
 
-fn resident(input: &[u8]) -> Result<Vec<u8>, base64::DecodeError> {
-    let filtered: Vec<u8> = input
-        .iter()
-        .copied()
-        .filter(|byte| is_rfc2045_base64_byte(*byte))
+/// The resident decoder over the filtered input, its failure located in
+/// `input` through the original position of every byte the filter kept.
+fn resident(input: &[u8]) -> Result<Vec<u8>, Base64Error> {
+    let positions: Vec<usize> = (0..input.len())
+        .filter(|index| is_rfc2045_base64_byte(input[*index]))
         .collect();
-    base64::engine::general_purpose::STANDARD.decode(filtered)
+    let filtered: Vec<u8> = positions.iter().map(|index| input[*index]).collect();
+    structured_base64::STANDARD
+        .decode(&filtered)
+        .map_err(|error| match error {
+            OwnedError::Codec(Base64Error::InvalidByte(offset, byte)) => {
+                Base64Error::InvalidByte(positions[offset], byte)
+            }
+            OwnedError::Codec(Base64Error::InvalidLastSymbol(offset, byte)) => {
+                Base64Error::InvalidLastSymbol(positions[offset], byte)
+            }
+            OwnedError::Codec(Base64Error::InvalidLength(_)) => {
+                Base64Error::InvalidLength(input.len())
+            }
+            OwnedError::Codec(error) => error,
+            OwnedError::Reserve(error) => panic!("test allocation: {error}"),
+        })
 }
 
 /// A decoded payload long enough to cross several decoding blocks.
@@ -35,7 +50,7 @@ fn encoded(length: usize) -> String {
         .cycle()
         .take(length)
         .collect();
-    base64::engine::general_purpose::STANDARD.encode(payload)
+    crate::base64::encode(&payload)
 }
 
 fn assert_matches_resident(input: &[u8]) {
@@ -100,6 +115,45 @@ fn padding_errors_match_the_resident_decoder_inside_and_across_blocks() {
     ] {
         assert_matches_resident(input.as_bytes());
     }
+}
+
+#[test]
+fn failures_are_located_in_the_original_input() {
+    // Offsets count every input byte, including those RFC 2045 filters out,
+    // and an incomplete quantum ends where the input ends.
+    for (input, expected) in [
+        (&b" \n=AAA"[..], Base64Error::InvalidByte(2, b'=')),
+        (b"Q R==", Base64Error::InvalidLastSymbol(2, b'R')),
+        (b"QUJD Q\n", Base64Error::InvalidLength(7)),
+        (b"QQ==\r\nQUJD", Base64Error::InvalidByte(2, b'=')),
+    ] {
+        for chunk in [1, 2, 3, input.len()] {
+            assert_eq!(
+                streamed(input, chunk).1,
+                Some(expected),
+                "{input:?} {chunk}"
+            );
+        }
+        assert_matches_resident(input);
+    }
+}
+
+#[test]
+fn data_after_padding_reports_the_resident_length_error() {
+    // The resident decoder checks the whole input's length before any symbol,
+    // so an incomplete quantum after padding is a length error, wherever the
+    // padding falls relative to a decoding block.
+    for input in [
+        format!("{}QQ==Q", "QUJD".repeat(2047)),
+        "QQ==Q".to_owned(),
+        format!("{}QR==QUJD", "QUJD".repeat(2047)),
+    ] {
+        assert_matches_resident(input.as_bytes());
+    }
+    assert_eq!(
+        streamed(format!("{}QQ==Q", "QUJD".repeat(2047)).as_bytes(), 8192).1,
+        Some(Base64Error::InvalidLength(8193))
+    );
 }
 
 #[test]

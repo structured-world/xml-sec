@@ -6,11 +6,10 @@
 //! XML signatures: only their `XAdES` properties violate EN 319 132-1.
 
 use super::{DS, EXC, SP, write};
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use structured_base64::STANDARD;
 
 #[cfg(test)]
 mod tests;
@@ -373,12 +372,13 @@ impl Generator {
 
     pub(crate) fn digests(&self) -> Result<Digests, String> {
         use sha2::Digest as _;
+        let encode = |bytes: &[u8]| STANDARD.encode(bytes).map_err(|error| error.to_string());
         let signer = self.der("signer")?;
         Ok(Digests {
-            signer_sha256: STANDARD.encode(sha2::Sha256::digest(&signer)),
-            signer_sha384: STANDARD.encode(sha2::Sha384::digest(&signer)),
-            root_sha256: STANDARD.encode(sha2::Sha256::digest(self.der("root")?)),
-            signer_md5: STANDARD.encode(self.md5(&signer)?),
+            signer_sha256: encode(&sha2::Sha256::digest(&signer))?,
+            signer_sha384: encode(&sha2::Sha384::digest(&signer))?,
+            root_sha256: encode(&sha2::Sha256::digest(self.der("root")?))?,
+            signer_md5: encode(&self.md5(&signer)?)?,
         })
     }
 

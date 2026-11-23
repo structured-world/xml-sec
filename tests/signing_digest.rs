@@ -8,7 +8,6 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use base64::Engine as _;
 use xml_sec::XmlDocument;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize};
 use xml_sec::policy::{
@@ -234,8 +233,9 @@ fn public_xpath_id_uses_request_registration() {
         &mut canonical,
     )
     .unwrap();
-    let value = base64::engine::general_purpose::STANDARD
-        .encode(key.sign(SignatureAlgorithm::RsaSha256, &canonical).unwrap());
+    let value = structured_base64::STANDARD
+        .encode(&key.sign(SignatureAlgorithm::RsaSha256, &canonical).unwrap())
+        .expect("test encoding");
     let signed = xml_sec::xmldsig::mutation::fill_signature_value(&signed, &value).unwrap();
     let resolver = DefaultKeyResolver::default();
     let mut policy = VerificationPolicy::default();
@@ -4018,8 +4018,8 @@ fn ecdsa_asn1_compatibility_is_explicit_across_the_signing_pipeline() {
         .chars()
         .filter(|character| !character.is_whitespace())
         .collect::<String>();
-    let signature = base64::engine::general_purpose::STANDARD
-        .decode(encoded)
+    let signature = structured_base64::STANDARD
+        .decode(encoded.as_bytes())
         .expect("SignatureValue must be base64");
     assert_eq!(
         signature.first(),

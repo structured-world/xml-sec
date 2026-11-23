@@ -784,7 +784,6 @@ fn dsa_policies(
 
 /// Decoded octet length of the document's `SignatureValue`.
 fn signature_value_len(signed: &str) -> usize {
-    use base64::Engine as _;
     let document = roxmltree::Document::parse(signed).unwrap();
     let value = document
         .descendants()
@@ -792,8 +791,8 @@ fn signature_value_len(signed: &str) -> usize {
         .unwrap()
         .text()
         .unwrap();
-    base64::engine::general_purpose::STANDARD
-        .decode(value)
+    structured_base64::STANDARD
+        .decode(value.as_bytes())
         .unwrap()
         .len()
 }

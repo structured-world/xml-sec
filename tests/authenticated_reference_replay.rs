@@ -242,15 +242,15 @@ fn current_query_admits_nonterminal_c14n_before_receiver() {
 fn current_query_admits_base64_capacity_before_receiver() {
     // A large decoded output cannot hide in an ordinary Vec while only the
     // small query index and replay records are charged to the supplied Work.
-    use base64::Engine as _;
     let uri = "https://example.test/base64";
     let transforms = r#"<ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#base64"/></ds:Transforms>"#;
     let (xml, key) = signed_manifest(uri, "http://www.w3.org/2001/04/xmlenc#sha256", transforms);
     let document = XmlDocument::parse(xml).unwrap();
     let resources = BTreeMap::from([(
         uri.to_owned(),
-        base64::engine::general_purpose::STANDARD
-            .encode(vec![0x42; 65536])
+        structured_base64::STANDARD
+            .encode(&vec![0x42; 65536])
+            .expect("test encoding")
             .into_bytes(),
     )]);
     let request = VerificationRequest {
@@ -293,14 +293,22 @@ fn current_query_admits_base64_capacity_before_receiver() {
 fn current_query_binary_chain_releases_consumed_input_capacity() {
     // Each new binary owns its paid allocation. Previous decoded inputs must
     // be released before downstream receiver work, not pinned by recursion.
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use structured_base64::STANDARD;
     let uri = "https://example.test/base64-chain";
     let transform = r#"<ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#base64"/>"#;
     let transforms = format!("<ds:Transforms>{transform}{transform}</ds:Transforms>");
     let expected = vec![0x42; 65536];
     let resources = BTreeMap::from([(
         uri.to_owned(),
-        STANDARD.encode(STANDARD.encode(&expected)).into_bytes(),
+        STANDARD
+            .encode(
+                STANDARD
+                    .encode(&expected)
+                    .expect("test encoding")
+                    .as_bytes(),
+            )
+            .expect("test encoding")
+            .into_bytes(),
     )]);
     let (xml, key) = signed_manifest(uri, "http://www.w3.org/2001/04/xmlenc#sha256", &transforms);
     let document = XmlDocument::parse(xml).unwrap();
@@ -398,12 +406,14 @@ fn current_query_base64_charges_local_and_aggregate_once() {
     // Exact local work succeeds; one less refuses before receiver effects.
     // One original Reference makes the table's comparison count deterministic:
     // independently seeded tables with two keys can require different probes.
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use structured_asn1::{Encoding, Limits, Parser};
     let uri = "https://example.test/base64-work";
     let transforms = r#"<ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#base64"/></ds:Transforms>"#;
     let expected = vec![0x42; 768];
-    let encoded = STANDARD.encode(&expected).into_bytes();
+    let encoded = structured_base64::STANDARD
+        .encode(&expected)
+        .expect("test encoding")
+        .into_bytes();
     let input_length = encoded.len();
     let resources = BTreeMap::from([(uri.to_owned(), encoded)]);
     let secret = vec![0x61; 32];

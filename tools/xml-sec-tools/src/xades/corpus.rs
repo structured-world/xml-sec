@@ -7,11 +7,10 @@ use super::{
     C11, Corpus, DS, EXC, F2, absolute, compare, debug_buffer, digest, line, read, write,
     write_json, xml,
 };
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
 use serde_json::{Map, Value, json};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use structured_base64::STANDARD;
 
 /// Decodes base64 text, ignoring the whitespace XML allows inside it.
 pub(crate) fn base64(text: &str) -> Result<Vec<u8>, String> {
@@ -20,7 +19,7 @@ pub(crate) fn base64(text: &str) -> Result<Vec<u8>, String> {
         .filter(|character| !character.is_ascii_whitespace())
         .collect();
     STANDARD
-        .decode(compact)
+        .decode(compact.as_bytes())
         .map_err(|error| format!("invalid base64: {error}"))
 }
 
@@ -369,7 +368,9 @@ fn signature_mutations(fixtures: &Path, manifest: &mut Vec<Value>) -> Result<(),
             .ok_or_else(|| format!("no match for {pattern}"))
     };
     let certificate = first("<ds:X509Certificate>([^<]+)")?;
-    let root = STANDARD.encode(read(&fixtures.join("baseline/root.der"))?);
+    let root = STANDARD
+        .encode(&read(&fixtures.join("baseline/root.der"))?)
+        .map_err(|error| error.to_string())?;
     write(
         &fixtures.join("keyinfo-certificate-substituted.xml"),
         signed.replacen(&certificate, &root, 1),

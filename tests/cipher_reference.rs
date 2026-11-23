@@ -1,7 +1,7 @@
 #![cfg(feature = "xmlenc")]
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::collections::BTreeMap;
+use structured_base64::STANDARD;
 use xml_sec::policy::DecryptionPolicy;
 use xml_sec::xmldsig::UriTypeSet;
 use xml_sec::xmlenc::{
@@ -346,7 +346,7 @@ fn external_cipher_reference_decrypts_authenticated_content() {
         .unwrap();
     let parsed = xml_sec::xmlenc::parse_encrypted_data(&encrypted.encrypted_data_xml).unwrap();
     let encoded = parsed.cipher_data.inline_value().unwrap();
-    let ciphertext = STANDARD.decode(encoded).unwrap();
+    let ciphertext = STANDARD.decode(encoded.as_bytes()).unwrap();
     let xml = encrypted.encrypted_data_xml.replace(
         &format!("<xenc:CipherValue>{encoded}</xenc:CipherValue>"),
         "<xenc:CipherReference URI=\"urn:cipher\"/>",
@@ -401,7 +401,7 @@ fn an_externally_referenced_wrapped_key_is_in_the_audit() {
         .unwrap();
     let parsed = xml_sec::xmlenc::parse_encrypted_data(&encrypted.encrypted_data_xml).unwrap();
     let key_value = parsed.encrypted_keys[0].cipher_data.inline_value().unwrap();
-    let key_bytes = STANDARD.decode(key_value).unwrap();
+    let key_bytes = STANDARD.decode(key_value.as_bytes()).unwrap();
     let xml = encrypted.encrypted_data_xml.replace(
         &format!("<xenc:CipherValue>{key_value}</xenc:CipherValue>"),
         "<xenc:CipherReference URI=\"urn:key\"/>",
@@ -441,8 +441,8 @@ fn referenced_wrapped_key_and_content_share_external_budget() {
     let parsed = xml_sec::xmlenc::parse_encrypted_data(&encrypted.encrypted_data_xml).unwrap();
     let key_value = parsed.encrypted_keys[0].cipher_data.inline_value().unwrap();
     let content_value = parsed.cipher_data.inline_value().unwrap();
-    let key_bytes = STANDARD.decode(key_value).unwrap();
-    let content_bytes = STANDARD.decode(content_value).unwrap();
+    let key_bytes = STANDARD.decode(key_value.as_bytes()).unwrap();
+    let content_bytes = STANDARD.decode(content_value.as_bytes()).unwrap();
     let xml = encrypted
         .encrypted_data_xml
         .replace(

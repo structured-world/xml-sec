@@ -2,8 +2,8 @@
 //! Certification Authority of Ukraine (<https://czo.gov.ua/testexamples>).
 #![cfg(feature = "dstu4145")]
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::collections::BTreeSet;
+use structured_base64::STANDARD;
 use xml_sec::policy::{
     CertificateSignatureAlgorithms, Instant, VerificationPolicy, VerificationTrustMode,
 };
@@ -53,7 +53,9 @@ fn published_chain() -> (Vec<u8>, Vec<u8>) {
             let (encoded, _) = part
                 .split_once("</xades:EncapsulatedX509Certificate>")
                 .expect("fixture closes its certificate");
-            STANDARD.decode(encoded).expect("fixture value is Base64")
+            STANDARD
+                .decode(encoded.as_bytes())
+                .expect("fixture value is Base64")
         });
     let issuing = certificates.next().expect("fixture carries the issuing CA");
     let root = certificates.next().expect("fixture carries the root");
@@ -101,11 +103,13 @@ fn with_flipped_signature_octet(xml: &str, index: usize) -> String {
     let (value, tail) = rest
         .split_once("</ds:SignatureValue>")
         .expect("fixture closes its SignatureValue");
-    let mut octets = STANDARD.decode(value).expect("fixture value is Base64");
+    let mut octets = STANDARD
+        .decode(value.as_bytes())
+        .expect("fixture value is Base64");
     octets[index] ^= 1;
     format!(
         "{head}<ds:SignatureValue>{}</ds:SignatureValue>{tail}",
-        STANDARD.encode(octets)
+        STANDARD.encode(&octets).expect("test encoding")
     )
 }
 
@@ -228,7 +232,9 @@ fn a_key_under_another_substitution_table_is_refused() {
     let (encoded, tail) = rest
         .split_once("</ds:X509Certificate>")
         .expect("fixture closes its certificate");
-    let mut certificate = STANDARD.decode(encoded).expect("fixture value is Base64");
+    let mut certificate = STANDARD
+        .decode(encoded.as_bytes())
+        .expect("fixture value is Base64");
     let table = certificate
         .windows(4)
         .position(|window| window == [0xa9, 0xd6, 0xeb, 0x45])
@@ -236,7 +242,7 @@ fn a_key_under_another_substitution_table_is_refused() {
     certificate[table] ^= 1;
     let xml = format!(
         "{head}<ds:X509Certificate>{}</ds:X509Certificate>{tail}",
-        STANDARD.encode(certificate)
+        STANDARD.encode(&certificate).expect("test encoding")
     );
     let resolver = DefaultKeyResolver::default();
     let result = VerifyContext::new()

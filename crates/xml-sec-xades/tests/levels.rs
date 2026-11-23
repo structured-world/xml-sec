@@ -7,8 +7,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
 use structured_asn1::Oid;
 use structured_asn1::memory::{Memory, MemoryAccount};
 use structured_cms::timestamp::{Accuracy, PolicyAccuracy};
@@ -236,12 +234,19 @@ fn both_token_profiles_meet_every_level_on_der_tokens() {
 /// every signed byte unchanged.
 fn indefinite_token(xml: &str) -> String {
     let value = token_value(xml, 0);
-    let der = STANDARD.decode(value).expect("base64");
+    let der = structured_base64::STANDARD
+        .decode(value.as_bytes())
+        .expect("base64");
     assert_eq!(der[..2], [0x30, 0x82], "a long-form SEQUENCE");
     let mut ber = vec![0x30, 0x80];
     ber.extend_from_slice(&der[4..]);
     ber.extend_from_slice(&[0, 0]);
-    xml.replace(value, &STANDARD.encode(ber))
+    xml.replace(
+        value,
+        &structured_base64::STANDARD
+            .encode(&ber)
+            .expect("test encoding"),
+    )
 }
 
 #[test]
@@ -628,7 +633,9 @@ fn tsa_certificate() -> Vec<u8> {
     let open = "<xades:EncapsulatedX509Certificate>";
     let start = data + B_LT[data..].find(open).expect("certificate") + open.len();
     let end = start + B_LT[start..].find('<').expect("certificate end");
-    STANDARD.decode(&B_LT[start..end]).expect("base64")
+    structured_base64::STANDARD
+        .decode(&B_LT.as_bytes()[start..end])
+        .expect("base64")
 }
 
 fn stated_second<'a>(policy: &'a [u8], authority: &'a [u8]) -> AuthorityAccuracy<'a> {
@@ -717,7 +724,9 @@ fn encapsulated(xml: &str, tag: &str) -> Vec<Vec<u8>> {
         .map(|(start, _)| {
             let body = start + open.len();
             let end = body + xml[body..].find('<').expect("value end");
-            STANDARD.decode(&xml[body..end]).expect("base64")
+            structured_base64::STANDARD
+                .decode(&xml.as_bytes()[body..end])
+                .expect("base64")
         })
         .collect()
 }

@@ -1,7 +1,6 @@
 use std::fs;
 
 use aes::cipher::{BlockModeEncrypt as _, KeyIvInit as _, block_padding::Pkcs7};
-use base64::Engine as _;
 use der::{Decode as _, Encode as _, asn1::UintRef};
 use dsa::{Components as DsaComponents, SigningKey as NativeDsaSigningKey};
 use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng as _};
@@ -323,7 +322,9 @@ fn encrypted_traditional_pem(tag: &str, der: &[u8], password: &[u8]) -> String {
         .unwrap()
         .len();
     ciphertext.truncate(ciphertext_len);
-    let encoded = base64::engine::general_purpose::STANDARD.encode(ciphertext);
+    let encoded = structured_base64::STANDARD
+        .encode(&ciphertext)
+        .expect("test encoding");
     let body = encoded
         .as_bytes()
         .chunks(64)
@@ -901,7 +902,9 @@ fn oversized_asymmetric_material_is_rejected_before_decoding() {
 fn selected_signature_controls_verification_key_algorithm() {
     // Key decoding must inspect the same selected Signature as verification;
     // an unrelated earlier signature may use a different key family.
-    let digest = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0_u8; 32]);
+    let digest = structured_base64::STANDARD
+        .encode(&[0_u8; 32])
+        .expect("test encoding");
     let signature = |id: &str, algorithm: &str| {
         format!(
             r#"<ds:Signature Id="{id}" xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
@@ -935,7 +938,9 @@ fn selected_signature_controls_verification_key_algorithm() {
 fn direct_verification_metadata_ignores_malformed_document_keys() {
     // A pinned caller key makes document KeyInfo irrelevant. Malformed key
     // metadata must therefore remain for the core verifier to ignore.
-    let digest = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0_u8; 32]);
+    let digest = structured_base64::STANDARD
+        .encode(&[0_u8; 32])
+        .expect("test encoding");
     let xml = format!(
         r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI=""><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AA==</ds:SignatureValue><ds:KeyInfo><dsig11:DEREncodedKeyValue>not-base64!</dsig11:DEREncodedKeyValue></ds:KeyInfo></ds:Signature>"#
     );
@@ -982,7 +987,9 @@ fn direct_verification_metadata_ignores_malformed_document_keys() {
 fn signature_metadata_preserves_every_key_name_for_resolution() {
     // KeyInfo is an ordered list of lookup sources; collapsing it to the
     // first KeyName makes later valid key-manager entries unreachable.
-    let digest = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0_u8; 32]);
+    let digest = structured_base64::STANDARD
+        .encode(&[0_u8; 32])
+        .expect("test encoding");
     let xml = format!(
         r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI=""><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AA==</ds:SignatureValue><ds:KeyInfo><ds:KeyName>old</ds:KeyName><ds:KeyName>wan<!--split-->ted</ds:KeyName></ds:KeyInfo></ds:Signature>"#
     );
@@ -1005,7 +1012,9 @@ fn signature_metadata_preserves_every_key_name_for_resolution() {
 fn verification_metadata_resolves_referenced_key_names() {
     // CLI candidate selection precedes core verification, so it must see
     // the same bounded KeyInfoReference graph as the verifier.
-    let digest = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0_u8; 32]);
+    let digest = structured_base64::STANDARD
+        .encode(&[0_u8; 32])
+        .expect("test encoding");
     let xml = format!(
         r##"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><ds:Signature><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI=""><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AA==</ds:SignatureValue><ds:KeyInfo><dsig11:KeyInfoReference URI="#target"/></ds:KeyInfo></ds:Signature><ds:KeyInfo Id="target"><ds:KeyName>wanted</ds:KeyName></ds:KeyInfo></root>"##
     );
@@ -1045,7 +1054,9 @@ fn verification_metadata_resolves_referenced_key_names() {
 fn signature_discovery_obeys_the_verification_node_ceiling() {
     // Metadata discovery runs before cryptographic verification and must
     // not allocate a DOM larger than the operation policy permits.
-    let digest = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0_u8; 32]);
+    let digest = structured_base64::STANDARD
+        .encode(&[0_u8; 32])
+        .expect("test encoding");
     let xml = format!(
         r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI=""><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AA==</ds:SignatureValue></ds:Signature>"#
     );

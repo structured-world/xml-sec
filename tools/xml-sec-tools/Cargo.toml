@@ -7,7 +7,6 @@ license = "Apache-2.0 AND MIT"
 publish = false
 
 [dependencies]
-base64 = "0.23"
 # Finds the platform's C and C++ compilers for the C ABI round trips.
 cc = "1"
 flate2 = "1"
@@ -18,6 +17,7 @@ regex = "1"
 # survive a read and rewrite unchanged.
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 sha2 = "0.11"
+structured-base64 = { version = "0.25", features = ["alloc"] }
 tar = "0.4"
 tempfile = "3"
 # Executes the WebAssembly smoke build without a JavaScript host.

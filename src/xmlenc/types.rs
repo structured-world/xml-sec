@@ -1047,10 +1047,9 @@ pub enum CipherData {
 
 impl CipherData {
     pub(super) fn octets(&self) -> Result<std::borrow::Cow<'_, [u8]>, XmlEncError> {
-        use base64::Engine as _;
         match self {
-            Self::Value { value } => base64::engine::general_purpose::STANDARD
-                .decode(value)
+            Self::Value { value } => structured_base64::STANDARD
+                .decode(value.as_bytes())
                 .map(std::borrow::Cow::Owned)
                 .map_err(|error| XmlEncError::Base64(error.to_string())),
             Self::Bytes(bytes) => Ok(std::borrow::Cow::Borrowed(bytes)),

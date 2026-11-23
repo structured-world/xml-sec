@@ -10,9 +10,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
-
 use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
 use xml_sec::XmlDocument;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
@@ -320,7 +317,11 @@ fn the_signing_certificate_is_bound_and_carried() {
         .filter(|node| node.has_tag_name((DS, "X509Certificate")))
         .map(|node| node.text().expect("certificate text").to_owned())
         .collect();
-    let encode = |der| STANDARD.encode(der);
+    let encode = |der: &[u8]| {
+        structured_base64::STANDARD
+            .encode(der)
+            .expect("test encoding")
+    };
     assert_eq!(carried, [encode(SIGNER), encode(INTERMEDIATE)]);
     let time = created
         .descendants()

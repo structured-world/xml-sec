@@ -12,8 +12,8 @@ use aes_gcm::{
     aead::{AeadInOut, KeyInit},
 };
 use aes_kw::KwAes256;
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rsa::PrivateKey as RsaPrivateKey;
+use structured_base64::STANDARD;
 use xml_sec as roxmltree;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize, canonicalize_xml};
 use xml_sec::rsa_encoding::RsaPrivateKeyEncoding as _;
@@ -71,7 +71,7 @@ fn assert_surplus_cek_plaintext(xml: &str, name: &str, recovered: &[u8]) {
         .decrypt_data(
             algorithm,
             &recovered[..16],
-            &STANDARD.decode(value).unwrap(),
+            &STANDARD.decode(value.as_bytes()).unwrap(),
         )
         .unwrap();
     let expected = std::fs::read(format!("{VECTOR_DIR}/{name}.data")).unwrap();
@@ -691,7 +691,7 @@ fn decrypts_ecdh_hkdf_and_pbkdf2_donor_plaintexts() {
             else {
                 panic!("donor CipherValue")
             };
-            let wrapped = STANDARD.decode(value).unwrap();
+            let wrapped = STANDARD.decode(value.as_bytes()).unwrap();
             let recovered = zeroize::Zeroizing::new(
                 RUST_CRYPTO_PROVIDER
                     .unwrap_key(KeyWrapAlgorithm::AesKw256, &kek, &wrapped)
@@ -701,7 +701,7 @@ fn decrypts_ecdh_hkdf_and_pbkdf2_donor_plaintexts() {
             let xml_sec::xmlenc::CipherData::Value { value } = &parsed.cipher_data else {
                 panic!("donor content CipherValue")
             };
-            let ciphertext = STANDARD.decode(value).unwrap();
+            let ciphertext = STANDARD.decode(value.as_bytes()).unwrap();
             // This primitive-only comparison documents exactly what the donor
             // truncated; it never makes the invalid public input acceptable.
             assert_eq!(
@@ -922,7 +922,7 @@ fn assert_documented_surplus_cek(
             .unwrap_key(
                 KeyWrapAlgorithm::AesKw256,
                 &kek,
-                &STANDARD.decode(value).unwrap(),
+                &STANDARD.decode(value.as_bytes()).unwrap(),
             )
             .unwrap(),
     );
@@ -1196,7 +1196,7 @@ fn decrypts_aleksey_legacy_direct_and_reference_shapes() {
             .resolve(reference)
             .unwrap();
             parsed.cipher_data = xml_sec::xmlenc::CipherData::Value {
-                value: STANDARD.encode(ciphertext),
+                value: STANDARD.encode(&ciphertext).expect("test encoding"),
             };
             assert_eq!(
                 context.decrypt_data(&parsed).unwrap().output,
@@ -1483,8 +1483,13 @@ fn read_merlin_aes_keys() -> HashMap<String, Vec<u8>> {
                 .descendants()
                 .find(|node| node.tag_name().name() == "AESKeyValue")?
                 .text()?;
-            let key = STANDARD
-                .decode(value.split_ascii_whitespace().collect::<String>())
+            let key = structured_base64::STANDARD
+                .decode(
+                    value
+                        .split_ascii_whitespace()
+                        .collect::<String>()
+                        .as_bytes(),
+                )
                 .expect("Merlin AES key must be base64");
             Some((name.to_owned(), key))
         })
@@ -1542,7 +1547,7 @@ fn rejects_original_merlin_corrupted_wrapped_key_before_document_mutation() {
     let xml_sec::xmlenc::CipherData::Value { value } = &parsed.encrypted_keys[0].cipher_data else {
         panic!("original bad vector must carry an inline wrapped key");
     };
-    let wrapped = STANDARD.decode(value).unwrap();
+    let wrapped = STANDARD.decode(value.as_bytes()).unwrap();
     assert_eq!(wrapped.len(), 24);
     assert_eq!(
         RUST_CRYPTO_PROVIDER.unwrap_key(W::AesKw192, &kek, &wrapped),
@@ -2086,7 +2091,7 @@ fn validates_merlin_rsa_transported_hmac_keys_without_exporting_recovered_keys()
         let envelope = format!(
             "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\"><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes256-gcm\"/><KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\">{}</KeyInfo><CipherData><CipherValue>{}</CipherValue></CipherData></EncryptedData>",
             &xml[encrypted_key.range()],
-            STANDARD.encode(cipher),
+            STANDARD.encode(&cipher).expect("test encoding"),
         );
         assert_eq!(
             context.decrypt(&envelope).unwrap().output,
@@ -2124,12 +2129,13 @@ struct MerlinDh {
 /// Base64 text of `node`, ignoring the whitespace that wraps archive values.
 #[cfg(feature = "legacy-algorithms")]
 fn base64_text(node: xml_sec::Node<'_, '_>) -> Vec<u8> {
-    STANDARD
+    structured_base64::STANDARD
         .decode(
             node.text()
                 .unwrap()
                 .split_ascii_whitespace()
-                .collect::<String>(),
+                .collect::<String>()
+                .as_bytes(),
         )
         .unwrap()
 }
@@ -2446,8 +2452,13 @@ fn assert_documented_dh_hmac_departure(
         .unwrap()
         .text()
         .unwrap();
-    let original = STANDARD
-        .decode(value.split_ascii_whitespace().collect::<String>())
+    let original = structured_base64::STANDARD
+        .decode(
+            value
+                .split_ascii_whitespace()
+                .collect::<String>()
+                .as_bytes(),
+        )
         .unwrap();
     assert!(
         !verifier
@@ -2469,7 +2480,13 @@ fn assert_documented_dh_hmac_departure(
     // memory, never the archived file or its signed reference.
     // This checks that full verification succeeds with the
     // independently computed tag under the same explicit binding.
-    let counterpart = xml.replacen(value, &STANDARD.encode(expected), 1);
+    let counterpart = xml.replacen(
+        value,
+        &structured_base64::STANDARD
+            .encode(&expected)
+            .expect("test encoding"),
+        1,
+    );
     let positive = VerifyContext::new()
         .key(verifier)
         .allowed_uri_types(UriTypeSet::ALL)
@@ -2499,8 +2516,8 @@ fn read_nist_keys(path: &Path) -> HashMap<String, Vec<u8>> {
                 .find(|node| node.tag_name().name() == "AESKeyValue")
                 .and_then(xml_sec::Node::text)
                 .expect("NIST KeyInfo must contain AESKeyValue");
-            let key = STANDARD
-                .decode(value.trim())
+            let key = structured_base64::STANDARD
+                .decode(value.trim().as_bytes())
                 .expect("NIST AES key must be base64");
             (name.to_owned(), key)
         })
@@ -2524,8 +2541,13 @@ fn read_aes_keys(path: &Path) -> HashMap<String, Vec<u8>> {
                 .text()?;
             Some((
                 name.to_owned(),
-                STANDARD
-                    .decode(value.split_ascii_whitespace().collect::<String>())
+                structured_base64::STANDARD
+                    .decode(
+                        value
+                            .split_ascii_whitespace()
+                            .collect::<String>()
+                            .as_bytes(),
+                    )
                     .expect("AES key must be base64"),
             ))
         })
@@ -2595,8 +2617,8 @@ fn classifies_complete_nist_aes_gcm_corpus() {
             } else if data_path.exists() {
                 let encoded =
                     std::fs::read_to_string(&data_path).expect("NIST plaintext must be readable");
-                let expected = STANDARD
-                    .decode(encoded.trim())
+                let expected = structured_base64::STANDARD
+                    .decode(encoded.trim().as_bytes())
                     .expect("NIST plaintext must be base64");
                 assert_eq!(
                     result.expect("valid NIST vector must decrypt").output,
@@ -2761,8 +2783,8 @@ fn encrypt_gcm_wire(key: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
 fn wrapped_key_xml(wrapped_key: &[u8], ciphertext: &[u8]) -> String {
     format!(
         r#"<xenc:EncryptedData xmlns:xenc="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" Type="http://www.w3.org/2001/04/xmlenc#Element"><xenc:EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><xenc:EncryptedKey Recipient="integration-test"><xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#kw-aes256"/><xenc:CipherData><xenc:CipherValue>{}</xenc:CipherValue></xenc:CipherData></xenc:EncryptedKey></ds:KeyInfo><xenc:CipherData><xenc:CipherValue>{}</xenc:CipherValue></xenc:CipherData></xenc:EncryptedData>"#,
-        STANDARD.encode(wrapped_key),
-        STANDARD.encode(ciphertext)
+        STANDARD.encode(wrapped_key).expect("test encoding"),
+        STANDARD.encode(ciphertext).expect("test encoding")
     )
 }
 
@@ -2870,13 +2892,14 @@ fn decrypts_all_phaos_legacy_transport_and_wrap_vectors() {
                 name.into(),
                 (
                     xml_sec::key_manager::SymmetricKeyKind::Des,
-                    STANDARD
+                    structured_base64::STANDARD
                         .decode(
                             value
                                 .text()
                                 .unwrap()
                                 .split_ascii_whitespace()
-                                .collect::<String>(),
+                                .collect::<String>()
+                                .as_bytes(),
                         )
                         .unwrap(),
                 ),
@@ -2931,13 +2954,14 @@ fn originator_dh_public_key(node: xml_sec::Node<'_, '_>) -> Vec<u8> {
         .descendants()
         .find(|n| n.tag_name().name() == "X509Certificate")
         .expect("originator certificate");
-    let certificate = STANDARD
+    let certificate = structured_base64::STANDARD
         .decode(
             certificate
                 .text()
                 .expect("certificate bytes")
                 .split_whitespace()
-                .collect::<String>(),
+                .collect::<String>()
+                .as_bytes(),
         )
         .expect("certificate base64");
     let certificate =
@@ -3196,13 +3220,14 @@ fn rejects_original_phaos_bad_wrapping_with_permitted_algorithms() {
         .descendants()
         .find(|node| node.tag_name().name() == "DESKeyValue")
         .unwrap();
-    let key = STANDARD
+    let key = structured_base64::STANDARD
         .decode(
             value
                 .text()
                 .unwrap()
                 .split_ascii_whitespace()
-                .collect::<String>(),
+                .collect::<String>()
+                .as_bytes(),
         )
         .unwrap();
     let resolver = KekDecryptor::with_kind(key, xml_sec::key_manager::SymmetricKeyKind::Des);

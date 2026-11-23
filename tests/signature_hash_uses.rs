@@ -45,7 +45,6 @@ fn completed_nested_manifest_hash_survives_a_later_frontier_error() {
     // A successful first Manifest digest authenticates a second Manifest whose
     // historical digest is unsupported. Losing VerifyResult must not erase
     // the actual first digest or fabricate execution of the second.
-    use base64::Engine as _;
     use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize_xml};
     let nested = r##"<ds:Manifest xmlns:ds="http://www.w3.org/2000/09/xmldsig#" Id="nested"><ds:Reference Id="old" URI="#target"><ds:DigestMethod Algorithm="urn:example:historical-digest"/><ds:DigestValue>AA==</ds:DigestValue></ds:Reference></ds:Manifest>"##;
     let nested = nested.replace("</ds:Manifest>", r##"<ds:Reference Id="later" URI="#target"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#sha384"/><ds:DigestValue>AA==</ds:DigestValue></ds:Reference></ds:Manifest>"##);
@@ -54,8 +53,9 @@ fn completed_nested_manifest_hash_survives_a_later_frontier_error() {
         &C14nAlgorithm::new(C14nMode::Exclusive1_0, false),
     )
     .unwrap();
-    let digest = base64::engine::general_purpose::STANDARD
-        .encode(compute_digest(DigestAlgorithm::Sha256, &bytes));
+    let digest = structured_base64::STANDARD
+        .encode(&compute_digest(DigestAlgorithm::Sha256, &bytes))
+        .expect("test encoding");
     let (original, key) = signed_manifest("http://www.w3.org/2001/04/xmlenc#sha256");
     let template = original.as_xml()
         .replace("Id=\"inside\" URI=\"#target\">", "Id=\"inside\" URI=\"#nested\"><ds:Transforms><ds:Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/></ds:Transforms>")

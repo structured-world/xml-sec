@@ -7,8 +7,7 @@
 
 use std::path::Path;
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
+use structured_base64::STANDARD;
 use x509_parser::prelude::{FromDer, X509Certificate};
 use xml_sec::XmlDomDocument as Document;
 use xml_sec::policy::PolicyViolation;
@@ -45,8 +44,12 @@ fn phaos_x509_data() -> X509DataInfo {
             "<X509Certificate>{}</X509Certificate>",
             "</X509Data></KeyInfo>"
         ),
-        STANDARD.encode(PHAOS_RSA_CERTIFICATE),
-        STANDARD.encode(PHAOS_RSA_CA_CERTIFICATE),
+        STANDARD
+            .encode(PHAOS_RSA_CERTIFICATE)
+            .expect("test encoding"),
+        STANDARD
+            .encode(PHAOS_RSA_CA_CERTIFICATE)
+            .expect("test encoding"),
     );
     let document = Document::parse(&xml).expect("Phaos certificate wrapper must parse");
     let key_info = parse_key_info(document.root_element()).expect("Phaos chain must parse");

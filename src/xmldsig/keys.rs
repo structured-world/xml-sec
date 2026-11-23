@@ -2849,7 +2849,6 @@ mod tests {
     use alloc::collections::BTreeSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use base64::{Engine, engine::general_purpose::STANDARD};
     #[cfg(feature = "xmldsig-sign")]
     use der::Decode as _;
     use pkcs8::DecodePublicKey as _;
@@ -3638,8 +3637,8 @@ mod tests {
 
     fn rsa_key_value_parts(public_key: &rsa::PublicKey) -> (String, String) {
         (
-            STANDARD.encode(public_key.n().to_be_bytes_trimmed_vartime()),
-            STANDARD.encode(public_key.e().to_be_bytes_trimmed_vartime()),
+            crate::base64::encode(&public_key.n().to_be_bytes_trimmed_vartime()),
+            crate::base64::encode(&public_key.e().to_be_bytes_trimmed_vartime()),
         )
     }
 
@@ -4057,13 +4056,14 @@ mod tests {
                 node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "X509Certificate"))
             })
             .expect("signed SAML must embed its certificate");
-        let der = STANDARD
+        let der = structured_base64::STANDARD
             .decode(
                 certificate
                     .text()
                     .expect("fixture certificate must contain Base64 text")
                     .split_whitespace()
-                    .collect::<String>(),
+                    .collect::<String>()
+                    .as_bytes(),
             )
             .expect("fixture certificate must be valid Base64");
         let trusted = DefaultKeyResolver::new(KeyResolverConfig {
@@ -4100,8 +4100,8 @@ mod tests {
             })
             .and_then(crate::xml::dom::Node::text)
             .expect("fixture embeds a certificate");
-        let certificate = STANDARD
-            .decode(text.split_whitespace().collect::<String>())
+        let certificate = structured_base64::STANDARD
+            .decode(text.split_whitespace().collect::<String>().as_bytes())
             .expect("fixture certificate must decode");
         let resolver = DefaultKeyResolver::new(KeyResolverConfig {
             trusted_certs: vec![certificate],
@@ -5212,7 +5212,7 @@ mod tests {
         ));
         let xml = replace_unprefixed_key_info(
             RSA_KEY_VALUE_SIGNATURE,
-            &selector.replace("CRL_PLACEHOLDER", &STANDARD.encode(&crl)),
+            &selector.replace("CRL_PLACEHOLDER", &crate::base64::encode(&crl)),
         );
         let resolver = DefaultKeyResolver::new(KeyResolverConfig {
             lookup_certs: vec![certificate_der(include_str!(
@@ -5416,7 +5416,7 @@ mod tests {
             .expect("SHA-256 selector digest must be available");
         let key_info_xml = format!(
             "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\" xmlns:dsig11=\"http://www.w3.org/2009/xmldsig11#\"><X509Data><X509SubjectName>CN=Test Key rsa-2048,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509SubjectName><dsig11:X509Digest Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\">{}</dsig11:X509Digest></X509Data></KeyInfo>",
-            STANDARD.encode(digest)
+            crate::base64::encode(&digest)
         );
         let document = roxmltree::Document::parse(&key_info_xml)
             .expect("generated selector KeyInfo must be XML");
@@ -5634,7 +5634,7 @@ mod tests {
     #[test]
     fn resolves_der_encoded_key_end_to_end() {
         // DSig 1.1 DEREncodedKeyValue must feed the same SPKI verifier path.
-        let encoded = STANDARD.encode(public_key_der(SAML_PUBLIC_KEY));
+        let encoded = crate::base64::encode(&public_key_der(SAML_PUBLIC_KEY));
         let xml = replace_key_info(
             SIGNED_SAML,
             &format!(
@@ -6186,9 +6186,9 @@ mod tests {
             super::super::compute_digest(super::super::DigestAlgorithm::Sha512, &certificate);
         let xml = format!(
             "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><X509Data><X509Certificate>{}</X509Certificate><X509Digest xmlns=\"http://www.w3.org/2009/xmldsig11#\" Algorithm=\"{}\">{}</X509Digest></X509Data></KeyInfo>",
-            STANDARD.encode(&certificate),
+            crate::base64::encode(&certificate),
             super::super::DigestAlgorithm::Sha512.uri(),
-            STANDARD.encode(digest),
+            crate::base64::encode(&digest),
         );
         let document = roxmltree::Document::parse(&xml).expect("generated KeyInfo must be XML");
         let provider = RejectSecondSha512Provider {
@@ -6268,7 +6268,7 @@ mod tests {
                 let cert_xml = if embedded {
                     format!(
                         "<X509Certificate>{}</X509Certificate>",
-                        STANDARD.encode(&certificate)
+                        crate::base64::encode(&certificate)
                     )
                 } else {
                     String::new()
@@ -6278,7 +6278,7 @@ mod tests {
                     &format!(
                         "<KeyInfo><X509Data>{cert_xml}<X509Digest xmlns=\"http://www.w3.org/2009/xmldsig11#\" Algorithm=\"{}\">{}</X509Digest></X509Data></KeyInfo>",
                         algorithm.uri(),
-                        STANDARD.encode(&digest)
+                        crate::base64::encode(&digest)
                     ),
                 );
                 let provider = RejectSecondSha512Provider {

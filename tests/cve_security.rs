@@ -216,7 +216,7 @@ fn cve_2025_66568_canonicalization_failure_is_not_empty_success() {
 #[cfg(feature = "xmlenc")]
 #[test]
 fn cve_2026_32313_gcm_never_accepts_a_shortened_tag() {
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use structured_base64::STANDARD;
     use xml_sec::xmlenc::{
         DataEncryptionAlgorithm, DecryptContext, DecryptedContent, EncryptedDataBuilder,
         SymmetricKeyDecryptor, XmlEncError,
@@ -236,7 +236,7 @@ fn cve_2026_32313_gcm_never_accepts_a_shortened_tag() {
         .unwrap()
         .text()
         .unwrap();
-    let ciphertext = STANDARD.decode(value).unwrap();
+    let ciphertext = STANDARD.decode(value.as_bytes()).unwrap();
     let resolver = SymmetricKeyDecryptor::new(key);
     for backend in XmlBackend::available() {
         let context = DecryptContext::new(&resolver).xml_backend(backend);
@@ -247,7 +247,9 @@ fn cve_2026_32313_gcm_never_accepts_a_shortened_tag() {
         for removed in 1..=16 {
             let attack = good.replace(
                 value,
-                &STANDARD.encode(&ciphertext[..ciphertext.len() - removed]),
+                &structured_base64::STANDARD
+                    .encode(&ciphertext[..ciphertext.len() - removed])
+                    .expect("test encoding"),
             );
             assert!(
                 matches!(

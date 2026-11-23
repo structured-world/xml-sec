@@ -150,7 +150,6 @@ pub fn parse_encapsulation<'a, 'input>(
     node: crate::Node<'a, 'input>,
     template: bool,
 ) -> Result<ParsedEncapsulation<'a, 'input>, KeyEstablishmentError> {
-    use base64::Engine as _;
     let invalid = KeyEstablishmentError::Structure;
     let algorithm = encapsulation_algorithm(node)
         .ok_or(invalid("not an EncryptedKey with an ML-KEM method"))?;
@@ -203,11 +202,9 @@ pub fn parse_encapsulation<'a, 'input>(
         }
     }
     let mut ciphertext = [0u8; 1568];
-    // GeneralPurpose checks actual output bytes, including terminal padding,
-    // not decoded_len_estimate (1569 for a padded 1568-byte ciphertext).
-    // Decode directly into retained storage; no staging copy is necessary.
-    // https://docs.rs/base64/0.23.1/src/base64/engine/general_purpose/decode_suffix.rs.html
-    let ciphertext_len = base64::engine::general_purpose::STANDARD
+    // The profile needs room for the exact decoded length after padding, so
+    // a padded 1568-byte ciphertext decodes directly into retained storage.
+    let ciphertext_len = structured_base64::STANDARD
         .decode_slice(&encoded[..len], &mut ciphertext)
         .map_err(|_| invalid("invalid ciphertext base64"))?;
     if ciphertext_len != algorithm.ciphertext_len() && !(template && ciphertext_len == 0) {
@@ -580,7 +577,6 @@ mod tests {
 
     #[test]
     fn maximum_ciphertext_decodes_without_estimate_workspace() {
-        use base64::Engine as _;
         // The final padded quad needs two bytes, not the three in the
         // conservative length estimate. Exact-capacity decoding must remain
         // valid; a 1569-byte ciphertext with the same encoded length must fail.
@@ -588,7 +584,7 @@ mod tests {
             format!(
                 "<x:EncryptedKey xmlns:d=\"http://www.w3.org/2000/09/xmldsig#\" xmlns:x=\"{XMLENC_NS}\"><x:EncryptionMethod Algorithm=\"{}\"/><d:KeyInfo/><x:CipherData><x:CipherValue>{}</x:CipherValue></x:CipherData></x:EncryptedKey>",
                 KeyEncapsulationAlgorithm::MlKem1024.uri(),
-                base64::engine::general_purpose::STANDARD.encode(bytes)
+                crate::base64::encode(bytes)
             )
         };
         let bytes = [7; 1568];

@@ -549,9 +549,11 @@ fn pkcs12_input_consumes_aggregate_import_budget() {
 fn pkcs12_unrelated_ca_does_not_block_private_key() {
     // Generated with OpenSSL from the tracked RSA key and unrelated CA;
     // the CA is lookup material, not a fabricated leaf certificate.
-    let bundle = base64::engine::general_purpose::STANDARD
+    let bundle = structured_base64::STANDARD
         .decode(
-            include_str!("../../tests/fixtures/keys/pkcs12/rsa-key-unrelated-ca.p12.b64").trim(),
+            include_str!("../../tests/fixtures/keys/pkcs12/rsa-key-unrelated-ca.p12.b64")
+                .trim()
+                .as_bytes(),
         )
         .expect("fixture base64 decodes");
     let mut inventory = KeyInventory::default();
@@ -588,8 +590,12 @@ fn pkcs12_unrelated_ca_does_not_block_private_key() {
 fn pkcs12_identical_leaf_bags_are_one_candidate() {
     // OpenSSL exported the same certificate as both the leaf and an extra
     // cert bag; the inventory retains one copy for the matching key.
-    let bundle = base64::engine::general_purpose::STANDARD
-        .decode(include_str!("../../tests/fixtures/keys/pkcs12/rsa-duplicate-leaf.p12.b64").trim())
+    let bundle = structured_base64::STANDARD
+        .decode(
+            include_str!("../../tests/fixtures/keys/pkcs12/rsa-duplicate-leaf.p12.b64")
+                .trim()
+                .as_bytes(),
+        )
         .expect("fixture base64 decodes");
     let mut inventory = KeyInventory::default();
     inventory
@@ -677,8 +683,12 @@ fn kem_pkcs12_auto_usage_is_decrypt_only() {
 #[test]
 fn ec_pkcs12_import_is_sign_only() {
     // The convenience importer must not advertise RSA transport for EC.
-    let bundle = base64::engine::general_purpose::STANDARD
-        .decode(include_str!("../../tests/fixtures/keys/pkcs12/ec-key.p12.b64").trim())
+    let bundle = structured_base64::STANDARD
+        .decode(
+            include_str!("../../tests/fixtures/keys/pkcs12/ec-key.p12.b64")
+                .trim()
+                .as_bytes(),
+        )
         .expect("fixture base64 decodes");
     let resources = ResourcePolicy::default();
     let mut inventory = KeyInventory::default();
@@ -976,7 +986,7 @@ fn aes_imports_require_supported_key_widths() {
         );
         let xml = format!(
             "<Keys xmlns=\"{XMLSEC_NS}\"><KeyInfo xmlns=\"{XMLDSIG_NS}\"><KeyName>aes</KeyName><KeyValue><AESKeyValue xmlns=\"{XMLSEC_NS}\">{}</AESKeyValue></KeyValue></KeyInfo></Keys>",
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, vec![0; length])
+            crate::base64::encode(&vec![0; length])
         );
         assert!(
             KeyInventory::from_xml_bytes(
@@ -1040,8 +1050,7 @@ fn xml_store_accepts_xmlsig11_ec_key_value() {
     .expect("EC public PEM decodes");
     let (_, spki) =
         x509_parser::x509::SubjectPublicKeyInfo::from_der(pem.contents()).expect("EC SPKI parses");
-    let point =
-        base64::engine::general_purpose::STANDARD.encode(spki.subject_public_key.data.as_ref());
+    let point = crate::base64::encode(spki.subject_public_key.data.as_ref());
     let xml = format!(
         "<Keys xmlns=\"{XMLSEC_NS}\"><KeyInfo xmlns=\"{XMLDSIG_NS}\"><KeyName>ec</KeyName><KeyValue><ECKeyValue xmlns=\"{XMLDSIG11_NS}\"><NamedCurve URI=\"urn:oid:1.2.840.10045.3.1.7\"/><PublicKey>{point}</PublicKey></ECKeyValue></KeyValue></KeyInfo></Keys>"
     );
@@ -1067,7 +1076,7 @@ fn xml_store_names_follow_the_key_name_semantics() {
     // XMLDSig 1.1 section 4.5.1: a stored KeyName keeps its white space;
     // read as libxmlsec1 reads it, the name is trimmed, so the store answers
     // the names a document read the same way carries.
-    let encoded = base64::engine::general_purpose::STANDARD.encode(include_bytes!(
+    let encoded = crate::base64::encode(include_bytes!(
         "../../tests/fixtures/xmlenc/keys/ec/ec-prime256v1-pubkey.der"
     ));
     let xml = format!(
@@ -1091,7 +1100,7 @@ fn xml_store_der_keys_share_one_x509_work_budget() {
     // Every key read while loading one store is paid by the same X.509
     // work account: the allowance that admits one DEREncodedKeyValue must
     // not admit two, as it already does not for two KeyValue entries.
-    let encoded = base64::engine::general_purpose::STANDARD.encode(include_bytes!(
+    let encoded = crate::base64::encode(include_bytes!(
         "../../tests/fixtures/xmlenc/keys/ec/ec-prime256v1-pubkey.der"
     ));
     let store = |keys: usize| {
@@ -1141,7 +1150,7 @@ fn xml_store_der_keys_share_one_x509_work_budget() {
 fn xml_store_imports_triple_des_without_granting_operation_permission() {
     // A supported key encoding grants usage, not algorithm policy permission;
     // an eight-byte DES key must never be mistaken for a three-key TDEA key.
-    let encoded = base64::engine::general_purpose::STANDARD.encode([0x31; 24]);
+    let encoded = crate::base64::encode(&[0x31; 24]);
     let xml = format!(
         "<Keys xmlns=\"{XMLSEC_NS}\"><KeyInfo xmlns=\"{XMLDSIG_NS}\"><KeyName>des</KeyName><KeyValue><DESKeyValue xmlns=\"{XMLSEC_NS}\">{encoded}</DESKeyValue></KeyValue></KeyInfo></Keys>"
     );
@@ -2316,7 +2325,7 @@ fn xml_import_counts_source_and_decoded_material_together() {
     // The caller still owns the Base64 XML while the decoded HMAC is live.
     let xml = format!(
         "<Keys xmlns='{XMLSEC_NS}' xmlns:ds='{XMLDSIG_NS}'><ds:KeyInfo><ds:KeyName>hmac</ds:KeyName><ds:KeyValue><HMACKeyValue>{}</HMACKeyValue></ds:KeyValue></ds:KeyInfo></Keys>",
-        base64::engine::general_purpose::STANDARD.encode(vec![1; 1024])
+        crate::base64::encode(&[1; 1024])
     );
     let resources = ResourcePolicy {
         max_external_resource_total_bytes: xml.len(),
@@ -4178,11 +4187,10 @@ fn named_verification_bounds_complete_key_value() {
     let modulus = public.n().to_be_bytes_trimmed_vartime();
     let exponent = public.e().to_be_bytes_trimmed_vartime();
     let size = modulus.len() + exponent.len();
-    let base64 = base64::engine::general_purpose::STANDARD;
     let xml = format!(
         "<Keys xmlns=\"{XMLSEC_NS}\"><KeyInfo xmlns=\"{XMLDSIG_NS}\"><KeyName>named</KeyName><KeyValue><RSAKeyValue><Modulus>{}</Modulus><Exponent>{}</Exponent></RSAKeyValue></KeyValue></KeyInfo></Keys>",
-        base64.encode(modulus),
-        base64.encode(exponent)
+        crate::base64::encode(&modulus),
+        crate::base64::encode(&exponent)
     );
     let inventory = KeyInventory::from_xml_bytes(
         xml.as_bytes(),
@@ -4808,7 +4816,7 @@ fn public_dsa_store_entries_require_usable_parameters() {
 fn oversized_private_dsa_component_stops_before_big_integer_work() {
     // A bounded XML file can still contain an outsized exponent; reject
     // it before constructing a large modular exponentiation.
-    let oversized = base64::engine::general_purpose::STANDARD.encode(vec![1_u8; 513]);
+    let oversized = crate::base64::encode(&vec![1_u8; 513]);
     let xml = format!(
         "<Keys xmlns=\"{XMLSEC_NS}\"><KeyInfo xmlns=\"{XMLDSIG_NS}\"><KeyName>dsa</KeyName><KeyValue><DSAKeyValue><P>{oversized}</P><Q>AQ==</Q><G>AQ==</G><X xmlns=\"{XMLSEC_NS}\">AQ==</X><Y>AQ==</Y></DSAKeyValue></KeyValue></KeyInfo></Keys>"
     );

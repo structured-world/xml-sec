@@ -139,9 +139,8 @@ fn stylesheet_tag_staging_obeys_its_workspace_before_serialization() {
 fn owned_binary_inputs_share_the_xslt_workspace() {
     // Every producer leaves its allocation live during the next transform.
     // A borrowed input's minimum workspace cannot also admit that allocation.
-    use base64::Engine as _;
     let xml = format!("<root>{}</root>", "x".repeat(64 * 1024));
-    let encoded = base64::engine::general_purpose::STANDARD.encode(xml.as_bytes());
+    let encoded = crate::base64::encode(xml.as_bytes());
     let document = Document::parse(&xml).expect("source XML");
     let sheet = stylesheet(r#"<xsl:template match="/"><out/></xsl:template>"#);
     let producer = XsltStylesheet::new(format!(

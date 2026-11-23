@@ -8,7 +8,6 @@ mod refusing_state;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use base64::Engine as _;
 use refusing_state::RefusingStateProvider;
 use sha2::{Digest, Sha256};
 use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
@@ -345,8 +344,9 @@ fn base64_chain_decodes_the_stream_with_the_resident_rules() {
     // One byte past a multiple of three, so the encoding ends with "==".
     let mut decoded = b"payload behind a Base64 transform".repeat(200);
     decoded.push(b'!');
-    let mut encoded = base64::engine::general_purpose::STANDARD
+    let mut encoded = structured_base64::STANDARD
         .encode(&decoded)
+        .expect("test encoding")
         .into_bytes();
     // Line breaks every 76 characters, as MIME writes them.
     let mut wrapped = Vec::new();
@@ -800,7 +800,9 @@ fn invalid_payload_requests_are_rejected_before_any_byte() {
 /// A signature whose `SignedInfo` covers `payload` by a detached Reference and
 /// an authenticated Manifest.
 fn manifest_document(payload: &[u8]) -> XmlDocument {
-    let digest = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(payload));
+    let digest = structured_base64::STANDARD
+        .encode(&Sha256::digest(payload))
+        .expect("test encoding");
     let template = format!(
         r##"<root xml:base="https://example.test/data/"><item Id="item">manifest target</item><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#hmac-sha256"/><ds:Reference URI="part.bin"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference><ds:Reference URI="#manifest"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/><ds:Object><ds:Manifest Id="manifest"><ds:Reference URI="#item"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:Manifest></ds:Object></ds:Signature></root>"##
     );
@@ -1119,7 +1121,9 @@ fn streamed_base64_obeys_the_operation_base64_budgets() {
     // must reach the same refusal. A resource refusal ends the resident
     // signature's processing, and it refuses the streamed payload, leaving
     // its Reference unavailable.
-    let encoded = base64::engine::general_purpose::STANDARD.encode(b"decoded payload bytes");
+    let encoded = structured_base64::STANDARD
+        .encode(b"decoded payload bytes")
+        .expect("test encoding");
     let document = signed(
         &[Detached {
             uri: "payload.b64",
@@ -1237,7 +1241,9 @@ fn listing_does_not_reparse_chains_that_cannot_stream() {
     // it is never offered for streaming; listing must not parse its transforms
     // again and spend the operation's XPath allowance on every call.
     let payload = b"<doc/>";
-    let digest = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(b"<doc/>"));
+    let digest = structured_base64::STANDARD
+        .encode(&Sha256::digest(b"<doc/>"))
+        .expect("test encoding");
     let template = format!(
         r#"<root xml:base="https://example.test/data/"><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#hmac-sha256"/><ds:Reference URI="doc.xml"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>true()</ds:XPath></ds:Transform></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature></root>"#
     );

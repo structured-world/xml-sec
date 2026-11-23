@@ -2,11 +2,11 @@
 //! sample published by the Central Certification Authority of Ukraine.
 #![cfg(all(feature = "dstu4145", feature = "cms"))]
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use structured_asn1::Parser;
 use structured_asn1::memory::{Memory, MemoryAccount, Work};
+use structured_base64::STANDARD;
 use structured_cms::binding::Scope;
 use structured_cms::prepare::{self, Preparation};
 use structured_cms::provider::SignatureAnswer;
@@ -35,7 +35,9 @@ fn tokens() -> Vec<Vec<u8>> {
             let (encoded, _) = value
                 .split_once("</xades:EncapsulatedTimeStamp>")
                 .expect("fixture closes its token");
-            STANDARD.decode(encoded).expect("fixture value is Base64")
+            STANDARD
+                .decode(encoded.as_bytes())
+                .expect("fixture value is Base64")
         })
         .collect()
 }

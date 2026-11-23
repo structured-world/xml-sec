@@ -7,8 +7,6 @@
 //! caller's account and admitted through its work before it grows.
 
 use alloc::{format, string::String, vec::Vec};
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
 use structured_asn1::memory::{Memory, MemoryError, OwnedVec, Work};
 use structured_xades::produce::{Datatype, Event, Value, Writer};
 use structured_xades::xml::Name;
@@ -283,7 +281,7 @@ impl Draft {
         let mut encoded = [0_u8; 1024];
         for chunk in bytes.chunks(768) {
             work.charge_work(chunk.len() as u64)?;
-            let length = STANDARD
+            let length = structured_base64::STANDARD
                 .encode_slice(chunk, &mut encoded)
                 .map_err(|_| DraftError::Order("base64 output does not fit its chunk"))?;
             self.push(&encoded[..length], work)?;

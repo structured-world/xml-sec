@@ -2747,8 +2747,9 @@ fn load_explicit_certificate_key_info(
     // resolver can then build its path through caller-supplied intermediates
     // and anchors without allowing the document's embedded KeyInfo to replace
     // the explicitly selected identity.
-    let encoded =
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, certificate_der);
+    let encoded = structured_base64::STANDARD
+        .encode(&certificate_der)
+        .map_err(|error| CommandError::Signature(error.to_string()))?;
     let key_info_xml = format!(
         "<KeyInfo xmlns=\"{XMLDSIG_NS}\"><X509Data><X509Certificate>{encoded}</X509Certificate></X509Data></KeyInfo>"
     );
@@ -6510,7 +6511,9 @@ fn keys(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
         selected_provider(invocation)?
             .fill_random(&mut key)
             .map_err(|error| CommandError::Encryption(error.to_string()))?;
-        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key);
+        let encoded = structured_base64::STANDARD
+            .encode(&key)
+            .map_err(|error| CommandError::Encryption(error.to_string()))?;
         entries.push_str("<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\">\n");
         if let Some(name) = generated.parameter.as_deref() {
             writeln!(entries, "<KeyName>{}</KeyName>", escape_text(name))

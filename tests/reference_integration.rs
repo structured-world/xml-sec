@@ -12,7 +12,6 @@
 
 #![cfg(feature = "xmldsig")]
 
-use base64::Engine;
 use xml_sec::xmldsig::digest::{DigestAlgorithm, compute_digest};
 use xml_sec::xmldsig::parse::{find_signature_node, parse_signed_info};
 use xml_sec::xmldsig::transforms::execute_transforms;
@@ -36,7 +35,9 @@ fn compute_reference_digest_b64(
     let initial_data = resolver.dereference(uri).unwrap();
     let pre_digest = execute_transforms(sig_node, initial_data, transforms).unwrap();
     let digest = compute_digest(digest_algo, &pre_digest);
-    base64::engine::general_purpose::STANDARD.encode(&digest)
+    structured_base64::STANDARD
+        .encode(&digest)
+        .expect("test encoding")
 }
 
 // ── SAML Response: enveloped signature over entire document ──────────────────

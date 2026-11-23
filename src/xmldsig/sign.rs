@@ -9,7 +9,6 @@
 // same-named `pkcs8`/`spki` trait methods on these key types.
 use crate::rsa_encoding::{RsaPrivateKeyEncoding, RsaPublicKeyEncoding};
 use crate::xml::dom::{Document, Node, NodeId};
-use base64::Engine;
 use p256::ecdsa::{
     Signature as P256Signature, SigningKey as P256SigningKey, VerifyingKey as P256VerifyingKey,
 };
@@ -510,7 +509,7 @@ impl KeyInfoWriter for DerEncodedKeyValueInfoWriter {
         let spki_der = public_key
             .spki_der()
             .ok_or(KeyInfoWriteError::MissingPublicKey)?;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(spki_der);
+        let encoded = crate::base64::encode(spki_der);
         Ok(format!(
             "<dsig11:DEREncodedKeyValue xmlns:dsig11=\"http://www.w3.org/2009/xmldsig11#\">{encoded}</dsig11:DEREncodedKeyValue>"
         ))
@@ -523,7 +522,7 @@ pub struct KeyValueInfoWriter;
 
 impl KeyInfoWriter for KeyValueInfoWriter {
     fn write_key_info(&self, signing_key: &dyn SigningKey) -> Result<String, KeyInfoWriteError> {
-        let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let encode = crate::base64::encode;
         match signing_key.public_key_info()? {
             SigningPublicKeyInfo::Rsa {
                 modulus, exponent, ..
@@ -714,7 +713,7 @@ impl KeyInfoWriter for X509CertificateKeyInfoWriter {
         xml.push_str(start);
         for certificate_der in &self.certificates_der {
             xml.push_str("<X509Certificate>");
-            base64::engine::general_purpose::STANDARD.encode_string(certificate_der, &mut xml);
+            crate::base64::encode_into(certificate_der, &mut xml);
             xml.push_str("</X509Certificate>");
         }
         xml.push_str("</X509Data>");
@@ -823,7 +822,7 @@ impl KeyInfoWriter for X509DigestKeyInfoWriter {
         xml.push_str(start);
         xml.push_str(self.digest_algorithm.uri());
         xml.push_str("\">");
-        base64::engine::general_purpose::STANDARD.encode_string(digest, &mut xml);
+        crate::base64::encode_into(&digest, &mut xml);
         xml.push_str(end);
         Ok(xml)
     }
@@ -2263,7 +2262,7 @@ impl<'a> SignContext<'a> {
             operation.add_dependency(mutation, key_info)?;
             operation.compile()?;
             operation.run_document_transition(mutation, document, |document, budgets| {
-                let encoded = base64::engine::general_purpose::STANDARD.encode(&result.ciphertext);
+                let encoded = crate::base64::encode(&result.ciphertext);
                 document
                     .replace_base64_contents_with_budget(
                         &[(target, encoded)],
@@ -2887,7 +2886,7 @@ impl<'a> SignContext<'a> {
                 signature_value,
                 self.policy.ecdsa_signature_value_encoding,
             )?;
-            let encoded = base64::engine::general_purpose::STANDARD.encode(signature_value);
+            let encoded = crate::base64::encode(&signature_value);
             Ok::<_, SigningError>(match self.base64_line_size {
                 Some(size) => wrap_base64(&encoded, size),
                 None => encoded,
@@ -4588,7 +4587,7 @@ fn reference_dependency_levels(
             )
             .map_err(map_reference_digest_error)?;
             digests.push(output.digest.map(|digest| AnalyzedDigest {
-                value: base64::engine::general_purpose::STANDARD.encode(digest.digest),
+                value: crate::base64::encode(&digest.digest),
                 pre_digest: digest.pre_digest,
             }));
             Ok(output.dependencies)
@@ -4971,7 +4970,7 @@ fn compute_signing_reference_digests_retaining(
                 },
             )
             .map_err(map_reference_digest_error)?;
-            let digest_value = base64::engine::general_purpose::STANDARD.encode(digest.digest);
+            let digest_value = crate::base64::encode(&digest.digest);
             Ok(RetainedDigest {
                 computed: ComputedReferenceDigest {
                     index,

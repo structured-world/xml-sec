@@ -576,8 +576,7 @@ pub enum TransformError {
 
     /// Base64 decoding failed during the standard `XMLDSig` Base64 transform.
     #[error("base64 transform decode error: {0}")]
-    // base64 implements `Error` only with its `std` feature.
-    Base64(#[cfg_attr(feature = "std", source)] base64::DecodeSliceError),
+    Base64(#[source] structured_base64::Base64Error),
 
     /// `XPath` parsing or evaluation failed.
     #[error("XPath transform error: {0}")]

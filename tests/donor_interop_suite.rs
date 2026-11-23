@@ -8,7 +8,6 @@ use std::{
     path::Path,
 };
 
-use base64::Engine as _;
 use xml_sec::policy::{
     HmacPolicy, PolicyViolation, RsaKeyPolicy, SigningPolicy, VerificationPolicy,
 };
@@ -453,10 +452,12 @@ fn external_key_info_reference_rebinds_fragments_and_shares_resource_budget() {
 
     // RetrievalMethod fragments belong to the external KeyInfo document too;
     // flattening parsed sources must not rebind them to the signature document.
-    let certificate = base64::engine::general_purpose::STANDARD.encode(
-        fs::read("tests/fixtures/xmldsig/phaos-xmldsig-three/certs/rsa-cert.der")
-            .expect("matching RSA certificate must be readable"),
-    );
+    let certificate = structured_base64::STANDARD
+        .encode(
+            &fs::read("tests/fixtures/xmldsig/phaos-xmldsig-three/certs/rsa-cert.der")
+                .expect("matching RSA certificate must be readable"),
+        )
+        .expect("test encoding");
     let retrieval_document = format!(
         r##"<keys xmlns:dsig="http://www.w3.org/2000/09/xmldsig#"><dsig:KeyInfo Id="outer"><dsig:RetrievalMethod URI="#certificate" Type="http://www.w3.org/2000/09/xmldsig#X509Data"/></dsig:KeyInfo><dsig:X509Data Id="certificate"><dsig:X509Certificate>{certificate}</dsig:X509Certificate></dsig:X509Data></keys>"##
     );

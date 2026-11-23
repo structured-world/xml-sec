@@ -169,7 +169,6 @@ enum Signed {
 /// decoded text under a base64 transform (`XMLDSig` §6.6.2), otherwise the
 /// exclusive canonical form of its element.
 fn signed(text: &str, what: &str) -> Result<Signed, String> {
-    use base64::Engine;
     const DS: &str = crate::xades::DS;
     let document = xml::parse(text, what)?;
     let root = document.root_element();
@@ -196,8 +195,8 @@ fn signed(text: &str, what: &str) -> Result<Signed, String> {
             .unwrap_or_default()
             .split_ascii_whitespace()
             .collect();
-        return base64::engine::general_purpose::STANDARD
-            .decode(encoded)
+        return structured_base64::STANDARD
+            .decode(encoded.as_bytes())
             .map(Signed::Carried)
             .map_err(|error| format!("{what}: the Object is not base64: {error}"));
     }

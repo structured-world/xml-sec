@@ -228,7 +228,7 @@ fn kept_signing_inputs_are_the_bytes_the_operation_digested_and_signed() {
                 .filter(|c| !c.is_ascii_whitespace())
                 .collect::<String>();
             assert_eq!(
-                base64::engine::general_purpose::STANDARD.encode(digest),
+                crate::base64::encode(&digest),
                 unwrapped,
                 "{name} at width {width:?}"
             );

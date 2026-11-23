@@ -13,8 +13,6 @@ use crate::collections::Set;
 
 #[cfg(all(test, feature = "xmldsig-sign"))]
 use crate::xmldsig::DsaSigningKey;
-#[cfg(all(test, feature = "xmldsig-sign"))]
-use base64::Engine as _;
 #[cfg(feature = "xmldsig-sign")]
 use crypto_bigint::{
     BoxedUint,

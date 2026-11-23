@@ -8,7 +8,6 @@
 
 use std::path::Path;
 
-use base64::Engine;
 use p384::ecdsa::signature::Signer;
 use p384::ecdsa::{Signature as P384Signature, SigningKey as P384SigningKey};
 use p384::pkcs8::DecodePrivateKey;
@@ -56,8 +55,8 @@ fn canonicalized_signed_info_and_signature(xml: &str) -> (SignatureAlgorithm, Ve
         .chars()
         .filter(|ch| !ch.is_whitespace())
         .collect::<String>();
-    let signature_value = base64::engine::general_purpose::STANDARD
-        .decode(signature_value_text)
+    let signature_value = structured_base64::STANDARD
+        .decode(signature_value_text.as_bytes())
         .expect("SignatureValue should be valid base64");
 
     (signed_info.signature_method, canonical, signature_value)

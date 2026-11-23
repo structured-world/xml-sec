@@ -7,7 +7,6 @@
     any(feature = "xml-backend-xmloxide", feature = "xml-backend-roxmltree")
 ))]
 
-use base64::Engine as _;
 use dsa::pkcs8::DecodePublicKey as _;
 use xml_sec::XmlBackend;
 use xml_sec::key_manager::KeyInventory;
@@ -96,7 +95,9 @@ fn crypto_binary(value: &crypto_bigint::BoxedUint) -> String {
         .iter()
         .position(|byte| *byte != 0)
         .unwrap_or(bytes.len());
-    base64::engine::general_purpose::STANDARD.encode(&bytes[start..])
+    structured_base64::STANDARD
+        .encode(&bytes[start..])
+        .expect("test encoding")
 }
 
 #[test]

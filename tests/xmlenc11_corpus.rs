@@ -2,8 +2,8 @@
 
 use std::{collections::BTreeSet, fs, path::PathBuf};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use der::{Decode as _, Reader as _, asn1::UintRef};
+use structured_base64::STANDARD;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize_xml};
 use xml_sec::policy::{DecryptionPolicy, KeyAgreementAlgorithm};
 use xml_sec::provider::{EcdhCurve, RUST_CRYPTO_PROVIDER, RustCryptoDhKey, RustCryptoEcdhKey};
@@ -179,7 +179,13 @@ fn peer(document: &Document<'_>, local_name: &str) -> Vec<u8> {
         .find(|node| node.tag_name().name() == local_name)
         .unwrap();
     STANDARD
-        .decode(node.text().unwrap().split_whitespace().collect::<String>())
+        .decode(
+            node.text()
+                .unwrap()
+                .split_whitespace()
+                .collect::<String>()
+                .as_bytes(),
+        )
         .unwrap()
 }
 
@@ -645,7 +651,12 @@ fn encrypt_case(case: &Case, populated_template: &str, backend: XmlBackend) -> S
                 .find(|node| node.tag_name().name() == "PublicKey")
                 .unwrap();
             let text = node.children().find(xml_sec::Node::is_text).unwrap();
-            public_replacement = Some((text.range(), STANDARD.encode(sender.public_key())));
+            public_replacement = Some((
+                text.range(),
+                structured_base64::STANDARD
+                    .encode(&sender.public_key())
+                    .expect("test encoding"),
+            ));
         }
         Credential::Dh => {
             let kek = rfc5114_dh_kek(&parsed.encrypted_keys[0].sources.agreement_methods[0]);
@@ -771,11 +782,22 @@ fn corrupted_authenticated_content_and_wrapped_keys_are_rejected() {
         {
             let text = value.children().find(xml_sec::Node::is_text).unwrap();
             let mut bytes = STANDARD
-                .decode(text.text().unwrap().split_whitespace().collect::<String>())
+                .decode(
+                    text.text()
+                        .unwrap()
+                        .split_whitespace()
+                        .collect::<String>()
+                        .as_bytes(),
+                )
                 .unwrap();
             *bytes.last_mut().unwrap() ^= 1;
             let mut corrupted = xml.clone();
-            corrupted.replace_range(text.range(), &STANDARD.encode(bytes));
+            corrupted.replace_range(
+                text.range(),
+                &structured_base64::STANDARD
+                    .encode(&bytes)
+                    .expect("test encoding"),
+            );
             for backend in XmlBackend::available() {
                 let error = decrypt_case(case, &corrupted, backend, false).unwrap_err();
                 assert!(

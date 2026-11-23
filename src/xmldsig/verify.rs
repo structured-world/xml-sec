@@ -23,7 +23,6 @@ use alloc::{
     vec,
     vec::Vec,
 };
-use base64::Engine;
 use core::cell::{Cell, RefCell};
 
 use crate::document::{
@@ -2140,8 +2139,8 @@ pub struct VerifyResult {
     pub policy: crate::policy::PolicyAudit,
 }
 
-impl From<base64::DecodeError> for DsigError {
-    fn from(error: base64::DecodeError) -> Self {
+impl From<structured_base64::Base64Error> for DsigError {
+    fn from(error: structured_base64::Base64Error) -> Self {
         Self::SignatureValueBase64(error)
     }
 }
@@ -2238,8 +2237,7 @@ pub enum DsigError {
 
     /// `SignatureValue` base64 decoding failed.
     #[error("invalid SignatureValue base64: {0}")]
-    // base64 implements `Error` only with its `std` feature.
-    SignatureValueBase64(#[cfg_attr(feature = "std", source)] base64::DecodeError),
+    SignatureValueBase64(#[source] structured_base64::Base64Error),
 
     /// Cryptographic verification failed before validity decision.
     #[error("signature verification failed: {0}")]
@@ -6837,6 +6835,16 @@ fn decode_signature_value(
             }
         }
     }
+    let located = |error| {
+        let texts = signature_value_node
+            .children()
+            .filter(Node::is_text)
+            .filter_map(Node::text)
+            .map(str::as_bytes);
+        SignatureVerificationPipelineError::SignatureValueBase64(
+            super::whitespace::locate_in_xml_text(error, texts),
+        )
+    };
     let mut normalized = Vec::with_capacity(normalized_len);
     let mut raw_text_len = 0usize;
     for child in signature_value_node.children().filter(Node::is_text) {
@@ -6847,11 +6855,22 @@ fn decode_signature_value(
                 &mut normalized,
                 algorithm,
                 resources,
-            )?;
+            )
+            .map_err(|error| match error {
+                SignatureVerificationPipelineError::SignatureValueBase64(error) => located(error),
+                other => other,
+            })?;
         }
     }
 
-    Ok(base64::engine::general_purpose::STANDARD.decode(normalized)?)
+    structured_base64::STANDARD
+        .decode(&normalized)
+        .map_err(|error| match error {
+            structured_base64::OwnedError::Codec(error) => located(error),
+            structured_base64::OwnedError::Reserve(_) => {
+                structured_asn1::memory::MemoryError::OutOfMemory.into()
+            }
+        })
 }
 
 fn push_normalized_signature_text(
@@ -6879,10 +6898,9 @@ fn push_normalized_signature_text(
     }
 
     normalize_xml_base64_bytes(text.as_bytes(), normalized, |_| true).map_err(|err| {
-        SignatureVerificationPipelineError::SignatureValueBase64(base64::DecodeError::InvalidByte(
-            err.normalized_offset,
-            err.invalid_byte,
-        ))
+        SignatureVerificationPipelineError::SignatureValueBase64(
+            structured_base64::Base64Error::InvalidByte(err.normalized_offset, err.invalid_byte),
+        )
     })?;
 
     Ok(())

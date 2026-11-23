@@ -4,7 +4,6 @@
 use std::convert::Infallible;
 use std::sync::Arc;
 
-use base64::Engine as _;
 use structured_asn1::memory::{Memory, MemoryAccount};
 use structured_asn1::{Oid, Parser};
 use structured_cms::timestamp::{Accuracy, PolicyAccuracy, Token};
@@ -28,7 +27,7 @@ pub fn values(text: &str, tag: &str) -> Vec<Vec<u8>> {
             .chars()
             .filter(|character| !character.is_ascii_whitespace())
             .collect();
-        if let Ok(value) = base64::engine::general_purpose::STANDARD.decode(compact) {
+        if let Ok(value) = structured_base64::STANDARD.decode(compact.as_bytes()) {
             found.push(value);
         }
     }

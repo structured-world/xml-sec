@@ -3,8 +3,6 @@
 #[cfg(test)]
 use crate::xml::dom::ParsingOptions;
 use crate::xml::dom::{Document, Node};
-#[cfg(test)]
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 use crate::document::{
     DocumentParseSettings, XmlParseWorkBudget, parse_borrowed_with_settings_and_budget,
@@ -2966,7 +2964,7 @@ mod tests {
         // normalized lexical form before either String or decoded Vec can grow.
         let xml = format!(
             "<xenc:EncryptionMethod xmlns:xenc=\"{XMLENC_NS}\" Algorithm=\"http://www.w3.org/2009/xmlenc11#rsa-oaep\"><xenc:OAEPparams>{}</xenc:OAEPparams></xenc:EncryptionMethod>",
-            STANDARD.encode([0_u8; 65])
+            crate::base64::encode(&[0_u8; 65])
         );
         let document = Document::parse(&xml).expect("test method must be XML");
 
