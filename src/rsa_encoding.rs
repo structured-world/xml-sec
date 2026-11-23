@@ -294,7 +294,7 @@ impl RsaPublicKeyEncoding for RsaPublicKey {
             key.public_exponent.as_bytes(),
             width(key.public_exponent.as_bytes())?,
         )?;
-        Self::new(n, e).map_err(|_| pkcs1::Error::KeyMalformed)
+        public_key(n, e).ok_or(pkcs1::Error::KeyMalformed)
     }
 
     fn to_pkcs1_der(&self) -> pkcs1::Result<Document> {
@@ -391,7 +391,14 @@ fn read_spki_rsa_key(
     let (Some(n), Some(e)) = (integer(modulus), integer(exponent)) else {
         return Ok(None);
     };
-    Ok(RsaPublicKey::new(n, e).ok())
+    Ok(public_key(n, e))
+}
+
+/// An RSA public key of any size up to the implementation ceiling: the
+/// minimum belongs to the operation's `RsaKeyPolicy`, which reports a
+/// too-small key as a policy violation rather than as malformed material.
+pub(crate) fn public_key(n: BoxedUint, e: BoxedUint) -> Option<RsaPublicKey> {
+    RsaPublicKey::new_with_size_limits(n, e, 1..=crate::hard_limits::RSA_MODULUS_BIT_CEILING).ok()
 }
 
 #[cfg(feature = "xmldsig-sign")]

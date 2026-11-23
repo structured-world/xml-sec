@@ -161,6 +161,28 @@ fn rsa_encoding_protected_container_requires_correct_password() {
 }
 
 #[test]
+fn public_key_codecs_leave_the_size_floor_to_policy() {
+    // The deployment's RSA key policy decides the minimum modulus; the codecs
+    // must decode a 768-bit key so that policy, not a decoder floor, gives
+    // the verdict.
+    use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng as _};
+    let small = RsaPrivateKey::new_unchecked(&mut ChaCha20Rng::seed_from_u64(768), 768)
+        .unwrap()
+        .to_public_key();
+    assert_eq!(small.n().bit_width_vartime(), 768);
+    let pkcs1 = RsaPublicKeyEncoding::to_pkcs1_der(&small).unwrap();
+    let spki = RsaPublicKeyEncoding::to_public_key_der(&small).unwrap();
+    assert_eq!(
+        <RsaPublicKey as RsaPublicKeyEncoding>::from_pkcs1_der(pkcs1.as_bytes()).unwrap(),
+        small
+    );
+    assert_eq!(
+        <RsaPublicKey as RsaPublicKeyEncoding>::from_public_key_der(spki.as_bytes()).unwrap(),
+        small
+    );
+}
+
+#[test]
 fn rsa_encoding_rejects_invalid_key_components() {
     // Codec parsing is not validation: the existing RSA engine must reject
     // invalid exponents and inconsistent private components after DER decode.

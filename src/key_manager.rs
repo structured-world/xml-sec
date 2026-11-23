@@ -3210,11 +3210,11 @@ fn rsa_recipient_from_components(
         .iter()
         .position(|byte| *byte != 0)
         .ok_or(KeyStoreError::Selection("invalid RSA encryption key"))?;
-    RsaPublicKey::new(
+    crate::rsa_encoding::public_key(
         BoxedUint::from_be_slice_vartime(&modulus[first_nonzero..]),
         BoxedUint::from_be_slice_vartime(exponent),
     )
-    .map_err(|_| KeyStoreError::Selection("invalid RSA encryption key"))
+    .ok_or(KeyStoreError::Selection("invalid RSA encryption key"))
 }
 
 #[cfg(feature = "xmldsig-sign")]

@@ -2842,8 +2842,9 @@ pub(crate) fn supported_key_value_is_rsa(
 
 #[cfg(test)]
 mod tests {
+    // Codec calls are qualified: `rsa`'s own codecs add same-named methods.
     #[cfg(feature = "rustcrypto")]
-    use crate::rsa_encoding::RsaPublicKeyEncoding as _;
+    use crate::rsa_encoding::RsaPublicKeyEncoding;
     use crate::xml::dom as roxmltree;
     use alloc::collections::BTreeSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -5653,8 +5654,9 @@ mod tests {
     #[test]
     fn resolves_rsa_key_value_end_to_end() {
         // Embedded CryptoBinary parameters must verify the original RSA-2048 donor signature.
-        let public_key = rsa::PublicKey::from_public_key_pem(RSA_PUBLIC_KEY)
-            .expect("fixture must contain an RSA public key");
+        let public_key =
+            <rsa::PublicKey as RsaPublicKeyEncoding>::from_public_key_pem(RSA_PUBLIC_KEY)
+                .expect("fixture must contain an RSA public key");
         let (modulus, exponent) = rsa_key_value_parts(&public_key);
         let key_info = format!(
             "<KeyInfo><KeyValue><RSAKeyValue><Modulus>{modulus}</Modulus><Exponent>{exponent}</Exponent></RSAKeyValue></KeyValue></KeyInfo>",
@@ -6350,8 +6352,9 @@ mod tests {
         let (_, parsed_certificate) = X509Certificate::from_der(&certificate)
             .expect("the Phaos fixture is a DER certificate");
         let public_key = parsed_certificate.public_key().raw.to_vec();
-        let rsa_public_key = rsa::PublicKey::from_public_key_der(&public_key)
-            .expect("the Phaos certificate contains an RSA public key");
+        let rsa_public_key =
+            <rsa::PublicKey as RsaPublicKeyEncoding>::from_public_key_der(&public_key)
+                .expect("the Phaos certificate contains an RSA public key");
         let certificate_metadata = parse_x509_certificate(&certificate)
             .expect("the Phaos fixture has supported X.509 metadata");
         let named_key = VerificationKey {
@@ -6408,8 +6411,9 @@ mod tests {
     #[test]
     fn rsa_key_value_rejects_ecdsa_signature_method() {
         // Embedded RSA parameters must not be relabeled for an ECDSA SignatureMethod.
-        let public_key = rsa::PublicKey::from_public_key_pem(RSA_PUBLIC_KEY)
-            .expect("fixture must contain an RSA public key");
+        let public_key =
+            <rsa::PublicKey as RsaPublicKeyEncoding>::from_public_key_pem(RSA_PUBLIC_KEY)
+                .expect("fixture must contain an RSA public key");
         let (modulus, exponent) = rsa_key_value_parts(&public_key);
         let key_info = format!(
             "<ds:KeyInfo><ds:KeyValue><ds:RSAKeyValue><ds:Modulus>{modulus}</ds:Modulus><ds:Exponent>{exponent}</ds:Exponent></ds:RSAKeyValue></ds:KeyValue></ds:KeyInfo>",
@@ -6473,8 +6477,9 @@ mod tests {
     #[test]
     fn incompatible_ec_key_value_falls_back_to_later_rsa_key_value() {
         // Mixed KeyInfo should keep scanning after an incompatible ECKeyValue source.
-        let public_key = rsa::PublicKey::from_public_key_pem(RSA_PUBLIC_KEY)
-            .expect("fixture must contain an RSA public key");
+        let public_key =
+            <rsa::PublicKey as RsaPublicKeyEncoding>::from_public_key_pem(RSA_PUBLIC_KEY)
+                .expect("fixture must contain an RSA public key");
         let (modulus, exponent) = rsa_key_value_parts(&public_key);
         let key_info = format!(
             r#"<KeyInfo xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><KeyValue><dsig11:ECKeyValue><dsig11:NamedCurve URI="urn:oid:1.2.840.10045.3.1.7"/><dsig11:PublicKey>BJ/yaXNlq4FRObyJCBhb5jAz8GVzinK3bBGLjSDfjbJwNfydtgjnlS4EsDmxSRhWyJWq6GIqy5wvnaiARK04uB4=</dsig11:PublicKey></dsig11:ECKeyValue></KeyValue><KeyValue><RSAKeyValue><Modulus>{modulus}</Modulus><Exponent>{exponent}</Exponent></RSAKeyValue></KeyValue></KeyInfo>"#,

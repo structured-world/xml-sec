@@ -20,7 +20,8 @@ use rcgen::{
 use rsa::{PrivateKey as RsaPrivateKey, PublicKey as RsaPublicKey, traits::PublicKeyParts as _};
 use time::{Duration, OffsetDateTime};
 use x509_parser::{extensions::ParsedExtension, prelude::FromDer as _};
-use xml_sec::rsa_encoding::{RsaPrivateKeyEncoding as _, RsaPublicKeyEncoding as _};
+// RSA codec calls are qualified: `rsa`'s own codecs add same-named methods.
+use xml_sec::rsa_encoding::{RsaPrivateKeyEncoding, RsaPublicKeyEncoding};
 use xml_sec::{
     c14n::{C14nAlgorithm, C14nMode},
     policy::{EncryptionPolicy, HmacPolicy, VerificationPolicy},
@@ -941,9 +942,7 @@ fn donor_pkcs12_signs_without_exposing_password() {
             .unwrap();
     fs::write(
         &public,
-        private
-            .to_public_key()
-            .to_public_key_der()
+        RsaPublicKeyEncoding::to_public_key_der(&private.to_public_key())
             .unwrap()
             .as_bytes(),
     )
@@ -1396,12 +1395,18 @@ fn compatibility_cli_resolves_key_info_reference_before_signing_key_selection() 
         "tests/fixtures/xmldsig/xmldsig11-interop-2012/signature-enveloping-keyinforeference-rsa.tmpl",
     );
     let private_key = temp.path().join("rsa-4096-private.der");
-    let fixture_key = RsaPrivateKey::from_pkcs8_pem(
+    let fixture_key = <RsaPrivateKey as RsaPrivateKeyEncoding>::from_pkcs8_pem(
         &fs::read_to_string(project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem"))
             .unwrap(),
     )
     .unwrap();
-    fs::write(&private_key, fixture_key.to_pkcs8_der().unwrap().as_bytes()).unwrap();
+    fs::write(
+        &private_key,
+        RsaPrivateKeyEncoding::to_pkcs8_der(&fixture_key)
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
     let signed = temp.path().join("key-info-reference-signed.xml");
 
     let sign = Command::new(binary())
@@ -2057,7 +2062,7 @@ fn compatibility_cli_decrypts_rsa_and_ecdsa_pkcs8_signing_keys() {
     let rsa_plain_private = temp.path().join("rsa-plain.der");
     let rsa_private = temp.path().join("rsa-encrypted.der");
     let rsa_public = temp.path().join("rsa-public.der");
-    let rsa_der = rsa.to_pkcs8_der().unwrap();
+    let rsa_der = RsaPrivateKeyEncoding::to_pkcs8_der(&rsa).unwrap();
     fs::write(&rsa_plain_private, rsa_der.as_bytes()).unwrap();
     let encrypted_rsa = pkcs8::PrivateKeyInfoRef::try_from(rsa_der.as_bytes())
         .unwrap()
@@ -2066,8 +2071,7 @@ fn compatibility_cli_decrypts_rsa_and_ecdsa_pkcs8_signing_keys() {
     fs::write(&rsa_private, encrypted_rsa.as_bytes()).unwrap();
     fs::write(
         &rsa_public,
-        RsaPublicKey::from(&rsa)
-            .to_public_key_der()
+        RsaPublicKeyEncoding::to_public_key_der(&RsaPublicKey::from(&rsa))
             .unwrap()
             .as_bytes(),
     )
@@ -2656,8 +2660,7 @@ fn rsa_key_value_with_leading_zeroes(
 }
 
 fn der_encoded_key_value(public_key: &RsaPublicKey) -> String {
-    let der = public_key
-        .to_public_key_der()
+    let der = RsaPublicKeyEncoding::to_public_key_der(public_key)
         .expect("fixture public key must encode as SPKI");
     format!(
         "<dsig11:DEREncodedKeyValue xmlns:dsig11=\"http://www.w3.org/2009/xmldsig11#\">{}</dsig11:DEREncodedKeyValue>",
@@ -3042,7 +3045,10 @@ fn signing_rejects_preserved_key_info_for_another_key() {
     }
 
     let matching_public = RsaPublicKey::from(
-        &RsaPrivateKey::from_pkcs8_pem(&fs::read_to_string(&private_key).unwrap()).unwrap(),
+        &<RsaPrivateKey as RsaPrivateKeyEncoding>::from_pkcs8_pem(
+            &fs::read_to_string(&private_key).unwrap(),
+        )
+        .unwrap(),
     );
     fs::write(
         &template,
@@ -3212,9 +3218,15 @@ fn lax_signing_preserves_order_across_private_key_option_kinds() {
     let first_pem =
         fs::read_to_string(project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem"))
             .unwrap();
-    let first = RsaPrivateKey::from_pkcs8_pem(&first_pem).unwrap();
+    let first = <RsaPrivateKey as RsaPrivateKeyEncoding>::from_pkcs8_pem(&first_pem).unwrap();
     let first_der = temp.path().join("first.der");
-    fs::write(&first_der, first.to_pkcs8_der().unwrap().as_bytes()).unwrap();
+    fs::write(
+        &first_der,
+        RsaPrivateKeyEncoding::to_pkcs8_der(&first)
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
     let second = project_root().join("tests/fixtures/keys/rsa/rsa-2048-key.pem");
     let first_public = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
     let signed = temp.path().join("signed.xml");
@@ -7726,10 +7738,11 @@ fn lax_rsa_encryption_skips_keys_rejected_by_policy() {
     let weak_key = RsaPrivateKey::new(&mut ChaCha8Rng::from_seed([0x72; 32]), 1024).unwrap();
     fs::write(
         &weak_public_key,
-        weak_key
-            .to_public_key()
-            .to_public_key_pem(pkcs8::LineEnding::default())
-            .unwrap(),
+        RsaPublicKeyEncoding::to_public_key_pem(
+            &weak_key.to_public_key(),
+            pkcs8::LineEnding::default(),
+        )
+        .unwrap(),
     )
     .unwrap();
     let compliant_key = project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
@@ -9717,11 +9730,11 @@ fn der_private_key_option_decodes_its_der_companion_certificate() {
     let private_der = temp.path().join("private.der");
     fs::write(
         &private_der,
-        RsaPrivateKey::from_pkcs8_pem(&private_pem)
-            .unwrap()
-            .to_pkcs8_der()
-            .unwrap()
-            .as_bytes(),
+        RsaPrivateKeyEncoding::to_pkcs8_der(
+            &<RsaPrivateKey as RsaPrivateKeyEncoding>::from_pkcs8_pem(&private_pem).unwrap(),
+        )
+        .unwrap()
+        .as_bytes(),
     )
     .unwrap();
     let certificate_pem =
@@ -9809,8 +9822,7 @@ fn lax_signing_skips_keys_rejected_by_the_signing_policy() {
     let weak_key = RsaPrivateKey::new(&mut ChaCha8Rng::from_seed([0x71; 32]), 1024).unwrap();
     fs::write(
         &weak_key_path,
-        weak_key
-            .to_pkcs8_pem(pkcs8::LineEnding::default())
+        RsaPrivateKeyEncoding::to_pkcs8_pem(&weak_key, pkcs8::LineEnding::default())
             .unwrap()
             .as_bytes(),
     )
@@ -9879,8 +9891,10 @@ fn lax_signing_skips_a_key_that_conflicts_with_preserved_rsa_key_value() {
     let template = temp.path().join("key-value-template.xml");
     let wrong = project_root().join("tests/fixtures/keys/rsa/rsa-2048-key.pem");
     let matching = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
-    let matching_key =
-        RsaPrivateKey::from_pkcs8_pem(&fs::read_to_string(&matching).unwrap()).unwrap();
+    let matching_key = <RsaPrivateKey as RsaPrivateKeyEncoding>::from_pkcs8_pem(
+        &fs::read_to_string(&matching).unwrap(),
+    )
+    .unwrap();
     fs::write(
         &template,
         signature_template_with_key_info(&rsa_key_value_with_leading_zeroes(

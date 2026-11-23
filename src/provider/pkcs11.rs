@@ -23,7 +23,7 @@ use cryptoki::{
     session::{Session, UserType},
     types::AuthPin,
 };
-use rsa::{PublicKey as RsaPublicKey, traits::PublicKeyParts};
+use rsa::traits::PublicKeyParts;
 
 use super::{
     ContentDecryptionKey, CryptoProvider, ExternalProviderError, KeyAgreementKey,
@@ -179,11 +179,11 @@ impl Pkcs11Provider {
         if modulus.is_empty() || exponent.is_empty() {
             return Err(external(ExternalProviderError::Object));
         }
-        let public = RsaPublicKey::new(
+        let public = crate::rsa_encoding::public_key(
             BoxedUint::from_be_slice_vartime(modulus),
             BoxedUint::from_be_slice_vartime(exponent),
         )
-        .map_err(|_| external(ExternalProviderError::Object))?;
+        .ok_or(external(ExternalProviderError::Object))?;
         let modulus = public.n().to_be_bytes_trimmed_vartime().into_vec();
         let exponent = public.e().to_be_bytes_trimmed_vartime().into_vec();
         let spki = public
