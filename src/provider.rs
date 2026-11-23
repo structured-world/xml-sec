@@ -1724,7 +1724,7 @@ rust_crypto_digest! {
 #[cfg(feature = "xmlenc")]
 #[derive(Clone)]
 pub struct RustCryptoRsaPublicKey {
-    key: rsa::RsaPublicKey,
+    key: rsa::PublicKey,
     modulus: Vec<u8>,
     exponent: Vec<u8>,
 }
@@ -1733,7 +1733,7 @@ pub struct RustCryptoRsaPublicKey {
 impl RustCryptoRsaPublicKey {
     /// Wrap an already parsed `RustCrypto` RSA public key.
     #[must_use]
-    pub fn new(key: rsa::RsaPublicKey) -> Self {
+    pub fn new(key: rsa::PublicKey) -> Self {
         use rsa::traits::PublicKeyParts as _;
         let modulus = key.n().to_be_bytes_trimmed_vartime().into_vec();
         let exponent = key.e().to_be_bytes_trimmed_vartime().into_vec();
@@ -1762,8 +1762,8 @@ impl RustCryptoRsaPublicKey {
 }
 
 #[cfg(feature = "xmlenc")]
-impl From<rsa::RsaPublicKey> for RustCryptoRsaPublicKey {
-    fn from(key: rsa::RsaPublicKey) -> Self {
+impl From<rsa::PublicKey> for RustCryptoRsaPublicKey {
+    fn from(key: rsa::PublicKey) -> Self {
         Self::new(key)
     }
 }
@@ -1797,7 +1797,7 @@ impl KeyTransportKey for RustCryptoRsaPublicKey {
 }
 
 #[cfg(feature = "xmlenc")]
-impl KeyTransportKey for rsa::RsaPublicKey {
+impl KeyTransportKey for rsa::PublicKey {
     #[cfg(feature = "legacy-algorithms")]
     fn transport_pkcs1v15(
         &self,
@@ -1830,7 +1830,7 @@ impl KeyTransportKey for rsa::RsaPublicKey {
 #[cfg(feature = "xmlenc")]
 #[derive(Clone)]
 pub struct RustCryptoRsaPrivateKey {
-    key: rsa::RsaPrivateKey,
+    key: rsa::PrivateKey,
     ciphertext_len: usize,
 }
 
@@ -1838,7 +1838,7 @@ pub struct RustCryptoRsaPrivateKey {
 impl RustCryptoRsaPrivateKey {
     /// Wrap an already parsed `RustCrypto` RSA private key.
     #[must_use]
-    pub fn new(key: rsa::RsaPrivateKey) -> Self {
+    pub fn new(key: rsa::PrivateKey) -> Self {
         use rsa::traits::PublicKeyParts as _;
         let ciphertext_len = key.size();
         Self {
@@ -1849,8 +1849,8 @@ impl RustCryptoRsaPrivateKey {
 }
 
 #[cfg(feature = "xmlenc")]
-impl From<rsa::RsaPrivateKey> for RustCryptoRsaPrivateKey {
-    fn from(key: rsa::RsaPrivateKey) -> Self {
+impl From<rsa::PrivateKey> for RustCryptoRsaPrivateKey {
+    fn from(key: rsa::PrivateKey) -> Self {
         Self::new(key)
     }
 }
@@ -1887,7 +1887,7 @@ impl KeyRecoveryKey for RustCryptoRsaPrivateKey {
 }
 
 #[cfg(feature = "xmlenc")]
-impl KeyRecoveryKey for rsa::RsaPrivateKey {
+impl KeyRecoveryKey for rsa::PrivateKey {
     #[cfg(feature = "legacy-algorithms")]
     fn recover_pkcs1v15(
         &self,
@@ -2094,7 +2094,7 @@ impl CryptoProvider for RustCryptoProvider {
     #[cfg(feature = "xmlenc")]
     fn import_recovery_key(&self, pkcs8: &[u8]) -> Result<Arc<dyn KeyRecoveryKey>, ProviderError> {
         use crate::rsa_encoding::RsaPrivateKeyEncoding as _;
-        let key = rsa::RsaPrivateKey::from_pkcs8_der(pkcs8).map_err(|_| {
+        let key = rsa::PrivateKey::from_pkcs8_der(pkcs8).map_err(|_| {
             ProviderError::InvalidInput(ProviderInputError::PrimitiveInitialization(
                 "RSA recovery key",
             ))
@@ -2504,7 +2504,7 @@ pub(crate) mod rustcrypto_x509 {
     use alloc::borrow::ToOwned;
     use der::Decode as _;
     use rsa::{
-        RsaPublicKey,
+        PublicKey as RsaPublicKey,
         pss::{Signature as RsaPssSignature, VerifyingKey as RsaPssVerifyingKey},
         traits::PublicKeyParts as _,
     };
@@ -3231,7 +3231,7 @@ mod rustcrypto {
     #[cfg(feature = "legacy-algorithms")]
     pub(super) fn transport_pkcs1v15(
         provider: &dyn CryptoProvider,
-        key: &rsa::RsaPublicKey,
+        key: &rsa::PublicKey,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, ProviderError> {
         rsa::Pkcs1v15Encrypt
@@ -3241,7 +3241,7 @@ mod rustcrypto {
 
     pub(super) fn transport_key(
         provider: &dyn CryptoProvider,
-        key: &rsa::RsaPublicKey,
+        key: &rsa::PublicKey,
         parameters: &RsaOaepParameters,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, ProviderError> {
@@ -3255,7 +3255,7 @@ mod rustcrypto {
 
     pub(super) fn recover_key(
         provider: &dyn CryptoProvider,
-        key: &rsa::RsaPrivateKey,
+        key: &rsa::PrivateKey,
         parameters: &RsaOaepParameters,
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, ProviderError> {
@@ -3274,8 +3274,8 @@ mod rustcrypto {
 
     #[derive(Clone, Copy)]
     enum OaepOperation<'a> {
-        Encrypt(&'a rsa::RsaPublicKey),
-        Decrypt(&'a rsa::RsaPrivateKey),
+        Encrypt(&'a rsa::PublicKey),
+        Decrypt(&'a rsa::PrivateKey),
     }
 
     fn run_oaep(
@@ -4102,7 +4102,7 @@ mod tests {
         use crate::rsa_encoding::RsaPublicKeyEncoding as _;
         use der::{Decode as _, Encode as _};
         use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng};
-        use rsa::{RsaPrivateKey, pss::SigningKey as RsaPssSigningKey};
+        use rsa::{PrivateKey as RsaPrivateKey, pss::SigningKey as RsaPssSigningKey};
         use sha2::Sha256;
         use signature::{RandomizedSigner, SignatureEncoding};
         use x509_cert::spki::{AlgorithmIdentifierOwned, ObjectIdentifier};
@@ -4234,7 +4234,7 @@ mod tests {
     fn primitive_provider_does_not_embed_rsa_strength_policy() {
         use crate::rsa_encoding::RsaPublicKeyEncoding as _;
         use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng};
-        use rsa::{RsaPrivateKey, pss::SigningKey as RsaPssSigningKey};
+        use rsa::{PrivateKey as RsaPrivateKey, pss::SigningKey as RsaPssSigningKey};
         use sha2::Sha256;
         use signature::{RandomizedSigner, SignatureEncoding};
 
@@ -4274,7 +4274,7 @@ mod tests {
     fn oversized_rsa_pss_salt_is_a_verification_miss() {
         use crate::rsa_encoding::RsaPublicKeyEncoding as _;
         use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng};
-        use rsa::{RsaPrivateKey, traits::PublicKeyParts as _};
+        use rsa::{PrivateKey as RsaPrivateKey, traits::PublicKeyParts as _};
 
         // ASN.1 saltLength is attacker-controlled. It must not reach the
         // dependency's unchecked hLen + saltLen + 2 arithmetic.

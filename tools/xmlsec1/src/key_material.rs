@@ -5,7 +5,7 @@ use std::{
 };
 
 use pkcs8::{EncryptedPrivateKeyInfoRef, PrivateKeyInfoRef};
-use rsa::{RsaPrivateKey, RsaPublicKey};
+use rsa::{PrivateKey as RsaPrivateKey, PublicKey as RsaPublicKey};
 use xml_sec::key_manager::{KeyInventory, KeyStoreError, KeyUsages, PrivateKeyContainer};
 use xml_sec::policy::{PolicyViolation, ResourcePolicy, SigningPolicy, VerificationPolicy};
 use xml_sec::rsa_encoding::{RsaPrivateKeyEncoding as _, RsaPublicKeyEncoding as _};

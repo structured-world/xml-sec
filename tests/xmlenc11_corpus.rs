@@ -208,7 +208,7 @@ fn decrypt_case(
             let bytes = zeroize::Zeroizing::new(
                 fs::read(path(&format!("RSA-{bits}_SHA256WithRSA.der"))).unwrap(),
             );
-            let key = rsa::RsaPrivateKey::from_pkcs1_der(&bytes).unwrap();
+            let key = rsa::PrivateKey::from_pkcs1_der(&bytes).unwrap();
             context(&PrivateKeyDecryptor::new(key))
         }
         Credential::Derived(file) => {
@@ -607,9 +607,9 @@ fn encrypt_case(case: &Case, populated_template: &str, backend: XmlBackend) -> S
             let bytes = zeroize::Zeroizing::new(
                 fs::read(path(&format!("RSA-{bits}_SHA256WithRSA.der"))).unwrap(),
             );
-            let private = rsa::RsaPrivateKey::from_pkcs1_der(&bytes).unwrap();
+            let private = rsa::PrivateKey::from_pkcs1_der(&bytes).unwrap();
             builder = builder.add_recipient(
-                EncryptionRecipient::rsa_oaep(rsa::RsaPublicKey::from(&private)).oaep_parameters(
+                EncryptionRecipient::rsa_oaep(rsa::PublicKey::from(&private)).oaep_parameters(
                     template_oaep_parameters(&parsed.encrypted_keys[0].encryption_method),
                 ),
             );

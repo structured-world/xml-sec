@@ -270,8 +270,15 @@ unsafe fn add_sibling(
             }
             xsSetNs(cur, declared);
         }
+        // libxmlsec1 puts the line feed after the new element when adding a
+        // next sibling (node, element, line feed) and before `node` when
+        // adding a previous one (element, line feed, node).
+        let anchor = match side {
+            Side::Next => cur,
+            Side::Prev => node,
+        };
         let text = line_feed(node, here);
-        if text.is_null() || add(node, text).is_null() {
+        if text.is_null() || add(anchor, text).is_null() {
             // The edit is taken back whole: the element leaves with the line
             // feed that could not follow it.
             if !text.is_null() {

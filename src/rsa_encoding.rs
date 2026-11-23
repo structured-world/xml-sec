@@ -1,7 +1,7 @@
-//! RSA container codecs for the existing `sad-rsa` key types.
+//! RSA container codecs for the `RustCrypto` `rsa` key types.
 //!
 //! Only serialization lives here; RSA operations, validation and blinding stay
-//! in `sad-rsa`. Adapted from sadco-io/sad-rsa 0.10.2, src/encoding.rs,
+//! in `rsa`. Adapted from sadco-io/sad-rsa 0.10.2, src/encoding.rs,
 //! licensed MIT OR Apache-2.0, copyright its original contributors.
 
 // Copyright (c) 2025-2026 Sadco Security Team
@@ -41,15 +41,15 @@ use pkcs8::{
 #[cfg(feature = "xmldsig-sign")]
 use pkcs8::{SecretDocument, der::asn1::OctetStringRef};
 #[cfg(feature = "xmldsig-sign")]
-use rsa::{RsaPrivateKey, traits::PrivateKeyParts};
-use rsa::{RsaPublicKey, traits::PublicKeyParts};
+use rsa::{PrivateKey as RsaPrivateKey, traits::PrivateKeyParts};
+use rsa::{PublicKey as RsaPublicKey, traits::PublicKeyParts};
 #[cfg(feature = "xmldsig-sign")]
 use zeroize::Zeroizing;
 
 /// PKCS#1 and PKCS#8 codecs without enabling the RSA dependency's codecs.
 #[cfg(feature = "xmldsig-sign")]
 pub trait RsaPrivateKeyEncoding: Sized {
-    /// Decode a two-prime PKCS#1 key and validate it with `sad-rsa`.
+    /// Decode a two-prime PKCS#1 key and validate it with `rsa`.
     ///
     /// # Errors
     /// Returns DER decoding errors, an unsupported multiprime version, invalid
@@ -226,6 +226,10 @@ impl RsaPrivateKeyEncoding for RsaPrivateKey {
             uint(key.prime1.as_bytes(), bits)?,
             uint(key.prime2.as_bytes(), bits)?,
         ];
+        // NIST SP 800-56B Rev. 2 section 6.4.1.2.1 steps 5(a) and 5(b): each
+        // prime of a valid key pair is at most 2^(nBits/2) - 1, so a factor
+        // wider than half the modulus marks an invalid key, not one to import
+        // through slower full-width CRT arithmetic.
         Self::from_components(n, e, d, primes).map_err(|_| pkcs1::Error::KeyMalformed)
     }
 
@@ -241,14 +245,18 @@ impl RsaPrivateKeyEncoding for RsaPrivateKey {
         let bits = self.d().bits_precision();
         let exponent1 = Zeroizing::new(
             (self.d()
-                % NonZero::new((&self.primes()[0]).resize_unchecked(bits) - &BoxedUint::one())
-                    .unwrap())
+                % NonZero::new(
+                    self.primes()[0].as_ref().resize_unchecked(bits) - &BoxedUint::one(),
+                )
+                .unwrap())
             .to_be_bytes(),
         );
         let exponent2 = Zeroizing::new(
             (self.d()
-                % NonZero::new((&self.primes()[1]).resize_unchecked(bits) - &BoxedUint::one())
-                    .unwrap())
+                % NonZero::new(
+                    self.primes()[1].as_ref().resize_unchecked(bits) - &BoxedUint::one(),
+                )
+                .unwrap())
             .to_be_bytes(),
         );
         let coefficient = Zeroizing::new(
@@ -290,7 +298,7 @@ impl RsaPublicKeyEncoding for RsaPublicKey {
             key.public_exponent.as_bytes(),
             width(key.public_exponent.as_bytes())?,
         )?;
-        Self::new(n, e).map_err(|_| pkcs1::Error::KeyMalformed)
+        public_key(n, e).ok_or(pkcs1::Error::KeyMalformed)
     }
 
     fn to_pkcs1_der(&self) -> pkcs1::Result<Document> {
@@ -367,9 +375,9 @@ fn read_spki_rsa_key(
         // https://www.rfc-editor.org/rfc/rfc3279#section-2.3.1
         // RFC 4055 sections 1.2 and 3.1 allow absent PSS parameters.
         // https://www.rfc-editor.org/rfc/rfc4055#section-3.1
-        // Preserve sad-rsa's parameter-unconstrained import contract;
-        // explicit restrictions cannot be retained by its bare RSA type
-        // and are therefore not silently discarded by this decoder.
+        // Preserve the parameter-unconstrained import contract of the bare
+        // `rsa` key type: it cannot retain explicit restrictions, so this
+        // decoder refuses them instead of silently discarding them.
         Ok(if algorithm == structured_pkix::oid::RSA_ENCRYPTION {
             identifier.has_null_parameter()
         } else {
@@ -387,7 +395,14 @@ fn read_spki_rsa_key(
     let (Some(n), Some(e)) = (integer(modulus), integer(exponent)) else {
         return Ok(None);
     };
-    Ok(RsaPublicKey::new(n, e).ok())
+    Ok(public_key(n, e))
+}
+
+/// An RSA public key of any size up to the implementation ceiling: the
+/// minimum belongs to the operation's `RsaKeyPolicy`, which reports a
+/// too-small key as a policy violation rather than as malformed material.
+pub(crate) fn public_key(n: BoxedUint, e: BoxedUint) -> Option<RsaPublicKey> {
+    RsaPublicKey::new_with_size_limits(n, e, 1..=crate::hard_limits::RSA_MODULUS_BIT_CEILING).ok()
 }
 
 #[cfg(feature = "xmldsig-sign")]
@@ -403,9 +418,9 @@ fn verify_algorithm_id(algorithm: &pkcs8::AlgorithmIdentifierRef<'_>) -> pkcs8::
         oid if oid == pkcs8::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.10") => {
             // RFC 4055 sections 1.2 and 3.1 allow absent PSS parameters.
             // https://www.rfc-editor.org/rfc/rfc4055#section-3.1
-            // Preserve sad-rsa's parameter-unconstrained import contract;
-            // explicit restrictions cannot be retained by its bare RSA type
-            // and are therefore not silently discarded by this decoder.
+            // Preserve the parameter-unconstrained import contract of the bare
+            // `rsa` key type: it cannot retain explicit restrictions, so this
+            // decoder refuses them instead of silently discarding them.
             if algorithm.parameters.is_some() {
                 return Err(pkcs8::spki::Error::KeyMalformed);
             }

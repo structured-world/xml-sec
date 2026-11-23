@@ -494,7 +494,7 @@ fn explicit_pkcs8_signing_enforces_import_kdf_limits() {
     // reject KDF policy violations before password-dependent decryption.
     use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng as _};
     use xml_sec::rsa_encoding::RsaPrivateKeyEncoding as _;
-    let rsa = rsa::RsaPrivateKey::from_pkcs8_pem(include_str!(
+    let rsa = rsa::PrivateKey::from_pkcs8_pem(include_str!(
         "../../../../tests/fixtures/keys/rsa/rsa-2048-key.pem"
     ))
     .unwrap();

@@ -1,8 +1,8 @@
 # Fixed-Width RSA Recovery Adaptation
 
 `src/provider/rsa_pkcs1v15.rs` adapts the PKCS#1 v1.5 padding recovery of
-[`sad-rsa` 0.10.2](https://github.com/sadco-io/sad-rsa), specifically
-`src/pkcs1v15.rs::decrypt` and `src/algorithms/pkcs1v15.rs::decrypt_inner`.
+the RustCrypto [`rsa`](https://github.com/RustCrypto/RSA) crate, specifically
+`src/pkcs1v15.rs::decrypt` and its `src/algorithms/pkcs1v15.rs` padding check.
 The existing dependency remains responsible for RSA arithmetic, blinding and fault checking
 through its `hazmat::rsa_decrypt_and_check` primitive. No second RSA engine is introduced.
 
@@ -17,12 +17,13 @@ successful fallback plaintext. Key-ring wrappers preserve the opaque candidate.
 checks. Since the CEK length is known from the content algorithm, its delimiter position is
 public. A single linear padding scan replaces the donor's variable-length alignment buffers.
 All width-correct ciphertexts, including representatives at least as large as the modulus,
-perform blinded RSA; out-of-range values are normalized but keep an invalid mask. Operational
+perform blinded RSA; out-of-range values are normalized before the private operation,
+which itself refuses representatives not below the modulus, and keep an invalid mask. Operational
 RNG or arithmetic failures still fail closed. Secret decoded integers, encoded blocks and
 candidate bytes are zeroized on drop.
 
 This is a narrow embedded adaptation, not a whole dependency fork or a separately published
-crate. It remains in the single `xml-sec` package. Updating `sad-rsa` requires checking the
+crate. It remains in the single `xml-sec` package. Updating `rsa` requires checking the
 named donor functions and its arithmetic API against this adaptation. Regression tests cover
 all supported CEK lengths, header/delimiter/nonzero-padding checks, out-of-range values, and
 successful CBC output following invalid recovery.

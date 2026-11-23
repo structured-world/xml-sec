@@ -56,6 +56,11 @@ jobs:
       - run: cargo run --quiet -p xml-sec-tools -- security-corpus check
       - run: cargo run --quiet -p xml-sec-tools -- hardening dependencies
       - run: cargo run --quiet -p xml-sec-tools -- hardening safety
+      # A consumer with `rsa`'s default features unifies its codecs into our
+      # build; the library and its tests must still compile beside them.
+      - run: >-
+          cargo check -p xml-sec -p xml-sec-cli --all-features --all-targets
+          --features rsa/encoding
 
   coverage:
     name: canonical line coverage (85%)

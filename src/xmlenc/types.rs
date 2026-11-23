@@ -2,7 +2,7 @@
 
 use std::{fmt, sync::Arc};
 
-use rsa::RsaPublicKey;
+use rsa::PublicKey as RsaPublicKey;
 
 /// XML Encryption 1.0 namespace.
 pub const XMLENC_NS: &str = "http://www.w3.org/2001/04/xmlenc#";

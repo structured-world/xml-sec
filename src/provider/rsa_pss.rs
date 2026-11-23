@@ -1,15 +1,16 @@
-//! Local parameterized adaptation of sad-rsa 0.10.2 PSS and MGF1.
+//! Local parameterized adaptation of `rsa` PSS and MGF1.
 //!
-//! Derived from src/pss.rs and src/algorithms/{pss,mgf}.rs, MIT OR Apache-2.0.
-//! RSA arithmetic, blinding and fault checks remain in sad-rsa. Only the
+//! Derived from src/pss.rs and src/algorithms/{pss,mgf}.rs, MIT OR Apache-2.0,
+//! first through the sadco-io/sad-rsa 0.10.2 fork.
+//! RSA arithmetic, blinding and fault checks remain in `rsa`. Only the
 //! padding module is adapted here, as with the fixed-width recovery patch.
 
 use crate::rsa_encoding::RsaPublicKeyEncoding as _;
 use crate::rustcrypto_sha3 as sha3;
 use crypto_bigint::BoxedUint;
 #[cfg(feature = "xmldsig-sign")]
-use rsa::RsaPrivateKey;
-use rsa::{RsaPublicKey, traits::PublicKeyParts};
+use rsa::PrivateKey as RsaPrivateKey;
+use rsa::{PublicKey as RsaPublicKey, traits::PublicKeyParts};
 use sha2::Digest as _;
 use subtle::ConstantTimeEq as _;
 #[cfg(feature = "xmldsig-sign")]

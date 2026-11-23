@@ -1,7 +1,7 @@
 #![cfg(feature = "xmldsig-sign")]
 
 use der::{Decode, Encode};
-use rsa::{RsaPrivateKey, RsaPublicKey, traits::PublicKeyParts};
+use rsa::{PrivateKey as RsaPrivateKey, PublicKey as RsaPublicKey, traits::PublicKeyParts};
 use xml_sec::rsa_encoding::{RsaPrivateKeyEncoding, RsaPublicKeyEncoding};
 
 const PRIVATE: &str = include_str!("fixtures/keys/rsa/rsa-2048-key.pem");
@@ -158,6 +158,77 @@ fn rsa_encoding_protected_container_requires_correct_password() {
     assert!(RsaPrivateKey::from_pkcs8_encrypted_der(encrypted.as_bytes(), b"wrong").is_err());
     assert!(RsaPrivateKey::from_pkcs8_encrypted_pem(&pem, b"wrong").is_err());
     assert!(RsaPrivateKey::from_pkcs8_encrypted_pem(PRIVATE, b"correct").is_err());
+}
+
+#[test]
+fn public_key_codecs_leave_the_size_floor_to_policy() {
+    // The deployment's RSA key policy decides the minimum modulus; the codecs
+    // must decode a 768-bit key so that policy, not a decoder floor, gives
+    // the verdict.
+    use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng as _};
+    let small = RsaPrivateKey::new_unchecked(&mut ChaCha20Rng::seed_from_u64(768), 768)
+        .unwrap()
+        .to_public_key();
+    assert_eq!(small.n().bit_width_vartime(), 768);
+    let pkcs1 = RsaPublicKeyEncoding::to_pkcs1_der(&small).unwrap();
+    let spki = RsaPublicKeyEncoding::to_public_key_der(&small).unwrap();
+    assert_eq!(
+        <RsaPublicKey as RsaPublicKeyEncoding>::from_pkcs1_der(pkcs1.as_bytes()).unwrap(),
+        small
+    );
+    assert_eq!(
+        <RsaPublicKey as RsaPublicKeyEncoding>::from_public_key_der(spki.as_bytes()).unwrap(),
+        small
+    );
+}
+
+#[test]
+fn a_private_key_with_a_prime_wider_than_half_the_modulus_is_invalid() {
+    // NIST SP 800-56B Rev. 2 section 6.4.1.2.1 steps 5(a)-(b) bound each
+    // prime by 2^(nBits/2) - 1. Here p = 2^61 - 1 and q = 2^19 - 1 give an
+    // 80-bit modulus with a 61-bit factor: consistent RSA components that
+    // only a full-width import admits, and the decoder refuses.
+    use crypto_bigint::{BoxedUint, ConcatenatingMul as _, NonZero, Resize as _};
+    let wide = BoxedUint::from((1_u64 << 61) - 1);
+    let narrow = BoxedUint::from((1_u64 << 19) - 1);
+    let exponent = BoxedUint::from(65_537_u64);
+    let modulus = wide.concatenating_mul(&narrow);
+    let one = BoxedUint::one();
+    let totient = NonZero::new(
+        wide.wrapping_sub(&one)
+            .concatenating_mul(&narrow.wrapping_sub(&one)),
+    )
+    .unwrap();
+    let private = (&exponent)
+        .resize_unchecked(totient.bits_precision())
+        .invert_mod(&totient)
+        .unwrap();
+    assert!(
+        RsaPrivateKey::from_components_with_wide_primes(
+            modulus.clone(),
+            exponent.clone(),
+            private.clone(),
+            vec![wide.clone(), narrow.clone()]
+        )
+        .is_ok(),
+        "the components form a consistent key"
+    );
+    let bytes = |value: &BoxedUint| value.to_be_bytes_trimmed_vartime().into_vec();
+    let encoded = [&modulus, &exponent, &private, &wide, &narrow].map(bytes);
+    let encoded = pkcs1::RsaPrivateKeyRef {
+        modulus: pkcs1::UintRef::new(&encoded[0]).unwrap(),
+        public_exponent: pkcs1::UintRef::new(&encoded[1]).unwrap(),
+        private_exponent: pkcs1::UintRef::new(&encoded[2]).unwrap(),
+        prime1: pkcs1::UintRef::new(&encoded[3]).unwrap(),
+        prime2: pkcs1::UintRef::new(&encoded[4]).unwrap(),
+        exponent1: pkcs1::UintRef::new(&[1]).unwrap(),
+        exponent2: pkcs1::UintRef::new(&[1]).unwrap(),
+        coefficient: pkcs1::UintRef::new(&[1]).unwrap(),
+        other_prime_infos: None,
+    }
+    .to_der()
+    .unwrap();
+    assert!(<RsaPrivateKey as RsaPrivateKeyEncoding>::from_pkcs1_der(&encoded).is_err());
 }
 
 #[test]

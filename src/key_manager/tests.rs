@@ -1,9 +1,10 @@
-use crate::rsa_encoding::RsaPublicKeyEncoding as _;
+// RSA codec calls are qualified: `rsa`'s own codecs add same-named methods.
+use crate::rsa_encoding::RsaPublicKeyEncoding;
 use pkcs8::EncodePublicKey as _;
 #[cfg(feature = "xmldsig-sign")]
 use pkcs8::EncryptedPrivateKeyInfoRef;
 use rand_chacha::{ChaCha8Rng, rand_core::SeedableRng as _};
-use rsa::RsaPublicKey;
+use rsa::PublicKey as RsaPublicKey;
 
 use super::*;
 use std::fmt::Write as _;
@@ -1396,11 +1397,10 @@ fn imports_rsa_pkcs1_pem_and_resolves_named_spki() {
     // Traditional RSA import and named public lookup share one inventory,
     // while the resolver still applies the operation's verification policy.
     let private_pem = include_str!("../../tests/fixtures/keys/rsa/rsa-2048-key.pem");
-    let rsa = RsaPrivateKey::from_pkcs8_pem(private_pem).expect("RSA fixture parses");
+    let rsa = <RsaPrivateKey as RsaPrivateKeyEncoding>::from_pkcs8_pem(private_pem)
+        .expect("RSA fixture parses");
     let pkcs1 = rsa.to_pkcs1_der().expect("RSA fixture encodes as PKCS#1");
-    let public = rsa
-        .to_public_key()
-        .to_public_key_der()
+    let public = RsaPublicKeyEncoding::to_public_key_der(&rsa.to_public_key())
         .expect("RSA fixture has SPKI");
     let resources = ResourcePolicy::default();
     let mut inventory = KeyInventory::default();
@@ -1671,8 +1671,9 @@ fn encrypted_pkcs8_requires_correct_password_without_plaintext_fallback() {
     // Wrong passwords must not retry another format or leave a partial
     // registration in the caller-owned inventory.
     let private_pem = include_str!("../../tests/fixtures/keys/rsa/rsa-2048-key.pem");
-    let rsa = RsaPrivateKey::from_pkcs8_pem(private_pem).expect("RSA fixture parses");
-    let plain = rsa.to_pkcs8_der().expect("RSA fixture encodes as PKCS#8");
+    let rsa = <RsaPrivateKey as RsaPrivateKeyEncoding>::from_pkcs8_pem(private_pem)
+        .expect("RSA fixture parses");
+    let plain = RsaPrivateKeyEncoding::to_pkcs8_der(&rsa).expect("RSA fixture encodes as PKCS#8");
     let mut rng = ChaCha8Rng::seed_from_u64(0xA11C_E501);
     let encrypted = PrivateKeyInfoRef::try_from(plain.as_bytes())
         .expect("PKCS#8 reference parses")
@@ -2255,11 +2256,10 @@ fn private_identity_matches_without_owned_public_encoding() {
     ))
     .expect("RSA PEM fixture")
     .into_contents();
-    let rsa = RsaPrivateKey::from_pkcs8_der(&rsa_der).expect("RSA private key");
-    let public = rsa
-        .to_public_key()
-        .to_public_key_der()
-        .expect("RSA public encoding");
+    let rsa = <RsaPrivateKey as RsaPrivateKeyEncoding>::from_pkcs8_der(&rsa_der)
+        .expect("RSA private key");
+    let public =
+        RsaPublicKeyEncoding::to_public_key_der(&rsa.to_public_key()).expect("RSA public encoding");
     let identity = PrivateKeyIdentity::decode(&rsa_der).expect("RSA identity");
     assert!(identity.matches_spki(public.as_bytes()));
     let mut changed = public.as_bytes().to_vec();
@@ -2508,7 +2508,7 @@ fn plaintext_private_import_checks_all_live_copies() {
     ))
     .expect("private key")
     .into_contents();
-    let pkcs1 = RsaPrivateKey::from_pkcs8_der(&der)
+    let pkcs1 = <RsaPrivateKey as RsaPrivateKeyEncoding>::from_pkcs8_der(&der)
         .expect("RSA")
         .to_pkcs1_der()
         .expect("PKCS1");
@@ -3341,12 +3341,12 @@ fn private_import_rejects_public_only_usage() {
 #[test]
 fn normalized_private_key_must_fit_resource_limit() {
     // PKCS#8 wrapping may cross the per-resource ceiling even when PKCS#1 fits.
-    let rsa = RsaPrivateKey::from_pkcs8_pem(include_str!(
+    let rsa = <RsaPrivateKey as RsaPrivateKeyEncoding>::from_pkcs8_pem(include_str!(
         "../../tests/fixtures/keys/rsa/rsa-2048-key.pem"
     ))
     .expect("RSA fixture parses");
     let pkcs1 = rsa.to_pkcs1_der().expect("PKCS#1 encodes");
-    let pkcs8 = rsa.to_pkcs8_der().expect("PKCS#8 encodes");
+    let pkcs8 = RsaPrivateKeyEncoding::to_pkcs8_der(&rsa).expect("PKCS#8 encodes");
     assert!(pkcs8.as_bytes().len() > pkcs1.as_bytes().len());
     let resources = ResourcePolicy {
         max_external_resource_bytes: pkcs1.as_bytes().len(),
@@ -4631,10 +4631,11 @@ fn imported_usage_restricts_operation_selection() {
 fn selected_weak_rsa_decryptor_obeys_default_policy() {
     // Importing a legacy key grants no exemption from operation minima.
     let mut inventory = KeyInventory::default();
-    let weak = RsaPrivateKey::new(&mut ChaCha8Rng::seed_from_u64(0xA11C_E502), 1024)
-        .expect("legacy key generation")
-        .to_pkcs8_der()
-        .expect("legacy key encoding");
+    let weak = RsaPrivateKeyEncoding::to_pkcs8_der(
+        &RsaPrivateKey::new(&mut ChaCha8Rng::seed_from_u64(0xA11C_E502), 1024)
+            .expect("legacy key generation"),
+    )
+    .expect("legacy key encoding");
     inventory
         .add_private_der(
             "weak".into(),
@@ -4660,7 +4661,8 @@ fn selected_weak_rsa_decryptor_obeys_default_policy() {
     );
     // A caller can deliberately authorize legacy input, but the snapshot
     // must survive inventory selection and the complete recovery pipeline.
-    let key = RsaPrivateKey::from_pkcs8_der(weak.as_bytes()).expect("legacy decode");
+    let key = <RsaPrivateKey as RsaPrivateKeyEncoding>::from_pkcs8_der(weak.as_bytes())
+        .expect("legacy decode");
     let mut encryption = crate::policy::EncryptionPolicy::default();
     encryption.rsa_keys.minimum_modulus_bits = 1024;
     let encrypted =

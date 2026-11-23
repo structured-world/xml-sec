@@ -310,12 +310,12 @@ winnow ={ version = "1.0.4", default-features = false, features = ["parser"], op
 snafu = { version = "0.9", default-features = false, features = ["rust_1_81"], optional = true }
 
 # Crypto
-structured-dstu4145 = { version = "0.23", default-features = false, features = ["alloc"], optional = true }
+structured-dstu4145 = { version = "0.24", default-features = false, features = ["alloc"], optional = true }
 # Holds the prepared GOST substitution tables that digest states borrow.
 once_cell = { version = "1", default-features = false, features = ["alloc", "race"], optional = true }
 cryptoki = { version = "0.12.1", optional = true }
 aws-lc-rs = { version = "1.19", default-features = false, features = ["fips"], optional = true }
-rsa = { package = "sad-rsa", version = "0.10.2", default-features = false, features = ["sha1", "sha2", "hazmat"], optional = true }
+rsa = { version = "0.10", default-features = false, features = ["sha1", "hazmat", "pkcs1v15"], optional = true }
 sha1 = { version = "0.11", features = ["oid", "zeroize"], optional = true }
 sha2 = { version = "0.11", features = ["oid", "zeroize"], optional = true }
 # Dependencies of the embedded RustCrypto SHA-3 bit-tail adaptation.
@@ -367,10 +367,10 @@ ripemd = { version = "0.2.0", default-features = false, features = ["oid", "zero
 
 # X.509 certificates, the seeded hashing of every table keyed by document
 # content, and the incremental HMAC of the HMAC signature methods.
-structured-asn1 = { version = "0.23", default-features = false, features = ["alloc"] }
-structured-pkix = { version = "0.23.2", default-features = false, features = ["alloc"], optional = true }
+structured-asn1 = { version = "0.24", default-features = false, features = ["alloc"] }
+structured-pkix = { version = "0.24", default-features = false, features = ["alloc"], optional = true }
 # PKCS#12 containers and their password engine, OpenSSL traditional private keys.
-structured-cms = { version = "0.23.2", default-features = false, features = ["alloc"], optional = true }
+structured-cms = { version = "0.24", default-features = false, features = ["alloc"], optional = true }
 tinyvec = { version = "1.13", optional = true }
 # `pem` is RFC 7468 decoding of caller key and certificate text.
 der = { version = "0.8", default-features = false, features = ["alloc", "pem"], optional = true }

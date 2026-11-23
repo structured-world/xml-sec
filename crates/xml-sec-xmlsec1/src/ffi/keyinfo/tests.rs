@@ -365,6 +365,47 @@ fn encrypted_key_nesting_counts_as_key_reference_depth() {
 }
 
 #[test]
+fn an_encrypted_key_after_the_key_has_its_value_is_skipped() {
+    // An earlier EncryptedKey in the same KeyInfo already gave the key its
+    // value: libxmlsec1 skips a later one without reading or reporting it,
+    // and the value stays the first one.
+    own_process();
+    let doc = parse(
+        "<EncryptedKey xmlns=\"http://www.w3.org/2001/04/xmlenc#\">\
+         <CipherData><CipherValue>AAAA</CipherValue></CipherData>\
+         </EncryptedKey>",
+    );
+    // SAFETY: objects created and destroyed here.
+    unsafe {
+        assert_eq!(xmlSecKeyDataIdsInit(), 0);
+        let ctx = xmlSecKeyInfoCtxCreate(std::ptr::null_mut());
+        (*ctx).operation = crate::ffi::transforms::OPERATION_DECRYPT;
+        let key = xmlSecKeyCreate();
+        let data = xmlSecKeyDataCreate(symkeys::aes());
+        assert_eq!(
+            xmlSecKeyDataBinaryValueSetBuffer(data, [7_u8; 16].as_ptr(), 16),
+            0
+        );
+        assert_eq!(xmlSecKeySetValue(key, data), 0);
+        REASONS.lock().expect("reasons").clear();
+        errors::xmlSecErrorsSetCallback(Some(record as errors::ErrorsCallback));
+        let read = xmlSecKeyDataXmlRead(
+            crate::ffi::keysdata::xmlSecKeyDataEncryptedKeyGetKlass(),
+            key.cast(),
+            xsDocGetRootElement(doc).cast(),
+            ctx.cast(),
+        );
+        let reasons = REASONS.lock().expect("reasons").clone();
+        assert_eq!(read, 0);
+        assert!(reasons.is_empty(), "{reasons:?}");
+        assert_eq!((*key).value, data, "the first value is kept");
+        xmlSecKeyDestroy(key);
+        xmlSecKeyInfoCtxDestroy(ctx);
+        xsFreeDoc(doc);
+    }
+}
+
+#[test]
 fn an_unknown_key_name_names_the_key_and_a_second_name_is_refused() {
     // A name the keys manager does not know still names the key, whatever
     // the deprecated XMLSEC_KEYINFO_FLAGS_KEYNAME_STOP_ON_UNKNOWN says; a

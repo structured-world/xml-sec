@@ -13,7 +13,7 @@ use aes_gcm::{
 };
 use aes_kw::KwAes256;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use rsa::RsaPrivateKey;
+use rsa::PrivateKey as RsaPrivateKey;
 use xml_sec as roxmltree;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize, canonicalize_xml};
 use xml_sec::rsa_encoding::RsaPrivateKeyEncoding as _;

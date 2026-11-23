@@ -37,12 +37,12 @@ required-features = ["xmldsig", "xmlenc", "c14n"]
 [dependencies]
 xml-sec = { path = "../..", default-features = false }
 xml-sec-config = { path = "../../crates/xml-sec-config", default-features = false }
-rsa = { package = "sad-rsa", version = "0.10.2", default-features = false, features = ["sha1", "sha2", "hazmat"] }
+rsa = { version = "0.10", default-features = false, features = ["sha1", "hazmat", "pkcs1v15"] }
 der = "0.8"
 pkcs8 = { version = "0.11", features = ["encryption", "pem"] }
 x509-parser = "0.18"
-structured-asn1 = { version = "0.23", default-features = false, features = ["alloc", "std"] }
-structured-pkix = { version = "0.23", default-features = false, features = ["alloc", "std"] }
+structured-asn1 = { version = "0.24", default-features = false, features = ["alloc", "std"] }
+structured-pkix = { version = "0.24", default-features = false, features = ["alloc", "std"] }
 zeroize = "1"
 base64 = "0.23"
 thiserror = "2"

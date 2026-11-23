@@ -4,7 +4,7 @@
 //! test public key solely to demonstrate the API; applications must resolve
 //! recipient keys from authenticated configuration or certificate metadata.
 
-use rsa::RsaPublicKey;
+use rsa::PublicKey as RsaPublicKey;
 use xml_sec::rsa_encoding::RsaPublicKeyEncoding as _;
 use xml_sec::xmlenc::{DataEncryptionAlgorithm, EncryptedDataBuilder, EncryptionRecipient};
 

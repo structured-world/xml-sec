@@ -13,7 +13,7 @@ use crate::operation::{
     OperationStage,
 };
 use crate::policy::{Audited, PolicyAudit, PolicyDecision};
-use rsa::RsaPrivateKey;
+use rsa::PrivateKey as RsaPrivateKey;
 
 use super::parse::validate_encrypted_data_metadata;
 use super::types::{MAX_CIPHER_VALUE_BASE64_LEN, XMLENC_NS, validate_ciphertext_framing};
@@ -3726,7 +3726,7 @@ mod tests {
     use aes_kw::KwAes128;
     use base64::engine::general_purpose::STANDARD;
     use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng};
-    use rsa::{Oaep, RsaPublicKey};
+    use rsa::{Oaep, PublicKey as RsaPublicKey};
     use sha1::Sha1;
     use sha2::{Sha256, Sha384};
 
