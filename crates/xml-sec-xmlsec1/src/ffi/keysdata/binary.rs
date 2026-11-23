@@ -650,10 +650,11 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataBinaryValueGetBuffer(
 }
 
 /// `xmlSecKeyDataBinaryValueSetBuffer`: replaces the value with `size`
-/// bytes.
+/// bytes; an empty input empties it.
 ///
 /// # Safety
-/// `data` is null or a key-data object; `buf` holds `size` bytes.
+/// `data` is null or a key-data object; `buf` holds `size` bytes and may be
+/// null when `size` is zero.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecKeyDataBinaryValueSetBuffer(
     data: *mut XmlSecKeyData,
@@ -663,18 +664,13 @@ pub(crate) unsafe extern "C" fn xmlSecKeyDataBinaryValueSetBuffer(
     contain(-1, || {
         let buffer = binary_buffer_or!(data, "xmlSecKeyDataBinaryValueSetBuffer", -1);
         check!(
-            !buf.is_null(),
+            !buf.is_null() || size == 0,
             "xmlSecKeyDataBinaryValueSetBuffer",
-            c"buf != NULL",
+            c"(buf != NULL) || (bufSize == 0)",
             -1
         );
-        check!(
-            size > 0,
-            "xmlSecKeyDataBinaryValueSetBuffer",
-            c"bufSize > 0",
-            -1
-        );
-        // SAFETY: the object's value buffer; `buf` holds `size` bytes.
+        // SAFETY: the object's value buffer; `buf` holds `size` bytes, or is
+        // unread for an empty input.
         unsafe { xmlSecBufferSetData(buffer, buf, size) }
     })
 }

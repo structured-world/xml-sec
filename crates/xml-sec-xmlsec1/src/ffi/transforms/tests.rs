@@ -219,6 +219,39 @@ fn zero_chunk_size_fails_the_default_push() {
     }
 }
 
+/// The same chunk size of 0 fails a default pop before it reads anything,
+/// as libxmlsec1 asserts it.
+#[test]
+fn zero_chunk_size_fails_the_default_pop() {
+    // SAFETY: the context and its transforms are used while live.
+    unsafe {
+        let ctx = xmlSecTransformCtxCreate();
+        assert!(!xmlSecTransformCtxCreateAndAppend(ctx, base64()).is_null());
+        let transform = xmlSecTransformCtxCreateAndAppend(ctx, base64());
+        (*ctx).binary_chunk_size = 0;
+        let mut out = [0_u8; 16];
+        let mut size = 0;
+        REASONS.lock().expect("one test thread").clear();
+        crate::ffi::errors::xmlSecErrorsSetCallback(Some(
+            record as crate::ffi::errors::ErrorsCallback,
+        ));
+        let popped = super::xmlSecTransformDefaultPopBin(
+            transform,
+            out.as_mut_ptr(),
+            out.len(),
+            &raw mut size,
+            ctx,
+        );
+        crate::ffi::errors::xmlSecErrorsClearCallback();
+        let reasons = REASONS.lock().expect("one test thread").clone();
+        assert_eq!(popped, -1);
+        // The pop refuses on its own assertion, not through the previous
+        // transform's failure.
+        assert_eq!(reasons, [crate::ffi::errors::R_ASSERTION], "{reasons:?}");
+        xmlSecTransformCtxDestroy(ctx);
+    }
+}
+
 /// A chain longer than the policy's transforms-per-reference limit is
 /// refused before it runs, as the core refuses such a reference; one at the
 /// limit runs.

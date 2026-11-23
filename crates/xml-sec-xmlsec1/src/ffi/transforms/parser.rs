@@ -122,6 +122,12 @@ unsafe extern "C" fn push_bin(
         c"transformCtx != NULL",
         -1
     );
+    check!(
+        !data.is_null() || size == 0,
+        "xmlSecParserPushBin",
+        c"(data != NULL) || (dataSize == 0)",
+        -1
+    );
     let here = here!("xmlSecParserPushBin");
     // SAFETY: an XML parser transform in a live chain; `data` holds `size`
     // bytes.

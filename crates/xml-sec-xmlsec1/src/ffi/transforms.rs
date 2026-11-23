@@ -1746,6 +1746,16 @@ pub(crate) unsafe extern "C" fn xmlSecTransformDefaultPopBin(
             c"transformCtx != NULL",
             -1
         );
+        // A zero chunk size would read nothing from the previous transform
+        // and never finish.
+        // SAFETY: a context.
+        let chunk = unsafe { (*ctx).binary_chunk_size };
+        check!(
+            chunk > 0,
+            "xmlSecTransformDefaultPopBin",
+            c"transformCtx->binaryChunkSize > 0",
+            -1
+        );
         let here = here!("xmlSecTransformDefaultPopBin");
         let name = klass.name.cast();
         // SAFETY: the caller's contract; every buffer belongs to the live
