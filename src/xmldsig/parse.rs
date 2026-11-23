@@ -3083,7 +3083,7 @@ pub(crate) fn build_x509_certificate_paths_to_trusted_prefix(
     )
 }
 
-/// [`build_x509_certificate_paths_to_trusted_prefix`] over `source`, the
+/// `build_x509_certificate_paths_to_trusted_prefix` over `source`, the
 /// operation's already-read certificates of `info` in pool order, so a caller
 /// that validates every candidate reads each certificate once.
 #[expect(
@@ -3110,11 +3110,7 @@ pub(crate) fn build_x509_certificate_paths_to_trusted_prefix_in(
         |index| index < trusted_prefix_len,
         false,
         bounds,
-        super::pkix::ProviderVerifier {
-            provider,
-            allowed,
-            edges: Some(certificates.edges()),
-        },
+        (provider, allowed),
         certificates,
     )
 }
@@ -3148,11 +3144,7 @@ pub(crate) fn build_x509_certificate_paths_to_selector_targets(
         |index| targets.contains(&index),
         true,
         bounds,
-        super::pkix::ProviderVerifier {
-            provider,
-            allowed,
-            edges: Some(certificates.edges()),
-        },
+        (provider, allowed),
         certificates,
     )
 }
@@ -3206,7 +3198,7 @@ fn build_x509_certificate_paths(
     is_terminal: impl Fn(usize) -> bool,
     continue_after_terminal: bool,
     bounds: X509PathBounds,
-    verifier: super::pkix::ProviderVerifier<'_>,
+    verifier: EdgeVerifier<'_>,
     certificates: &super::pkix::CertificateSession,
 ) -> Result<X509CandidatePaths, X509ChainBuildError> {
     let X509PathBounds {
@@ -3333,11 +3325,18 @@ impl IssuerRejections {
     }
 }
 
+/// The provider and certificate-signature permissions that decide discovery
+/// edges; the session's shared outcomes are selected where they are checked.
+type EdgeVerifier<'a> = (
+    &'a dyn crate::provider::CryptoProvider,
+    Option<&'a crate::policy::CertificateSignatureAlgorithms>,
+);
+
 /// Indices of same-DN issuers whose edge signature does not disprove `current`.
 fn verified_issuers(
     current: &structured_pkix::Certificate<'_>,
     source: &[structured_pkix::Certificate<'_>],
-    verifier: super::pkix::ProviderVerifier<'_>,
+    (provider, allowed): EdgeVerifier<'_>,
     certificates: &super::pkix::CertificateSession,
     rejections: &mut IssuerRejections,
 ) -> Result<structured_asn1::memory::OwnedVec<usize>, X509ChainBuildError> {
@@ -3359,8 +3358,8 @@ fn verified_issuers(
         match super::x509::shared_certificate_signature_outcome(
             current,
             issuer,
-            verifier.provider,
-            verifier.allowed,
+            provider,
+            allowed,
             certificates,
         ) {
             Ok(

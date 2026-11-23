@@ -1538,6 +1538,13 @@ impl DefaultKeyResolver {
             certificates,
         )
         .map_err(build_error)?;
+        // Without a candidate no path is validated, so no verification time
+        // is needed to report the untrusted root.
+        if candidates.is_empty() {
+            return Err(KeyResolutionError::Chain(
+                super::X509ChainError::UntrustedRoot,
+            ));
+        }
         let options = self.x509_chain_options(trust, budget)?;
         // The configured anchors lead the pool, already read with it.
         let anchors = &sources[..trusted_prefix_len];

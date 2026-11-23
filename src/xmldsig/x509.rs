@@ -495,7 +495,8 @@ pub fn verify_x509_certificate(
     let Some(key) = validated else {
         return Err(first_error.unwrap_or(X509ChainError::UntrustedRoot));
     };
-    let certificate = session.read(target)?;
+    // The target was read with the pool; its index names the same DER.
+    let certificate = &sources[signing];
     let validity = certificate.tbs().validity();
     let subject_public_key_info = match key.effective_spki {
         Some(spki) => spki.to_vec(),
@@ -535,18 +536,53 @@ pub(crate) fn verify_x509_certificate_chain_in_session(
             .map_err(|reason| path_storage(session, reason))?;
     }
 
-    // The last certificate and the anchors are read first, then the rest in
-    // path order; the target's time gate stays with path validation.
+    // Certificates are read in the order the decisions need them: the last
+    // one and the anchors decide how the path ends, and the rest is read only
+    // for a path that reaches validation, the target's time gate first.
     let (last_der, before) = path_der.split_last().ok_or(X509ChainError::UntrustedRoot)?;
     let last = session.read(last_der)?;
     let anchors = read_anchors(options, session)?;
+    // The certificate before the last one, which root replacement examines.
+    let mut issued = None;
+    if anchors
+        .iter()
+        .any(|cert| cert.as_bytes() == last.as_bytes())
+    {
+        if path_der.len() > options.max_chain_depth {
+            return Err(X509ChainError::DepthExceeded(options.max_chain_depth));
+        }
+    } else {
+        // Only a self-signed root that an anchor may replace makes the
+        // certificate before it matter here.
+        if let Some(der) = before.last()
+            && self_signed_root(&last, options, provider, session)?
+        {
+            issued = Some(session.read(der)?);
+        }
+        if !anchor_completes(issued.as_ref(), &last, &anchors, options, provider, session)? {
+            return Err(X509ChainError::UntrustedRoot);
+        }
+    }
     let mut decoded = session.memory().vector();
     decoded
         .try_reserve_exact(before.len())
         .map_err(|reason| path_storage(session, reason))?;
-    for der in before {
+    let unread = &before[..before.len() - usize::from(issued.is_some())];
+    for der in unread {
+        let certificate = session.read(der)?;
+        if decoded.is_empty() {
+            target_in_validity(&certificate, options)?;
+        }
         decoded
-            .try_push(session.read(der)?)
+            .try_push(certificate)
+            .map_err(|reason| path_storage(session, reason))?;
+    }
+    if let Some(certificate) = issued {
+        if decoded.is_empty() {
+            target_in_validity(&certificate, options)?;
+        }
+        decoded
+            .try_push(certificate)
             .map_err(|reason| path_storage(session, reason))?;
     }
     let mut path = session.memory().vector();
@@ -689,6 +725,42 @@ fn malformed_anchor(error: X509ChainError) -> X509ChainError {
     }
 }
 
+/// Whether a trust anchor can complete a supplied path that does not end at
+/// one: an anchor issues its `last` certificate, or the `issued` certificate
+/// before a replaceable self-signed root.
+fn anchor_completes(
+    issued: Option<&structured_pkix::Certificate<'_>>,
+    last: &structured_pkix::Certificate<'_>,
+    anchors: &[structured_pkix::Certificate<'_>],
+    options: &X509ChainOptions<'_>,
+    provider: &dyn crate::provider::CryptoProvider,
+    session: &super::pkix::CertificateSession,
+) -> Result<bool, X509ChainError> {
+    // `issued` is read only after `last` proved a self-signed root.
+    let child = match issued {
+        Some(child) if issued_by(child, last, options, provider, session)? => child,
+        _ => last,
+    };
+    for cert in anchors {
+        if !session.source_names_equal(cert.tbs().subject(), child.tbs().issuer())? {
+            continue;
+        }
+        if matches!(
+            shared_certificate_signature_outcome(
+                child,
+                cert,
+                provider,
+                options.certificate_signature_algorithms,
+                session,
+            )?,
+            structured_pkix::path::Verified::Yes | structured_pkix::path::Verified::Unsupported
+        ) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Whether the supplied path ends in a self-signed root that a trusted anchor
 /// may replace.
 ///
@@ -701,24 +773,35 @@ fn replaceable_untrusted_root(
     provider: &dyn crate::provider::CryptoProvider,
     session: &super::pkix::CertificateSession,
 ) -> Result<bool, X509ChainError> {
-    if path.len() < 2
-        || !session.source_names_equal(last.tbs().subject(), last.tbs().issuer())?
-        || shared_certificate_signature_outcome(
-            last,
-            last,
-            provider,
-            options.certificate_signature_algorithms,
-            session,
-        )? != structured_pkix::path::Verified::Yes
-    {
+    if path.len() < 2 || !self_signed_root(last, options, provider, session)? {
         return Ok(false);
     }
-    let child = path[path.len() - 2];
+    issued_by(path[path.len() - 2], last, options, provider, session)
+}
+
+/// Whether `certificate` names itself as issuer and its own key proves it.
+fn self_signed_root(
+    certificate: &structured_pkix::Certificate<'_>,
+    options: &X509ChainOptions<'_>,
+    provider: &dyn crate::provider::CryptoProvider,
+    session: &super::pkix::CertificateSession,
+) -> Result<bool, X509ChainError> {
+    issued_by(certificate, certificate, options, provider, session)
+}
+
+/// Whether `issuer` names and proves the signature of `child`.
+fn issued_by(
+    child: &structured_pkix::Certificate<'_>,
+    issuer: &structured_pkix::Certificate<'_>,
+    options: &X509ChainOptions<'_>,
+    provider: &dyn crate::provider::CryptoProvider,
+    session: &super::pkix::CertificateSession,
+) -> Result<bool, X509ChainError> {
     Ok(
-        session.source_names_equal(child.tbs().issuer(), last.tbs().subject())?
+        session.source_names_equal(child.tbs().issuer(), issuer.tbs().subject())?
             && shared_certificate_signature_outcome(
                 child,
-                last,
+                issuer,
                 provider,
                 options.certificate_signature_algorithms,
                 session,
