@@ -433,9 +433,11 @@ fn read_relationship<'a, S: Scratch, D: crate::xml::dom::storage::Storage>(
     scratch: &S,
 ) -> Result<(Relationship<'a, S, D>, bool), TransformError> {
     let edition = reading.edition;
-    // ECMA-376 Part 2 opc-relationships.xsd declares the CT_Relationship
-    // attributes unqualified, with no anyAttribute: a Relationships-namespace
-    // TargetMode is foreign unless the policy reads it as libxmlsec1 does.
+    // ECMA-376 Part 2 opc-relationships.xsd (2012 D.4 / 2021 C.5) declares
+    // the CT_Relationship attributes unqualified, with no anyAttribute: a
+    // Relationships-namespace TargetMode is foreign unless the policy reads it
+    // as libxmlsec1 does.
+    // https://ecma-international.org/publications-and-standards/standards/ecma-376/
     let qualified_mode = reading.target_mode == RelationshipTargetModeSemantics::Libxmlsec1;
     validate_relationship_attributes(node, qualified_mode, budget)?;
     let id = budget
