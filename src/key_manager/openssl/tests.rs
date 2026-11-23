@@ -1,7 +1,6 @@
 use std::fmt::Write as _;
 
 use aes::cipher::{BlockModeEncrypt as _, KeyIvInit as _, block_padding::Pkcs7};
-use base64::Engine as _;
 use der::{Decode as _, Encode as _, asn1::UintRef};
 use md5::{Digest as _, Md5};
 use p256::pkcs8::DecodePrivateKey as _;
@@ -74,7 +73,7 @@ fn encrypted_pem(tag: &str, der: &[u8], password: &[u8]) -> String {
         .expect("room for one padding block")
         .len();
     ciphertext.truncate(length);
-    let body = base64::engine::general_purpose::STANDARD.encode(ciphertext);
+    let body = crate::base64::encode(&ciphertext);
     let mut iv_hex = String::new();
     for byte in iv {
         write!(iv_hex, "{byte:02X}").expect("writing to a String cannot fail");
@@ -85,7 +84,7 @@ fn encrypted_pem(tag: &str, der: &[u8], password: &[u8]) -> String {
 }
 
 fn plain_pem(tag: &str, der: &[u8]) -> String {
-    let body = base64::engine::general_purpose::STANDARD.encode(der);
+    let body = crate::base64::encode(der);
     format!("-----BEGIN {tag}-----\n{body}\n-----END {tag}-----\n")
 }
 

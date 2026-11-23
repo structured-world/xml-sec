@@ -3,7 +3,6 @@
 use std::io::{self, Write};
 
 use crate::xml_input::lexical::Writer;
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 use super::{CONCAT, HKDF, KeyDerivationMethod, MORE_NS, PBKDF2, XMLDSIG_NS, XMLENC11_NS};
 use crate::xmlenc::{XmlEncError, parse::validate_metadata_len};
@@ -75,9 +74,9 @@ pub(super) fn serialize(
     // fields partition one context, rather than copying it five times.
     let mut fields = Fields {
         concat: core::array::from_fn(|_| None),
-        salt: STANDARD.encode(&method.salt),
+        salt: crate::base64::encode(&method.salt),
         info: if method.algorithm == HKDF {
-            STANDARD.encode(&method.context)
+            crate::base64::encode(&method.context)
         } else {
             String::new()
         },

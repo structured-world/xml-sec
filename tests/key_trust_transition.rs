@@ -4,7 +4,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use base64::{Engine, engine::general_purpose::STANDARD};
+use structured_base64::STANDARD;
 use xml_sec::policy::{PolicyViolation, VerificationPolicy, VerificationTrustMode};
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DsigError, DsigStatus, KeyInfo, KeyResolver, KeyResolverConfig,
@@ -86,7 +86,7 @@ fn real_embedded_signature_needs_explicit_trust_each_operation() {
         .and_then(|node| node.text())
         .expect("fixture must contain its certificate");
     let certificate = STANDARD
-        .decode(text.split_whitespace().collect::<String>())
+        .decode(text.split_whitespace().collect::<String>().as_bytes())
         .expect("fixture certificate must decode");
     let pinned = DefaultKeyResolver::new(KeyResolverConfig {
         trusted_certs: vec![certificate],

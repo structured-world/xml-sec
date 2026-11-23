@@ -35,8 +35,6 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
 use structured_asn1::Oid;
 use structured_asn1::memory::{Memory, MemoryAccount};
 use structured_pkix::algorithm::digest::Algorithm;
@@ -360,8 +358,8 @@ fn values(xml: &str, local: &str) -> Result<Vec<Vec<u8>>, String> {
             + xml[start..]
                 .find(&close)
                 .ok_or_else(|| format!("unterminated {local}"))?;
-        let value = STANDARD
-            .decode(&xml[start..end])
+        let value = structured_base64::STANDARD
+            .decode(&xml.as_bytes()[start..end])
             .map_err(|error| format!("{local}: {error}"))?;
         if !values.contains(&value) {
             values.push(value);

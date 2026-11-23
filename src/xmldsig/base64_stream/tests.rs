@@ -1,9 +1,9 @@
 use super::{Base64Stream, is_rfc2045_base64_byte};
 use alloc::{format, string::String, vec::Vec};
-use base64::Engine as _;
+use structured_base64::{Base64Error, OwnedError};
 
 /// The decoded bytes and error of one streamed input.
-fn streamed(input: &[u8], chunk: usize) -> (Vec<u8>, Option<base64::DecodeError>) {
+fn streamed(input: &[u8], chunk: usize) -> (Vec<u8>, Option<Base64Error>) {
     let mut output = Vec::new();
     let mut sink = |decoded: &[u8]| -> Result<(), ()> {
         output.extend_from_slice(decoded);
@@ -19,13 +19,18 @@ fn streamed(input: &[u8], chunk: usize) -> (Vec<u8>, Option<base64::DecodeError>
     (output, failure)
 }
 
-fn resident(input: &[u8]) -> Result<Vec<u8>, base64::DecodeError> {
+fn resident(input: &[u8]) -> Result<Vec<u8>, Base64Error> {
     let filtered: Vec<u8> = input
         .iter()
         .copied()
         .filter(|byte| is_rfc2045_base64_byte(*byte))
         .collect();
-    base64::engine::general_purpose::STANDARD.decode(filtered)
+    structured_base64::STANDARD
+        .decode(&filtered)
+        .map_err(|error| match error {
+            OwnedError::Codec(error) => error,
+            OwnedError::Reserve(error) => panic!("test allocation: {error}"),
+        })
 }
 
 /// A decoded payload long enough to cross several decoding blocks.
@@ -35,7 +40,7 @@ fn encoded(length: usize) -> String {
         .cycle()
         .take(length)
         .collect();
-    base64::engine::general_purpose::STANDARD.encode(payload)
+    crate::base64::encode(&payload)
 }
 
 fn assert_matches_resident(input: &[u8]) {

@@ -4,9 +4,9 @@
 
 use std::fs;
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use roxmltree::Node;
 use rsa::{PrivateKey as RsaPrivateKey, PublicKey as RsaPublicKey};
+use structured_base64::STANDARD;
 use xml_sec::rsa_encoding::{RsaPrivateKeyEncoding as _, RsaPublicKeyEncoding as _};
 use xml_sec::xmlenc::{
     DataEncryptionAlgorithm, DecryptedContent, DocumentEncryptionOptions, EncryptedDataBuilder,
@@ -187,11 +187,12 @@ fn pkcs1v15_transport_is_parameterless_and_explicitly_permitted() {
         .unwrap()
         .text()
         .unwrap();
-    let mut corrupt = STANDARD.decode(wrapped).unwrap();
+    let mut corrupt = STANDARD.decode(wrapped.as_bytes()).unwrap();
     corrupt.fill(0);
+    let encode = |bytes: &[u8]| STANDARD.encode(bytes).expect("test encoding");
     let damaged = encrypted
         .encrypted_data_xml
-        .replace(wrapped, &STANDARD.encode(&corrupt));
+        .replace(wrapped, &encode(&corrupt));
     assert!(
         DecryptContext::new(&resolver)
             .policy(policy.clone())
@@ -200,13 +201,13 @@ fn pkcs1v15_transport_is_parameterless_and_explicitly_permitted() {
     );
     let short = encrypted
         .encrypted_data_xml
-        .replace(wrapped, &STANDARD.encode(&corrupt[..corrupt.len() - 1]));
+        .replace(wrapped, &encode(&corrupt[..corrupt.len() - 1]));
     // An out-of-range RSA representative must reach the same authenticated
     // content check as a padding failure, never a distinct provider error.
     corrupt.fill(0xff);
     let out_of_range = encrypted
         .encrypted_data_xml
-        .replace(wrapped, &STANDARD.encode(&corrupt));
+        .replace(wrapped, &encode(&corrupt));
     assert!(matches!(
         DecryptContext::new(&resolver)
             .policy(policy.clone())
@@ -442,7 +443,7 @@ fn donor_rsa_templates_match_legacy_and_xmlenc11_oaep_contracts() {
             .map(str::trim)
             .map(|value| {
                 STANDARD
-                    .decode(value)
+                    .decode(value.as_bytes())
                     .expect("donor OAEP label must be base64")
             });
         let transport = &generated_data.encrypted_keys[0].encryption_method;

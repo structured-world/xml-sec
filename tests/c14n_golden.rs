@@ -73,8 +73,9 @@ fn sha1_base64(data: &[u8]) -> String {
 
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 fn base64_encode(data: &[u8]) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD.encode(data)
+    structured_base64::STANDARD
+        .encode(data)
+        .expect("test encoding")
 }
 
 fn assert_c14n_matches_golden(xml: &[u8], mode: C14nMode, golden: &str, label: &str) {

@@ -4,8 +4,8 @@ use crate::xml_input as xml_sec_xml_input;
 use std::{fmt, io::Write, sync::Arc};
 
 use crate::xml::dom::{Document, Node};
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rsa::PublicKey as RsaPublicKey;
+use structured_base64::STANDARD;
 use xml_sec_xml_input::lexical::Writer;
 
 use crate::document::{
@@ -1771,7 +1771,7 @@ fn write_encrypted_key<W: Write>(
             write_text_element(
                 writer,
                 "xenc:OAEPparams",
-                &STANDARD.encode(&parameters.label),
+                &crate::base64::encode(&parameters.label),
             )?;
         }
         write_empty_with_algorithm(writer, "ds:DigestMethod", parameters.digest.uri())?;
@@ -2062,7 +2062,7 @@ mod tests {
                 output,
                 format!(
                     "<root xmlns:xenc=\"{XMLENC_NS}\"><xenc:CipherData><xenc:CipherValue>{}</xenc:CipherValue></xenc:CipherData></root>",
-                    STANDARD.encode(bytes),
+                    crate::base64::encode(&bytes),
                 )
             );
         }

@@ -32,14 +32,15 @@ fn fixture_path(path: &str) -> std::path::PathBuf {
 #[test]
 fn xml_inventory_imports_standard_ml_kem_spki() {
     // A DEREncodedKeyValue is an SPKI, never a private-key container.
-    use base64::Engine as _;
     use xml_sec::key_manager::{KeyInventory, KeyUsage};
     let key = RustCryptoMlKemPrivateKey::from_seed(KeyEncapsulationAlgorithm::MlKem512, &[7; 64])
         .expect("seed");
     let der = key.public_key().to_spki_der().expect("SPKI");
     let xml = format!(
         "<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\"><KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>recipient</KeyName><DEREncodedKeyValue xmlns=\"http://www.w3.org/2009/xmldsig11#\">{}</DEREncodedKeyValue></KeyInfo></Keys>",
-        base64::engine::general_purpose::STANDARD.encode(der.as_bytes())
+        structured_base64::STANDARD
+            .encode(der.as_bytes())
+            .expect("test encoding")
     );
     let policy = xml_sec::policy::VerificationPolicy::default();
     let inventory =
@@ -69,12 +70,16 @@ fn xml_inventory_imports_standard_ml_kem_spki() {
         .is_err()
     );
     let private = xml.replace(
-        &base64::engine::general_purpose::STANDARD.encode(der.as_bytes()),
-        &base64::engine::general_purpose::STANDARD.encode(
-            key.to_pkcs8_der(MlKemPrivateKeyEncoding::Seed)
-                .expect("PKCS8")
-                .as_bytes(),
-        ),
+        &structured_base64::STANDARD
+            .encode(der.as_bytes())
+            .expect("test encoding"),
+        &structured_base64::STANDARD
+            .encode(
+                key.to_pkcs8_der(MlKemPrivateKeyEncoding::Seed)
+                    .expect("PKCS8")
+                    .as_bytes(),
+            )
+            .expect("test encoding"),
     );
     assert!(
         KeyInventory::from_xml_bytes(private.as_bytes(), &policy, xml_sec::XmlBackend::default())
@@ -101,7 +106,6 @@ fn run_cli(arguments: &[&std::ffi::OsStr]) -> std::process::Output {
 /// verification-only key.
 #[cfg(all(feature = "xmldsig", feature = "xmlenc", feature = "c14n"))]
 fn write_kem_store(directory: &std::path::Path, size: u16) -> std::path::PathBuf {
-    use base64::Engine as _;
     let public = fixture_path(&format!("xmldsig/keys/ml-kem/ml-kem-{size}-pubkey.pem"));
     // RFC 9935 SPKI inside XMLDSig 1.1 DEREncodedKeyValue reaches the
     // same provider key as a standalone PEM, without custom XML key types.
@@ -113,8 +117,12 @@ fn write_kem_store(directory: &std::path::Path, size: u16) -> std::path::PathBuf
     let store = directory.join(format!("keys-{size}.xml"));
     std::fs::write(&store, format!(
         "<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\"><KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>TestKeyName-ml-kem-{size}</KeyName><DEREncodedKeyValue xmlns=\"http://www.w3.org/2009/xmldsig11#\">{}</DEREncodedKeyValue></KeyInfo><KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>unrelated</KeyName><DEREncodedKeyValue xmlns=\"http://www.w3.org/2009/xmldsig11#\">{}</DEREncodedKeyValue></KeyInfo></Keys>",
-        base64::engine::general_purpose::STANDARD.encode(spki.as_bytes()),
-        base64::engine::general_purpose::STANDARD.encode(std::fs::read(ed).expect("Ed25519 SPKI"))
+        structured_base64::STANDARD
+            .encode(spki.as_bytes())
+            .expect("test encoding"),
+        structured_base64::STANDARD
+            .encode(&std::fs::read(ed).expect("Ed25519 SPKI"))
+            .expect("test encoding")
     )).expect("mixed public store");
     store
 }
@@ -610,7 +618,6 @@ fn an_established_key_signs_only_its_own_template_mechanism() {
     // A caller that encapsulated and wrote the ciphertext itself (as the C
     // library's KeyInfo write does) signs with the secret; the core signs only
     // a template carrying exactly that ciphertext, and the recipient verifies.
-    use base64::Engine as _;
     use xml_sec::key_establishment::EstablishedEncapsulation;
     use xml_sec::provider::KeyEncapsulationKey as _;
     let template = std::fs::read_to_string(fixture_path(
@@ -628,7 +635,9 @@ fn an_established_key_signs_only_its_own_template_mechanism() {
         "<enc:CipherValue/>",
         &format!(
             "<enc:CipherValue>{}</enc:CipherValue>",
-            base64::engine::general_purpose::STANDARD.encode(&encapsulated.ciphertext)
+            structured_base64::STANDARD
+                .encode(&encapsulated.ciphertext)
+                .expect("test encoding")
         ),
     );
     let mut signing = xml_sec::policy::SigningPolicy::default();
@@ -1827,7 +1836,6 @@ fn direct_kem_cbc_requires_external_authentication_permission() {
 fn encapsulation_candidate_budget_precedes_nested_der_decode() {
     // The mechanism and its embedded key share one ingestion allowance.
     // Malformed base64 proves exhaustion is detected before key decoding.
-    use base64::Engine as _;
     let xml = std::fs::read_to_string(fixture_path(
         "xmlenc/aleksey-xmlenc-01/enc-aes128gcm-kt-ml-kem-512.xml",
     ))
@@ -1866,7 +1874,9 @@ fn encapsulation_candidate_budget_precedes_nested_der_decode() {
         ">!</DEREncodedKeyValue>",
         &format!(
             ">{}</DEREncodedKeyValue>",
-            base64::engine::general_purpose::STANDARD.encode(spki.as_bytes())
+            structured_base64::STANDARD
+                .encode(spki.as_bytes())
+                .expect("test encoding")
         ),
     );
     let document = xml_sec::Document::parse(&valid).unwrap();
@@ -2288,7 +2298,6 @@ fn cli_refuses_xml_data_template_with_referenced_recipient_metadata() {
     // libxmlsec1's xmlSecReplaceNode does. Mechanism metadata referenced from elsewhere
     // in the template would dangle, so the CLI refuses instead of writing output that
     // no implementation can decrypt.
-    use base64::Engine as _;
     use std::fmt::Write as _;
     let directory = tempfile::tempdir().unwrap();
     let algorithm = KeyEncapsulationAlgorithm::MlKem512;
@@ -2300,7 +2309,9 @@ fn cli_refuses_xml_data_template_with_referenced_recipient_metadata() {
         write!(
             store_xml,
             "<d:KeyInfo xmlns:d=\"http://www.w3.org/2000/09/xmldsig#\"><d:KeyName>{name}</d:KeyName><i:DEREncodedKeyValue xmlns:i=\"http://www.w3.org/2009/xmldsig11#\">{}</i:DEREncodedKeyValue></d:KeyInfo>",
-            base64::engine::general_purpose::STANDARD.encode(key.public_key().to_spki_der().unwrap().as_bytes()),
+            structured_base64::STANDARD
+                .encode(key.public_key().to_spki_der().unwrap().as_bytes())
+                .expect("test encoding"),
         )
         .expect("writing to a String cannot fail");
     }
@@ -2465,7 +2476,6 @@ fn cli_selects_nested_kem_recipient(
 fn nested_kem_wrap_recovery_shares_the_operation_budget() {
     // A KEM supplies an AES-KW KEK, not the content key. Nested execution
     // must preserve the same permission and zero-attempt rejection boundary.
-    use base64::Engine as _;
     let private =
         RustCryptoMlKemPrivateKey::from_seed(KeyEncapsulationAlgorithm::MlKem768, &[7; 64])
             .unwrap();
@@ -2487,7 +2497,11 @@ fn nested_kem_wrap_recovery_shares_the_operation_budget() {
             b"nested KEM plaintext",
         )
         .unwrap();
-    let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    let encode = |bytes: &[u8]| {
+        structured_base64::STANDARD
+            .encode(bytes)
+            .expect("test encoding")
+    };
     let xml = format!(
         "<x:EncryptedData xmlns:x=\"http://www.w3.org/2001/04/xmlenc#\" xmlns:d=\"http://www.w3.org/2000/09/xmldsig#\"><x:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes256-gcm\"/><d:KeyInfo><x:EncryptedKey><x:EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#kw-aes256\"/><d:KeyInfo><x:EncryptedKey><x:EncryptionMethod Algorithm=\"{}\"/><x:CipherData><x:CipherValue>{}</x:CipherValue></x:CipherData></x:EncryptedKey></d:KeyInfo><x:CipherData><x:CipherValue>{}</x:CipherValue></x:CipherData></x:EncryptedKey></d:KeyInfo><x:CipherData><x:CipherValue>{}</x:CipherValue></x:CipherData></x:EncryptedData>",
         private.algorithm().uri(),

@@ -3,7 +3,6 @@
 use crate::xml_input as xml_sec_xml_input;
 use std::io::Write;
 
-use base64::Engine;
 use xml_sec_xml_input::lexical::{self, Writer};
 
 use crate::c14n::{
@@ -582,7 +581,7 @@ impl SignatureBuilder {
             [("xmlns", super::parse::SIGNATURE_CONTEXT_NS)],
         )?;
         let mut encoded = [0_u8; 340];
-        let length = base64::engine::general_purpose::STANDARD
+        let length = structured_base64::STANDARD
             .encode_slice(self.signature_context.as_bytes(), &mut encoded)
             .map_err(std::io::Error::other)?;
         writer.text(std::str::from_utf8(&encoded[..length]).map_err(std::io::Error::other)?)?;
@@ -602,12 +601,9 @@ impl SignatureBuilder {
         // completed artifact exactly as the signing operation will consume it.
         policy.resources.validate_xml_document_len(template.len())?;
         let digest_placeholders = self.references.iter().map(|reference| {
-            base64::engine::general_purpose::STANDARD.encode(vec![
-                0_u8;
-                reference
-                    .digest_method
-                    .output_len()
-            ])
+            crate::base64::encode(
+                &[0_u8; super::MAX_DIGEST_OUTPUT][..reference.digest_method.output_len()],
+            )
         });
         let digest_validation_template = fill_signed_info_digest_values_with_budget(
             template,

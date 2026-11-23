@@ -1,7 +1,7 @@
 //! Deterministic historical attack classes; sources and scope: docs/historical-security.md.
 #![cfg(all(feature = "xmldsig-sign", feature = "c14n"))]
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use structured_base64::STANDARD;
 use xml_sec::XmlDocument;
 use xml_sec::policy::{
     CompiledPolicies, PolicyCompileContext, PolicyCompiler, PolicyProfile, PolicyViolation,
@@ -199,11 +199,13 @@ fn hmac_truncation_refuses_genuine_short_prefixes_not_only_random_forgeries() {
                 .unwrap()
                 .text()
                 .unwrap();
-            let prefix = &STANDARD.decode(mac).unwrap()[..bits / 8];
-            let attack = original.replace(mac, &STANDARD.encode(prefix)).replace(
-                ">128</ds:HMACOutputLength>",
-                &format!(">{bits}</ds:HMACOutputLength>"),
-            );
+            let prefix = &STANDARD.decode(mac.as_bytes()).unwrap()[..bits / 8];
+            let attack = original
+                .replace(mac, &STANDARD.encode(prefix).expect("test encoding"))
+                .replace(
+                    ">128</ds:HMACOutputLength>",
+                    &format!(">{bits}</ds:HMACOutputLength>"),
+                );
             assert!(matches!(context.verify(&attack),
                 Err(DsigError::Policy(PolicyViolation::HmacOutputLength { minimum: 128, actual, .. })) if actual == bits));
         }
@@ -536,13 +538,16 @@ fn cbc_downgrade_and_padding_probes_have_one_pre_decryption_policy_refusal() {
             .unwrap()
             .text()
             .unwrap();
-        let ciphertext = STANDARD.decode(text).unwrap();
+        let ciphertext = STANDARD.decode(text.as_bytes()).unwrap();
         for tail in [0, 1, 16, 17, 255] {
             let mut probe = ciphertext.clone();
             *probe.last_mut().unwrap() = tail;
-            let probe = cbc
-                .encrypted_data_xml
-                .replace(text, &STANDARD.encode(probe));
+            let probe = cbc.encrypted_data_xml.replace(
+                text,
+                &structured_base64::STANDARD
+                    .encode(&probe)
+                    .expect("test encoding"),
+            );
             assert!(matches!(
                 context.decrypt(&probe),
                 Err(XmlEncError::Policy(PolicyViolation::Algorithm { .. }))

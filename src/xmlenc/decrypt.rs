@@ -4,8 +4,6 @@ use std::{borrow::Cow, fmt, sync::Arc};
 
 #[cfg(test)]
 use crate::xml::dom::Document;
-#[cfg(test)]
-use base64::Engine as _;
 
 use crate::document::{DocumentParseSettings, XmlDocument, XmlParseWorkBudget};
 use crate::operation::{
@@ -3724,7 +3722,6 @@ mod tests {
         aead::{AeadInOut, KeyInit},
     };
     use aes_kw::KwAes128;
-    use base64::engine::general_purpose::STANDARD;
     use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng};
     use rsa::{Oaep, PublicKey as RsaPublicKey};
     use sha1::Sha1;
@@ -3766,7 +3763,7 @@ mod tests {
             encryption_method: method(algorithm.uri()),
             encrypted_keys: Vec::new(),
             cipher_data: CipherData::Value {
-                value: STANDARD.encode(ciphertext),
+                value: crate::base64::encode(ciphertext),
             },
         }
     }
@@ -4156,7 +4153,7 @@ mod tests {
                 oaep_params: None,
             },
             cipher_data: CipherData::Value {
-                value: STANDARD.encode([0_u8; 256]),
+                value: crate::base64::encode(&[0_u8; 256]),
             },
             reference_list: data_reference.map(|uri| crate::xmlenc::ReferenceList {
                 data_references: vec![uri.into()],
@@ -4188,8 +4185,8 @@ mod tests {
             key_name: key_name.map(str::to_owned),
             encrypted_keys,
             cipher_data: CipherData::Value {
-                value: STANDARD.encode(
-                    crate::provider::default_provider()
+                value: crate::base64::encode(
+                    &crate::provider::default_provider()
                         .encrypt_data(DataEncryptionAlgorithm::Aes128Gcm, key, b"payload")
                         .expect("test encryption must succeed"),
                 ),
@@ -4481,7 +4478,7 @@ mod tests {
         wire.extend_from_slice(&ciphertext);
         let xml = format!(
             "<xenc:EncryptedData xmlns:xenc=\"http://www.w3.org/2001/04/xmlenc#\" Type=\"http://www.w3.org/2001/04/xmlenc#Element\"><xenc:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><xenc:CipherData><xenc:CipherValue>{}</xenc:CipherValue></xenc:CipherData></xenc:EncryptedData>",
-            STANDARD.encode(&wire)
+            crate::base64::encode(&wire)
         );
         let decrypted = decrypt(&xml, &SymmetricKeyDecryptor::new(key))
             .expect("valid AES-GCM XML must decrypt")
@@ -4492,7 +4489,10 @@ mod tests {
         );
         let last = wire.len() - 1;
         wire[last] ^= 1;
-        let tampered = xml.replace(&STANDARD.encode(ciphertext), &STANDARD.encode(&wire[12..]));
+        let tampered = xml.replace(
+            &crate::base64::encode(&ciphertext),
+            &crate::base64::encode(&wire[12..]),
+        );
         assert!(matches!(
             decrypt(&tampered, &SymmetricKeyDecryptor::new(key)),
             Err(XmlEncError::AeadAuthenticationFailed)
@@ -4529,7 +4529,7 @@ mod tests {
             key_name: None,
             encrypted_keys: Vec::new(),
             cipher_data: CipherData::Value {
-                value: STANDARD.encode(wire),
+                value: crate::base64::encode(&wire),
             },
         };
         let resolver = CandidateResolver {
@@ -4575,7 +4575,7 @@ mod tests {
             key_name: None,
             encrypted_keys: Vec::new(),
             cipher_data: CipherData::Value {
-                value: STANDARD.encode([0_u8; 36]),
+                value: crate::base64::encode(&[0_u8; 36]),
             },
         };
 
@@ -4603,7 +4603,7 @@ mod tests {
         let encrypted = format!(
             "<xenc:EncryptedData xmlns:xenc=\"{XMLENC_NS}\" Type=\"{XMLENC_NS}Element\"><xenc:EncryptionMethod Algorithm=\"{}\"/><xenc:CipherData><xenc:CipherValue>{}</xenc:CipherValue></xenc:CipherData></xenc:EncryptedData>",
             DataEncryptionAlgorithm::Aes128Gcm.uri(),
-            STANDARD.encode([0_u8; 32]),
+            crate::base64::encode(&[0_u8; 32]),
         );
 
         let result = DecryptContext::new(&resolver)
@@ -4637,8 +4637,8 @@ mod tests {
             key_name: None,
             encrypted_keys: Vec::new(),
             cipher_data: CipherData::Value {
-                value: STANDARD.encode(
-                    crate::provider::default_provider()
+                value: crate::base64::encode(
+                    &crate::provider::default_provider()
                         .encrypt_data(
                             DataEncryptionAlgorithm::Aes128Cbc,
                             &[7_u8; 16],
@@ -4687,8 +4687,8 @@ mod tests {
             key_name: None,
             encrypted_keys: Vec::new(),
             cipher_data: CipherData::Value {
-                value: STANDARD.encode(
-                    crate::provider::default_provider()
+                value: crate::base64::encode(
+                    &crate::provider::default_provider()
                         .encrypt_data(
                             DataEncryptionAlgorithm::Aes128Cbc,
                             &key,
@@ -4732,7 +4732,7 @@ mod tests {
             key_name: None,
             encrypted_keys: Vec::new(),
             cipher_data: CipherData::Value {
-                value: STANDARD.encode(vec![0_u8; 28]),
+                value: crate::base64::encode(&[0_u8; 28]),
             },
         };
         let actual = crate::hard_limits::KEY_CANDIDATE_CEILING + 1;
@@ -4775,7 +4775,7 @@ mod tests {
             key_name: None,
             encrypted_keys: Vec::new(),
             cipher_data: CipherData::Value {
-                value: STANDARD.encode(vec![0_u8; 28]),
+                value: crate::base64::encode(&[0_u8; 28]),
             },
         };
         let resolver = CandidateResolver {
@@ -4960,8 +4960,8 @@ mod tests {
         *encrypted
             .cipher_data
             .inline_value_mut()
-            .expect("inline ciphertext") = STANDARD.encode(
-            crate::provider::default_provider()
+            .expect("inline ciphertext") = crate::base64::encode(
+            &crate::provider::default_provider()
                 .encrypt_data(DataEncryptionAlgorithm::Aes128Cbc, &recipient, b"payload")
                 .expect("test encryption must succeed"),
         );
@@ -5008,7 +5008,7 @@ mod tests {
             key_name: None,
             encrypted_keys: Vec::new(),
             cipher_data: CipherData::Value {
-                value: STANDARD.encode(ciphertext),
+                value: crate::base64::encode(&ciphertext),
             },
         };
         let resolver = CandidateResolver {
@@ -5113,7 +5113,7 @@ mod tests {
                 oaep_params: None,
             },
             cipher_data: super::super::CipherData::Value {
-                value: STANDARD.encode([0_u8; 24]),
+                value: crate::base64::encode(&[0_u8; 24]),
             },
             reference_list: None,
             carried_key_name: None,
@@ -5248,7 +5248,7 @@ mod tests {
                 oaep_params: None,
             },
             cipher_data: super::super::CipherData::Value {
-                value: STANDARD.encode(wrapped),
+                value: crate::base64::encode(&wrapped),
             },
             reference_list: None,
             carried_key_name: None,
@@ -5281,7 +5281,7 @@ mod tests {
                 oaep_params: None,
             },
             cipher_data: super::super::CipherData::Value {
-                value: STANDARD.encode([0_u8; 24]),
+                value: crate::base64::encode(&[0_u8; 24]),
             },
             reference_list: None,
             carried_key_name: None,
@@ -5333,7 +5333,7 @@ mod tests {
                 },
                 encrypted_keys: Vec::new(),
                 cipher_data: super::super::CipherData::Value {
-                    value: STANDARD.encode(vec![0_u8; ciphertext_len]),
+                    value: crate::base64::encode(&vec![0_u8; ciphertext_len]),
                 },
             };
 
@@ -5381,7 +5381,7 @@ mod tests {
                 },
                 encrypted_keys: Vec::new(),
                 cipher_data: super::super::CipherData::Value {
-                    value: STANDARD.encode(vec![0_u8; ciphertext_len]),
+                    value: crate::base64::encode(&vec![0_u8; ciphertext_len]),
                 },
             };
 
@@ -5433,7 +5433,7 @@ mod tests {
                     oaep_params: None,
                 },
                 cipher_data: super::super::CipherData::Value {
-                    value: STANDARD.encode(vec![0_u8; actual]),
+                    value: crate::base64::encode(&vec![0_u8; actual]),
                 },
                 reference_list: None,
                 carried_key_name: None,
@@ -5511,7 +5511,7 @@ mod tests {
                 .cipher_data
                 .inline_value_mut()
                 .expect("inline ciphertext") =
-                STANDARD.encode(vec![
+                crate::base64::encode(&vec![
                     0;
                     algorithm
                         .ciphertext_len_for_plaintext(provider.plaintext.len())
@@ -5522,7 +5522,7 @@ mod tests {
             *encrypted.encrypted_keys[0]
                 .cipher_data
                 .inline_value_mut()
-                .expect("inline wrapped key") = STANDARD.encode([0; 256]);
+                .expect("inline wrapped key") = crate::base64::encode(&[0; 256]);
             let result = DecryptContext::new(&resolver)
                 .provider(&provider)
                 .policy(crate::policy::DecryptionPolicy {
@@ -5591,7 +5591,7 @@ mod tests {
                 oaep_params: None,
             },
             cipher_data: super::super::CipherData::Value {
-                value: STANDARD.encode(vec![0x5a; 256]),
+                value: crate::base64::encode(&vec![0x5a; 256]),
             },
             reference_list: None,
             carried_key_name: None,
@@ -5641,7 +5641,7 @@ mod tests {
             },
             encrypted_keys: Vec::new(),
             cipher_data: super::super::CipherData::Value {
-                value: STANDARD.encode([0_u8; 27]),
+                value: crate::base64::encode(&[0_u8; 27]),
             },
         };
         assert!(matches!(
@@ -5666,7 +5666,7 @@ mod tests {
                 oaep_params: None,
             },
             cipher_data: super::super::CipherData::Value {
-                value: STANDARD.encode([0_u8; 24]),
+                value: crate::base64::encode(&[0_u8; 24]),
             },
             reference_list: None,
             carried_key_name: None,
@@ -5724,7 +5724,7 @@ mod tests {
                 oaep_params: Some(label),
             },
             cipher_data: super::super::CipherData::Value {
-                value: STANDARD.encode(wrapped),
+                value: crate::base64::encode(&wrapped),
             },
             reference_list: None,
             carried_key_name: None,
@@ -5769,7 +5769,7 @@ mod tests {
                 oaep_params: None,
             },
             cipher_data: super::super::CipherData::Value {
-                value: STANDARD.encode(wrapped),
+                value: crate::base64::encode(&wrapped),
             },
             reference_list: None,
             carried_key_name: None,
@@ -5824,7 +5824,7 @@ mod tests {
                     oaep_params: None,
                 },
                 cipher_data: super::super::CipherData::Value {
-                    value: STANDARD.encode(wrapped),
+                    value: crate::base64::encode(&wrapped),
                 },
                 reference_list: None,
                 carried_key_name: None,
@@ -5862,7 +5862,7 @@ mod tests {
                 oaep_params: None,
             },
             cipher_data: super::super::CipherData::Value {
-                value: STANDARD.encode([0_u8; 256]),
+                value: crate::base64::encode(&[0_u8; 256]),
             },
             reference_list: None,
             carried_key_name: None,
@@ -5903,7 +5903,7 @@ mod tests {
                 oaep_params: None,
             },
             cipher_data: super::super::CipherData::Value {
-                value: STANDARD.encode([0_u8; 256]),
+                value: crate::base64::encode(&[0_u8; 256]),
             },
             reference_list: None,
             carried_key_name: None,
@@ -5999,7 +5999,7 @@ mod tests {
             },
             encrypted_keys: Vec::new(),
             cipher_data: super::super::CipherData::Value {
-                value: STANDARD.encode(ciphertext),
+                value: crate::base64::encode(&ciphertext),
             },
         };
         let policy = crate::policy::DecryptionPolicy {
@@ -6068,7 +6068,7 @@ mod tests {
         *encrypted
             .cipher_data
             .inline_value_mut()
-            .expect("inline ciphertext") = STANDARD.encode([0_u8; 28]);
+            .expect("inline ciphertext") = crate::base64::encode(&[0_u8; 28]);
         encrypted.encrypted_keys.push(EncryptedKey {
             sources: crate::xmlenc::EncryptionKeySources::default(),
             id: None,
@@ -6366,13 +6366,13 @@ mod tests {
                     oaep_params: None,
                 },
                 cipher_data: super::super::CipherData::Value {
-                    value: STANDARD.encode([0_u8; 256]),
+                    value: crate::base64::encode(&[0_u8; 256]),
                 },
                 reference_list: None,
                 carried_key_name: None,
             }],
             cipher_data: super::super::CipherData::Value {
-                value: STANDARD.encode(ciphertext),
+                value: crate::base64::encode(&ciphertext),
             },
         };
         let resolver = CountingResolver {
@@ -6432,13 +6432,13 @@ mod tests {
                     oaep_params: None,
                 },
                 cipher_data: super::super::CipherData::Value {
-                    value: STANDARD.encode([0_u8; 256]),
+                    value: crate::base64::encode(&[0_u8; 256]),
                 },
                 reference_list: None,
                 carried_key_name: None,
             }],
             cipher_data: super::super::CipherData::Value {
-                value: STANDARD.encode(ciphertext),
+                value: crate::base64::encode(&ciphertext),
             },
         };
         let resolver = CountingResolver {
@@ -6479,7 +6479,7 @@ mod tests {
             },
             encrypted_keys: Vec::new(),
             cipher_data: super::super::CipherData::Value {
-                value: STANDARD.encode(ciphertext),
+                value: crate::base64::encode(&ciphertext),
             },
         };
         let resolver = AllCallsResolver {
@@ -6532,13 +6532,13 @@ mod tests {
                     oaep_params: None,
                 },
                 cipher_data: super::super::CipherData::Value {
-                    value: STANDARD.encode([0_u8; 24]),
+                    value: crate::base64::encode(&[0_u8; 24]),
                 },
                 reference_list: None,
                 carried_key_name: None,
             }],
             cipher_data: super::super::CipherData::Value {
-                value: STANDARD.encode(ciphertext),
+                value: crate::base64::encode(&ciphertext),
             },
         };
         let resolver = CountingResolver {
@@ -7122,7 +7122,7 @@ mod tests {
             .unwrap_or_default();
         format!(
             "<xenc:EncryptedData{namespace}{data_type}{id}><xenc:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><xenc:CipherData><xenc:CipherValue>{}</xenc:CipherValue></xenc:CipherData></xenc:EncryptedData>",
-            STANDARD.encode(wire)
+            crate::base64::encode(&wire)
         )
     }
 }

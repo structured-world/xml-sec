@@ -300,7 +300,6 @@ fn context_whitespace_uses_the_operation_document_budget() {
 
 #[test]
 fn context_parameter_accepts_exact_wire_limit_and_rejects_malformed_base64() {
-    use base64::Engine;
     use pkcs8::EncodePrivateKey;
     use xml_sec::xmldsig::{EdDsaSigningKey, SignContext, SignatureAlgorithm};
     // RFC 8032 §5 permits exactly 255 octets. Whitespace and text-node
@@ -313,7 +312,9 @@ fn context_parameter_accepts_exact_wire_limit_and_rejects_malformed_base64() {
     let xml = template(algorithm);
     let marker = format!("<SignatureMethod Algorithm=\"{}\"/>", algorithm.uri());
     let with_context = |text: &str| xml.replace(&marker, &context_method(algorithm, text));
-    let encoded = base64::engine::general_purpose::STANDARD.encode([0x42; 255]);
+    let encoded = structured_base64::STANDARD
+        .encode(&[0x42; 255])
+        .expect("test encoding");
     let split = format!(
         " {}<!-- text boundary -->\n{} ",
         &encoded[..100],
@@ -325,7 +326,9 @@ fn context_parameter_accepts_exact_wire_limit_and_rejects_malformed_base64() {
             .is_ok()
     );
     for malformed in [
-        base64::engine::general_purpose::STANDARD.encode([0x42; 256]),
+        structured_base64::STANDARD
+            .encode(&[0x42; 256])
+            .expect("test encoding"),
         "Zh==".to_owned(),       // Nonzero unused trailing bits.
         "Zm9v=AAA".to_owned(),   // Padding before the final quantum.
         "Zm9v\u{a0}".to_owned(), // Not XML whitespace.

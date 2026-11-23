@@ -2,7 +2,6 @@
 
 use std::{borrow::Cow, sync::Arc};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use xml_sec::{
     provider::{
         CryptoProvider, KeyRecoveryKey, KeyTransportKey, ProviderCapability, ProviderError,
@@ -321,8 +320,12 @@ fn legacy_oaep_mgf_input_error_remains_constructible() {
 }
 
 fn external_encrypted_xml() -> String {
-    let wrapped = STANDARD.encode(vec![0xa5; 256]);
-    let ciphertext = STANDARD.encode(vec![0x5a; 46]);
+    let wrapped = structured_base64::STANDARD
+        .encode(&vec![0xa5; 256])
+        .expect("test encoding");
+    let ciphertext = structured_base64::STANDARD
+        .encode(&[0x5a; 46])
+        .expect("test encoding");
     format!(
         r#"<xenc:EncryptedData xmlns:xenc="http://www.w3.org/2001/04/xmlenc#"
              xmlns:xenc11="http://www.w3.org/2009/xmlenc11#"

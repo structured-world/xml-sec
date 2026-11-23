@@ -10,10 +10,9 @@
 
 use std::sync::Arc;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
 use structured_asn1::Parser;
 use structured_asn1::memory::{Memory, MemoryAccount};
+use structured_base64::STANDARD;
 use structured_pkix::Certificate;
 use structured_pkix::temporal::LeapTable;
 use xml_sec::XmlDocument;
@@ -59,7 +58,9 @@ fn encapsulated(xml: &str, local: &str) -> Vec<Vec<u8>> {
     for (start, _) in xml.match_indices(&open) {
         let start = start + open.len();
         let end = start + xml[start..].find(&close).expect("closed value");
-        let value = STANDARD.decode(&xml[start..end]).expect("base64 value");
+        let value = STANDARD
+            .decode(&xml.as_bytes()[start..end])
+            .expect("base64 value");
         if !values.contains(&value) {
             values.push(value);
         }
@@ -96,7 +97,7 @@ fn signer_key() -> VerificationKey {
     let start = B_T.find(open).expect("signer certificate") + open.len();
     let end = start + B_T[start..].find('<').expect("certificate end");
     let der: String = B_T[start..end].split_whitespace().collect();
-    let der = STANDARD.decode(der).expect("base64 certificate");
+    let der = STANDARD.decode(der.as_bytes()).expect("base64 certificate");
     let parser = Parser::der(account());
     let certificate = Certificate::read(&parser, &der, 0).expect("signer certificate");
     VerificationKey {
@@ -323,12 +324,22 @@ fn only_values_without_an_eligible_copy_are_added() {
         .iter()
         .find(|certificate| embedded(certificate))
         .expect("responder certificate");
-    assert_eq!(extended.matches(&STANDARD.encode(responder)).count(), 1);
+    assert_eq!(
+        extended
+            .matches(&STANDARD.encode(responder).expect("test encoding"))
+            .count(),
+        1
+    );
     for shared in certificates
         .iter()
         .filter(|certificate| !embedded(certificate))
     {
-        assert_eq!(extended.matches(&STANDARD.encode(shared)).count(), 2);
+        assert_eq!(
+            extended
+                .matches(&STANDARD.encode(shared).expect("test encoding"))
+                .count(),
+            2
+        );
     }
     let level = fixture.level(&extended, Requirements::LongTerm);
     assert!(matches!(level, Outcome::Assessed(true)), "{level:?}");
@@ -448,7 +459,12 @@ fn a_configured_responder_is_incorporated() {
     assert!(matches!(added, Ok(DataAdded::Published)), "{added:?}");
     let extended = document.as_xml().to_owned();
     // The signer and the TSA both need it; one general copy serves both.
-    assert_eq!(extended.matches(&STANDARD.encode(OUTSIDER)).count(), 1);
+    assert_eq!(
+        extended
+            .matches(&STANDARD.encode(OUTSIDER).expect("test encoding"))
+            .count(),
+        1
+    );
     let level = fixture.level(&extended, Requirements::LongTerm);
     assert!(matches!(level, Outcome::Assessed(true)), "{level:?}");
 }
@@ -460,7 +476,12 @@ fn a_timestamp_status_held_only_by_the_signature_is_copied_whole() {
     // timestamp. The caller supplies no response: the document's whole
     // OCSPResponse is copied into the general container.
     let responses = encapsulated(B_LT_UNCERTIFIED_RESPONDER, OCSP);
-    let element = |der: &Vec<u8>| format!("<{OCSP_TAG}>{}</{OCSP_TAG}>", STANDARD.encode(der));
+    let element = |der: &Vec<u8>| {
+        format!(
+            "<{OCSP_TAG}>{}</{OCSP_TAG}>",
+            STANDARD.encode(der).expect("test encoding")
+        )
+    };
     let (signer, tsa) = (element(&responses[0]), element(&responses[1]));
     let moved = B_LT_UNCERTIFIED_RESPONDER
         .replacen(
@@ -569,9 +590,11 @@ fn a_status_carried_only_by_another_token_is_copied_whole() {
     let start = B_LTA_RENEWED.rfind(open).expect("last token") + open.len();
     let end = start + B_LTA_RENEWED[start..].find('<').expect("token end");
     let token = STANDARD
-        .decode(&B_LTA_RENEWED[start..end])
+        .decode(&B_LTA_RENEWED.as_bytes()[start..end])
         .expect("base64 token");
-    let carried = STANDARD.encode(carrying(&token, tsa_status));
+    let carried = STANDARD
+        .encode(&carrying(&token, tsa_status))
+        .expect("test encoding");
     let document_xml = format!(
         "{}{carried}{}",
         &B_LTA_RENEWED[..start],

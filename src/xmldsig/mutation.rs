@@ -427,7 +427,8 @@ pub(super) fn padded_base64_len_for_xml(
     decoded_len: usize,
     policy: &crate::policy::SigningPolicy,
 ) -> Result<usize, XmlMutationError> {
-    base64::encoded_len(decoded_len, true)
+    structured_base64::STANDARD
+        .encoded_len(decoded_len)
         .ok_or_else(|| projected_xml_length_overflow(Some(policy)))
 }
 

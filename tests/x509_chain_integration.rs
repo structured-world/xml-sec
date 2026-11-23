@@ -2,7 +2,6 @@
 
 use std::{fs, path::Path};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use der::{Decode as _, Encode as _, asn1::BitString};
 use rcgen::SigningKey as _;
 use rcgen::{
@@ -10,6 +9,7 @@ use rcgen::{
     CrlIssuingDistributionPoint, CrlScope, IsCa, Issuer, KeyIdMethod, KeyPair, KeyUsagePurpose,
     RevokedCertParams, SerialNumber, date_time_ymd,
 };
+use structured_base64::STANDARD;
 use xml_sec::XmlDomDocument as Document;
 use xml_sec::policy::Instant;
 use xml_sec::xmldsig::{
@@ -185,7 +185,7 @@ fn pem_der(path: impl AsRef<Path>) -> Vec<u8> {
         })
         .collect::<String>();
     STANDARD
-        .decode(payload)
+        .decode(payload.as_bytes())
         .expect("fixture PEM should contain base64 DER")
 }
 
@@ -198,11 +198,22 @@ fn fixture(path: &str) -> Vec<u8> {
 }
 
 fn parsed_chain(leaf_path: &str, crl: Option<Vec<u8>>) -> X509DataInfo {
-    let leaf = STANDARD.encode(fixture(leaf_path));
-    let intermediate = STANDARD.encode(fixture("ca2cert.pem"));
-    let root = STANDARD.encode(fixture("cacert.pem"));
+    let leaf = structured_base64::STANDARD
+        .encode(&fixture(leaf_path))
+        .expect("test encoding");
+    let intermediate = structured_base64::STANDARD
+        .encode(&fixture("ca2cert.pem"))
+        .expect("test encoding");
+    let root = structured_base64::STANDARD
+        .encode(&fixture("cacert.pem"))
+        .expect("test encoding");
     let crl = crl
-        .map(|der| format!("<X509CRL>{}</X509CRL>", STANDARD.encode(der)))
+        .map(|der| {
+            format!(
+                "<X509CRL>{}</X509CRL>",
+                STANDARD.encode(&der).expect("test encoding")
+            )
+        })
         .unwrap_or_default();
     let xml = format!(
         r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"><X509Data>

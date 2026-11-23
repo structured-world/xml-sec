@@ -60,6 +60,10 @@ pub mod api;
 #[cfg(all(doctest, feature = "xmldsig", feature = "std"))]
 #[doc = include_str!("../docs/examples/dcc-signature-verification.md")]
 pub struct DccSignatureVerificationGuide;
+// Generated XML values are signing and encryption output; tests also build
+// fixtures with it in verification-only builds.
+#[cfg(any(feature = "xmldsig-sign", all(test, feature = "xmldsig")))]
+mod base64;
 #[cfg(feature = "benchmark-internals")]
 #[doc(hidden)]
 pub mod benchmark_support;

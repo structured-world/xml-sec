@@ -4,8 +4,8 @@
 
 use std::{collections::BTreeMap, sync::Arc};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
+use structured_base64::STANDARD;
 use xml_sec::{
     XmlDocument,
     c14n::{C14nAlgorithm, C14nMode},
@@ -62,7 +62,7 @@ fn signed_with(key_info: &str, object: &str) -> XmlDocument {
 fn certificate_element(id: &str, der: &[u8]) -> String {
     format!(
         "<X509Certificate xmlns=\"{DS}\" Id=\"{id}\">{}</X509Certificate>",
-        STANDARD.encode(der)
+        STANDARD.encode(der).expect("test encoding")
     )
 }
 
@@ -128,7 +128,7 @@ fn every_offered_material_is_visited_with_its_own_element() {
          <KeyValue Id=\"value\"><RSAKeyValue><Modulus>AQAB</Modulus><Exponent>AQAB</Exponent></RSAKeyValue></KeyValue>\
          </KeyInfo>",
         certificate_element("leaf", &signing_certificate()),
-        STANDARD.encode(other_public_key()),
+        STANDARD.encode(&other_public_key()).expect("test encoding"),
     );
     let document = signed_with(&key_info, "");
     let resolver = DefaultKeyResolver::default();

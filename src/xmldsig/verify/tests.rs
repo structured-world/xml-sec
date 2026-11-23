@@ -10,7 +10,6 @@ use crate::xmldsig::digest::DigestAlgorithm;
 use crate::xmldsig::parse::{Reference, parse_signed_info};
 use crate::xmldsig::transforms::Transform;
 use crate::xmldsig::uri::UriReferenceResolver;
-use base64::Engine;
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -117,10 +116,8 @@ fn reference_resolution_uses_each_elements_effective_xml_base() {
     // caller-owned resources and must not collide in the resolver.
     let first = b"first payload";
     let second = b"second payload";
-    let first_digest = base64::engine::general_purpose::STANDARD
-        .encode(compute_digest(DigestAlgorithm::Sha256, first));
-    let second_digest = base64::engine::general_purpose::STANDARD
-        .encode(compute_digest(DigestAlgorithm::Sha256, second));
+    let first_digest = crate::base64::encode(&compute_digest(DigestAlgorithm::Sha256, first));
+    let second_digest = crate::base64::encode(&compute_digest(DigestAlgorithm::Sha256, second));
     let xml = format!(
         r#"<root xml:base="https://example.test/base/" xmlns:ds="{XMLDSIG_NS}">
                 <ds:Signature><ds:SignedInfo>
@@ -170,8 +167,7 @@ fn lazy_external_resources_are_fetched_only_after_the_signature_value_verifies()
     // A forged SignatureValue fails before any reference is dereferenced, so
     // the caller's source is never asked for the URI the forgery names; an
     // authentic one fetches the resource once, when its Reference is digested.
-    let digest = base64::engine::general_purpose::STANDARD
-        .encode(compute_digest(DigestAlgorithm::Sha256, b"payload"));
+    let digest = crate::base64::encode(&compute_digest(DigestAlgorithm::Sha256, b"payload"));
     let xml = format!(
         r#"<root xmlns:ds="{XMLDSIG_NS}">
   <ds:Signature>
@@ -242,7 +238,7 @@ fn internal_dtd_opt_in_applies_to_detached_xml_transforms() {
     // The parse policy covers every XML document in one verification
     // pipeline, including caller-owned octets converted to a node-set.
     let detached = b"<!DOCTYPE payload [<!ELEMENT payload (#PCDATA)>]><payload>ok</payload>";
-    let digest = base64::engine::general_purpose::STANDARD.encode(compute_digest(
+    let digest = crate::base64::encode(&compute_digest(
         DigestAlgorithm::Sha256,
         b"<payload>ok</payload>",
     ));
@@ -338,7 +334,7 @@ fn owned_verification_revalidates_internal_dtd_provenance() {
 fn verification_policy_bounds_reference_canonicalization() {
     // Reference transforms and SignedInfo canonicalization are one operation;
     // references must not fall back to the transform hard-limit budget.
-    let digest = base64::engine::general_purpose::STANDARD.encode([0_u8; 32]);
+    let digest = crate::base64::encode(&[0_u8; 32]);
     let xml = format!(
         r#"<root xmlns:ds="{XMLDSIG_NS}"><payload>{}</payload><ds:Signature><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI=""><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AQ==</ds:SignatureValue></ds:Signature></root>"#,
         "payload".repeat(16)
@@ -439,7 +435,7 @@ fn verification_entry_points_enforce_policy_depth() {
 fn verification_policy_bounds_base64_transform_input() {
     // The operation snapshot must reach the transform executor rather than
     // silently falling back to its implementation-wide default budget.
-    let digest = base64::engine::general_purpose::STANDARD.encode([0_u8; 32]);
+    let digest = crate::base64::encode(&[0_u8; 32]);
     let xml = format!(
         r##"<root xmlns:ds="{XMLDSIG_NS}"><payload ID="payload">QUJDRA==</payload><ds:Signature><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#payload"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#base64"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AQ==</ds:SignatureValue></ds:Signature></root>"##
     );
@@ -471,10 +467,8 @@ fn verification_policy_bounds_base64_transform_input() {
 fn verification_policy_bounds_cumulative_base64_transform_output() {
     // References share one operation budget. Validating each decoded value
     // against the full ceiling would let a signature multiply output work.
-    let first_digest = base64::engine::general_purpose::STANDARD
-        .encode(compute_digest(DigestAlgorithm::Sha256, b"a"));
-    let second_digest = base64::engine::general_purpose::STANDARD
-        .encode(compute_digest(DigestAlgorithm::Sha256, b"b"));
+    let first_digest = crate::base64::encode(&compute_digest(DigestAlgorithm::Sha256, b"a"));
+    let second_digest = crate::base64::encode(&compute_digest(DigestAlgorithm::Sha256, b"b"));
     let xml = format!(
         r##"<root xmlns:ds="{XMLDSIG_NS}"><first ID="first">YQ==</first><second ID="second">Yg==</second><ds:Signature><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#first"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#base64"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{first_digest}</ds:DigestValue></ds:Reference><ds:Reference URI="#second"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#base64"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{second_digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AQ==</ds:SignatureValue></ds:Signature></root>"##
     );
@@ -507,7 +501,7 @@ fn verification_policy_bounds_cumulative_base64_transform_output() {
 fn verification_policy_bounds_xpath_source_before_compilation() {
     // XPath parser limits are part of the same operation snapshot as the
     // evaluator limits; parsing cannot use a separate hard-coded budget.
-    let digest = base64::engine::general_purpose::STANDARD.encode([0_u8; 32]);
+    let digest = crate::base64::encode(&[0_u8; 32]);
     let xml = format!(
         r#"<root xmlns:ds="{XMLDSIG_NS}"><ds:Signature><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI=""><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>true()</ds:XPath></ds:Transform></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AQ==</ds:SignatureValue></ds:Signature></root>"#
     );
@@ -542,7 +536,7 @@ fn verification_policy_shares_canonicalization_budget_with_signed_info() {
     // two separate copies of the configured canonicalization allowance.
     let payload_text = "x".repeat(700);
     let canonical_payload = format!("<payload ID=\"payload\">{payload_text}</payload>");
-    let digest = base64::engine::general_purpose::STANDARD.encode(compute_digest(
+    let digest = crate::base64::encode(&compute_digest(
         DigestAlgorithm::Sha256,
         canonical_payload.as_bytes(),
     ));
@@ -583,7 +577,7 @@ fn manifest_processing_stops_after_c14n_budget_exhaustion() {
     // A failed bounded render consumes the remaining operation allowance.
     // Later Manifest references, including cheap binary ones, must not run:
     // the operation ends with the typed limit and returns no results.
-    let digest = base64::engine::general_purpose::STANDARD.encode([0_u8; 32]);
+    let digest = crate::base64::encode(&[0_u8; 32]);
     let xml = format!(
         r##"<root xmlns:ds="{XMLDSIG_NS}"><payload Id="payload">too large</payload><ds:Signature><ds:Object Id="signed-object"><ds:Manifest><ds:Reference URI="#payload"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference><ds:Reference URI="urn:small"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:Manifest></ds:Object></ds:Signature></root>"##
     );
@@ -659,7 +653,7 @@ fn verification_policy_bounds_detached_xml_nodes() {
     // Caller-owned detached octets become a second XML document during a
     // node-set transform and must inherit the same operation node ceiling.
     let detached = format!("<payload>{}</payload>", "<n/>".repeat(32));
-    let digest = base64::engine::general_purpose::STANDARD.encode([0_u8; 32]);
+    let digest = crate::base64::encode(&[0_u8; 32]);
     let xml = format!(
         r#"<root xmlns:ds="{XMLDSIG_NS}"><ds:Signature><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="urn:detached-nodes"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>true()</ds:XPath></ds:Transform></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AQ==</ds:SignatureValue></ds:Signature></root>"#
     );
@@ -703,8 +697,7 @@ fn query_only_reference_resolves_against_relative_xml_base() {
     // A query-only URI replaces the inherited base query without changing
     // its relative path; no absolute document base is required by XML Base.
     let payload = b"query-selected payload";
-    let digest = base64::engine::general_purpose::STANDARD
-        .encode(compute_digest(DigestAlgorithm::Sha256, payload));
+    let digest = crate::base64::encode(&compute_digest(DigestAlgorithm::Sha256, payload));
     let xml = format!(
         r#"<ds:Signature xmlns:ds="{XMLDSIG_NS}"><ds:SignedInfo>
                 <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
@@ -736,8 +729,7 @@ fn manifest_reference_resolution_uses_its_effective_xml_base() {
     // Manifest references carry their own XML Base context and must not
     // accidentally reuse the SignedInfo or Signature element context.
     let payload = b"manifest payload";
-    let digest = base64::engine::general_purpose::STANDARD
-        .encode(compute_digest(DigestAlgorithm::Sha256, payload));
+    let digest = crate::base64::encode(&compute_digest(DigestAlgorithm::Sha256, payload));
     let xml = format!(
         r#"<ds:Signature xmlns:ds="{XMLDSIG_NS}" xml:base="https://example.test/">
                 <ds:Object><ds:Manifest xml:base="manifests/">
@@ -779,8 +771,7 @@ fn manifest_reference_index_ignores_nested_manifest_descendants() {
     // The public Manifest index follows Signature/Object/Manifest structure;
     // wrapper descendants must not steal an index and supply another base URI.
     let payload = b"direct manifest payload";
-    let digest = base64::engine::general_purpose::STANDARD
-        .encode(compute_digest(DigestAlgorithm::Sha256, payload));
+    let digest = crate::base64::encode(&compute_digest(DigestAlgorithm::Sha256, payload));
     let xml = format!(
         r#"<ds:Signature xmlns:ds="{XMLDSIG_NS}" xml:base="https://example.test/">
                 <ds:Object><wrapper><ds:Manifest xml:base="nested/">
@@ -1661,7 +1652,7 @@ fn signature_with_target_content(signature_value_b64: &str, content: &str) -> St
     let pre_digest =
         crate::xmldsig::execute_transforms(sig_node, initial_data, &reference.transforms).unwrap();
     let digest = compute_digest(reference.digest_method, &pre_digest);
-    let digest_b64 = base64::engine::general_purpose::STANDARD.encode(digest);
+    let digest_b64 = crate::base64::encode(&digest);
     xml_template
         .replace("AAAAAAAAAAAAAAAAAAAAAAAAAAA=", &digest_b64)
         .replace("SIGNATURE_VALUE_PLACEHOLDER", signature_value_b64)
@@ -1841,7 +1832,7 @@ fn verify_context_meters_repeated_external_dereferences() {
     // One caller-owned entry can be referenced repeatedly. The aggregate
     // ceiling bounds bytes cloned and processed, not just unique map data.
     let payload = b"payload";
-    let digest = base64::engine::general_purpose::STANDARD.encode(crate::xmldsig::compute_digest(
+    let digest = crate::base64::encode(&crate::xmldsig::compute_digest(
         DigestAlgorithm::Sha1,
         payload,
     ));
@@ -1885,7 +1876,7 @@ fn lazy_resources_are_fetched_one_by_one_within_the_aggregate_allowance() {
     // source is asked for a resource only when its Reference is digested, so
     // the aggregate ceiling refuses the second before the third is fetched.
     let payload = b"payload";
-    let digest = base64::engine::general_purpose::STANDARD.encode(crate::xmldsig::compute_digest(
+    let digest = crate::base64::encode(&crate::xmldsig::compute_digest(
         DigestAlgorithm::Sha1,
         payload,
     ));
@@ -1952,7 +1943,7 @@ fn a_lazy_resource_past_its_limit_is_neither_kept_nor_followed_by_more_work() {
     // for. An operation with room for it fetches it again, as nothing of
     // the refused one was kept.
     let payload = [0x41_u8; 16];
-    let digest = base64::engine::general_purpose::STANDARD.encode(crate::xmldsig::compute_digest(
+    let digest = crate::base64::encode(&crate::xmldsig::compute_digest(
         DigestAlgorithm::Sha1,
         &payload,
     ));
@@ -2226,8 +2217,8 @@ where
     let initial_data = resolver.dereference("#target").unwrap();
     let manifest_pre_digest =
         crate::xmldsig::execute_transforms(signature_node, initial_data, &[]).unwrap();
-    let computed_manifest_digest_b64 = base64::engine::general_purpose::STANDARD
-        .encode(compute_digest(DigestAlgorithm::Sha1, &manifest_pre_digest));
+    let computed_manifest_digest_b64 =
+        crate::base64::encode(&compute_digest(DigestAlgorithm::Sha1, &manifest_pre_digest));
     let final_manifest_digest_b64 = if valid_manifest_digest {
         computed_manifest_digest_b64.as_str()
     } else {
@@ -2264,7 +2255,7 @@ where
         &object_reference.transforms,
     )
     .unwrap();
-    let signed_digest_b64 = base64::engine::general_purpose::STANDARD.encode(compute_digest(
+    let signed_digest_b64 = crate::base64::encode(&compute_digest(
         object_reference.digest_method,
         &signed_pre_digest,
     ));
@@ -2687,10 +2678,7 @@ fn verify_context_applies_digest_policy_to_manifest_references() {
             .find("</ds:DigestValue>")
             .map(|relative| value_start + relative)
             .expect("Manifest DigestValue must be closed");
-        xml.replace_range(
-            value_start..value_end,
-            &base64::engine::general_purpose::STANDARD.encode([0_u8; 32]),
-        );
+        xml.replace_range(value_start..value_end, &crate::base64::encode(&[0_u8; 32]));
         xml
     });
     let result = VerifyContext::new()
@@ -2878,7 +2866,7 @@ fn only_a_reference_that_obtained_its_bytes_has_resident_evidence() {
     // evidence nor the fingerprint of the bytes the first one fetched.
     const XPATH: &str = "http://www.w3.org/TR/1999/REC-xpath-19991116";
     let payload = b"payload";
-    let digest = base64::engine::general_purpose::STANDARD.encode(crate::xmldsig::compute_digest(
+    let digest = crate::base64::encode(&crate::xmldsig::compute_digest(
         DigestAlgorithm::Sha256,
         payload,
     ));
@@ -3117,7 +3105,7 @@ fn unsigned_manifest_remains_eligible_after_trust_expands() {
     // The second Object is not authenticated during the first discovery
     // pass. It must remain unprocessed so a valid reference from the first
     // Manifest can make its sibling Manifest eligible on the next pass.
-    let digest = base64::engine::general_purpose::STANDARD.encode([0_u8; 32]);
+    let digest = crate::base64::encode(&[0_u8; 32]);
     let xml = format!(
         r##"<ds:Signature xmlns:ds="{XMLDSIG_NS}"><ds:Object Id="outer"><ds:Manifest><ds:Reference URI="#inner"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:Manifest></ds:Object><ds:Object Id="inner"><ds:Manifest><ds:Reference URI="#payload"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:Manifest></ds:Object></ds:Signature>"##
     );
@@ -4835,9 +4823,10 @@ fn valid_signature_gives_every_reference_its_own_result() {
     // Reference no longer hides the later ones; the overall status names the
     // first failure in document order and stays Invalid.
     let payload = b"payload";
-    let payload_digest = base64::engine::general_purpose::STANDARD.encode(
-        crate::xmldsig::compute_digest(DigestAlgorithm::Sha1, payload),
-    );
+    let payload_digest = crate::base64::encode(&crate::xmldsig::compute_digest(
+        DigestAlgorithm::Sha1,
+        payload,
+    ));
     let xml = signature_with_references(&[
         &sha1_reference("", "AAAAAAAAAAAAAAAAAAAAAAAAAAA="),
         &sha1_reference("#missing", "AAAAAAAAAAAAAAAAAAAAAAAAAAA="),
@@ -4886,9 +4875,10 @@ fn undecodable_detached_xml_fails_only_its_reference() {
         )
     };
     let payload = b"payload";
-    let payload_digest = base64::engine::general_purpose::STANDARD.encode(
-        crate::xmldsig::compute_digest(DigestAlgorithm::Sha1, payload),
-    );
+    let payload_digest = crate::base64::encode(&crate::xmldsig::compute_digest(
+        DigestAlgorithm::Sha1,
+        payload,
+    ));
     let xml = signature_with_references(&[
         &c14n_reference("urn:invalid-utf8"),
         &c14n_reference("urn:unknown-encoding"),
@@ -5151,7 +5141,7 @@ fn resolver_receives_the_certificate_account_spent_by_ingestion() {
         .expect("empty SAN list")
         .self_signed(&pair)
         .expect("test certificate");
-    let encoded = base64::engine::general_purpose::STANDARD.encode(certificate.der());
+    let encoded = crate::base64::encode(certificate.der());
     let xml = signature_with_target_reference("AQ==").replace("</ds:Signature>", &format!(
             "<ds:KeyInfo><ds:X509Data><ds:X509Certificate>{encoded}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></ds:Signature>",
         ));
@@ -5170,7 +5160,7 @@ fn resolver_receives_the_certificate_account_spent_by_ingestion() {
 fn verification_candidate_budget_precedes_embedded_x509_parsing() {
     // The first certificate is valid and consumes the sole permitted slot;
     // malformed bytes in the second must never reach the X.509 parser.
-    let first_certificate = base64::engine::general_purpose::STANDARD.encode(include_bytes!(
+    let first_certificate = crate::base64::encode(include_bytes!(
         "../../../tests/fixtures/xmldsig/phaos-xmldsig-three/certs/rsa-cert.der"
     ));
     let xml = signature_with_target_reference("AQ==").replace(
@@ -5766,7 +5756,7 @@ fn fragmented_pq_signature_value_decodes_at_exact_wire_limit() {
     // decoding must preserve bytes and reject an oversized aggregate.
     let parameter = super::super::pq_algorithm::PqAlgorithm::SlhDsaSha2_256f;
     let bytes = vec![0x5a; parameter.signature_len()];
-    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let encoded = crate::base64::encode(&bytes);
     let mut xml = String::from("<SignatureValue>");
     for chunk in encoded.as_bytes().chunks(4) {
         xml.push_str(std::str::from_utf8(chunk).unwrap());
@@ -5812,10 +5802,9 @@ fn push_normalized_signature_text_rejects_form_feed() {
     .expect_err("form-feed must not be treated as XML base64 whitespace");
     assert!(matches!(
         err,
-        SignatureVerificationPipelineError::SignatureValueBase64(base64::DecodeError::InvalidByte(
-            _,
-            0x0C
-        ))
+        SignatureVerificationPipelineError::SignatureValueBase64(
+            structured_base64::Base64Error::InvalidByte(_, 0x0C)
+        )
     ));
 }
 

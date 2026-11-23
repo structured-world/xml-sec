@@ -4194,15 +4194,11 @@ mod tests {
     #[cfg(feature = "xmldsig")]
     #[test]
     fn rustcrypto_provider_verifies_dsa_certificate_signature_at_q_width() {
-        use base64::Engine as _;
-
         // OpenSSL-generated L=2048/N=224 DSA material. X.509 carries DER r/s
         // integers at q width, not XMLDSig's legacy fixed 20-byte components.
-        let spki = base64::engine::general_purpose::STANDARD
-            .decode("MIIDQzCCAjYGByqGSM44BAEwggIpAoIBAQDEkm7mUEj1dizQRRrcU6ehyhpQ1NAkcKi9XyNcBJDZlyTdVH09XZ04UZNuXAWRL1hEDvDAvFimuwmW7k099j0PRM+WypsfOOgZPJhIVNZu9poTPGINKpbMTXFmR+qhrYM4z+NSKxuUBWZwX5HibBIG5INbx8IDHWAxZqxgHQsebDej1+yZyCTTpmDS9nKGkBRVaxsJgZt958UPNlIz1ECf4n4P4mPLAl7W5xV8VSWMqlXdkOAPbLC/mChjFoCj0jmCQpbcOvd7a6cWhcyhw/yikoVoKEPNWr9xLtdJV37f1/4q/xTvoPKWhMmgMQ/DigUnYgPzmexyS82m5HLZ/vOJAh0A/ckrg9g9PsZesUsH/4bEijeNwWGXB5e+/LCt0QKCAQEAuBGFzyjZEmvbDKbb+8tz+zqw4lK7RGwOjVM3v9xPS6LuG5L1OwCNQcUcVIsU9VxBnEx9oMnl8eVX1nq3kfdiZB2F9ESxwX5FzBt+KLjMOzBa8rPlzVcyCZ3sT3orAQ2D/q7ffDhTCUt+v8UNiAhVbaNnR/vI7AkVoP9crRjpOSV/7b5MGa0BcjIyEzTtqM58wppfSQt8jkj7WT3+Bww/Y9rOtshDE2QosaX/7xoDnzyeZ3amLjTe3/MjBcsKlbK2z4QuaI6xoQBVd/QjP8FjXpZBhXWFIAsOL/sz6uR2Er0ovdX8DBA0EJpuzlTX94Lvf+Eh+5/83ESAm97fk4pnhQOCAQUAAoIBAEwSwKuLFPeR7UJGXkWM9egyYewhqHpIXPBEWOVPqwTw3xLc3EkufpYY9wkhJS08KD+J92jMjm//0bYeVf7fXisc6PHtGY4wx5XBm1g9HKw9lwRjbk7nH495dlZdl0BXHa14TJ8myE2zOM1jsaFyz6jAFTaRnKYIj6WlKOj59d2iAXtLZRme9r+7U4G6zDUkphyIEcIGH4vhb6gm3URr1zAV5kJjTlsPAiqgeH/PgxU52tmvLphJgv/xPxsuX5W0/s7iKbphIb2YWh/gtTWXvRQHiQQ2fCncI3TAMnZ75dBY0gPOVLQJhUyffeRbk9UULux/jc8QBPgKBS7GM5DnNSw=")
+        let spki = structured_base64::STANDARD.decode("MIIDQzCCAjYGByqGSM44BAEwggIpAoIBAQDEkm7mUEj1dizQRRrcU6ehyhpQ1NAkcKi9XyNcBJDZlyTdVH09XZ04UZNuXAWRL1hEDvDAvFimuwmW7k099j0PRM+WypsfOOgZPJhIVNZu9poTPGINKpbMTXFmR+qhrYM4z+NSKxuUBWZwX5HibBIG5INbx8IDHWAxZqxgHQsebDej1+yZyCTTpmDS9nKGkBRVaxsJgZt958UPNlIz1ECf4n4P4mPLAl7W5xV8VSWMqlXdkOAPbLC/mChjFoCj0jmCQpbcOvd7a6cWhcyhw/yikoVoKEPNWr9xLtdJV37f1/4q/xTvoPKWhMmgMQ/DigUnYgPzmexyS82m5HLZ/vOJAh0A/ckrg9g9PsZesUsH/4bEijeNwWGXB5e+/LCt0QKCAQEAuBGFzyjZEmvbDKbb+8tz+zqw4lK7RGwOjVM3v9xPS6LuG5L1OwCNQcUcVIsU9VxBnEx9oMnl8eVX1nq3kfdiZB2F9ESxwX5FzBt+KLjMOzBa8rPlzVcyCZ3sT3orAQ2D/q7ffDhTCUt+v8UNiAhVbaNnR/vI7AkVoP9crRjpOSV/7b5MGa0BcjIyEzTtqM58wppfSQt8jkj7WT3+Bww/Y9rOtshDE2QosaX/7xoDnzyeZ3amLjTe3/MjBcsKlbK2z4QuaI6xoQBVd/QjP8FjXpZBhXWFIAsOL/sz6uR2Er0ovdX8DBA0EJpuzlTX94Lvf+Eh+5/83ESAm97fk4pnhQOCAQUAAoIBAEwSwKuLFPeR7UJGXkWM9egyYewhqHpIXPBEWOVPqwTw3xLc3EkufpYY9wkhJS08KD+J92jMjm//0bYeVf7fXisc6PHtGY4wx5XBm1g9HKw9lwRjbk7nH495dlZdl0BXHa14TJ8myE2zOM1jsaFyz6jAFTaRnKYIj6WlKOj59d2iAXtLZRme9r+7U4G6zDUkphyIEcIGH4vhb6gm3URr1zAV5kJjTlsPAiqgeH/PgxU52tmvLphJgv/xPxsuX5W0/s7iKbphIb2YWh/gtTWXvRQHiQQ2fCncI3TAMnZ75dBY0gPOVLQJhUyffeRbk9UULux/jc8QBPgKBS7GM5DnNSw=".as_bytes())
             .expect("DSA SPKI fixture must decode");
-        let signature = base64::engine::general_purpose::STANDARD
-            .decode("MD0CHQChtB1c+f5BmTJCtT7Gi4cyQiR2igj0znRQYCJ3Ahw4NGg4pL5jgA8Ri07ESV9Yr90WfUmRrbRcnjsY")
+        let signature = structured_base64::STANDARD.decode("MD0CHQChtB1c+f5BmTJCtT7Gi4cyQiR2igj0znRQYCJ3Ahw4NGg4pL5jgA8Ri07ESV9Yr90WfUmRrbRcnjsY".as_bytes())
             .expect("DSA signature fixture must decode");
         let message = b"certificate tbs bytes for dsa q-width regression";
 

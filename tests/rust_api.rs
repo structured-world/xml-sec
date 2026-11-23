@@ -913,7 +913,6 @@ fn detached_signatures_use_only_request_supplied_external_bytes() {
 fn recovery_request_ids_and_external_ciphertext_are_not_implicit() {
     // Same-document references need the caller's ID registration, and detached
     // ciphertext needs both compiled URI permission and the supplied map.
-    use base64::Engine;
     use xml_sec::xmlenc::{
         CipherData, DataEncryptionAlgorithm, DecryptedContent, EncryptedDataBuilder,
         SymmetricKeyDecryptor, parse_encrypted_data,
@@ -959,8 +958,8 @@ fn recovery_request_ids_and_external_ciphertext_are_not_implicit() {
         document.as_xml(),
         format!("<root><p>secret</p><cipher Token='cipher'>{value}</cipher></root>")
     );
-    let ciphertext = base64::engine::general_purpose::STANDARD
-        .decode(value)
+    let ciphertext = structured_base64::STANDARD
+        .decode(value.as_bytes())
         .unwrap();
     let inputs = std::collections::BTreeMap::from([("urn:test:cipher".into(), ciphertext)]);
     let detached = format!(

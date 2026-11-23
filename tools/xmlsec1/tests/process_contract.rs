@@ -6,7 +6,6 @@ use std::{
     process::{Command, Stdio},
 };
 
-use base64::Engine as _;
 use der::{Encode as _, asn1::UintRef};
 use p256::SecretKey as P256SecretKey;
 use p384::SecretKey as P384SecretKey;
@@ -38,6 +37,13 @@ use xml_sec::{
 
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_xmlsec1")
+}
+
+/// The canonical Base64 text of `bytes`.
+fn base64(bytes: &[u8]) -> String {
+    structured_base64::STANDARD
+        .encode(bytes)
+        .expect("test encoding")
 }
 
 /// Run `command`, require success, and return its standard output.
@@ -81,7 +87,9 @@ fn opc_relationship_cli_uses_the_2012_contract() {
         String::from_utf8_lossy(&signed.stderr)
     );
     let empty = format!("<Relationships xmlns=\"{namespace}\"></Relationships>");
-    let digest = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(empty.as_bytes()));
+    let digest = structured_base64::STANDARD
+        .encode(&Sha256::digest(empty.as_bytes()))
+        .expect("test encoding");
     assert!(
         fs::read_to_string(temp.path().join("signed.xml"))
             .unwrap()
@@ -118,7 +126,7 @@ fn url_maps_do_not_authorize_external_key_retrieval() {
     let certificate =
         pem::parse(fs::read(root.join("tests/fixtures/keys/rsa/rsa-2048-cert.pem")).unwrap())
             .unwrap();
-    let encoded = base64::engine::general_purpose::STANDARD.encode(certificate.contents());
+    let encoded = base64(certificate.contents());
     let mapped = directory.path().join("payload.der");
     fs::write(&mapped, certificate.contents()).unwrap();
     for (uri, kind, accepted) in [
@@ -235,7 +243,7 @@ fn decrypt_nested_wrapping_keys_through_the_cli() {
     let outer = default_provider()
         .wrap_key(wrap, &intermediate, &content)
         .unwrap();
-    let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    let encode = base64;
     let inner = format!(
         "<xenc:EncryptedKey><xenc:EncryptionMethod Algorithm='{}'/><ds:KeyInfo><ds:KeyName>root</ds:KeyName></ds:KeyInfo><xenc:CipherData><xenc:CipherValue>{}</xenc:CipherValue></xenc:CipherData></xenc:EncryptedKey>",
         wrap.uri(),
@@ -448,7 +456,9 @@ fn symmetric_recipient_wraps_are_executable_through_cli() {
         } else {
             "DESKeyValue"
         };
-        let encoded = base64::engine::general_purpose::STANDARD.encode([0x31; 24]);
+        let encoded = structured_base64::STANDARD
+            .encode(&[0x31; 24])
+            .expect("test encoding");
         fs::write(&store, format!("<Keys xmlns='http://www.aleksey.com/xmlsec/2002'><ds:KeyInfo xmlns:ds='http://www.w3.org/2000/09/xmldsig#'><ds:KeyName>kek</ds:KeyName><ds:KeyValue><{value_name}>{encoded}</{value_name}></ds:KeyValue></ds:KeyInfo></Keys>")).unwrap();
         let result = Command::new(binary())
             .args(["encrypt", "--keys-file"])
@@ -1183,7 +1193,7 @@ fn traditional_dsa_private_key_pem(der: &[u8]) -> String {
 }
 
 fn pem_text(label: &str, der: &[u8]) -> String {
-    let encoded = base64::engine::general_purpose::STANDARD.encode(der);
+    let encoded = base64(der);
     let body = encoded
         .as_bytes()
         .chunks(64)
@@ -1563,7 +1573,9 @@ fn key_store_supplies_named_hmac_key_for_sign_and_verify() {
     let key_store = temp.path().join("keys.xml");
     let signed = temp.path().join("signed.xml");
     let secret = fs::read(project_root().join("tests/fixtures/keys/hmackey.bin")).unwrap();
-    let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, secret);
+    let encoded = structured_base64::STANDARD
+        .encode(&secret)
+        .expect("test encoding");
     fs::write(
         &key_store,
         format!(
@@ -1674,15 +1686,14 @@ fn lax_key_store_verification_skips_incompatible_family() {
         fs::read_to_string(project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem"))
             .unwrap();
     let public = RsaPublicKey::from_public_key_pem(&public_pem).unwrap();
-    let base64 = base64::engine::general_purpose::STANDARD;
     let store = temp.path().join("keys.xml");
     fs::write(
         &store,
         format!(
             "<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\">{}<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>rsa</KeyName><KeyValue><RSAKeyValue><Modulus>{}</Modulus><Exponent>{}</Exponent></RSAKeyValue></KeyValue></KeyInfo></Keys>",
             &donor[dsa_start..dsa_end],
-            base64.encode(public.n().to_be_bytes_trimmed_vartime()),
-            base64.encode(public.e().to_be_bytes_trimmed_vartime()),
+            base64(&public.n().to_be_bytes_trimmed_vartime()),
+            base64(&public.e().to_be_bytes_trimmed_vartime()),
         ),
     )
     .unwrap();
@@ -1876,7 +1887,7 @@ fn check_lax_dsa_search(
 }
 
 fn encode_component(value: &[u8]) -> String {
-    base64::engine::general_purpose::STANDARD.encode(value)
+    base64(value)
 }
 
 /// Sign the Merlin DSA template with the 1024-bit key and verify it; return
@@ -2647,15 +2658,14 @@ fn rsa_key_value_with_leading_zeroes(
     modulus_zeroes: usize,
     exponent_zeroes: usize,
 ) -> String {
-    let base64 = &base64::engine::general_purpose::STANDARD;
     let mut modulus = vec![0; modulus_zeroes];
     modulus.extend(public_key.n().to_be_bytes_trimmed_vartime());
     let mut exponent = vec![0; exponent_zeroes];
     exponent.extend(public_key.e().to_be_bytes_trimmed_vartime());
     format!(
         "<ds:KeyValue><ds:RSAKeyValue><ds:Modulus>{}</ds:Modulus><ds:Exponent>{}</ds:Exponent></ds:RSAKeyValue></ds:KeyValue>",
-        base64.encode(modulus),
-        base64.encode(exponent)
+        base64(&modulus),
+        base64(&exponent)
     )
 }
 
@@ -2664,7 +2674,7 @@ fn der_encoded_key_value(public_key: &RsaPublicKey) -> String {
         .expect("fixture public key must encode as SPKI");
     format!(
         "<dsig11:DEREncodedKeyValue xmlns:dsig11=\"http://www.w3.org/2009/xmldsig11#\">{}</dsig11:DEREncodedKeyValue>",
-        base64::engine::general_purpose::STANDARD.encode(der.as_bytes())
+        base64(der.as_bytes())
     )
 }
 
@@ -2672,13 +2682,15 @@ fn x509_certificate_value(path: &Path) -> String {
     let (_, pem) = x509_parser::pem::parse_x509_pem(&fs::read(path).unwrap()).unwrap();
     format!(
         "<ds:X509Data><ds:X509Certificate>{}</ds:X509Certificate></ds:X509Data>",
-        base64::engine::general_purpose::STANDARD.encode(pem.contents)
+        base64(&pem.contents)
     )
 }
 
 fn pem_der_base64(path: &Path) -> String {
     let (_, pem) = x509_parser::pem::parse_x509_pem(&fs::read(path).unwrap()).unwrap();
-    base64::engine::general_purpose::STANDARD.encode(pem.contents)
+    structured_base64::STANDARD
+        .encode(&pem.contents)
+        .expect("test encoding")
 }
 
 #[test]
@@ -2771,10 +2783,11 @@ fn signing_leaves_a_node_set_conversion_implicit_as_xmlsec1_does() {
     );
     // The implicit conversion is Canonical XML 1.0 without comments: the
     // digest covers the document without the Signature and the comment.
-    let expected = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        <sha2::Sha256 as sha2::Digest>::digest(b"<root><payload>payload</payload></root>"),
-    );
+    let expected = structured_base64::STANDARD
+        .encode(&<sha2::Sha256 as sha2::Digest>::digest(
+            b"<root><payload>payload</payload></root>",
+        ))
+        .expect("test encoding");
     let digest_value = document
         .descendants()
         .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "DigestValue")))
@@ -2814,10 +2827,9 @@ fn signing_leaves_a_node_set_conversion_implicit_as_xmlsec1_does() {
         "{xml}"
     );
     let digest_of = |canonical: &[u8]| {
-        base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            <sha2::Sha256 as sha2::Digest>::digest(canonical),
-        )
+        structured_base64::STANDARD
+            .encode(&<sha2::Sha256 as sha2::Digest>::digest(canonical))
+            .expect("test encoding")
     };
     let digest_value = document
         .descendants()
@@ -2874,8 +2886,8 @@ fn cli_asn1_signature_mode_requires_the_explicit_donor_flag() {
         .find(|node| node.has_tag_name("SignatureValue"))
         .and_then(|node| node.text())
         .unwrap();
-    let signature = base64::engine::general_purpose::STANDARD
-        .decode(encoded)
+    let signature = structured_base64::STANDARD
+        .decode(encoded.as_bytes())
         .unwrap();
     assert_eq!(signature.first(), Some(&0x30));
     assert_ne!(signature.len(), 64);
@@ -4679,7 +4691,7 @@ fn key_store_supplies_aes_key_for_encryption_and_decryption() {
         (&store, b"0123456789abcdef"),
         (&wrong_store, b"fedcba9876543210"),
     ] {
-        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key);
+        let encoded = base64(key);
         fs::write(path, format!("<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\"><KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>content</KeyName><KeyValue><AESKeyValue xmlns=\"http://www.aleksey.com/xmlsec/2002\">{encoded}</AESKeyValue></KeyValue></KeyInfo></Keys>")).unwrap();
     }
     run_success(
@@ -4738,14 +4750,8 @@ fn key_store_supplies_aes_key_for_encryption_and_decryption() {
     assert!(!wrong.status.success());
 
     let mixed_store = temp.path().join("mixed.xml");
-    let wrong_encoded = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        b"fedcba9876543210",
-    );
-    let right_encoded = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        b"0123456789abcdef",
-    );
+    let wrong_encoded = base64(b"fedcba9876543210");
+    let right_encoded = base64(b"0123456789abcdef");
     fs::write(
         &mixed_store,
         format!("<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\"><KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>wrong</KeyName><KeyValue><AESKeyValue xmlns=\"http://www.aleksey.com/xmlsec/2002\">{wrong_encoded}</AESKeyValue></KeyValue></KeyInfo><KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>content</KeyName><KeyValue><AESKeyValue xmlns=\"http://www.aleksey.com/xmlsec/2002\">{right_encoded}</AESKeyValue></KeyValue></KeyInfo></Keys>"),
@@ -4849,11 +4855,10 @@ fn key_store_rsa_recipient_round_trips_with_explicit_private_key() {
         )
     );
 
-    let base64 = base64::engine::general_purpose::STANDARD;
     let conflicting = format!(
         "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\" xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#rsa-oaep\"/><ds:KeyInfo><ds:KeyName>recipient</ds:KeyName><ds:KeyValue><ds:RSAKeyValue><ds:Modulus>{}</ds:Modulus><ds:Exponent>{}</ds:Exponent></ds:RSAKeyValue></ds:KeyValue></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>",
-        base64.encode(wrong_public.n().to_be_bytes_trimmed_vartime()),
-        base64.encode(wrong_public.e().to_be_bytes_trimmed_vartime()),
+        base64(&wrong_public.n().to_be_bytes_trimmed_vartime()),
+        base64(&wrong_public.e().to_be_bytes_trimmed_vartime()),
     );
     fs::write(&template, conflicting).unwrap();
     let rejected = Command::new(binary())
@@ -4881,7 +4886,9 @@ fn lax_store_encryption_replaces_stale_content_key_name() {
         r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><ds:KeyName>selected<!--split text-->-old</ds:KeyName></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
     )
     .unwrap();
-    let encoded = base64::engine::general_purpose::STANDARD.encode(b"0123456789abcdef");
+    let encoded = structured_base64::STANDARD
+        .encode(b"0123456789abcdef")
+        .expect("test encoding");
     fs::write(
         &store,
         format!("<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\"><KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>selected</KeyName><KeyValue><AESKeyValue xmlns=\"http://www.aleksey.com/xmlsec/2002\">{encoded}</AESKeyValue></KeyValue></KeyInfo></Keys>"),
@@ -5047,11 +5054,10 @@ fn rsa_fixture_public_key(bits: u16) -> RsaPublicKey {
 
 /// A `KeyInfo` naming `name` and carrying `public` as an `RSAKeyValue`.
 fn rsa_key_value_key_info(name: &str, public: &RsaPublicKey) -> String {
-    let base64 = base64::engine::general_purpose::STANDARD;
     format!(
         "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>{name}</KeyName><KeyValue><RSAKeyValue><Modulus>{}</Modulus><Exponent>{}</Exponent></RSAKeyValue></KeyValue></KeyInfo>",
-        base64.encode(public.n().to_be_bytes_trimmed_vartime()),
-        base64.encode(public.e().to_be_bytes_trimmed_vartime()),
+        base64(&public.n().to_be_bytes_trimmed_vartime()),
+        base64(&public.e().to_be_bytes_trimmed_vartime()),
     )
 }
 
@@ -5116,9 +5122,12 @@ fn lax_rsa_recipients_charge_only_attempted_store_keys() {
         fs::read_to_string(project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem"))
             .unwrap();
     let public = RsaPublicKey::from_public_key_pem(&public_pem).unwrap();
-    let base64 = base64::engine::general_purpose::STANDARD;
-    let modulus = base64.encode(public.n().to_be_bytes_trimmed_vartime());
-    let exponent = base64.encode(public.e().to_be_bytes_trimmed_vartime());
+    let modulus = structured_base64::STANDARD
+        .encode(&public.n().to_be_bytes_trimmed_vartime())
+        .expect("test encoding");
+    let exponent = structured_base64::STANDARD
+        .encode(&public.e().to_be_bytes_trimmed_vartime())
+        .expect("test encoding");
     let mut key_store = String::from("<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\">");
     for index in 0..33 {
         write!(
@@ -5175,9 +5184,12 @@ fn lax_cached_recipients_charge_decoding_once() {
         fs::read_to_string(project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"))
             .unwrap();
     let public = RsaPublicKey::from_public_key_pem(&public_pem).unwrap();
-    let base64 = base64::engine::general_purpose::STANDARD;
-    let modulus = base64.encode(public.n().to_be_bytes_trimmed_vartime());
-    let exponent = base64.encode(public.e().to_be_bytes_trimmed_vartime());
+    let modulus = structured_base64::STANDARD
+        .encode(&public.n().to_be_bytes_trimmed_vartime())
+        .expect("test encoding");
+    let exponent = structured_base64::STANDARD
+        .encode(&public.e().to_be_bytes_trimmed_vartime())
+        .expect("test encoding");
     let key_value = format!(
         "<ds:KeyValue><ds:RSAKeyValue><ds:Modulus>{modulus}</ds:Modulus><ds:Exponent>{exponent}</ds:Exponent></ds:RSAKeyValue></ds:KeyValue>"
     );
@@ -6701,7 +6713,9 @@ fn chacha_cli_preserves_nonce_namespace_forms() {
     let encrypted = temp.path().join("encrypted.xml");
     let key = temp.path().join("keys.xml");
     fs::write(&plaintext, b"ChaCha template nonce round trip").expect("plaintext");
-    let encoded = base64::engine::general_purpose::STANDARD.encode([0x37; 32]);
+    let encoded = structured_base64::STANDARD
+        .encode(&[0x37; 32])
+        .expect("test encoding");
     fs::write(&key, format!("<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\"><KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>content</KeyName><KeyValue><ChaCha20KeyValue xmlns=\"http://www.aleksey.com/xmlsec/2002\">{encoded}</ChaCha20KeyValue></KeyValue></KeyInfo></Keys>"))
         .expect("key store");
     for algorithm in ["chacha20", "chacha20poly1305"] {
@@ -7301,14 +7315,14 @@ fn rsa_encryption_matches_selector_only_x509data_to_configured_certificate() {
             "ski",
             format!(
                 "<ds:X509SKI>{}</ds:X509SKI>",
-                base64::engine::general_purpose::STANDARD.encode(ski)
+                base64(ski)
             ),
         ),
         (
             "digest",
             format!(
                 "<dsig11:X509Digest Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\">{}</dsig11:X509Digest>",
-                base64::engine::general_purpose::STANDARD.encode(digest)
+                base64(&digest)
             ),
         ),
     ];
@@ -9096,7 +9110,8 @@ fn generated_key_store_allows_an_unnamed_key() {
         .and_then(|node| node.text())
         .unwrap();
     assert_eq!(
-        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, value)
+        structured_base64::STANDARD
+            .decode(value.as_bytes())
             .unwrap()
             .len(),
         16
@@ -9678,10 +9693,7 @@ fn explicit_certificate_verification_reports_revoked_leaf() {
     let signed_xml = fs::read_to_string(&signed).unwrap();
     let signed_xml = signed_xml.replacen(
         "</X509Data>",
-        &format!(
-            "<X509CRL>{}</X509CRL></X509Data>",
-            base64::engine::general_purpose::STANDARD.encode(crl)
-        ),
+        &format!("<X509CRL>{}</X509CRL></X509Data>", base64(&crl)),
         1,
     );
     fs::write(&with_crl, signed_xml).unwrap();
@@ -10109,12 +10121,10 @@ fn generated_key_store_contains_every_requested_key() {
         .descendants()
         .filter(|node| node.has_tag_name(("http://www.aleksey.com/xmlsec/2002", "AESKeyValue")))
         .map(|node| {
-            base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD,
-                node.text().unwrap(),
-            )
-            .unwrap()
-            .len()
+            structured_base64::STANDARD
+                .decode(node.text().unwrap().as_bytes())
+                .unwrap()
+                .len()
         })
         .collect::<Vec<_>>();
     assert_eq!(key_lengths, [16, 32]);

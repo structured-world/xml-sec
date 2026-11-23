@@ -1,6 +1,6 @@
 #![cfg(feature = "xmlenc")]
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use structured_base64::STANDARD;
 use xml_sec::policy::DecryptionPolicy;
 use xml_sec::provider::{CryptoProvider, RUST_CRYPTO_PROVIDER};
 use xml_sec::xmlenc::{
@@ -78,7 +78,9 @@ fn repeated_key_retrieval_charges_retained_cipher_values_during_parsing() {
         .replace("<x:EncryptedKey>", "<x:EncryptedKey Id='transport'>")
         .replace(
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            &STANDARD.encode([0; 768]),
+            &structured_base64::STANDARD
+                .encode(&[0; 768])
+                .expect("test encoding"),
         );
     let wire = format!(
         "<root xmlns:x='{X}' xmlns:d='{D}'>{}{detached}</root>",
@@ -244,7 +246,10 @@ fn derived_retrieval_accepts_both_specification_identifiers() {
         let ciphertext = parse_encrypted_data(&encrypted.encrypted_data_xml).unwrap();
         let resources = std::collections::BTreeMap::from([(
             "https://example.test/derived.b64".into(),
-            STANDARD.encode(derived).into_bytes(),
+            STANDARD
+                .encode(derived.as_bytes())
+                .expect("test encoding")
+                .into_bytes(),
         )]);
         let mut policy = xml_sec::policy::DecryptionPolicy::default();
         policy.uris.retrieval_methods = xml_sec::xmldsig::UriTypeSet::ALL;
@@ -319,7 +324,9 @@ fn detached_derivation_document(
             .replace("<x:EncryptedKey>", "<x:EncryptedKey ID='payload'>")
             .replace(
                 "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-                &STANDARD.encode(wrapped),
+                &structured_base64::STANDARD
+                    .encode(&wrapped)
+                    .expect("test encoding"),
             )
     } else {
         selected.to_owned()
@@ -544,7 +551,7 @@ fn detached_key_association_preserves_registered_ids() {
                 "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
                 parsed.cipher_data.inline_value().unwrap(),
             );
-        let detached = key("").replace("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", &STANDARD.encode(&wrapped)).replace("</x:EncryptedKey>", &format!("<x:ReferenceList><x:DataReference URI='#{target}'/></x:ReferenceList></x:EncryptedKey>"));
+        let detached = key("").replace("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", &structured_base64::STANDARD.encode(&wrapped).expect("test encoding")).replace("</x:EncryptedKey>", &format!("<x:ReferenceList><x:DataReference URI='#{target}'/></x:ReferenceList></x:EncryptedKey>"));
         let wire = format!("<root xmlns:x='{X}' xmlns:d='{D}'>{payload}{detached}</root>");
         let resolver = KekDecryptor::new(kek);
         let result = DecryptContext::new(&resolver)
@@ -582,9 +589,11 @@ fn detached_nested_key_association_keeps_registered_consumer_identity() {
         .replace("<x:EncryptedKey>", "<x:EncryptedKey ID='transport'>")
         .replace(
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            &STANDARD.encode(outer_bytes),
+            &structured_base64::STANDARD
+                .encode(&outer_bytes)
+                .expect("test encoding"),
         );
-    let inner = key("").replace("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", &STANDARD.encode(inner_bytes)).replace("</x:EncryptedKey>", "<x:ReferenceList><x:KeyReference URI='#transport'/></x:ReferenceList></x:EncryptedKey>");
+    let inner = key("").replace("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", &structured_base64::STANDARD.encode(&inner_bytes).expect("test encoding")).replace("</x:EncryptedKey>", "<x:ReferenceList><x:KeyReference URI='#transport'/></x:ReferenceList></x:EncryptedKey>");
     let skipped = key(&format!("<d:KeyInfo>{}</d:KeyInfo>", key(""))).replace("</x:CipherData></x:EncryptedKey>", "</x:CipherData><x:ReferenceList><x:DataReference URI='#other'/></x:ReferenceList></x:EncryptedKey>");
     let generated = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
         .direct_key(content)
@@ -696,7 +705,9 @@ fn retrieved_key_decrypts_in_the_original_document_context() {
         .replace("<x:EncryptedKey>", "<x:EncryptedKey Id='transport'>")
         .replace(
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            &STANDARD.encode(&wrapped),
+            &structured_base64::STANDARD
+                .encode(&wrapped)
+                .expect("test encoding"),
         );
     let generated = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
         .direct_key(content)
@@ -739,7 +750,9 @@ fn external_retrieval_and_transforms_share_caller_owned_resources() {
         )
         .replace(
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            &STANDARD.encode(&wrapped),
+            &structured_base64::STANDARD
+                .encode(&wrapped)
+                .expect("test encoding"),
         );
     let generated = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
         .direct_key(content)
@@ -753,12 +766,15 @@ fn external_retrieval_and_transforms_share_caller_owned_resources() {
     );
     resources.insert(
         "https://example.test/keys/transport.b64".into(),
-        STANDARD.encode(&transport).into_bytes(),
+        STANDARD
+            .encode(transport.as_bytes())
+            .expect("test encoding")
+            .into_bytes(),
     );
     let referenced = transport.replace(
         &format!(
             "<x:CipherValue>{}</x:CipherValue>",
-            STANDARD.encode(&wrapped)
+            STANDARD.encode(&wrapped).expect("test encoding")
         ),
         "<x:CipherReference URI='wrapped.bin'/>",
     );
@@ -1135,13 +1151,15 @@ fn nested_encrypted_key_recovers_the_outer_kek_not_a_second_content_key() {
         .unwrap();
     let inner = key("").replace(
         "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        &STANDARD.encode(inner_bytes),
+        &structured_base64::STANDARD
+            .encode(&inner_bytes)
+            .expect("test encoding"),
     );
     let outer = key(&format!("<d:KeyInfo>{inner}</d:KeyInfo>")).replacen(
         "<x:CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA</x:CipherValue>",
         &format!(
             "<x:CipherValue>{}</x:CipherValue>",
-            STANDARD.encode(outer_bytes)
+            STANDARD.encode(&outer_bytes).expect("test encoding")
         ),
         1,
     );
@@ -1275,14 +1293,16 @@ fn an_unsupported_nested_method_falls_through_to_the_next_nested_key() {
         .unwrap();
     let inner = key("").replace(
         "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        &STANDARD.encode(inner_bytes),
+        &structured_base64::STANDARD
+            .encode(&inner_bytes)
+            .expect("test encoding"),
     );
     let unsupported = inner.replace(&format!("{X}kw-aes128"), "urn:example:unsupported-wrap");
     let outer = key(&format!("<d:KeyInfo>{unsupported}{inner}</d:KeyInfo>")).replacen(
         "<x:CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA</x:CipherValue>",
         &format!(
             "<x:CipherValue>{}</x:CipherValue>",
-            STANDARD.encode(outer_bytes)
+            STANDARD.encode(&outer_bytes).expect("test encoding")
         ),
         1,
     );
@@ -1317,7 +1337,7 @@ fn nested_implicit_rejection_reaches_final_content_authentication() {
         "<x:CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA</x:CipherValue>",
         &format!(
             "<x:CipherValue>{}</x:CipherValue>",
-            STANDARD.encode([0; 256])
+            STANDARD.encode(&[0; 256]).expect("test encoding")
         ),
     );
     let wrapped = RUST_CRYPTO_PROVIDER
@@ -1327,7 +1347,7 @@ fn nested_implicit_rejection_reaches_final_content_authentication() {
         "<x:CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA</x:CipherValue>",
         &format!(
             "<x:CipherValue>{}</x:CipherValue>",
-            STANDARD.encode(wrapped)
+            STANDARD.encode(&wrapped).expect("test encoding")
         ),
         1,
     );

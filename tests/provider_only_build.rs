@@ -9,7 +9,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use base64::Engine as _;
 use num_bigint::BigUint;
 use sha2::Digest as _;
 use structured_asn1::Parser;
@@ -187,7 +186,9 @@ fn spki(pem_text: &str) -> Vec<u8> {
 }
 
 fn b64(bytes: &[u8]) -> String {
-    base64::engine::general_purpose::STANDARD.encode(bytes)
+    structured_base64::STANDARD
+        .encode(&bytes)
+        .expect("test encoding")
 }
 
 /// The XML Signature 1.1 interop P-256 document with `method`, a

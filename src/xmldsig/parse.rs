@@ -4198,9 +4198,6 @@ fn parse_x509_issuer_serial(node: Node<'_, '_>) -> Result<(String, String), Pars
 ///
 /// `XMLDSig` allows whitespace within base64 content (line-wrapped encodings).
 fn base64_decode_digest(b64: &str, digest_method: DigestAlgorithm) -> Result<Vec<u8>, ParseError> {
-    use base64::Engine;
-    use base64::engine::general_purpose::STANDARD;
-
     let expected = digest_method.output_len();
     let max_base64_len = expected.div_ceil(3) * 4;
     let mut cleaned = String::with_capacity(b64.len().min(max_base64_len));
@@ -4215,8 +4212,8 @@ fn base64_decode_digest(b64: &str, digest_method: DigestAlgorithm) -> Result<Vec
             "DigestValue exceeds maximum allowed base64 length".into(),
         ));
     }
-    let digest = STANDARD
-        .decode(&cleaned)
+    let digest = structured_base64::STANDARD
+        .decode(cleaned.as_bytes())
         .map_err(|e| ParseError::Base64(e.to_string()))?;
     let actual = digest.len();
     if actual != expected {
@@ -4261,9 +4258,6 @@ fn decode_digest_value_children(
 }
 
 fn decode_der_encoded_key_value_base64(node: Node<'_, '_>) -> Result<Vec<u8>, ParseError> {
-    use base64::Engine;
-    use base64::engine::general_purpose::STANDARD;
-
     let mut cleaned = String::new();
     let mut raw_text_len = 0usize;
     for text in node.children().filter(Node::is_text).filter_map(Node::text) {
@@ -4286,8 +4280,8 @@ fn decode_der_encoded_key_value_base64(node: Node<'_, '_>) -> Result<Vec<u8>, Pa
         }
     }
 
-    let der = STANDARD
-        .decode(&cleaned)
+    let der = structured_base64::STANDARD
+        .decode(cleaned.as_bytes())
         .map_err(|e| ParseError::Base64(e.to_string()))?;
     if der.is_empty() {
         return Err(ParseError::InvalidStructure(
@@ -4509,7 +4503,6 @@ mod tests {
 
     use super::*;
     use crate::xmldsig::TransformError;
-    use base64::Engine;
 
     fn fixture_rsa_cert_base64() -> String {
         fixture_cert_base64("../../tests/fixtures/keys/rsa/rsa-2048-cert.pem")
@@ -4831,11 +4824,11 @@ mod tests {
     #[test]
     fn parse_key_info_dispatches_supported_children() {
         let cert_base64 = fixture_rsa_cert_base64();
-        let expected_cert = base64::engine::general_purpose::STANDARD
-            .decode(&cert_base64)
+        let expected_cert = structured_base64::STANDARD
+            .decode(cert_base64.as_bytes())
             .expect("fixture PEM must contain valid base64");
-        let cert_digest = base64::engine::general_purpose::STANDARD
-            .encode(compute_digest(DigestAlgorithm::Sha256, &expected_cert));
+        let cert_digest =
+            crate::base64::encode(&compute_digest(DigestAlgorithm::Sha256, &expected_cert));
         let xml = format!(
             r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
                               xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
@@ -5276,7 +5269,7 @@ BA== </Modulus>
 
     #[test]
     fn parse_key_info_rejects_x509_data_exceeding_total_binary_budget() {
-        let payload = base64::engine::general_purpose::STANDARD.encode(vec![0u8; 190_000]);
+        let payload = crate::base64::encode(&vec![0u8; 190_000]);
         let entries = format!("<X509SKI>{payload}</X509SKI>").repeat(6);
         let xml = format!(
             "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><X509Data>{entries}</X509Data></KeyInfo>"
@@ -5306,11 +5299,11 @@ BA== </Modulus>
     #[test]
     fn parse_key_info_rejects_x509_certificate_with_trailing_der_bytes() {
         // Trailing bytes remain a structural refusal, with a precise shared error code.
-        let mut cert = base64::engine::general_purpose::STANDARD
-            .decode(fixture_rsa_cert_base64())
+        let mut cert = structured_base64::STANDARD
+            .decode(fixture_rsa_cert_base64().as_bytes())
             .unwrap();
         cert.extend_from_slice(&[0x00, 0x01]);
-        let cert_base64 = base64::engine::general_purpose::STANDARD.encode(cert);
+        let cert_base64 = crate::base64::encode(&cert);
         let xml = format!(
             r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
                 <X509Data>
@@ -5480,10 +5473,10 @@ BA== </Modulus>
     fn certificate_selectors_ignore_rewritten_display_metadata() {
         // Serial/SKI discovery must consult the source certificate, not a
         // stale or edited projection supplied alongside its unchanged DER.
-        let der = base64::engine::general_purpose::STANDARD
-            .decode(fixture_cert_base64(
-                "../../tests/fixtures/keys/rsa/rsa-2048-cert.pem",
-            ))
+        let der = structured_base64::STANDARD
+            .decode(
+                fixture_cert_base64("../../tests/fixtures/keys/rsa/rsa-2048-cert.pem").as_bytes(),
+            )
             .unwrap();
         let mut metadata = parse_x509_certificate(&der).unwrap();
         let session =
@@ -5530,8 +5523,8 @@ BA== </Modulus>
             fixture_cert_base64("../../tests/fixtures/keys/cacert.pem"),
         ]
         .map(|encoded| {
-            base64::engine::general_purpose::STANDARD
-                .decode(encoded)
+            structured_base64::STANDARD
+                .decode(encoded.as_bytes())
                 .unwrap()
         })
         .to_vec();
@@ -5571,8 +5564,8 @@ BA== </Modulus>
             fixture_cert_base64("../../tests/fixtures/keys/cacert.pem"),
         ]
         .map(|encoded| {
-            base64::engine::general_purpose::STANDARD
-                .decode(encoded)
+            structured_base64::STANDARD
+                .decode(encoded.as_bytes())
                 .unwrap()
         })
         .to_vec();
@@ -5839,8 +5832,8 @@ BA== </Modulus>
     fn configured_certificate_matching_requires_every_x509_selector_category() {
         // A configured certificate is the lookup candidate for selector-only
         // X509Data. Every asserted category must match that same certificate.
-        let certificate = base64::engine::general_purpose::STANDARD
-            .decode(fixture_rsa_cert_base64())
+        let certificate = structured_base64::STANDARD
+            .decode(fixture_rsa_cert_base64().as_bytes())
             .unwrap();
         let parsed = parse_x509_certificate(&certificate).unwrap();
         let digest = compute_digest_with_provider(
@@ -6281,8 +6274,8 @@ BA== </Modulus>
             </KeyValue>
         </KeyInfo>"#;
         let doc = Document::parse(xml).unwrap();
-        let expected_public_key = base64::engine::general_purpose::STANDARD
-            .decode(public_key)
+        let expected_public_key = structured_base64::STANDARD
+            .decode(public_key.as_bytes())
             .expect("fixture EC point must be valid base64");
 
         let key_info = parse_key_info(doc.root_element()).unwrap();
@@ -6297,8 +6290,6 @@ BA== </Modulus>
 
     #[test]
     fn parse_ec_key_value_accepts_bare_curve_oid() {
-        use base64::Engine;
-
         let encoded_public_key = "BO/yd/OZzDfjX4qivDY/vsUIuh6KWAxoxW5P4ukvwd+T6pVljWsX2UBJNNy5MdhTwB8e2YwB8kUbJwdsAS/XGi/fz8unFrs+lVlAgIs6s/xBYFbfUoRiAacD2SpVDe6XBA==";
         let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
                               xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
@@ -6310,8 +6301,8 @@ BA== </Modulus>
             </KeyValue>
         </KeyInfo>"#;
         let doc = Document::parse(xml).unwrap();
-        let expected_public_key = base64::engine::general_purpose::STANDARD
-            .decode(encoded_public_key)
+        let expected_public_key = structured_base64::STANDARD
+            .decode(encoded_public_key.as_bytes())
             .unwrap();
 
         let sources = parse_key_info(doc.root_element()).unwrap().sources;
@@ -6894,9 +6885,7 @@ BA== </Modulus>
 
     #[test]
     fn parse_key_info_der_encoded_key_value_rejects_oversized_payload() {
-        let oversized =
-            base64::engine::general_purpose::STANDARD
-                .encode(vec![0u8; MAX_DER_ENCODED_KEY_VALUE_LEN + 1]);
+        let oversized = crate::base64::encode(&vec![0u8; MAX_DER_ENCODED_KEY_VALUE_LEN + 1]);
         let xml = format!(
             "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\" xmlns:dsig11=\"http://www.w3.org/2009/xmldsig11#\"><dsig11:DEREncodedKeyValue>{oversized}</dsig11:DEREncodedKeyValue></KeyInfo>"
         );

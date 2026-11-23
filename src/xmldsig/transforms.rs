@@ -49,8 +49,8 @@ pub use xslt::XsltStylesheet;
 use crate::xml::dom::storage::names::NameStorage;
 use crate::xml::dom::storage::{Native as NativeDom, Storage as DomStorage};
 use crate::xml::dom::{Document, Node, NodeId, NodeType};
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use sha2::{Digest as _, Sha256};
+use structured_base64::STANDARD;
 
 use super::base64_stream::is_rfc2045_base64_byte;
 use super::parse::XMLDSIG_NS;
@@ -1220,7 +1220,14 @@ fn decode_base64_transform<S: Scratch>(
         .rev()
         .take_while(|byte| **byte == b'=')
         .count();
-    let decoded_len = base64::decoded_len_estimate(normalized.len()).saturating_sub(padding);
+    // RFC 4648 section 4: canonical input is whole quanta, the last carrying
+    // at most two pad characters. Other input fails before any byte is written.
+    let decoded_len = if normalized.len().is_multiple_of(4) {
+        let symbols = normalized.len() - padding.min(2);
+        symbols / 4 * 3 + symbols % 4 * 3 / 4
+    } else {
+        0
+    };
     budget.ensure_output_capacity(decoded_len)?;
 
     let mut decoded = scratch.bytes();
@@ -2241,9 +2248,7 @@ impl TransformTerminal<Native> for DigestTerminal<'_> {
             stream.feed(encoded, &mut absorb)
         })?;
         if let Some(failure) = stream.finish(&mut absorb)? {
-            return Err(
-                TransformError::Base64(base64::DecodeSliceError::DecodeError(failure)).into(),
-            );
+            return Err(TransformError::Base64(failure).into());
         }
         admit_digest_input(empty_input, sink.written)?;
         let (digest, pre_digest) = sink
@@ -4426,11 +4431,9 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, TransformError::Base64(_)));
-        // base64 implements `Error` only with `std`, so only then is it the source.
-        #[cfg(feature = "std")]
         assert!(
-            std::error::Error::source(&error)
-                .and_then(|cause| cause.downcast_ref::<base64::DecodeSliceError>())
+            core::error::Error::source(&error)
+                .and_then(|cause| cause.downcast_ref::<structured_base64::Base64Error>())
                 .is_some()
         );
     }
@@ -4445,6 +4448,30 @@ mod tests {
         );
 
         assert!(matches!(result, Err(TransformError::Base64(_))));
+    }
+
+    #[test]
+    fn base64_transform_locates_excess_padding_instead_of_a_short_buffer() {
+        // RFC 4648 section 4: a quantum carries at most two pad characters.
+        // The output is sized for that quantum, so an extra `=` is reported
+        // at its offset, as the streaming digest decoder reports it.
+        let doc = Document::parse("<root/>").unwrap();
+        for (input, offset) in [(&b"===="[..], 0), (b"Q===", 1), (b"QUJD====", 4)] {
+            let result = apply_transform(
+                doc.root_element(),
+                &Transform::Base64Decode,
+                TransformData::Binary(input.to_vec()),
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(TransformError::Base64(structured_base64::Base64Error::InvalidByte(
+                        at, b'='
+                    ))) if at == offset
+                ),
+                "{input:?}: {result:?}"
+            );
+        }
     }
 
     #[test]
@@ -4510,7 +4537,7 @@ mod tests {
         // nodes. Normalization must retain linear allocation behavior while
         // preserving document-order concatenation.
         let expected = vec![0x42_u8; 3 * 1_024];
-        let encoded = STANDARD.encode(&expected);
+        let encoded = crate::base64::encode(&expected);
         let mut xml = String::from("<root>");
         for byte in encoded.bytes() {
             xml.push(char::from(byte));
@@ -4531,7 +4558,7 @@ mod tests {
         // current input permits one reference chain to exceed the total bound.
         let doc = Document::parse("<root/>").unwrap();
         let inner = vec![b'A'; MAX_BASE64_TRANSFORM_OUTPUT_BYTES];
-        let outer = STANDARD.encode(&inner);
+        let outer = crate::base64::encode(&inner);
         let transforms = [Transform::Base64Decode, Transform::Base64Decode];
 
         let result = execute_transforms(
@@ -5466,7 +5493,7 @@ mod tests {
             .descendants()
             .find(|node| node.tag_name().name() == "Signature")
             .unwrap();
-        let encoded = base64::engine::general_purpose::STANDARD.encode(b"<payload>ok</payload>");
+        let encoded = crate::base64::encode(b"<payload>ok</payload>");
         let transforms = vec![
             Transform::Base64Decode,
             Transform::XPath(XPathExpression::new("true()")),

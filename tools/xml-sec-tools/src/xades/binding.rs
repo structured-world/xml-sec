@@ -8,10 +8,9 @@ use super::{
     Corpus, DS, EXC, SP, absolute, compare, debug_buffer, digest, line, read, write, write_json,
     xml,
 };
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
 use serde_json::{Map, Value, json};
 use std::path::Path;
+use structured_base64::STANDARD;
 
 /// One investigation input: its `Target`, the certificates its
 /// `SigningCertificateV2` references, and whether binding must hold.
@@ -108,13 +107,17 @@ pub(crate) fn template(
         references.push_str(
             r#"<x:Cert><x:CertDigest><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>"#,
         );
-        references.push_str(&STANDARD.encode(digest));
+        STANDARD
+            .encode_string(&digest, &mut references)
+            .map_err(|error| error.to_string())?;
         references.push_str("</ds:DigestValue></x:CertDigest></x:Cert>");
     }
     let mut key_info = String::new();
     for name in ["signer", "intermediate"] {
         key_info.push_str("<ds:X509Certificate>");
-        key_info.push_str(&STANDARD.encode(der(name)?));
+        STANDARD
+            .encode_string(&der(name)?, &mut key_info)
+            .map_err(|error| error.to_string())?;
         key_info.push_str("</ds:X509Certificate>");
     }
     let target = target

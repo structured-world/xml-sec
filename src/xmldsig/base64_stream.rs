@@ -1,10 +1,12 @@
 //! Streaming decoder of the `XMLDSig` Base64 transform.
 
+use structured_base64::{Base64Error, STANDARD};
+
 #[cfg(test)]
 mod tests;
 
 /// Alphabet bytes are decoded in blocks of whole quanta; the same `STANDARD`
-/// engine as the resident transform enforces padding. A decoded block spans a
+/// profile as the resident transform enforces padding. A decoded block spans a
 /// whole digest block, so the digest hashes it in place.
 const BASE64_BLOCK: usize = 8192;
 
@@ -21,7 +23,7 @@ pub(crate) struct Base64Stream {
     offset: usize,
     /// Offset of the padding that ended the last decoded block.
     padding: Option<usize>,
-    failure: Option<base64::DecodeError>,
+    failure: Option<Base64Error>,
 }
 
 impl Base64Stream {
@@ -56,7 +58,7 @@ impl Base64Stream {
                 // Padding ended the encoded data in an earlier block; the
                 // resident decoder reports its first byte when more follows.
                 if chunk.iter().any(|byte| is_rfc2045_base64_byte(*byte)) {
-                    self.failure = Some(base64::DecodeError::InvalidByte(padding, b'='));
+                    self.failure = Some(Base64Error::InvalidByte(padding, b'='));
                 }
                 return Ok(());
             }
@@ -91,8 +93,6 @@ impl Base64Stream {
     }
 
     fn flush<E>(&mut self, sink: &mut impl FnMut(&[u8]) -> Result<(), E>) -> Result<(), E> {
-        use base64::Engine as _;
-
         let mut decoded = [0_u8; BASE64_BLOCK / 4 * 3];
         let encoded = &self.block[..self.filled];
         // The block holds the last `filled` accepted bytes.
@@ -104,35 +104,12 @@ impl Base64Stream {
             .count();
         self.padding = (padding > 0).then(|| self.offset - padding);
         self.filled = 0;
-        match base64::engine::general_purpose::STANDARD.decode_slice(encoded, &mut decoded) {
+        // The output block holds every quantum of a full input block, so
+        // `OutputFull` cannot occur.
+        match STANDARD.decode_slice(encoded, &mut decoded) {
             Ok(written) => sink(&decoded[..written]),
             Err(error) => {
-                self.failure = Some(match error {
-                    base64::DecodeSliceError::DecodeError(base64::DecodeError::InvalidByte(
-                        index,
-                        byte,
-                    )) => base64::DecodeError::InvalidByte(base + index, byte),
-                    base64::DecodeSliceError::DecodeError(
-                        base64::DecodeError::InvalidLastSymbol {
-                            offset,
-                            symbol,
-                            symbol_value,
-                        },
-                    ) => base64::DecodeError::InvalidLastSymbol {
-                        offset: base + offset,
-                        symbol,
-                        symbol_value,
-                    },
-                    base64::DecodeSliceError::DecodeError(base64::DecodeError::InvalidLength(
-                        length,
-                    )) => base64::DecodeError::InvalidLength(base + length),
-                    base64::DecodeSliceError::DecodeError(error) => error,
-                    // The output block holds every quantum of a full input
-                    // block, so its size cannot be the failure.
-                    base64::DecodeSliceError::OutputSliceTooSmall => {
-                        base64::DecodeError::InvalidLength(encoded.len())
-                    }
-                });
+                self.failure = Some(rebase(error, base));
                 Ok(())
             }
         }
@@ -143,10 +120,23 @@ impl Base64Stream {
     pub(crate) fn finish<E>(
         mut self,
         sink: &mut impl FnMut(&[u8]) -> Result<(), E>,
-    ) -> Result<Option<base64::DecodeError>, E> {
+    ) -> Result<Option<Base64Error>, E> {
         if self.failure.is_none() && self.filled > 0 {
             self.flush(sink)?;
         }
         Ok(self.failure)
+    }
+}
+
+/// `error` of a block that starts `base` bytes into the filtered input,
+/// located within that whole input.
+fn rebase(error: Base64Error, base: usize) -> Base64Error {
+    match error {
+        Base64Error::InvalidByte(offset, byte) => Base64Error::InvalidByte(base + offset, byte),
+        Base64Error::InvalidLastSymbol(offset, byte) => {
+            Base64Error::InvalidLastSymbol(base + offset, byte)
+        }
+        Base64Error::InvalidLength(offset) => Base64Error::InvalidLength(base + offset),
+        Base64Error::Invalid | Base64Error::OutputFull => error,
     }
 }

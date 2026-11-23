@@ -11,10 +11,9 @@ use super::fixtures::{
     detached_reference, document, target_reference,
 };
 use super::{DS, EXC, SP, write};
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
 use sha2::{Digest as _, Sha256, Sha512};
 use std::process::{Command, Stdio};
+use structured_base64::STANDARD;
 
 const V141: &str = "http://uri.etsi.org/01903/v1.4.1#";
 const KEY: &str = "signer.key,signer.pem,issuer.pem";
@@ -342,7 +341,9 @@ impl Levels<'_> {
             "-out",
             "tsa.der",
         ])?;
-        Ok(STANDARD.encode(self.read("tsa.der")?))
+        STANDARD
+            .encode(&self.read("tsa.der")?)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -351,7 +352,9 @@ fn certificate_values(generator: &Generator, names: &[&str]) -> Result<String, S
     for name in names {
         let der = generator.der(name)?;
         values.push_str("<xades:EncapsulatedX509Certificate>");
-        values.push_str(&STANDARD.encode(der));
+        STANDARD
+            .encode_string(&der, &mut values)
+            .map_err(|error| error.to_string())?;
         values.push_str("</xades:EncapsulatedX509Certificate>");
     }
     Ok(format!(
@@ -368,7 +371,11 @@ fn revocation_values(crls: &[&Vec<u8>], responses: &[&Vec<u8>]) -> String {
         let mut text = format!("<xades:{list}>");
         for value in values {
             text.push_str(&open);
-            text.push_str(&STANDARD.encode(value));
+            // Only a failed allocation can fail here, which the surrounding
+            // `format!` strings treat as fatal as well.
+            STANDARD
+                .encode_string(value, &mut text)
+                .expect("the encoding of a fixture fits memory");
             text.push_str(&close);
         }
         text + &format!("</xades:{list}>")
@@ -505,12 +512,13 @@ impl Shared<'_> {
     /// B-LTA whose signed `Manifest` names a detached object, with the renewal
     /// EN 319 132-1 §5.5.3 defines under a digest other than the Manifest's.
     fn write_renewed(&self, payload: &str) -> Result<(), String> {
+        let encode = |bytes: &[u8]| STANDARD.encode(bytes).map_err(|error| error.to_string());
         let profile = RSA_SHA256_PROFILE;
         let generator = self.levels.generator;
         let reference = format!(
             r#"<ds:Reference URI="detached.txt" Id="detached-object"><ds:DigestMethod Algorithm="{}"/><ds:DigestValue>{}</ds:DigestValue></ds:Reference>"#,
             profile.digest,
-            STANDARD.encode(Sha256::digest(payload))
+            encode(&Sha256::digest(payload))?
         );
         let signature = Signature {
             // XMLDSig 1.1 §5.1: this Type identifies the referenced Manifest,
@@ -555,8 +563,8 @@ impl Shared<'_> {
         let renewal = format!(
             r#"<xadesv141:ArchiveTimeStamp Id="archive">{}</xadesv141:ArchiveTimeStamp><xadesv141:RenewedDigestsV2><ds:CanonicalizationMethod Algorithm="{EXC}"/><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha512"/><xadesv141:RecomputedDigestValue><xadesv141:NewSDODigestValue>{}</xadesv141:NewSDODigestValue><xadesv141:OriginalRefDigest>{}</xadesv141:OriginalRefDigest></xadesv141:RecomputedDigestValue></xadesv141:RenewedDigestsV2>"#,
             stamped(&self.levels.token(&input)?),
-            STANDARD.encode(Sha512::digest(payload)),
-            STANDARD.encode(Sha512::digest(canonical(generator, &instruction)?)),
+            encode(&Sha512::digest(payload))?,
+            encode(&Sha512::digest(canonical(generator, &instruction)?))?,
         );
         write(
             &self.directory.join("b-lta-renewed-digests.xml"),

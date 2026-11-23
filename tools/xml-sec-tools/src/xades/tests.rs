@@ -3,7 +3,6 @@ use super::check::{check_expectations, check_goldens, check_inventory};
 use super::dss::profile_binding;
 use super::package::{Entry, Evidence, GIT_LOCATION, archive_entries, git_command, source_commit};
 use super::{Corpus, DS, compare, debug_buffer, probe_executable, resolved_versions};
-use base64::Engine as _;
 use serde_json::{Map, Value, json};
 use std::ffi::OsStr;
 use std::path::Path;
@@ -396,7 +395,9 @@ fn analysis_uses_retained_octets_without_raw_process_logs() {
         write(&case.join(format!("rust/reference-{index}.bin")), data);
         write(&case.join(format!("rust/replay-{index}.bin")), data);
         let digest = <sha2::Sha256 as sha2::Digest>::digest(data);
-        let value = base64::engine::general_purpose::STANDARD.encode(digest);
+        let value = structured_base64::STANDARD
+            .encode(&digest)
+            .expect("test encoding");
         values.push_str("<Reference><DigestValue>");
         values.push_str(&value);
         values.push_str("</DigestValue></Reference>");

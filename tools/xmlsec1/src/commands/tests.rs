@@ -1,7 +1,5 @@
 use std::{cell::Cell, ffi::OsString, rc::Rc};
 
-use base64::Engine as _;
-
 use super::*;
 
 fn project_root() -> &'static Path {
@@ -956,7 +954,11 @@ fn cli_lax_store_encryption_preserves_policy_denial() {
         fs::read_to_string(project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"))
             .expect("public key fixture");
     let public_key = RsaPublicKey::from_public_key_pem(&pem).expect("RSA public key");
-    let encode = |bytes: Vec<u8>| base64::engine::general_purpose::STANDARD.encode(bytes);
+    let encode = |bytes: Vec<u8>| {
+        structured_base64::STANDARD
+            .encode(&bytes)
+            .expect("test encoding")
+    };
     let extra = format!(
         "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>valid-rsa</KeyName><KeyValue><RSAKeyValue><Modulus>{}</Modulus><Exponent>{}</Exponent></RSAKeyValue></KeyValue></KeyInfo>",
         encode(public_key.n().to_be_bytes_trimmed_vartime().into_vec()),
@@ -1160,10 +1162,11 @@ fn strict_store_signing_requires_template_key_name() {
 #[test]
 fn pkcs12_signing_ignores_unrelated_ca_certificate() {
     // A CA-only bundle still provides its private signing key, without a leaf writer.
-    let bundle = base64::engine::general_purpose::STANDARD
+    let bundle = structured_base64::STANDARD
         .decode(
             include_str!("../../../../tests/fixtures/keys/pkcs12/rsa-key-unrelated-ca.p12.b64")
-                .trim(),
+                .trim()
+                .as_bytes(),
         )
         .unwrap();
     let temp = tempfile::tempdir().unwrap();
@@ -1820,7 +1823,9 @@ fn kem_template_updates_referenced_cipher_value() {
         "<i:KeyInfoReference URI=\"#mechanism\"/>",
         "",
     );
-    let ciphertext = base64::engine::general_purpose::STANDARD.encode([7; 768]);
+    let ciphertext = structured_base64::STANDARD
+        .encode(&[7; 768])
+        .expect("test encoding");
     let generated = format!(
         "<x:EncryptedData xmlns:x=\"{XMLENC_NS}\" xmlns:d=\"{XMLDSIG_NS}\"><x:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><d:KeyInfo><x:EncryptedKey><x:EncryptionMethod Algorithm=\"{}\"/><d:KeyInfo><d:KeyName>wanted</d:KeyName></d:KeyInfo><x:CipherData><x:CipherValue>{ciphertext}</x:CipherValue></x:CipherData></x:EncryptedKey></d:KeyInfo><x:CipherData><x:CipherValue>AA==</x:CipherValue></x:CipherData></x:EncryptedData>",
         xml_sec::provider::KeyEncapsulationAlgorithm::MlKem512.uri(),
@@ -2393,7 +2398,9 @@ fn recipient_resolver_bounds_applicable_private_keys_before_unwrap() {
             oaep_params: None,
         },
         cipher_data: xml_sec::xmlenc::CipherData::Value {
-            value: base64::engine::general_purpose::STANDARD.encode([0_u8; 256]),
+            value: structured_base64::STANDARD
+                .encode(&[0_u8; 256])
+                .expect("test encoding"),
         },
         reference_list: None,
         carried_key_name: None,

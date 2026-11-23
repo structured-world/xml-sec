@@ -2809,13 +2809,12 @@ mod tests {
     #[test]
     fn public_key_info_parser_enforces_certificate_workspace_policy() {
         // XML ingestion must not turn resource exhaustion into malformed DER.
-        use base64::Engine as _;
         let pair = rcgen::KeyPair::generate().expect("test key generation");
         let cert = rcgen::CertificateParams::new(Vec::<String>::new())
             .expect("empty SAN list")
             .self_signed(&pair)
             .expect("test certificate signing");
-        let encoded = base64::engine::general_purpose::STANDARD.encode(cert.der());
+        let encoded = crate::base64::encode(cert.der());
         let xml = format!(
             "<KeyInfo xmlns='http://www.w3.org/2000/09/xmldsig#'><X509Data><X509Certificate>{encoded}</X509Certificate></X509Data></KeyInfo>"
         );
