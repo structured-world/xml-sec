@@ -1135,6 +1135,16 @@ pub(crate) fn validate_key_info_source_permissions(
     Ok(())
 }
 
+/// An X.509 source's key, its trust evidence and how the key is stored.
+type X509Resolution = Result<
+    Option<(
+        VerificationKey,
+        Option<X509TrustEvidence>,
+        VerificationKeyStorage,
+    )>,
+    DsigError,
+>;
+
 impl DefaultKeyResolver {
     /// Resolve another candidate without resetting aggregate inspection work.
     /// The caller must keep the same budget throughout an operation, including
@@ -1152,20 +1162,14 @@ impl DefaultKeyResolver {
         candidate_budget: &mut InspectedKeyCandidateBudget,
     ) -> Result<Option<ResolvedVerificationKey<'static>>, DsigError> {
         candidate_budget.bind_policy(policy)?;
-        // Kept signature answers belong to the provider borrowed for one
-        // call: a later call with the same budget may pass another provider,
-        // even one at the same address.
-        candidate_budget.certificates().edges().forget();
-        let resolved = self.resolve_with_trust(
+        self.resolve_with_trust(
             key_info,
             algorithm,
             policy,
             provider,
             candidate_budget,
             ResolutionScope::Document,
-        );
-        candidate_budget.certificates().edges().forget();
-        resolved
+        )
     }
 
     pub(crate) fn resolve_trusted_material_with_candidate_budget(
@@ -1269,6 +1273,11 @@ impl DefaultKeyResolver {
         Ok(())
     }
 
+    /// [`Self::resolve_x509_with`], with the signature answers the session
+    /// keeps limited to this call. Every X.509 path discovery and validation
+    /// runs here with one borrowed `provider`, while the budget, and its
+    /// session, may serve later calls with another provider, even one at the
+    /// same address.
     fn resolve_x509(
         &self,
         info: &X509DataInfo,
@@ -1276,14 +1285,21 @@ impl DefaultKeyResolver {
         trust: &crate::policy::KeyTrustPolicy,
         provider: &dyn crate::provider::CryptoProvider,
         budget: &mut InspectedKeyCandidateBudget,
-    ) -> Result<
-        Option<(
-            VerificationKey,
-            Option<X509TrustEvidence>,
-            VerificationKeyStorage,
-        )>,
-        DsigError,
-    > {
+    ) -> X509Resolution {
+        budget.certificates().edges().forget();
+        let resolved = self.resolve_x509_with(info, algorithm, trust, provider, budget);
+        budget.certificates().edges().forget();
+        resolved
+    }
+
+    fn resolve_x509_with(
+        &self,
+        info: &X509DataInfo,
+        algorithm: SignatureAlgorithm,
+        trust: &crate::policy::KeyTrustPolicy,
+        provider: &dyn crate::provider::CryptoProvider,
+        budget: &mut InspectedKeyCandidateBudget,
+    ) -> X509Resolution {
         let mut evidence = None;
         let effective_trust;
         let trust = if trust.verify_x509_chains && trust.verification_time.is_none() {
@@ -5436,6 +5452,68 @@ mod tests {
             )
             .map(|resolved| resolved.is_some());
         // Path discovery reports the replacement's refusal of the leaf edge.
+        assert!(
+            matches!(
+                result,
+                Err(DsigError::KeyResolution(KeyResolutionError::Chain(
+                    super::super::X509ChainError::UnsupportedSignatureAlgorithm { .. }
+                )))
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_provider_replaced_between_inventory_resolutions_answers_itself() {
+        // The key inventory resolves through the internal entry points, not
+        // the public resolver method. A provider replaced in place between
+        // two of its resolutions with one budget must still verify the
+        // certificate signatures itself.
+        let (mut info, root) = authorized_revoked_chain();
+        let issuer = info.certificates[1].clone();
+        info.crls.clear();
+        let policy = verification_policy_with_trust(crate::policy::KeyTrustPolicy {
+            max_x509_chain_depth: 3,
+            ..chain_policy_at(hours_after_epoch(492_768))
+        });
+        let session = super::super::pkix::CertificateSession::new(&policy.resources);
+        let leaf_signed_data = session
+            .read(&info.certificates[0])
+            .expect("test leaf parses")
+            .signed_bytes()
+            .to_vec();
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            lookup_certs: vec![issuer],
+            trusted_certs: vec![root],
+            ..KeyResolverConfig::default()
+        });
+        let key_info = KeyInfo {
+            sources: vec![KeyInfoSource::X509Data(info)],
+        };
+        let mut budget = InspectedKeyCandidateBudget::new_with_utc_facts(
+            &policy,
+            super::super::pkix::test_utc_facts(),
+        );
+        let mut provider = RejectSecondSha512Provider {
+            sha512_calls: AtomicUsize::new(0),
+            verification_calls: AtomicUsize::new(0),
+            reject_verification_call: None,
+            rejected_verification_data: None,
+        };
+        let mut resolve = |provider: &RejectSecondSha512Provider| {
+            resolver
+                .resolve_trusted_material_with_candidate_budget(
+                    &key_info,
+                    SignatureAlgorithm::EcdsaSha256,
+                    &policy,
+                    provider,
+                    &mut budget,
+                )
+                .map(|resolved| resolved.is_some())
+        };
+        assert!(matches!(resolve(&provider), Ok(true)));
+        provider.rejected_verification_data = Some(leaf_signed_data);
+        let result = resolve(&provider);
         assert!(
             matches!(
                 result,
