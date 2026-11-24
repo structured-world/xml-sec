@@ -1372,6 +1372,98 @@ fn xades_profile_authenticates_nonempty_ordered_properties() {
     }
 }
 
+/// `xades_template` with one more `Reference`, to a `ds:Object` holding
+/// base64 text, under `transform`.
+fn xades_with_object_reference(transform: &str) -> String {
+    xades_template(
+        "<x:SignedSignatureProperties><x:SigningTime>2026-10-14T00:00:00Z</x:SigningTime></x:SignedSignatureProperties>",
+    )
+    .replace(
+        "</ds:SignedInfo>",
+        &format!(
+            r##"<ds:Reference URI="#binary"><ds:Transforms><ds:Transform Algorithm="{transform}"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo>"##
+        ),
+    )
+    .replace(
+        "</ds:Signature>",
+        r#"<ds:Object Id="binary">YmluYXJ5IHBheWxvYWQ=</ds:Object></ds:Signature>"#,
+    )
+}
+
+#[test]
+fn strict_profiles_admit_the_base64_transform_but_no_node_set_selection() {
+    // XMLDSig 1.1 §6.6.2 makes Base64 a required transform: enveloping
+    // signatures over binary data, which EU DSS writes by default, carry it.
+    // It decodes octets and selects no nodes, so the strict profiles admit it
+    // for signing and verification, while XPath keeps its refusal.
+    // https://www.w3.org/TR/xmldsig-core1/#sec-Base-64
+    let compiled = compiler(PolicyProfile::Xades).compile(&context()).unwrap();
+    let key = HmacSigningKey::new(vec![0x53; 32]).unwrap();
+    let verifier = HmacVerificationKey::new(vec![0x53; 32]).unwrap();
+    let xml = SignContext::new(&key)
+        .policy(compiled.signing().unwrap().clone())
+        .sign_template(&xades_with_object_reference(
+            "http://www.w3.org/2000/09/xmldsig#base64",
+        ))
+        .unwrap()
+        .output;
+    let document = XmlDocument::parse(xml).unwrap();
+    let targets = document.with_view(|view| [view.root_element()]);
+    let evidence = VerifyContext::new()
+        .key(&verifier)
+        .policy(compiled.verification().unwrap().clone())
+        .verify_request(
+            &document,
+            &VerificationRequest {
+                expected_targets: &targets,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(evidence.all_valid());
+    // SecureSaml keeps its own narrower list: SAML Core §5.4.4 admits only the
+    // enveloped-signature and exclusive canonicalization transforms.
+    // https://docs.oasis-open.org/security/saml/v2.0/saml-core-2.0-os.pdf
+    for profile in [
+        PolicyProfile::Modern,
+        PolicyProfile::WsSecurity,
+        PolicyProfile::Xades,
+    ] {
+        let compiled = compiler(profile).compile(&context()).unwrap();
+        let transforms = &compiled.verification().unwrap().transforms;
+        let admitted = |uri: &str| {
+            transforms
+                .allowed_algorithms
+                .as_ref()
+                .is_some_and(|methods| methods.contains(uri))
+        };
+        assert!(
+            admitted("http://www.w3.org/2000/09/xmldsig#base64"),
+            "{profile:?}"
+        );
+        for refused in [
+            "http://www.w3.org/TR/1999/REC-xpath-19991116",
+            "http://www.w3.org/2002/06/xmldsig-filter2",
+            "http://www.w3.org/TR/1999/REC-xslt-19991116",
+        ] {
+            assert!(!admitted(refused), "{profile:?} admits {refused}");
+        }
+        assert_eq!(
+            compiled.signing().unwrap().transforms.allowed_algorithms,
+            transforms.allowed_algorithms,
+            "{profile:?}"
+        );
+    }
+    assert!(matches!(
+        SignContext::new(&key)
+            .policy(compiled.signing().unwrap().clone())
+            .sign_template(&xades_with_object_reference(
+                "http://www.w3.org/TR/1999/REC-xpath-19991116"
+            )),
+        Err(xml_sec::xmldsig::SigningError::Policy(_))
+    ));
+}
+
 #[test]
 fn incompatible_protocols_and_interpretation_models_reject_composition() {
     // Restriction cannot silently change which document bytes an ID names.

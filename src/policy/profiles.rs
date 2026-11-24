@@ -534,9 +534,15 @@ fn profile_transforms(compatibility: bool) -> TransformPolicy {
             ..TransformPolicy::default()
         }
     } else {
+        // Base64 is a required transform (XMLDSig 1.1 §6.6.2) that decodes
+        // octets and selects no nodes, so it widens no coverage question;
+        // XPath, XPath Filter 2.0 and XSLT, which select or rewrite node sets,
+        // stay outside the strict profiles.
+        // https://www.w3.org/TR/xmldsig-core1/#sec-Base-64
         TransformPolicy {
             allowed_algorithms: Some(
                 [
+                    "http://www.w3.org/2000/09/xmldsig#base64",
                     "http://www.w3.org/2000/09/xmldsig#enveloped-signature",
                     "http://www.w3.org/2001/10/xml-exc-c14n#",
                     "http://www.w3.org/2001/10/xml-exc-c14n#WithComments",
