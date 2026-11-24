@@ -16,6 +16,15 @@ owns loading, inheritance and effective-output behavior; the
 `extends` names another profile in the same document. Missing parents and
 cycles fail. All profiles are validated, not only the selected one.
 
+A profile may also carry a `deny` table, the permissions it withdraws from what
+it inherits without restating the allowlists. Its arrays are `transforms`
+(transform and canonicalization URIs), `signature_algorithms` and
+`digest_algorithms` (algorithm URIs), `key_sources` (the key-source names below)
+and `reference_uri_classes` (`empty`, `same_document`, `external`). Each value
+must name something the build knows, so a misspelt denial fails loading. A
+denial only withdraws: denying what the profile already refuses changes nothing,
+and a child that extends the profile keeps it.
+
 Each operation optionally accepts `enabled` (boolean). `false` must be the
 only field in that operation table. Omission inherits; a child cannot re-enable
 a disabled operation. Encryption tables require an encryption-enabled build.

@@ -20,6 +20,9 @@ use alloc::{borrow::ToOwned, collections::BTreeSet, string::String, sync::Arc};
 
 mod composition;
 mod constraints;
+mod denials;
+
+pub use denials::Denials;
 
 /// XML Security presets, selected only by trusted application code.
 /// These names do not certify full SAML, SOAP or `XAdES` conformance.

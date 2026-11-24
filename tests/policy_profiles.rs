@@ -1572,6 +1572,106 @@ fn the_xades_profiles_widen_one_step_at_a_time() {
 }
 
 #[test]
+fn a_denial_withdraws_exactly_the_named_permissions() {
+    // A deployment narrows any profile without restating it: each denied
+    // permission disappears from every operation that had it, and the rest
+    // of the profile stays as it was.
+    use xml_sec::policy::{Denials, KeySourceKind};
+    use xml_sec::xmldsig::{SignatureAlgorithm, UriClass};
+    const FILTER2: &str = "http://www.w3.org/2002/06/xmldsig-filter2";
+    const XPATH: &str = "http://www.w3.org/TR/1999/REC-xpath-19991116";
+    let denials = Denials {
+        transforms: [FILTER2.to_owned()].into(),
+        signature_algorithms: [SignatureAlgorithm::RsaSha1].into(),
+        key_sources: vec![KeySourceKind::KeyValue],
+        reference_uri_classes: vec![UriClass::External],
+        ..Denials::default()
+    };
+    let denied = compiler(PolicyProfile::XadesConformant)
+        .deny(&denials)
+        .unwrap()
+        .compile(&context())
+        .unwrap();
+    let full = compiler(PolicyProfile::XadesConformant)
+        .compile(&context())
+        .unwrap();
+    let verification = denied.verification().unwrap();
+    let transforms = verification.transforms.allowed_algorithms.clone().unwrap();
+    assert!(!transforms.contains(FILTER2));
+    assert!(transforms.contains(XPATH));
+    let methods = verification.signature_algorithms.clone().unwrap();
+    assert!(!methods.contains(&SignatureAlgorithm::RsaSha1));
+    assert!(methods.contains(&SignatureAlgorithm::DsaSha1));
+    assert!(!verification.key_sources.contains(KeySourceKind::KeyValue));
+    assert!(verification.key_sources.contains(KeySourceKind::X509Data));
+    assert!(!verification.uris.references.allows("external.xml"));
+    let signing = denied.signing().unwrap();
+    assert!(
+        !signing
+            .transforms
+            .allowed_algorithms
+            .as_ref()
+            .unwrap()
+            .contains(FILTER2)
+    );
+    // Everything not named is unchanged.
+    let mut expected = full.verification().unwrap().clone();
+    expected.transforms.allowed_algorithms = Some(transforms);
+    expected.signature_algorithms = Some(methods);
+    expected.key_sources.remove(KeySourceKind::KeyValue);
+    expected.uris.references = verification.uris.references;
+    assert_eq!(format!("{verification:?}"), format!("{expected:?}"));
+}
+
+#[test]
+fn a_denial_never_grants_and_reaches_absent_allowlists() {
+    // Denying what a profile already refuses changes nothing. A profile that
+    // admits every implemented transform (no allowlist) still loses exactly
+    // the denied one, so signing with it is a typed policy refusal.
+    use xml_sec::policy::Denials;
+    const XPATH: &str = "http://www.w3.org/TR/1999/REC-xpath-19991116";
+    let absent = Denials {
+        transforms: ["http://www.w3.org/TR/1999/REC-xslt-19991116".to_owned()].into(),
+        ..Denials::default()
+    };
+    let unchanged = compiler(PolicyProfile::Xades)
+        .deny(&absent)
+        .unwrap()
+        .compile(&context())
+        .unwrap();
+    let strict = compiler(PolicyProfile::Xades).compile(&context()).unwrap();
+    assert_eq!(
+        format!("{:?}", unchanged.verification()),
+        format!("{:?}", strict.verification())
+    );
+    let compatible = compiler(PolicyProfile::XmlSecCompatible)
+        .deny(&Denials {
+            transforms: [XPATH.to_owned()].into(),
+            ..Denials::default()
+        })
+        .unwrap()
+        .compile(&context())
+        .unwrap();
+    let verification = compatible.verification().unwrap();
+    let transforms = verification.transforms.allowed_algorithms.as_ref().unwrap();
+    assert!(!transforms.contains(XPATH));
+    assert!(transforms.contains("http://www.w3.org/2000/09/xmldsig#base64"));
+    assert!(transforms.contains("http://www.w3.org/2002/06/xmldsig-filter2"));
+    let key = HmacSigningKey::new(vec![0x53; 32]).unwrap();
+    let refused = SignContext::new(&key)
+        .policy(compatible.signing().unwrap().clone())
+        .sign_template(&xades_with_object_reference(XPATH));
+    assert!(
+        matches!(
+            refused,
+            Err(xml_sec::xmldsig::SigningError::Policy(PolicyViolation::Algorithm { ref algorithm, .. }))
+                if algorithm == XPATH
+        ),
+        "{refused:?}"
+    );
+}
+
+#[test]
 fn incompatible_protocols_and_interpretation_models_reject_composition() {
     // Restriction cannot silently change which document bytes an ID names.
     let saml = compiler(PolicyProfile::SecureSaml);

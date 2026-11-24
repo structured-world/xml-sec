@@ -53,7 +53,7 @@ pub use audit::{
 mod profiles;
 #[cfg(feature = "xmldsig")]
 pub use profiles::{
-    CompiledPolicies, PolicyCompileContext, PolicyCompiler, PolicyProfile, PolicySet,
+    CompiledPolicies, Denials, PolicyCompileContext, PolicyCompiler, PolicyProfile, PolicySet,
     PolicyValidity, SignatureConstraints,
 };
 

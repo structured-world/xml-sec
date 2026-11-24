@@ -419,17 +419,21 @@ fn xml(p: &mut XmlInputPolicy, v: &Value) -> Result<(), Error> {
     }
     Ok(())
 }
+/// The key source a configuration names `name`.
+pub(super) fn key_source_named(name: &str) -> Option<KeySourceKind> {
+    Some(match name {
+        "preset_key" => KeySourceKind::PresetKey,
+        "key_name" => KeySourceKind::KeyName,
+        "key_value" => KeySourceKind::KeyValue,
+        "der_encoded_key_value" => KeySourceKind::DerEncodedKeyValue,
+        "x509_data" => KeySourceKind::X509Data,
+        "key_info_reference" => KeySourceKind::KeyInfoReference,
+        _ => return None,
+    })
+}
 fn key_sources(p: &mut KeySourcePolicy, v: &Value) -> Result<(), Error> {
     for (key, value) in table(v, "key_sources")? {
-        let source = match key.as_str() {
-            "preset_key" => KeySourceKind::PresetKey,
-            "key_name" => KeySourceKind::KeyName,
-            "key_value" => KeySourceKind::KeyValue,
-            "der_encoded_key_value" => KeySourceKind::DerEncodedKeyValue,
-            "x509_data" => KeySourceKind::X509Data,
-            "key_info_reference" => KeySourceKind::KeyInfoReference,
-            _ => return Err(invalid(key)),
-        };
+        let source = key_source_named(key).ok_or_else(|| invalid(key))?;
         p.set(source, boolean(value, key)?);
     }
     Ok(())

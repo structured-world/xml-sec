@@ -85,6 +85,77 @@ fn all_ordinary_profiles_round_trip_effective_policy() {
     }
 }
 
+#[test]
+fn a_deny_table_withdraws_permissions_and_children_inherit_it() {
+    // A deployment narrows a named profile by naming what to withdraw, without
+    // restating its allowlists; a child extending it keeps the withdrawal.
+    let document = r"schema_version = 1
+[profiles.team]
+base = 'XadesConformant'
+[profiles.team.deny]
+transforms = ['http://www.w3.org/2002/06/xmldsig-filter2']
+signature_algorithms = ['http://www.w3.org/2000/09/xmldsig#rsa-sha1']
+key_sources = ['key_value']
+reference_uri_classes = ['external']
+[profiles.child]
+extends = 'team'
+";
+    let config = Configuration::from_str(document, LoadLimits::default()).unwrap();
+    for name in ["team", "child"] {
+        let policy = effective(&config, name);
+        let verification = policy.compiled().verification().unwrap();
+        let transforms = verification.transforms.allowed_algorithms.as_ref().unwrap();
+        assert!(
+            !transforms.contains("http://www.w3.org/2002/06/xmldsig-filter2"),
+            "{name}"
+        );
+        assert!(
+            transforms.contains("http://www.w3.org/TR/1999/REC-xpath-19991116"),
+            "{name}"
+        );
+        let methods = verification.signature_algorithms.as_ref().unwrap();
+        assert!(
+            !methods.contains(&xml_sec::xmldsig::SignatureAlgorithm::RsaSha1),
+            "{name}"
+        );
+        assert!(
+            methods.contains(&xml_sec::xmldsig::SignatureAlgorithm::DsaSha1),
+            "{name}"
+        );
+        assert!(
+            !verification
+                .key_sources
+                .contains(xml_sec::policy::KeySourceKind::KeyValue),
+            "{name}"
+        );
+        assert!(
+            !verification.uris.references.allows("external.xml"),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_denial_fails_loading() {
+    // A misspelt denial would otherwise withdraw nothing and go unnoticed.
+    for table in [
+        "transforms = ['http://www.w3.org/2002/06/xmldsig-filter3']",
+        "signature_algorithms = ['urn:no-such-method']",
+        "digest_algorithms = ['urn:no-such-digest']",
+        "key_sources = ['key_valve']",
+        "reference_uri_classes = ['remote']",
+        "unknown_field = []",
+    ] {
+        let document = format!(
+            "schema_version = 1\n[profiles.team]\nbase = 'Xades'\n[profiles.team.deny]\n{table}\n"
+        );
+        assert!(
+            Configuration::from_str(&document, LoadLimits::default()).is_err(),
+            "{table}"
+        );
+    }
+}
+
 #[cfg(feature = "pkcs11")]
 #[test]
 fn pkcs11_configuration_retains_encryption_policies() {

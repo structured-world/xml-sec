@@ -35,6 +35,31 @@ ceilings decrease, and a disabled operation cannot be re-enabled. `None` means
 disabled, not unspecified inheritance. Conflicting interpretation modes and
 protocol constraints are errors, not an implicit precedence rule.
 
+## Denials
+
+`PolicyCompiler::deny` withdraws named permissions from any profile and the
+layers composed so far: transforms, signature and digest methods, key sources
+and reference URI classes, in every operation that has them. It is one more
+restrictive layer, so it never grants: denying what the profile refuses changes
+nothing, and the rest of the profile stays as it was. A profile without a
+transform allowlist (it admits every implemented transform) loses exactly the
+denied ones. `xml-sec-config` reads the same denials from a profile's `deny`
+table.
+
+```rust
+use xml_sec::policy::{Denials, KeySourceKind, PolicyCompileContext, PolicyCompiler, PolicyProfile};
+use xml_sec::provider::default_provider;
+
+let denials = Denials {
+    transforms: ["http://www.w3.org/2002/06/xmldsig-filter2".into()].into(),
+    key_sources: vec![KeySourceKind::KeyValue],
+    ..Denials::default()
+};
+let policies = PolicyCompiler::new(PolicyProfile::XadesConformant, default_provider(), None)?
+    .deny(&denials)?
+    .compile(&PolicyCompileContext { external_resources: false, target_evidence: true })?;
+```
+
 ## Key Source Permissions
 
 `KeySourcePolicy` is a typed set of `KeySourceKind` values. The default remains
