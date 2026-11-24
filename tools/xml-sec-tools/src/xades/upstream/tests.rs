@@ -328,6 +328,37 @@ fn a_reviewed_difference_needs_a_class_and_a_reason() {
 }
 
 #[test]
+fn the_validity_horizon_of_each_passing_signature_is_recorded_and_checked() {
+    // Until when each signature keeps passing is part of what a run
+    // observes: listed per signature where any has one, and a changed
+    // horizon fails the check like a changed comparison.
+    let facts = json!({ "signatures": [
+        { "etsi": { "indication": "TOTAL_PASSED", "valid_until": 1_820_055_894 } },
+        { "etsi": { "indication": "INDETERMINATE" } },
+    ] });
+    assert_eq!(super::horizons(&facts), Some(json!([1_820_055_894, null])));
+    assert_eq!(
+        super::horizons(&json!({ "signatures": [{ "etsi": {} }] })),
+        None
+    );
+    let mut summary = unreviewed_summary();
+    summary["cases"]["a.xml"]["instant/strict"]["valid_until"] = json!([1]);
+    let reviews = review("normative-difference", "EN 319 102-1 5.2.6.4 step 4");
+    let recorded = super::recorded(&summary, &reviews);
+    assert_eq!(
+        recorded["cases"]["a.xml"]["instant/strict"]["valid_until"],
+        json!([1])
+    );
+    assert_eq!(
+        differences(&recorded, &summary, &reviews),
+        Vec::<String>::new()
+    );
+    let mut changed = summary.clone();
+    changed["cases"]["a.xml"]["instant/strict"]["valid_until"] = json!([2]);
+    assert_eq!(differences(&recorded, &changed, &reviews).len(), 1);
+}
+
+#[test]
 fn a_review_no_observation_matches_fails() {
     // A review whose comparison is no longer observed would otherwise
     // outlive the difference it explains.

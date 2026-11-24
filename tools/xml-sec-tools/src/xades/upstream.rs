@@ -701,6 +701,22 @@ fn conditions_of(
     Ok((cases, conditions))
 }
 
+/// Until when each signature of `facts` keeps passing (the probe's
+/// `valid_until`, Unix seconds, `null` for one that does not pass now or
+/// that no certificate bounds), when any signature has such a time.
+pub(crate) fn horizons(facts: &Value) -> Option<Value> {
+    let horizons: Vec<Value> = facts["signatures"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|signature| signature["etsi"]["valid_until"].clone())
+        .collect();
+    horizons
+        .iter()
+        .any(|horizon| !horizon.is_null())
+        .then(|| Value::Array(horizons))
+}
+
 /// Every case's comparison in each pass it took part in.
 fn observations(
     cases: &[Case],
@@ -719,17 +735,18 @@ fn observations(
             }
             for (profile, _) in PROFILES {
                 let (rows, facts) = pass_rows(&pass, profile, stamped)?;
-                row.insert(
-                    format!("{label}/{profile}"),
-                    json!({
-                        "observed": observed(&rows),
-                        "class": automatic_class(&rows, anchors),
-                        "passed": every_passed(&rows, "ours")
-                            && facts["signatures"].as_array().is_some_and(|s| !s.is_empty()),
-                        "dss_passed": every_passed(&rows, "dss"),
-                        "indication": every_overall(&rows, "indication"),
-                    }),
-                );
+                let mut entry = json!({
+                    "observed": observed(&rows),
+                    "class": automatic_class(&rows, anchors),
+                    "passed": every_passed(&rows, "ours")
+                        && facts["signatures"].as_array().is_some_and(|s| !s.is_empty()),
+                    "dss_passed": every_passed(&rows, "dss"),
+                    "indication": every_overall(&rows, "indication"),
+                });
+                if let Some(horizons) = horizons(&facts) {
+                    entry["valid_until"] = horizons;
+                }
+                row.insert(format!("{label}/{profile}"), entry);
             }
         }
         observations.insert(name.clone(), Value::Object(row));
@@ -852,7 +869,11 @@ pub(crate) fn report(expectations: &Value) -> String {
          DSS's simple report, and the shared EN 319 102-1 process over \
          xml-sec's facts); it is in *agreement* when every signature reaches \
          DSS's indication and sub-indication. Each other input carries a \
-         reviewed class with the clause it rests on.\n",
+         reviewed class with the clause it rests on.\n\n\
+         For every signature xml-sec passes, the expectations record until \
+         when it keeps passing (`valid_until`, Unix seconds): the last \
+         certificate validity bound past which the same process, over the \
+         evidence the document carries, still reaches TOTAL_PASSED.\n",
     );
     for pass in ["instant", "signing-time"] {
         let mut rows = Vec::new();
@@ -965,6 +986,13 @@ pub(crate) fn differences(expected: &Value, summary: &Value, reviews: &Value) ->
                 found.push(format!(
                     "{name} {label}: observed {} where {} is expected",
                     pass["observed"], entry["observed"]
+                ));
+                continue;
+            }
+            if entry["valid_until"] != pass["valid_until"] {
+                found.push(format!(
+                    "{name} {label}: valid until {} where {} is expected",
+                    pass["valid_until"], entry["valid_until"]
                 ));
                 continue;
             }

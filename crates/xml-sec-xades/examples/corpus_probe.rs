@@ -864,10 +864,18 @@ fn integrity(
                 Err(ValidationError::Enclosing(error))
                     if matches!(*error, EnclosingError::Counter(_))
             );
-            found.push((
-                verification(entry),
-                etsi::indication(&session, entry.result(), declared, inputs, uncountersigned),
-            ));
+            let at = |now| {
+                let inputs = etsi::Inputs { now, ..*inputs };
+                etsi::indication(&session, entry.result(), declared, &inputs, uncountersigned)
+            };
+            let mut computed = at(inputs.now);
+            if computed["indication"] == "TOTAL_PASSED" {
+                computed["valid_until"] = valid_until(
+                    &etsi::validity_bounds(&session.certificate_parser(), inputs),
+                    at,
+                );
+            }
+            found.push((verification(entry), computed));
         }
         Ok(())
     });
@@ -876,6 +884,17 @@ fn integrity(
         json!({ "error": kind(&debug), "detail": error.to_string() })
     });
     Ok((found, refusal))
+}
+
+/// Until when a signature that passes now keeps passing over the evidence it
+/// carries: the last of `bounds` before the first one past which the ETSI
+/// process `at` no longer reaches `TOTAL_PASSED`, as Unix seconds. `null`
+/// when it passes past every bound, so no certificate limits it.
+fn valid_until(bounds: &[i64], at: impl Fn(i64) -> Value) -> Value {
+    bounds
+        .iter()
+        .find(|bound| at(**bound + 1)["indication"] != "TOTAL_PASSED")
+        .map_or(Value::Null, |bound| json!(bound))
 }
 
 /// The hash a digest method computes, when both constraint vocabularies

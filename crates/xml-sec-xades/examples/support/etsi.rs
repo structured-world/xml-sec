@@ -61,6 +61,7 @@ pub struct Declared {
 }
 
 /// The conditions and constraints every signature of one comparison shares.
+#[derive(Clone, Copy)]
 pub struct Inputs<'a> {
     /// Every certificate the document and its tokens carry.
     pub pool: &'a [Vec<u8>],
@@ -377,6 +378,28 @@ fn parse<'a>(parser: &'a structured_asn1::Parser, inputs: &'a Inputs<'_>) -> Par
             .collect(),
         responses,
     }
+}
+
+/// Every instant after `inputs.now` at which a certificate the comparison
+/// knows starts or stops being valid, as Unix seconds, ascending and once
+/// each. Over the same evidence these are the only times after which the
+/// process can decide otherwise: the profiles' constraints have no time
+/// dimension, and DSS's policy ignores revocation freshness.
+pub fn validity_bounds(parser: &structured_asn1::Parser, inputs: &Inputs<'_>) -> Vec<i64> {
+    let parsed = parse(parser, inputs);
+    let mut bounds: Vec<i64> = parsed
+        .pool
+        .iter()
+        .chain(&parsed.anchors)
+        .flat_map(|certificate| {
+            let (not_before, not_after) = validity(certificate);
+            [not_before.seconds(), not_after.seconds()]
+        })
+        .filter(|bound| *bound >= inputs.now)
+        .collect();
+    bounds.sort_unstable();
+    bounds.dedup();
+    bounds
 }
 
 /// The validity of `certificate`.
