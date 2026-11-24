@@ -257,7 +257,8 @@ const USAGE_KEY_VALUE_NODE_WRITE: c_uint = 0x00008;
 use errors::R_INVALID_KEY_DATA;
 /// The documented initial `maxKeyInfoChildren` of the libxmlsec1 ABI
 /// (`keyinfo.h`), a caller-owned context field like the reference levels
-/// above it.
+/// above it. It is not a policy default: a read takes the smaller of it and
+/// the pinned policy's `max_key_info_children`, so it never widens the policy.
 const MAX_KEY_INFO_CHILDREN_DEFAULT: usize = 10;
 
 /// `xmlSecKeyInfoCtx`, with the `XMLEnc` and X.509 members of a build that
@@ -378,6 +379,17 @@ pub(crate) unsafe extern "C" fn xmlSecKeyInfoNodeRead(
             let Some(_pin) = policy::SlotPin::hold(&raw mut (*ctx).reserved0, here) else {
                 return -1;
             };
+            // The pinned policy's `max_key_info_children` bounds the read;
+            // the context's `maxKeyInfoChildren`, unless zero (no limit of
+            // its own), can only narrow it.
+            let pinned = policy::pinned((*ctx).reserved0).expect("the read holds its pin");
+            let mut maximum = pinned
+                .of(references::read_side(ctx))
+                .resources()
+                .max_key_info_children;
+            if (*ctx).max_key_info_children != 0 {
+                maximum = maximum.min((*ctx).max_key_info_children);
+            }
             let mut cur = xmlSecGetNextElementNode(nodes::first_child(key_info_node));
             let mut children = 0_usize;
             while !cur.is_null() {
@@ -393,12 +405,10 @@ pub(crate) unsafe extern "C" fn xmlSecKeyInfoNodeRead(
                         break;
                     }
                 }
-                // Every child the read reaches counts, known or not, up to
-                // the context's `maxKeyInfoChildren`; zero lifts the limit.
+                // Every child the read reaches counts, known or not.
                 // Bounded by the document's element count, which fits usize.
                 children += 1;
-                let maximum = (*ctx).max_key_info_children;
-                if maximum != 0 && children > maximum {
+                if children > maximum {
                     errors::report(
                         here,
                         c"KeyInfo".as_ptr(),

@@ -1303,6 +1303,7 @@ fn assert_cli_exit_statuses_match(ledger: &Ledger) {
 /// The classification the ledger must give the CLI option `option`. The
 /// libxmlsec1 limits the command maps onto the compatibility profile's
 /// resource policy, measured as the core measures them, are profile-only.
+#[cfg(all(feature = "xmldsig", feature = "xmlenc", feature = "c14n"))]
 fn expected_cli_outcome(
     option: &str,
     behavior_compatible: &BTreeSet<&str>,

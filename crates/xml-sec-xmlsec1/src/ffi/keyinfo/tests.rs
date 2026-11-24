@@ -397,6 +397,36 @@ fn a_read_reaches_at_most_the_contexts_key_info_children() {
 }
 
 #[test]
+fn the_contexts_key_info_children_only_narrow_the_policy_limit() {
+    // A deployment that narrows max_key_info_children binds every C read:
+    // neither the context's initial 10 nor a zero (no limit of its own)
+    // reaches past the compiled policy, while a smaller context value still
+    // narrows it.
+    own_process();
+    let xml = "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\">\
+               <a xmlns=\"urn:test\"/><b xmlns=\"urn:test\"/><c xmlns=\"urn:test\"/>\
+               </KeyInfo>";
+    xml_sec_libxml2::policy::republish(
+        |verification| verification.resources.max_key_info_children = 2,
+        |_| {},
+    )
+    .expect("the library policy compiles");
+    // SAFETY: contexts created and destroyed here.
+    unsafe {
+        assert_eq!(xmlSecKeyDataIdsInit(), 0);
+        let ctx = xmlSecKeyInfoCtxCreate(std::ptr::null_mut());
+        let unknown = errors::R_UNEXPECTED_NODE;
+        let over = errors::R_MAX_KEYINFO_CHILDREN;
+        assert_eq!(read_reported(xml, ctx), (-1, vec![unknown, unknown, over]));
+        (*ctx).max_key_info_children = 0;
+        assert_eq!(read_reported(xml, ctx), (-1, vec![unknown, unknown, over]));
+        (*ctx).max_key_info_children = 1;
+        assert_eq!(read_reported(xml, ctx), (-1, vec![unknown, over]));
+        xmlSecKeyInfoCtxDestroy(ctx);
+    }
+}
+
+#[test]
 fn an_encrypted_key_after_the_key_has_its_value_is_skipped() {
     // An earlier EncryptedKey in the same KeyInfo already gave the key its
     // value: libxmlsec1 skips a later one without reading or reporting it,

@@ -500,7 +500,9 @@ static DEFAULT_CHUNK_SIZE: AtomicUsize = AtomicUsize::new(64 * 1024);
 /// The maximum transform depth of contexts initialized from now on.
 static DEFAULT_MAX_DEPTH: AtomicU32 = AtomicU32::new(16);
 /// The `XPath` operations limit of contexts initialized from now on, the
-/// documented initial value of the libxmlsec1 ABI; 0 lifts it.
+/// documented initial value of the libxmlsec1 ABI. It is not a policy
+/// default: a context's limit only narrows the pinned policy's
+/// `max_xpath_evaluation_work`, and 0 leaves the policy's alone.
 static DEFAULT_XPATH_OPS_LIMIT: AtomicUsize = AtomicUsize::new(1_000_000);
 
 /// `xmlSecTransformCtxGetDefaultXpathOpsLimit`.
