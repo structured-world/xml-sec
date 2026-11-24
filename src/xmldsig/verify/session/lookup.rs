@@ -243,6 +243,12 @@ impl<W: Work> VerifiedSession<'_, '_, '_, W> {
         super::super::super::pkix::path_bounds(self.context.policy.key_trust.max_x509_chain_depth)
     }
 
+    /// How this operation's key-trust policy took a signer that is itself a
+    /// trust anchor (EN 319 102-1 V1.4.1 §5.2.6.4 step 1).
+    pub fn trust_anchor_signer(&self) -> crate::policy::TrustAnchorSigner {
+        self.context.policy.key_trust.trust_anchor_signer
+    }
+
     /// How this operation's compiled policy reads timestamp tokens.
     pub fn timestamp_token_encoding(&self) -> crate::policy::TimestampTokenEncoding {
         self.context.policy.timestamp_token_encoding

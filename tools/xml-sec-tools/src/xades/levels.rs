@@ -676,9 +676,14 @@ const DSS_SIGNATURES: [(&str, &str, &str, &str); 7] = [
     ),
     // EN 319 132-1 §5.1.3: an unmarked token is DER, and this SET OF is unsorted.
     ("xades-t-with-tsvd.xml", "1701100000", "t", "SetOrder"),
-    // The RFC 5652 reading admits the same token; the corpus anchors then end
-    // at its signer, which is this setting's limit and not a token fact.
-    ("xades-t-with-tsvd.xml", "1701100000", "t cms", "AnchorOnly"),
+    // The RFC 5652 reading admits the same token; the corpus anchors end at
+    // its signer, whose B-B binds to that anchor certificate itself.
+    (
+        "xades-t-with-tsvd.xml",
+        "1701100000",
+        "t cms",
+        "Ok(Assessed(true))",
+    ),
 ];
 
 /// Checks the adapter's report on every signature of `DSS_SIGNATURES`, read at

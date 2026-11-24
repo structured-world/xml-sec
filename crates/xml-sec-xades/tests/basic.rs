@@ -17,7 +17,7 @@ use structured_xades::properties::{ClaimedTimeFailure, Error as PropertyError};
 use structured_xades::xml::{Access, Xml};
 use xml_sec::XmlDocument;
 use xml_sec::document::NodeIdentity;
-use xml_sec::policy::{Instant, VerificationPolicy};
+use xml_sec::policy::{Instant, TrustAnchorSigner, VerificationPolicy};
 use xml_sec::xmldsig::extension::{self, NodeView};
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DigestAlgorithm, DsigError, KeyResolverConfig, UriTypeSet,
@@ -379,10 +379,11 @@ fn key_info_must_carry_the_signing_certificate() {
 }
 
 #[test]
-fn signer_trusted_as_its_own_anchor_has_no_certification_path() {
+fn signer_trusted_as_its_own_anchor_binds_its_signing_certificate() {
     // With the signer itself configured as the anchor, the validated path is
-    // the anchor alone; RFC 5280 §6.1 excludes the anchor, so B-B has no
-    // certification path to bind and reports that, not success.
+    // the anchor alone. B-B still binds SigningCertificateV2 to that exact
+    // certificate (EN 319 102-1 V1.4.1 §5.2.6.4 step 1) rather than reporting
+    // a missing path: the signature is otherwise left without B-B at all.
     let pinned = DefaultKeyResolver::new(KeyResolverConfig {
         trusted_certs: vec![SIGNER.to_vec()],
         ..KeyResolverConfig::default()
@@ -393,16 +394,28 @@ fn signer_trusted_as_its_own_anchor_has_no_certification_path() {
         |_| {},
         |session| validate_basic(session, signature(session, 0), &[], facts),
     );
-    assert!(
-        matches!(
-            outcome,
-            Ok(Outcome::Path {
-                failure: PathFailure::AnchorOnly,
-                ..
-            })
-        ),
-        "{outcome:?}"
+    assert!(matches!(outcome, Ok(Outcome::Assessed(MET))), "{outcome:?}");
+}
+
+#[test]
+fn accepted_anchor_signer_is_bound_after_its_validity() {
+    // TrustAnchorSigner::Accepted takes the anchor without its validity
+    // period (§5.2.6.4 step 1(b)), so verification long after the signer
+    // expired still yields a B-B binding to the anchor certificate.
+    let pinned = DefaultKeyResolver::new(KeyResolverConfig {
+        trusted_certs: vec![SIGNER.to_vec()],
+        ..KeyResolverConfig::default()
+    });
+    let outcome = verified(
+        include_str!("fixtures/enveloped.xml"),
+        &pinned,
+        |policy| {
+            policy.key_trust.trust_anchor_signer = TrustAnchorSigner::Accepted;
+            policy.key_trust.verification_time = Instant::new(4_000_000_000, 0);
+        },
+        |session| validate_basic(session, signature(session, 0), &[], facts),
     );
+    assert!(matches!(outcome, Ok(Outcome::Assessed(MET))), "{outcome:?}");
 }
 
 #[test]
