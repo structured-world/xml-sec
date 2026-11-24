@@ -534,7 +534,7 @@ fn status_of<'a, W: structured_asn1::memory::Work>(
     inputs: &Inputs<'_>,
     now: Instant,
     memory: &Memory,
-) -> (Status, Vec<RevocationIssuer>, Vec<Record>) {
+) -> Result<(Status, Vec<RevocationIssuer>, Vec<Record>), String> {
     let anchor_subject = path
         .anchor()
         .certificate()
@@ -611,9 +611,15 @@ fn status_of<'a, W: structured_asn1::memory::Work>(
     match revocation::assess(path, member, &sources, &query, &context, &verifier, &digest) {
         Ok(assessment) => {
             let (issuers, records) = statements(assessment.statements());
-            (assessment.status(), issuers, records)
+            Ok((assessment.status(), issuers, records))
         }
-        Err(_) => (Status::NoEvidence, Vec::new(), Vec::new()),
+        // A located PKIX failure is a source this member cannot use, such as
+        // a CRL marking its Issuing Distribution Point non-critical (RFC 5280
+        // section 5.2.5); `assess` ends the whole member on it, so no source
+        // establishes a status. Resource, provider and binding failures end
+        // the validation instead of standing for missing evidence.
+        Err(revocation::Error::Processing(_)) => Ok((Status::NoEvidence, Vec::new(), Vec::new())),
+        Err(error) => Err(format!("status assessment failed: {error:?}")),
     }
 }
 
@@ -807,7 +813,7 @@ fn path_facts<'a, W: structured_asn1::memory::Work>(
     inputs: &Inputs<'_>,
     now: Instant,
     memory: &Memory,
-) -> PathFacts {
+) -> Result<PathFacts, String> {
     let mut facts = PathFacts {
         chains: Vec::new(),
         statuses: Vec::new(),
@@ -833,7 +839,7 @@ fn path_facts<'a, W: structured_asn1::memory::Work>(
             basis: 0,
             later: None,
         };
-        return facts;
+        return Ok(facts);
     }
     let (not_before, not_after) = validity(signer);
     let mut accepted = false;
@@ -875,7 +881,7 @@ fn path_facts<'a, W: structured_asn1::memory::Work>(
             inputs,
             now,
             memory,
-        );
+        )?;
         if !accepted {
             facts.signer_status = members.signer;
         }
@@ -916,7 +922,7 @@ fn path_facts<'a, W: structured_asn1::memory::Work>(
         });
         accepted = true;
     }
-    facts
+    Ok(facts)
 }
 
 /// The facts of every non-anchor member of one checked chain.
@@ -941,7 +947,7 @@ fn member_facts<'a, W: structured_asn1::memory::Work>(
     inputs: &Inputs<'_>,
     now: Instant,
     memory: &Memory,
-) -> MemberFacts {
+) -> Result<MemberFacts, String> {
     let count = checked.members().len();
     let mut facts = MemberFacts {
         statuses: Vec::new(),
@@ -960,7 +966,7 @@ fn member_facts<'a, W: structured_asn1::memory::Work>(
             inputs,
             now,
             memory,
-        );
+        )?;
         facts.issuers.extend(used);
         if member + 1 == count {
             facts.signer = status;
@@ -982,7 +988,7 @@ fn member_facts<'a, W: structured_asn1::memory::Work>(
             scheme: Some(scheme_of(issuer, Family::RsaPkcs1, memory).unwrap_or(UNKNOWN_SCHEME)),
         });
     }
-    facts
+    Ok(facts)
 }
 
 /// What a timestamp token states, read without checking anything.
@@ -1082,7 +1088,8 @@ fn authority<'a>(
 /// step 3 consumes it): a token xml-sec-xades established passes when its
 /// TSA's certificate validates now, the X.509 building block deciding
 /// otherwise; a token it refused is discarded as one whose imprint does not
-/// bind; one it could not judge is left out.
+/// bind; one it could not judge is left out. A process failure ends the
+/// validation rather than passing or dropping a token.
 fn signature_timestamps<W: structured_asn1::memory::Work>(
     session: &VerifiedSession<'_, '_, '_, W>,
     declared: &Declared,
@@ -1090,7 +1097,7 @@ fn signature_timestamps<W: structured_asn1::memory::Work>(
     inputs: &Inputs<'_>,
     now: Instant,
     memory: &Memory,
-) -> Vec<SignatureTimestamp> {
+) -> Result<Vec<SignatureTimestamp>, String> {
     let mut found = Vec::new();
     for token in &declared.signature_timestamps {
         let Some(TokenFacts {
@@ -1106,8 +1113,8 @@ fn signature_timestamps<W: structured_asn1::memory::Work>(
                 let Some(tsa) = authority(&carried, parsed, memory) else {
                     continue;
                 };
-                let outcome = authority_outcome(session, tsa, parsed, inputs, now, memory);
-                found.push(match outcome.and_then(|outcome| outcome.sub) {
+                let outcome = authority_outcome(session, tsa, parsed, inputs, now, memory)?;
+                found.push(match outcome.sub {
                     None => SignatureTimestamp::Passed(instant(generated)),
                     Some(sub) => SignatureTimestamp::Finding {
                         sub,
@@ -1119,7 +1126,7 @@ fn signature_timestamps<W: structured_asn1::memory::Work>(
             None => {}
         }
     }
-    found
+    Ok(found)
 }
 
 /// The basic validation (clause 5.3.4) of a token signed by `tsa`, whose
@@ -1132,8 +1139,8 @@ fn authority_outcome<W: structured_asn1::memory::Work>(
     inputs: &Inputs<'_>,
     now: Instant,
     memory: &Memory,
-) -> Option<structured_ltv::validation::Outcome> {
-    let paths = path_facts(session, tsa, parsed, inputs, now, memory);
+) -> Result<structured_ltv::validation::Outcome, String> {
+    let paths = path_facts(session, tsa, parsed, inputs, now, memory)?;
     let etsi_paths = paths.lend();
     let (not_before, not_after) = validity(tsa);
     let facts = Facts {
@@ -1168,7 +1175,8 @@ fn authority_outcome<W: structured_asn1::memory::Work>(
         elements: Elements::NONE,
         ..*inputs.requirements
     };
-    structured_ltv::validation::validate(&facts, &requirements, memory).ok()
+    structured_ltv::validation::validate(&facts, &requirements, memory)
+        .map_err(|error| format!("timestamp authority validation failed: {error:?}"))
 }
 
 /// The signature value's material (its suite, sized by the signing
@@ -1231,9 +1239,16 @@ pub fn indication<W: structured_asn1::memory::Work>(
         return verdict("INDETERMINATE", Some("NO_SIGNING_CERTIFICATE_FOUND"), "ISC");
     };
     let (not_before, not_after) = validity(signer);
-    let paths = path_facts(session, signer, &parsed, inputs, now, &memory);
+    let stamped = path_facts(session, signer, &parsed, inputs, now, &memory).and_then(|paths| {
+        signature_timestamps(session, declared, &parsed, inputs, now, &memory)
+            .map(|stamps| (paths, stamps))
+    });
+    // A process that could not complete decides nothing about the signature.
+    let (paths, stamps) = match stamped {
+        Ok(found) => found,
+        Err(error) => return verdict("INDETERMINATE", Some("CUSTOM"), error),
+    };
     let etsi_paths = paths.lend();
-    let stamps = signature_timestamps(session, declared, &parsed, inputs, now, &memory);
     let (references, value) = integrity(result);
     let materials = own_materials(declared, signer, &memory);
     let mut elements = Elements::NONE;
@@ -1346,7 +1361,9 @@ impl<W: structured_asn1::memory::Work> TokenContext<'_, '_, '_, '_, '_, W> {
             &paths.history,
             self.catalogue,
         )];
-        self.tokens(declared, &mut tokens, &mut pasts);
+        if let Err(error) = self.tokens(declared, &mut tokens, &mut pasts) {
+            return verdict("INDETERMINATE", Some("CUSTOM"), error);
+        }
         let long_term_attributes = !tokens.is_empty() || self.catalogue.sources > 0;
         match long_term::validate(
             current,
@@ -1365,13 +1382,13 @@ impl<W: structured_asn1::memory::Work> TokenContext<'_, '_, '_, '_, '_, W> {
     /// Every token of `declared` the long-term process can place, with its
     /// TSA's past-validation inputs appended to `pasts`. A token xml-sec-xades
     /// refused has a broken imprint or signature (clause 5.4 via 5.2.7); one
-    /// it could not judge is left out.
+    /// it could not judge is left out; a process failure ends the validation.
     fn tokens(
         &self,
         declared: &Declared,
         tokens: &mut Vec<long_term::Token>,
         pasts: &mut Vec<long_term::Past>,
-    ) {
+    ) -> Result<(), String> {
         let signature = declared.signature_timestamps.len();
         let validation = declared.validation_timestamps.len();
         let kinds = declared
@@ -1435,33 +1452,34 @@ impl<W: structured_asn1::memory::Work> TokenContext<'_, '_, '_, '_, '_, W> {
             let tsa = authority(&facts.certificates, self.parsed, self.memory);
             let current = if !intact {
                 long_term::Decision::Finding(SubIndication::HashFailure)
-            } else if let Some(outcome) = tsa.and_then(|tsa| {
-                authority_outcome(
+            } else if let Some(tsa) = tsa {
+                long_term::Decision::from(authority_outcome(
                     self.session,
                     tsa,
                     self.parsed,
                     self.inputs,
                     self.now,
                     self.memory,
-                )
-            }) {
-                long_term::Decision::from(outcome)
+                )?)
             } else {
                 continue;
             };
-            let past = tsa.map(|tsa| {
-                let history = path_facts(
-                    self.session,
-                    tsa,
-                    self.parsed,
-                    self.inputs,
-                    self.now,
-                    self.memory,
-                )
-                .history;
-                pasts.push(long_term::past(object, tsa, &history, self.catalogue));
-                pasts.len() - 1
-            });
+            let past = match tsa {
+                Some(tsa) => {
+                    let history = path_facts(
+                        self.session,
+                        tsa,
+                        self.parsed,
+                        self.inputs,
+                        self.now,
+                        self.memory,
+                    )?
+                    .history;
+                    pasts.push(long_term::past(object, tsa, &history, self.catalogue));
+                    Some(pasts.len() - 1)
+                }
+                None => None,
+            };
             tokens.push(long_term::Token {
                 object,
                 facts,
@@ -1470,5 +1488,6 @@ impl<W: structured_asn1::memory::Work> TokenContext<'_, '_, '_, '_, '_, W> {
                 past,
             });
         }
+        Ok(())
     }
 }
