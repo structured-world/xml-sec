@@ -9,6 +9,38 @@ use structured_asn1::{Oid, Parser};
 use structured_cms::timestamp::{Accuracy, PolicyAccuracy, Token};
 use xml_sec_xades::AuthorityAccuracy;
 
+/// `text` with its XML character references (XML 1.0 §4.1, `&#13;` and
+/// `&#xD;` as signers write line breaks in base64) replaced by the
+/// characters they name; any other text stays as it is.
+fn character_references(text: &str) -> String {
+    let mut found = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("&#") {
+        found.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let decoded = after.find(';').and_then(|end| {
+            let digits = &after[..end];
+            let value = match digits.strip_prefix(['x', 'X']) {
+                Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                None => digits.parse().ok()?,
+            };
+            Some((char::from_u32(value)?, end))
+        });
+        match decoded {
+            Some((character, end)) => {
+                found.push(character);
+                rest = &after[end + 1..];
+            }
+            None => {
+                found.push_str("&#");
+                rest = after;
+            }
+        }
+    }
+    found.push_str(rest);
+    found
+}
+
 /// Every base64 value of an element whose name ends with `tag`.
 pub fn values(text: &str, tag: &str) -> Vec<Vec<u8>> {
     let mut found = Vec::new();
@@ -23,7 +55,7 @@ pub fn values(text: &str, tag: &str) -> Vec<Vec<u8>> {
         let Some(end) = text[body..].find('<') else {
             continue;
         };
-        let compact: String = text[body..body + end]
+        let compact: String = character_references(&text[body..body + end])
             .chars()
             .filter(|character| !character.is_ascii_whitespace())
             .collect();
