@@ -31,6 +31,7 @@ use structured_ltv::validation::{Family, Hash};
 use structured_pkix::Certificate;
 use structured_pkix::temporal::LeapTable;
 use xml_sec::XmlDocument;
+use xml_sec::document::NodeIdentity;
 use xml_sec::policy::{
     Instant, PolicyCompileContext, PolicyCompiler, PolicyProfile, VerificationPolicy,
 };
@@ -335,50 +336,13 @@ fn facts(xml: &str, anchors: &Path, at: i64, profile: PolicyProfile) -> Result<V
     let ids = signature_ids(&text);
     let mut signatures = Vec::new();
     let account = account();
-    // A target the document does not resolve, or a signature over detached
-    // data alone, leaves the whole document as the expected target.
-    let expected: Vec<_> = document.with_view(|view| {
-        let mut found: Vec<_> = targets(&text)
-            .into_iter()
-            .filter_map(|target| match target {
-                Target::Root => Some(view.root_element()),
-                Target::Id(id) => view.node_for_id(&id, &[]),
-            })
-            .collect();
-        if found.is_empty() {
-            found.push(view.root_element());
-        }
-        found.dedup();
-        found
-    });
+    let expected = expected_targets(&document, &text);
     let request = VerificationRequest {
         expected_targets: &expected,
         ..VerificationRequest::default()
     };
-    // EN 319 102-1 5.2.7 establishes integrity with the signing certificate's
-    // key whatever its path: every certificate the document carries is
-    // trusted directly, so the references and value are checked even where
-    // no path validates at `at`.
-    let direct = DefaultKeyResolver::new(KeyResolverConfig {
-        trusted_certs: carried.clone(),
-        ..KeyResolverConfig::default()
-    });
-    let integrity_context = VerifyContext::new()
-        .policy(profile_policy(profile, at, false)?)
-        .key_resolver(&direct);
-    let mut integrity = Vec::new();
-    let integrity_run = with_verified_request(
-        &document,
-        &integrity_context,
-        &request,
-        &account,
-        |session| {
-            for entry in session.evidence().signatures() {
-                integrity.push(verification(entry));
-            }
-            Ok(())
-        },
-    );
+    let (integrity, integrity_refusal) =
+        integrity(&document, &request, &account, profile, at, &carried)?;
     let verified = with_verified_request(&document, &context, &request, &account, |session| {
         let entries = session.evidence().signatures();
         // Ids are reported only when both readings see the same signatures.
@@ -417,15 +381,68 @@ fn facts(xml: &str, anchors: &Path, at: i64, profile: PolicyProfile) -> Result<V
         Ok(())
     });
     let mut facts = json!({ "signatures": signatures });
-    if let Err(error) = integrity_run {
-        let debug = format!("{error:?}");
-        facts["integrity_request"] = json!({ "error": kind(&debug), "detail": error.to_string() });
+    if let Some(refusal) = integrity_refusal {
+        facts["integrity_request"] = refusal;
     }
     if let Err(error) = verified {
         let debug = format!("{error:?}");
         facts["request"] = json!({ "error": kind(&debug), "detail": error.to_string() });
     }
     Ok(facts)
+}
+
+/// The nodes the data `Reference`s of `text` name in `document`. A target
+/// the document does not resolve, or a signature over detached data alone,
+/// leaves the whole document as the expected target.
+fn expected_targets(document: &XmlDocument, text: &str) -> Vec<NodeIdentity> {
+    document.with_view(|view| {
+        let mut found: Vec<_> = targets(text)
+            .into_iter()
+            .filter_map(|target| match target {
+                Target::Root => Some(view.root_element()),
+                Target::Id(id) => view.node_for_id(&id, &[]),
+            })
+            .collect();
+        if found.is_empty() {
+            found.push(view.root_element());
+        }
+        found.dedup();
+        found
+    })
+}
+
+/// Each signature's integrity (EN 319 102-1 5.2.7), established with the
+/// signing certificate's key whatever its path: every certificate the
+/// document carries is trusted directly and no chain is checked, so the
+/// references and value are known even where no path validates at `at`.
+/// The second value is the refusal of the whole request, if any.
+fn integrity(
+    document: &XmlDocument,
+    request: &VerificationRequest<'_>,
+    account: &Memory,
+    profile: PolicyProfile,
+    at: i64,
+    carried: &[Vec<u8>],
+) -> Result<(Vec<Value>, Option<Value>), Failure> {
+    let direct = DefaultKeyResolver::new(KeyResolverConfig {
+        trusted_certs: carried.to_vec(),
+        ..KeyResolverConfig::default()
+    });
+    let context = VerifyContext::new()
+        .policy(profile_policy(profile, at, false)?)
+        .key_resolver(&direct);
+    let mut found = Vec::new();
+    let run = with_verified_request(document, &context, request, account, |session| {
+        for entry in session.evidence().signatures() {
+            found.push(verification(entry));
+        }
+        Ok(())
+    });
+    let refusal = run.err().map(|error| {
+        let debug = format!("{error:?}");
+        json!({ "error": kind(&debug), "detail": error.to_string() })
+    });
+    Ok((found, refusal))
 }
 
 /// The hash a digest method computes, as cryptographic constraints name it.
