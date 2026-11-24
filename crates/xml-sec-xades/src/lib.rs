@@ -79,8 +79,8 @@ pub use augment::{
     request_archive_timestamp_with_renewal, request_timestamp,
 };
 pub use basic::{
-    CounterError, Outcome, PathFailure, Report, TimestampCheckError, ValidationError,
-    validate_basic,
+    CounterError, EnclosingError, Outcome, PathFailure, Report, TimestampCheckError,
+    ValidationError, validate_basic,
 };
 pub use binary::DigestIdentity;
 #[cfg(feature = "produce")]

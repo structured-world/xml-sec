@@ -24,7 +24,8 @@ use xml_sec::xmldsig::{
     VerificationRequest, VerifiedSession, VerifyContext, with_verified_request,
 };
 use xml_sec_xades::{
-    DigestIdentity, Document, Error, Outcome, PathFailure, Report, ValidationError, validate_basic,
+    DigestIdentity, Document, EnclosingError, Error, Outcome, PathFailure, Report, ValidationError,
+    validate_basic,
 };
 
 const ROOT: &[u8] = include_bytes!("fixtures/root.der");
@@ -187,6 +188,29 @@ fn countersignature_joins_the_root_with_its_own_checked_path() {
     assert_eq!(facts, MET);
     assert_eq!((actors, hashes), (1, 1));
     assert!(same_child, "the actor is the document's countersignature");
+}
+
+#[test]
+fn countersignature_over_other_data_is_not_a_countersignature() {
+    // EN 319 132-1 §5.2.7.2: a CounterSignature property's signature shall
+    // reference the embedding signature's SignatureValue. One whose reference
+    // names the parent's SignedProperties instead is refused as such, and the
+    // cause is nameable through the crate's own error types.
+    let xml = include_str!("fixtures/countersigned.xml")
+        .replace(r##"URI="#sig-value""##, r##"URI="#sp""##);
+    let outcome = verified(
+        &xml,
+        &anchored(),
+        |_| {},
+        |session| validate_basic(session, signature(session, 1), &[ROOT], facts),
+    );
+    assert!(
+        matches!(
+            &outcome,
+            Err(ValidationError::Enclosing(error)) if matches!(**error, EnclosingError::Counter(_))
+        ),
+        "{outcome:?}"
+    );
 }
 
 #[test]
