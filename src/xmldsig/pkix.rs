@@ -1660,6 +1660,17 @@ pub(crate) enum SpkiAlgorithm {
     Other,
 }
 
+/// What a standalone EC SPKI names for ECDSA verification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EcNamedPoint {
+    /// A curve this build verifies with, and the range of the SEC1 point.
+    Supported(super::signature::EcCurve, core::ops::Range<usize>),
+    /// A well-formed named curve this build does not verify with.
+    UnsupportedCurve,
+    /// Another key, explicit curve parameters or a malformed encoding.
+    Malformed,
+}
+
 /// Structure of an RSA or EC public key, borrowed from its SPKI encoding.
 pub(crate) enum PublicKey<'a> {
     Rsa(structured_pkix::key::rsa::PublicKey<'a>),
@@ -1895,31 +1906,34 @@ impl CertificateSession {
     }
 
     /// Supported named curve and range of the SEC1 point inside a standalone
-    /// EC SPKI; `None` for another key, curve choice or malformed encoding.
+    /// EC SPKI.
     ///
     /// # Errors
     /// The reader's resource refusal under this session's account.
     pub(crate) fn ec_named_point(
         &self,
         spki: &[u8],
-    ) -> Result<Option<(super::signature::EcCurve, core::ops::Range<usize>)>, structured_pkix::Error>
-    {
+    ) -> Result<EcNamedPoint, structured_pkix::Error> {
         let Some(PublicKey::Ec(key)) = refused_as_none(self.read_public_key(spki))? else {
-            return Ok(None);
+            return Ok(EcNamedPoint::Malformed);
         };
         let structured_pkix::key::ec::Curve::Named(curve) = key.curve() else {
-            return Ok(None);
+            // Explicit parameters are a curve choice RFC 5480 §2.1.1 forbids
+            // in PKIX, not one of the named curves this build lacks.
+            return Ok(EcNamedPoint::Malformed);
         };
         let Some(curve) = super::signature::EcCurve::from_oid_bytes(curve.as_bytes()) else {
-            return Ok(None);
+            return Ok(EcNamedPoint::UnsupportedCurve);
         };
         // The SPKI is read at document offset zero, so source offsets index it.
         let Ok(start) = usize::try_from(key.offset()) else {
-            return Ok(None);
+            return Ok(EcNamedPoint::Malformed);
         };
         Ok(start
             .checked_add(key.as_bytes().len())
-            .map(|end| (curve, start..end)))
+            .map_or(EcNamedPoint::Malformed, |end| {
+                EcNamedPoint::Supported(curve, start..end)
+            }))
     }
 
     /// RSA key of a standalone SPKI whose algorithm identifier `admit` accepts.
