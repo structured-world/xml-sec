@@ -1,21 +1,22 @@
 //! The facts the EU DSS corpus comparison reads, through the public API under
-//! the strict `Xades` policy profile.
+//! one of the `XAdES` policy profiles.
 //!
 //! `corpus_probe conditions XML ANCHORS_DIR` writes, as `0.der`, `1.der`, ...
 //! in `ANCHORS_DIR`, every certificate where a chain the document carries
 //! ends, and prints the document's claimed signing time and whether it
 //! carries a timestamp.
 //!
-//! `corpus_probe facts XML ANCHORS_DIR UNIX_TIME` verifies the document at
-//! that time with those certificates as the only trust anchors and prints,
-//! for each Signature in document order, its verification outcome and the
-//! `XAdES` facts of every baseline level.
+//! `corpus_probe facts XML ANCHORS_DIR UNIX_TIME PROFILE` verifies the
+//! document at that time with those certificates as the only trust anchors
+//! and prints, for each Signature in document order, its verification outcome
+//! and the `XAdES` facts of every baseline level. `PROFILE` is `xades`,
+//! `xades-extended` or `xades-conformant`.
 //!
 //! The anchors, the time and the stated accuracy of tokens that omit theirs
 //! (zero, the generation time read as exact) are conditions of the
 //! comparison, the same ones the other validator receives, never a trust
-//! decision. The policy is the compiled `Xades` profile, narrowed only to
-//! check X.509 chains at that time.
+//! decision. The policy is the compiled profile, narrowed only to check
+//! X.509 chains at that time.
 
 #[path = "support/tokens.rs"]
 mod tokens;
@@ -239,10 +240,20 @@ fn level<E: std::fmt::Debug>(result: Result<Outcome<bool>, E>) -> Value {
     }
 }
 
-/// The compiled `Xades` profile, narrowed by one restriction for every input:
+/// The `XAdES` profile a comparison names.
+fn named_profile(name: &str) -> Result<PolicyProfile, Failure> {
+    Ok(match name {
+        "xades" => PolicyProfile::Xades,
+        "xades-extended" => PolicyProfile::XadesExtended,
+        "xades-conformant" => PolicyProfile::XadesConformant,
+        _ => return Err(format!("unknown profile {name}").into()),
+    })
+}
+
+/// The compiled `profile`, narrowed by one restriction for every input:
 /// check X.509 chains, at time `at`.
-fn strict_policy(at: i64) -> Result<VerificationPolicy, Failure> {
-    let profile = PolicyCompiler::new(PolicyProfile::Xades, &RustCryptoProvider, None)?;
+fn profile_policy(profile: PolicyProfile, at: i64) -> Result<VerificationPolicy, Failure> {
+    let profile = PolicyCompiler::new(profile, &RustCryptoProvider, None)?;
     let mut layer = profile.policies().clone();
     if let Some(verification) = layer.verification.as_mut() {
         verification.key_trust.verify_x509_chains = true;
@@ -255,7 +266,7 @@ fn strict_policy(at: i64) -> Result<VerificationPolicy, Failure> {
     })?;
     Ok(snapshot
         .verification()
-        .ok_or("the Xades profile verifies")?
+        .ok_or("the XAdES profiles verify")?
         .clone())
 }
 
@@ -279,7 +290,7 @@ fn verification(entry: &SignatureEvidence) -> Value {
     }
 }
 
-fn facts(xml: &str, anchors: &Path, at: i64) -> Result<Value, Failure> {
+fn facts(xml: &str, anchors: &Path, at: i64, profile: PolicyProfile) -> Result<Value, Failure> {
     let bytes = std::fs::read(xml)?;
     let text = ascii_view(&bytes);
     let mut trusted = Vec::new();
@@ -288,7 +299,7 @@ fn facts(xml: &str, anchors: &Path, at: i64) -> Result<Value, Failure> {
     }
     trusted.sort();
     let carried = pool(&text);
-    let policy = strict_policy(at)?;
+    let policy = profile_policy(profile, at)?;
     let resolver = DefaultKeyResolver::new(KeyResolverConfig {
         trusted_certs: trusted.clone(),
         ..KeyResolverConfig::default()
@@ -386,12 +397,14 @@ fn main() -> Result<(), Failure> {
     let args: Vec<String> = std::env::args().collect();
     let result = match &args[1..] {
         [mode, xml, anchors] if mode == "conditions" => conditions(xml, Path::new(anchors))?,
-        [mode, xml, anchors, at] if mode == "facts" => facts(xml, Path::new(anchors), at.parse()?)?,
+        [mode, xml, anchors, at, profile] if mode == "facts" => facts(
+            xml,
+            Path::new(anchors),
+            at.parse()?,
+            named_profile(profile)?,
+        )?,
         _ => {
-            return Err(
-                "usage: corpus_probe conditions XML ANCHORS_DIR | facts XML ANCHORS_DIR UNIX_TIME"
-                    .into(),
-            );
+            return Err("usage: corpus_probe conditions XML ANCHORS_DIR | facts XML ANCHORS_DIR UNIX_TIME xades|xades-extended|xades-conformant".into());
         }
     };
     println!("{result}");

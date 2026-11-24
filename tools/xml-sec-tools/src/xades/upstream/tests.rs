@@ -1,4 +1,6 @@
-use super::{BLOCKS, automatic_class, compare, differences, dss_signatures, observed, our_blocks};
+use super::{
+    BLOCKS, automatic_class, compare, differences, dss_signatures, observed, our_blocks, report,
+};
 use serde_json::{Value, json};
 
 const DIAGNOSTIC: &str = r#"<DiagnosticData xmlns="http://dss.esig.europa.eu/validation/diagnostic">
@@ -117,6 +119,40 @@ fn every_block_is_compared() {
     for name in BLOCKS {
         assert!(rows[0]["blocks"][name].is_object(), "{name}");
     }
+}
+
+#[test]
+fn the_report_counts_each_profile_of_each_pass() {
+    // The published table is what a reader compares policies by: each
+    // profile counts its own inputs, and a pass no input took is left out.
+    let entry = |class: &str, intact: bool, trusted: bool| json!({ "class": class, "intact": intact, "trusted": trusted, "dss_intact": true });
+    let expectations = json!({
+        "dss": "6.5.1",
+        "instant": 1_800_000_000,
+        "cases": {
+            "a.xml": {
+                "instant/strict": entry("policy-refusal", false, false),
+                "instant/extended": entry("agreement", true, true),
+                "instant/conformant": entry("agreement", true, true),
+            },
+            "b.xml": {
+                "instant/strict": entry("agreement", true, true),
+                "instant/extended": entry("agreement", true, true),
+                "instant/conformant": entry("agreement", true, true),
+            },
+        },
+    });
+    let text = report(&expectations);
+    assert!(text.contains("EU DSS 6.5.1"), "{text}");
+    assert!(
+        text.contains("| `xades` | 2 | 2 | 1 | 1 | 1 | agreement 1, policy-refusal 1 |"),
+        "{text}"
+    );
+    assert!(
+        text.contains("| `xades-conformant` | 2 | 2 | 2 | 2 | 2 | agreement 2 |"),
+        "{text}"
+    );
+    assert!(!text.contains("signing-time"), "{text}");
 }
 
 #[test]

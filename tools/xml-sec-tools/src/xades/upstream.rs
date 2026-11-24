@@ -33,6 +33,20 @@ const SOURCES: [&str; 2] = [
     "dss-cookbook/src/test/resources/signature-pool",
 ];
 
+/// The `XAdES` profiles the corpus runs under, widest last: a result label and
+/// the probe's profile name.
+pub(crate) const PROFILES: [(&str, &str); 3] = [
+    ("strict", "xades"),
+    ("extended", "xades-extended"),
+    ("conformant", "xades-conformant"),
+];
+
+/// Whether `rows` hold at least one signature and `side` reads `value` for
+/// `block` in every one of them.
+pub(crate) fn every_block(rows: &[Value], block: &str, side: &str, value: &str) -> bool {
+    !rows.is_empty() && rows.iter().all(|row| row["blocks"][block][side] == value)
+}
+
 /// The building blocks compared, in report order.
 pub(crate) const BLOCKS: [&str; 6] = ["FC", "ISC", "CV", "XCV", "SAV", "TIMESTAMPS"];
 
@@ -406,26 +420,33 @@ impl Pass<'_> {
                 output.join("dss").display()
             )
             .map_err(|error| error.to_string())?;
-            let probe = self.corpus.command(
-                &line(&[
-                    &self.probe,
-                    &"facts",
-                    input,
-                    &directory.join("anchors"),
-                    &at.to_string(),
-                ]),
-                &output.join("facts"),
-            )?;
-            // A probe that fails on an input, a panic included, is a finding
-            // about xml-sec: it stays in the facts instead of ending the run.
-            let facts = if probe.success() {
-                probe.stdout
-            } else {
-                json!({ "probe": { "code": probe.code, "stderr": String::from_utf8_lossy(&probe.stderr) } })
-                    .to_string()
-                    .into_bytes()
-            };
-            super::write(&output.join("facts.json"), facts)?;
+            for (label, profile) in PROFILES {
+                let directory_of_profile = output.join(label);
+                std::fs::create_dir_all(&directory_of_profile)
+                    .map_err(|error| error.to_string())?;
+                let probe = self.corpus.command(
+                    &line(&[
+                        &self.probe,
+                        &"facts",
+                        input,
+                        &directory.join("anchors"),
+                        &at.to_string(),
+                        &profile,
+                    ]),
+                    &directory_of_profile.join("facts"),
+                )?;
+                // A probe that fails on an input, a panic included, is a
+                // finding about xml-sec: it stays in the facts instead of
+                // ending the run.
+                let facts = if probe.success() {
+                    probe.stdout
+                } else {
+                    json!({ "probe": { "code": probe.code, "stderr": String::from_utf8_lossy(&probe.stderr) } })
+                        .to_string()
+                        .into_bytes()
+                };
+                super::write(&directory_of_profile.join("facts.json"), facts)?;
+            }
         }
         let file = logs.join(format!("{}-manifest.tsv", self.label));
         super::write(&file, manifest)?;
@@ -437,10 +458,15 @@ impl Pass<'_> {
     }
 }
 
-/// Reads one pass of one case into its comparison rows.
-fn pass_rows(directory: &Path, stamped: bool) -> Result<(Vec<Value>, bool, Value), String> {
+/// Reads one pass of one case under the profile `label` into its comparison
+/// rows, whether DSS refused the input, and our facts.
+fn pass_rows(
+    directory: &Path,
+    label: &str,
+    stamped: bool,
+) -> Result<(Vec<Value>, bool, Value), String> {
     let dss = directory.join("dss");
-    let facts: Value = serde_json::from_str(&xml::read(&directory.join("facts.json"))?)
+    let facts: Value = serde_json::from_str(&xml::read(&directory.join(label).join("facts.json"))?)
         .map_err(|error| error.to_string())?;
     let ours = facts["signatures"].as_array().cloned().unwrap_or_default();
     if dss.join("error.txt").exists() {
@@ -523,14 +549,20 @@ fn observations(
             if !pass.exists() {
                 continue;
             }
-            let (rows, dss_error, _) = pass_rows(&pass, stamped)?;
-            row.insert(
-                label.into(),
-                json!({
-                    "observed": observed(&rows),
-                    "class": automatic_class(&rows, dss_error, anchors),
-                }),
-            );
+            for (profile, _) in PROFILES {
+                let (rows, dss_error, facts) = pass_rows(&pass, profile, stamped)?;
+                row.insert(
+                    format!("{label}/{profile}"),
+                    json!({
+                        "observed": observed(&rows),
+                        "class": automatic_class(&rows, dss_error, anchors),
+                        "intact": every_block(&rows, "CV", "ours", "pass"),
+                        "trusted": every_block(&rows, "XCV", "ours", "pass")
+                            && facts["signatures"].as_array().is_some_and(|s| !s.is_empty()),
+                        "dss_intact": every_block(&rows, "CV", "dss", "PASSED"),
+                    }),
+                );
+            }
         }
         observations.insert(name.clone(), Value::Object(row));
     }
@@ -563,9 +595,14 @@ fn execute(corpus: &Corpus, results: &Path, record: bool) -> Result<(), String> 
     let mut later = Vec::new();
     for (name, path, directory, _) in &cases {
         let found = &conditions[name];
-        let facts: Value =
-            serde_json::from_str(&xml::read(&directory.join("instant").join("facts.json"))?)
-                .map_err(|error| error.to_string())?;
+        // The widest profile decides: a strict refusal is policy, not time.
+        let facts: Value = serde_json::from_str(&xml::read(
+            &directory
+                .join("instant")
+                .join("conformant")
+                .join("facts.json"),
+        )?)
+        .map_err(|error| error.to_string())?;
         if let Some(time) = found["signing_time"].as_i64()
             && found["timestamps"] == false
             && unvalidated(&facts)
@@ -589,11 +626,16 @@ fn execute(corpus: &Corpus, results: &Path, record: bool) -> Result<(), String> 
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
-        return write_json(&path, &recorded(&summary, &path));
+        let expectations = recorded(&summary, &path);
+        write_json(&path, &expectations)?;
+        return super::write(&report_path(corpus), report(&expectations));
     }
     let expected: Value = serde_json::from_str(&xml::read(&path)?)
         .map_err(|error| format!("{}: {error}", path.display()))?;
-    let found = differences(&expected, &summary);
+    let mut found = differences(&expected, &summary);
+    if xml::read(&report_path(corpus)).ok() != Some(report(&expected)) {
+        found.push("docs/eu-dss-corpus.md is not the report of the expectations".into());
+    }
     if !found.is_empty() {
         return Err(format!(
             "DSS corpus comparison differs from {}:\n{}",
@@ -607,6 +649,94 @@ fn execute(corpus: &Corpus, results: &Path, record: bool) -> Result<(), String> 
         observations.len()
     );
     Ok(())
+}
+
+/// The published result of a recorded comparison: per pass and profile, how
+/// many corpus inputs each implementation finds intact, how many xml-sec
+/// also trusts, how many agree with DSS on every block, and the classes.
+pub(crate) fn report(expectations: &Value) -> String {
+    use std::fmt::Write as _;
+    let mut text = String::from(
+        "# EU DSS XAdES corpus\n\n\
+         Generated by `cargo run -p xml-sec-tools -- xades dss-corpus --record`; \
+         CI fails when a run differs from it.\n\n",
+    );
+    writeln!(
+        text,
+        "EU DSS {}, every XML input of `dss-xades/src/test/resources` and \
+         `dss-cookbook/src/test/resources/signature-pool` at its release tag. \
+         Both validators get the same trust anchors (where each chain the \
+         document carries ends) and the same time ({} Unix seconds; a second \
+         pass at the claimed signing time when no signature reaches a \
+         validated path and the document carries no timestamp).\n",
+        expectations["dss"].as_str().unwrap_or("?"),
+        expectations["instant"],
+    )
+    .expect("writing to a String cannot fail");
+    text.push_str(
+        "An input is *intact* when every signature's value and references \
+         verify (DSS building block CV), *trusted* when xml-sec also validated \
+         the signer's path, and in *agreement* when every compared block \
+         (FC, ISC, CV, XCV, SAV, timestamps) reaches the same conclusion.\n",
+    );
+    for pass in ["instant", "signing-time"] {
+        let mut rows = Vec::new();
+        for (profile, name) in PROFILES {
+            let label = format!("{pass}/{profile}");
+            let entries: Vec<&Value> = expectations["cases"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter_map(|(_, passes)| passes.get(&label))
+                .collect();
+            if entries.is_empty() {
+                continue;
+            }
+            let count = |field: &str| entries.iter().filter(|entry| entry[field] == true).count();
+            let mut classes = std::collections::BTreeMap::<String, usize>::new();
+            for entry in &entries {
+                *classes
+                    .entry(entry["class"].as_str().unwrap_or("?").to_owned())
+                    .or_default() += 1;
+            }
+            let classes: Vec<String> = classes
+                .iter()
+                .map(|(class, count)| format!("{class} {count}"))
+                .collect();
+            rows.push(format!(
+                "| `{name}` | {} | {} | {} | {} | {} | {} |",
+                entries.len(),
+                count("dss_intact"),
+                count("intact"),
+                count("trusted"),
+                classes
+                    .iter()
+                    .find(|class| class.starts_with("agreement "))
+                    .map_or("0", |class| &class["agreement ".len()..]),
+                classes.join(", "),
+            ));
+        }
+        if rows.is_empty() {
+            continue;
+        }
+        writeln!(
+            text,
+            "\n## Pass `{pass}`\n\n\
+             | Profile | Inputs | DSS intact | xml-sec intact | xml-sec trusted | Agreement | Classes |\n\
+             | --- | --- | --- | --- | --- | --- | --- |"
+        )
+        .expect("writing to a String cannot fail");
+        for row in rows {
+            text.push_str(&row);
+            text.push('\n');
+        }
+    }
+    text
+}
+
+/// Where the published result lives.
+fn report_path(corpus: &Corpus) -> PathBuf {
+    corpus.root.join("docs/eu-dss-corpus.md")
 }
 
 /// `summary` as expectations, keeping the reviewed class and reason of every
