@@ -1572,6 +1572,58 @@ fn the_xades_profiles_widen_one_step_at_a_time() {
 }
 
 #[test]
+fn the_extended_profile_signs_and_verifies_an_xpath_selected_reference() {
+    // XadesExtended admits node-set selection through the public operations;
+    // Xades refuses the same signature with a typed policy violation.
+    let transform = r#"<ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>true()</ds:XPath></ds:Transform>"#;
+    let template = xades_template(
+        "<x:SignedSignatureProperties><x:SigningTime>2026-10-14T00:00:00Z</x:SigningTime></x:SignedSignatureProperties>",
+    )
+    .replace(
+        "</ds:SignedInfo>",
+        &format!(
+            r##"<ds:Reference URI="#binary"><ds:Transforms>{transform}</ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo>"##
+        ),
+    )
+    .replace(
+        "</ds:Signature>",
+        r#"<ds:Object Id="binary">selected</ds:Object></ds:Signature>"#,
+    );
+    let key = HmacSigningKey::new(vec![0x53; 32]).unwrap();
+    let verifier = HmacVerificationKey::new(vec![0x53; 32]).unwrap();
+    let extended = compiler(PolicyProfile::XadesExtended)
+        .compile(&context())
+        .unwrap();
+    let xml = SignContext::new(&key)
+        .policy(extended.signing().unwrap().clone())
+        .sign_template(&template)
+        .unwrap()
+        .output;
+    let document = XmlDocument::parse(xml).unwrap();
+    let targets = document.with_view(|view| [view.root_element()]);
+    let request = VerificationRequest {
+        expected_targets: &targets,
+        ..Default::default()
+    };
+    let evidence = VerifyContext::new()
+        .key(&verifier)
+        .policy(extended.verification().unwrap().clone())
+        .verify_request(&document, &request)
+        .unwrap();
+    assert!(evidence.all_valid());
+    let strict = compiler(PolicyProfile::Xades).compile(&context()).unwrap();
+    let refused = VerifyContext::new()
+        .key(&verifier)
+        .policy(strict.verification().unwrap().clone())
+        .verify_request(&document, &request);
+    let refused = format!("{refused:?}");
+    assert!(
+        refused.contains("REC-xpath-19991116"),
+        "Xades must refuse the XPath transform: {refused}"
+    );
+}
+
+#[test]
 fn a_denial_withdraws_exactly_the_named_permissions() {
     // A deployment narrows any profile without restating it: each denied
     // permission disappears from every operation that had it, and the rest
