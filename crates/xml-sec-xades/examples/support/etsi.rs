@@ -323,8 +323,16 @@ fn integrity(result: &VerifyResult) -> (Vec<Reference>, Computed) {
                 FailureReason::ReferenceUnavailable { .. }
                 | FailureReason::ReferenceProcessingFailure { .. },
             ) => Reference::Missing,
-            // A reference left unprocessed because the value failed has no
-            // finding of its own (the value's decides the block).
+            // A reference left unprocessed because the value failed is not
+            // dereferenced (W3C XML Signature Best Practices 1). An external
+            // one is still known to be unobtainable: the comparison supplies
+            // its bytes to neither validator (clause 5.2.7.4 step 1).
+            DsigStatus::NotProcessed
+                if !reference.uri.is_empty() && !reference.uri.starts_with('#') =>
+            {
+                Reference::Missing
+            }
+            // Any other has no finding of its own (the value's decides).
             _ => Reference::Intact,
         })
         .collect();
