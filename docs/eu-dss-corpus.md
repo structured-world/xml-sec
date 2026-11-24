@@ -14,12 +14,12 @@ For every signature xml-sec passes, the expectations record until when it keeps 
 | --- | --- | --- | --- | --- | --- | --- |
 | `xades` | 249 | 34 | 7 | 164 | 117 | agreement 117, dss-deviation 31, no-usable-anchor 3, normative-difference 8, not-a-signature 52, policy-refusal 35, unsupported 3 |
 | `xades-extended` | 249 | 34 | 9 | 166 | 119 | agreement 119, dss-deviation 31, no-usable-anchor 3, normative-difference 8, not-a-signature 52, policy-refusal 33, unsupported 3 |
-| `xades-conformant` | 249 | 37 | 35 | 190 | 148 | agreement 148, dss-deviation 31, no-usable-anchor 3, normative-difference 8, not-a-signature 52, policy-refusal 4, unsupported 3 |
+| `xades-conformant` | 249 | 37 | 36 | 191 | 149 | agreement 149, dss-deviation 31, no-usable-anchor 3, normative-difference 8, not-a-signature 52, policy-refusal 3, unsupported 3 |
 
 ## Pass `signing-time`
 
 | Profile | Inputs | DSS passes | xml-sec passes | Same indication | Agreement | Classes |
 | --- | --- | --- | --- | --- | --- | --- |
-| `xades` | 65 | 2 | 1 | 60 | 50 | agreement 50, dss-deviation 9, no-usable-anchor 1, normative-difference 1, policy-refusal 1, unsupported 3 |
-| `xades-extended` | 65 | 2 | 1 | 60 | 50 | agreement 50, dss-deviation 9, no-usable-anchor 1, normative-difference 1, policy-refusal 1, unsupported 3 |
-| `xades-conformant` | 65 | 2 | 1 | 60 | 50 | agreement 50, dss-deviation 9, no-usable-anchor 1, normative-difference 1, policy-refusal 1, unsupported 3 |
+| `xades` | 64 | 1 | 1 | 60 | 50 | agreement 50, dss-deviation 9, no-usable-anchor 1, normative-difference 1, unsupported 3 |
+| `xades-extended` | 64 | 1 | 1 | 60 | 50 | agreement 50, dss-deviation 9, no-usable-anchor 1, normative-difference 1, unsupported 3 |
+| `xades-conformant` | 64 | 1 | 1 | 60 | 50 | agreement 50, dss-deviation 9, no-usable-anchor 1, normative-difference 1, unsupported 3 |

@@ -397,7 +397,14 @@ fn targets(text: &str) -> Vec<Target> {
                 parent.tag_name().name() == "SignedInfo"
                     && parent.tag_name().namespace() == Some(DS)
             })
-            && node.attribute("Type") != Some("http://uri.etsi.org/01903#SignedProperties")
+            // EN 319 132-1 §4.4.2 and TS 101 903 V1.2.2 §6.3.1 type it.
+            && !matches!(
+                node.attribute("Type"),
+                Some(
+                    "http://uri.etsi.org/01903#SignedProperties"
+                        | "http://uri.etsi.org/01903/v1.2.2#SignedProperties"
+                )
+            )
     });
     for reference in references {
         let target = match reference.attribute("URI") {
