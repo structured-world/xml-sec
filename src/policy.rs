@@ -1621,6 +1621,22 @@ pub enum TimestampTokenEncoding {
     Ber,
 }
 
+/// The `XAdES` syntaxes a signature's qualifying properties may use. Signing
+/// always writes ETSI EN 319 132-1.
+#[cfg(feature = "xmldsig")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum XadesSyntax {
+    /// ETSI EN 319 132-1 only: the `http://uri.etsi.org/01903/v1.3.2#`
+    /// properties with their `v1.4.1` additions.
+    #[default]
+    En319132,
+    /// Also ETSI TS 101 903 V1.2.2: its namespace and `SignedProperties`
+    /// reference type (TS 101 903 V1.2.2 §5, §6.3.1), as signatures made
+    /// before EN 319 132-1 carry them.
+    /// <https://www.etsi.org/deliver/etsi_ts/101900_101999/101903/01.02.02_60/ts_101903v010202p.pdf>
+    WithTs101903V122,
+}
+
 /// Values a request may select for its own operation in place of the
 /// policy's: a caller's compatibility option (a libxmlsec1 context flag)
 /// takes effect only when the policy lists the value here, so a request
@@ -1799,6 +1815,8 @@ pub struct VerificationPolicy {
     pub detached_digest_attestation: DetachedDigestAttestation,
     /// How the signature's timestamp tokens are read.
     pub timestamp_token_encoding: TimestampTokenEncoding,
+    /// The `XAdES` syntaxes the signature's qualifying properties may use.
+    pub xades_syntax: XadesSyntax,
     /// XML parser rules.
     pub xml: XmlInputPolicy,
     /// Resource ceilings.

@@ -1372,6 +1372,94 @@ fn xades_profile_authenticates_nonempty_ordered_properties() {
     }
 }
 
+/// `xades_template` in ETSI TS 101 903 V1.2.2 syntax: that namespace and
+/// that `SignedProperties` reference type (TS 101 903 V1.2.2 §5, §6.3.1).
+fn xades_v122_template(properties: &str) -> String {
+    xades_template(properties)
+        .replace(
+            "http://uri.etsi.org/01903#SignedProperties",
+            "http://uri.etsi.org/01903/v1.2.2#SignedProperties",
+        )
+        .replace(
+            "http://uri.etsi.org/01903/v1.3.2#",
+            "http://uri.etsi.org/01903/v1.2.2#",
+        )
+}
+
+#[test]
+fn only_the_conformant_profile_verifies_ts_101_903_v1_2_2_signatures() {
+    // XAdES signatures made before EN 319 132-1 carry TS 101 903 V1.2.2's
+    // namespace and reference type. XadesConformant verifies them, as EU DSS
+    // does; the other profiles admit only EN 319 132-1, and no profile signs
+    // them. Each syntax keeps its own reference type: V1.2.2 properties
+    // under EN 319 132-1's type are neither.
+    let properties = "<x:SignedSignatureProperties><x:SigningTime>2014-11-07T09:48:27Z</x:SigningTime></x:SignedSignatureProperties>";
+    let key = HmacSigningKey::new(vec![0x53; 32]).unwrap();
+    let verifier = HmacVerificationKey::new(vec![0x53; 32]).unwrap();
+    let general = compiler(PolicyProfile::Modern).compile(&context()).unwrap();
+    let sign = |template: &str| {
+        let xml = SignContext::new(&key)
+            .policy(general.signing().unwrap().clone())
+            .sign_template(template)
+            .unwrap()
+            .output;
+        XmlDocument::parse(xml).unwrap()
+    };
+    // Whether `profile` accepts `document`, and the evidence that says why.
+    let verify = |profile, document: &XmlDocument| {
+        let compiled = compiler(profile).compile(&context()).unwrap();
+        let targets = document.with_view(|view| [view.root_element()]);
+        let evidence = VerifyContext::new()
+            .key(&verifier)
+            .policy(compiled.verification().unwrap().clone())
+            .verify_request(
+                document,
+                &VerificationRequest {
+                    expected_targets: &targets,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        (
+            evidence.accepted(document).unwrap(),
+            format!("{evidence:?}"),
+        )
+    };
+    let earlier = sign(&xades_v122_template(properties));
+    let (accepted, evidence) = verify(PolicyProfile::XadesConformant, &earlier);
+    assert!(accepted, "{evidence}");
+    for profile in [PolicyProfile::Xades, PolicyProfile::XadesExtended] {
+        let (accepted, evidence) = verify(profile, &earlier);
+        assert!(
+            !accepted && evidence.contains("SignatureProfile"),
+            "{profile:?}: {evidence}"
+        );
+    }
+    let mixed = sign(&xades_template(properties).replace(
+        "http://uri.etsi.org/01903/v1.3.2#",
+        "http://uri.etsi.org/01903/v1.2.2#",
+    ));
+    let (accepted, evidence) = verify(PolicyProfile::XadesConformant, &mixed);
+    assert!(
+        !accepted && evidence.contains("SignatureProfile"),
+        "{evidence}"
+    );
+    let conformant = compiler(PolicyProfile::XadesConformant)
+        .compile(&context())
+        .unwrap();
+    assert!(matches!(
+        SignContext::new(&key)
+            .policy(conformant.signing().unwrap().clone())
+            .sign_template(&xades_v122_template(properties)),
+        Err(xml_sec::xmldsig::SigningError::Policy(
+            PolicyViolation::SignatureProfile {
+                profile: SignatureConstraints::Xades,
+                ..
+            }
+        ))
+    ));
+}
+
 /// `xades_template` with one more `Reference`, to a `ds:Object` holding
 /// base64 text, under `transform`.
 fn xades_with_object_reference(transform: &str) -> String {

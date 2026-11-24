@@ -18,7 +18,7 @@ use xml_sec::{
         RequestSelections, ResourcePolicy, RsaKeyPolicy, RsaPssPermission, SameDocumentIdSemantics,
         SignatureConstraints, SigningPolicy, TimestampTokenEncoding, TransformPolicy,
         TrustAnchorSigner, UnknownX509CertificateSemantics, UriPolicy, VerificationPolicy,
-        VerificationTrustMode, XmlInputPolicy, XsltStylesheetSemantics,
+        VerificationTrustMode, XadesSyntax, XmlInputPolicy, XsltStylesheetSemantics,
     },
     provider::{KeyEncapsulationAlgorithm, X509SignatureAlgorithm},
     xmldsig::{
@@ -653,6 +653,14 @@ fn verification(p: &mut VerificationPolicy, t: &Table, syntax_only: bool) -> Res
                     TimestampTokenEncoding::Ber
                 );
             }
+            "xades_syntax" => {
+                p.xades_syntax = choice!(
+                    value,
+                    key,
+                    XadesSyntax::En319132,
+                    XadesSyntax::WithTs101903V122
+                );
+            }
             _ => signature_fields!(p, key, value, TransformTable::Processing),
         }
     }
@@ -1255,6 +1263,7 @@ fn verification_snapshot(p: &VerificationPolicy) -> Result<Value, Error> {
         request_selections: _,
         detached_digest_attestation: _,
         timestamp_token_encoding: _,
+        xades_syntax: _,
         xml: _,
         resources: _,
     } = p;
@@ -1269,6 +1278,7 @@ fn verification_snapshot(p: &VerificationPolicy) -> Result<Value, Error> {
         "timestamp_token_encoding".into(),
         named(p.timestamp_token_encoding),
     );
+    t.insert("xades_syntax".into(), named(p.xades_syntax));
     Ok(Value::Table(t))
 }
 
@@ -1579,6 +1589,7 @@ fn direction(field: &str, old: Option<&Value>, new: Option<&Value>) -> Direction
                 | "Forbidden"
                 | "Declared"
                 | "Validated"
+                | "En319132"
                 | "Refuse",
             ),
         )
@@ -1836,12 +1847,18 @@ mod tests {
 
     #[test]
     fn each_narrowing_the_composition_keeps_is_restrictive() {
-        // Composition keeps a validated anchor signer unless every layer
-        // accepts, orders the RSA-PSS family ExactOnly < SecureSupported <
-        // Sha1Supported < AllSupported and unions denials; the rollout report
-        // must classify the same changes the same way, in both directions.
+        // Composition keeps EN 319 132-1 alone and a validated anchor signer
+        // unless every layer widens them, orders the RSA-PSS family
+        // ExactOnly < SecureSupported < Sha1Supported < AllSupported and
+        // unions denials; the rollout report must classify the same changes
+        // the same way, in both directions.
         let text = |value: &str| Value::String(value.into());
         for (field, narrow, wide) in [
+            (
+                "verification.xades_syntax",
+                text("En319132"),
+                text("WithTs101903V122"),
+            ),
             (
                 "verification.key_trust.trust_anchor_signer",
                 text("Validated"),

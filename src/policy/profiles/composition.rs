@@ -5,7 +5,7 @@ use crate::policy::{
     KeyEstablishmentPolicy, KeySourcePolicy, KeyTrustPolicy, ManifestProcessing, PolicyViolation,
     ResourcePolicy, RsaKeyPolicy, RsaPssPermission, SigningPolicy, TimestampTokenEncoding,
     TransformPolicy, TrustAnchorSigner, UriPolicy, VerificationPolicy, VerificationTrustMode,
-    XmlInputPolicy,
+    XadesSyntax, XmlInputPolicy,
 };
 #[cfg(feature = "xmlenc")]
 use crate::policy::{
@@ -568,10 +568,21 @@ fn verification(
             a.timestamp_token_encoding,
             b.timestamp_token_encoding,
         ),
+        xades_syntax: xades_syntax(a.xades_syntax, b.xades_syntax),
         xml: xml(a.xml, b.xml)?,
         resources: resources(&a.resources, &b.resources),
     })
 }
+
+/// TS 101 903 V1.2.2 is read only when both layers read it.
+fn xades_syntax(a: XadesSyntax, b: XadesSyntax) -> XadesSyntax {
+    if a == XadesSyntax::WithTs101903V122 && b == XadesSyntax::WithTs101903V122 {
+        XadesSyntax::WithTs101903V122
+    } else {
+        XadesSyntax::En319132
+    }
+}
+
 /// BER is read only when both layers read it.
 fn token_encoding(a: TimestampTokenEncoding, b: TimestampTokenEncoding) -> TimestampTokenEncoding {
     if a == TimestampTokenEncoding::Ber && b == TimestampTokenEncoding::Ber {
