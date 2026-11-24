@@ -667,10 +667,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/extended": {
         "observed": [
@@ -693,10 +694,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/conformant": {
         "observed": [
@@ -719,10 +721,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       }
     },
     "dss-xades/src/test/resources/sample-duplicate-ids.xml": {
@@ -2416,10 +2419,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/extended": {
         "observed": [
@@ -2433,10 +2437,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/conformant": {
         "observed": [
@@ -2450,10 +2455,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       }
     },
     "dss-xades/src/test/resources/validation/Signature-X-PT-4.xml": {
@@ -3095,10 +3101,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/extended": {
         "observed": [
@@ -3121,10 +3128,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/conformant": {
         "observed": [
@@ -3147,10 +3155,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       }
     },
     "dss-xades/src/test/resources/validation/dss-1647_OJ_L_2018_109_FULL.xml": {
@@ -5651,10 +5660,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/extended": {
         "observed": [
@@ -5668,10 +5678,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/conformant": {
         "observed": [
@@ -5685,10 +5696,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       }
     },
     "dss-xades/src/test/resources/validation/dss2278/xades-with-multiple-alldatatimestamps.xml": {
@@ -5757,10 +5769,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/extended": {
         "observed": [
@@ -5774,10 +5787,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/conformant": {
         "observed": [
@@ -5791,10 +5805,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       }
     },
     "dss-xades/src/test/resources/validation/dss2278/xades-with-multiple-signaturetimestamps.xml": {
@@ -7117,10 +7132,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/extended": {
         "observed": [
@@ -7134,10 +7150,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/conformant": {
         "observed": [
@@ -7151,10 +7168,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       }
     },
     "dss-xades/src/test/resources/validation/dss3732/xades-enveloping-arcTst132.xml": {
@@ -7170,10 +7188,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/extended": {
         "observed": [
@@ -7187,10 +7206,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/conformant": {
         "observed": [
@@ -7204,10 +7224,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       }
     },
     "dss-xades/src/test/resources/validation/dss3758/xades-bes-issuer-linebreaks-end-cr.xml": {
@@ -7959,10 +7980,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/extended": {
         "observed": [
@@ -7985,10 +8007,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/conformant": {
         "observed": [
@@ -8011,10 +8034,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       }
     },
     "dss-xades/src/test/resources/validation/evidence-record/X-E-ERS-DETACHED-LT-chain-renewal.xml": {
@@ -9071,10 +9095,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/extended": {
         "observed": [
@@ -9097,10 +9122,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/conformant": {
         "observed": [
@@ -9123,10 +9149,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       }
     },
     "dss-xades/src/test/resources/validation/evidence-record/XAdES-B_ER_Renewed_can.xml": {
@@ -10101,10 +10128,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/extended": {
         "observed": [
@@ -10118,10 +10146,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/conformant": {
         "observed": [
@@ -10135,10 +10164,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       }
     },
     "dss-xades/src/test/resources/validation/sig_bundle.signed_detached.xml": {
@@ -10692,10 +10722,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/extended": {
         "observed": [
@@ -10709,10 +10740,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/conformant": {
         "observed": [
@@ -10726,10 +10758,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       }
     },
     "dss-xades/src/test/resources/validation/xades-b-copied-cnttst.xml": {
@@ -10816,10 +10849,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/extended": {
         "observed": [
@@ -10851,10 +10885,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/conformant": {
         "observed": [
@@ -10886,10 +10921,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       }
     },
     "dss-xades/src/test/resources/validation/xades-counter-signature-injected.xml": {
@@ -11667,10 +11703,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/extended": {
         "observed": [
@@ -11684,10 +11721,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/conformant": {
         "observed": [
@@ -11701,10 +11739,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       }
     },
     "dss-xades/src/test/resources/validation/xades-extended-t.xml": {
@@ -12298,10 +12337,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/extended": {
         "observed": [
@@ -12315,10 +12355,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/conformant": {
         "observed": [
@@ -12332,10 +12373,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       }
     },
     "dss-xades/src/test/resources/validation/xades-lta-corrupted-cert.xml": {
@@ -12351,10 +12393,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/extended": {
         "observed": [
@@ -12368,10 +12411,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/conformant": {
         "observed": [
@@ -12385,10 +12429,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       }
     },
     "dss-xades/src/test/resources/validation/xades-lta-valid.xml": {
@@ -12404,10 +12449,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6. The signer's OCSP response is also signed by a responder the root issued, not the signer's issuer, and no responder is configured as trusted: RFC 6960 section 4.2.2.2 does not authorize it, while DSS accepts it."
       },
       "instant/extended": {
         "observed": [
@@ -12421,10 +12467,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6. The signer's OCSP response is also signed by a responder the root issued, not the signer's issuer, and no responder is configured as trusted: RFC 6960 section 4.2.2.2 does not authorize it, while DSS accepts it."
       },
       "instant/conformant": {
         "observed": [
@@ -12438,10 +12485,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6. The signer's OCSP response is also signed by a responder the root issued, not the signer's issuer, and no responder is configured as trusted: RFC 6960 section 4.2.2.2 does not authorize it, while DSS accepts it."
       }
     },
     "dss-xades/src/test/resources/validation/xades-lta-with-additional-cert-in-keyinfo.xml": {
@@ -12457,10 +12505,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/extended": {
         "observed": [
@@ -12474,10 +12523,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/conformant": {
         "observed": [
@@ -12491,10 +12541,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       }
     },
     "dss-xades/src/test/resources/validation/xades-no-keyinfo-sign-cert.xml": {
@@ -12726,10 +12777,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/extended": {
         "observed": [
@@ -12743,10 +12795,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/conformant": {
         "observed": [
@@ -12760,10 +12813,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       }
     },
     "dss-xades/src/test/resources/validation/xades-sigPolicy-with-SPDocSpecification.xml": {
@@ -14152,10 +14206,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/extended": {
         "observed": [
@@ -14169,10 +14224,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       },
       "instant/conformant": {
         "observed": [
@@ -14186,10 +14242,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
       }
     },
     "dss-xades/src/test/resources/validation/xades-with-no-name-reference.xml": {
