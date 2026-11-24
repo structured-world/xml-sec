@@ -151,7 +151,7 @@ fn complete_surface_categories_are_stable() {
         "https://github.com/lsh123/xmlsec"
     );
     assert_eq!(ledger.generated_by, "xml-sec-capability-ledger/3");
-    assert_eq!(ledger.classifications.len(), 27);
+    assert_eq!(ledger.classifications.len(), 28);
 
     let counts = ledger
         .items
@@ -170,15 +170,15 @@ fn complete_surface_categories_are_stable() {
             ("class-id", 1_128),
             ("cli-command", 24),
             ("cli-exit-status", 3),
-            ("cli-option", 77),
-            ("deprecated-api", 15),
+            ("cli-option", 79),
+            ("deprecated-api", 17),
             ("enum", 15),
-            ("export-function", 625),
-            ("export-variable", 431),
+            ("export-function", 627),
+            ("export-variable", 427),
             ("header", 59),
             ("internal-export", 70),
             ("key-format", 11),
-            ("macro", 1_668),
+            ("macro", 1_669),
             ("registry", 15),
             ("struct-layout", 25),
             ("test-family", 29),
@@ -728,6 +728,9 @@ fn legacy_algorithm_claims_are_policy_gated() {
             "xmlSecHrefHmacRipemd160",
             "xmlSecHrefEcdsaRipemd160",
             "xmlSecHrefXslt",
+            // libxmlsec1 limits the command maps onto the profile's resources.
+            "--max-key-info-children",
+            "--xpath-ops-limit",
         ])
     );
 
@@ -1297,6 +1300,26 @@ fn assert_cli_exit_statuses_match(ledger: &Ledger) {
     }
 }
 
+/// The classification the ledger must give the CLI option `option`. The
+/// libxmlsec1 limits the command maps onto the compatibility profile's
+/// resource policy, measured as the core measures them, are profile-only.
+#[cfg(all(feature = "xmldsig", feature = "xmlenc", feature = "c14n"))]
+fn expected_cli_outcome(
+    option: &str,
+    behavior_compatible: &BTreeSet<&str>,
+    provider_limited: &BTreeSet<&str>,
+) -> &'static str {
+    if behavior_compatible.contains(option) {
+        "behavior-compatible"
+    } else if provider_limited.contains(option) {
+        "provider-limited"
+    } else if ["max-key-info-children", "xpath-ops-limit"].contains(&option) {
+        "compatibility-profile-only"
+    } else {
+        "planned"
+    }
+}
+
 #[test]
 #[cfg(all(feature = "xmldsig", feature = "xmlenc", feature = "c14n"))]
 fn native_cli_claims_match_process_and_upstream_runner_tests() {
@@ -1393,13 +1416,8 @@ fn native_cli_claims_match_process_and_upstream_runner_tests() {
             .iter()
             .find(|item| item.kind == "cli-option" && item.name == option)
             .unwrap_or_else(|| panic!("missing CLI option {option}"));
-        let expected = if behavior_compatible.contains(spec.canonical) {
-            "behavior-compatible"
-        } else if provider_limited.contains(spec.canonical) {
-            "provider-limited"
-        } else {
-            "planned"
-        };
+        let expected =
+            expected_cli_outcome(spec.canonical, &behavior_compatible, &provider_limited);
         assert_eq!(
             classification(&ledger, item).outcome,
             expected,
@@ -1420,7 +1438,7 @@ fn deprecated_surface_is_explicitly_classified() {
         .iter()
         .filter(|item| item.kind == "deprecated-api")
         .collect();
-    assert_eq!(deprecated.len(), 15);
+    assert_eq!(deprecated.len(), 17);
     for item in deprecated {
         if from_backend_header(item) {
             assert_eq!(item.classification, "backend-specific-surface");

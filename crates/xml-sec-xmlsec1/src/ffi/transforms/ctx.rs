@@ -13,7 +13,8 @@ use super::super::keysdata::{
 };
 use super::super::list::{
     XmlSecPtrList, xmlSecPtrListAdd, xmlSecPtrListCopy, xmlSecPtrListCreate, xmlSecPtrListDestroy,
-    xmlSecPtrListFinalize, xmlSecPtrListGetItem, xmlSecPtrListGetSize, xmlSecPtrListInitialize,
+    xmlSecPtrListEmpty, xmlSecPtrListFinalize, xmlSecPtrListGetItem, xmlSecPtrListGetSize,
+    xmlSecPtrListInitialize,
 };
 use super::super::nodeset::{
     NORMAL, XmlSecNodeSet, xmlSecNodeSetCreate, xmlSecNodeSetDestroy, xmlSecNodeSetGetChildren,
@@ -61,6 +62,7 @@ pub(crate) struct XmlSecTransformCtx {
     pub(crate) flags: c_uint,
     pub(crate) max_depth: c_uint,
     pub(crate) binary_chunk_size: usize,
+    pub(crate) xpath_ops_limit: usize,
     pub(crate) enabled_uris: c_uint,
     pub(crate) enabled_transforms: XmlSecPtrList,
     pub(crate) pre_exec_callback: PreExecuteCallback,
@@ -497,6 +499,29 @@ pub(crate) fn charge(
 static DEFAULT_CHUNK_SIZE: AtomicUsize = AtomicUsize::new(64 * 1024);
 /// The maximum transform depth of contexts initialized from now on.
 static DEFAULT_MAX_DEPTH: AtomicU32 = AtomicU32::new(16);
+/// The `XPath` operations limit of contexts initialized from now on, the
+/// documented initial value of the libxmlsec1 ABI. It is not a policy
+/// default: a context's limit only narrows the pinned policy's
+/// `max_xpath_evaluation_work`, and 0 leaves the policy's alone.
+static DEFAULT_XPATH_OPS_LIMIT: AtomicUsize = AtomicUsize::new(1_000_000);
+
+/// `xmlSecTransformCtxGetDefaultXpathOpsLimit`.
+///
+/// # Safety
+/// Callable at any time.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn xmlSecTransformCtxGetDefaultXpathOpsLimit() -> usize {
+    DEFAULT_XPATH_OPS_LIMIT.load(Ordering::Relaxed)
+}
+
+/// `xmlSecTransformCtxSetDefaultXpathOpsLimit`: 0 lifts the limit.
+///
+/// # Safety
+/// Callable at any time.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn xmlSecTransformCtxSetDefaultXpathOpsLimit(limit: usize) {
+    DEFAULT_XPATH_OPS_LIMIT.store(limit, Ordering::Relaxed);
+}
 
 /// `xmlSecTransformCtxGetDefaultBinaryChunkSize`.
 ///
@@ -792,6 +817,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxInitialize(
             (*ctx).enabled_uris = URI_TYPES_DEFAULT;
             (*ctx).binary_chunk_size = xmlSecTransformCtxGetDefaultBinaryChunkSize();
             (*ctx).max_depth = xmlSecTransformCtxGetDefaultMaxDepth();
+            (*ctx).xpath_ops_limit = xmlSecTransformCtxGetDefaultXpathOpsLimit();
         }
         0
     })
@@ -887,8 +913,13 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxCopyUserPref(
             target.user_data = source.user_data;
             target.flags = source.flags;
             target.max_depth = source.max_depth;
+            target.binary_chunk_size = source.binary_chunk_size;
+            target.xpath_ops_limit = source.xpath_ops_limit;
             target.enabled_uris = source.enabled_uris;
             target.pre_exec_callback = source.pre_exec_callback;
+            // The copy appends, so the destination's own list is emptied
+            // first: the preferences are replaced, never merged.
+            xmlSecPtrListEmpty(&raw mut target.enabled_transforms);
             if xmlSecPtrListCopy(
                 &raw mut target.enabled_transforms,
                 &raw mut source.enabled_transforms,
@@ -1461,9 +1492,37 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxSetUri(
                 return -1;
             }
             let fragment = &text[hash..];
-            select_fragment(ctx, fragment, here)
+            select_fragment(ctx, fragment, here, text)
         }
     })
+}
+
+/// Whether `ctx` enables the klass `id` (every klass while its list is
+/// empty); otherwise reports the refusal of `uri` at `here`.
+///
+/// # Safety
+/// `ctx` is an initialized context; `id` a registered klass.
+unsafe fn uri_klass_enabled(
+    ctx: *mut XmlSecTransformCtx,
+    id: *const XmlSecTransformKlass,
+    here: errors::Here,
+    uri: &[u8],
+) -> bool {
+    // SAFETY: by the caller's contract.
+    unsafe {
+        let enabled = &raw mut (*ctx).enabled_transforms;
+        if xmlSecPtrListGetSize(enabled) == 0 || xmlSecTransformIdListFind(enabled, id) == 1 {
+            return true;
+        }
+        errors::report(
+            here,
+            (*id).name.cast(),
+            std::ptr::null(),
+            errors::R_TRANSFORM_DISABLED,
+            &format!("uri={}", String::from_utf8_lossy(uri)),
+        );
+        false
+    }
 }
 
 /// `uri` for a report: its text, or `NULL` as libxmlsec1's
@@ -1487,7 +1546,8 @@ fn stored(copy: *mut u8, here: errors::Here, text: &[u8]) -> c_int {
     }
 }
 
-/// Prepends the transform that selects `fragment` (starting with `#`).
+/// Prepends the transform that selects `fragment` (starting with `#`) of
+/// `uri`, when the context enables that transform.
 ///
 /// # Safety
 /// `ctx` is an initialized context still building; `here` is a live node.
@@ -1495,11 +1555,24 @@ unsafe fn select_fragment(
     ctx: *mut XmlSecTransformCtx,
     fragment: &[u8],
     here: *mut XmlNode,
+    uri: &[u8],
 ) -> c_int {
     let location = here!("xmlSecTransformCtxSetUri");
     // SAFETY: by the caller's contract.
     unsafe {
         let visa3d = (*ctx).flags & FLAGS_USE_VISA3D_HACK != 0;
+        let selected = if visa3d
+            && !(fragment.starts_with(b"#xpointer(") || fragment.starts_with(b"#xmlns("))
+        {
+            xpath::visa3d_hack()
+        } else {
+            xpath::xpointer()
+        };
+        // The transform a URI implies is held to the enabled list as a
+        // `Transform` element's is.
+        if !uri_klass_enabled(ctx, selected, location, uri) {
+            return -1;
+        }
         let (expression, kind) =
             if fragment.starts_with(b"#xpointer(") || fragment.starts_with(b"#xmlns(") {
                 (fragment[1..].to_vec(), TREE)

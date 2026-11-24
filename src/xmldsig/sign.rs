@@ -2917,6 +2917,9 @@ impl<'a> SignContext<'a> {
             .allow_internal_dtd(self.policy.xml.allow_internal_dtd)
             .xpath_here_semantics(self.policy.transforms.xpath_here_semantics)
             .opc_relationship_edition(self.policy.transforms.opc_relationship_edition)
+            .relationship_target_mode_semantics(
+                self.policy.transforms.relationship_target_mode_semantics,
+            )
             .xslt_stylesheet_semantics(self.policy.transforms.xslt_stylesheet_semantics)
             .empty_digest_input(self.policy.transforms.empty_digest_input);
         let external_resources = ExternalResourceContext::new(

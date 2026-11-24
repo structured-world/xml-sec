@@ -648,6 +648,22 @@ fn all_named_profiles_compile_and_legacy_requires_auditable_expiry() {
             expected,
             "{profile:?}"
         );
+        // Likewise only that profile reads a Relationships-namespace
+        // TargetMode as libxmlsec1 does, in both directions.
+        let target_mode = if profile == PolicyProfile::XmlSecCompatible {
+            xml_sec::policy::RelationshipTargetModeSemantics::Libxmlsec1
+        } else {
+            xml_sec::policy::RelationshipTargetModeSemantics::Specification
+        };
+        for transforms in [
+            &compiled.verification().unwrap().transforms,
+            &compiled.signing().unwrap().transforms,
+        ] {
+            assert_eq!(
+                transforms.relationship_target_mode_semantics, target_mode,
+                "{profile:?}"
+            );
+        }
         // Every profile signs a node set with an explicit Exclusive C14N, the
         // libxmlsec1-compatible one included; implicit conversion is left to
         // the libxmlsec1 boundaries.

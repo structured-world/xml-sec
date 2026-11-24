@@ -617,9 +617,6 @@ pub(crate) static xmlSecNameChaCha20Poly1305: [u8; 18] = *b"chacha20-poly1305\0"
 pub(crate) static xmlSecNameConcatKdf: [u8; 10] = *b"concatkdf\0";
 
 #[unsafe(no_mangle)]
-pub(crate) static xmlSecNameConcatKdfKey: [u8; 10] = *b"concatkdf\0";
-
-#[unsafe(no_mangle)]
 pub(crate) static xmlSecNameDEREncodedKeyValue: [u8; 22] = *b"der-encoded-key-value\0";
 
 #[unsafe(no_mangle)]
@@ -748,9 +745,6 @@ pub(crate) static xmlSecNameHMACKeyValue: [u8; 5] = *b"hmac\0";
 pub(crate) static xmlSecNameHkdf: [u8; 5] = *b"hkdf\0";
 
 #[unsafe(no_mangle)]
-pub(crate) static xmlSecNameHkdfKey: [u8; 5] = *b"hkdf\0";
-
-#[unsafe(no_mangle)]
 pub(crate) static xmlSecNameHmacMd5: [u8; 9] = *b"hmac-md5\0";
 
 #[unsafe(no_mangle)]
@@ -836,9 +830,6 @@ pub(crate) static xmlSecNamePGPData: [u8; 4] = *b"pgp\0";
 
 #[unsafe(no_mangle)]
 pub(crate) static xmlSecNamePbkdf2: [u8; 7] = *b"pbkdf2\0";
-
-#[unsafe(no_mangle)]
-pub(crate) static xmlSecNamePbkdf2Key: [u8; 7] = *b"pbkdf2\0";
 
 #[unsafe(no_mangle)]
 pub(crate) static xmlSecNameRSAKeyValue: [u8; 4] = *b"rsa\0";
@@ -1326,10 +1317,6 @@ pub(crate) static xmlSecNsEdDSAContextString: [u8; 40] =
 
 #[unsafe(no_mangle)]
 pub(crate) static xmlSecNsExcC14N: [u8; 40] = *b"http://www.w3.org/2001/10/xml-exc-c14n#\0";
-
-#[unsafe(no_mangle)]
-pub(crate) static xmlSecNsExcC14NWithComments: [u8; 52] =
-    *b"http://www.w3.org/2001/10/xml-exc-c14n#WithComments\0";
 
 #[unsafe(no_mangle)]
 pub(crate) static xmlSecNsMLDSAContextString: [u8; 40] =

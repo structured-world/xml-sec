@@ -327,6 +327,233 @@ fn public_executor_can_select_2012_policy() {
     );
 }
 
+#[test]
+fn a_relationships_namespace_target_mode_follows_the_policy() {
+    // ECMA-376 Part 2 declares the Relationship attributes unqualified, so
+    // the specification reading refuses rel:TargetMode; the libxmlsec1
+    // reading takes it as TargetMode, prefers an unprefixed one present on
+    // the same element, and writes a single unprefixed TargetMode. Inputs are
+    // libxmlsec1's targetmode and targetmode-both fixtures.
+    use xml_sec::policy::RelationshipTargetModeSemantics;
+    let kind = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument";
+    let part = |modes: &str| {
+        format!(
+            "<Relationships xmlns=\"{REL}\" xmlns:rel=\"{REL}\"><Relationship Id=\"rId1\" {modes} Type=\"{kind}\" Target=\"word/document.xml\"/></Relationships>"
+        )
+    };
+    let normalized = |mode: &str| {
+        format!(
+            "<Relationships xmlns=\"{REL}\"><Relationship Id=\"rId1\" Target=\"word/document.xml\" TargetMode=\"{mode}\" Type=\"{kind}\"></Relationship></Relationships>"
+        )
+    };
+    let run = |xml: &str, semantics| {
+        let document = Document::parse(xml).unwrap();
+        let mut policy = VerificationPolicy::default();
+        policy.transforms.relationship_target_mode_semantics = semantics;
+        xml_sec::xmldsig::execute_transforms_with_policy(
+            document.root_element(),
+            TransformData::NodeSet(NodeSet::entire_document_with_comments(&document).unwrap()),
+            &[
+                Transform::Relationship(vec![RelationshipSelector::SourceId("rId1".into())]),
+                Transform::C14n(C14nAlgorithm::new(C14nMode::Inclusive1_0, false)),
+            ],
+            &policy,
+        )
+        .map_err(|error| error.to_string())
+    };
+    let prefixed = part("rel:TargetMode=\"External\"");
+    let both = part("TargetMode=\"Internal\" rel:TargetMode=\"External\"");
+    for xml in [&prefixed, &both] {
+        let error = run(xml, RelationshipTargetModeSemantics::Specification)
+            .expect_err("the schema has no qualified TargetMode");
+        assert!(
+            error.contains("unexpected Relationships part attribute"),
+            "{error}"
+        );
+    }
+    assert_eq!(
+        run(&prefixed, RelationshipTargetModeSemantics::Libxmlsec1).unwrap(),
+        normalized("External").as_bytes()
+    );
+    assert_eq!(
+        run(&both, RelationshipTargetModeSemantics::Libxmlsec1).unwrap(),
+        normalized("Internal").as_bytes()
+    );
+    // An unprefixed TargetMode alone reads the same under either policy.
+    for semantics in [
+        RelationshipTargetModeSemantics::Specification,
+        RelationshipTargetModeSemantics::Libxmlsec1,
+    ] {
+        assert_eq!(
+            run(&part("TargetMode=\"External\""), semantics).unwrap(),
+            normalized("External").as_bytes()
+        );
+    }
+}
+
+/// A part whose only relationship carries a Relationships-namespace `TargetMode`.
+fn qualified_target_mode_part() -> String {
+    format!(
+        "<Relationships xmlns=\"{REL}\" xmlns:rel=\"{REL}\"><Relationship Id=\"rid\" rel:TargetMode=\"External\" Type=\"urn:t\" Target=\"a\"/></Relationships>"
+    )
+}
+
+#[test]
+fn relationship_target_mode_policy_reaches_signing_and_verification() {
+    // The operation's compiled policy, not only the standalone executor,
+    // decides how rel:TargetMode is read: signing and verification refuse it
+    // under the specification reading and read it as TargetMode under the
+    // libxmlsec1 one.
+    use xml_sec::policy::RelationshipTargetModeSemantics::{Libxmlsec1, Specification};
+    let key = RsaSigningKey::from_pkcs8_pem(
+        &std::fs::read_to_string("tests/fixtures/keys/rsa/rsa-2048-key.pem").unwrap(),
+    )
+    .unwrap();
+    let key_info = X509CertificateKeyInfoWriter::from_pem(
+        &std::fs::read_to_string("tests/fixtures/keys/rsa/rsa-2048-cert.pem").unwrap(),
+    )
+    .unwrap();
+    let resources = std::collections::BTreeMap::from([(
+        "_rels/.rels".to_owned(),
+        qualified_target_mode_part().into_bytes(),
+    )]);
+    let canonical = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
+    let builder = SignatureBuilder::new(canonical.clone(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("_rels/.rels")
+                .transform(Transform::Relationship(vec![
+                    RelationshipSelector::SourceId("rid".into()),
+                ]))
+                .transform(Transform::C14n(canonical)),
+        )
+        .key_info(true);
+    let sign = |semantics| {
+        let mut policy = SigningPolicy::default();
+        policy.uris.references = UriTypeSet::ALL;
+        policy.transforms.relationship_target_mode_semantics = semantics;
+        SignContext::new(&key)
+            .policy(policy)
+            .key_info_writer(&key_info)
+            .external_resources(&resources)
+            .sign_with_builder("<root/>", &builder)
+    };
+    let refused = sign(Specification);
+    assert!(refused.is_err(), "{refused:?}");
+    let signed = sign(Libxmlsec1).unwrap().output;
+
+    let resolver = DefaultKeyResolver::default();
+    let verify = |semantics| {
+        let mut policy = VerificationPolicy::default();
+        policy.key_trust.mode = VerificationTrustMode::CryptographicOnly;
+        policy.uris.references = UriTypeSet::ALL;
+        policy.transforms.relationship_target_mode_semantics = semantics;
+        VerifyContext::new()
+            .policy(policy)
+            .key_resolver(&resolver)
+            .external_resources(&resources)
+            .store_pre_digest(true)
+            .verify(&signed)
+    };
+    let accepted = verify(Libxmlsec1).unwrap();
+    assert_eq!(accepted.status, DsigStatus::Valid);
+    let pre_digest = std::str::from_utf8(
+        accepted.signed_info_references[0]
+            .pre_digest_data
+            .as_ref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        pre_digest,
+        format!(
+            "<Relationships xmlns=\"{REL}\"><Relationship Id=\"rid\" Target=\"a\" TargetMode=\"External\" Type=\"urn:t\"></Relationship></Relationships>"
+        )
+    );
+    let refused = verify(Specification);
+    assert!(
+        !matches!(&refused, Ok(result) if result.status == DsigStatus::Valid),
+        "{refused:?}"
+    );
+}
+
+#[test]
+#[cfg(feature = "xmlenc")]
+fn relationship_target_mode_policy_reaches_cipher_reference() {
+    // A CipherReference's Relationship transform reads TargetMode under the
+    // decryption policy, as signing and verification do.
+    use xml_sec::policy::RelationshipTargetModeSemantics::{Libxmlsec1, Specification};
+    let xml = format!(
+        "<CipherReference xmlns=\"http://www.w3.org/2001/04/xmlenc#\" URI=\"part.rels\"><Transforms><ds:Transform xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\" Algorithm=\"{URI}\"><RelationshipReference xmlns=\"{PARAM}\" SourceId=\"rid\"/></ds:Transform><ds:Transform xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\" Algorithm=\"http://www.w3.org/TR/2001/REC-xml-c14n-20010315\"/></Transforms></CipherReference>"
+    );
+    let document = Document::parse(&xml).unwrap();
+    let resources = std::collections::BTreeMap::from([(
+        "part.rels".to_owned(),
+        qualified_target_mode_part().into_bytes(),
+    )]);
+    let resolve = |semantics| {
+        let mut policy = xml_sec::policy::DecryptionPolicy::default();
+        policy.uris.references = UriTypeSet::ALL;
+        policy.transforms.relationship_target_mode_semantics = semantics;
+        xml_sec::xmlenc::CipherReferenceContext::new(
+            &policy,
+            Some(&resources),
+            xml_sec::XmlBackend::default(),
+            &[],
+        )
+        .unwrap()
+        .resolve(document.root_element())
+    };
+    let refused = resolve(Specification);
+    assert!(refused.is_err(), "{refused:?}");
+    assert_eq!(
+        resolve(Libxmlsec1).unwrap(),
+        format!(
+            "<Relationships xmlns=\"{REL}\"><Relationship Id=\"rid\" Target=\"a\" TargetMode=\"External\" Type=\"urn:t\"></Relationship></Relationships>"
+        )
+        .as_bytes()
+    );
+}
+
+#[test]
+#[cfg(feature = "xmlenc")]
+fn the_compatible_decryption_profile_reads_target_mode_as_libxmlsec1() {
+    // The C library and the xmlsec1 command decrypt under the compatible
+    // profile's decryption policy, so a CipherReference's Relationship
+    // transform reads rel:TargetMode there as libxmlsec1 does.
+    let compiled = xml_sec::policy::PolicyCompiler::new(
+        xml_sec::policy::PolicyProfile::XmlSecCompatible,
+        &xml_sec::provider::RustCryptoProvider,
+        None,
+    )
+    .unwrap();
+    let mut policy = compiled.policies().decryption.clone().unwrap();
+    policy.uris.references = UriTypeSet::ALL;
+    let xml = format!(
+        "<CipherReference xmlns=\"http://www.w3.org/2001/04/xmlenc#\" URI=\"part.rels\"><Transforms><ds:Transform xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\" Algorithm=\"{URI}\"><RelationshipReference xmlns=\"{PARAM}\" SourceId=\"rid\"/></ds:Transform><ds:Transform xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\" Algorithm=\"http://www.w3.org/TR/2001/REC-xml-c14n-20010315\"/></Transforms></CipherReference>"
+    );
+    let document = Document::parse(&xml).unwrap();
+    let resources = std::collections::BTreeMap::from([(
+        "part.rels".to_owned(),
+        qualified_target_mode_part().into_bytes(),
+    )]);
+    let resolved = xml_sec::xmlenc::CipherReferenceContext::new(
+        &policy,
+        Some(&resources),
+        xml_sec::XmlBackend::default(),
+        &[],
+    )
+    .unwrap()
+    .resolve(document.root_element());
+    assert_eq!(
+        resolved.unwrap(),
+        format!(
+            "<Relationships xmlns=\"{REL}\"><Relationship Id=\"rid\" Target=\"a\" TargetMode=\"External\" Type=\"urn:t\"></Relationship></Relationships>"
+        )
+        .as_bytes()
+    );
+}
+
 #[path = "common/xmlsec1.rs"]
 mod xmlsec1;
 

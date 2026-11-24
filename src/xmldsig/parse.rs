@@ -51,7 +51,6 @@ const MAX_DER_ENCODED_KEY_VALUE_LEN: usize = 8192;
 const MAX_DER_ENCODED_KEY_VALUE_TEXT_LEN: usize = 65_536;
 const MAX_DER_ENCODED_KEY_VALUE_BASE64_LEN: usize = MAX_DER_ENCODED_KEY_VALUE_LEN.div_ceil(3) * 4;
 pub(crate) const MAX_KEY_NAME_TEXT_LEN: usize = 4096;
-const MAX_KEY_INFO_CHILD_COUNT: usize = 64;
 const MAX_HMAC_OUTPUT_LENGTH_TEXT_LEN: usize = 32;
 /// Namespace of the `SignatureContext` element of
 /// draft-eastlake-rfc9231bis-xmlsec-uris-09 section 3.3.15 and appendix E.
@@ -2021,11 +2020,7 @@ fn parse_key_info_contents_in_session(
     // of every embedded key before decoding or algorithm-specific parsing.
     // This does not consume the resolver's inspected-candidate work budget.
     for (index, child) in element_children(key_info_node).enumerate() {
-        if index >= MAX_KEY_INFO_CHILD_COUNT {
-            return Err(ParseError::InvalidStructure(
-                "KeyInfo contains too many child elements".into(),
-            ));
-        }
+        resources.validate_key_info_children(index + 1)?;
         let source = match (child.tag_name().namespace(), child.tag_name().name()) {
             (Some(XMLDSIG_NS), "KeyName") => {
                 ensure_no_element_children(child, "KeyName")?;
@@ -6861,9 +6856,70 @@ BA== </Modulus>
 
         assert!(matches!(
             parse_key_info(document.root_element()),
-            Err(ParseError::InvalidStructure(reason))
-                if reason == "KeyInfo contains too many child elements"
+            Err(ParseError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::KEY_INFO_CHILDREN,
+                    maximum: 64,
+                    actual: 65,
+                }
+            ))
         ));
+    }
+
+    #[test]
+    fn key_info_children_follow_the_policy() {
+        // `max_key_info_children` counts every child element, known or not.
+        // The compatible profile keeps the canonical limit: the core reads
+        // every child before it selects a key, where libxmlsec1 stops
+        // counting at the one that yields it.
+        let children = r#"<KeyName>a</KeyName><extension xmlns="urn:test"/>"#;
+        let xml =
+            format!(r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">{children}</KeyInfo>"#);
+        let document = Document::parse(&xml).unwrap();
+        let mut resources = crate::policy::ResourcePolicy {
+            max_key_info_children: 1,
+            ..crate::policy::ResourcePolicy::default()
+        };
+        let parse = |resources: &crate::policy::ResourcePolicy| {
+            parse_key_info_with_policy_budgets(
+                document.root_element(),
+                crate::provider::default_provider(),
+                &XmlBaseResolutionBudget::with_limits(
+                    resources.effective_xml_base_components(),
+                    resources.effective_xml_base_resolution_bytes(),
+                ),
+                resources,
+                None,
+            )
+        };
+        assert!(matches!(
+            parse(&resources),
+            Err(ParseError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::KEY_INFO_CHILDREN,
+                    maximum: 1,
+                    actual: 2,
+                }
+            ))
+        ));
+        resources.max_key_info_children = 2;
+        assert!(parse(&resources).is_ok());
+        let compatible = crate::policy::PolicyCompiler::new(
+            crate::policy::PolicyProfile::XmlSecCompatible,
+            crate::provider::default_provider(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            compatible
+                .policies()
+                .verification
+                .as_ref()
+                .unwrap()
+                .resources
+                .max_key_info_children,
+            crate::policy::ResourcePolicy::default().max_key_info_children
+        );
     }
 
     #[test]

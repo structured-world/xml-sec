@@ -227,6 +227,14 @@
       "evidence": "native-cli-tests"
     },
     {
+      "id": "native-cli-resource-options",
+      "kinds": ["cli-option"],
+      "name_regex": "^--(?:max-key-info-children|xpath-ops-limit)$",
+      "outcome": "compatibility-profile-only",
+      "rationale": "The native CLI maps this libxmlsec1 limit onto the compatibility profile's typed resource policy: the KeyInfo child count, which the core takes over every child before selecting a key (libxmlsec1 stops at the child that yields it) and caps at its own ceiling, so the profile keeps that ceiling rather than libxmlsec1's default of 10; and the XPath evaluation work, which the core measures itself rather than in libxml2 operations.",
+      "evidence": "native-cli-tests"
+    },
+    {
       "id": "native-cli-exit-status",
       "kinds": ["cli-exit-status"],
       "name_regex": "^(?:success|failure)$",

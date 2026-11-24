@@ -11,6 +11,60 @@ fn project_root() -> &'static Path {
 }
 
 #[test]
+fn resource_options_set_the_compatible_limits_as_libxmlsec1_reads_them() {
+    // Without options the command keeps the profile's canonical limits; a
+    // count sets the KeyInfo child limit up to the core's canonical value,
+    // zero lifts it there, and the XPath operations limit only narrows the
+    // evaluation work.
+    let canonical = ResourcePolicy::default();
+    let resources = |options: &[&str]| {
+        let mut arguments = vec!["xmlsec1", "verify"];
+        arguments.extend_from_slice(options);
+        arguments.push("input.xml");
+        xmlsec_compatibility_resources(&invocation(&arguments))
+    };
+    let defaults = resources(&[]);
+    assert_eq!(
+        defaults.max_key_info_children,
+        canonical.max_key_info_children
+    );
+    assert_eq!(
+        defaults.max_xpath_evaluation_work,
+        canonical.max_xpath_evaluation_work
+    );
+    assert_eq!(
+        resources(&["--max-key-info-children", "1"]).max_key_info_children,
+        1
+    );
+    for lifted in ["0", "100000"] {
+        assert_eq!(
+            resources(&["--max-key-info-children", lifted]).max_key_info_children,
+            canonical.max_key_info_children
+        );
+    }
+    assert_eq!(
+        resources(&["--xpath-ops-limit", "3"]).max_xpath_evaluation_work,
+        3
+    );
+    assert_eq!(
+        resources(&["--xpath-ops-limit", "0"]).max_xpath_evaluation_work,
+        canonical.max_xpath_evaluation_work
+    );
+    for invalid in ["-1", "many"] {
+        assert!(matches!(
+            validate_resource_options(&invocation(&[
+                "xmlsec1",
+                "verify",
+                "--max-key-info-children",
+                invalid,
+                "input.xml"
+            ])),
+            Err(CommandError::Usage(_))
+        ));
+    }
+}
+
+#[test]
 fn signing_certificate_failure_has_signature_category() {
     // A malformed embedded certificate is a signing-input failure, not encryption.
     let key = xml_sec::xmldsig::RsaSigningKey::from_pkcs8_pem(include_str!(
@@ -1559,6 +1613,22 @@ fn compatibility_verification_uses_libxmlsec_here_semantics() {
     assert_eq!(policy.key_trust.dsa_keys.minimum_modulus_bits, 1024);
     assert_eq!(policy.hmac.minimum_key_bits, 40);
     assert_eq!(policy.uris.key_info_references, UriTypeSet::SAME_DOCUMENT);
+}
+
+#[test]
+fn compatibility_decryption_reads_relationships_as_libxmlsec1() {
+    // A CipherReference's Relationship transform follows the same command
+    // contract as signing and verification: the 2012 edition and a
+    // Relationships-namespace TargetMode read as libxmlsec1 reads it.
+    let policy = xmlsec_compatibility_decryption_policy();
+    assert_eq!(
+        policy.transforms.opc_relationship_edition,
+        xml_sec::policy::OpcRelationshipEdition::Ecma2012
+    );
+    assert_eq!(
+        policy.transforms.relationship_target_mode_semantics,
+        xml_sec::policy::RelationshipTargetModeSemantics::Libxmlsec1
+    );
 }
 
 #[test]

@@ -208,6 +208,11 @@ pub(crate) unsafe extern "C" fn xmlSecCheckVersionExt(
             VERSION_EXACT if minor != our_minor || subminor != our_subminor => {
                 refuse(detail("exact"))
             }
+            // A negative component would otherwise pass as older than the
+            // library.
+            VERSION_ABI_COMPATIBLE if minor < 0 || subminor < 0 => refuse(format!(
+                "mode=abi compatible;negative version component is not allowed;minor version={minor};subminor version={subminor}"
+            )),
             VERSION_ABI_COMPATIBLE
                 if minor > our_minor || (minor == our_minor && subminor > our_subminor) =>
             {

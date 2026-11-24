@@ -124,6 +124,7 @@ pub(crate) mod resource_name {
     #[cfg(feature = "xmldsig")]
     pub const KEY_ESTABLISHMENT_MODULAR_WORK: &str = "key establishment modular work";
     pub const KEY_INFO_REFERENCE_DEPTH: &str = "KeyInfoReference depth";
+    pub const KEY_INFO_CHILDREN: &str = "KeyInfo children";
     pub const BASE64_TRANSFORM_INPUT_BYTES: &str = "Base64 transform input bytes";
     pub const BASE64_TRANSFORM_OUTPUT_BYTES: &str = "Base64 transform output bytes";
     pub const XPATH_EXPRESSIONS: &str = "XPath expressions";
@@ -619,6 +620,9 @@ pub struct ResourcePolicy {
     /// Maximum nesting of the key references one `KeyInfo` read dereferences:
     /// `KeyInfoReference`, and `RetrievalMethod` where a reader follows it.
     pub max_key_info_reference_depth: usize,
+    /// Maximum child elements of one `KeyInfo`, known or not, read for a key.
+    /// Every child is read before a key is selected, so all of them count.
+    pub max_key_info_children: usize,
     /// Maximum bytes accepted by Base64 transforms before decoding.
     pub max_base64_transform_input_bytes: usize,
     /// Maximum cumulative bytes emitted by Base64 transforms in one operation.
@@ -702,6 +706,7 @@ impl Default for ResourcePolicy {
             .expect("key import work ceiling fits supported 32-bit and 64-bit targets"),
             max_key_import_kdf_memory_bytes: crate::hard_limits::KEY_IMPORT_KDF_MEMORY_CEILING,
             max_key_info_reference_depth: crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING,
+            max_key_info_children: crate::hard_limits::KEY_INFO_CHILD_CEILING,
             max_base64_transform_input_bytes:
                 crate::hard_limits::BASE64_TRANSFORM_INPUT_BYTE_CEILING,
             max_base64_transform_output_bytes:
@@ -873,6 +878,11 @@ impl ResourcePolicy {
                 crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING,
             ),
             (
+                resource_name::KEY_INFO_CHILDREN,
+                self.max_key_info_children,
+                crate::hard_limits::KEY_INFO_CHILD_CEILING,
+            ),
+            (
                 resource_name::BASE64_TRANSFORM_INPUT_BYTES,
                 self.max_base64_transform_input_bytes,
                 crate::hard_limits::BASE64_TRANSFORM_INPUT_BYTE_CEILING,
@@ -1042,6 +1052,23 @@ impl ResourcePolicy {
             return Err(PolicyViolation::ResourceLimit {
                 resource: resource_name::KEY_INFO_REFERENCE_DEPTH,
                 maximum: self.max_key_info_reference_depth,
+                actual,
+            });
+        }
+        Ok(())
+    }
+
+    /// Reject the `actual`-th child element of one `KeyInfo` beyond this
+    /// policy snapshot.
+    ///
+    /// # Errors
+    /// Returns a `ResourceLimit` when `actual` exceeds `max_key_info_children`.
+    #[cfg(feature = "xmldsig")]
+    pub fn validate_key_info_children(&self, actual: usize) -> Result<(), PolicyViolation> {
+        if actual > self.max_key_info_children {
+            return Err(PolicyViolation::ResourceLimit {
+                resource: resource_name::KEY_INFO_CHILDREN,
+                maximum: self.max_key_info_children,
                 actual,
             });
         }
@@ -1226,6 +1253,22 @@ pub enum XsltStylesheetSemantics {
     Libxmlsec1,
 }
 
+/// How the Relationship transform reads a `TargetMode` attribute bound to the
+/// Relationships namespace (`rel:TargetMode`).
+#[cfg(feature = "xmldsig")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RelationshipTargetModeSemantics {
+    /// ECMA-376 Part 2 schema: the attributes of `CT_Relationship` are
+    /// unqualified and no `anyAttribute` is declared, so a qualified
+    /// `TargetMode` is an unexpected attribute and the part is refused.
+    #[default]
+    Specification,
+    /// libxmlsec1: a Relationships-namespace `TargetMode` is the
+    /// `TargetMode` attribute; an unprefixed one present on the same element
+    /// takes precedence, and the output carries one unprefixed `TargetMode`.
+    Libxmlsec1,
+}
+
 /// Wire representation used for ECDSA `SignatureValue` bytes.
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -1283,6 +1326,8 @@ pub struct TransformPolicy {
     pub same_document_id_semantics: SameDocumentIdSemantics,
     /// Trusted normalization edition, not package validation; never inferred from XML.
     pub opc_relationship_edition: OpcRelationshipEdition,
+    /// How a Relationships-namespace `TargetMode` is read.
+    pub relationship_target_mode_semantics: RelationshipTargetModeSemantics,
     /// How XSLT stylesheets are read; applies to builds with `xslt`.
     pub xslt_stylesheet_semantics: XsltStylesheetSemantics,
     /// Whether a Reference whose transforms produce no octets is digested.
@@ -2406,6 +2451,7 @@ mod tests {
                 => max_key_import_kdf_memory_bytes;
             KEY_INFO_REFERENCE_DEPTH: limit::KEY_INFO_REFERENCE_DEPTH_CEILING
                 => max_key_info_reference_depth;
+            KEY_INFO_CHILDREN: limit::KEY_INFO_CHILD_CEILING => max_key_info_children;
             BASE64_TRANSFORM_INPUT_BYTES: limit::BASE64_TRANSFORM_INPUT_BYTE_CEILING
                 => max_base64_transform_input_bytes;
             BASE64_TRANSFORM_OUTPUT_BYTES: limit::BASE64_TRANSFORM_OUTPUT_BYTE_CEILING
@@ -2488,6 +2534,7 @@ mod tests {
             max_key_import_kdf_work: 0,
             max_key_import_kdf_memory_bytes: 0,
             max_key_info_reference_depth: 0,
+            max_key_info_children: 0,
             max_base64_transform_input_bytes: 0,
             max_base64_transform_output_bytes: 0,
             max_xpath_expressions: 0,

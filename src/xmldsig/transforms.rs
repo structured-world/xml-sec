@@ -139,6 +139,7 @@ pub(crate) struct TransformOptions<'r> {
     xpath_here_semantics: XPathHereSemantics,
     allow_internal_dtd: bool,
     opc_relationship_edition: crate::policy::OpcRelationshipEdition,
+    relationship_target_mode_semantics: crate::policy::RelationshipTargetModeSemantics,
     xslt_stylesheet_semantics: crate::policy::XsltStylesheetSemantics,
     empty_digest_input: crate::policy::EmptyDigestInput,
     id_attributes: &'r [crate::xml::IdAttributeRegistration],
@@ -540,6 +541,13 @@ impl<'r> TransformOptions<'r> {
         edition: crate::policy::OpcRelationshipEdition,
     ) -> Self {
         self.opc_relationship_edition = edition;
+        self
+    }
+    pub(crate) fn relationship_target_mode_semantics(
+        mut self,
+        semantics: crate::policy::RelationshipTargetModeSemantics,
+    ) -> Self {
+        self.relationship_target_mode_semantics = semantics;
         self
     }
     pub(crate) fn xslt_stylesheet_semantics(
@@ -968,7 +976,10 @@ fn apply_relationship_transform<'d, S: TransformScratch, D: DomStorage>(
     relationship::normalize_in(
         &document,
         selectors,
-        context.options.opc_relationship_edition,
+        relationship::Reading {
+            edition: context.options.opc_relationship_edition,
+            target_mode: context.options.relationship_target_mode_semantics,
+        },
         budget,
         context.scratch,
     )
@@ -1415,6 +1426,7 @@ pub fn execute_transforms_with_policy<'a>(
     let permissions = policy.transform_policy();
     let options = TransformOptions::default()
         .opc_relationship_edition(permissions.opc_relationship_edition)
+        .relationship_target_mode_semantics(permissions.relationship_target_mode_semantics)
         .xpath_here_semantics(permissions.xpath_here_semantics)
         .xslt_stylesheet_semantics(permissions.xslt_stylesheet_semantics)
         .allow_internal_dtd(policy.xml_policy().allow_internal_dtd);

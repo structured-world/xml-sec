@@ -27,8 +27,8 @@ use super::keysdata::{
 };
 use super::keysmngr::{XmlSecKeysMngr, xmlSecKeysMngrFindKey};
 use super::list::{
-    XmlSecPtrList, xmlSecPtrListCopy, xmlSecPtrListFinalize, xmlSecPtrListGetSize,
-    xmlSecPtrListInitialize,
+    XmlSecPtrList, xmlSecPtrListCopy, xmlSecPtrListEmpty, xmlSecPtrListFinalize,
+    xmlSecPtrListGetSize, xmlSecPtrListInitialize,
 };
 use super::transforms::{
     XmlSecTransformCtx,
@@ -255,6 +255,11 @@ const USAGE_KEY_VALUE_NODE_READ: c_uint = 0x00004;
 /// `xmlSecKeyDataUsageKeyValueNodeWrite`.
 const USAGE_KEY_VALUE_NODE_WRITE: c_uint = 0x00008;
 use errors::R_INVALID_KEY_DATA;
+/// The documented initial `maxKeyInfoChildren` of the libxmlsec1 ABI
+/// (`keyinfo.h`), a caller-owned context field like the reference levels
+/// above it. It is not a policy default: a read takes the smaller of it and
+/// the pinned policy's `max_key_info_children`, so it never widens the policy.
+const MAX_KEY_INFO_CHILDREN_DEFAULT: usize = 10;
 
 /// `xmlSecKeyInfoCtx`, with the `XMLEnc` and X.509 members of a build that
 /// has both.
@@ -267,6 +272,7 @@ pub(crate) struct XmlSecKeyInfoCtx {
     pub(crate) mode: c_int,
     pub(crate) enabled_key_data: XmlSecPtrList,
     pub(crate) base64_line_size: c_int,
+    pub(crate) max_key_info_children: usize,
     pub(crate) retrieval_method_ctx: XmlSecTransformCtx,
     pub(crate) max_retrieval_method_level: c_int,
     pub(crate) key_info_reference_ctx: XmlSecTransformCtx,
@@ -373,7 +379,19 @@ pub(crate) unsafe extern "C" fn xmlSecKeyInfoNodeRead(
             let Some(_pin) = policy::SlotPin::hold(&raw mut (*ctx).reserved0, here) else {
                 return -1;
             };
+            // The pinned policy's `max_key_info_children` bounds the read;
+            // the context's `maxKeyInfoChildren`, unless zero (no limit of
+            // its own), can only narrow it.
+            let pinned = policy::pinned((*ctx).reserved0).expect("the read holds its pin");
+            let mut maximum = pinned
+                .of(references::read_side(ctx))
+                .resources()
+                .max_key_info_children;
+            if (*ctx).max_key_info_children != 0 {
+                maximum = maximum.min((*ctx).max_key_info_children);
+            }
             let mut cur = xmlSecGetNextElementNode(nodes::first_child(key_info_node));
+            let mut children = 0_usize;
             while !cur.is_null() {
                 // A key already meeting the requirements ends the read, unless
                 // the caller asked for every child.
@@ -386,6 +404,19 @@ pub(crate) unsafe extern "C" fn xmlSecKeyInfoNodeRead(
                     if matched != 0 {
                         break;
                     }
+                }
+                // Every child the read reaches counts, known or not.
+                // Bounded by the document's element count, which fits usize.
+                children += 1;
+                if children > maximum {
+                    errors::report(
+                        here,
+                        c"KeyInfo".as_ptr(),
+                        std::ptr::null(),
+                        errors::R_MAX_KEYINFO_CHILDREN,
+                        &format!("cur={children};max={maximum}"),
+                    );
+                    return -1;
                 }
                 let data_id = child_klass(ctx, cur, USAGE_KEY_INFO_NODE_READ);
                 if data_id.is_null() {
@@ -550,6 +581,7 @@ pub(crate) unsafe extern "C" fn xmlSecKeyInfoCtxInitialize(
             let context = &mut *ctx;
             context.keys_mngr = keys_mngr;
             context.base64_line_size = xmlSecBase64GetDefaultLineSize();
+            context.max_key_info_children = MAX_KEY_INFO_CHILDREN_DEFAULT;
             if xmlSecPtrListInitialize(
                 &raw mut context.enabled_key_data,
                 xmlSecKeyDataIdListGetKlass(),
@@ -691,6 +723,10 @@ pub(crate) unsafe extern "C" fn xmlSecKeyInfoCtxCopyUserPref(
             to.flags2 = from.flags2;
             to.keys_mngr = from.keys_mngr;
             to.base64_line_size = from.base64_line_size;
+            to.max_key_info_children = from.max_key_info_children;
+            // The copy appends, so the destination's own list is emptied
+            // first: the preferences are replaced, never merged.
+            xmlSecPtrListEmpty(&raw mut to.enabled_key_data);
             if xmlSecPtrListCopy(&raw mut to.enabled_key_data, &raw mut from.enabled_key_data) < 0 {
                 errors::internal(here, std::ptr::null(), c"xmlSecPtrListCopy(enabledKeyData)");
                 return -1;

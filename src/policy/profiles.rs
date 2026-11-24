@@ -10,9 +10,10 @@ use super::{
 use super::{
     DigestAlgorithm, KemContentAuthentication, KemSignatureTrust, KeyAgreementAlgorithm,
     KeyDerivationAlgorithm, KeyEstablishmentPolicy, KeySourceKind, KeySourcePolicy,
-    PolicyViolation, RequestSelections, RsaPssPermission, SameDocumentIdSemantics,
-    SignatureAlgorithm, SigningPolicy, TransformPolicy, UnknownX509CertificateSemantics, UriPolicy,
-    UriTypeSet, VerificationPolicy, XsltStylesheetSemantics,
+    PolicyViolation, RelationshipTargetModeSemantics, RequestSelections, RsaPssPermission,
+    SameDocumentIdSemantics, SignatureAlgorithm, SigningPolicy, TransformPolicy,
+    UnknownX509CertificateSemantics, UriPolicy, UriTypeSet, VerificationPolicy,
+    XsltStylesheetSemantics,
 };
 use crate::provider::{CryptoProvider, KeyEncapsulationAlgorithm, ProviderCapability};
 use alloc::{borrow::ToOwned, collections::BTreeSet, string::String, sync::Arc};
@@ -429,6 +430,11 @@ fn profile_policies(
     if let Some(policy) = decryption.as_mut() {
         policy.key_establishment = key_establishment_profile(provider, compatibility);
     }
+    // The compatibility profiles keep the canonical `max_key_info_children`
+    // rather than libxmlsec1's ten: libxmlsec1 stops counting at the child
+    // that yields the key, while the core reads every child before selecting
+    // one, so ten would refuse a document with many recipients that
+    // libxmlsec1 decrypts with the first.
     PolicySet {
         verification: Some(verification),
         signing: (!legacy).then_some(signing),
@@ -517,12 +523,14 @@ fn verification_profile(
 
 fn profile_transforms(compatibility: bool) -> TransformPolicy {
     if compatibility {
-        // Signers and verifiers in this profile must agree with libxmlsec1 on the
-        // digested output of XSLT transforms. Signing otherwise writes what
+        // Signers, verifiers and decryptors in this profile must agree with
+        // libxmlsec1 on the output of XSLT and Relationship transforms. Signing
+        // otherwise writes what
         // the specification recommends; byte-for-byte libxmlsec1 templates
         // are the business of the C library and the xmlsec1 command.
         TransformPolicy {
             xslt_stylesheet_semantics: XsltStylesheetSemantics::Libxmlsec1,
+            relationship_target_mode_semantics: RelationshipTargetModeSemantics::Libxmlsec1,
             ..TransformPolicy::default()
         }
     } else {
@@ -827,6 +835,12 @@ fn decryption_profile(
                 .collect(),
         ),
         oaep_digests: Some(oaep_digests),
+        // A CipherReference's transforms read as the profile's signatures do.
+        transforms: if compatibility {
+            profile_transforms(true)
+        } else {
+            DecryptionPolicy::default().transforms
+        },
         ..DecryptionPolicy::default()
     }
 }

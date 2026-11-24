@@ -495,6 +495,42 @@ fn base64_input_is_bounded_per_run() {
     assert_eq!(run(&vec![b'\n'; limit + 1]), -1);
 }
 
+/// The `XPointer` transform a fragment implies is held to the context's
+/// enabled list as a `Transform` element's is: refused while the list leaves
+/// it out, selected while the list is empty or names it.
+#[test]
+fn a_fragment_needs_the_xpointer_transform_enabled() {
+    let xml = b"<r/>";
+    // SAFETY: the document and contexts are used while live.
+    unsafe {
+        let doc = crate::ffi::parser::xmlSecParseMemory(xml.as_ptr(), xml.len(), 0);
+        assert!(!doc.is_null());
+        let set = |enabled: &[*const super::XmlSecTransformKlass]| {
+            let ctx = xmlSecTransformCtxCreate();
+            for klass in enabled {
+                assert_eq!(
+                    crate::ffi::list::xmlSecPtrListAdd(
+                        &raw mut (*ctx).enabled_transforms,
+                        klass.cast_mut().cast()
+                    ),
+                    0
+                );
+            }
+            let status = super::ctx::xmlSecTransformCtxSetUri(
+                ctx,
+                c"#xpointer(id('x'))".as_ptr().cast(),
+                nodes::first_child(doc),
+            );
+            xmlSecTransformCtxDestroy(ctx);
+            status
+        };
+        assert_eq!(set(&[]), 0);
+        assert_eq!(set(&[super::xpath::xpointer()]), 0);
+        assert_eq!(set(&[super::xpath::xpath()]), -1);
+        xml_sec_libxml2::document::free(doc);
+    }
+}
+
 /// A bare-name fragment is an id inside an `id('...')` literal, so a name
 /// that would close the literal or change the pointer's scheme data is
 /// refused instead of selecting more than one element; numeric ids, which
@@ -700,6 +736,55 @@ fn library_policy_runs_the_relationship_transform() {
          <Relationship Id=\"rId1\" Target=\"a.xml\" TargetMode=\"External\" Type=\"urn:t:a\">\
          </Relationship><Relationship Id=\"rId3\" Target=\"c.xml\" TargetMode=\"Internal\" \
          Type=\"urn:t:c\"></Relationship></Relationships>"
+    );
+}
+
+/// The library reads a Relationships-namespace `TargetMode` as libxmlsec1
+/// does: as `TargetMode`, written unprefixed, an unprefixed one winning.
+#[test]
+fn library_policy_reads_a_qualified_target_mode_as_libxmlsec1() {
+    use xml_sec::xmldsig::transforms::{
+        RelationshipSelector, Transform, execute_transforms_with_policy,
+    };
+    use xml_sec::xmldsig::types::{NodeSet, TransformData};
+
+    let policy = crate::ffi::policy::verification().expect("the library policy compiles");
+    let run = |modes: &str| {
+        let document = xml_sec::XmlDocument::parse(format!(
+            "<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships' \
+             xmlns:rel='http://schemas.openxmlformats.org/package/2006/relationships'>\
+             <Relationship Id='rId1' {modes} Type='urn:t:a' Target='a.xml'/></Relationships>"
+        ))
+        .expect("parse");
+        let transforms = [
+            Transform::Relationship(vec![RelationshipSelector::SourceId("rId1".into())]),
+            Transform::C14n(xml_sec::c14n::C14nAlgorithm::new(
+                xml_sec::c14n::C14nMode::Inclusive1_0,
+                false,
+            )),
+        ];
+        let output = document.with_view(|view| {
+            let document = view.document();
+            execute_transforms_with_policy(
+                document.root(),
+                TransformData::NodeSet(NodeSet::entire_document_without_comments(document)?),
+                &transforms,
+                &*policy,
+            )
+        });
+        String::from_utf8(output.expect("relationship transform")).expect("UTF-8")
+    };
+    let expected = |mode: &str| {
+        format!(
+            "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+             <Relationship Id=\"rId1\" Target=\"a.xml\" TargetMode=\"{mode}\" Type=\"urn:t:a\">\
+             </Relationship></Relationships>"
+        )
+    };
+    assert_eq!(run("rel:TargetMode='External'"), expected("External"));
+    assert_eq!(
+        run("TargetMode='Internal' rel:TargetMode='External'"),
+        expected("Internal")
     );
 }
 

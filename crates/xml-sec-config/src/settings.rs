@@ -14,11 +14,11 @@ use xml_sec::{
         GeneratedCanonicalization, HmacPolicy, Instant, KemContentAuthentication,
         KemSignatureTrust, KeyAgreementAlgorithm, KeyDerivationAlgorithm, KeyEstablishmentPolicy,
         KeyNameSemantics, KeySourceKind, KeySourcePolicy, KeyTrustPolicy, ManifestProcessing,
-        OpcRelationshipEdition, PolicySet, PolicyValidity, RequestSelections, ResourcePolicy,
-        RsaKeyPolicy, RsaPssPermission, SameDocumentIdSemantics, SignatureConstraints,
-        SigningPolicy, TimestampTokenEncoding, TransformPolicy, UnknownX509CertificateSemantics,
-        UriPolicy, VerificationPolicy, VerificationTrustMode, XmlInputPolicy,
-        XsltStylesheetSemantics,
+        OpcRelationshipEdition, PolicySet, PolicyValidity, RelationshipTargetModeSemantics,
+        RequestSelections, ResourcePolicy, RsaKeyPolicy, RsaPssPermission, SameDocumentIdSemantics,
+        SignatureConstraints, SigningPolicy, TimestampTokenEncoding, TransformPolicy,
+        UnknownX509CertificateSemantics, UriPolicy, VerificationPolicy, VerificationTrustMode,
+        XmlInputPolicy, XsltStylesheetSemantics,
     },
     provider::{KeyEncapsulationAlgorithm, X509SignatureAlgorithm},
     xmldsig::{
@@ -195,7 +195,8 @@ macro_rules! resource_fields {
         max_encryption_plaintext_bytes, max_xml_document_bytes, max_xml_parse_work_bytes,
         max_encryption_recipients, max_encryption_metadata_bytes, max_key_candidates,
         max_x509_work, max_x509_workspace_bytes, max_key_import_kdf_work, max_key_import_kdf_memory_bytes,
-        max_key_info_reference_depth, max_base64_transform_input_bytes, max_base64_transform_output_bytes,
+        max_key_info_reference_depth, max_key_info_children, max_base64_transform_input_bytes,
+        max_base64_transform_output_bytes,
         max_xpath_expressions, max_xpath_expression_bytes, max_xpath_expression_complexity,
         max_xpath_context_evaluations, max_xpath_evaluation_work, max_xpath_mirror_string_bytes,
         max_xpath_string_work_bytes, max_xpath_namespace_bindings, max_xpath_namespace_bytes,
@@ -280,6 +281,14 @@ fn transforms(p: &mut TransformPolicy, v: &Value, of: TransformTable) -> Result<
                     key,
                     OpcRelationshipEdition::Ecma2012,
                     OpcRelationshipEdition::Ecma2021
+                );
+            }
+            "relationship_target_mode_semantics" => {
+                p.relationship_target_mode_semantics = choice!(
+                    value,
+                    key,
+                    RelationshipTargetModeSemantics::Specification,
+                    RelationshipTargetModeSemantics::Libxmlsec1
                 );
             }
             "xslt_stylesheet_semantics" => {
@@ -905,6 +914,10 @@ fn transform_snapshot(p: &TransformPolicy, of: TransformTable) -> Value {
         (
             "opc_relationship_edition".into(),
             named(p.opc_relationship_edition),
+        ),
+        (
+            "relationship_target_mode_semantics".into(),
+            named(p.relationship_target_mode_semantics),
         ),
         (
             "xslt_stylesheet_semantics".into(),

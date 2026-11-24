@@ -129,6 +129,11 @@
       "rationale": "The native CLI implements this option only for the formats, algorithms, or fixed RustCrypto provider behavior advertised by its capability registry.",
       "evidence": "native-cli-tests"
     },
+    "native-cli-resource-options": {
+      "outcome": "compatibility-profile-only",
+      "rationale": "The native CLI maps this libxmlsec1 limit onto the compatibility profile's typed resource policy: the KeyInfo child count, which the core takes over every child before selecting a key (libxmlsec1 stops at the child that yields it) and caps at its own ceiling, so the profile keeps that ceiling rather than libxmlsec1's default of 10; and the XPath evaluation work, which the core measures itself rather than in libxml2 operations.",
+      "evidence": "native-cli-tests"
+    },
     "native-rsa-pss-uri": {
       "outcome": "behavior-compatible",
       "rationale": "RSA-PSS fixed URI signing and verification execute through CryptoProvider with exact digest-sized salt and matching MGF1; the complete upstream PSS family is exercised by public pipeline tests.",
@@ -24447,7 +24452,7 @@
       "kind": "cli-option",
       "name": "--enable-visa3d-hack",
       "source": "apps/xmlsec.c",
-      "detail": "static xmlSecAppCmdLineParam enableVisa3DHackParam = { xmlSecAppCmdLineTopicDSigCommon, \"--enable-visa3d-hack\", NULL, \"--enable-visa3d-hack\" \"\\n\\tenables Visa3D protocol specific hack for URI attributes processing\" \"\\n\\twhen we are trying not to use XPath/XPointer engine; this is a hack\" \"\\n\\tand I don't know what else might be broken in your application when\" \"\\n\\tyou use it (also check \\\"--id-attr\\\" option because you might need it)\", xmlSecAppCmdLineParamTypeFlag, xmlSecAppCmdLineParamFlagNone, NULL };",
+      "detail": "static xmlSecAppCmdLineParam enableVisa3DHackParam = { xmlSecAppCmdLineTopicDSigCommon, \"--enable-visa3d-hack\", NULL, \"--enable-visa3d-hack\" \"\\n\\tdeprecated, enables Visa3D protocol specific hack for URI attributes processing\" \"\\n\\twhen we are trying not to use XPath/XPointer engine; this is a hack\" \"\\n\\tand I don't know what else might be broken in your application when\" \"\\n\\tyou use it (also check \\\"--id-attr\\\" option because you might need it)\", xmlSecAppCmdLineParamTypeFlag, xmlSecAppCmdLineParamFlagNone, NULL };",
       "classification": "native-cli-behavior-options"
     },
     {
@@ -24561,6 +24566,13 @@
       "source": "apps/xmlsec.c",
       "detail": "static xmlSecAppCmdLineParam maxEncryptedKeyLevelParam = { xmlSecAppCmdLineTopicDSigCommon | xmlSecAppCmdLineTopicEncCommon, \"--max-encrypted-key-level\", NULL, \"--max-encrypted-key-level <level>\" \"\\n\\tsets the max depth level when processing encrypted keys, key agreements, etc.\" \"\\n\\tto <level>; default is 1\", xmlSecAppCmdLineParamTypeNumber, xmlSecAppCmdLineParamFlagNone, NULL };",
       "classification": "planned-cli-surface"
+    },
+    {
+      "kind": "cli-option",
+      "name": "--max-key-info-children",
+      "source": "apps/xmlsec.c",
+      "detail": "static xmlSecAppCmdLineParam maxKeyInfoChildrenParam = { xmlSecAppCmdLineTopicDSigCommon | xmlSecAppCmdLineTopicEncCommon, \"--max-key-info-children\", NULL, \"--max-key-info-children <count>\" \"\\n\\tlimits the number of <dsig:KeyInfo /> child elements processed when\" \"\\n\\treading to <count>; set to 0 to disable the limit; default is 10\", xmlSecAppCmdLineParamTypeNumber, xmlSecAppCmdLineParamFlagNone, NULL };",
+      "classification": "native-cli-resource-options"
     },
     {
       "kind": "cli-option",
@@ -24851,6 +24863,13 @@
     },
     {
       "kind": "cli-option",
+      "name": "--xpath-ops-limit",
+      "source": "apps/xmlsec.c",
+      "detail": "static xmlSecAppCmdLineParam xpathOpsLimitParam = { xmlSecAppCmdLineTopicCryptoConfig, \"--xpath-ops-limit\", NULL, \"--xpath-ops-limit <limit>\" \"\\n\\tsets the limit on the number of XPath operations performed by XPath, \" \"\\n\\tXPath2 and XPointer transforms to <limit>; default: 1000000; \" \"\\n\\tset to 0 to disable the limit\", xmlSecAppCmdLineParamTypeNumber, xmlSecAppCmdLineParamFlagNone, NULL };",
+      "classification": "native-cli-resource-options"
+    },
+    {
+      "kind": "cli-option",
       "name": "--xxe",
       "source": "apps/xmlsec.c",
       "detail": "static xmlSecAppCmdLineParam xxeParam = { xmlSecAppCmdLineTopicAll, \"--xxe\", NULL, \"--xxe\" \"\\n\\tenable External Entity resolution.\" \"\\n\\tWARNING: this may allow the reading of arbitrary files and URLs,\" \"\\n\\tcontrolled by the input XML document.  Use with caution!\", xmlSecAppCmdLineParamTypeFlag, xmlSecAppCmdLineParamFlagNone, NULL };",
@@ -25007,6 +25026,26 @@
         "#ifndef XMLSEC_NO_X509"
       ],
       "classification": "backend-specific-surface"
+    },
+    {
+      "kind": "deprecated-api",
+      "name": "xmlSecTransformVisa3DHackGetKlass",
+      "source": "include/xmlsec/transforms.h",
+      "detail": "XMLSEC_EXPORT XMLSEC_DEPRECATED xmlSecTransformId xmlSecTransformVisa3DHackGetKlass (void);",
+      "conditions": [
+        "#ifndef XMLSEC_TRANSFORMS_H"
+      ],
+      "classification": "deprecated-generic-surface"
+    },
+    {
+      "kind": "deprecated-api",
+      "name": "xmlSecTransformVisa3DHackSetID",
+      "source": "include/xmlsec/transforms.h",
+      "detail": "XMLSEC_EXPORT XMLSEC_DEPRECATED int xmlSecTransformVisa3DHackSetID (xmlSecTransformPtr transform, const xmlChar* id);",
+      "conditions": [
+        "#ifndef XMLSEC_TRANSFORMS_H"
+      ],
+      "classification": "deprecated-generic-surface"
     },
     {
       "kind": "deprecated-api",
@@ -29893,6 +29932,16 @@
     },
     {
       "kind": "export-function",
+      "name": "xmlSecTransformCtxGetDefaultXpathOpsLimit",
+      "source": "include/xmlsec/transforms.h",
+      "detail": "XMLSEC_EXPORT xmlSecSize xmlSecTransformCtxGetDefaultXpathOpsLimit(void);",
+      "conditions": [
+        "#ifndef XMLSEC_TRANSFORMS_H"
+      ],
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "export-function",
       "name": "xmlSecTransformCtxInitialize",
       "source": "include/xmlsec/transforms.h",
       "detail": "XMLSEC_EXPORT int xmlSecTransformCtxInitialize (xmlSecTransformCtxPtr ctx);",
@@ -29966,6 +30015,16 @@
       "name": "xmlSecTransformCtxSetDefaultMaxDepth",
       "source": "include/xmlsec/transforms.h",
       "detail": "XMLSEC_EXPORT void xmlSecTransformCtxSetDefaultMaxDepth(unsigned int maxDepth);",
+      "conditions": [
+        "#ifndef XMLSEC_TRANSFORMS_H"
+      ],
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "export-function",
+      "name": "xmlSecTransformCtxSetDefaultXpathOpsLimit",
+      "source": "include/xmlsec/transforms.h",
+      "detail": "XMLSEC_EXPORT void xmlSecTransformCtxSetDefaultXpathOpsLimit(xmlSecSize xpathOpsLimit);",
       "conditions": [
         "#ifndef XMLSEC_TRANSFORMS_H"
       ],
@@ -31421,7 +31480,7 @@
       "kind": "export-function",
       "name": "xmlSecTransformVisa3DHackGetKlass",
       "source": "include/xmlsec/transforms.h",
-      "detail": "XMLSEC_EXPORT xmlSecTransformId xmlSecTransformVisa3DHackGetKlass (void);",
+      "detail": "XMLSEC_EXPORT XMLSEC_DEPRECATED xmlSecTransformId xmlSecTransformVisa3DHackGetKlass (void);",
       "conditions": [
         "#ifndef XMLSEC_TRANSFORMS_H"
       ],
@@ -31431,7 +31490,7 @@
       "kind": "export-function",
       "name": "xmlSecTransformVisa3DHackSetID",
       "source": "include/xmlsec/transforms.h",
-      "detail": "XMLSEC_EXPORT int xmlSecTransformVisa3DHackSetID (xmlSecTransformPtr transform, const xmlChar* id);",
+      "detail": "XMLSEC_EXPORT XMLSEC_DEPRECATED int xmlSecTransformVisa3DHackSetID (xmlSecTransformPtr transform, const xmlChar* id);",
       "conditions": [
         "#ifndef XMLSEC_TRANSFORMS_H"
       ],
@@ -33398,16 +33457,6 @@
     },
     {
       "kind": "export-variable",
-      "name": "xmlSecNameConcatKdfKey",
-      "source": "include/xmlsec/strings.h",
-      "detail": "XMLSEC_EXPORT_VAR const xmlChar xmlSecNameConcatKdfKey[];",
-      "conditions": [
-        "#ifndef XMLSEC_STRINGS_H"
-      ],
-      "classification": "binary-c-surface"
-    },
-    {
-      "kind": "export-variable",
       "name": "xmlSecNameDEREncodedKeyValue",
       "source": "include/xmlsec/strings.h",
       "detail": "XMLSEC_EXPORT_VAR const xmlChar xmlSecNameDEREncodedKeyValue[];",
@@ -33828,16 +33877,6 @@
     },
     {
       "kind": "export-variable",
-      "name": "xmlSecNameHkdfKey",
-      "source": "include/xmlsec/strings.h",
-      "detail": "XMLSEC_EXPORT_VAR const xmlChar xmlSecNameHkdfKey[];",
-      "conditions": [
-        "#ifndef XMLSEC_STRINGS_H"
-      ],
-      "classification": "binary-c-surface"
-    },
-    {
-      "kind": "export-variable",
       "name": "xmlSecNameHmacMd5",
       "source": "include/xmlsec/strings.h",
       "detail": "XMLSEC_EXPORT_VAR const xmlChar xmlSecNameHmacMd5[];",
@@ -34124,16 +34163,6 @@
       "name": "xmlSecNamePbkdf2",
       "source": "include/xmlsec/strings.h",
       "detail": "XMLSEC_EXPORT_VAR const xmlChar xmlSecNamePbkdf2[];",
-      "conditions": [
-        "#ifndef XMLSEC_STRINGS_H"
-      ],
-      "classification": "binary-c-surface"
-    },
-    {
-      "kind": "export-variable",
-      "name": "xmlSecNamePbkdf2Key",
-      "source": "include/xmlsec/strings.h",
-      "detail": "XMLSEC_EXPORT_VAR const xmlChar xmlSecNamePbkdf2Key[];",
       "conditions": [
         "#ifndef XMLSEC_STRINGS_H"
       ],
@@ -35759,16 +35788,6 @@
       "name": "xmlSecNsExcC14N",
       "source": "include/xmlsec/strings.h",
       "detail": "XMLSEC_EXPORT_VAR const xmlChar xmlSecNsExcC14N[];",
-      "conditions": [
-        "#ifndef XMLSEC_STRINGS_H"
-      ],
-      "classification": "binary-c-surface"
-    },
-    {
-      "kind": "export-variable",
-      "name": "xmlSecNsExcC14NWithComments",
-      "source": "include/xmlsec/strings.h",
-      "detail": "XMLSEC_EXPORT_VAR const xmlChar xmlSecNsExcC14NWithComments[];",
       "conditions": [
         "#ifndef XMLSEC_STRINGS_H"
       ],
@@ -38080,6 +38099,16 @@
       "name": "XMLSEC_ERRORS_R_MAX_KEYINFOREFERENCE_LEVEL",
       "source": "include/xmlsec/errors.h",
       "detail": "#define XMLSEC_ERRORS_R_MAX_KEYINFOREFERENCE_LEVEL 53",
+      "conditions": [
+        "#ifndef XMLSEC_ERRORS_H"
+      ],
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "macro",
+      "name": "XMLSEC_ERRORS_R_MAX_KEYINFO_CHILDREN",
+      "source": "include/xmlsec/errors.h",
+      "detail": "#define XMLSEC_ERRORS_R_MAX_KEYINFO_CHILDREN 54",
       "conditions": [
         "#ifndef XMLSEC_ERRORS_H"
       ],
@@ -55904,7 +55933,7 @@
       "kind": "struct-layout",
       "name": "_xmlSecKeyInfoCtx",
       "source": "include/xmlsec/keyinfo.h",
-      "detail": "struct _xmlSecKeyInfoCtx { void* userData; unsigned int flags; unsigned int flags2; xmlSecKeysMngrPtr keysMngr; xmlSecKeyInfoMode mode; xmlSecPtrList enabledKeyData; int base64LineSize; xmlSecTransformCtx retrievalMethodCtx; int maxRetrievalMethodLevel; xmlSecTransformCtx keyInfoReferenceCtx; int maxKeyInfoReferenceLevel; #ifndef XMLSEC_NO_XMLENC xmlSecEncCtxPtr encCtx; int maxEncryptedKeyLevel; #endif #ifndef XMLSEC_NO_X509 time_t certsVerificationTime; int certsVerificationDepth; #endif void* deprecated0; int curRetrievalMethodLevel; int curKeyInfoReferenceLevel; #ifndef XMLSEC_NO_XMLENC int curEncryptedKeyLevel; #endif xmlSecTransformOperation operation; xmlSecKeyReq keyReq; void* reserved0; void* reserved1; };",
+      "detail": "struct _xmlSecKeyInfoCtx { void* userData; unsigned int flags; unsigned int flags2; xmlSecKeysMngrPtr keysMngr; xmlSecKeyInfoMode mode; xmlSecPtrList enabledKeyData; int base64LineSize; xmlSecSize maxKeyInfoChildren; xmlSecTransformCtx retrievalMethodCtx; int maxRetrievalMethodLevel; xmlSecTransformCtx keyInfoReferenceCtx; int maxKeyInfoReferenceLevel; #ifndef XMLSEC_NO_XMLENC xmlSecEncCtxPtr encCtx; int maxEncryptedKeyLevel; #endif #ifndef XMLSEC_NO_X509 time_t certsVerificationTime; int certsVerificationDepth; #endif void* deprecated0; int curRetrievalMethodLevel; int curKeyInfoReferenceLevel; #ifndef XMLSEC_NO_XMLENC int curEncryptedKeyLevel; #endif xmlSecTransformOperation operation; xmlSecKeyReq keyReq; void* reserved0; void* reserved1; };",
       "conditions": [
         "#ifndef XMLSEC_KEYINFO_H"
       ],
@@ -56034,7 +56063,7 @@
       "kind": "struct-layout",
       "name": "_xmlSecTransformCtx",
       "source": "include/xmlsec/transforms.h",
-      "detail": "struct _xmlSecTransformCtx { void* userData; unsigned int flags; unsigned int maxDepth; xmlSecSize binaryChunkSize; xmlSecTransformUriType enabledUris; xmlSecPtrList enabledTransforms; xmlSecTransformCtxPreExecuteCallback preExecCallback; xmlSecKeyInfoCtxPtr parentKeyInfoCtx; xmlSecBufferPtr result; xmlSecTransformStatus status; xmlChar* uri; xmlChar* xptrExpr; xmlSecTransformPtr first; xmlSecTransformPtr last; xmlSecPtrListPtr extraKeyData; void* reserved0; };",
+      "detail": "struct _xmlSecTransformCtx { void* userData; unsigned int flags; unsigned int maxDepth; xmlSecSize binaryChunkSize; xmlSecSize xpathOpsLimit; xmlSecTransformUriType enabledUris; xmlSecPtrList enabledTransforms; xmlSecTransformCtxPreExecuteCallback preExecCallback; xmlSecKeyInfoCtxPtr parentKeyInfoCtx; xmlSecBufferPtr result; xmlSecTransformStatus status; xmlChar* uri; xmlChar* xptrExpr; xmlSecTransformPtr first; xmlSecTransformPtr last; xmlSecPtrListPtr extraKeyData; void* reserved0; };",
       "conditions": [
         "#ifndef XMLSEC_TRANSFORMS_H"
       ],
