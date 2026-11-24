@@ -7023,13 +7023,16 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "FAILED/not-reached",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
-        "passed": false,
+        "class": "agreement",
+        "passed": true,
         "dss_passed": true,
-        "indication": false
+        "indication": true,
+        "valid_until": [
+          4481395199
+        ]
       },
       "instant/extended": {
         "observed": [
@@ -7040,13 +7043,16 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "FAILED/not-reached",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
-        "passed": false,
+        "class": "agreement",
+        "passed": true,
         "dss_passed": true,
-        "indication": false
+        "indication": true,
+        "valid_until": [
+          4481395199
+        ]
       },
       "instant/conformant": {
         "observed": [
@@ -7057,13 +7063,16 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "FAILED/not-reached",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
-        "passed": false,
+        "class": "agreement",
+        "passed": true,
         "dss_passed": true,
-        "indication": false
+        "indication": true,
+        "valid_until": [
+          4481395199
+        ]
       }
     },
     "dss-xades/src/test/resources/validation/dss3732/xades-enveloped-arcTst132.xml": {
@@ -7076,13 +7085,16 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE/not-reached",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
-        "passed": false,
+        "class": "agreement",
+        "passed": true,
         "dss_passed": true,
-        "indication": false
+        "indication": true,
+        "valid_until": [
+          4481395199
+        ]
       },
       "instant/extended": {
         "observed": [
@@ -7093,13 +7105,16 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE/not-reached",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
-        "passed": false,
+        "class": "agreement",
+        "passed": true,
         "dss_passed": true,
-        "indication": false
+        "indication": true,
+        "valid_until": [
+          4481395199
+        ]
       },
       "instant/conformant": {
         "observed": [
@@ -7110,13 +7125,16 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE/not-reached",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
-        "passed": false,
+        "class": "agreement",
+        "passed": true,
         "dss_passed": true,
-        "indication": false
+        "indication": true,
+        "valid_until": [
+          4481395199
+        ]
       }
     },
     "dss-xades/src/test/resources/validation/dss3732/xades-enveloping-arcTst132-add-object.xml": {
@@ -11809,7 +11827,7 @@
             "XCV": "INDETERMINATE/not-reached",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE/not-reached",
-            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
           }
         ],
         "class": "unreviewed",
@@ -11826,7 +11844,7 @@
             "XCV": "INDETERMINATE/not-reached",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE/not-reached",
-            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
           }
         ],
         "class": "unreviewed",
@@ -11843,7 +11861,7 @@
             "XCV": "INDETERMINATE/not-reached",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE/not-reached",
-            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
           }
         ],
         "class": "unreviewed",

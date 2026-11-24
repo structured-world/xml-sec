@@ -476,13 +476,13 @@ fn check<'a, W: structured_asn1::memory::Work>(
     session: &VerifiedSession<'_, '_, '_, W>,
     chain: &[&'a Certificate<'a>],
     anchor: &'a Certificate<'a>,
-    at: Instant,
+    interval: Interval,
     memory: &Memory,
 ) -> Option<CheckedPath<'a>> {
-    checked(session, chain, anchor, at, memory).ok()
+    checked_over(session, chain, anchor, interval, memory).ok()
 }
 
-/// [`check`], with the reason a chain was not accepted.
+/// [`check`] at one instant, with the reason a chain was not accepted.
 fn checked<'a, W: structured_asn1::memory::Work>(
     session: &VerifiedSession<'_, '_, '_, W>,
     chain: &[&'a Certificate<'a>],
@@ -490,10 +490,21 @@ fn checked<'a, W: structured_asn1::memory::Work>(
     at: Instant,
     memory: &Memory,
 ) -> Result<CheckedPath<'a>, String> {
+    checked_over(session, chain, anchor, Interval::at_instant(at), memory)
+}
+
+/// `chain` checked over all of `interval`, with the reason it was not.
+fn checked_over<'a, W: structured_asn1::memory::Work>(
+    session: &VerifiedSession<'_, '_, '_, W>,
+    chain: &[&'a Certificate<'a>],
+    anchor: &'a Certificate<'a>,
+    interval: Interval,
+    memory: &Memory,
+) -> Result<CheckedPath<'a>, String> {
     let verifier = session.certificate_path_verifier(chain, anchor);
     let context = ValidationContext {
         execution: memory,
-        interval: Interval::at_instant(at),
+        interval,
         policy: Policy::default(),
         bounds: session.certificate_path_bounds(),
         verifier: &verifier,
@@ -658,12 +669,12 @@ fn authority_paths<'a, W: structured_asn1::memory::Work>(
     chain: &[&'a Certificate<'a>],
     anchor: &'a Certificate<'a>,
     parsed: &'a Parsed<'a>,
-    at: Instant,
     memory: &Memory,
 ) -> Vec<CheckedPath<'a>> {
-    // Each authority path is checked where all its members are valid, as
-    // close to `at` as they allow: a responder certificate usually lives far
-    // shorter than the chain it answers for.
+    // Each authority path is checked over the whole time all its members are
+    // valid: a status binds to it at its own issuance (EN 319 102-1 V1.4.1
+    // §5.2.6.4 step 4 checks that the issuance date lies within the issuer's
+    // validity, not the validation time), which may be long before it.
     let checked_within = |path: &[&'a Certificate<'a>]| {
         let (from, until) = path
             .iter()
@@ -672,7 +683,15 @@ fn authority_paths<'a, W: structured_asn1::memory::Work>(
                 (from.max(start), until.min(end))
             });
         (from <= until)
-            .then(|| check(session, path, anchor, at.max(from).min(until), memory))
+            .then(|| {
+                check(
+                    session,
+                    path,
+                    anchor,
+                    Interval::between_instants(from, until),
+                    memory,
+                )
+            })
             .flatten()
     };
     let mut found = Vec::new();
@@ -846,7 +865,7 @@ fn path_facts<'a, W: structured_asn1::memory::Work>(
             let (from, until) = validity(member);
             from <= now && now <= until
         });
-        let authorities = authority_paths(session, &chain, anchor, parsed, chain_time, memory);
+        let authorities = authority_paths(session, &chain, anchor, parsed, memory);
         let members = member_facts(
             session,
             &checked,
