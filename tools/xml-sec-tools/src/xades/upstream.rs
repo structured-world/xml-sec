@@ -21,6 +21,7 @@ use super::{Build, Corpus, absolute, line, write_json, xml};
 use serde_json::{Map, Value, json};
 use std::path::{Path, PathBuf};
 
+mod dss_policy;
 #[cfg(test)]
 mod tests;
 
@@ -142,11 +143,26 @@ fn worst(indications: &[String]) -> String {
     "none".into()
 }
 
-/// One signature of a DSS report: its token, the `Id` of its `ds:Signature`
-/// and the indication of each compared block.
-pub(crate) fn dss_signatures(diagnostic: &str, detailed: &str) -> Result<Vec<Value>, String> {
+/// One signature of a DSS report: its token, the `Id` of its `ds:Signature`,
+/// the indication of each compared block and the overall indication and
+/// sub-indication of the simple report.
+pub(crate) fn dss_signatures(
+    diagnostic: &str,
+    detailed: &str,
+    simple: &str,
+) -> Result<Vec<Value>, String> {
     let diagnostic = xml::parse(diagnostic, "diagnostic report")?;
     let detailed = xml::parse(detailed, "detailed report")?;
+    let simple = xml::parse(simple, "simple report")?;
+    let overall = |token: &str| {
+        let signature = xml::elements(simple.root_element()).find(|node| {
+            node.tag_name().name() == "Signature" && node.attribute("Id") == Some(token)
+        });
+        json!({
+            "indication": signature.and_then(|node| xml::text_at(node, &["Indication"])),
+            "sub": signature.and_then(|node| xml::text_at(node, &["SubIndication"])),
+        })
+    };
     let blocks = |token: &str, kind: &str| {
         xml::below(detailed.root_element(), "BasicBuildingBlocks", None)
             .filter(move |node| {
@@ -185,6 +201,7 @@ pub(crate) fn dss_signatures(diagnostic: &str, detailed: &str) -> Result<Vec<Val
             "token": token,
             "id": xml::text_at(signature, &["DAIdentifier"]),
             "blocks": row,
+            "overall": overall(&token),
         }));
     }
     Ok(found)
@@ -401,25 +418,70 @@ struct Pass<'a> {
     probe: &'a Path,
     classpath: &'a str,
     label: &'a str,
+    /// The DSS validation policy of each profile, by its result label.
+    policies: &'a Path,
+}
+
+/// Writes the DSS validation policy of every profile into `directory`: the
+/// release's default policy with the profile's cryptographic constraints.
+fn write_policies(
+    corpus: &Corpus,
+    probe: &Path,
+    release: &str,
+    directory: &Path,
+) -> Result<(), String> {
+    let jar = super::dss::tools(corpus)
+        .join("repository/eu/europa/ec/joinup/sd-dss/dss-policy-jaxb")
+        .join(release)
+        .join(format!("dss-policy-jaxb-{release}.jar"));
+    std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    let template = corpus.require(
+        &line(&[&"unzip", &"-p", &jar, &"policy/constraint.xml"]),
+        &directory.join("template"),
+    )?;
+    let template = String::from_utf8(template.stdout).map_err(|error| error.to_string())?;
+    for (label, profile) in PROFILES {
+        let probe_run = corpus.require(
+            &line(&[&probe, &"constraints", &profile]),
+            &directory.join(format!("{label}-constraints")),
+        )?;
+        let constraints: Value =
+            serde_json::from_slice(&probe_run.stdout).map_err(|error| error.to_string())?;
+        super::write(
+            &directory.join(format!("{label}.xml")),
+            dss_policy::policy(&template, &constraints)?,
+        )?;
+    }
+    Ok(())
 }
 
 impl Pass<'_> {
     /// Validates every `(name, input, directory, at)`: the probe's facts and
-    /// DSS's reports (or its refusal) land in the case's directory for this pass.
+    /// DSS's reports (or its refusal) under each profile land in the case's
+    /// directory for this pass.
     fn run(&self, cases: &[(String, PathBuf, PathBuf, i64)], logs: &Path) -> Result<(), String> {
         use std::fmt::Write as _;
         let mut manifest = String::new();
         for (name, input, directory, at) in cases {
             let output = directory.join(self.label);
             std::fs::create_dir_all(&output).map_err(|error| error.to_string())?;
-            writeln!(
+            write!(
                 manifest,
-                "{name}\t{}\t{at}\t{}\t{}",
+                "{name}\t{}\t{at}\t{}",
                 input.display(),
                 directory.join("anchors").display(),
-                output.join("dss").display()
             )
             .map_err(|error| error.to_string())?;
+            for (label, _) in PROFILES {
+                write!(
+                    manifest,
+                    "\t{}\t{}",
+                    self.policies.join(format!("{label}.xml")).display(),
+                    output.join(label).join("dss").display()
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            manifest.push('\n');
             for (label, profile) in PROFILES {
                 let directory_of_profile = output.join(label);
                 std::fs::create_dir_all(&directory_of_profile)
@@ -465,7 +527,7 @@ fn pass_rows(
     label: &str,
     stamped: bool,
 ) -> Result<(Vec<Value>, bool, Value), String> {
-    let dss = directory.join("dss");
+    let dss = directory.join(label).join("dss");
     let facts: Value = serde_json::from_str(&xml::read(&directory.join(label).join("facts.json"))?)
         .map_err(|error| error.to_string())?;
     let ours = facts["signatures"].as_array().cloned().unwrap_or_default();
@@ -480,6 +542,7 @@ fn pass_rows(
     let signatures = dss_signatures(
         &xml::read(&dss.join("diagnostic.xml"))?,
         &xml::read(&dss.join("detailed.xml"))?,
+        &xml::read(&dss.join("simple.xml"))?,
     )?;
     Ok((compare(&signatures, &ours, stamped), false, facts))
 }
@@ -584,12 +647,15 @@ fn execute(corpus: &Corpus, results: &Path, record: bool) -> Result<(), String> 
         &results.join("corpus-probe-build"),
     )?;
     let classpath = super::dss::classpath(corpus)?;
+    let policies = results.join("policies");
+    write_policies(corpus, &probe, &release.dss, &policies)?;
     let (cases, conditions) = conditions_of(corpus, &probe, &checkout, results)?;
     let pass = |label| Pass {
         corpus,
         probe: &probe,
         classpath: &classpath,
         label,
+        policies: &policies,
     };
     pass("instant").run(&cases, results)?;
     let mut later = Vec::new();

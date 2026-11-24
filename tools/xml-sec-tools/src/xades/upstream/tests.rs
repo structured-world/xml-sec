@@ -33,6 +33,13 @@ const DETAILED: &str = r#"<DetailedReport xmlns="http://dss.esig.europa.eu/valid
   </BasicBuildingBlocks>
 </DetailedReport>"#;
 
+const SIMPLE: &str = r#"<SimpleReport xmlns="http://dss.esig.europa.eu/validation/simple-report">
+  <Signature Id="S-1">
+    <Indication>INDETERMINATE</Indication>
+    <SubIndication>TRY_LATER</SubIndication>
+  </Signature>
+</SimpleReport>"#;
+
 /// Facts of a signature that verified with a validated path and met B-B and B-T.
 fn verified() -> Value {
     json!({
@@ -46,16 +53,19 @@ fn verified() -> Value {
 #[test]
 fn a_signature_keeps_only_the_timestamps_that_cover_it() {
     // T-2 covers another signature; its FAILED block must not reach S-1.
-    let signatures = dss_signatures(DIAGNOSTIC, DETAILED).unwrap();
+    let signatures = dss_signatures(DIAGNOSTIC, DETAILED, SIMPLE).unwrap();
     assert_eq!(signatures.len(), 1);
     assert_eq!(signatures[0]["id"], "sig");
     assert_eq!(signatures[0]["blocks"]["XCV"], "INDETERMINATE");
     assert_eq!(signatures[0]["blocks"]["TIMESTAMPS"], "PASSED");
+    // The overall verdict is the simple report's, found by the same token.
+    assert_eq!(signatures[0]["overall"]["indication"], "INDETERMINATE");
+    assert_eq!(signatures[0]["overall"]["sub"], "TRY_LATER");
 }
 
 #[test]
 fn each_block_compares_with_its_own_fact() {
-    let signatures = dss_signatures(DIAGNOSTIC, DETAILED).unwrap();
+    let signatures = dss_signatures(DIAGNOSTIC, DETAILED, SIMPLE).unwrap();
     let rows = compare(&signatures, &[verified()], true);
     let blocks = &rows[0]["blocks"];
     for name in ["FC", "ISC", "CV", "SAV", "TIMESTAMPS"] {
@@ -99,7 +109,7 @@ fn a_tampered_signature_fails_cryptographic_verification_only() {
 
 #[test]
 fn an_unmatched_or_missing_signature_never_counts_as_agreement() {
-    let signatures = dss_signatures(DIAGNOSTIC, DETAILED).unwrap();
+    let signatures = dss_signatures(DIAGNOSTIC, DETAILED, SIMPLE).unwrap();
     let mut other = verified();
     other["id"] = json!("elsewhere");
     let rows = compare(&signatures, &[other], true);
@@ -114,7 +124,7 @@ fn an_unmatched_or_missing_signature_never_counts_as_agreement() {
 
 #[test]
 fn every_block_is_compared() {
-    let signatures = dss_signatures(DIAGNOSTIC, DETAILED).unwrap();
+    let signatures = dss_signatures(DIAGNOSTIC, DETAILED, SIMPLE).unwrap();
     let rows = compare(&signatures, &[verified()], true);
     for name in BLOCKS {
         assert!(rows[0]["blocks"][name].is_object(), "{name}");
@@ -153,6 +163,70 @@ fn the_report_counts_each_profile_of_each_pass() {
         "{text}"
     );
     assert!(!text.contains("signing-time"), "{text}");
+}
+
+#[test]
+fn the_dss_policy_takes_the_profiles_cryptography_and_keeps_the_rest() {
+    // DSS must decide under the profile's algorithm and key-size rules, not
+    // its own dated catalogue: the signature's constraints carry exactly the
+    // profile's suites, certificates keep every SHA family at the same key
+    // sizes, and the non-cryptographic constraints stay DSS's.
+    let template = r#"<ConstraintsParameters xmlns="http://dss.esig.europa.eu/validation/policy">
+  <SignatureConstraints><BasicSignatureConstraints>
+    <SigningCertificate><NotExpired Level="FAIL" /><Cryptographic /></SigningCertificate>
+    <Cryptographic />
+  </BasicSignatureConstraints></SignatureConstraints>
+  <Timestamp><BasicSignatureConstraints><Cryptographic /></BasicSignatureConstraints></Timestamp>
+  <Cryptographic Level="FAIL"><AcceptableDigestAlgo><Algo>MD5</Algo></AcceptableDigestAlgo></Cryptographic>
+</ConstraintsParameters>"#;
+    let constraints = json!({
+        "signature": { "families": ["ECDSA", "RSA"], "hashes": ["SHA256"] },
+        "minimum_bits": { "RSA": 2048, "ECDSA": 256 },
+    });
+    let policy = super::dss_policy::policy(template, &constraints).unwrap();
+    assert!(!policy.contains("MD5"), "{policy}");
+    assert!(
+        policy.contains(r#"<NotExpired Level="FAIL" />"#),
+        "{policy}"
+    );
+    let document = crate::xades::xml::parse(&policy, "policy").unwrap();
+    let digests = |element: crate::xades::xml::Node<'_, '_>| -> Vec<String> {
+        crate::xades::xml::below(element, "AcceptableDigestAlgo", None)
+            .flat_map(crate::xades::xml::elements)
+            .map(|algo| algo.text().unwrap_or_default().to_owned())
+            .collect()
+    };
+    let cryptographic: Vec<_> =
+        crate::xades::xml::below(document.root_element(), "Cryptographic", None).collect();
+    assert_eq!(cryptographic.len(), 4);
+    for element in cryptographic {
+        let parent = element.parent().unwrap().tag_name().name().to_owned();
+        let grand = element
+            .parent()
+            .and_then(crate::xades::xml::Node::parent)
+            .unwrap()
+            .tag_name()
+            .name()
+            .to_owned();
+        let certificate = parent == "SigningCertificate" || grand == "Timestamp";
+        let expected: Vec<String> = if certificate {
+            [
+                "SHA1", "SHA224", "SHA256", "SHA384", "SHA512", "SHA3-256", "SHA3-384", "SHA3-512",
+            ]
+            .map(str::to_owned)
+            .to_vec()
+        } else {
+            vec!["SHA256".to_owned()]
+        };
+        assert_eq!(digests(element), expected, "{parent}/{grand}");
+        // XMLDSig ECDSA values are r || s: DSS calls them PLAIN-ECDSA.
+        assert!(
+            crate::xades::xml::below(element, "MiniPublicKeySize", None)
+                .flat_map(crate::xades::xml::elements)
+                .any(|algo| algo.text() == Some("PLAIN-ECDSA")
+                    && algo.attribute("Size") == Some("256"))
+        );
+    }
 }
 
 #[test]

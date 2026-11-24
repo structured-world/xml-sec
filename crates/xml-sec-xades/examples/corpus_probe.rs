@@ -24,9 +24,10 @@ mod tokens;
 use std::path::Path;
 use std::sync::Arc;
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use structured_asn1::Parser;
 use structured_asn1::memory::{Memory, MemoryAccount};
+use structured_ltv::validation::{Family, Hash};
 use structured_pkix::Certificate;
 use structured_pkix::temporal::LeapTable;
 use xml_sec::XmlDocument;
@@ -35,8 +36,8 @@ use xml_sec::policy::{
 };
 use xml_sec::provider::RustCryptoProvider;
 use xml_sec::xmldsig::{
-    DefaultKeyResolver, KeyResolverConfig, SignatureEvidence, VerificationRequest, VerifyContext,
-    with_verified_request,
+    DefaultKeyResolver, DigestAlgorithm, KeyResolverConfig, SignatureAlgorithm, SignatureEvidence,
+    VerificationRequest, VerifyContext, with_verified_request,
 };
 use xml_sec_xades::{Inputs, Level, Outcome, Requirements, validate, validate_basic};
 
@@ -393,9 +394,167 @@ fn facts(xml: &str, anchors: &Path, at: i64, profile: PolicyProfile) -> Result<V
     Ok(facts)
 }
 
+/// The hash a digest method computes, as cryptographic constraints name it.
+fn hash_of(digest: DigestAlgorithm) -> Option<Hash> {
+    Some(match digest {
+        DigestAlgorithm::Sha1 => Hash::Sha1,
+        DigestAlgorithm::Sha224 => Hash::Sha224,
+        DigestAlgorithm::Sha256 => Hash::Sha256,
+        DigestAlgorithm::Sha384 => Hash::Sha384,
+        DigestAlgorithm::Sha512 => Hash::Sha512,
+        DigestAlgorithm::Sha3_256 => Hash::Sha3_256,
+        DigestAlgorithm::Sha3_384 => Hash::Sha3_384,
+        DigestAlgorithm::Sha3_512 => Hash::Sha3_512,
+        // SHA3-224 has no TS 119 312 entry nor DSS name.
+        DigestAlgorithm::Sha3_224 => return None,
+    })
+}
+
+/// The family and message hash of a fixed asymmetric signature method.
+/// Parameterized RSA-PSS, HMAC, the prehashed and context `EdDSA` variants
+/// and post-quantum methods have no entry in either constraint vocabulary.
+fn suite_of(algorithm: SignatureAlgorithm) -> Option<(Family, Option<Hash>)> {
+    use SignatureAlgorithm as S;
+    let (family, digest) = match algorithm {
+        S::Ed25519 => return Some((Family::Ed25519, None)),
+        S::Ed448 => return Some((Family::Ed448, None)),
+        S::DsaSha1 => (Family::Dsa, DigestAlgorithm::Sha1),
+        S::DsaSha256 => (Family::Dsa, DigestAlgorithm::Sha256),
+        S::RsaSha1 => (Family::RsaPkcs1, DigestAlgorithm::Sha1),
+        S::RsaSha224 => (Family::RsaPkcs1, DigestAlgorithm::Sha224),
+        S::RsaSha256 => (Family::RsaPkcs1, DigestAlgorithm::Sha256),
+        S::RsaSha384 => (Family::RsaPkcs1, DigestAlgorithm::Sha384),
+        S::RsaSha512 => (Family::RsaPkcs1, DigestAlgorithm::Sha512),
+        S::RsaPssSha1 => (Family::RsaPss, DigestAlgorithm::Sha1),
+        S::RsaPssSha224 => (Family::RsaPss, DigestAlgorithm::Sha224),
+        S::RsaPssSha256 => (Family::RsaPss, DigestAlgorithm::Sha256),
+        S::RsaPssSha384 => (Family::RsaPss, DigestAlgorithm::Sha384),
+        S::RsaPssSha512 => (Family::RsaPss, DigestAlgorithm::Sha512),
+        S::RsaPssSha3_256 => (Family::RsaPss, DigestAlgorithm::Sha3_256),
+        S::RsaPssSha3_384 => (Family::RsaPss, DigestAlgorithm::Sha3_384),
+        S::RsaPssSha3_512 => (Family::RsaPss, DigestAlgorithm::Sha3_512),
+        S::EcdsaSha1 => (Family::Ecdsa, DigestAlgorithm::Sha1),
+        S::EcdsaSha224 => (Family::Ecdsa, DigestAlgorithm::Sha224),
+        S::EcdsaSha256 => (Family::Ecdsa, DigestAlgorithm::Sha256),
+        S::EcdsaSha384 => (Family::Ecdsa, DigestAlgorithm::Sha384),
+        S::EcdsaSha512 => (Family::Ecdsa, DigestAlgorithm::Sha512),
+        S::EcdsaSha3_256 => (Family::Ecdsa, DigestAlgorithm::Sha3_256),
+        S::EcdsaSha3_384 => (Family::Ecdsa, DigestAlgorithm::Sha3_384),
+        S::EcdsaSha3_512 => (Family::Ecdsa, DigestAlgorithm::Sha3_512),
+        _ => return None,
+    };
+    Some((family, Some(hash_of(digest)?)))
+}
+
+/// What a compiled profile accepts, in the vocabulary both comparisons
+/// share: the `SignatureValue` suites, the `Reference` digests and the
+/// smallest key of each family, signer and issuer keys alike.
+struct Catalogue {
+    suites: Vec<(Family, Option<Hash>)>,
+    digests: Vec<Hash>,
+    minimum_bits: Vec<(Family, u32)>,
+}
+
+fn catalogue(policy: &VerificationPolicy) -> Result<Catalogue, Failure> {
+    let mut suites: Vec<_> = SignatureAlgorithm::ALL
+        .into_iter()
+        .filter(|algorithm| policy.check_signature_algorithm(*algorithm).is_ok())
+        .filter_map(suite_of)
+        .collect();
+    suites.dedup();
+    let digests = DigestAlgorithm::ALL
+        .into_iter()
+        .filter(|digest| policy.check_digest_algorithm(*digest).is_ok())
+        .filter_map(hash_of)
+        .collect();
+    let rsa = u32::try_from(policy.key_trust.rsa_keys.minimum_modulus_bits)?;
+    let dsa = u32::try_from(policy.key_trust.dsa_keys.minimum_modulus_bits)?;
+    Ok(Catalogue {
+        suites,
+        digests,
+        // The provider implements P-256 and larger curves only, and the fixed
+        // EdDSA variants have no size dimension.
+        minimum_bits: vec![
+            (Family::RsaPkcs1, rsa),
+            (Family::RsaPss, rsa),
+            (Family::Dsa, dsa),
+            (Family::Ecdsa, 256),
+            (Family::Ed25519, 0),
+            (Family::Ed448, 0),
+        ],
+    })
+}
+
+/// DSS's name of a signature family (`EncryptionAlgorithm`).
+fn dss_family(family: Family) -> &'static str {
+    match family {
+        Family::RsaPkcs1 => "RSA",
+        Family::RsaPss => "RSASSA-PSS",
+        Family::Dsa => "DSA",
+        Family::Ecdsa => "ECDSA",
+        Family::Ed25519 | Family::Ed448 => "EdDSA",
+        Family::Other => "other",
+    }
+}
+
+/// DSS's name of a hash function (`DigestAlgorithm`).
+fn dss_hash(hash: Hash) -> &'static str {
+    match hash {
+        Hash::Md5 => "MD5",
+        Hash::Sha1 => "SHA1",
+        Hash::Sha224 => "SHA224",
+        Hash::Sha256 => "SHA256",
+        Hash::Sha384 => "SHA384",
+        Hash::Sha512 => "SHA512",
+        Hash::Sha3_256 => "SHA3-256",
+        Hash::Sha3_384 => "SHA3-384",
+        Hash::Sha3_512 => "SHA3-512",
+        Hash::Ripemd160 => "RIPEMD160",
+        Hash::Whirlpool => "WHIRLPOOL",
+        Hash::Other => "other",
+    }
+}
+
+/// The profile's constraints in DSS's policy vocabulary, for the harness to
+/// write the DSS validation policy both comparisons run under.
+fn constraints(profile: PolicyProfile) -> Result<Value, Failure> {
+    let catalogue = catalogue(&profile_policy(profile, INSTANT_ANY)?)?;
+    let mut families: Vec<&str> = catalogue
+        .suites
+        .iter()
+        .map(|(family, _)| dss_family(*family))
+        .collect();
+    families.sort_unstable();
+    families.dedup();
+    let mut hashes: Vec<&str> = catalogue
+        .suites
+        .iter()
+        .filter_map(|(_, hash)| *hash)
+        .chain(catalogue.digests.iter().copied())
+        .map(dss_hash)
+        .collect();
+    hashes.sort_unstable();
+    hashes.dedup();
+    let minimum: Map<String, Value> = catalogue
+        .minimum_bits
+        .iter()
+        .filter(|(family, _)| families.contains(&dss_family(*family)))
+        .map(|(family, bits)| (dss_family(*family).to_owned(), json!(bits)))
+        .collect();
+    Ok(json!({
+        "signature": { "families": families, "hashes": hashes },
+        "minimum_bits": minimum,
+    }))
+}
+
+/// Any time inside the compiled policies' range: the constraints a profile
+/// accepts do not depend on it.
+const INSTANT_ANY: i64 = 1_800_000_000;
+
 fn main() -> Result<(), Failure> {
     let args: Vec<String> = std::env::args().collect();
     let result = match &args[1..] {
+        [mode, profile] if mode == "constraints" => constraints(named_profile(profile)?)?,
         [mode, xml, anchors] if mode == "conditions" => conditions(xml, Path::new(anchors))?,
         [mode, xml, anchors, at, profile] if mode == "facts" => facts(
             xml,
@@ -404,7 +563,7 @@ fn main() -> Result<(), Failure> {
             named_profile(profile)?,
         )?,
         _ => {
-            return Err("usage: corpus_probe conditions XML ANCHORS_DIR | facts XML ANCHORS_DIR UNIX_TIME xades|xades-extended|xades-conformant".into());
+            return Err("usage: corpus_probe constraints PROFILE | conditions XML ANCHORS_DIR | facts XML ANCHORS_DIR UNIX_TIME PROFILE, PROFILE xades|xades-extended|xades-conformant".into());
         }
     };
     println!("{result}");
