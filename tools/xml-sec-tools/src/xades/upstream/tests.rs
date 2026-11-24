@@ -99,6 +99,28 @@ fn a_policy_refusal_lands_on_the_block_it_concerns() {
 }
 
 #[test]
+fn agreement_is_the_overall_indication_and_sub_indication() {
+    // The verdict compared is DSS's simple report against the ETSI process
+    // over xml-sec's facts; the blocks only diagnose a difference, so an
+    // XCV difference alone does not deny agreement, and the same indication
+    // with another sub-indication is not agreement.
+    let signatures = dss_signatures(DIAGNOSTIC, DETAILED, SIMPLE).unwrap();
+    let mut facts = verified();
+    facts["etsi"] = json!({ "indication": "INDETERMINATE", "sub": "TRY_LATER" });
+    let rows = compare(&signatures, &[facts.clone()], true);
+    assert_eq!(rows[0]["blocks"]["XCV"]["agrees"], false);
+    assert_eq!(automatic_class(&rows, false, 1), "agreement");
+    assert_eq!(
+        observed(&rows)[0]["OVERALL"],
+        "INDETERMINATE:TRY_LATER/INDETERMINATE:TRY_LATER"
+    );
+    facts["etsi"]["sub"] = json!("CERTIFICATE_CHAIN_GENERAL_FAILURE");
+    let rows = compare(&signatures, &[facts], true);
+    assert_eq!(rows[0]["overall"]["indication"], true);
+    assert_eq!(automatic_class(&rows, false, 1), "unreviewed");
+}
+
+#[test]
 fn a_tampered_signature_fails_cryptographic_verification_only() {
     let mut facts = verified();
     facts["verification"]["references"] = json!(["Invalid", "Valid"]);
@@ -135,7 +157,7 @@ fn every_block_is_compared() {
 fn the_report_counts_each_profile_of_each_pass() {
     // The published table is what a reader compares policies by: each
     // profile counts its own inputs, and a pass no input took is left out.
-    let entry = |class: &str, intact: bool, trusted: bool| json!({ "class": class, "intact": intact, "trusted": trusted, "dss_intact": true });
+    let entry = |class: &str, passed: bool, indication: bool| json!({ "class": class, "passed": passed, "indication": indication, "dss_passed": true });
     let expectations = json!({
         "dss": "6.5.1",
         "instant": 1_800_000_000,

@@ -18,6 +18,8 @@
 //! decision. The policy is the compiled profile, narrowed only to check
 //! X.509 chains at that time.
 
+#[path = "support/etsi.rs"]
+mod etsi;
 #[path = "support/tokens.rs"]
 mod tokens;
 
@@ -37,8 +39,9 @@ use xml_sec::policy::{
 };
 use xml_sec::provider::RustCryptoProvider;
 use xml_sec::xmldsig::{
-    DefaultKeyResolver, DigestAlgorithm, KeyResolverConfig, SignatureAlgorithm, SignatureEvidence,
-    VerificationRequest, VerifyContext, with_verified_request,
+    DefaultKeyResolver, DigestAlgorithm, DsigError, KeyInfo, KeyInfoSource, KeyResolver,
+    KeyResolverConfig, ResolvedVerificationKey, SignatureAlgorithm, SignatureEvidence,
+    VerificationKey, VerificationRequest, VerifyContext, VerifyingKey, with_verified_request,
 };
 use xml_sec_xades::{Inputs, Level, Outcome, Requirements, validate, validate_basic};
 
@@ -89,7 +92,11 @@ fn pool(text: &str) -> Vec<Vec<u8>> {
 /// the `xs:dateTime` form `YYYY-MM-DDThh:mm:ss[.fraction][Z|(+|-)hh:mm]`.
 fn signing_time(text: &str) -> Option<i64> {
     let start = text.find("SigningTime>")? + "SigningTime>".len();
-    let value = text[start..].split('<').next()?.trim();
+    date_time(text[start..].split('<').next()?.trim())
+}
+
+/// An `xs:dateTime` value as Unix seconds.
+fn date_time(value: &str) -> Option<i64> {
     let number = |range: std::ops::Range<usize>| value.get(range)?.parse::<i64>().ok();
     let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
     let (hour, minute, second) = (number(11..13)?, number(14..16)?, number(17..19)?);
@@ -134,6 +141,160 @@ fn conditions(xml: &str, anchors: &Path) -> Result<Value, Failure> {
         "signing_time": signing_time(&text),
         "timestamps": text.contains("EncapsulatedTimeStamp"),
     }))
+}
+
+const DS: &str = "http://www.w3.org/2000/09/xmldsig#";
+
+/// What each `ds:Signature` declares, in document order: the elements that
+/// belong to it and to no signature nested inside it.
+fn declarations(text: &str) -> Vec<etsi::Declared> {
+    let Ok(document) = roxmltree::Document::parse_with_options(
+        text,
+        roxmltree::ParsingOptions {
+            allow_dtd: true,
+            ..roxmltree::ParsingOptions::default()
+        },
+    ) else {
+        return Vec::new();
+    };
+    let is = |node: &roxmltree::Node<'_, '_>, name: &str| {
+        node.is_element() && node.tag_name().name() == name
+    };
+    let is_signature = |node: &roxmltree::Node<'_, '_>| {
+        is(node, "Signature") && node.tag_name().namespace() == Some(DS)
+    };
+    let base64 = |node: roxmltree::Node<'_, '_>| -> Option<Vec<u8>> {
+        let compact: String = node
+            .text()
+            .unwrap_or_default()
+            .chars()
+            .filter(|character| !character.is_ascii_whitespace())
+            .collect();
+        structured_base64::STANDARD.decode(compact.as_bytes()).ok()
+    };
+    let mut found = Vec::new();
+    for signature in document.descendants().filter(is_signature) {
+        let own: Vec<_> = signature
+            .descendants()
+            .skip(1)
+            .filter(|node| node.ancestors().skip(1).find(is_signature) == Some(signature))
+            .collect();
+        let mut declared = etsi::Declared::default();
+        for node in &own {
+            if is(node, "SignatureMethod") {
+                declared.method = node
+                    .attribute("Algorithm")
+                    .and_then(SignatureAlgorithm::from_uri);
+            } else if is(node, "DigestMethod")
+                && node
+                    .parent()
+                    .is_some_and(|reference| is(&reference, "Reference"))
+                && node
+                    .parent()
+                    .and_then(|reference| reference.parent())
+                    .is_some_and(|info| is(&info, "SignedInfo"))
+            {
+                declared.digests.push(
+                    node.attribute("Algorithm")
+                        .and_then(DigestAlgorithm::from_uri),
+                );
+            } else if is(node, "SigningTime") {
+                declared.signing_time = date_time(node.text().unwrap_or_default().trim());
+            } else if is(node, "CertDigest") {
+                let method = node
+                    .children()
+                    .find(|child| is(child, "DigestMethod"))
+                    .and_then(|method| method.attribute("Algorithm"))
+                    .and_then(DigestAlgorithm::from_uri);
+                if let Some(value) = node
+                    .children()
+                    .find(|child| is(child, "DigestValue"))
+                    .and_then(base64)
+                {
+                    declared.certificate_references.push((method, value));
+                }
+            } else if is(node, "X509Certificate")
+                && node.ancestors().any(|ancestor| is(&ancestor, "KeyInfo"))
+            {
+                declared.key_info.extend(base64(*node));
+            }
+        }
+        found.push(declared);
+    }
+    found
+}
+
+/// The profile's constraints in the ETSI process's vocabulary, owned: none
+/// of them expires, as the profiles have no time dimension.
+struct Rules {
+    hashes: Vec<structured_ltv::validation::HashRule>,
+    schemes: Vec<structured_ltv::validation::SchemeRule>,
+    suites: Vec<(Family, Vec<Hash>)>,
+}
+
+impl Rules {
+    /// `then` over these rules as the ETSI process's requirements.
+    fn lend<R>(&self, then: impl FnOnce(&structured_ltv::validation::Requirements<'_>) -> R) -> R {
+        let suites: Vec<structured_ltv::validation::SuiteRule<'_>> = self
+            .suites
+            .iter()
+            .map(|(family, hashes)| structured_ltv::validation::SuiteRule {
+                family: *family,
+                key_bits: None,
+                hashes,
+            })
+            .collect();
+        then(&structured_ltv::validation::Requirements {
+            crypto: structured_ltv::validation::Constraints {
+                hashes: &self.hashes,
+                schemes: &self.schemes,
+                suites: &suites,
+                rsa_exponent_bits: None,
+            },
+            // DSS's policy fails a signature without a claimed signing time
+            // (`SigningTime Level="FAIL"`); no other element is required.
+            elements: structured_ltv::validation::Elements::NONE
+                .with(structured_ltv::validation::Element::ClaimedSigningTime),
+            timestamp_delay: None,
+        })
+    }
+}
+
+fn rules(catalogue: &Catalogue) -> Rules {
+    let mut hashes: Vec<Hash> = catalogue.digests.clone();
+    hashes.extend(catalogue.suites.iter().filter_map(|(_, hash)| *hash));
+    hashes.dedup();
+    let mut suites: Vec<(Family, Vec<Hash>)> = Vec::new();
+    for (family, hash) in &catalogue.suites {
+        let entry = if let Some(entry) = suites.iter_mut().find(|(known, _)| known == family) {
+            entry
+        } else {
+            suites.push((*family, Vec::new()));
+            suites.last_mut().expect("just pushed")
+        };
+        entry.1.extend(*hash);
+    }
+    Rules {
+        hashes: hashes
+            .into_iter()
+            .map(|hash| structured_ltv::validation::HashRule { hash, until: None })
+            .collect(),
+        // Every family keeps its minimum: certificates are restricted by key
+        // size alone, while the suites below restrict the signature itself.
+        schemes: catalogue
+            .minimum_bits
+            .iter()
+            .map(|(family, bits)| structured_ltv::validation::SchemeRule {
+                family: *family,
+                min_bits: *bits,
+                // DSA's subgroup is sized as TS 119 312 Table D.2 sizes the
+                // discontinued 1024-bit tier.
+                min_subgroup_bits: if *family == Family::Dsa { 160 } else { 0 },
+                until: None,
+            })
+            .collect(),
+        suites,
+    }
 }
 
 /// The variant name of a debug rendering: its first identifier.
@@ -341,39 +502,45 @@ fn facts(xml: &str, anchors: &Path, at: i64, profile: PolicyProfile) -> Result<V
         expected_targets: &expected,
         ..VerificationRequest::default()
     };
-    let (integrity, integrity_refusal) =
-        integrity(&document, &request, &account, profile, at, &carried)?;
+    let rules = rules(&catalogue(&profile_policy(profile, at, true)?)?);
+    let crls = tokens::values(&text, "EncapsulatedCRLValue");
+    let responses = tokens::values(&text, "EncapsulatedOCSPValue");
+    let (integrity, integrity_refusal) = rules.lend(|requirements| {
+        let etsi_inputs = etsi::Inputs {
+            pool: &carried,
+            anchors: &trusted,
+            crls: &crls,
+            responses: &responses,
+            now: at,
+            requirements,
+            utc: &utc,
+        };
+        integrity(
+            &document,
+            &request,
+            &account,
+            at,
+            &declarations(&text),
+            &etsi_inputs,
+        )
+    })?;
     let verified = with_verified_request(&document, &context, &request, &account, |session| {
         let entries = session.evidence().signatures();
         // Ids are reported only when both readings see the same signatures.
         let aligned = ids.len() == entries.len();
         for (index, entry) in entries.iter().enumerate() {
+            let trust = verification(entry);
+            let (own, computed) = integrity.get(index).cloned().unwrap_or_default();
             let mut row = json!({
                 "index": index,
                 "id": if aligned { ids[index].clone() } else { None },
-                "verification": verification(entry),
-                "integrity": integrity.get(index).cloned().unwrap_or(Value::Null),
+                "etsi": etsi::under_profile(computed, &trust),
+                "verification": trust,
+                "integrity": own,
             });
             if entry.result().is_ok() {
-                let identity = entry.identity();
-                row["basic"] = match validate_basic(&session, identity, &caller, |report| {
-                    (
-                        report.inputs().certificate.is_bound(),
-                        report.included().is_some(),
-                        report.all_root_requirements_met(),
-                    )
-                }) {
-                    Ok(Outcome::Assessed((bound, included, met))) => {
-                        json!({ "bound": bound, "included": included, "assessed": met })
-                    }
-                    other => level(other.map(|outcome| outcome.map(|_| false))),
-                };
-                for (name, requirements) in [
-                    ("timestamped", Requirements::Timestamped),
-                    ("long_term", Requirements::LongTerm),
-                    ("archival", Requirements::Archival),
-                ] {
-                    row[name] = level(validate(&session, identity, &inputs(requirements), met));
+                for (name, value) in level_facts(&session, entry.identity(), &caller, &inputs) {
+                    row[name] = value;
                 }
             }
             signatures.push(row);
@@ -389,6 +556,39 @@ fn facts(xml: &str, anchors: &Path, at: i64, profile: PolicyProfile) -> Result<V
         facts["request"] = json!({ "error": kind(&debug), "detail": error.to_string() });
     }
     Ok(facts)
+}
+
+/// The `XAdES` facts of every baseline level of one verified signature.
+fn level_facts<'i, W: structured_asn1::memory::Work>(
+    session: &xml_sec::xmldsig::VerifiedSession<'_, '_, '_, W>,
+    identity: NodeIdentity,
+    caller: &[&[u8]],
+    inputs: &impl Fn(Requirements) -> Inputs<'i>,
+) -> Vec<(&'static str, Value)> {
+    let basic = match validate_basic(session, identity, caller, |report| {
+        (
+            report.inputs().certificate.is_bound(),
+            report.included().is_some(),
+            report.all_root_requirements_met(),
+        )
+    }) {
+        Ok(Outcome::Assessed((bound, included, met))) => {
+            json!({ "bound": bound, "included": included, "assessed": met })
+        }
+        other => level(other.map(|outcome| outcome.map(|_| false))),
+    };
+    let mut found = vec![("basic", basic)];
+    for (name, requirements) in [
+        ("timestamped", Requirements::Timestamped),
+        ("long_term", Requirements::LongTerm),
+        ("archival", Requirements::Archival),
+    ] {
+        found.push((
+            name,
+            level(validate(session, identity, &inputs(requirements), met)),
+        ));
+    }
+    found
 }
 
 /// The nodes the data `Reference`s of `text` name in `document`. A target
@@ -411,30 +611,115 @@ fn expected_targets(document: &XmlDocument, text: &str) -> Vec<NodeIdentity> {
     })
 }
 
-/// Each signature's integrity (EN 319 102-1 5.2.7), established with the
-/// signing certificate's key whatever its path: every certificate the
-/// document carries is trusted directly and no chain is checked, so the
-/// references and value are known even where no path validates at `at`.
-/// The second value is the refusal of the whole request, if any.
+/// The key of each signature's signing certificate, identified as clause
+/// 5.2.3.4 identifies it, handed to verification as the caller's own trusted
+/// key: clause 5.2.7.4 step 3 verifies "using the public key extracted from
+/// the signing certificate", so `KeyInfo` is neither read nor required.
+/// Verification asks once per signature in document order; a `KeyInfo` that
+/// carries one of the identified certificates names its signer directly.
+struct SigningKeys {
+    signers: Vec<Option<Vec<u8>>>,
+    next: std::cell::Cell<usize>,
+}
+
+impl SigningKeys {
+    fn new(declared: &[etsi::Declared], carried: &[Vec<u8>]) -> Self {
+        let parser = Parser::der(account());
+        let pool: Vec<Certificate<'_>> = carried
+            .iter()
+            .filter_map(|bytes| Certificate::read(&parser, bytes, 0).ok())
+            .collect();
+        let signers = declared
+            .iter()
+            .map(|declared| {
+                etsi::signing_certificate(declared, &pool, parser.memory())
+                    .map(|certificate| certificate.as_bytes().to_vec())
+            })
+            .collect();
+        Self {
+            signers,
+            next: std::cell::Cell::new(0),
+        }
+    }
+}
+
+impl KeyResolver for SigningKeys {
+    fn resolve<'a>(
+        &'a self,
+        _key_info: Option<&KeyInfo>,
+        _algorithm: SignatureAlgorithm,
+    ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError> {
+        Ok(None)
+    }
+
+    fn resolve_for_verification<'a>(
+        &'a self,
+        key_info: Option<&KeyInfo>,
+        algorithm: SignatureAlgorithm,
+        _policy: &VerificationPolicy,
+        _provider: &dyn xml_sec::provider::CryptoProvider,
+    ) -> Result<Option<ResolvedVerificationKey<'a>>, DsigError> {
+        let index = self.next.get();
+        self.next.set(index + 1);
+        let named = key_info.and_then(|key_info| {
+            key_info.sources.iter().find_map(|source| match source {
+                KeyInfoSource::X509Data(data) => self
+                    .signers
+                    .iter()
+                    .flatten()
+                    .find(|signer| data.certificates.iter().any(|carried| carried == *signer)),
+                _ => None,
+            })
+        });
+        let Some(certificate) = named.or_else(|| self.signers.get(index).and_then(Option::as_ref))
+        else {
+            return Ok(None);
+        };
+        let parser = Parser::der(account());
+        let Ok(parsed) = Certificate::read(&parser, certificate, 0) else {
+            return Ok(None);
+        };
+        Ok(Some(ResolvedVerificationKey::CallerTrusted(Box::new(
+            VerificationKey {
+                algorithm,
+                public_key_bytes: parsed.tbs().public_key().as_bytes().to_vec(),
+                certificate_der: Some(certificate.clone()),
+                name: None,
+            },
+        ))))
+    }
+}
+
+/// Per signature, its integrity and its ETSI indication; then the refusal of
+/// the whole request, if any.
+type Established = (Vec<(Value, Value)>, Option<Value>);
+
+/// Each signature's integrity (EN 319 102-1 5.2.7) and its ETSI indication
+/// under the compared profile's constraints (`inputs`). Integrity is
+/// established under the widest profile with the signing certificate's key
+/// and no chain checked, so the references and value are known even where
+/// no path validates at `at` or the compared profile refuses the signature.
 fn integrity(
     document: &XmlDocument,
     request: &VerificationRequest<'_>,
     account: &Memory,
-    profile: PolicyProfile,
     at: i64,
-    carried: &[Vec<u8>],
-) -> Result<(Vec<Value>, Option<Value>), Failure> {
-    let direct = DefaultKeyResolver::new(KeyResolverConfig {
-        trusted_certs: carried.to_vec(),
-        ..KeyResolverConfig::default()
-    });
+    declared: &[etsi::Declared],
+    inputs: &etsi::Inputs<'_>,
+) -> Result<Established, Failure> {
+    let direct = SigningKeys::new(declared, inputs.pool);
     let context = VerifyContext::new()
-        .policy(profile_policy(profile, at, false)?)
+        .policy(profile_policy(PolicyProfile::XadesConformant, at, false)?)
         .key_resolver(&direct);
     let mut found = Vec::new();
+    let unknown = etsi::Declared::default();
     let run = with_verified_request(document, &context, request, account, |session| {
-        for entry in session.evidence().signatures() {
-            found.push(verification(entry));
+        for (index, entry) in session.evidence().signatures().iter().enumerate() {
+            let declared = declared.get(index).unwrap_or(&unknown);
+            found.push((
+                verification(entry),
+                etsi::indication(&session, entry.result(), declared, inputs),
+            ));
         }
         Ok(())
     });
@@ -445,20 +730,10 @@ fn integrity(
     Ok((found, refusal))
 }
 
-/// The hash a digest method computes, as cryptographic constraints name it.
+/// The hash a digest method computes, when both constraint vocabularies
+/// name it.
 fn hash_of(digest: DigestAlgorithm) -> Option<Hash> {
-    Some(match digest {
-        DigestAlgorithm::Sha1 => Hash::Sha1,
-        DigestAlgorithm::Sha224 => Hash::Sha224,
-        DigestAlgorithm::Sha256 => Hash::Sha256,
-        DigestAlgorithm::Sha384 => Hash::Sha384,
-        DigestAlgorithm::Sha512 => Hash::Sha512,
-        DigestAlgorithm::Sha3_256 => Hash::Sha3_256,
-        DigestAlgorithm::Sha3_384 => Hash::Sha3_384,
-        DigestAlgorithm::Sha3_512 => Hash::Sha3_512,
-        // SHA3-224 has no TS 119 312 entry nor DSS name.
-        DigestAlgorithm::Sha3_224 => return None,
-    })
+    Some(etsi::hash_of(digest)).filter(|hash| *hash != Hash::Other)
 }
 
 /// The family and message hash of a fixed asymmetric signature method.

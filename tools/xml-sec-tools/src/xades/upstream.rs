@@ -42,12 +42,6 @@ pub(crate) const PROFILES: [(&str, &str); 3] = [
     ("conformant", "xades-conformant"),
 ];
 
-/// Whether `rows` hold at least one signature and `side` reads `value` for
-/// `block` in every one of them.
-pub(crate) fn every_block(rows: &[Value], block: &str, side: &str, value: &str) -> bool {
-    !rows.is_empty() && rows.iter().all(|row| row["blocks"][block][side] == value)
-}
-
 /// The building blocks compared, in report order.
 pub(crate) const BLOCKS: [&str; 6] = ["FC", "ISC", "CV", "XCV", "SAV", "TIMESTAMPS"];
 
@@ -349,6 +343,21 @@ pub(crate) fn compare(dss: &[Value], ours: &[Value], stamped: bool) -> Vec<Value
             .find(|facts| id.is_some() && facts["id"].as_str() == id)
             .or_else(|| ours.get(index).filter(|_| id.is_none()));
         let mine = matched.map_or_else(Map::new, |facts| our_blocks(facts, stamped));
+        let spelled = |value: &Value| {
+            format!(
+                "{}:{}",
+                value["indication"].as_str().unwrap_or("absent"),
+                value["sub"].as_str().unwrap_or("-")
+            )
+        };
+        let theirs = &signature["overall"];
+        let ours = matched.map_or(Value::Null, |facts| facts["etsi"].clone());
+        let overall = json!({
+            "dss": spelled(theirs),
+            "ours": spelled(&ours),
+            "indication": matched.is_some() && theirs["indication"] == ours["indication"],
+            "agrees": matched.is_some() && spelled(theirs) == spelled(&ours),
+        });
         let mut blocks = Map::new();
         for name in BLOCKS {
             let theirs = signature["blocks"][name].as_str().unwrap_or("absent");
@@ -361,7 +370,12 @@ pub(crate) fn compare(dss: &[Value], ours: &[Value], stamped: bool) -> Vec<Value
                 json!({ "dss": theirs, "ours": verdict, "agrees": agrees(theirs, verdict) }),
             );
         }
-        rows.push(json!({ "id": id, "matched": matched.is_some(), "blocks": blocks }));
+        rows.push(json!({
+            "id": id,
+            "matched": matched.is_some(),
+            "blocks": blocks,
+            "overall": overall,
+        }));
     }
     rows
 }
@@ -372,7 +386,7 @@ pub(crate) fn observed(rows: &[Value]) -> Value {
     Value::Array(
         rows.iter()
             .map(|row| {
-                let blocks: Map<String, Value> = BLOCKS
+                let mut blocks: Map<String, Value> = BLOCKS
                     .iter()
                     .map(|name| {
                         let block = &row["blocks"][*name];
@@ -387,14 +401,25 @@ pub(crate) fn observed(rows: &[Value]) -> Value {
                         )
                     })
                     .collect();
+                blocks.insert(
+                    "OVERALL".into(),
+                    format!(
+                        "{}/{}",
+                        row["overall"]["dss"].as_str().unwrap_or_default(),
+                        row["overall"]["ours"].as_str().unwrap_or_default()
+                    )
+                    .into(),
+                );
                 Value::Object(blocks)
             })
             .collect(),
     )
 }
 
-/// The class a comparison takes without review: every block agrees, both
-/// sides found no signature, or the document carries no anchor.
+/// The class a comparison takes without review: every signature reaches
+/// DSS's overall indication and sub-indication (the building blocks are the
+/// diagnosis of a difference, not the verdict), both sides found no
+/// signature, or the document carries no anchor.
 pub(crate) fn automatic_class(rows: &[Value], dss_error: bool, anchors: u64) -> &'static str {
     if dss_error && rows.is_empty() {
         return "not-a-signature";
@@ -402,14 +427,30 @@ pub(crate) fn automatic_class(rows: &[Value], dss_error: bool, anchors: u64) -> 
     if anchors == 0 {
         return "no-usable-anchor";
     }
-    let all = !rows.is_empty()
+    if every_overall(rows, "agrees") {
+        "agreement"
+    } else {
+        "unreviewed"
+    }
+}
+
+/// Whether `rows` hold at least one signature and every one's overall
+/// comparison has `field` set.
+pub(crate) fn every_overall(rows: &[Value], field: &str) -> bool {
+    !rows.is_empty()
+        && rows
+            .iter()
+            .all(|row| row["matched"] == true && row["overall"][field] == true)
+}
+
+/// Whether every signature of `rows` reads `TOTAL_PASSED` on `side`.
+fn every_passed(rows: &[Value], side: &str) -> bool {
+    !rows.is_empty()
         && rows.iter().all(|row| {
-            row["matched"] == true
-                && BLOCKS
-                    .iter()
-                    .all(|name| row["blocks"][*name]["agrees"] == true)
-        });
-    if all { "agreement" } else { "unreviewed" }
+            row["overall"][side]
+                .as_str()
+                .is_some_and(|value| value.starts_with("TOTAL_PASSED"))
+        })
 }
 
 /// One validation pass of both implementations at `at` over `cases`.
@@ -619,10 +660,10 @@ fn observations(
                     json!({
                         "observed": observed(&rows),
                         "class": automatic_class(&rows, dss_error, anchors),
-                        "intact": every_block(&rows, "CV", "ours", "pass"),
-                        "trusted": every_block(&rows, "XCV", "ours", "pass")
+                        "passed": every_passed(&rows, "ours")
                             && facts["signatures"].as_array().is_some_and(|s| !s.is_empty()),
-                        "dss_intact": every_block(&rows, "CV", "dss", "PASSED"),
+                        "dss_passed": every_passed(&rows, "dss"),
+                        "indication": every_overall(&rows, "indication"),
                     }),
                 );
             }
@@ -740,10 +781,13 @@ pub(crate) fn report(expectations: &Value) -> String {
     )
     .expect("writing to a String cannot fail");
     text.push_str(
-        "An input is *intact* when every signature's value and references \
-         verify (DSS building block CV), *trusted* when xml-sec also validated \
-         the signer's path, and in *agreement* when every compared block \
-         (FC, ISC, CV, XCV, SAV, timestamps) reaches the same conclusion.\n",
+        "Each profile's DSS run uses DSS's own default policy with every \
+         cryptographic constraint replaced by the profile's. An input *passes* \
+         when every signature reaches TOTAL_PASSED (ETSI EN 319 102-1 V1.4.1: \
+         DSS's simple report, and the shared EN 319 102-1 process over \
+         xml-sec's facts); it is in *agreement* when every signature reaches \
+         DSS's indication and sub-indication. Each other input carries a \
+         reviewed class with the clause it rests on.\n",
     );
     for pass in ["instant", "signing-time"] {
         let mut rows = Vec::new();
@@ -772,9 +816,9 @@ pub(crate) fn report(expectations: &Value) -> String {
             rows.push(format!(
                 "| `{name}` | {} | {} | {} | {} | {} | {} |",
                 entries.len(),
-                count("dss_intact"),
-                count("intact"),
-                count("trusted"),
+                count("dss_passed"),
+                count("passed"),
+                count("indication"),
                 classes
                     .iter()
                     .find(|class| class.starts_with("agreement "))
@@ -788,7 +832,7 @@ pub(crate) fn report(expectations: &Value) -> String {
         writeln!(
             text,
             "\n## Pass `{pass}`\n\n\
-             | Profile | Inputs | DSS intact | xml-sec intact | xml-sec trusted | Agreement | Classes |\n\
+             | Profile | Inputs | DSS passes | xml-sec passes | Same indication | Agreement | Classes |\n\
              | --- | --- | --- | --- | --- | --- | --- |"
         )
         .expect("writing to a String cannot fail");
