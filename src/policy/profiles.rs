@@ -11,7 +11,7 @@ use super::{
     DigestAlgorithm, KemContentAuthentication, KemSignatureTrust, KeyAgreementAlgorithm,
     KeyDerivationAlgorithm, KeyEstablishmentPolicy, KeySourceKind, KeySourcePolicy,
     PolicyViolation, RelationshipTargetModeSemantics, RequestSelections, RsaPssPermission,
-    SameDocumentIdSemantics, SignatureAlgorithm, SigningPolicy, TransformPolicy,
+    SameDocumentIdSemantics, SignatureAlgorithm, SigningPolicy, TransformPolicy, TrustAnchorSigner,
     UnknownX509CertificateSemantics, UriPolicy, UriTypeSet, VerificationPolicy,
     XsltStylesheetSemantics,
 };
@@ -548,6 +548,8 @@ fn verification_profile(
             .collect();
         verification.key_trust.rsa_keys.minimum_modulus_bits = 1024;
         verification.key_trust.dsa_keys.minimum_modulus_bits = 1024;
+        // ETSI EN 319 102-1 V1.4.1 5.2.6.4 step 1(b), as EU DSS applies it.
+        verification.key_trust.trust_anchor_signer = TrustAnchorSigner::Accepted;
     }
     if compatibility {
         verification.key_trust.allowed_legacy_signature_algorithms = verification

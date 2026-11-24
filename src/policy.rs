@@ -1407,6 +1407,22 @@ pub enum UnknownX509CertificateSemantics {
     Libxmlsec1,
 }
 
+/// How X.509 validation treats a signing certificate that is itself one of
+/// the caller's trust anchors (ETSI EN 319 102-1 V1.4.1 5.2.6.4 step 1).
+/// <https://www.etsi.org/deliver/etsi_en/319100_319199/31910201/01.04.01_60/en_31910201v010401p.pdf>
+#[cfg(feature = "xmldsig")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TrustAnchorSigner {
+    /// Validated as the one-certificate path it forms, its validity period
+    /// included (step 1 "go to the next step", then step 7).
+    #[default]
+    Validated,
+    /// Accepted as trusted without further checks, the anchor's validity
+    /// period included (step 1(b), as RFC 5280 6.1.1(d) leaves an anchor's
+    /// validity to the relying party).
+    Accepted,
+}
+
 /// X.509 and key-resolution decisions for verification.
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1447,6 +1463,8 @@ pub struct KeyTrustPolicy {
     /// Which `X509Data` children a lookup stopping on an unknown certificate
     /// refuses.
     pub unknown_x509_certificate: UnknownX509CertificateSemantics,
+    /// How a signing certificate that is itself a trust anchor validates.
+    pub trust_anchor_signer: TrustAnchorSigner,
 }
 
 #[cfg(feature = "xmldsig")]
@@ -1466,6 +1484,7 @@ impl Default for KeyTrustPolicy {
             check_crls: false,
             verification_time: None,
             unknown_x509_certificate: UnknownX509CertificateSemantics::References,
+            trust_anchor_signer: TrustAnchorSigner::Validated,
         }
     }
 }

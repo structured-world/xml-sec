@@ -1623,6 +1623,91 @@ fn the_extended_profile_signs_and_verifies_an_xpath_selected_reference() {
     );
 }
 
+/// How a signing certificate the caller configured as its trust anchor
+/// resolves from `KeyInfo` at `at` under `profile` with X.509 chains
+/// checked: `validated`, or the refusal.
+fn resolve_anchor_signer(profile: PolicyProfile, at: i64) -> String {
+    use xml_sec::xmldsig::{
+        DefaultKeyResolver, InspectedKeyCandidateBudget, KeyResolverConfig,
+        ResolvedVerificationKey, parse_key_info,
+    };
+    let pem = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/keys/rsa/rsa-2048-cert.pem"),
+    )
+    .unwrap();
+    let body: String = pem
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect();
+    let der = structured_base64::STANDARD.decode(body.as_bytes()).unwrap();
+    let xml = format!(
+        r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"><X509Data><X509Certificate>{body}</X509Certificate></X509Data></KeyInfo>"#
+    );
+    let document = xml_sec::XmlDomDocument::parse(&xml).unwrap();
+    let key_info = parse_key_info(document.root_element()).unwrap();
+    let mut policy = compiler(profile)
+        .compile(&context())
+        .unwrap()
+        .verification()
+        .unwrap()
+        .clone();
+    policy.key_trust.verify_x509_chains = true;
+    policy.key_trust.verification_time = Some(Instant::new(at, 0).unwrap());
+    let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+        trusted_certs: vec![der],
+        ..KeyResolverConfig::default()
+    });
+    let mut budget = InspectedKeyCandidateBudget::new(&policy);
+    match resolver.resolve_with_candidate_budget(
+        Some(&key_info),
+        SignatureAlgorithm::RsaSha256,
+        &policy,
+        &RustCryptoProvider,
+        &mut budget,
+    ) {
+        Ok(Some(ResolvedVerificationKey::Validated(_))) => "validated".into(),
+        Ok(Some(_)) => "unvalidated key".into(),
+        Ok(None) => "no key".into(),
+        Err(error) => format!("{error:?}"),
+    }
+}
+
+#[test]
+fn a_conformant_profile_accepts_a_signing_certificate_that_is_its_trust_anchor() {
+    // ETSI EN 319 102-1 V1.4.1 5.2.6.4 step 1(b): when the signing
+    // certificate is itself a trust anchor, the policy may pass X.509
+    // validation without step 7's validity check. XadesConformant does, as
+    // EU DSS does; the stricter profiles keep the check, so the same expired
+    // anchor-signer is refused there.
+    const LONG_AFTER_EXPIRY: i64 = 7_258_118_400; // 2200-01-01
+    assert_eq!(
+        resolve_anchor_signer(PolicyProfile::XadesConformant, LONG_AFTER_EXPIRY),
+        "validated"
+    );
+    let refused = resolve_anchor_signer(PolicyProfile::Xades, LONG_AFTER_EXPIRY);
+    assert!(refused.contains("CertificateNotValid(0)"), "{refused}");
+    // A permission: a layer that validates the anchor-signer withdraws it.
+    let conformant = compiler(PolicyProfile::XadesConformant);
+    let mut layer = conformant.policies().clone();
+    if let Some(verification) = layer.verification.as_mut() {
+        verification.key_trust.trust_anchor_signer = xml_sec::policy::TrustAnchorSigner::Validated;
+    }
+    let narrowed = conformant
+        .restrict(&layer)
+        .unwrap()
+        .compile(&context())
+        .unwrap();
+    assert_eq!(
+        narrowed
+            .verification()
+            .unwrap()
+            .key_trust
+            .trust_anchor_signer,
+        xml_sec::policy::TrustAnchorSigner::Validated
+    );
+}
+
 #[test]
 fn a_denial_withdraws_exactly_the_named_permissions() {
     // A deployment narrows any profile without restating it: each denied

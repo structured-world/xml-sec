@@ -12,7 +12,7 @@ conformance, certificate trust deployment or every XAdES signature level.
 | `WsSecurity` | SOAP Security-header placement and explicit authenticated target coverage |
 | `Xades` | Typed, authenticated SignedProperties references and explicit target coverage |
 | `XadesExtended` | `Xades` plus the XPath and XPath Filter 2.0 transforms; their references keep transformed-data coverage |
-| `XadesConformant` | `XadesExtended` plus verification of every signature ETSI EN 319 132-1 and XMLDSig 1.1 define: SHA-1 based methods and digests, RSA and DSA keys from 1024 bits and `KeyValue` keys; signing stays modern |
+| `XadesConformant` | `XadesExtended` plus verification of every signature ETSI EN 319 132-1 and XMLDSig 1.1 define: SHA-1 based methods and digests, RSA and DSA keys from 1024 bits and `KeyValue` keys, and a signing certificate that is itself a trust anchor accepted as trusted (ETSI EN 319 102-1 5.2.6.4 step 1(b)); signing stays modern |
 | `LegacyVerify` | Verification only, requiring an auditable, expiring caller authorization |
 
 The strict signature profiles (`Modern`, `WsSecurity`, `Xades`) admit the

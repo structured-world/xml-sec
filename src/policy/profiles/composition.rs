@@ -4,7 +4,8 @@ use crate::policy::{
     HmacPolicy, KemContentAuthentication, KemSignatureTrust, KeyDerivationAlgorithm,
     KeyEstablishmentPolicy, KeySourcePolicy, KeyTrustPolicy, ManifestProcessing, PolicyViolation,
     ResourcePolicy, RsaKeyPolicy, RsaPssPermission, SigningPolicy, TimestampTokenEncoding,
-    TransformPolicy, UriPolicy, VerificationPolicy, VerificationTrustMode, XmlInputPolicy,
+    TransformPolicy, TrustAnchorSigner, UriPolicy, VerificationPolicy, VerificationTrustMode,
+    XmlInputPolicy,
 };
 #[cfg(feature = "xmlenc")]
 use crate::policy::{
@@ -488,6 +489,15 @@ fn key_trust(a: &KeyTrustPolicy, b: &KeyTrustPolicy) -> Result<KeyTrustPolicy, P
         verification_time,
         // An interpretation, not a level: layers must agree on it.
         unknown_x509_certificate: equal(a.unknown_x509_certificate, b.unknown_x509_certificate)?,
+        // A permission: a restricting layer that validates the anchor-signer
+        // keeps the check.
+        trust_anchor_signer: if a.trust_anchor_signer == TrustAnchorSigner::Accepted
+            && b.trust_anchor_signer == TrustAnchorSigner::Accepted
+        {
+            TrustAnchorSigner::Accepted
+        } else {
+            TrustAnchorSigner::Validated
+        },
     })
 }
 

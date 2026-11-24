@@ -1544,6 +1544,16 @@ impl DefaultKeyResolver {
         };
         check_trusted_prefix_request(available, signing_index, trusted_prefix_len, bounds)
             .map_err(build_error)?;
+        // The configured anchors lead the pool, so a signing certificate below
+        // `trusted_prefix_len` is one of them.
+        if signing_index < trusted_prefix_len
+            && trust.trust_anchor_signer == crate::policy::TrustAnchorSigner::Accepted
+            && accept_anchor_signer(available, signing_index, selectors, execution)?
+        {
+            return Ok(Some(super::pkix::ValidatedX509Key {
+                effective_spki: None,
+            }));
+        }
         // The pool is read once: discovery and the validation of every
         // candidate path use these certificates rather than reading again.
         let sources = certificates
@@ -2250,6 +2260,40 @@ fn certificate_resolution_error(error: super::X509ChainError) -> KeyResolutionEr
             KeyResolutionError::Chain(super::X509ChainError::Processing(error))
         }
         _ => KeyResolutionError::InvalidCertificate,
+    }
+}
+
+/// Selects the signing certificate, itself a configured anchor, as its own
+/// one-certificate path, and tells whether the document's selectors name it.
+/// ETSI EN 319 102-1 V1.4.1 5.2.6.4 step 1(b) lets the policy accept such a
+/// certificate as it is; its key stays the anchor's own, which no path
+/// transforms (RFC 5280 6.1.1(d)).
+fn accept_anchor_signer(
+    available: &mut BorrowedX509Pool<'_>,
+    signing_index: usize,
+    selectors: Option<&X509DataInfo>,
+    (provider, budget): (
+        &dyn crate::provider::CryptoProvider,
+        &InspectedKeyCandidateBudget<'_>,
+    ),
+) -> Result<bool, KeyResolutionError> {
+    available.certificate_chain.clear();
+    available
+        .certificate_chain
+        .try_push(signing_index)
+        .map_err(|reason| {
+            KeyResolutionError::Chain(super::X509ChainError::Processing(
+                structured_pkix::Error::resource(reason, "certificate.path", 0),
+            ))
+        })?;
+    match selectors {
+        Some(selectors) => selected_x509_path_matches_selectors(
+            available,
+            selectors,
+            provider,
+            &budget.certificates,
+        ),
+        None => Ok(true),
     }
 }
 

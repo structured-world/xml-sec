@@ -17,8 +17,8 @@ use xml_sec::{
         OpcRelationshipEdition, PolicySet, PolicyValidity, RelationshipTargetModeSemantics,
         RequestSelections, ResourcePolicy, RsaKeyPolicy, RsaPssPermission, SameDocumentIdSemantics,
         SignatureConstraints, SigningPolicy, TimestampTokenEncoding, TransformPolicy,
-        UnknownX509CertificateSemantics, UriPolicy, VerificationPolicy, VerificationTrustMode,
-        XmlInputPolicy, XsltStylesheetSemantics,
+        TrustAnchorSigner, UnknownX509CertificateSemantics, UriPolicy, VerificationPolicy,
+        VerificationTrustMode, XmlInputPolicy, XsltStylesheetSemantics,
     },
     provider::{KeyEncapsulationAlgorithm, X509SignatureAlgorithm},
     xmldsig::{
@@ -521,6 +521,14 @@ fn key_trust(p: &mut KeyTrustPolicy, v: &Value) -> Result<(), Error> {
                     key,
                     UnknownX509CertificateSemantics::References,
                     UnknownX509CertificateSemantics::Libxmlsec1
+                );
+            }
+            "trust_anchor_signer" => {
+                p.trust_anchor_signer = choice!(
+                    value,
+                    key,
+                    TrustAnchorSigner::Validated,
+                    TrustAnchorSigner::Accepted
                 );
             }
             _ => return Err(invalid(key)),
@@ -1043,6 +1051,7 @@ fn trust_snapshot(p: &KeyTrustPolicy) -> Result<Value, Error> {
         check_crls: _,
         verification_time: _,
         unknown_x509_certificate: _,
+        trust_anchor_signer: _,
     } = p;
     let purpose = |v: &ExtendedKeyPurpose| match v {
         ExtendedKeyPurpose::Other(arcs) => {
@@ -1105,6 +1114,7 @@ fn trust_snapshot(p: &KeyTrustPolicy) -> Result<Value, Error> {
             "unknown_x509_certificate".into(),
             named(p.unknown_x509_certificate),
         ),
+        ("trust_anchor_signer".into(), named(p.trust_anchor_signer)),
     ])))
 }
 fn source_snapshot(p: KeySourcePolicy) -> Value {

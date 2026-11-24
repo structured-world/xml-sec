@@ -114,6 +114,15 @@ does not itself establish trust or supply a key.
 | `allowed_extended_key_usages` | Purpose array, described below |
 | `verification_time` | `"system"` or explicit timestamp below |
 | `unknown_x509_certificate` | `References`, `Libxmlsec1` |
+| `trust_anchor_signer` | `Validated`, `Accepted` |
+
+`trust_anchor_signer` decides a signing certificate that is itself a
+configured trust anchor (ETSI EN 319 102-1 V1.4.1 5.2.6.4 step 1):
+`Validated` checks it as the one-certificate path it forms, its validity
+period included; `Accepted` passes it as trusted, as step 1(b) permits. It is
+a permission, so a layer composes it restrictively: `Accepted` survives only
+where every layer accepts. `XadesConformant` accepts; every other profile
+validates.
 
 `unknown_x509_certificate` is an interpretation, composed like the transform
 semantics: it decides which `X509Data` children a lookup that stops on an
