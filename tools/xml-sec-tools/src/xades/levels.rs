@@ -648,10 +648,6 @@ const VERDICTS: [(&str, &str, &str); 8] = [
     ("b-lta-renewed.xml", "XAdES-BASELINE-LTA", "TOTAL_PASSED"),
 ];
 
-/// The EU DSS release whose own test signatures are read at run time, the one
-/// `interop/xades/dss/pom.xml` builds. They stay outside the repository.
-const DSS_RELEASE: &str = "6.5.1";
-
 /// A signature DSS produced, the instant and level to validate it at, and what
 /// the adapter must report. Every token here omits accuracy, so the probe states
 /// it; the chains carry their own ends as test anchors.
@@ -685,8 +681,14 @@ const DSS_SIGNATURES: [(&str, &str, &str, &str); 7] = [
     ("xades-t-with-tsvd.xml", "1701100000", "t cms", "AnchorOnly"),
 ];
 
-/// Checks the adapter's report on every signature of `DSS_SIGNATURES`.
-fn dss_signatures(corpus: &super::Corpus, results: &std::path::Path) -> Result<(), String> {
+/// Checks the adapter's report on every signature of `DSS_SIGNATURES`, read at
+/// run time from the tag of the DSS `release` the probes were built against.
+/// They stay outside the repository.
+fn dss_signatures(
+    corpus: &super::Corpus,
+    results: &std::path::Path,
+    release: &str,
+) -> Result<(), String> {
     let directory = results.join("dss-signatures");
     std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
     let mut failures = Vec::new();
@@ -694,7 +696,7 @@ fn dss_signatures(corpus: &super::Corpus, results: &std::path::Path) -> Result<(
         let target = directory.join(file);
         if !target.exists() {
             let url = format!(
-                "https://raw.githubusercontent.com/esig/dss/{DSS_RELEASE}/dss-xades/src/test/resources/validation/{file}"
+                "https://raw.githubusercontent.com/esig/dss/{release}/dss-xades/src/test/resources/validation/{file}"
             );
             // A failed fetch leaves no `target`, so the next run fetches again
             // instead of reading a truncated file.
@@ -764,7 +766,7 @@ pub(crate) fn run(corpus: &super::Corpus, args: &[String]) -> Result<(), crate::
 /// Compares DSS's conclusion on every fixture with `VERDICTS`.
 pub(crate) fn execute(corpus: &super::Corpus, results: &std::path::Path) -> Result<(), String> {
     std::fs::create_dir_all(results).map_err(|error| error.to_string())?;
-    super::dss::build(corpus, results)?;
+    let release = super::dss::build(corpus, results)?;
     let classpath = super::dss::classpath(corpus)?;
     let fixtures = corpus
         .root
@@ -796,7 +798,7 @@ pub(crate) fn execute(corpus: &super::Corpus, results: &std::path::Path) -> Resu
     if !failures.is_empty() {
         return Err(format!("DSS verdict mismatch: {failures:?}"));
     }
-    dss_signatures(corpus, results)
+    dss_signatures(corpus, results, &release.dss)
 }
 
 /// The signed payload: a short text, or `units` elements for a sized document.

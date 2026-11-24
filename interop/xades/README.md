@@ -16,8 +16,11 @@ All validation runs are local; fixtures are never uploaded to online validators.
   upstream commit (`compatibility/libxmlsec1-donor-commit.txt`) by `install-xmlsec1`,
   which also builds the OpenSSL it links. This is not this
   repository's Rust `tools/xmlsec1`. The corpus refuses any other oracle version.
-- Independent profile diagnostics: **EU DSS 6.5.1**, Maven **3.9.12**, OpenJDK **21.0.12.1**.
-  Versioned expectations are in `dss-evidence/expectations.json` and
+- Independent profile diagnostics: the **current EU DSS release**, built with the current
+  Maven 3 release and OpenJDK 21. Each run resolves both from Maven Central's version lists
+  (pre-releases excluded) and records them, with the slf4j binding, in `versions.json` of its
+  DSS build directory; nothing in the repository fixes them.
+  Expectations are in `dss-evidence/expectations.json` and
   `dss-investigation/*expectations.json`; CI compares fresh observations with them.
   Dependency trees, actual outputs and full reports are run artifacts, excluded from Git and the bundle.
   CI uses native libxmlsec1 built from the pinned commit by the repository's installer, stable Rust and JDK 21.
@@ -69,7 +72,7 @@ rows below, and EU DSS assesses them independently.
 | Full XAdES/trust verdict from DSS | failed | All nine global outcomes are INDETERMINATE / CERTIFICATE_CHAIN_GENERAL_FAILURE; no revocation data was supplied |
 | B-T/B-LT/B-LTA over a test PKI (`crates/xml-sec-xades/tests/fixtures/levels`) | verified | OpenSSL issues every token, CRL and OCSP response; `xades levels` compares DSS's format and indication on each fixture, `validate` reaches the same levels, detached, parallel and countersigned structures included |
 | RFC 3161 token without stated accuracy | verified | Rejected unless `Inputs::accuracies` states the accuracy of its authority and signed policy (RFC 3161 §2.4.2); a token's own field comes first |
-| Signatures produced by DSS 6.5.1 | verified | `xades levels` reads them at the DSS tag at run time, outside the repository: `xades-lta-valid` meets B-T and copied tokens are rejected. Its last archive TSA has no status in the document, so B-LT and B-LTA stop at `NoSource` (EN 319 132-1 §6.3(x)). `xades-t-with-tsvd` carries an unsorted certificate SET OF: `TimestampTokenEncoding::Declared` refuses it because an unmarked token is DER (§5.1.3), `TimestampTokenEncoding::Ber` reads it as RFC 5652 BER |
+| Signatures produced by DSS | verified | `xades levels` reads them at the tag of the run's DSS release, outside the repository: `xades-lta-valid` meets B-T and copied tokens are rejected. Its last archive TSA has no status in the document, so B-LT and B-LTA stop at `NoSource` (EN 319 132-1 §6.3(x)). `xades-t-with-tsvd` carries an unsorted certificate SET OF: `TimestampTokenEncoding::Declared` refuses it because an unmarked token is DER (§5.1.3), `TimestampTokenEncoding::Ber` reads it as RFC 5652 BER |
 | OCSP responder outside the issuer | verified | Counts only as `Inputs::responders` configures it for that issuer (RFC 6960 §4.2.2.2) |
 | `RenewedDigestsV2` over a signed Manifest | verified | B-LTA with SHA-512 renewal of a SHA-256 Manifest reference; a wrong new digest or reference digest stops the level with `Outcome::Renewal` (EN 319 132-1 §5.5.3). No independent validator checked it |
 | Caller-supplied CRLs and OCSP responses | verified | They answer status but do not count as incorporated, so the level stays unmet |
