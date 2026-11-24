@@ -197,6 +197,84 @@ fn fixture(path: &str) -> Vec<u8> {
     )
 }
 
+/// A supplied path of these DER certificates, target first, in this order.
+fn supplied_path(certificates: Vec<Vec<u8>>) -> X509DataInfo {
+    let mut info = X509DataInfo::default();
+    info.certificate_chain = (0..certificates.len()).collect();
+    info.certificates = certificates;
+    info
+}
+
+#[test]
+fn an_over_depth_anchored_path_fails_before_its_intermediates_are_read() {
+    // A supplied path that ends at a configured anchor is refused for its
+    // length alone; a malformed intermediate it carries is never decoded.
+    let root = fixture("cacert.pem");
+    let info = supplied_path(vec![
+        fixture("rsa/rsa-2048-cert.pem"),
+        vec![0x30, 0x00],
+        root.clone(),
+    ]);
+    let anchors = [root];
+    let options = X509ChainOptions {
+        max_chain_depth: 2,
+        ..options(&anchors, false)
+    };
+    assert_eq!(
+        verify_x509_certificate_chain(&info, &options),
+        Err(X509ChainError::DepthExceeded(2))
+    );
+}
+
+#[test]
+fn an_over_depth_path_an_anchor_completes_fails_before_its_intermediates_are_read() {
+    // The anchor appended to the supplied path counts toward its depth, so a
+    // completed path that is too long is refused before a malformed
+    // intermediate is decoded.
+    let info = supplied_path(vec![
+        fixture("rsa/rsa-2048-cert.pem"),
+        vec![0x30, 0x00],
+        fixture("ca2cert.pem"),
+    ]);
+    let anchors = [fixture("cacert.pem")];
+    assert_eq!(
+        verify_x509_certificate_chain(&info, &options(&anchors, false)),
+        Err(X509ChainError::DepthExceeded(3))
+    );
+}
+
+#[test]
+fn an_unanchored_path_no_anchor_completes_is_untrusted_before_its_target_is_read() {
+    // Without an anchor that can complete the path from its last
+    // certificate, the path is untrusted; the earlier target is not decoded.
+    let info = supplied_path(vec![vec![0x30, 0x00], fixture("ca2cert.pem")]);
+    assert_eq!(
+        verify_x509_certificate_chain(&info, &options(&[], false)),
+        Err(X509ChainError::UntrustedRoot)
+    );
+}
+
+#[test]
+fn an_expired_target_fails_its_time_gate_before_later_entries_are_read() {
+    // RFC 5280 section 6.1.3(a)(2): the target outside its validity window
+    // is reported as such, before a malformed later entry is decoded.
+    let root = fixture("cacert.pem");
+    let info = supplied_path(vec![
+        fixture("rsa/rsa-2048-cert.pem"),
+        vec![0x30, 0x00],
+        root.clone(),
+    ]);
+    let anchors = [root];
+    let options = X509ChainOptions {
+        verification_time: Instant::new(7_258_118_400, 0).unwrap(), // 2200-01-01
+        ..options(&anchors, false)
+    };
+    assert_eq!(
+        verify_x509_certificate_chain(&info, &options),
+        Err(X509ChainError::CertificateNotValid(0))
+    );
+}
+
 fn parsed_chain(leaf_path: &str, crl: Option<Vec<u8>>) -> X509DataInfo {
     let leaf = structured_base64::STANDARD
         .encode(&fixture(leaf_path))

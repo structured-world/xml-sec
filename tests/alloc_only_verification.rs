@@ -9,8 +9,9 @@ use std::collections::BTreeMap;
 
 use xml_sec::XmlDocument;
 use xml_sec::xmldsig::{
-    CallerTrustedSignatureKey, HmacVerificationKey, SignatureRequirement, UriTypeSet,
-    VerificationRequest, VerifyContext,
+    CallerTrustedSignatureKey, DefaultKeyResolver, DsigError, HmacVerificationKey,
+    KeyResolutionError, KeyResolverConfig, SignatureRequirement, UriTypeSet, VerificationRequest,
+    VerifyContext, X509ChainError,
 };
 
 const TWO_SIGNATURES: &str = include_str!("fixtures/xmldsig/alloc-only/two-signatures.xml");
@@ -156,6 +157,37 @@ fn signature_lookalikes_in_other_namespaces_are_not_signatures() {
     );
     let document = XmlDocument::parse(rebound).unwrap();
     assert!(!accepted(&document, &first_key(), &["first"]));
+}
+
+#[test]
+fn an_embedded_certificate_without_a_path_is_untrusted_without_a_clock() {
+    // The configured anchor does not issue the embedded certificate, and the
+    // document carries no issuer, so discovery finds no candidate path. No
+    // path is validated and no verification time is needed: the result is an
+    // untrusted root, also without a clock.
+    let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+        trusted_certs: vec![
+            include_bytes!("fixtures/xmldsig/phaos-xmldsig-three/certs/rsa-ca-cert.der").to_vec(),
+        ],
+        ..KeyResolverConfig::default()
+    });
+    let mut policy = xml_sec::policy::VerificationPolicy::default();
+    policy.key_trust.verify_x509_chains = true;
+    let result = VerifyContext::new()
+        .policy(policy)
+        .key_resolver(&resolver)
+        .verify(include_str!(
+            "fixtures/xmldsig/dcc/signed-calibration-certificate.xml"
+        ));
+    assert!(
+        matches!(
+            result,
+            Err(DsigError::KeyResolution(KeyResolutionError::Chain(
+                X509ChainError::UntrustedRoot
+            )))
+        ),
+        "{result:?}"
+    );
 }
 
 #[test]

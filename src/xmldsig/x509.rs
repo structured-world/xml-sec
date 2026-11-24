@@ -426,19 +426,7 @@ pub fn verify_x509_certificate(
     for der in intermediates {
         pool.insert(der, &session)?;
     }
-    let candidates = super::parse::build_x509_certificate_paths_to_trusted_prefix(
-        &pool,
-        signing,
-        trusted_prefix_len,
-        super::parse::X509PathBounds {
-            max_depth: options.max_chain_depth,
-            max_candidate_paths,
-        },
-        provider,
-        options.certificate_signature_algorithms,
-        &session,
-    )
-    .map_err(|error| match error {
+    let build_error = |error| match error {
         X509ChainBuildError::Certificate(error) => error,
         X509ChainBuildError::Policy(error) => X509ChainError::Policy(error),
         X509ChainBuildError::Provider(error) => X509ChainError::Provider(error),
@@ -454,12 +442,46 @@ pub fn verify_x509_certificate(
         | X509ChainBuildError::Cycle
         | X509ChainBuildError::IssuerSignatureMismatch
         | X509ChainBuildError::AmbiguousIssuer => X509ChainError::UntrustedRoot,
-    })?;
+    };
+    let bounds = super::parse::X509PathBounds {
+        max_depth: options.max_chain_depth,
+        max_candidate_paths,
+    };
+    super::parse::check_trusted_prefix_request(&pool, signing, trusted_prefix_len, bounds)
+        .map_err(build_error)?;
+    // The pool is read once for discovery and every candidate's validation.
+    let sources = session.read_sources(pool.certificates.iter().copied())?;
+    let candidates = super::parse::build_x509_certificate_paths_to_trusted_prefix_in(
+        &pool,
+        &sources,
+        signing,
+        trusted_prefix_len,
+        bounds,
+        provider,
+        options.certificate_signature_algorithms,
+        &session,
+    )
+    .map_err(build_error)?;
+    // The anchors lead the pool, already read with it.
+    let anchors = &sources[..trusted_prefix_len];
     let mut first_error = None;
     let mut validated = None;
     for candidate in candidates {
-        pool.certificate_chain = candidate;
-        match verify_x509_certificate_chain_in_session(&pool, options, provider, &[], &session) {
+        let mut path = session.memory().vector();
+        path.try_reserve_exact(candidate.len())
+            .map_err(|reason| path_storage(&session, reason))?;
+        for &index in &candidate {
+            path.try_push(sources.get(index).ok_or(X509ChainError::UntrustedRoot)?)
+                .map_err(|reason| path_storage(&session, reason))?;
+        }
+        match verify_read_x509_chain(
+            &path,
+            anchors,
+            pool.crls(),
+            options,
+            (provider, &session),
+            &[],
+        ) {
             Ok(key) => {
                 validated = Some(key);
                 break;
@@ -473,7 +495,8 @@ pub fn verify_x509_certificate(
     let Some(key) = validated else {
         return Err(first_error.unwrap_or(X509ChainError::UntrustedRoot));
     };
-    let certificate = session.read(target)?;
+    // The target was read with the pool; its index names the same DER.
+    let certificate = &sources[signing];
     let validity = certificate.tbs().validity();
     let subject_public_key_info = match key.effective_spki {
         Some(spki) => spki.to_vec(),
@@ -500,66 +523,133 @@ pub(crate) fn verify_x509_certificate_chain_in_session(
         return Err(X509ChainError::UntrustedRoot);
     }
 
-    let storage_error = |reason| {
-        session.error(structured_pkix::Error::resource(
-            reason,
-            "certificate.path",
-            0,
-        ))
-    };
     let mut path_der = session.memory().vector();
     path_der
         .try_reserve_exact(info.chain().len())
-        .map_err(storage_error)?;
+        .map_err(|reason| path_storage(session, reason))?;
     for &index in info.chain() {
         let bytes = info
             .certificate(index)
             .ok_or(X509ChainError::UntrustedRoot)?;
-        path_der.try_push(bytes).map_err(storage_error)?;
+        path_der
+            .try_push(bytes)
+            .map_err(|reason| path_storage(session, reason))?;
     }
 
-    let last = session.read(
-        path_der
-            .last()
-            .copied()
-            .ok_or(X509ChainError::UntrustedRoot)?,
-    )?;
-    let trusted_anchors = session
-        .read_pool(options.trusted_certs)
-        .map_err(malformed_anchor)?;
-    if trusted_anchors
+    // Certificates are read in the order the decisions need them: the last
+    // one and the anchors decide how the path ends, and the rest is read only
+    // for a path that reaches validation, the target's time gate first.
+    let (last_der, before) = path_der.split_last().ok_or(X509ChainError::UntrustedRoot)?;
+    let last = session.read(last_der)?;
+    let anchors = read_anchors(options, session)?;
+    // The certificate before the last one, which root replacement examines.
+    let mut issued = None;
+    if anchors
         .iter()
         .any(|cert| cert.as_bytes() == last.as_bytes())
     {
-        return validate_path(
-            &path_der,
-            info,
-            options,
-            (provider, session),
-            additional_crls,
-        );
+        if path_der.len() > options.max_chain_depth {
+            return Err(X509ChainError::DepthExceeded(options.max_chain_depth));
+        }
+    } else {
+        // Only a self-signed root that an anchor may replace makes the
+        // certificate before it matter here.
+        if let Some(der) = before.last()
+            && self_signed_root(&last, options, provider, session)?
+        {
+            issued = Some(session.read(der)?);
+        }
+        let Some(replaces_root) =
+            anchor_completes(issued.as_ref(), &last, &anchors, options, provider, session)?
+        else {
+            return Err(X509ChainError::UntrustedRoot);
+        };
+        // The anchor joins the path, in place of a replaced root.
+        if path_der.len() - usize::from(replaces_root) + 1 > options.max_chain_depth {
+            return Err(X509ChainError::DepthExceeded(options.max_chain_depth));
+        }
+    }
+    let mut decoded = session.memory().vector();
+    decoded
+        .try_reserve_exact(before.len())
+        .map_err(|reason| path_storage(session, reason))?;
+    let unread = &before[..before.len() - usize::from(issued.is_some())];
+    for der in unread {
+        let certificate = session.read(der)?;
+        if decoded.is_empty() {
+            target_in_validity(&certificate, options)?;
+        }
+        decoded
+            .try_push(certificate)
+            .map_err(|reason| path_storage(session, reason))?;
+    }
+    if let Some(certificate) = issued {
+        if decoded.is_empty() {
+            target_in_validity(&certificate, options)?;
+        }
+        decoded
+            .try_push(certificate)
+            .map_err(|reason| path_storage(session, reason))?;
+    }
+    let mut path = session.memory().vector();
+    path.try_reserve_exact(path_der.len())
+        .map_err(|reason| path_storage(session, reason))?;
+    for certificate in decoded.iter().chain(core::iter::once(&last)) {
+        path.try_push(certificate)
+            .map_err(|reason| path_storage(session, reason))?;
+    }
+    verify_read_x509_chain(
+        &path,
+        &anchors,
+        info.crls(),
+        options,
+        (provider, session),
+        additional_crls,
+    )
+}
+
+/// [`verify_x509_certificate_chain_in_session`] over a target-first `path`
+/// and trust `anchors` the operation already read, so a caller validating
+/// several candidate paths reads each certificate once.
+pub(crate) fn verify_read_x509_chain<'a>(
+    path: &[&'a structured_pkix::Certificate<'a>],
+    anchors: &'a [structured_pkix::Certificate<'a>],
+    embedded_crls: &[Vec<u8>],
+    options: &X509ChainOptions<'_>,
+    execution: (
+        &dyn crate::provider::CryptoProvider,
+        &super::pkix::CertificateSession,
+    ),
+    additional_crls: &[Vec<u8>],
+) -> Result<super::pkix::ValidatedX509Key, X509ChainError> {
+    let (provider, session) = execution;
+    if options.max_chain_depth == 0 {
+        return Err(X509ChainError::InvalidDepth);
+    }
+    let Some(&last) = path.last() else {
+        return Err(X509ChainError::UntrustedRoot);
+    };
+    if anchors
+        .iter()
+        .any(|cert| cert.as_bytes() == last.as_bytes())
+    {
+        return validate_path(path, embedded_crls, options, execution, additional_crls);
     }
 
-    let candidate_base =
-        if replaceable_untrusted_root(&path_der, &last, options, provider, session)? {
-            &path_der[..path_der.len() - 1]
-        } else {
-            &path_der[..]
-        };
-    let candidate_child = session.read(
-        candidate_base
-            .last()
-            .copied()
-            .ok_or(X509ChainError::UntrustedRoot)?,
-    )?;
+    let candidate_base = if replaceable_untrusted_root(path, last, options, provider, session)? {
+        &path[..path.len() - 1]
+    } else {
+        path
+    };
+    let &candidate_child = candidate_base.last().ok_or(X509ChainError::UntrustedRoot)?;
 
     let mut first_validation_error = None;
-    for cert in &trusted_anchors {
+    for cert in anchors {
         if !session.source_names_equal(cert.tbs().subject(), candidate_child.tbs().issuer())? {
             continue;
         }
         match shared_certificate_signature_outcome(
-            &candidate_child,
+            candidate_child,
             cert,
             provider,
             options.certificate_signature_algorithms,
@@ -571,16 +661,19 @@ pub(crate) fn verify_x509_certificate_chain_in_session(
         }
         let mut candidate_path = session.memory().vector();
         candidate_path
-            .try_extend_from_slice(candidate_base)
-            .map_err(storage_error)?;
+            .try_reserve_exact(candidate_base.len() + 1)
+            .map_err(|reason| path_storage(session, reason))?;
         candidate_path
-            .try_push(cert.as_bytes())
-            .map_err(storage_error)?;
+            .try_extend_from_slice(candidate_base)
+            .map_err(|reason| path_storage(session, reason))?;
+        candidate_path
+            .try_push(cert)
+            .map_err(|reason| path_storage(session, reason))?;
         match validate_path(
             &candidate_path,
-            info,
+            embedded_crls,
             options,
-            (provider, session),
+            execution,
             additional_crls,
         ) {
             Ok(key) => return Ok(key),
@@ -590,6 +683,41 @@ pub(crate) fn verify_x509_certificate_chain_in_session(
     }
 
     Err(first_validation_error.unwrap_or(X509ChainError::UntrustedRoot))
+}
+
+fn path_storage(
+    session: &super::pkix::CertificateSession,
+    reason: structured_asn1::memory::MemoryError,
+) -> X509ChainError {
+    session.error(structured_pkix::Error::resource(
+        reason,
+        "certificate.path",
+        0,
+    ))
+}
+
+/// The target's time gate, checked before any issuer permission is examined,
+/// as shared path discovery also does before entering its pool.
+fn target_in_validity(
+    target: &structured_pkix::Certificate<'_>,
+    options: &X509ChainOptions<'_>,
+) -> Result<(), X509ChainError> {
+    let at = options.verification_time;
+    let validity = target.tbs().validity();
+    if at < validity.not_before().instant() || at > validity.not_after().instant() {
+        return Err(X509ChainError::CertificateNotValid(0));
+    }
+    Ok(())
+}
+
+/// The caller's trust anchors read by the operation's session.
+pub(crate) fn read_anchors<'a>(
+    options: &X509ChainOptions<'a>,
+    session: &'a super::pkix::CertificateSession,
+) -> Result<structured_asn1::memory::OwnedVec<structured_pkix::Certificate<'a>>, X509ChainError> {
+    session
+        .read_pool(options.trusted_certs)
+        .map_err(malformed_anchor)
 }
 
 /// A malformed caller anchor is invalid DER; resource exhaustion stays itself.
@@ -603,36 +731,84 @@ fn malformed_anchor(error: X509ChainError) -> X509ChainError {
     }
 }
 
+/// Whether a trust anchor can complete a supplied path that does not end at
+/// one: an anchor issues its `last` certificate, or the `issued` certificate
+/// before a replaceable self-signed root. `Some` tells whether the anchor
+/// replaces that root.
+fn anchor_completes(
+    issued: Option<&structured_pkix::Certificate<'_>>,
+    last: &structured_pkix::Certificate<'_>,
+    anchors: &[structured_pkix::Certificate<'_>],
+    options: &X509ChainOptions<'_>,
+    provider: &dyn crate::provider::CryptoProvider,
+    session: &super::pkix::CertificateSession,
+) -> Result<Option<bool>, X509ChainError> {
+    // `issued` is read only after `last` proved a self-signed root.
+    let (child, replaces_root) = match issued {
+        Some(child) if issued_by(child, last, options, provider, session)? => (child, true),
+        _ => (last, false),
+    };
+    for cert in anchors {
+        if !session.source_names_equal(cert.tbs().subject(), child.tbs().issuer())? {
+            continue;
+        }
+        if matches!(
+            shared_certificate_signature_outcome(
+                child,
+                cert,
+                provider,
+                options.certificate_signature_algorithms,
+                session,
+            )?,
+            structured_pkix::path::Verified::Yes | structured_pkix::path::Verified::Unsupported
+        ) {
+            return Ok(Some(replaces_root));
+        }
+    }
+    Ok(None)
+}
+
 /// Whether the supplied path ends in a self-signed root that a trusted anchor
 /// may replace.
 ///
 /// Root replacement requires a proved self-signature and child signature;
 /// a merely prospective edge cannot authorize discarding a certificate.
 fn replaceable_untrusted_root(
-    path_der: &[&[u8]],
+    path: &[&structured_pkix::Certificate<'_>],
     last: &structured_pkix::Certificate<'_>,
     options: &X509ChainOptions<'_>,
     provider: &dyn crate::provider::CryptoProvider,
     session: &super::pkix::CertificateSession,
 ) -> Result<bool, X509ChainError> {
-    if path_der.len() < 2
-        || !session.source_names_equal(last.tbs().subject(), last.tbs().issuer())?
-        || shared_certificate_signature_outcome(
-            last,
-            last,
-            provider,
-            options.certificate_signature_algorithms,
-            session,
-        )? != structured_pkix::path::Verified::Yes
-    {
+    if path.len() < 2 || !self_signed_root(last, options, provider, session)? {
         return Ok(false);
     }
-    let child = session.read(path_der[path_der.len() - 2])?;
+    issued_by(path[path.len() - 2], last, options, provider, session)
+}
+
+/// Whether `certificate` names itself as issuer and its own key proves it.
+fn self_signed_root(
+    certificate: &structured_pkix::Certificate<'_>,
+    options: &X509ChainOptions<'_>,
+    provider: &dyn crate::provider::CryptoProvider,
+    session: &super::pkix::CertificateSession,
+) -> Result<bool, X509ChainError> {
+    issued_by(certificate, certificate, options, provider, session)
+}
+
+/// Whether `issuer` names and proves the signature of `child`.
+fn issued_by(
+    child: &structured_pkix::Certificate<'_>,
+    issuer: &structured_pkix::Certificate<'_>,
+    options: &X509ChainOptions<'_>,
+    provider: &dyn crate::provider::CryptoProvider,
+    session: &super::pkix::CertificateSession,
+) -> Result<bool, X509ChainError> {
     Ok(
-        session.source_names_equal(child.tbs().issuer(), last.tbs().subject())?
+        session.source_names_equal(child.tbs().issuer(), issuer.tbs().subject())?
             && shared_certificate_signature_outcome(
-                &child,
-                last,
+                child,
+                issuer,
                 provider,
                 options.certificate_signature_algorithms,
                 session,
@@ -640,9 +816,9 @@ fn replaceable_untrusted_root(
     )
 }
 
-fn validate_path(
-    path_der: &[&[u8]],
-    info: &impl X509DataSource,
+fn validate_path<'a>(
+    decoded: &[&'a structured_pkix::Certificate<'a>],
+    embedded_crls: &[Vec<u8>],
     options: &X509ChainOptions<'_>,
     execution: (
         &dyn crate::provider::CryptoProvider,
@@ -651,49 +827,22 @@ fn validate_path(
     additional_crls: &[Vec<u8>],
 ) -> Result<super::pkix::ValidatedX509Key, X509ChainError> {
     let (provider, session) = execution;
-    if path_der.len() > options.max_chain_depth {
+    if decoded.len() > options.max_chain_depth {
         return Err(X509ChainError::DepthExceeded(options.max_chain_depth));
     }
+    let Some(&target) = decoded.first() else {
+        return Err(X509ChainError::UntrustedRoot);
+    };
+    target_in_validity(target, options)?;
 
-    let mut decoded = session.memory().vector();
-    for der in path_der {
-        let certificate = session.read(der)?;
-        if decoded.is_empty() {
-            // Fail the target's time gate before examining issuer permissions,
-            // as shared path discovery also does before entering its pool.
-            let at = options.verification_time;
-            let validity = certificate.tbs().validity();
-            if at < validity.not_before().instant() || at > validity.not_after().instant() {
-                return Err(X509ChainError::CertificateNotValid(0));
-            }
-        }
-        decoded.try_push(certificate).map_err(|reason| {
-            X509ChainError::Processing(structured_pkix::Error::resource(
-                reason,
-                "certificate.path",
-                0,
-            ))
-        })?;
-    }
-
-    let anchor_limit = validate_path_profile(&decoded, options, session)?;
+    let anchor_limit = validate_path_profile(decoded, options, session)?;
     let mut effective_key = super::pkix::ValidatedX509Key {
         effective_spki: None,
     };
-    if path_der.len() > 1 {
-        let anchor = decoded.last().expect("nonempty path");
-        let mut chain = session.memory().vector();
-        for certificate in &decoded[..decoded.len() - 1] {
-            chain.try_push(certificate).map_err(|reason| {
-                X509ChainError::Processing(structured_pkix::Error::resource(
-                    reason,
-                    "certificate.path",
-                    0,
-                ))
-            })?;
-        }
-        let facts =
-            super::pkix::validate_supplied_path(&chain, anchor, options, provider, session)?;
+    if let [chain @ .., anchor] = decoded
+        && !chain.is_empty()
+    {
+        let facts = super::pkix::validate_supplied_path(chain, anchor, options, provider, session)?;
         // The anchor is a caller input, excluded by RFC 5280 6.1. Our existing
         // certificate-anchor profile additionally honors its pathLenConstraint.
         // https://www.rfc-editor.org/rfc/rfc5280.html#section-6.1
@@ -713,8 +862,8 @@ fn validate_path(
 
     if options.check_crls {
         super::pkix::verify_crls(
-            &decoded,
-            info.crls(),
+            decoded,
+            embedded_crls,
             additional_crls,
             options,
             provider,
@@ -727,7 +876,7 @@ fn validate_path(
 /// Apply this profile's per-certificate rules along a target-first path;
 /// returns the anchor's pathLenConstraint.
 fn validate_path_profile(
-    decoded: &[structured_pkix::Certificate<'_>],
+    decoded: &[&structured_pkix::Certificate<'_>],
     options: &X509ChainOptions<'_>,
     session: &super::pkix::CertificateSession,
 ) -> Result<Option<u32>, X509ChainError> {
@@ -1376,7 +1525,11 @@ pub(crate) fn shared_certificate_signature_outcome(
     session: &super::pkix::CertificateSession,
 ) -> Result<structured_pkix::path::Verified, X509ChainError> {
     use structured_pkix::path::{EffectiveKey, Verify as _};
-    let verifier = super::pkix::ProviderVerifier { provider, allowed };
+    let verifier = super::pkix::ProviderVerifier {
+        provider,
+        allowed,
+        edges: Some(session.edges()),
+    };
     verifier
         .verify(
             &certificate.tbs().signature(),
