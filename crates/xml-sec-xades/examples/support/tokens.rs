@@ -26,15 +26,12 @@ fn character_references(text: &str) -> String {
             };
             Some((char::from_u32(value)?, end))
         });
-        match decoded {
-            Some((character, end)) => {
-                found.push(character);
-                rest = &after[end + 1..];
-            }
-            None => {
-                found.push_str("&#");
-                rest = after;
-            }
+        if let Some((character, end)) = decoded {
+            found.push(character);
+            rest = &after[end + 1..];
+        } else {
+            found.push_str("&#");
+            rest = after;
         }
     }
     found.push_str(rest);

@@ -45,7 +45,9 @@ use xml_sec::xmldsig::{
     KeyResolverConfig, ResolvedVerificationKey, SignatureAlgorithm, SignatureEvidence,
     VerificationKey, VerificationRequest, VerifyContext, VerifyingKey, with_verified_request,
 };
-use xml_sec_xades::{Inputs, Level, Outcome, Requirements, validate, validate_basic};
+use xml_sec_xades::{
+    EnclosingError, Inputs, Level, Outcome, Requirements, ValidationError, validate, validate_basic,
+};
 
 type Failure = Box<dyn std::error::Error>;
 
@@ -830,9 +832,17 @@ fn integrity(
     let run = with_verified_request(document, &context, request, account, |session| {
         for (index, entry) in session.evidence().signatures().iter().enumerate() {
             let declared = declared.get(index).unwrap_or(&unknown);
+            // EN 319 132-1 §5.2.7.2: a CounterSignature property's signature
+            // shall reference the embedding signature's SignatureValue; one
+            // that does not is not of the format (EN 319 102-1 §5.2.2).
+            let malformed = matches!(
+                validate_basic(&session, entry.identity(), &[], |_| ()),
+                Err(ValidationError::Enclosing(error))
+                    if matches!(*error, EnclosingError::Counter(_))
+            );
             found.push((
                 verification(entry),
-                etsi::indication(&session, entry.result(), declared, inputs),
+                etsi::indication(&session, entry.result(), declared, inputs, malformed),
             ));
         }
         Ok(())

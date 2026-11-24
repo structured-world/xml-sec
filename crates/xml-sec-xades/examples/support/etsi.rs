@@ -1140,11 +1140,14 @@ fn own_materials(declared: &Declared, signer: &Certificate<'_>, memory: &Memory)
 
 /// The ETSI indication of one signature verified in `session` (whose policy
 /// trusts every carried key directly, so `result` is its integrity alone).
+/// `malformed` says the signature does not conform to its format (clause
+/// 5.2.2), which clause 5.3.4 step 1 decides first.
 pub fn indication<W: structured_asn1::memory::Work>(
     session: &VerifiedSession<'_, '_, '_, W>,
     result: &Result<VerifyResult, xml_sec::xmldsig::DsigError>,
     declared: &Declared,
     inputs: &Inputs<'_>,
+    malformed: bool,
 ) -> Value {
     let result = match result {
         Ok(result) => result,
@@ -1185,7 +1188,11 @@ pub fn indication<W: structured_asn1::memory::Work>(
         elements = elements.with(Element::SigningCertificate);
     }
     let facts = Facts {
-        format: Format::Conformant,
+        format: if malformed {
+            Format::Malformed
+        } else {
+            Format::Conformant
+        },
         context: Context::Ready,
         signer: Some(Signer {
             not_before,
