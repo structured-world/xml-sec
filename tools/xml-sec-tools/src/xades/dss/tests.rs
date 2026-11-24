@@ -1,10 +1,12 @@
 use super::newest_release;
 
 fn metadata(versions: &[&str]) -> String {
-    let listed: String = versions
-        .iter()
-        .map(|version| format!("<version>{version}</version>"))
-        .collect();
+    let listed = versions.iter().fold(String::new(), |mut listed, version| {
+        listed.push_str("<version>");
+        listed.push_str(version);
+        listed.push_str("</version>");
+        listed
+    });
     format!(
         "<metadata><versioning><release>{}</release><versions>{listed}</versions></versioning></metadata>",
         versions.last().copied().unwrap_or_default()
