@@ -219,12 +219,16 @@ fn declarations(text: &str) -> Vec<etsi::Declared> {
                 && node.ancestors().any(|ancestor| is(&ancestor, "KeyInfo"))
             {
                 declared.key_info.extend(base64(*node));
-            } else if is(node, "EncapsulatedTimeStamp")
-                && node
-                    .parent()
-                    .is_some_and(|parent| is(&parent, "SignatureTimeStamp"))
-            {
-                declared.signature_timestamps.extend(base64(*node));
+            } else if is(node, "EncapsulatedTimeStamp") {
+                let list = match node.parent().map(|parent| parent.tag_name().name()) {
+                    Some("SignatureTimeStamp") => &mut declared.signature_timestamps,
+                    Some("SigAndRefsTimeStamp" | "RefsOnlyTimeStamp") => {
+                        &mut declared.validation_timestamps
+                    }
+                    Some("ArchiveTimeStamp") => &mut declared.archive_timestamps,
+                    _ => continue,
+                };
+                list.extend(base64(*node));
             }
         }
         found.push(declared);
@@ -567,11 +571,12 @@ fn facts(xml: &str, anchors: &Path, at: i64, profile: PolicyProfile) -> Result<V
     Ok(facts)
 }
 
-/// Sets each signature's [`etsi::Declared::timestamps_intact`]: xml-sec-xades
-/// validates B-T at the earliest signature timestamp's generation time,
-/// where the signer's path can still validate, and so establishes each
-/// token's imprint, TSA signature and TSA path at its generation time once,
-/// for the ETSI process to place against the validation time.
+/// Sets each signature's [`etsi::Declared::timestamps_intact`] and
+/// [`etsi::Declared::archive_intact`]: xml-sec-xades validates B-T and B-LTA
+/// at the latest token's generation time, since it refuses any token
+/// generated after the time it validates at, and so establishes each token's
+/// imprint and TSA signature once, for the ETSI process to place against the
+/// validation time.
 fn establish_timestamps(
     document: &XmlDocument,
     request: &VerificationRequest<'_>,
@@ -581,9 +586,15 @@ fn establish_timestamps(
 ) -> Result<(), Failure> {
     let Some(at) = declared
         .iter()
-        .flat_map(|declared| &declared.signature_timestamps)
-        .filter_map(|token| etsi::token_facts(token).map(|(generated, _)| generated))
-        .min()
+        .flat_map(|declared| {
+            declared
+                .signature_timestamps
+                .iter()
+                .chain(&declared.validation_timestamps)
+                .chain(&declared.archive_timestamps)
+        })
+        .filter_map(|token| etsi::token_details(token).map(|token| token.generated))
+        .max()
     else {
         return Ok(());
     };
@@ -611,11 +622,38 @@ fn establish_timestamps(
             if entry.result().is_err() || declared.signature_timestamps.is_empty() {
                 continue;
             }
-            declared.timestamps_intact = match validate(&session, entry.identity(), &inputs, met) {
-                Ok(Outcome::Assessed(met)) => Some(met),
-                Ok(Outcome::Timestamp { .. }) => Some(false),
+            let established = |requirements| match validate(
+                &session,
+                entry.identity(),
+                &Inputs {
+                    requirements,
+                    ..inputs
+                },
+                met,
+            ) {
+                // Every token's imprint and signature are checked before
+                // their paths, statuses and the level's requirements, which
+                // are the ETSI process's to judge; a token whose own checks
+                // failed is refused as Rejected. A refusal before the tokens
+                // (the signer's path, a countersignature, the hashes)
+                // establishes nothing about them.
+                Ok(Outcome::Timestamp {
+                    failure: xml_sec_xades::TimestampFailure::Rejected,
+                    ..
+                }) => Some(false),
+                Ok(
+                    Outcome::Assessed(_)
+                    | Outcome::Timestamp { .. }
+                    | Outcome::Status(_)
+                    | Outcome::Credential { .. }
+                    | Outcome::Renewal { .. },
+                ) => Some(true),
                 _ => None,
             };
+            declared.timestamps_intact = established(Requirements::Timestamped);
+            if !declared.archive_timestamps.is_empty() {
+                declared.archive_intact = established(Requirements::Archival);
+            }
         }
         Ok(())
     });

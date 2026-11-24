@@ -7,10 +7,14 @@
 //! shared PKIX and LTV mechanisms with the verification's own verifiers, and
 //! the cryptographic material the profile's constraints judge.
 
+#[path = "etsi_long_term.rs"]
+mod long_term;
+
 use serde_json::{Value, json};
 use structured_asn1::memory::Memory;
 use structured_ltv::pki::status::{self as revocation, Query, Responder, Source, Status};
 use structured_ltv::pki::{CheckedPath, CrlAuthority, PathOutcome};
+use structured_ltv::validation::SubIndication;
 use structured_ltv::validation::{
     Anchor as Trust, Chain, Changes, Context, Element, Elements, Facts, Family, Format, Hash,
     Material, Order, Path as EtsiPath, Recognition, Reference, Requirements, RevocationIssuer,
@@ -47,6 +51,13 @@ pub struct Declared {
     /// signature (imprint, TSA signature and TSA path at its generation
     /// time, EN 319 132-1 B-T), when it could validate the signature at all.
     pub timestamps_intact: Option<bool>,
+    /// Each `SigAndRefsTimeStamp` and `RefsOnlyTimeStamp` token, DER.
+    pub validation_timestamps: Vec<Vec<u8>>,
+    /// Each `ArchiveTimeStamp` token, DER.
+    pub archive_timestamps: Vec<Vec<u8>>,
+    /// Whether xml-sec-xades established the archive timestamps (B-LTA),
+    /// when it could validate the signature at all.
+    pub archive_intact: Option<bool>,
 }
 
 /// The conditions and constraints every signature of one comparison shares.
@@ -477,7 +488,7 @@ fn status_of<'a, W: structured_asn1::memory::Work>(
     inputs: &Inputs<'_>,
     now: Instant,
     memory: &Memory,
-) -> (Status, Vec<RevocationIssuer>) {
+) -> (Status, Vec<RevocationIssuer>, Vec<Record>) {
     let anchor_subject = path
         .anchor()
         .certificate()
@@ -553,25 +564,56 @@ fn status_of<'a, W: structured_asn1::memory::Work>(
     let digest = session.cms_provider();
     match revocation::assess(path, member, &sources, &query, &context, &verifier, &digest) {
         Ok(assessment) => {
-            let issuers = assessment
-                .statements()
-                .iter()
-                .filter_map(|statement| match statement.authentication? {
-                    revocation::Authentication::Crl { signer, .. }
-                    | revocation::Authentication::Ocsp { signer, .. } => Some(signer),
-                })
-                .map(|signer| {
-                    let (not_before, not_after) = validity(signer);
-                    RevocationIssuer {
-                        not_before,
-                        not_after,
-                    }
-                })
-                .collect();
-            (assessment.status(), issuers)
+            let (issuers, records) = statements(assessment.statements());
+            (assessment.status(), issuers, records)
         }
-        Err(_) => (Status::NoEvidence, Vec::new()),
+        Err(_) => (Status::NoEvidence, Vec::new(), Vec::new()),
     }
+}
+
+/// The certificates that authenticated `statements`, and each statement
+/// that knows the status as historical evidence (clause 5.6.2.1).
+fn statements(statements: &[revocation::Statement<'_>]) -> (Vec<RevocationIssuer>, Vec<Record>) {
+    let mut issuers = Vec::new();
+    let mut records = Vec::new();
+    for statement in statements {
+        let Some(
+            revocation::Authentication::Crl { signer, .. }
+            | revocation::Authentication::Ocsp { signer, .. },
+        ) = statement.authentication
+        else {
+            continue;
+        };
+        let (not_before, not_after) = validity(signer);
+        issuers.push(RevocationIssuer {
+            not_before,
+            not_after,
+        });
+        let revoked = match statement.finding {
+            revocation::Finding::NotRevoked(_) => None,
+            revocation::Finding::Revoked(revoked) => Some((revoked.at.instant(), revoked.reason)),
+            _ => continue,
+        };
+        records.push(Record {
+            source: statement.sources.primary,
+            signer: signer.as_bytes().to_vec(),
+            issued: statement.issued.instant(),
+            revoked,
+        });
+    }
+    (issuers, records)
+}
+
+/// One authenticated status statement about one path member, as the
+/// long-term process reads it: its source (CRLs first, then OCSP responses,
+/// in the document's order), the certificate that signed it, when it was
+/// issued and what it says.
+#[derive(Debug, Clone)]
+struct Record {
+    source: usize,
+    signer: Vec<u8>,
+    issued: Instant,
+    revoked: Option<(Instant, Option<structured_pkix::crl::Reason>)>,
 }
 
 /// Every checked path that ends at a CA member of `path` or at a responder
@@ -584,25 +626,53 @@ fn authority_paths<'a, W: structured_asn1::memory::Work>(
     at: Instant,
     memory: &Memory,
 ) -> Vec<CheckedPath<'a>> {
+    // Each authority path is checked where all its members are valid, as
+    // close to `at` as they allow: a responder certificate usually lives far
+    // shorter than the chain it answers for.
+    let checked_within = |path: &[&'a Certificate<'a>]| {
+        let (from, until) = path
+            .iter()
+            .fold(validity(path[0]), |(from, until), member| {
+                let (start, end) = validity(member);
+                (from.max(start), until.min(end))
+            });
+        (from <= until)
+            .then(|| check(session, path, anchor, at.max(from).min(until), memory))
+            .flatten()
+    };
     let mut found = Vec::new();
     // The CA members, each with the part of the chain above it.
     for start in 1..chain.len() {
-        if let Some(path) = check(session, &chain[start..], anchor, at, memory) {
+        if let Some(path) = checked_within(&chain[start..]) {
             found.push(path);
         }
     }
-    // Delegated responders the responses carry, issued by a chain member or
-    // the anchor (RFC 6960 4.2.2.2).
-    for response in &parsed.responses {
-        for responder in response.certificates() {
-            // Below each CA member, or directly below the anchor.
-            for start in 1..=chain.len() {
-                let mut delegated = vec![responder];
-                delegated.extend_from_slice(&chain[start..]);
-                if let Some(path) = check(session, &delegated, anchor, at, memory) {
-                    found.push(path);
-                    break;
-                }
+    // Delegated responders, issued by a chain member or the anchor (RFC 6960
+    // 4.2.2.2): a response may carry its responder's certificate, or the
+    // document may incorporate it with the other validation data.
+    let mut responders: Vec<&'a Certificate<'a>> = Vec::new();
+    for responder in parsed
+        .responses
+        .iter()
+        .flat_map(BasicResponse::certificates)
+        .chain(&parsed.pool)
+    {
+        let known = responders
+            .iter()
+            .chain(chain)
+            .any(|other| other.as_bytes() == responder.as_bytes());
+        if !known {
+            responders.push(responder);
+        }
+    }
+    for responder in responders {
+        // Below each CA member, or directly below the anchor.
+        for start in 1..=chain.len() {
+            let mut delegated = vec![responder];
+            delegated.extend_from_slice(&chain[start..]);
+            if let Some(path) = checked_within(&delegated) {
+                found.push(path);
+                break;
             }
         }
     }
@@ -620,6 +690,21 @@ struct PathFacts {
     signer_status: Status,
     /// Why each rejected chain was rejected, for review.
     rejections: Vec<String>,
+    /// Every chain the shared processor accepts inside the signing
+    /// certificate's validity, as past certificate validation reads it
+    /// (clause 5.6.2.1): a chain that fails only at the validation time is
+    /// still a historical candidate.
+    history: Vec<History>,
+}
+
+/// One historical candidate chain: its result, the intersection of its
+/// members' validity (shell model) and each non-anchor member, issuer to
+/// target, with its status statements.
+#[derive(Debug)]
+struct History {
+    chain: Chain,
+    validity: (Instant, Instant),
+    members: Vec<(Vec<u8>, Vec<Record>)>,
 }
 
 impl PathFacts {
@@ -676,6 +761,7 @@ fn path_facts<'a, W: structured_asn1::memory::Work>(
         issuers: Vec::new(),
         signer_status: Status::NoEvidence,
         rejections: Vec::new(),
+        history: Vec::new(),
     };
     if parsed
         .anchors
@@ -696,13 +782,24 @@ fn path_facts<'a, W: structured_asn1::memory::Work>(
         return facts;
     }
     let (not_before, not_after) = validity(signer);
-    // Clause 5.2.6.4 step 4 validates the chain apart from the signing
-    // certificate's own validity period, which step 7 checks: the chain is
-    // checked inside that period, and every other member is held to `now`
-    // (shell model).
-    let chain_time = now.max(not_before).min(not_after);
     let mut accepted = false;
     for (chain, anchor) in candidates(signer, parsed, memory) {
+        // The chain is checked where all its members are valid, as close to
+        // `now` as they allow: clause 5.2.6.4 step 4 leaves the signing
+        // certificate's own validity to step 7, the shell model holds every
+        // other member to `now` below, and past certificate validation
+        // (clause 5.6.2.1) needs the chain at the times it was valid.
+        let (from, until) = chain
+            .iter()
+            .fold((not_before, not_after), |(from, until), member| {
+                let (start, end) = validity(member);
+                (from.max(start), until.min(end))
+            });
+        if from > until {
+            facts.rejected("the members of the chain are never valid together".into());
+            continue;
+        }
+        let chain_time = now.max(from).min(until);
         let checked = match checked(session, &chain, anchor, chain_time, memory) {
             Ok(checked) => checked,
             Err(reason) => {
@@ -710,82 +807,194 @@ fn path_facts<'a, W: structured_asn1::memory::Work>(
                 continue;
             }
         };
-        if !chain.iter().skip(1).all(|member| {
+        let members_valid = chain.iter().skip(1).all(|member| {
             let (from, until) = validity(member);
             from <= now && now <= until
-        }) {
-            facts.rejected("a CA member is outside its validity at the validation time".into());
-            continue;
-        }
+        });
         let authorities = authority_paths(session, &chain, anchor, parsed, chain_time, memory);
-        let count = checked.members().len();
-        let mut own_signer = Status::NoEvidence;
-        let (mut statuses, mut issuers, mut materials) = (Vec::new(), Vec::new(), Vec::new());
-        for member in 0..count {
-            let (status, used) = status_of(
-                session,
-                &checked,
-                member,
-                parsed,
-                &authorities,
-                inputs,
-                now,
-                memory,
-            );
-            issuers.extend(used);
-            if member + 1 == count {
-                own_signer = status;
-            } else {
-                statuses.push(status);
-            }
-            // The issuer's key signed this member: its scheme is the
-            // certificate's material (clause 5.2.6.4 step 6). Certificate
-            // hashes are not restricted by the profiles.
-            let issuer = member
-                .checked_sub(1)
-                .map_or(anchor, |previous| checked.members()[previous].certificate());
-            materials.push(Material {
-                hash: None,
-                scheme: Some(scheme_of(issuer, Family::RsaPkcs1, memory).unwrap_or(UNKNOWN_SCHEME)),
-            });
-        }
+        let members = member_facts(
+            session,
+            &checked,
+            anchor,
+            parsed,
+            &authorities,
+            inputs,
+            now,
+            memory,
+        );
         if !accepted {
-            facts.signer_status = own_signer;
+            facts.signer_status = members.signer;
         }
         // Step 4 includes revocation checking for each certificate of the
         // chain; with no status at all RFC 5280 6.1.3(a)(3) is not
         // established, so path validation fails "with any other reason"
         // (step 4(e)), while a status that exists but is stale or on hold is
-        // the process's own TRY_LATER (steps 4(a) and 4(c)).
-        let undetermined = statuses
+        // the process's own TRY_LATER (steps 4(a) and 4(c)). A CA member
+        // outside its validity at the validation time fails the shell model.
+        let undetermined = members
+            .statuses
             .iter()
-            .chain([&own_signer])
+            .chain([&members.signer])
             .any(|status| matches!(status, Status::NoEvidence));
-        facts.chains.push(if undetermined {
+        if !members_valid {
+            facts
+                .rejections
+                .push("a CA member is outside its validity at the validation time".into());
+        }
+        facts.chains.push(if undetermined || !members_valid {
             Chain::GeneralFailure
         } else {
             Chain::Valid
         });
-        facts.statuses.push(statuses);
-        facts.issuers.push(issuers);
-        facts.materials.push(materials);
+        facts.statuses.push(members.statuses);
+        facts.issuers.push(members.issuers);
+        facts.materials.push(members.materials);
+        let intersection = chain
+            .iter()
+            .fold((not_before, not_after), |(from, until), member| {
+                let (start, end) = validity(member);
+                (from.max(start), until.min(end))
+            });
+        facts.history.push(History {
+            chain: Chain::Valid,
+            validity: intersection,
+            members: members.history,
+        });
         accepted = true;
     }
     facts
 }
 
-/// A timestamp token's `genTime` as Unix seconds and the certificates its
-/// signed data carries (RFC 3161 2.4.2), read without checking anything.
-pub fn token_facts(token: &[u8]) -> Option<(i64, Vec<Vec<u8>>)> {
+/// The facts of every non-anchor member of one checked chain.
+struct MemberFacts {
+    statuses: Vec<Status>,
+    issuers: Vec<RevocationIssuer>,
+    materials: Vec<Material>,
+    signer: Status,
+    history: Vec<(Vec<u8>, Vec<Record>)>,
+}
+
+/// Each member's status at `now` (the target's apart), the issuers of the
+/// statements read, the material of each certificate signature and each
+/// member's statements for past validation.
+#[expect(clippy::too_many_arguments, reason = "one frozen input each")]
+fn member_facts<'a, W: structured_asn1::memory::Work>(
+    session: &VerifiedSession<'_, '_, '_, W>,
+    checked: &CheckedPath<'a>,
+    anchor: &'a Certificate<'a>,
+    parsed: &'a Parsed<'a>,
+    authorities: &[CheckedPath<'a>],
+    inputs: &Inputs<'_>,
+    now: Instant,
+    memory: &Memory,
+) -> MemberFacts {
+    let count = checked.members().len();
+    let mut facts = MemberFacts {
+        statuses: Vec::new(),
+        issuers: Vec::new(),
+        materials: Vec::new(),
+        signer: Status::NoEvidence,
+        history: Vec::new(),
+    };
+    for member in 0..count {
+        let (status, used, records) = status_of(
+            session,
+            checked,
+            member,
+            parsed,
+            authorities,
+            inputs,
+            now,
+            memory,
+        );
+        facts.issuers.extend(used);
+        if member + 1 == count {
+            facts.signer = status;
+        } else {
+            facts.statuses.push(status);
+        }
+        let certificate = checked.members()[member].certificate();
+        facts
+            .history
+            .push((certificate.as_bytes().to_vec(), records));
+        // The issuer's key signed this member: its scheme is the
+        // certificate's material (clause 5.2.6.4 step 6). Certificate hashes
+        // are not restricted by the profiles.
+        let issuer = member
+            .checked_sub(1)
+            .map_or(anchor, |previous| checked.members()[previous].certificate());
+        facts.materials.push(Material {
+            hash: None,
+            scheme: Some(scheme_of(issuer, Family::RsaPkcs1, memory).unwrap_or(UNKNOWN_SCHEME)),
+        });
+    }
+    facts
+}
+
+/// What a timestamp token states, read without checking anything.
+pub struct TokenFacts {
+    /// `genTime`, Unix seconds.
+    pub generated: i64,
+    /// The certificates its signed data carries (RFC 3161 2.4.2).
+    pub certificates: Vec<Vec<u8>>,
+    /// The `messageImprint` hash function.
+    pub imprint: Hash,
+}
+
+/// The DER contents of the hash OIDs a `messageImprint` may name.
+const IMPRINT_HASHES: [(&[u8], Hash); 8] = [
+    (&[0x2b, 0x0e, 0x03, 0x02, 0x1a], Hash::Sha1),
+    (
+        &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x04],
+        Hash::Sha224,
+    ),
+    (
+        &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01],
+        Hash::Sha256,
+    ),
+    (
+        &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02],
+        Hash::Sha384,
+    ),
+    (
+        &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03],
+        Hash::Sha512,
+    ),
+    (
+        &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x08],
+        Hash::Sha3_256,
+    ),
+    (
+        &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x09],
+        Hash::Sha3_384,
+    ),
+    (
+        &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x0a],
+        Hash::Sha3_512,
+    ),
+];
+
+/// [`TokenFacts`] of `token`.
+pub fn token_details(token: &[u8]) -> Option<TokenFacts> {
     use std::sync::Arc;
     use structured_asn1::memory::MemoryAccount;
     let parser =
         structured_asn1::Parser::ber(Memory::new(Arc::new(MemoryAccount::new(1 << 24, 1 << 28))));
     let read = structured_cms::timestamp::Token::read(&parser, token, 0).ok()?;
     let parent = parser.read(&[], 0).ok()?;
-    let generated = read
+    let (generated, imprint) = read
         .with_info(&parent, |info, _, _| {
-            Ok::<_, core::convert::Infallible>(info.gen_time().start().seconds())
+            let imprint = match info.imprint().algorithm() {
+                structured_cms::timestamp::HashAlgorithmReading::Identifier(identifier) => {
+                    let oid = identifier.algorithm();
+                    IMPRINT_HASHES
+                        .iter()
+                        .find(|(known, _)| *known == oid.as_bytes())
+                        .map_or(Hash::Other, |(_, hash)| *hash)
+                }
+                structured_cms::timestamp::HashAlgorithmReading::Malformed { .. } => Hash::Other,
+            };
+            Ok::<_, core::convert::Infallible>((info.gen_time().start().seconds(), imprint))
         })
         .ok()?;
     let certificates = read
@@ -794,7 +1003,11 @@ pub fn token_facts(token: &[u8]) -> Option<(i64, Vec<Vec<u8>>)> {
         .iter()
         .map(|certificate| certificate.as_bytes().to_vec())
         .collect();
-    Some((generated, certificates))
+    Some(TokenFacts {
+        generated,
+        certificates,
+        imprint,
+    })
 }
 
 /// The TSA of a token: the leaf of the certificates it carries, found in
@@ -826,7 +1039,12 @@ fn signature_timestamps<W: structured_asn1::memory::Work>(
 ) -> Vec<SignatureTimestamp> {
     let mut found = Vec::new();
     for token in &declared.signature_timestamps {
-        let Some((generated, carried)) = token_facts(token) else {
+        let Some(TokenFacts {
+            generated,
+            certificates: carried,
+            ..
+        }) = token_details(token)
+        else {
             continue;
         };
         match declared.timestamps_intact {
@@ -994,27 +1212,200 @@ pub fn indication<W: structured_asn1::memory::Work>(
         changes: Changes::NotApplicable,
         now,
     };
-    match structured_ltv::validation::validate(&facts, inputs.requirements, &memory) {
-        Ok(outcome) => {
-            let indication = screaming(&format!("{:?}", outcome.indication));
-            let sub = outcome.sub.map(|sub| {
-                let debug = format!("{sub:?}");
-                if debug.starts_with("Custom") {
-                    "CUSTOM".to_owned()
-                } else {
-                    screaming(&debug)
-                }
-            });
-            json!({
-                "indication": indication,
-                "sub": sub,
-                "basis": outcome.basis.map(|basis| format!("{basis:?}")),
-                "chains": format!("{:?}", paths.chains),
-                "rejections": paths.rejections,
-                "timestamps": format!("{:?} {stamps:?}", declared.timestamps_intact),
-                "revocation": format!("{:?} {:?}", paths.signer_status, paths.statuses),
+    let context = TokenContext {
+        session,
+        parsed: &parsed,
+        inputs,
+        now,
+        memory: &memory,
+        catalogue: &long_term::Catalogue {
+            tokens: declared.signature_timestamps.len()
+                + declared.validation_timestamps.len()
+                + declared.archive_timestamps.len(),
+            certificates: parsed.pool.iter().chain(&parsed.anchors).collect(),
+            sources: parsed.crls.len() + parsed.responses.len(),
+        },
+    };
+    let mut rendered = context.long_term(&facts, signer, &paths, declared);
+    rendered["detail"] = json!({
+        "chains": format!("{:?}", paths.chains),
+        "rejections": paths.rejections,
+        "timestamps": format!(
+            "{:?}/{:?} {stamps:?}",
+            declared.timestamps_intact, declared.archive_intact
+        ),
+        "revocation": format!("{:?} {:?}", paths.signer_status, paths.statuses),
+    });
+    rendered
+}
+
+/// A completed ETSI decision in DSS's spelling.
+fn decided(decision: long_term::Decision, basis: &str) -> Value {
+    let indication = screaming(&format!("{:?}", decision.indication()));
+    let sub = match decision {
+        long_term::Decision::Passed => None,
+        long_term::Decision::Finding(sub) => {
+            let debug = format!("{sub:?}");
+            Some(if debug.starts_with("Custom") {
+                "CUSTOM".to_owned()
+            } else {
+                screaming(&debug)
             })
         }
-        Err(error) => verdict("INDETERMINATE", Some("CUSTOM"), format!("{error:?}")),
+    };
+    json!({ "indication": indication, "sub": sub, "basis": basis })
+}
+
+/// What establishing one signature's timestamp tokens reads.
+struct TokenContext<'s, 'a, 'v, 'x, 'i, W: structured_asn1::memory::Work> {
+    session: &'s VerifiedSession<'v, 'x, 'i, W>,
+    parsed: &'a Parsed<'a>,
+    inputs: &'a Inputs<'a>,
+    now: Instant,
+    memory: &'a Memory,
+    catalogue: &'a long_term::Catalogue<'a>,
+}
+
+impl<W: structured_asn1::memory::Work> TokenContext<'_, '_, '_, '_, '_, W> {
+    /// Clause 5.6 over `current` (the basic and with-time facts), the
+    /// signer's historical chains and every token the signature carries.
+    fn long_term(
+        &self,
+        current: &Facts<'_>,
+        signer: &Certificate<'_>,
+        paths: &PathFacts,
+        declared: &Declared,
+    ) -> Value {
+        let mut tokens = Vec::new();
+        let mut pasts = vec![long_term::past(
+            long_term::Catalogue::VALUE,
+            signer,
+            &paths.history,
+            self.catalogue,
+        )];
+        self.tokens(declared, &mut tokens, &mut pasts);
+        let long_term_attributes = !tokens.is_empty() || self.catalogue.sources > 0;
+        match long_term::validate(
+            current,
+            self.inputs.requirements,
+            self.catalogue,
+            &pasts,
+            &mut tokens,
+            long_term_attributes,
+            self.memory,
+        ) {
+            Ok((decision, stage)) => decided(decision, &format!("{stage:?}")),
+            Err(error) => verdict("INDETERMINATE", Some("CUSTOM"), error),
+        }
+    }
+
+    /// Every token of `declared` the long-term process can place, with its
+    /// TSA's past-validation inputs appended to `pasts`. A token xml-sec-xades
+    /// refused has a broken imprint or signature (clause 5.4 via 5.2.7); one
+    /// it could not judge is left out.
+    fn tokens(
+        &self,
+        declared: &Declared,
+        tokens: &mut Vec<long_term::Token>,
+        pasts: &mut Vec<long_term::Past>,
+    ) {
+        let signature = declared.signature_timestamps.len();
+        let validation = declared.validation_timestamps.len();
+        let kinds = declared
+            .signature_timestamps
+            .iter()
+            .map(|token| (token, declared.timestamps_intact))
+            .chain(
+                declared
+                    .validation_timestamps
+                    .iter()
+                    .map(|token| (token, declared.timestamps_intact)),
+            )
+            .chain(
+                declared
+                    .archive_timestamps
+                    .iter()
+                    .map(|token| (token, declared.archive_intact)),
+            );
+        let generated: Vec<Option<i64>> = declared
+            .signature_timestamps
+            .iter()
+            .chain(&declared.validation_timestamps)
+            .chain(&declared.archive_timestamps)
+            .map(|token| token_details(token).map(|facts| facts.generated))
+            .collect();
+        for (index, (der, intact)) in kinds.enumerate() {
+            let (Some(facts), Some(intact)) = (token_details(der), intact) else {
+                continue;
+            };
+            let object = long_term::Catalogue::token(index);
+            // EN 319 132-1: a signature timestamp covers the signature
+            // value; SigAndRefs and RefsOnly timestamps also cover the
+            // signature timestamps; an archive timestamp covers all of these,
+            // the earlier archive timestamps and the incorporated validation
+            // data.
+            let mut covered = vec![long_term::Covered::Direct(long_term::Catalogue::VALUE)];
+            if index >= signature {
+                covered.extend(
+                    (0..signature).map(|other| {
+                        long_term::Covered::Direct(long_term::Catalogue::token(other))
+                    }),
+                );
+            }
+            if index >= signature + validation {
+                covered.extend(
+                    (signature..signature + validation).map(|other| {
+                        long_term::Covered::Direct(long_term::Catalogue::token(other))
+                    }),
+                );
+                covered.extend(
+                    (signature + validation..generated.len())
+                        .filter(|other| {
+                            generated[*other].is_some_and(|time| time < facts.generated)
+                        })
+                        .map(|other| {
+                            long_term::Covered::Direct(long_term::Catalogue::token(other))
+                        }),
+                );
+                covered.extend(self.catalogue.material().map(long_term::Covered::Direct));
+            }
+            let tsa = authority(&facts.certificates, self.parsed, self.memory);
+            let current = if !intact {
+                long_term::Decision::Finding(SubIndication::HashFailure)
+            } else if let Some(outcome) = tsa.and_then(|tsa| {
+                authority_outcome(
+                    self.session,
+                    tsa,
+                    self.parsed,
+                    self.inputs,
+                    self.now,
+                    self.memory,
+                )
+            }) {
+                long_term::Decision::from(outcome)
+            } else {
+                continue;
+            };
+            let past = tsa.map(|tsa| {
+                let history = path_facts(
+                    self.session,
+                    tsa,
+                    self.parsed,
+                    self.inputs,
+                    self.now,
+                    self.memory,
+                )
+                .history;
+                pasts.push(long_term::past(object, tsa, &history, self.catalogue));
+                pasts.len() - 1
+            });
+            tokens.push(long_term::Token {
+                object,
+                facts,
+                current,
+                covered,
+                past,
+            });
+        }
     }
 }
