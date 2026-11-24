@@ -105,8 +105,12 @@ final class Lifecycle {
         var verifier = new CommonCertificateVerifier();
         verifier.setAIASource(null);
         var trusted = new CommonTrustedCertificateSource();
-        for (var anchor : anchors) {
-            trusted.addCertificate(DSSUtils.loadCertificate(anchor));
+        for (var index = 0; index < anchors.size(); index++) {
+            try {
+                trusted.addCertificate(DSSUtils.loadCertificate(anchors.get(index)));
+            } catch (RuntimeException error) {
+                throw new IllegalArgumentException("anchor " + index + " cannot be loaded", error);
+            }
         }
         verifier.setTrustedCertSources(trusted);
         var certificates = new CommonCertificateSource();

@@ -55,14 +55,37 @@ fn account() -> Memory {
     Memory::new(Arc::new(MemoryAccount::new(1 << 27, 1 << 33)))
 }
 
+/// Whether the key of `certificate` decodes as its algorithm defines it. A
+/// trust anchor's public key is part of its information (RFC 5280 §6.1.1
+/// (d)), so a certificate whose key does not decode anchors nothing for
+/// either validator.
+fn readable_key(certificate: &Certificate<'_>, account: &Memory) -> bool {
+    use structured_pkix::key::{ec, rsa};
+    let info = certificate.tbs().public_key();
+    let algorithm = info.algorithm().algorithm();
+    if algorithm == structured_pkix::oid::EC_PUBLIC_KEY {
+        ec::read(structured_pkix::path::EffectiveKey::standing(info), account).is_ok()
+    } else if algorithm == structured_pkix::oid::RSA_ENCRYPTION
+        || algorithm == structured_pkix::oid::RSASSA_PSS
+    {
+        rsa::read(info, account).is_ok()
+    } else {
+        true
+    }
+}
+
 /// Where the chain of `certificate` ends among `pool`: it is self-issued, or
-/// `pool` holds no other certificate naming its issuer.
+/// `pool` holds no other certificate naming its issuer. Only a certificate
+/// whose key decodes is such an end.
 fn terminal(certificate: &[u8], pool: &[Vec<u8>]) -> bool {
     let account = account();
     let parser = Parser::der(account.clone());
     let Ok(parsed) = Certificate::read(&parser, certificate, 0) else {
         return false;
     };
+    if !readable_key(&parsed, &account) {
+        return false;
+    }
     let issuer = parsed.tbs().issuer();
     let names = |other: &Certificate<'_>| {
         other
