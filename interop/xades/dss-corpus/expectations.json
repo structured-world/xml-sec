@@ -1623,10 +1623,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signing certificate's certificatePolicies carries a userNotice explicitText encoded as VisibleString with UTF-8 octets, which VisibleString does not admit (X.680, ISO 646 repertoire). A recognized extension must be processed (RFC 5280 section 4.2), so xml-sec rejects the certificate and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS ignores the malformed text and reports the expiry."
       },
       "instant/extended": {
         "observed": [
@@ -1640,10 +1641,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signing certificate's certificatePolicies carries a userNotice explicitText encoded as VisibleString with UTF-8 octets, which VisibleString does not admit (X.680, ISO 646 repertoire). A recognized extension must be processed (RFC 5280 section 4.2), so xml-sec rejects the certificate and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS ignores the malformed text and reports the expiry."
       },
       "instant/conformant": {
         "observed": [
@@ -1657,10 +1659,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signing certificate's certificatePolicies carries a userNotice explicitText encoded as VisibleString with UTF-8 octets, which VisibleString does not admit (X.680, ISO 646 repertoire). A recognized extension must be processed (RFC 5280 section 4.2), so xml-sec rejects the certificate and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS ignores the malformed text and reports the expiry."
       }
     },
     "dss-xades/src/test/resources/validation/Signature-X-BG-1.xml": {
@@ -4534,10 +4537,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec refuses that CRL, the root's list for the intermediate CA, and with it the assessment of the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
       },
       "instant/extended": {
         "observed": [
@@ -4551,10 +4555,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec refuses that CRL, the root's list for the intermediate CA, and with it the assessment of the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
       },
       "instant/conformant": {
         "observed": [
@@ -4568,10 +4573,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec refuses that CRL, the root's list for the intermediate CA, and with it the assessment of the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
       }
     },
     "dss-xades/src/test/resources/validation/dss1788/dss1788-noCertProvided.xml": {
@@ -4640,10 +4646,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec refuses that CRL, the root's list for the intermediate CA, and with it the assessment of the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
       },
       "instant/extended": {
         "observed": [
@@ -4657,10 +4664,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec refuses that CRL, the root's list for the intermediate CA, and with it the assessment of the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
       },
       "instant/conformant": {
         "observed": [
@@ -4674,10 +4682,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec refuses that CRL, the root's list for the intermediate CA, and with it the assessment of the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
       }
     },
     "dss-xades/src/test/resources/validation/dss1788/dss1920-cert-in-certValues-without-publicKey.xml": {
@@ -4693,10 +4702,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec refuses that CRL, the root's list for the intermediate CA, and with it the assessment of the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
       },
       "instant/extended": {
         "observed": [
@@ -4710,10 +4720,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec refuses that CRL, the root's list for the intermediate CA, and with it the assessment of the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
       },
       "instant/conformant": {
         "observed": [
@@ -4727,10 +4738,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec refuses that CRL, the root's list for the intermediate CA, and with it the assessment of the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
       }
     },
     "dss-xades/src/test/resources/validation/dss1788/dss1920-cert-in-certValues.xml": {
@@ -4746,10 +4758,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec refuses that CRL, the root's list for the intermediate CA, and with it the assessment of the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
       },
       "instant/extended": {
         "observed": [
@@ -4763,10 +4776,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec refuses that CRL, the root's list for the intermediate CA, and with it the assessment of the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
       },
       "instant/conformant": {
         "observed": [
@@ -4780,10 +4794,11 @@
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec refuses that CRL, the root's list for the intermediate CA, and with it the assessment of the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
       }
     },
     "dss-xades/src/test/resources/validation/dss1811-multi-algo.xml": {
