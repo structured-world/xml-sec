@@ -260,7 +260,11 @@ pub fn refusal(kind: &str, detail: &str) -> Value {
     match kind {
         // Clause 5.2.7.4 step 1: the signed data cannot be obtained.
         "Reference" => verdict("INDETERMINATE", Some("SIGNED_DATA_NOT_FOUND"), detail),
-        _ if detail.contains("unsupported algorithm") => {
+        // A mechanism this build lacks is not a finding about the signature
+        // (Table 6 names none for it).
+        _ if detail.contains("unsupported algorithm")
+            || detail.contains("unsupported elliptic curve") =>
+        {
             verdict("INDETERMINATE", Some("CUSTOM"), detail)
         }
         // Clause 5.3.4 step 2: no key and no certificate identify the signer.
