@@ -76,7 +76,7 @@ fn each_block_compares_with_its_own_fact() {
     assert_eq!(blocks["XCV"]["dss"], "INDETERMINATE");
     assert_eq!(blocks["XCV"]["ours"], "pass");
     assert_eq!(blocks["XCV"]["agrees"], false);
-    assert_eq!(automatic_class(&rows, false, 1), "unreviewed");
+    assert_eq!(automatic_class(&rows, 1), "unreviewed");
     assert_eq!(observed(&rows)[0]["XCV"], "INDETERMINATE/pass");
 }
 
@@ -109,7 +109,7 @@ fn agreement_is_the_overall_indication_and_sub_indication() {
     facts["etsi"] = json!({ "indication": "INDETERMINATE", "sub": "TRY_LATER" });
     let rows = compare(&signatures, &[facts.clone()], true);
     assert_eq!(rows[0]["blocks"]["XCV"]["agrees"], false);
-    assert_eq!(automatic_class(&rows, false, 1), "agreement");
+    assert_eq!(automatic_class(&rows, 1), "agreement");
     assert_eq!(
         observed(&rows)[0]["OVERALL"],
         "INDETERMINATE:TRY_LATER/INDETERMINATE:TRY_LATER"
@@ -117,7 +117,7 @@ fn agreement_is_the_overall_indication_and_sub_indication() {
     facts["etsi"]["sub"] = json!("CERTIFICATE_CHAIN_GENERAL_FAILURE");
     let rows = compare(&signatures, &[facts], true);
     assert_eq!(rows[0]["overall"]["indication"], true);
-    assert_eq!(automatic_class(&rows, false, 1), "unreviewed");
+    assert_eq!(automatic_class(&rows, 1), "unreviewed");
 }
 
 #[test]
@@ -136,12 +136,31 @@ fn an_unmatched_or_missing_signature_never_counts_as_agreement() {
     other["id"] = json!("elsewhere");
     let rows = compare(&signatures, &[other], true);
     assert_eq!(rows[0]["matched"], false);
-    assert_eq!(automatic_class(&rows, false, 1), "unreviewed");
-    // Neither side found a signature: the input is not one.
-    assert_eq!(automatic_class(&[], true, 0), "not-a-signature");
+    assert_eq!(automatic_class(&rows, 1), "unreviewed");
+    // Neither side found a signature, whether DSS refused the input or
+    // reported none: the input is not one.
+    assert_eq!(
+        automatic_class(&compare(&[], &[], true), 0),
+        "not-a-signature"
+    );
     // A document without a chain to anchor is classified as such.
     let agreeing = compare(&signatures, &[verified()], true);
-    assert_eq!(automatic_class(&agreeing, false, 0), "no-usable-anchor");
+    assert_eq!(automatic_class(&agreeing, 0), "no-usable-anchor");
+}
+
+#[test]
+fn a_signature_only_xml_sec_reads_stays_a_difference() {
+    // DSS reporting no signature must not hide one xml-sec validated: it is
+    // compared against an absent one, so the input is neither in agreement
+    // nor "not a signature".
+    let mut facts = verified();
+    facts["etsi"] = json!({ "indication": "TOTAL_PASSED" });
+    let rows = compare(&[], &[facts], true);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["matched"], false);
+    assert_eq!(rows[0]["overall"]["dss"], "absent:-");
+    assert_eq!(rows[0]["overall"]["ours"], "TOTAL_PASSED:-");
+    assert_eq!(automatic_class(&rows, 1), "unreviewed");
 }
 
 #[test]
@@ -251,33 +270,74 @@ fn the_dss_policy_takes_the_profiles_cryptography_and_keeps_the_rest() {
     }
 }
 
+/// A summary of `a.xml` whose two profiles observe the same unreviewed
+/// overall difference.
+fn unreviewed_summary() -> Value {
+    let pass = json!({
+        "observed": [{ "XCV": "INDETERMINATE/pass", "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:TRY_LATER" }],
+        "class": "unreviewed",
+    });
+    json!({ "cases": { "a.xml": { "instant/strict": pass, "instant/conformant": pass } } })
+}
+
+fn review(class: &str, reason: &str) -> Value {
+    json!({ "a.xml": [{
+        "overall": ["TOTAL_PASSED:-/INDETERMINATE:TRY_LATER"],
+        "class": class,
+        "reason": reason,
+    }] })
+}
+
 #[test]
 fn a_reviewed_difference_needs_a_class_and_a_reason() {
-    let summary = json!({ "cases": { "a.xml": { "instant": {
-        "observed": [{ "XCV": "INDETERMINATE/pass" }], "class": "unreviewed"
-    } } } });
-    let expected = |class: &str, reason: Option<&str>| {
-        json!({ "cases": { "a.xml": { "instant": {
-            "observed": [{ "XCV": "INDETERMINATE/pass" }], "class": class, "reason": reason
-        } } } })
-    };
-    assert_eq!(
-        differences(&expected("unreviewed", None), &summary).len(),
-        1
-    );
-    assert_eq!(
-        differences(&expected("normative-difference", None), &summary).len(),
-        1
-    );
-    let reviewed = expected(
+    let summary = unreviewed_summary();
+    let none = json!({});
+    // Nobody reviewed it: recording keeps it unreviewed and the check fails
+    // for each pass.
+    let unreviewed = super::recorded(&summary, &none);
+    assert_eq!(differences(&unreviewed, &summary, &none).len(), 2);
+    // A review without a reason does not classify.
+    let unreasoned = review("normative-difference", "");
+    let recorded = super::recorded(&summary, &unreasoned);
+    assert_eq!(differences(&recorded, &summary, &unreasoned).len(), 2);
+    // One review covers every pass that observes its overall comparison.
+    let reviews = review(
         "normative-difference",
-        Some("EN 319 102-1 5.2.6: revocation status"),
+        "EN 319 102-1 5.2.6.4 step 4: revocation status",
     );
-    assert_eq!(differences(&reviewed, &summary), Vec::<String>::new());
+    let recorded = super::recorded(&summary, &reviews);
+    assert_eq!(
+        recorded["cases"]["a.xml"]["instant/strict"]["class"],
+        "normative-difference"
+    );
+    assert_eq!(
+        differences(&recorded, &summary, &reviews),
+        Vec::<String>::new()
+    );
+    // Expectations not recorded with the current reviews fail.
+    assert_eq!(differences(&unreviewed, &summary, &reviews).len(), 2);
     // A changed observation or an unlisted input fails whatever its class.
-    let changed = json!({ "cases": { "a.xml": { "instant": {
-        "observed": [{ "XCV": "PASSED/pass" }], "class": "agreement"
-    } } } });
-    assert_eq!(differences(&changed, &summary).len(), 1);
-    assert_eq!(differences(&json!({ "cases": {} }), &summary).len(), 1);
+    let mut changed = recorded.clone();
+    changed["cases"]["a.xml"]["instant/strict"]["observed"] =
+        json!([{ "XCV": "PASSED/pass", "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-" }]);
+    assert_eq!(differences(&changed, &summary, &reviews).len(), 1);
+    assert_eq!(
+        differences(&json!({ "cases": {} }), &summary, &reviews).len(),
+        2
+    );
+}
+
+#[test]
+fn a_review_no_observation_matches_fails() {
+    // A review whose comparison is no longer observed would otherwise
+    // outlive the difference it explains.
+    let summary = unreviewed_summary();
+    let reviews = json!({ "a.xml": [
+        { "overall": ["TOTAL_PASSED:-/INDETERMINATE:TRY_LATER"], "class": "dss-deviation", "reason": "r" },
+        { "overall": ["TOTAL_PASSED:-/TOTAL_FAILED:HASH_FAILURE"], "class": "dss-deviation", "reason": "r" },
+    ] });
+    let recorded = super::recorded(&summary, &reviews);
+    let found = differences(&recorded, &summary, &reviews);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("matches no observation"), "{found:?}");
 }

@@ -11,11 +11,12 @@
 //! path at that instant and the document carries no timestamp, a second pair
 //! of runs takes its claimed signing time, labelled `signing-time`.
 //!
-//! `interop/xades/dss-corpus/expectations.json` holds the reviewed
-//! classification of every input; a run that observes another comparison,
-//! or an input it does not list, fails. `--record` writes the observations
-//! for review instead, keeping the reviewed classes and reasons of inputs
-//! whose comparison did not change.
+//! `interop/xades/dss-corpus/expectations.json` holds the classification of
+//! every input; a run that observes another comparison, or an input it does
+//! not list, fails. `interop/xades/dss-corpus/reviews.json` holds the reviews
+//! of differences, each for one input's overall comparison, so one review
+//! covers every pass and profile that observes it. `--record` writes the
+//! observations with the reviews that apply instead of checking them.
 
 use super::{Build, Corpus, absolute, line, write_json, xml};
 use serde_json::{Map, Value, json};
@@ -55,6 +56,53 @@ const REVIEWED: [&str; 4] = [
 
 fn expectations_path(corpus: &Corpus) -> PathBuf {
     corpus.package().join("dss-corpus/expectations.json")
+}
+
+fn reviews_path(corpus: &Corpus) -> PathBuf {
+    corpus.package().join("dss-corpus/reviews.json")
+}
+
+/// The reviews of differences, by input; none when the file is absent.
+fn read_reviews(path: &Path) -> Result<Value, String> {
+    if !path.exists() {
+        return Ok(json!({}));
+    }
+    serde_json::from_str(&xml::read(path)?).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// The overall comparison of each signature of one pass's observation.
+fn overall_of(observed: &Value) -> Value {
+    Value::Array(
+        observed
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|row| row["OVERALL"].clone())
+            .collect(),
+    )
+}
+
+/// The review of input `name` written for the overall comparison `observed`
+/// shows.
+fn review_for<'r>(reviews: &'r Value, name: &str, observed: &Value) -> Option<&'r Value> {
+    let overall = overall_of(observed);
+    reviews[name]
+        .as_array()?
+        .iter()
+        .find(|review| review["overall"] == overall)
+}
+
+/// `pass` as an expectation: a difference nobody classified automatically
+/// takes the class and reason of the review written for it.
+fn applied(pass: &Value, review: Option<&Value>) -> Value {
+    let mut entry = pass.clone();
+    if pass["class"] == "unreviewed"
+        && let Some(review) = review
+    {
+        entry["class"] = review["class"].clone();
+        entry["reason"] = review["reason"].clone();
+    }
+    entry
 }
 
 /// The sparse checkout of the corpus at the DSS tag `release`, under the
@@ -334,50 +382,72 @@ fn agrees(dss: &str, ours: &str) -> bool {
 
 /// The per-block comparison of one input: one entry per signature, matched by
 /// the `Id` of its `ds:Signature`, or by position when an `Id` is missing.
+/// A signature only xml-sec reads stands against an absent one.
 pub(crate) fn compare(dss: &[Value], ours: &[Value], stamped: bool) -> Vec<Value> {
     let mut rows = Vec::new();
+    let mut paired = vec![false; ours.len()];
     for (index, signature) in dss.iter().enumerate() {
         let id = signature["id"].as_str();
-        let matched = ours
+        let position = ours
             .iter()
-            .find(|facts| id.is_some() && facts["id"].as_str() == id)
-            .or_else(|| ours.get(index).filter(|_| id.is_none()));
-        let mine = matched.map_or_else(Map::new, |facts| our_blocks(facts, stamped));
-        let spelled = |value: &Value| {
-            format!(
-                "{}:{}",
-                value["indication"].as_str().unwrap_or("absent"),
-                value["sub"].as_str().unwrap_or("-")
-            )
-        };
-        let theirs = &signature["overall"];
-        let ours = matched.map_or(Value::Null, |facts| facts["etsi"].clone());
-        let overall = json!({
-            "dss": spelled(theirs),
-            "ours": spelled(&ours),
-            "indication": matched.is_some() && theirs["indication"] == ours["indication"],
-            "agrees": matched.is_some() && spelled(theirs) == spelled(&ours),
-        });
-        let mut blocks = Map::new();
-        for name in BLOCKS {
-            let theirs = signature["blocks"][name].as_str().unwrap_or("absent");
-            let verdict = mine
-                .get(name)
-                .and_then(|verdict| verdict["verdict"].as_str())
-                .unwrap_or("absent");
-            blocks.insert(
-                name.into(),
-                json!({ "dss": theirs, "ours": verdict, "agrees": agrees(theirs, verdict) }),
-            );
+            .position(|facts| id.is_some() && facts["id"].as_str() == id)
+            .or_else(|| (id.is_none() && index < ours.len()).then_some(index));
+        if let Some(position) = position {
+            paired[position] = true;
         }
-        rows.push(json!({
-            "id": id,
-            "matched": matched.is_some(),
-            "blocks": blocks,
-            "overall": overall,
-        }));
+        rows.push(row(
+            signature,
+            position.map(|position| &ours[position]),
+            stamped,
+        ));
+    }
+    for (facts, _) in ours.iter().zip(&paired).filter(|(_, paired)| !**paired) {
+        let absent = json!({ "id": facts["id"], "blocks": {} });
+        let mut row = row(&absent, Some(facts), stamped);
+        row["matched"] = false.into();
+        row["overall"]["indication"] = false.into();
+        row["overall"]["agrees"] = false.into();
+        rows.push(row);
     }
     rows
+}
+
+/// The comparison of one DSS signature with its counterpart, if any.
+fn row(signature: &Value, matched: Option<&Value>, stamped: bool) -> Value {
+    let mine = matched.map_or_else(Map::new, |facts| our_blocks(facts, stamped));
+    let spelled = |value: &Value| {
+        format!(
+            "{}:{}",
+            value["indication"].as_str().unwrap_or("absent"),
+            value["sub"].as_str().unwrap_or("-")
+        )
+    };
+    let theirs = &signature["overall"];
+    let ours = matched.map_or(Value::Null, |facts| facts["etsi"].clone());
+    let overall = json!({
+        "dss": spelled(theirs),
+        "ours": spelled(&ours),
+        "indication": matched.is_some() && theirs["indication"] == ours["indication"],
+        "agrees": matched.is_some() && spelled(theirs) == spelled(&ours),
+    });
+    let mut blocks = Map::new();
+    for name in BLOCKS {
+        let theirs = signature["blocks"][name].as_str().unwrap_or("absent");
+        let verdict = mine
+            .get(name)
+            .and_then(|verdict| verdict["verdict"].as_str())
+            .unwrap_or("absent");
+        blocks.insert(
+            name.into(),
+            json!({ "dss": theirs, "ours": verdict, "agrees": agrees(theirs, verdict) }),
+        );
+    }
+    json!({
+        "id": signature["id"],
+        "matched": matched.is_some(),
+        "blocks": blocks,
+        "overall": overall,
+    })
 }
 
 /// The comparison a reviewer classifies: per signature, each block as
@@ -418,10 +488,10 @@ pub(crate) fn observed(rows: &[Value]) -> Value {
 
 /// The class a comparison takes without review: every signature reaches
 /// DSS's overall indication and sub-indication (the building blocks are the
-/// diagnosis of a difference, not the verdict), both sides found no
+/// diagnosis of a difference, not the verdict), neither side found a
 /// signature, or the document carries no anchor.
-pub(crate) fn automatic_class(rows: &[Value], dss_error: bool, anchors: u64) -> &'static str {
-    if dss_error && rows.is_empty() {
+pub(crate) fn automatic_class(rows: &[Value], anchors: u64) -> &'static str {
+    if rows.is_empty() {
         return "not-a-signature";
     }
     if anchors == 0 {
@@ -562,30 +632,24 @@ impl Pass<'_> {
 }
 
 /// Reads one pass of one case under the profile `label` into its comparison
-/// rows, whether DSS refused the input, and our facts.
-fn pass_rows(
-    directory: &Path,
-    label: &str,
-    stamped: bool,
-) -> Result<(Vec<Value>, bool, Value), String> {
+/// rows and our facts.
+fn pass_rows(directory: &Path, label: &str, stamped: bool) -> Result<(Vec<Value>, Value), String> {
     let dss = directory.join(label).join("dss");
     let facts: Value = serde_json::from_str(&xml::read(&directory.join(label).join("facts.json"))?)
         .map_err(|error| error.to_string())?;
     let ours = facts["signatures"].as_array().cloned().unwrap_or_default();
-    if dss.join("error.txt").exists() {
-        // DSS read no signature: each of ours stands against an absent one.
-        let absent: Vec<Value> = ours
-            .iter()
-            .map(|facts| json!({ "id": facts["id"], "blocks": {} }))
-            .collect();
-        return Ok((compare(&absent, &ours, stamped), true, facts));
-    }
-    let signatures = dss_signatures(
-        &xml::read(&dss.join("diagnostic.xml"))?,
-        &xml::read(&dss.join("detailed.xml"))?,
-        &xml::read(&dss.join("simple.xml"))?,
-    )?;
-    Ok((compare(&signatures, &ours, stamped), false, facts))
+    // DSS refusing the input read no signature: each of ours stands against
+    // an absent one.
+    let signatures = if dss.join("error.txt").exists() {
+        Vec::new()
+    } else {
+        dss_signatures(
+            &xml::read(&dss.join("diagnostic.xml"))?,
+            &xml::read(&dss.join("detailed.xml"))?,
+            &xml::read(&dss.join("simple.xml"))?,
+        )?
+    };
+    Ok((compare(&signatures, &ours, stamped), facts))
 }
 
 /// Whether no signature of a pass reached a validated path.
@@ -654,12 +718,12 @@ fn observations(
                 continue;
             }
             for (profile, _) in PROFILES {
-                let (rows, dss_error, facts) = pass_rows(&pass, profile, stamped)?;
+                let (rows, facts) = pass_rows(&pass, profile, stamped)?;
                 row.insert(
                     format!("{label}/{profile}"),
                     json!({
                         "observed": observed(&rows),
-                        "class": automatic_class(&rows, dss_error, anchors),
+                        "class": automatic_class(&rows, anchors),
                         "passed": every_passed(&rows, "ours")
                             && facts["signatures"].as_array().is_some_and(|s| !s.is_empty()),
                         "dss_passed": every_passed(&rows, "dss"),
@@ -729,17 +793,18 @@ fn execute(corpus: &Corpus, results: &Path, record: bool) -> Result<(), String> 
     });
     write_json(&results.join("summary.json"), &summary)?;
     let path = expectations_path(corpus);
+    let reviews = read_reviews(&reviews_path(corpus))?;
     if record {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
-        let expectations = recorded(&summary, &path);
+        let expectations = recorded(&summary, &reviews);
         write_json(&path, &expectations)?;
         return super::write(&report_path(corpus), report(&expectations));
     }
     let expected: Value = serde_json::from_str(&xml::read(&path)?)
         .map_err(|error| format!("{}: {error}", path.display()))?;
-    let mut found = differences(&expected, &summary);
+    let mut found = differences(&expected, &summary, &reviews);
     if xml::read(&report_path(corpus)).ok() != Some(report(&expected)) {
         found.push("docs/eu-dss-corpus.md is not the report of the expectations".into());
     }
@@ -849,33 +914,45 @@ fn report_path(corpus: &Corpus) -> PathBuf {
     corpus.root.join("docs/eu-dss-corpus.md")
 }
 
-/// `summary` as expectations, keeping the reviewed class and reason of every
-/// pass whose observed comparison is unchanged in `previous`.
-pub(crate) fn recorded(summary: &Value, previous: &Path) -> Value {
-    let previous: Value = xml::read(previous)
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or(Value::Null);
+/// `summary` as expectations, each pass with the review written for it.
+pub(crate) fn recorded(summary: &Value, reviews: &Value) -> Value {
     let mut cases = Map::new();
     for (name, passes) in summary["cases"].as_object().into_iter().flatten() {
         let mut row = Map::new();
         for (label, pass) in passes.as_object().into_iter().flatten() {
-            let old = &previous["cases"][name][label];
-            let mut entry = pass.clone();
-            if old["observed"] == pass["observed"] && !old["reason"].is_null() {
-                entry["class"] = old["class"].clone();
-                entry["reason"] = old["reason"].clone();
-            }
-            row.insert(label.clone(), entry);
+            let review = review_for(reviews, name, &pass["observed"]);
+            row.insert(label.clone(), applied(pass, review));
         }
         cases.insert(name.clone(), Value::Object(row));
     }
     json!({ "dss": summary["dss"], "instant": summary["instant"], "cases": cases })
 }
 
-/// Every way `summary` differs from the reviewed `expected` classification.
-pub(crate) fn differences(expected: &Value, summary: &Value) -> Vec<String> {
+/// Every review that no pass of its input observes any more.
+fn stale_reviews(summary: &Value, reviews: &Value) -> Vec<String> {
     let mut found = Vec::new();
+    for (name, list) in reviews.as_object().into_iter().flatten() {
+        for review in list.as_array().into_iter().flatten() {
+            let observed = summary["cases"][name]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .any(|(_, pass)| overall_of(&pass["observed"]) == review["overall"]);
+            if !observed {
+                found.push(format!(
+                    "{name}: the review of {} matches no observation",
+                    review["overall"]
+                ));
+            }
+        }
+    }
+    found
+}
+
+/// Every way `summary` differs from the `expected` classification recorded
+/// with `reviews`.
+pub(crate) fn differences(expected: &Value, summary: &Value, reviews: &Value) -> Vec<String> {
+    let mut found = stale_reviews(summary, reviews);
     let reviewed = &expected["cases"];
     for (name, passes) in summary["cases"].as_object().into_iter().flatten() {
         for (label, pass) in passes.as_object().into_iter().flatten() {
@@ -888,6 +965,13 @@ pub(crate) fn differences(expected: &Value, summary: &Value) -> Vec<String> {
                 found.push(format!(
                     "{name} {label}: observed {} where {} is expected",
                     pass["observed"], entry["observed"]
+                ));
+                continue;
+            }
+            let current = applied(pass, review_for(reviews, name, &pass["observed"]));
+            if entry["class"] != current["class"] || entry["reason"] != current["reason"] {
+                found.push(format!(
+                    "{name} {label}: the expectations were not recorded with the reviews"
                 ));
                 continue;
             }
