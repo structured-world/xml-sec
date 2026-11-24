@@ -11,7 +11,8 @@ owns loading, inheritance and effective-output behavior; the
 `schema_version = 1` and `profiles` are the only root fields. Each
 `profiles.NAME` contains exactly one of `base` or `extends` and optional
 `verification`, `signing`, `encryption`, `decryption` tables. `base` accepts
-`Modern`, `SecureSaml`, `WsSecurity`, `Xades`, `XmlSecCompatible`, `LegacyVerify`.
+`Modern`, `SecureSaml`, `WsSecurity`, `Xades`, `XadesExtended`, `XadesConformant`,
+`XmlSecCompatible`, `LegacyVerify`.
 `extends` names another profile in the same document. Missing parents and
 cycles fail. All profiles are validated, not only the selected one.
 

@@ -11,7 +11,23 @@ conformance, certificate trust deployment or every XAdES signature level.
 | `SecureSaml` | SAML signature placement, restricted references/transforms and explicit authenticated target coverage |
 | `WsSecurity` | SOAP Security-header placement and explicit authenticated target coverage |
 | `Xades` | Typed, authenticated SignedProperties references and explicit target coverage |
+| `XadesExtended` | `Xades` plus the XPath and XPath Filter 2.0 transforms; their references keep transformed-data coverage |
+| `XadesConformant` | `XadesExtended` plus verification of every signature ETSI EN 319 132-1 and XMLDSig 1.1 define: SHA-1 based methods and digests, RSA and DSA keys from 1024 bits and `KeyValue` keys; signing stays modern |
 | `LegacyVerify` | Verification only, requiring an auditable, expiring caller authorization |
+
+The strict signature profiles (`Modern`, `WsSecurity`, `Xades`) admit the
+enveloped-signature, Base64 and canonicalization transforms; `SecureSaml`
+admits only enveloped-signature and exclusive canonicalization (SAML Core
+§5.4.4). No modern profile admits XSLT.
+
+The three XAdES profiles are one chain of policy values, not three
+mechanisms: `XadesConformant` restricted by the `XadesExtended` policies
+compiles to exactly `XadesExtended`, which restricted by the `Xades` policies
+compiles to exactly `Xades`. A deployment that needs a point between them
+starts from the wider profile and narrows it with layers. A weak algorithm
+`XadesConformant` verifies is reported as a fact for the caller's
+acceptability assessment (EN 319 102-1 §5.2.8), never as an acceptance of
+the signature's purpose.
 
 `PolicyCompiler` composes complete `PolicySet` layers in system, application,
 then tenant order. Permissions intersect, strength minima increase, resource

@@ -68,6 +68,8 @@ fn all_ordinary_profiles_round_trip_effective_policy() {
         "SecureSaml",
         "WsSecurity",
         "Xades",
+        "XadesExtended",
+        "XadesConformant",
     ] {
         let config = Configuration::from_str(
             &format!("schema_version=1\n[profiles.team]\nbase='{base}'"),

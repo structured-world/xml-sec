@@ -1465,6 +1465,113 @@ fn strict_profiles_admit_the_base64_transform_but_no_node_set_selection() {
 }
 
 #[test]
+fn each_xades_profile_is_the_wider_one_restricted_by_its_policies() {
+    // A named profile is only a set of policy values: restricting the wider
+    // profile by the narrower one's policies compiles to exactly the narrower
+    // profile, so a deployment reaches any of them with layers alone.
+    for (wider, narrower) in [
+        (PolicyProfile::XadesConformant, PolicyProfile::XadesExtended),
+        (PolicyProfile::XadesExtended, PolicyProfile::Xades),
+    ] {
+        let layer = compiler(narrower).policies().clone();
+        let restricted = compiler(wider)
+            .restrict(&layer)
+            .unwrap()
+            .compile(&context())
+            .unwrap();
+        let named = compiler(narrower).compile(&context()).unwrap();
+        assert_eq!(
+            format!("{:?}", restricted.verification()),
+            format!("{:?}", named.verification()),
+            "{wider:?} -> {narrower:?} verification"
+        );
+        assert_eq!(
+            format!("{:?}", restricted.signing()),
+            format!("{:?}", named.signing()),
+            "{wider:?} -> {narrower:?} signing"
+        );
+    }
+}
+
+#[test]
+fn the_xades_profiles_widen_one_step_at_a_time() {
+    // Xades, XadesExtended and XadesConformant differ in exactly the values
+    // their contracts name: node-set transforms, then SHA-1 based
+    // verification, 1024-bit keys and KeyValue keys. Signing stays modern.
+    use xml_sec::policy::KeySourceKind;
+    use xml_sec::xmldsig::{DigestAlgorithm, SignatureAlgorithm};
+    let compiled = |profile| compiler(profile).compile(&context()).unwrap();
+    let (strict, extended, conformant) = (
+        compiled(PolicyProfile::Xades),
+        compiled(PolicyProfile::XadesExtended),
+        compiled(PolicyProfile::XadesConformant),
+    );
+    let transforms = |policies: &xml_sec::policy::CompiledPolicies, uri: &str| {
+        policies
+            .verification()
+            .unwrap()
+            .transforms
+            .allowed_algorithms
+            .as_ref()
+            .is_some_and(|methods| methods.contains(uri))
+    };
+    for uri in [
+        "http://www.w3.org/TR/1999/REC-xpath-19991116",
+        "http://www.w3.org/2002/06/xmldsig-filter2",
+    ] {
+        assert!(!transforms(&strict, uri), "{uri}");
+        assert!(transforms(&extended, uri), "{uri}");
+        assert!(transforms(&conformant, uri), "{uri}");
+    }
+    for policies in [&strict, &extended, &conformant] {
+        assert!(!transforms(
+            policies,
+            "http://www.w3.org/TR/1999/REC-xslt-19991116"
+        ));
+    }
+    let verifies = |policies: &xml_sec::policy::CompiledPolicies, method| {
+        policies
+            .verification()
+            .unwrap()
+            .signature_algorithms
+            .as_ref()
+            .is_some_and(|methods| methods.contains(&method))
+    };
+    assert!(!verifies(&extended, SignatureAlgorithm::RsaSha1));
+    assert!(verifies(&conformant, SignatureAlgorithm::RsaSha1));
+    assert!(!verifies(&conformant, SignatureAlgorithm::HmacSha1));
+    let digests = |policies: &xml_sec::policy::CompiledPolicies| {
+        policies
+            .verification()
+            .unwrap()
+            .digest_algorithms
+            .clone()
+            .unwrap()
+    };
+    assert!(!digests(&extended).contains(&DigestAlgorithm::Sha1));
+    assert!(digests(&conformant).contains(&DigestAlgorithm::Sha1));
+    let trust = |policies: &xml_sec::policy::CompiledPolicies| {
+        policies.verification().unwrap().key_trust.clone()
+    };
+    assert_eq!(
+        trust(&extended).rsa_keys.minimum_modulus_bits,
+        trust(&strict).rsa_keys.minimum_modulus_bits
+    );
+    assert_eq!(trust(&conformant).rsa_keys.minimum_modulus_bits, 1024);
+    let sources =
+        |policies: &xml_sec::policy::CompiledPolicies| policies.verification().unwrap().key_sources;
+    assert!(!sources(&extended).contains(KeySourceKind::KeyValue));
+    assert!(sources(&conformant).contains(KeySourceKind::KeyValue));
+    // Signing is the same modern set in all three.
+    for policies in [&extended, &conformant] {
+        assert_eq!(
+            format!("{:?}", policies.signing().unwrap().signature_algorithms),
+            format!("{:?}", strict.signing().unwrap().signature_algorithms)
+        );
+    }
+}
+
+#[test]
 fn incompatible_protocols_and_interpretation_models_reject_composition() {
     // Restriction cannot silently change which document bytes an ID names.
     let saml = compiler(PolicyProfile::SecureSaml);

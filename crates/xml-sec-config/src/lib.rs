@@ -95,6 +95,8 @@ enum Base {
     SecureSaml,
     WsSecurity,
     Xades,
+    XadesExtended,
+    XadesConformant,
     LegacyVerify,
 }
 
@@ -106,6 +108,8 @@ impl Base {
             Self::SecureSaml => PolicyProfile::SecureSaml,
             Self::WsSecurity => PolicyProfile::WsSecurity,
             Self::Xades => PolicyProfile::Xades,
+            Self::XadesExtended => PolicyProfile::XadesExtended,
+            Self::XadesConformant => PolicyProfile::XadesConformant,
             Self::LegacyVerify => PolicyProfile::LegacyVerify,
         }
     }
