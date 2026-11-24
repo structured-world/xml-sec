@@ -35,9 +35,11 @@ use structured_pkix::temporal::LeapTable;
 use xml_sec::XmlDocument;
 use xml_sec::document::NodeIdentity;
 use xml_sec::policy::{
-    Instant, PolicyCompileContext, PolicyCompiler, PolicyProfile, VerificationPolicy,
+    Instant, PolicyCompileContext, PolicyCompiler, PolicyProfile, SignatureConstraints,
+    VerificationPolicy,
 };
 use xml_sec::provider::RustCryptoProvider;
+use xml_sec::xmldsig::UriTypeSet;
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DigestAlgorithm, DsigError, KeyInfo, KeyInfoSource, KeyResolver,
     KeyResolverConfig, ResolvedVerificationKey, SignatureAlgorithm, SignatureEvidence,
@@ -217,6 +219,12 @@ fn declarations(text: &str) -> Vec<etsi::Declared> {
                 && node.ancestors().any(|ancestor| is(&ancestor, "KeyInfo"))
             {
                 declared.key_info.extend(base64(*node));
+            } else if is(node, "EncapsulatedTimeStamp")
+                && node
+                    .parent()
+                    .is_some_and(|parent| is(&parent, "SignatureTimeStamp"))
+            {
+                declared.signature_timestamps.extend(base64(*node));
             }
         }
         found.push(declared);
@@ -502,6 +510,14 @@ fn facts(xml: &str, anchors: &Path, at: i64, profile: PolicyProfile) -> Result<V
         expected_targets: &expected,
         ..VerificationRequest::default()
     };
+    let mut declared = declarations(&text);
+    establish_timestamps(
+        &document,
+        &request,
+        &account,
+        &inputs(Requirements::Timestamped),
+        &mut declared,
+    )?;
     let rules = rules(&catalogue(&profile_policy(profile, at, true)?)?);
     let crls = tokens::values(&text, "EncapsulatedCRLValue");
     let responses = tokens::values(&text, "EncapsulatedOCSPValue");
@@ -515,14 +531,7 @@ fn facts(xml: &str, anchors: &Path, at: i64, profile: PolicyProfile) -> Result<V
             requirements,
             utc: &utc,
         };
-        integrity(
-            &document,
-            &request,
-            &account,
-            at,
-            &declarations(&text),
-            &etsi_inputs,
-        )
+        integrity(&document, &request, &account, at, &declared, &etsi_inputs)
     })?;
     let verified = with_verified_request(&document, &context, &request, &account, |session| {
         let entries = session.evidence().signatures();
@@ -556,6 +565,67 @@ fn facts(xml: &str, anchors: &Path, at: i64, profile: PolicyProfile) -> Result<V
         facts["request"] = json!({ "error": kind(&debug), "detail": error.to_string() });
     }
     Ok(facts)
+}
+
+/// Sets each signature's [`etsi::Declared::timestamps_intact`]: xml-sec-xades
+/// validates B-T at the earliest signature timestamp's generation time,
+/// where the signer's path can still validate, and so establishes each
+/// token's imprint, TSA signature and TSA path at its generation time once,
+/// for the ETSI process to place against the validation time.
+fn establish_timestamps(
+    document: &XmlDocument,
+    request: &VerificationRequest<'_>,
+    account: &Memory,
+    level_inputs: &Inputs<'_>,
+    declared: &mut [etsi::Declared],
+) -> Result<(), Failure> {
+    let Some(at) = declared
+        .iter()
+        .flat_map(|declared| &declared.signature_timestamps)
+        .filter_map(|token| etsi::token_facts(token).map(|(generated, _)| generated))
+        .min()
+    else {
+        return Ok(());
+    };
+    let anchors: Vec<Vec<u8>> = level_inputs
+        .anchors
+        .iter()
+        .map(|anchor| anchor.to_vec())
+        .collect();
+    let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+        trusted_certs: anchors,
+        ..KeyResolverConfig::default()
+    });
+    let context = VerifyContext::new()
+        .policy(profile_policy(PolicyProfile::XadesConformant, at, true)?)
+        .key_resolver(&resolver);
+    let inputs = Inputs {
+        requirements: Requirements::Timestamped,
+        ..*level_inputs
+    };
+    let run = with_verified_request(document, &context, request, account, |session| {
+        for (index, entry) in session.evidence().signatures().iter().enumerate() {
+            let Some(declared) = declared.get_mut(index) else {
+                continue;
+            };
+            if entry.result().is_err() || declared.signature_timestamps.is_empty() {
+                continue;
+            }
+            declared.timestamps_intact = match validate(&session, entry.identity(), &inputs, met) {
+                Ok(Outcome::Assessed(met)) => Some(met),
+                Ok(Outcome::Timestamp { .. }) => Some(false),
+                _ => None,
+            };
+        }
+        Ok(())
+    });
+    // A refused request establishes no token of any signature.
+    if run.is_err() {
+        for declared in declared.iter_mut() {
+            declared.timestamps_intact = None;
+        }
+    }
+    Ok(())
 }
 
 /// The `XAdES` facts of every baseline level of one verified signature.
@@ -708,9 +778,15 @@ fn integrity(
     inputs: &etsi::Inputs<'_>,
 ) -> Result<Established, Failure> {
     let direct = SigningKeys::new(declared, inputs.pool);
-    let context = VerifyContext::new()
-        .policy(profile_policy(PolicyProfile::XadesConformant, at, false)?)
-        .key_resolver(&direct);
+    // Format checking covers the base format only; conformance to a signature
+    // profile such as XAdES is signature acceptance (EN 319 102-1 5.2.2 NOTE,
+    // 5.2.8), so integrity is established over plain XMLDSig. External
+    // references are admitted: their bytes are supplied to neither validator,
+    // so they are signed data that cannot be obtained (5.2.7.4 step 1).
+    let mut policy = profile_policy(PolicyProfile::XadesConformant, at, false)?;
+    policy.signature_constraints = SignatureConstraints::General;
+    policy.uris.references = UriTypeSet::new(true, true, true);
+    let context = VerifyContext::new().policy(policy).key_resolver(&direct);
     let mut found = Vec::new();
     let unknown = etsi::Declared::default();
     let run = with_verified_request(document, &context, request, account, |session| {

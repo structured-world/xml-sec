@@ -14,7 +14,7 @@ use structured_ltv::pki::{CheckedPath, CrlAuthority, PathOutcome};
 use structured_ltv::validation::{
     Anchor as Trust, Chain, Changes, Context, Element, Elements, Facts, Family, Format, Hash,
     Material, Order, Path as EtsiPath, Recognition, Reference, Requirements, RevocationIssuer,
-    Scheme, Signer, Time, Value as Computed,
+    Scheme, SignatureTimestamp, Signer, Time, Value as Computed,
 };
 use structured_pkix::Certificate;
 use structured_pkix::crl::CertificateList;
@@ -41,6 +41,12 @@ pub struct Declared {
     pub certificate_references: Vec<(Option<DigestAlgorithm>, Vec<u8>)>,
     /// The `KeyInfo/X509Data/X509Certificate` values.
     pub key_info: Vec<Vec<u8>>,
+    /// Each `SignatureTimeStamp` token, DER.
+    pub signature_timestamps: Vec<Vec<u8>>,
+    /// Whether xml-sec-xades established every signature timestamp of this
+    /// signature (imprint, TSA signature and TSA path at its generation
+    /// time, EN 319 132-1 B-T), when it could validate the signature at all.
+    pub timestamps_intact: Option<bool>,
 }
 
 /// The conditions and constraints every signature of one comparison shares.
@@ -211,9 +217,8 @@ pub fn signing_certificate<'c>(
 
 /// The indication of a signature whose integrity the widest profile
 /// established (`computed`), when the compared profile's own verification
-/// refused it with `trust`: a structural refusal is a format failure
-/// (clause 5.3.4 step 1), and a transform, URI or bound refusal is a
-/// constraint of that profile, which clause 5.2.8 applies last, so it
+/// refused it with `trust`: a structural, transform, URI or bound refusal is
+/// a constraint of that profile, which clause 5.2.8 applies last, so it
 /// replaces only a passing indication. Algorithm and key refusals are
 /// already the process's own through the profile's constraints.
 pub fn under_profile(computed: Value, trust: &Value) -> Value {
@@ -258,7 +263,9 @@ pub fn refusal(kind: &str, detail: &str) -> Value {
             Some("NO_SIGNING_CERTIFICATE_FOUND"),
             detail,
         ),
-        "Policy" if structural => verdict("TOTAL_FAILED", Some("FORMAT_FAILURE"), detail),
+        // Conformance to the XAdES profile is signature acceptance, not
+        // format checking (clause 5.2.2 NOTE, 5.2.8).
+        "Policy" if structural => verdict("INDETERMINATE", Some("SIG_CONSTRAINTS_FAILURE"), detail),
         // An implementation bound is not a finding about the signature.
         "Policy" if detail.contains("exceeds policy maximum") => {
             verdict("INDETERMINATE", Some("CUSTOM"), detail)
@@ -616,6 +623,26 @@ struct PathFacts {
 }
 
 impl PathFacts {
+    /// The chains as the process's path inputs, every anchor recognized: the
+    /// comparison's anchors are trusted at every time.
+    fn lend(&self) -> Vec<EtsiPath<'_>> {
+        self.chains
+            .iter()
+            .enumerate()
+            .map(|(index, chain)| EtsiPath {
+                chain: *chain,
+                anchor: Trust {
+                    current: Recognition::Recognized,
+                    over_interval: Recognition::Recognized,
+                },
+                authorities: &self.statuses[index],
+                materials: &self.materials[index],
+                revocation_issuers: &self.issuers[index],
+                revocation_retry: None,
+            })
+            .collect()
+    }
+
     fn rejected(&mut self, reason: String) {
         self.chains.push(Chain::GeneralFailure);
         self.statuses.push(Vec::new());
@@ -747,6 +774,131 @@ fn path_facts<'a, W: structured_asn1::memory::Work>(
     facts
 }
 
+/// A timestamp token's `genTime` as Unix seconds and the certificates its
+/// signed data carries (RFC 3161 2.4.2), read without checking anything.
+pub fn token_facts(token: &[u8]) -> Option<(i64, Vec<Vec<u8>>)> {
+    use std::sync::Arc;
+    use structured_asn1::memory::MemoryAccount;
+    let parser =
+        structured_asn1::Parser::ber(Memory::new(Arc::new(MemoryAccount::new(1 << 24, 1 << 28))));
+    let read = structured_cms::timestamp::Token::read(&parser, token, 0).ok()?;
+    let parent = parser.read(&[], 0).ok()?;
+    let generated = read
+        .with_info(&parent, |info, _, _| {
+            Ok::<_, core::convert::Infallible>(info.gen_time().start().seconds())
+        })
+        .ok()?;
+    let certificates = read
+        .message()
+        .certificates()
+        .iter()
+        .map(|certificate| certificate.as_bytes().to_vec())
+        .collect();
+    Some((generated, certificates))
+}
+
+/// The TSA of a token: the leaf of the certificates it carries, found in
+/// the parsed pool.
+fn authority<'a>(
+    carried: &[Vec<u8>],
+    parsed: &'a Parsed<'a>,
+    memory: &Memory,
+) -> Option<&'a Certificate<'a>> {
+    let declared = Declared {
+        key_info: carried.to_vec(),
+        ..Declared::default()
+    };
+    signing_certificate(&declared, &parsed.pool, memory)
+}
+
+/// Each signature timestamp's result at `now` (clause 5.4, as clause 5.5.4
+/// step 3 consumes it): a token xml-sec-xades established passes when its
+/// TSA's certificate validates now, the X.509 building block deciding
+/// otherwise; a token it refused is discarded as one whose imprint does not
+/// bind; one it could not judge is left out.
+fn signature_timestamps<W: structured_asn1::memory::Work>(
+    session: &VerifiedSession<'_, '_, '_, W>,
+    declared: &Declared,
+    parsed: &Parsed<'_>,
+    inputs: &Inputs<'_>,
+    now: Instant,
+    memory: &Memory,
+) -> Vec<SignatureTimestamp> {
+    let mut found = Vec::new();
+    for token in &declared.signature_timestamps {
+        let Some((generated, carried)) = token_facts(token) else {
+            continue;
+        };
+        match declared.timestamps_intact {
+            Some(true) => {
+                let Some(tsa) = authority(&carried, parsed, memory) else {
+                    continue;
+                };
+                let outcome = authority_outcome(session, tsa, parsed, inputs, now, memory);
+                found.push(match outcome.and_then(|outcome| outcome.sub) {
+                    None => SignatureTimestamp::Passed(instant(generated)),
+                    Some(sub) => SignatureTimestamp::Finding {
+                        sub,
+                        required: false,
+                    },
+                });
+            }
+            Some(false) => found.push(SignatureTimestamp::ImprintMismatch),
+            None => {}
+        }
+    }
+    found
+}
+
+/// The basic validation (clause 5.3.4) of a token signed by `tsa`, whose
+/// imprint and signature xml-sec-xades already established: its X.509
+/// building block at `now` decides it.
+fn authority_outcome<W: structured_asn1::memory::Work>(
+    session: &VerifiedSession<'_, '_, '_, W>,
+    tsa: &Certificate<'_>,
+    parsed: &Parsed<'_>,
+    inputs: &Inputs<'_>,
+    now: Instant,
+    memory: &Memory,
+) -> Option<structured_ltv::validation::Outcome> {
+    let paths = path_facts(session, tsa, parsed, inputs, now, memory);
+    let etsi_paths = paths.lend();
+    let (not_before, not_after) = validity(tsa);
+    let facts = Facts {
+        format: Format::Conformant,
+        context: Context::Ready,
+        signer: Some(Signer {
+            not_before,
+            not_after,
+            revocation: paths.signer_status,
+        }),
+        references: &[],
+        value: Computed::Verified,
+        materials: &[],
+        signed_attribute_materials: &[],
+        elements: Elements::NONE,
+        time: Time {
+            after: None,
+            before: None,
+        },
+        content_timestamp: None,
+        paths: &etsi_paths,
+        truncated: false,
+        order: Order::Coherent,
+        signature_timestamp: false,
+        signature_timestamps: &[],
+        claimed_signing_time: None,
+        utc: Some(inputs.utc),
+        changes: Changes::NotApplicable,
+        now,
+    };
+    let requirements = Requirements {
+        elements: Elements::NONE,
+        ..*inputs.requirements
+    };
+    structured_ltv::validation::validate(&facts, &requirements, memory).ok()
+}
+
 /// The signature value's material (its suite, sized by the signing
 /// certificate's key) and each reference digest's, for clause 5.2.8.
 fn own_materials(declared: &Declared, signer: &Certificate<'_>, memory: &Memory) -> Vec<Material> {
@@ -803,22 +955,8 @@ pub fn indication<W: structured_asn1::memory::Work>(
     };
     let (not_before, not_after) = validity(signer);
     let paths = path_facts(session, signer, &parsed, inputs, now, &memory);
-    let etsi_paths: Vec<EtsiPath<'_>> = paths
-        .chains
-        .iter()
-        .enumerate()
-        .map(|(index, chain)| EtsiPath {
-            chain: *chain,
-            anchor: Trust {
-                current: Recognition::Recognized,
-                over_interval: Recognition::Recognized,
-            },
-            authorities: &paths.statuses[index],
-            materials: &paths.materials[index],
-            revocation_issuers: &paths.issuers[index],
-            revocation_retry: None,
-        })
-        .collect();
+    let etsi_paths = paths.lend();
+    let stamps = signature_timestamps(session, declared, &parsed, inputs, now, &memory);
     let (references, value) = integrity(result);
     let materials = own_materials(declared, signer, &memory);
     let mut elements = Elements::NONE;
@@ -849,8 +987,8 @@ pub fn indication<W: structured_asn1::memory::Work>(
         paths: &etsi_paths,
         truncated: false,
         order: Order::Coherent,
-        signature_timestamp: false,
-        signature_timestamps: &[],
+        signature_timestamp: !declared.signature_timestamps.is_empty(),
+        signature_timestamps: &stamps,
         claimed_signing_time: declared.signing_time.map(instant),
         utc: Some(inputs.utc),
         changes: Changes::NotApplicable,
@@ -873,6 +1011,7 @@ pub fn indication<W: structured_asn1::memory::Work>(
                 "basis": outcome.basis.map(|basis| format!("{basis:?}")),
                 "chains": format!("{:?}", paths.chains),
                 "rejections": paths.rejections,
+                "timestamps": format!("{:?} {stamps:?}", declared.timestamps_intact),
                 "revocation": format!("{:?} {:?}", paths.signer_status, paths.statuses),
             })
         }
