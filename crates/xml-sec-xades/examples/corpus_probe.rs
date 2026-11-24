@@ -251,13 +251,18 @@ fn named_profile(name: &str) -> Result<PolicyProfile, Failure> {
     })
 }
 
-/// The compiled `profile`, narrowed by one restriction for every input:
-/// check X.509 chains, at time `at`.
-fn profile_policy(profile: PolicyProfile, at: i64) -> Result<VerificationPolicy, Failure> {
+/// The compiled `profile` at time `at`, narrowed to check X.509 chains when
+/// `chains` is set; without it a key the resolver trusts directly is the only
+/// key accepted, which establishes integrity apart from any path.
+fn profile_policy(
+    profile: PolicyProfile,
+    at: i64,
+    chains: bool,
+) -> Result<VerificationPolicy, Failure> {
     let profile = PolicyCompiler::new(profile, &RustCryptoProvider, None)?;
     let mut layer = profile.policies().clone();
     if let Some(verification) = layer.verification.as_mut() {
-        verification.key_trust.verify_x509_chains = true;
+        verification.key_trust.verify_x509_chains = chains;
         verification.key_trust.verification_time =
             Some(Instant::new(at, 0).ok_or("the time is out of range")?);
     }
@@ -300,7 +305,7 @@ fn facts(xml: &str, anchors: &Path, at: i64, profile: PolicyProfile) -> Result<V
     }
     trusted.sort();
     let carried = pool(&text);
-    let policy = profile_policy(profile, at)?;
+    let policy = profile_policy(profile, at, true)?;
     let resolver = DefaultKeyResolver::new(KeyResolverConfig {
         trusted_certs: trusted.clone(),
         ..KeyResolverConfig::default()
@@ -350,6 +355,30 @@ fn facts(xml: &str, anchors: &Path, at: i64, profile: PolicyProfile) -> Result<V
         expected_targets: &expected,
         ..VerificationRequest::default()
     };
+    // EN 319 102-1 5.2.7 establishes integrity with the signing certificate's
+    // key whatever its path: every certificate the document carries is
+    // trusted directly, so the references and value are checked even where
+    // no path validates at `at`.
+    let direct = DefaultKeyResolver::new(KeyResolverConfig {
+        trusted_certs: carried.clone(),
+        ..KeyResolverConfig::default()
+    });
+    let integrity_context = VerifyContext::new()
+        .policy(profile_policy(profile, at, false)?)
+        .key_resolver(&direct);
+    let mut integrity = Vec::new();
+    let integrity_run = with_verified_request(
+        &document,
+        &integrity_context,
+        &request,
+        &account,
+        |session| {
+            for entry in session.evidence().signatures() {
+                integrity.push(verification(entry));
+            }
+            Ok(())
+        },
+    );
     let verified = with_verified_request(&document, &context, &request, &account, |session| {
         let entries = session.evidence().signatures();
         // Ids are reported only when both readings see the same signatures.
@@ -359,6 +388,7 @@ fn facts(xml: &str, anchors: &Path, at: i64, profile: PolicyProfile) -> Result<V
                 "index": index,
                 "id": if aligned { ids[index].clone() } else { None },
                 "verification": verification(entry),
+                "integrity": integrity.get(index).cloned().unwrap_or(Value::Null),
             });
             if entry.result().is_ok() {
                 let identity = entry.identity();
@@ -387,6 +417,10 @@ fn facts(xml: &str, anchors: &Path, at: i64, profile: PolicyProfile) -> Result<V
         Ok(())
     });
     let mut facts = json!({ "signatures": signatures });
+    if let Err(error) = integrity_run {
+        let debug = format!("{error:?}");
+        facts["integrity_request"] = json!({ "error": kind(&debug), "detail": error.to_string() });
+    }
     if let Err(error) = verified {
         let debug = format!("{error:?}");
         facts["request"] = json!({ "error": kind(&debug), "detail": error.to_string() });
@@ -518,7 +552,7 @@ fn dss_hash(hash: Hash) -> &'static str {
 /// The profile's constraints in DSS's policy vocabulary, for the harness to
 /// write the DSS validation policy both comparisons run under.
 fn constraints(profile: PolicyProfile) -> Result<Value, Failure> {
-    let catalogue = catalogue(&profile_policy(profile, INSTANT_ANY)?)?;
+    let catalogue = catalogue(&profile_policy(profile, INSTANT_ANY, true)?)?;
     let mut families: Vec<&str> = catalogue
         .suites
         .iter()
