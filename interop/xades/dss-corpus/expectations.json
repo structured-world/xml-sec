@@ -215,13 +215,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "INDETERMINATE/fail",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:CRYPTO_CONSTRAINTS_FAILURE_NO_POE/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "INDETERMINATE:CRYPTO_CONSTRAINTS_FAILURE_NO_POE/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). That X.509 finding is returned before signature acceptance (section 5.3.4 step 5 f)), where DSS, which trusts the anchor directly, applies the profile's cryptographic constraints."
       },
       "instant/extended": {
         "observed": [
@@ -232,13 +233,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "INDETERMINATE/fail",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:CRYPTO_CONSTRAINTS_FAILURE_NO_POE/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "INDETERMINATE:CRYPTO_CONSTRAINTS_FAILURE_NO_POE/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). That X.509 finding is returned before signature acceptance (section 5.3.4 step 5 f)), where DSS, which trusts the anchor directly, applies the profile's cryptographic constraints."
       },
       "instant/conformant": {
         "observed": [
@@ -249,13 +251,13 @@
             "XCV": "PASSED/pass",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
-        "passed": false,
+        "class": "agreement",
+        "passed": true,
         "dss_passed": true,
-        "indication": false
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/dss-817-test.xml": {
@@ -1194,13 +1196,14 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/extended": {
         "observed": [
@@ -1211,13 +1214,14 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/conformant": {
         "observed": [
@@ -1228,13 +1232,13 @@
             "XCV": "PASSED/pass",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
-        "passed": false,
+        "class": "agreement",
+        "passed": true,
         "dss_passed": true,
-        "indication": false
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/11068_signed.xml": {
@@ -1247,13 +1251,14 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/extended": {
         "observed": [
@@ -1264,13 +1269,14 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/conformant": {
         "observed": [
@@ -1281,13 +1287,13 @@
             "XCV": "PASSED/pass",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
-        "passed": false,
+        "class": "agreement",
+        "passed": true,
         "dss_passed": true,
-        "indication": false
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/BaselineBWithCertificateValues.xml": {
@@ -1510,14 +1516,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
         "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "XMLDSig Core 1.1 section 4.4.3.3 and the ds:Object schema (Id of type ID): #refetsi names the ds:Object Id=\"refetsi\", whose XPath Filter 2.0 intersect selects the SignedProperties, so the signed data is obtained and its digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2); DSS does not find it. xml-sec's indication is its X.509 finding (section 5.3.4 step 5 f)."
+        "reason": "XMLDSig Core 1.1 section 4.4.3.3 and the ds:Object schema (Id of type ID): #refetsi names the ds:Object Id=\"refetsi\", whose XPath Filter 2.0 intersect selects the SignedProperties, so the signed data is obtained and its digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2); DSS does not find it. xml-sec's indication is its X.509 finding (section 5.3.4 step 5 f)): the signing certificate is itself a trust anchor, which this profile holds to its validity (section 5.2.6.4 steps 1 and 7), and it has expired with no status issued after its expiry (NOTE 8)."
       },
       "instant/extended": {
         "observed": [
@@ -1528,14 +1534,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
         "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "XMLDSig Core 1.1 section 4.4.3.3 and the ds:Object schema (Id of type ID): #refetsi names the ds:Object Id=\"refetsi\", whose XPath Filter 2.0 intersect selects the SignedProperties, so the signed data is obtained and its digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2); DSS does not find it. xml-sec's indication is its X.509 finding (section 5.3.4 step 5 f)."
+        "reason": "XMLDSig Core 1.1 section 4.4.3.3 and the ds:Object schema (Id of type ID): #refetsi names the ds:Object Id=\"refetsi\", whose XPath Filter 2.0 intersect selects the SignedProperties, so the signed data is obtained and its digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2); DSS does not find it. xml-sec's indication is its X.509 finding (section 5.3.4 step 5 f)): the signing certificate is itself a trust anchor, which this profile holds to its validity (section 5.2.6.4 steps 1 and 7), and it has expired with no status issued after its expiry (NOTE 8)."
       },
       "instant/conformant": {
         "observed": [
@@ -1546,14 +1552,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:SIG_CONSTRAINTS_FAILURE"
           }
         ],
         "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "XMLDSig Core 1.1 section 4.4.3.3 and the ds:Object schema (Id of type ID): #refetsi names the ds:Object Id=\"refetsi\", whose XPath Filter 2.0 intersect selects the SignedProperties, so the signed data is obtained and its digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2); DSS does not find it. xml-sec's indication is its X.509 finding (section 5.3.4 step 5 f)."
+        "reason": "XMLDSig Core 1.1 section 4.4.3.3 and the ds:Object schema (Id of type ID): #refetsi names the ds:Object Id=\"refetsi\", so the signed data is obtained and its digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2); DSS does not find it. The X.509 validation passes (the profile trusts the signer, itself a trust anchor, directly: section 5.2.6.4 step 1 b)) and xml-sec's profile refuses the TS 101 903 v1.1.1 namespace, which EN 319 132-1 section 4.2 does not define (signature acceptance, EN 319 102-1 section 5.2.8)."
       },
       "signing-time/strict": {
         "observed": [
@@ -1571,7 +1577,7 @@
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "XMLDSig Core 1.1 section 4.4.3.3 and the ds:Object schema (Id of type ID): #refetsi names the ds:Object Id=\"refetsi\", so the signed data is obtained and its digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2); DSS does not find it. At the signing time the path validates and xml-sec's profile refuses the TS 101 903 v1.1.1 namespace, which EN 319 132-1 section 4.2 does not define (signature acceptance, EN 319 102-1 section 5.2.8)."
+        "reason": "XMLDSig Core 1.1 section 4.4.3.3 and the ds:Object schema (Id of type ID): #refetsi names the ds:Object Id=\"refetsi\", so the signed data is obtained and its digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2); DSS does not find it. The X.509 validation passes (the profile trusts the signer, itself a trust anchor, directly: section 5.2.6.4 step 1 b)) and xml-sec's profile refuses the TS 101 903 v1.1.1 namespace, which EN 319 132-1 section 4.2 does not define (signature acceptance, EN 319 102-1 section 5.2.8)."
       },
       "signing-time/extended": {
         "observed": [
@@ -1589,7 +1595,7 @@
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "XMLDSig Core 1.1 section 4.4.3.3 and the ds:Object schema (Id of type ID): #refetsi names the ds:Object Id=\"refetsi\", so the signed data is obtained and its digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2); DSS does not find it. At the signing time the path validates and xml-sec's profile refuses the TS 101 903 v1.1.1 namespace, which EN 319 132-1 section 4.2 does not define (signature acceptance, EN 319 102-1 section 5.2.8)."
+        "reason": "XMLDSig Core 1.1 section 4.4.3.3 and the ds:Object schema (Id of type ID): #refetsi names the ds:Object Id=\"refetsi\", so the signed data is obtained and its digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2); DSS does not find it. The X.509 validation passes (the profile trusts the signer, itself a trust anchor, directly: section 5.2.6.4 step 1 b)) and xml-sec's profile refuses the TS 101 903 v1.1.1 namespace, which EN 319 132-1 section 4.2 does not define (signature acceptance, EN 319 102-1 section 5.2.8)."
       },
       "signing-time/conformant": {
         "observed": [
@@ -1607,7 +1613,7 @@
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "XMLDSig Core 1.1 section 4.4.3.3 and the ds:Object schema (Id of type ID): #refetsi names the ds:Object Id=\"refetsi\", so the signed data is obtained and its digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2); DSS does not find it. At the signing time the path validates and xml-sec's profile refuses the TS 101 903 v1.1.1 namespace, which EN 319 132-1 section 4.2 does not define (signature acceptance, EN 319 102-1 section 5.2.8)."
+        "reason": "XMLDSig Core 1.1 section 4.4.3.3 and the ds:Object schema (Id of type ID): #refetsi names the ds:Object Id=\"refetsi\", so the signed data is obtained and its digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2); DSS does not find it. The X.509 validation passes (the profile trusts the signer, itself a trust anchor, directly: section 5.2.6.4 step 1 b)) and xml-sec's profile refuses the TS 101 903 v1.1.1 namespace, which EN 319 132-1 section 4.2 does not define (signature acceptance, EN 319 102-1 section 5.2.8)."
       }
     },
     "dss-xades/src/test/resources/validation/Signature-X-BE_ECON-3.xml": {
@@ -1833,13 +1839,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "INDETERMINATE/not-reached",
             "TIMESTAMPS": "none/not-reached",
-            "OVERALL": "INDETERMINATE:SIG_CONSTRAINTS_FAILURE/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "INDETERMINATE:SIG_CONSTRAINTS_FAILURE/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). That X.509 finding is returned before signature acceptance (section 5.3.4 step 5 f)), which DSS, trusting the anchor directly, reaches and fails, as the xades-conformant profile does."
       },
       "instant/extended": {
         "observed": [
@@ -1850,13 +1857,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "INDETERMINATE/not-reached",
             "TIMESTAMPS": "none/not-reached",
-            "OVERALL": "INDETERMINATE:SIG_CONSTRAINTS_FAILURE/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "INDETERMINATE:SIG_CONSTRAINTS_FAILURE/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). That X.509 finding is returned before signature acceptance (section 5.3.4 step 5 f)), which DSS, trusting the anchor directly, reaches and fails, as the xades-conformant profile does."
       },
       "instant/conformant": {
         "observed": [
@@ -1867,10 +1875,10 @@
             "XCV": "PASSED/not-reached",
             "SAV": "INDETERMINATE/not-reached",
             "TIMESTAMPS": "none/not-reached",
-            "OVERALL": "INDETERMINATE:SIG_CONSTRAINTS_FAILURE/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "INDETERMINATE:SIG_CONSTRAINTS_FAILURE/INDETERMINATE:SIG_CONSTRAINTS_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "agreement",
         "passed": false,
         "dss_passed": false,
         "indication": true
@@ -1886,13 +1894,14 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "PASSED/not-reached",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/extended": {
         "observed": [
@@ -1903,13 +1912,14 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "PASSED/not-reached",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/conformant": {
         "observed": [
@@ -1920,13 +1930,13 @@
             "XCV": "PASSED/pass",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "PASSED/fail",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
-        "passed": false,
+        "class": "agreement",
+        "passed": true,
         "dss_passed": true,
-        "indication": false
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/Signature-X-CZ_SEF-5.xml": {
@@ -1939,13 +1949,14 @@
             "XCV": "INDETERMINATE/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE/not-reached",
-            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "agreement",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signing certificate expired on 2015-09-11, and the only status the document carries for it is a CRL issued on 2014-11-12, before that expiry. A certificate is known not to have been revoked only from status the CA keeps providing after its expiration, or from the CA's assurance (EN 319 102-1 V1.4.1 section 5.2.6.4 step 7, NOTE 8), so step 7 returns OUT_OF_BOUNDS_NO_POE; DSS takes the earlier CRL as establishing non-revocation."
       },
       "instant/extended": {
         "observed": [
@@ -1956,13 +1967,14 @@
             "XCV": "INDETERMINATE/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE/not-reached",
-            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "agreement",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signing certificate expired on 2015-09-11, and the only status the document carries for it is a CRL issued on 2014-11-12, before that expiry. A certificate is known not to have been revoked only from status the CA keeps providing after its expiration, or from the CA's assurance (EN 319 102-1 V1.4.1 section 5.2.6.4 step 7, NOTE 8), so step 7 returns OUT_OF_BOUNDS_NO_POE; DSS takes the earlier CRL as establishing non-revocation."
       },
       "instant/conformant": {
         "observed": [
@@ -1973,13 +1985,14 @@
             "XCV": "INDETERMINATE/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE/not-reached",
-            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "agreement",
+        "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signing certificate expired on 2015-09-11, and the only status the document carries for it is a CRL issued on 2014-11-12, before that expiry. A certificate is known not to have been revoked only from status the CA keeps providing after its expiration, or from the CA's assurance (EN 319 102-1 V1.4.1 section 5.2.6.4 step 7, NOTE 8), so step 7 returns OUT_OF_BOUNDS_NO_POE; DSS takes the earlier CRL as establishing non-revocation."
       }
     },
     "dss-xades/src/test/resources/validation/Signature-X-ES-100.xml": {
@@ -1992,10 +2005,10 @@
             "XCV": "INDETERMINATE/not-reached",
             "SAV": "INDETERMINATE/fail",
             "TIMESTAMPS": "INDETERMINATE/not-reached",
-            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CUSTOM"
           }
         ],
-        "class": "agreement",
+        "class": "unreviewed",
         "passed": false,
         "dss_passed": false,
         "indication": true
@@ -2009,10 +2022,10 @@
             "XCV": "INDETERMINATE/not-reached",
             "SAV": "INDETERMINATE/fail",
             "TIMESTAMPS": "INDETERMINATE/not-reached",
-            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CUSTOM"
           }
         ],
-        "class": "agreement",
+        "class": "unreviewed",
         "passed": false,
         "dss_passed": false,
         "indication": true
@@ -2026,10 +2039,10 @@
             "XCV": "INDETERMINATE/not-reached",
             "SAV": "PASSED/fail",
             "TIMESTAMPS": "INDETERMINATE/not-reached",
-            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CUSTOM"
           }
         ],
-        "class": "agreement",
+        "class": "unreviewed",
         "passed": false,
         "dss_passed": false,
         "indication": true
@@ -2045,10 +2058,10 @@
             "XCV": "INDETERMINATE/not-reached",
             "SAV": "INDETERMINATE/fail",
             "TIMESTAMPS": "INDETERMINATE/not-reached",
-            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CUSTOM"
           }
         ],
-        "class": "agreement",
+        "class": "unreviewed",
         "passed": false,
         "dss_passed": false,
         "indication": true
@@ -2062,10 +2075,10 @@
             "XCV": "INDETERMINATE/not-reached",
             "SAV": "INDETERMINATE/fail",
             "TIMESTAMPS": "INDETERMINATE/not-reached",
-            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CUSTOM"
           }
         ],
-        "class": "agreement",
+        "class": "unreviewed",
         "passed": false,
         "dss_passed": false,
         "indication": true
@@ -2079,10 +2092,10 @@
             "XCV": "INDETERMINATE/not-reached",
             "SAV": "PASSED/fail",
             "TIMESTAMPS": "INDETERMINATE/not-reached",
-            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CUSTOM"
           }
         ],
-        "class": "agreement",
+        "class": "unreviewed",
         "passed": false,
         "dss_passed": false,
         "indication": true
@@ -2098,13 +2111,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/extended": {
         "observed": [
@@ -2115,13 +2129,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/conformant": {
         "observed": [
@@ -2132,13 +2147,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:SIG_CONSTRAINTS_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The X.509 validation passes (at the signing time over its path, at the validation time because the profile trusts the signer, itself a trust anchor, directly: EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b)); the profile admits the XAdES namespaces EN 319 132-1 section 4.2 defines, and this signature uses the earlier TS 101 903 v1.2.2 one (signature acceptance, EN 319 102-1 V1.4.1 section 5.2.8)."
       },
       "signing-time/strict": {
         "observed": [
@@ -2156,7 +2172,7 @@
         "passed": false,
         "dss_passed": true,
         "indication": false,
-        "reason": "At the signing time the path validates; the profile admits the XAdES namespaces EN 319 132-1 section 4.2 defines, and this signature uses the earlier TS 101 903 v1.2.2 one (signature acceptance, EN 319 102-1 V1.4.1 section 5.2.8)."
+        "reason": "The X.509 validation passes (at the signing time over its path, at the validation time because the profile trusts the signer, itself a trust anchor, directly: EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b)); the profile admits the XAdES namespaces EN 319 132-1 section 4.2 defines, and this signature uses the earlier TS 101 903 v1.2.2 one (signature acceptance, EN 319 102-1 V1.4.1 section 5.2.8)."
       },
       "signing-time/extended": {
         "observed": [
@@ -2174,7 +2190,7 @@
         "passed": false,
         "dss_passed": true,
         "indication": false,
-        "reason": "At the signing time the path validates; the profile admits the XAdES namespaces EN 319 132-1 section 4.2 defines, and this signature uses the earlier TS 101 903 v1.2.2 one (signature acceptance, EN 319 102-1 V1.4.1 section 5.2.8)."
+        "reason": "The X.509 validation passes (at the signing time over its path, at the validation time because the profile trusts the signer, itself a trust anchor, directly: EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b)); the profile admits the XAdES namespaces EN 319 132-1 section 4.2 defines, and this signature uses the earlier TS 101 903 v1.2.2 one (signature acceptance, EN 319 102-1 V1.4.1 section 5.2.8)."
       },
       "signing-time/conformant": {
         "observed": [
@@ -2192,7 +2208,7 @@
         "passed": false,
         "dss_passed": true,
         "indication": false,
-        "reason": "At the signing time the path validates; the profile admits the XAdES namespaces EN 319 132-1 section 4.2 defines, and this signature uses the earlier TS 101 903 v1.2.2 one (signature acceptance, EN 319 102-1 V1.4.1 section 5.2.8)."
+        "reason": "The X.509 validation passes (at the signing time over its path, at the validation time because the profile trusts the signer, itself a trust anchor, directly: EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b)); the profile admits the XAdES namespaces EN 319 132-1 section 4.2 defines, and this signature uses the earlier TS 101 903 v1.2.2 one (signature acceptance, EN 319 102-1 V1.4.1 section 5.2.8)."
       }
     },
     "dss-xades/src/test/resources/validation/Signature-X-HR_FIN-1.xml": {
@@ -2419,14 +2435,13 @@
             "XCV": "INDETERMINATE/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE/not-reached",
-            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CUSTOM"
           }
         ],
-        "class": "dss-deviation",
+        "class": "unreviewed",
         "passed": false,
         "dss_passed": false,
-        "indication": true,
-        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
+        "indication": true
       },
       "instant/extended": {
         "observed": [
@@ -2437,14 +2452,13 @@
             "XCV": "INDETERMINATE/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE/not-reached",
-            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CUSTOM"
           }
         ],
-        "class": "dss-deviation",
+        "class": "unreviewed",
         "passed": false,
         "dss_passed": false,
-        "indication": true,
-        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
+        "indication": true
       },
       "instant/conformant": {
         "observed": [
@@ -2455,14 +2469,13 @@
             "XCV": "INDETERMINATE/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE/not-reached",
-            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CUSTOM"
           }
         ],
-        "class": "dss-deviation",
+        "class": "unreviewed",
         "passed": false,
         "dss_passed": false,
-        "indication": true,
-        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/Signature-X-PT-4.xml": {
@@ -2528,13 +2541,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "INDETERMINATE/fail",
             "TIMESTAMPS": "PASSED/not-reached",
-            "OVERALL": "INDETERMINATE:CRYPTO_CONSTRAINTS_FAILURE_NO_POE/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "INDETERMINATE:CRYPTO_CONSTRAINTS_FAILURE_NO_POE/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). That X.509 finding is returned before signature acceptance (section 5.3.4 step 5 f)), where DSS, which trusts the anchor directly, applies the profile's cryptographic constraints."
       },
       "instant/extended": {
         "observed": [
@@ -2545,13 +2559,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "INDETERMINATE/fail",
             "TIMESTAMPS": "PASSED/not-reached",
-            "OVERALL": "INDETERMINATE:CRYPTO_CONSTRAINTS_FAILURE_NO_POE/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "INDETERMINATE:CRYPTO_CONSTRAINTS_FAILURE_NO_POE/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). That X.509 finding is returned before signature acceptance (section 5.3.4 step 5 f)), where DSS, which trusts the anchor directly, applies the profile's cryptographic constraints."
       },
       "instant/conformant": {
         "observed": [
@@ -2562,13 +2577,13 @@
             "XCV": "PASSED/not-reached",
             "SAV": "PASSED/fail",
             "TIMESTAMPS": "PASSED/not-reached",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
-        "passed": false,
+        "class": "agreement",
+        "passed": true,
         "dss_passed": true,
-        "indication": false
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/Signature-X-RO_TRA-4.xml": {
@@ -2661,13 +2676,14 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/extended": {
         "observed": [
@@ -2678,13 +2694,14 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/conformant": {
         "observed": [
@@ -2695,13 +2712,13 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
-        "passed": false,
+        "class": "agreement",
+        "passed": true,
         "dss_passed": true,
-        "indication": false
+        "indication": true
       },
       "signing-time/strict": {
         "observed": [
@@ -2758,10 +2775,7 @@
         "class": "agreement",
         "passed": true,
         "dss_passed": true,
-        "indication": true,
-        "valid_until": [
-          1417779596
-        ]
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/Signature-X-UK_ASC-2.xml": {
@@ -2880,7 +2894,7 @@
             "XCV": "PASSED/not-reached",
             "SAV": "PASSED/fail",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           },
           {
             "FC": "absent/not-reached",
@@ -2892,10 +2906,11 @@
             "OVERALL": "TOTAL_FAILED:HASH_FAILURE/TOTAL_FAILED:HASH_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": false,
-        "indication": false
+        "indication": false,
+        "reason": "The first signature's signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does. Both validators fail the second signature's hash."
       },
       "instant/extended": {
         "observed": [
@@ -2906,7 +2921,7 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           },
           {
             "FC": "absent/not-reached",
@@ -2918,10 +2933,11 @@
             "OVERALL": "TOTAL_FAILED:HASH_FAILURE/TOTAL_FAILED:HASH_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": false,
-        "indication": false
+        "indication": false,
+        "reason": "The first signature's signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does. Both validators fail the second signature's hash."
       },
       "instant/conformant": {
         "observed": [
@@ -2932,7 +2948,7 @@
             "XCV": "PASSED/pass",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           },
           {
             "FC": "absent/fail",
@@ -2944,10 +2960,10 @@
             "OVERALL": "TOTAL_FAILED:HASH_FAILURE/TOTAL_FAILED:HASH_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "agreement",
         "passed": false,
         "dss_passed": false,
-        "indication": false
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/XAdESLTA.xml": {
@@ -3039,13 +3055,14 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/extended": {
         "observed": [
@@ -3056,13 +3073,14 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/conformant": {
         "observed": [
@@ -3073,13 +3091,13 @@
             "XCV": "PASSED/pass",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
-        "passed": false,
+        "class": "agreement",
+        "passed": true,
         "dss_passed": true,
-        "indication": false
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/doubleSignedTest.xml": {
@@ -3228,13 +3246,14 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/extended": {
         "observed": [
@@ -3245,13 +3264,14 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/conformant": {
         "observed": [
@@ -3262,13 +3282,13 @@
             "XCV": "PASSED/pass",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
-        "passed": false,
+        "class": "agreement",
+        "passed": true,
         "dss_passed": true,
-        "indication": false
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/dss-2506.xml": {
@@ -3703,13 +3723,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "INDETERMINATE/fail",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:CRYPTO_CONSTRAINTS_FAILURE_NO_POE/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "INDETERMINATE:CRYPTO_CONSTRAINTS_FAILURE_NO_POE/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). That X.509 finding is returned before signature acceptance (section 5.3.4 step 5 f)), where DSS, which trusts the anchor directly, applies the profile's cryptographic constraints."
       },
       "instant/extended": {
         "observed": [
@@ -3720,13 +3741,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "INDETERMINATE/fail",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:CRYPTO_CONSTRAINTS_FAILURE_NO_POE/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "INDETERMINATE:CRYPTO_CONSTRAINTS_FAILURE_NO_POE/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). That X.509 finding is returned before signature acceptance (section 5.3.4 step 5 f)), where DSS, which trusts the anchor directly, applies the profile's cryptographic constraints."
       },
       "instant/conformant": {
         "observed": [
@@ -3737,13 +3759,13 @@
             "XCV": "PASSED/pass",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
-        "passed": false,
+        "class": "agreement",
+        "passed": true,
         "dss_passed": true,
-        "indication": false
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/dss1334/document-signed-xades-baseline-b--null-for-filename.xml": {
@@ -4273,13 +4295,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "PASSED/fail",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/extended": {
         "observed": [
@@ -4290,13 +4313,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "PASSED/fail",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/conformant": {
         "observed": [
@@ -4307,13 +4331,13 @@
             "XCV": "PASSED/pass",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
-        "passed": false,
+        "class": "agreement",
+        "passed": true,
         "dss_passed": true,
-        "indication": false
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/dss1770/dss1770refUriRemoved.xml": {
@@ -4541,7 +4565,7 @@
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec refuses that CRL, the root's list for the intermediate CA, and with it the assessment of the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
+        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec takes that CRL, the root's list for the intermediate CA, as unusable, and no other source gives the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
       },
       "instant/extended": {
         "observed": [
@@ -4559,7 +4583,7 @@
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec refuses that CRL, the root's list for the intermediate CA, and with it the assessment of the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
+        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec takes that CRL, the root's list for the intermediate CA, as unusable, and no other source gives the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
       },
       "instant/conformant": {
         "observed": [
@@ -4577,7 +4601,7 @@
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec refuses that CRL, the root's list for the intermediate CA, and with it the assessment of the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
+        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec takes that CRL, the root's list for the intermediate CA, as unusable, and no other source gives the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
       }
     },
     "dss-xades/src/test/resources/validation/dss1788/dss1788-noCertProvided.xml": {
@@ -4650,7 +4674,7 @@
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec refuses that CRL, the root's list for the intermediate CA, and with it the assessment of the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
+        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec takes that CRL, the root's list for the intermediate CA, as unusable, and no other source gives the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
       },
       "instant/extended": {
         "observed": [
@@ -4668,7 +4692,7 @@
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec refuses that CRL, the root's list for the intermediate CA, and with it the assessment of the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
+        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec takes that CRL, the root's list for the intermediate CA, as unusable, and no other source gives the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
       },
       "instant/conformant": {
         "observed": [
@@ -4686,7 +4710,7 @@
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec refuses that CRL, the root's list for the intermediate CA, and with it the assessment of the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
+        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec takes that CRL, the root's list for the intermediate CA, as unusable, and no other source gives the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
       }
     },
     "dss-xades/src/test/resources/validation/dss1788/dss1920-cert-in-certValues-without-publicKey.xml": {
@@ -4706,7 +4730,7 @@
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec refuses that CRL, the root's list for the intermediate CA, and with it the assessment of the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
+        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec takes that CRL, the root's list for the intermediate CA, as unusable, and no other source gives the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
       },
       "instant/extended": {
         "observed": [
@@ -4724,7 +4748,7 @@
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec refuses that CRL, the root's list for the intermediate CA, and with it the assessment of the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
+        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec takes that CRL, the root's list for the intermediate CA, as unusable, and no other source gives the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
       },
       "instant/conformant": {
         "observed": [
@@ -4742,7 +4766,7 @@
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec refuses that CRL, the root's list for the intermediate CA, and with it the assessment of the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
+        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec takes that CRL, the root's list for the intermediate CA, as unusable, and no other source gives the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
       }
     },
     "dss-xades/src/test/resources/validation/dss1788/dss1920-cert-in-certValues.xml": {
@@ -4762,7 +4786,7 @@
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec refuses that CRL, the root's list for the intermediate CA, and with it the assessment of the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
+        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec takes that CRL, the root's list for the intermediate CA, as unusable, and no other source gives the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
       },
       "instant/extended": {
         "observed": [
@@ -4780,7 +4804,7 @@
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec refuses that CRL, the root's list for the intermediate CA, and with it the assessment of the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
+        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec takes that CRL, the root's list for the intermediate CA, as unusable, and no other source gives the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
       },
       "instant/conformant": {
         "observed": [
@@ -4798,7 +4822,7 @@
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec refuses that CRL, the root's list for the intermediate CA, and with it the assessment of the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
+        "reason": "A CRL the document carries marks its Issuing Distribution Point non-critical, while RFC 5280 section 5.2.5 defines it as a critical CRL extension, without which a processor that ignores it would take a partitioned CRL as complete. xml-sec takes that CRL, the root's list for the intermediate CA, as unusable, and no other source gives the CA's status, so that status is not established and path validation fails (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)); DSS uses the CRL and reports the expiry."
       }
     },
     "dss-xades/src/test/resources/validation/dss1811-multi-algo.xml": {
@@ -6514,13 +6538,14 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/extended": {
         "observed": [
@@ -6531,13 +6556,14 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/conformant": {
         "observed": [
@@ -6548,13 +6574,13 @@
             "XCV": "PASSED/pass",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
-        "passed": false,
+        "class": "agreement",
+        "passed": true,
         "dss_passed": true,
-        "indication": false
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/dss2517/xades-invalid-objectreference.xml": {
@@ -6671,13 +6697,14 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/extended": {
         "observed": [
@@ -6688,13 +6715,14 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/conformant": {
         "observed": [
@@ -6705,13 +6733,13 @@
             "XCV": "PASSED/pass",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
-        "passed": false,
+        "class": "agreement",
+        "passed": true,
         "dss_passed": true,
-        "indication": false
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/dss2517/xades-no-objectreference.xml": {
@@ -6828,13 +6856,14 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/extended": {
         "observed": [
@@ -6845,13 +6874,14 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/conformant": {
         "observed": [
@@ -6862,13 +6892,13 @@
             "XCV": "PASSED/pass",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
-        "passed": false,
+        "class": "agreement",
+        "passed": true,
         "dss_passed": true,
-        "indication": false
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/dss2517/xades-valid-reference.xml": {
@@ -6881,13 +6911,14 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/extended": {
         "observed": [
@@ -6898,30 +6929,31 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/conformant": {
         "observed": [
           {
             "FC": "PASSED/pass",
-            "ISC": "PASSED/not-reached",
+            "ISC": "PASSED/pass",
             "CV": "PASSED/pass",
-            "XCV": "PASSED/fail",
-            "SAV": "PASSED/not-reached",
+            "XCV": "PASSED/pass",
+            "SAV": "PASSED/pass",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
-        "passed": false,
+        "class": "agreement",
+        "passed": true,
         "dss_passed": true,
-        "indication": false
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/dss2517/xades-with-empty-dataobjectformat.xml": {
@@ -7422,10 +7454,7 @@
         "class": "agreement",
         "passed": true,
         "dss_passed": true,
-        "indication": true,
-        "valid_until": [
-          1860427736
-        ]
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/dss3758/xades-bes-issuer-linebreaks.xml": {
@@ -7586,10 +7615,7 @@
         "class": "agreement",
         "passed": true,
         "dss_passed": true,
-        "indication": true,
-        "valid_until": [
-          1860427736
-        ]
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/dss874/sellosFNMT-XAdES_A.xml": {
@@ -7948,13 +7974,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "PASSED/fail",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/extended": {
         "observed": [
@@ -7965,30 +7992,31 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/conformant": {
         "observed": [
           {
             "FC": "PASSED/pass",
-            "ISC": "PASSED/not-reached",
+            "ISC": "PASSED/pass",
             "CV": "PASSED/pass",
-            "XCV": "PASSED/fail",
-            "SAV": "PASSED/not-reached",
+            "XCV": "PASSED/pass",
+            "SAV": "PASSED/pass",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
-        "passed": false,
+        "class": "agreement",
+        "passed": true,
         "dss_passed": true,
-        "indication": false
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/evidence-record/X-B-LT-with-counter-sig-X-E-ERS.xml": {
@@ -8692,13 +8720,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "PASSED/fail",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/extended": {
         "observed": [
@@ -8709,30 +8738,31 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/conformant": {
         "observed": [
           {
             "FC": "PASSED/pass",
-            "ISC": "PASSED/not-reached",
+            "ISC": "PASSED/pass",
             "CV": "PASSED/pass",
-            "XCV": "PASSED/fail",
-            "SAV": "PASSED/not-reached",
+            "XCV": "PASSED/pass",
+            "SAV": "PASSED/pass",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
-        "passed": false,
+        "class": "agreement",
+        "passed": true,
         "dss_passed": true,
-        "indication": false
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/evidence-record/X-E-ERS-basic-chain-renewal-master-sig-not-found.xml": {
@@ -8745,13 +8775,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "PASSED/fail",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/extended": {
         "observed": [
@@ -8762,30 +8793,31 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/conformant": {
         "observed": [
           {
             "FC": "PASSED/pass",
-            "ISC": "PASSED/not-reached",
+            "ISC": "PASSED/pass",
             "CV": "PASSED/pass",
-            "XCV": "PASSED/fail",
-            "SAV": "PASSED/not-reached",
+            "XCV": "PASSED/pass",
+            "SAV": "PASSED/pass",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
-        "passed": false,
+        "class": "agreement",
+        "passed": true,
         "dss_passed": true,
-        "indication": false
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/evidence-record/X-E-ERS-basic-chain-renewal.xml": {
@@ -8798,13 +8830,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "PASSED/fail",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/extended": {
         "observed": [
@@ -8815,30 +8848,31 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/conformant": {
         "observed": [
           {
             "FC": "PASSED/pass",
-            "ISC": "PASSED/not-reached",
+            "ISC": "PASSED/pass",
             "CV": "PASSED/pass",
-            "XCV": "PASSED/fail",
-            "SAV": "PASSED/not-reached",
+            "XCV": "PASSED/pass",
+            "SAV": "PASSED/pass",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
-        "passed": false,
+        "class": "agreement",
+        "passed": true,
         "dss_passed": true,
-        "indication": false
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/evidence-record/X-E-ERS-basic.xml": {
@@ -8851,13 +8885,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "PASSED/fail",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/extended": {
         "observed": [
@@ -8868,30 +8903,31 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/conformant": {
         "observed": [
           {
             "FC": "PASSED/pass",
-            "ISC": "PASSED/not-reached",
+            "ISC": "PASSED/pass",
             "CV": "PASSED/pass",
-            "XCV": "PASSED/fail",
-            "SAV": "PASSED/not-reached",
+            "XCV": "PASSED/pass",
+            "SAV": "PASSED/pass",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
-        "passed": false,
+        "class": "agreement",
+        "passed": true,
         "dss_passed": true,
-        "indication": false
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/evidence-record/X-E-ERS-two-ers.xml": {
@@ -8904,13 +8940,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "PASSED/fail",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/extended": {
         "observed": [
@@ -8921,30 +8958,31 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/conformant": {
         "observed": [
           {
             "FC": "PASSED/pass",
-            "ISC": "PASSED/not-reached",
+            "ISC": "PASSED/pass",
             "CV": "PASSED/pass",
-            "XCV": "PASSED/fail",
-            "SAV": "PASSED/not-reached",
+            "XCV": "PASSED/pass",
+            "SAV": "PASSED/pass",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
-        "passed": false,
+        "class": "agreement",
+        "passed": true,
         "dss_passed": true,
-        "indication": false
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/evidence-record/X-E-ERS-two-parallel-ers-one-invalid.xml": {
@@ -8957,13 +8995,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "PASSED/fail",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/extended": {
         "observed": [
@@ -8974,30 +9013,31 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/conformant": {
         "observed": [
           {
             "FC": "PASSED/pass",
-            "ISC": "PASSED/not-reached",
+            "ISC": "PASSED/pass",
             "CV": "PASSED/pass",
-            "XCV": "PASSED/fail",
-            "SAV": "PASSED/not-reached",
+            "XCV": "PASSED/pass",
+            "SAV": "PASSED/pass",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
-        "passed": false,
+        "class": "agreement",
+        "passed": true,
         "dss_passed": true,
-        "indication": false
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/evidence-record/X-E-ERS-two-parallel-ers-one-tst-invalid.xml": {
@@ -9010,13 +9050,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "PASSED/fail",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/extended": {
         "observed": [
@@ -9027,30 +9068,31 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/conformant": {
         "observed": [
           {
             "FC": "PASSED/pass",
-            "ISC": "PASSED/not-reached",
+            "ISC": "PASSED/pass",
             "CV": "PASSED/pass",
-            "XCV": "PASSED/fail",
-            "SAV": "PASSED/not-reached",
+            "XCV": "PASSED/pass",
+            "SAV": "PASSED/pass",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
-        "passed": false,
+        "class": "agreement",
+        "passed": true,
         "dss_passed": true,
-        "indication": false
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/evidence-record/X-E-ERS-two-parallel-ers.xml": {
@@ -9063,13 +9105,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "PASSED/fail",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/extended": {
         "observed": [
@@ -9080,30 +9123,31 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/conformant": {
         "observed": [
           {
             "FC": "PASSED/pass",
-            "ISC": "PASSED/not-reached",
+            "ISC": "PASSED/pass",
             "CV": "PASSED/pass",
-            "XCV": "PASSED/fail",
-            "SAV": "PASSED/not-reached",
+            "XCV": "PASSED/pass",
+            "SAV": "PASSED/pass",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
-        "passed": false,
+        "class": "agreement",
+        "passed": true,
         "dss_passed": true,
-        "indication": false
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/evidence-record/X-E-ERS-with-counter-sig.xml": {
@@ -9194,10 +9238,10 @@
         "observed": [
           {
             "FC": "PASSED/pass",
-            "ISC": "PASSED/not-reached",
+            "ISC": "PASSED/pass",
             "CV": "PASSED/pass",
-            "XCV": "PASSED/fail",
-            "SAV": "PASSED/not-reached",
+            "XCV": "PASSED/pass",
+            "SAV": "PASSED/pass",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
@@ -9214,10 +9258,10 @@
         "observed": [
           {
             "FC": "PASSED/pass",
-            "ISC": "PASSED/not-reached",
+            "ISC": "PASSED/pass",
             "CV": "PASSED/pass",
-            "XCV": "PASSED/fail",
-            "SAV": "PASSED/not-reached",
+            "XCV": "PASSED/pass",
+            "SAV": "PASSED/pass",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
@@ -9234,10 +9278,10 @@
         "observed": [
           {
             "FC": "PASSED/pass",
-            "ISC": "PASSED/not-reached",
+            "ISC": "PASSED/pass",
             "CV": "PASSED/pass",
-            "XCV": "PASSED/fail",
-            "SAV": "PASSED/not-reached",
+            "XCV": "PASSED/pass",
+            "SAV": "PASSED/pass",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
@@ -9245,10 +9289,7 @@
         "class": "agreement",
         "passed": true,
         "dss_passed": true,
-        "indication": true,
-        "valid_until": [
-          1808915998
-        ]
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/evidence-record/XAdES-B_ER_Renewed_no_can.xml": {
@@ -9256,10 +9297,10 @@
         "observed": [
           {
             "FC": "PASSED/pass",
-            "ISC": "PASSED/not-reached",
+            "ISC": "PASSED/pass",
             "CV": "PASSED/pass",
-            "XCV": "PASSED/fail",
-            "SAV": "PASSED/not-reached",
+            "XCV": "PASSED/pass",
+            "SAV": "PASSED/pass",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
@@ -9276,10 +9317,10 @@
         "observed": [
           {
             "FC": "PASSED/pass",
-            "ISC": "PASSED/not-reached",
+            "ISC": "PASSED/pass",
             "CV": "PASSED/pass",
-            "XCV": "PASSED/fail",
-            "SAV": "PASSED/not-reached",
+            "XCV": "PASSED/pass",
+            "SAV": "PASSED/pass",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
@@ -9296,10 +9337,10 @@
         "observed": [
           {
             "FC": "PASSED/pass",
-            "ISC": "PASSED/not-reached",
+            "ISC": "PASSED/pass",
             "CV": "PASSED/pass",
-            "XCV": "PASSED/fail",
-            "SAV": "PASSED/not-reached",
+            "XCV": "PASSED/pass",
+            "SAV": "PASSED/pass",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
@@ -9307,10 +9348,7 @@
         "class": "agreement",
         "passed": true,
         "dss_passed": true,
-        "indication": true,
-        "valid_until": [
-          1808915998
-        ]
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/evidence-record/evidence-record-5b5edd31-344d-4d66-8e95-79f9acaab566-broken.xml": {
@@ -9484,13 +9522,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "PASSED/fail",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/extended": {
         "observed": [
@@ -9501,30 +9540,31 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/conformant": {
         "observed": [
           {
             "FC": "PASSED/pass",
-            "ISC": "PASSED/not-reached",
+            "ISC": "PASSED/pass",
             "CV": "PASSED/pass",
-            "XCV": "PASSED/fail",
-            "SAV": "PASSED/not-reached",
+            "XCV": "PASSED/pass",
+            "SAV": "PASSED/pass",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
-        "passed": false,
+        "class": "agreement",
+        "passed": true,
         "dss_passed": true,
-        "indication": false
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/evidence-record/incorporation/X-B-LT-detached.xml": {
@@ -9665,10 +9705,10 @@
         "observed": [
           {
             "FC": "PASSED/pass",
-            "ISC": "PASSED/not-reached",
+            "ISC": "PASSED/pass",
             "CV": "PASSED/pass",
-            "XCV": "PASSED/fail",
-            "SAV": "PASSED/not-reached",
+            "XCV": "PASSED/pass",
+            "SAV": "PASSED/pass",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
@@ -9685,10 +9725,10 @@
         "observed": [
           {
             "FC": "PASSED/pass",
-            "ISC": "PASSED/not-reached",
+            "ISC": "PASSED/pass",
             "CV": "PASSED/pass",
-            "XCV": "PASSED/fail",
-            "SAV": "PASSED/not-reached",
+            "XCV": "PASSED/pass",
+            "SAV": "PASSED/pass",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
@@ -9705,10 +9745,10 @@
         "observed": [
           {
             "FC": "PASSED/pass",
-            "ISC": "PASSED/not-reached",
+            "ISC": "PASSED/pass",
             "CV": "PASSED/pass",
-            "XCV": "PASSED/fail",
-            "SAV": "PASSED/not-reached",
+            "XCV": "PASSED/pass",
+            "SAV": "PASSED/pass",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
@@ -9716,10 +9756,7 @@
         "class": "agreement",
         "passed": true,
         "dss_passed": true,
-        "indication": true,
-        "valid_until": [
-          1808915998
-        ]
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/evidence-record/incorporation/evidence-record-X-B-B-no-hashtree.xml": {
@@ -10054,13 +10091,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "INDETERMINATE/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:SIG_CONSTRAINTS_FAILURE/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "INDETERMINATE:SIG_CONSTRAINTS_FAILURE/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). That X.509 finding is returned before signature acceptance (section 5.3.4 step 5 f)), which DSS, trusting the anchor directly, reaches and fails, as the xades-conformant profile does."
       },
       "instant/extended": {
         "observed": [
@@ -10071,13 +10109,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "INDETERMINATE/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:SIG_CONSTRAINTS_FAILURE/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "INDETERMINATE:SIG_CONSTRAINTS_FAILURE/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). That X.509 finding is returned before signature acceptance (section 5.3.4 step 5 f)), which DSS, trusting the anchor directly, reaches and fails, as the xades-conformant profile does."
       },
       "instant/conformant": {
         "observed": [
@@ -10088,10 +10127,10 @@
             "XCV": "PASSED/not-reached",
             "SAV": "INDETERMINATE/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:SIG_CONSTRAINTS_FAILURE/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "INDETERMINATE:SIG_CONSTRAINTS_FAILURE/INDETERMINATE:SIG_CONSTRAINTS_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "agreement",
         "passed": false,
         "dss_passed": false,
         "indication": true
@@ -10371,13 +10410,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "PASSED/fail",
             "TIMESTAMPS": "INDETERMINATE/not-reached",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/extended": {
         "observed": [
@@ -10388,13 +10428,14 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE/not-reached",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/conformant": {
         "observed": [
@@ -10405,13 +10446,13 @@
             "XCV": "PASSED/pass",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE/fail",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
-        "passed": false,
+        "class": "agreement",
+        "passed": true,
         "dss_passed": true,
-        "indication": false
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/sk-tsl.xml": {
@@ -11210,11 +11251,7 @@
         "class": "agreement",
         "passed": false,
         "dss_passed": false,
-        "indication": true,
-        "valid_until": [
-          1820055894,
-          null
-        ]
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/xades-counter-signature-no-type.xml": {
@@ -11231,10 +11268,10 @@
           },
           {
             "FC": "absent/pass",
-            "ISC": "absent/not-reached",
+            "ISC": "absent/pass",
             "CV": "absent/pass",
-            "XCV": "absent/fail",
-            "SAV": "absent/not-reached",
+            "XCV": "absent/pass",
+            "SAV": "absent/pass",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
@@ -11261,10 +11298,10 @@
           },
           {
             "FC": "absent/pass",
-            "ISC": "absent/not-reached",
+            "ISC": "absent/pass",
             "CV": "absent/pass",
-            "XCV": "absent/fail",
-            "SAV": "absent/not-reached",
+            "XCV": "absent/pass",
+            "SAV": "absent/pass",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
@@ -11291,10 +11328,10 @@
           },
           {
             "FC": "absent/pass",
-            "ISC": "absent/not-reached",
+            "ISC": "absent/pass",
             "CV": "absent/pass",
-            "XCV": "absent/fail",
-            "SAV": "absent/not-reached",
+            "XCV": "absent/pass",
+            "SAV": "absent/pass",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
@@ -11302,11 +11339,7 @@
         "class": "agreement",
         "passed": true,
         "dss_passed": true,
-        "indication": true,
-        "valid_until": [
-          1820055894,
-          1820055894
-        ]
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/xades-counter-signature-with-type-invalid.xml": {
@@ -11394,11 +11427,7 @@
         "class": "agreement",
         "passed": false,
         "dss_passed": false,
-        "indication": true,
-        "valid_until": [
-          1820055894,
-          null
-        ]
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/xades-detached-with-object-type-ref.xml": {
@@ -11842,10 +11871,10 @@
             "XCV": "INDETERMINATE/not-reached",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE/not-reached",
-            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "agreement",
         "passed": false,
         "dss_passed": false,
         "indication": true
@@ -11859,10 +11888,10 @@
             "XCV": "INDETERMINATE/not-reached",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE/not-reached",
-            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "agreement",
         "passed": false,
         "dss_passed": false,
         "indication": true
@@ -11876,10 +11905,10 @@
             "XCV": "INDETERMINATE/not-reached",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE/not-reached",
-            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "agreement",
         "passed": false,
         "dss_passed": false,
         "indication": true
@@ -13438,13 +13467,14 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE/not-reached",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/extended": {
         "observed": [
@@ -13455,30 +13485,31 @@
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE/not-reached",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "unreviewed",
+        "class": "policy-refusal",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/conformant": {
         "observed": [
           {
             "FC": "PASSED/pass",
-            "ISC": "PASSED/not-reached",
+            "ISC": "PASSED/pass",
             "CV": "PASSED/pass",
-            "XCV": "PASSED/fail",
-            "SAV": "PASSED/not-reached",
+            "XCV": "PASSED/pass",
+            "SAV": "PASSED/pass",
             "TIMESTAMPS": "INDETERMINATE/fail",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
-        "passed": false,
+        "class": "agreement",
+        "passed": true,
         "dss_passed": true,
-        "indication": false
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/xades-tampered-keyinfo.xml": {
@@ -14236,14 +14267,13 @@
             "XCV": "INDETERMINATE/not-reached",
             "SAV": "PASSED/fail",
             "TIMESTAMPS": "INDETERMINATE/not-reached",
-            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CUSTOM"
           }
         ],
-        "class": "dss-deviation",
+        "class": "unreviewed",
         "passed": false,
         "dss_passed": false,
-        "indication": true,
-        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
+        "indication": true
       },
       "instant/extended": {
         "observed": [
@@ -14254,14 +14284,13 @@
             "XCV": "INDETERMINATE/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE/not-reached",
-            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CUSTOM"
           }
         ],
-        "class": "dss-deviation",
+        "class": "unreviewed",
         "passed": false,
         "dss_passed": false,
-        "indication": true,
-        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
+        "indication": true
       },
       "instant/conformant": {
         "observed": [
@@ -14272,14 +14301,13 @@
             "XCV": "INDETERMINATE/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE/not-reached",
-            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CUSTOM"
           }
         ],
-        "class": "dss-deviation",
+        "class": "unreviewed",
         "passed": false,
         "dss_passed": false,
-        "indication": true,
-        "reason": "A CA of every chain is outside its validity at the validation time. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE, which section 5.6.3.4 step 3 does not take into the validation in the past. DSS reports the CA's expiry as OUT_OF_BOUNDS_NO_POE, which Table 6 ties to the signing certificate, and recovers through clause 5.6."
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/xades-with-no-name-reference.xml": {
@@ -14915,10 +14943,7 @@
         "class": "agreement",
         "passed": true,
         "dss_passed": true,
-        "indication": true,
-        "valid_until": [
-          1827619200
-        ]
+        "indication": true
       }
     },
     "dss-xades/src/test/resources/validation/xsw/TSL-noID.xml": {
@@ -15359,14 +15384,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "INDETERMINATE/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
         "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "Every Reference names an element that exists, and each digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2). That the QualifyingProperties' own SignedProperties is not the one signed is a matter of the XAdES profile, which is signature acceptance (section 5.2.2 NOTE, section 5.2.8) and comes after the X.509 finding (section 5.3.4 steps 4 to 6). DSS reports the signed data as not found."
+        "reason": "Every Reference names an element that exists, and each digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2). That the QualifyingProperties' own SignedProperties is not the one signed is a matter of the XAdES profile, which is signature acceptance (section 5.2.2 NOTE, section 5.2.8) and comes after the X.509 finding (section 5.3.4 steps 4 to 6): the signing certificate is itself a trust anchor, which this profile holds to its validity (section 5.2.6.4 steps 1 and 7), and it is outside it with no status issued after its expiry (NOTE 8). DSS reports the signed data as not found."
       },
       "instant/extended": {
         "observed": [
@@ -15377,14 +15402,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "INDETERMINATE/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
         "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "Every Reference names an element that exists, and each digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2). That the QualifyingProperties' own SignedProperties is not the one signed is a matter of the XAdES profile, which is signature acceptance (section 5.2.2 NOTE, section 5.2.8) and comes after the X.509 finding (section 5.3.4 steps 4 to 6). DSS reports the signed data as not found."
+        "reason": "Every Reference names an element that exists, and each digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2). That the QualifyingProperties' own SignedProperties is not the one signed is a matter of the XAdES profile, which is signature acceptance (section 5.2.2 NOTE, section 5.2.8) and comes after the X.509 finding (section 5.3.4 steps 4 to 6): the signing certificate is itself a trust anchor, which this profile holds to its validity (section 5.2.6.4 steps 1 and 7), and it is outside it with no status issued after its expiry (NOTE 8). DSS reports the signed data as not found."
       },
       "instant/conformant": {
         "observed": [
@@ -15395,14 +15420,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "INDETERMINATE/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:SIG_CONSTRAINTS_FAILURE"
           }
         ],
         "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "Every Reference names an element that exists, and each digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2). That the QualifyingProperties' own SignedProperties is not the one signed is a matter of the XAdES profile, which is signature acceptance (section 5.2.2 NOTE, section 5.2.8) and comes after the X.509 finding (section 5.3.4 steps 4 to 6). DSS reports the signed data as not found."
+        "reason": "Every Reference names an element that exists, and each digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2). The profile trusts the signer, itself a trust anchor, directly (section 5.2.6.4 step 1 b)), and refuses the signature because the QualifyingProperties' own SignedProperties is not the one signed, which is signature acceptance (section 5.2.2 NOTE, section 5.2.8). DSS reports the signed data as not found."
       },
       "signing-time/strict": {
         "observed": [
@@ -15413,14 +15438,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "INDETERMINATE/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
         "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "Every Reference names an element that exists, and each digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2). That the QualifyingProperties' own SignedProperties is not the one signed is a matter of the XAdES profile, which is signature acceptance (section 5.2.2 NOTE, section 5.2.8) and comes after the X.509 finding (section 5.3.4 steps 4 to 6). DSS reports the signed data as not found."
+        "reason": "Every Reference names an element that exists, and each digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2). That the QualifyingProperties' own SignedProperties is not the one signed is a matter of the XAdES profile, which is signature acceptance (section 5.2.2 NOTE, section 5.2.8) and comes after the X.509 finding (section 5.3.4 steps 4 to 6): the signing certificate is itself a trust anchor, which this profile holds to its validity (section 5.2.6.4 steps 1 and 7), and it is outside it with no status issued after its expiry (NOTE 8). DSS reports the signed data as not found."
       },
       "signing-time/extended": {
         "observed": [
@@ -15431,14 +15456,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "INDETERMINATE/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
         "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "Every Reference names an element that exists, and each digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2). That the QualifyingProperties' own SignedProperties is not the one signed is a matter of the XAdES profile, which is signature acceptance (section 5.2.2 NOTE, section 5.2.8) and comes after the X.509 finding (section 5.3.4 steps 4 to 6). DSS reports the signed data as not found."
+        "reason": "Every Reference names an element that exists, and each digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2). That the QualifyingProperties' own SignedProperties is not the one signed is a matter of the XAdES profile, which is signature acceptance (section 5.2.2 NOTE, section 5.2.8) and comes after the X.509 finding (section 5.3.4 steps 4 to 6): the signing certificate is itself a trust anchor, which this profile holds to its validity (section 5.2.6.4 steps 1 and 7), and it is outside it with no status issued after its expiry (NOTE 8). DSS reports the signed data as not found."
       },
       "signing-time/conformant": {
         "observed": [
@@ -15449,14 +15474,14 @@
             "XCV": "PASSED/not-reached",
             "SAV": "INDETERMINATE/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED"
+            "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:SIG_CONSTRAINTS_FAILURE"
           }
         ],
         "class": "dss-deviation",
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "Every Reference names an element that exists, and each digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2). That the QualifyingProperties' own SignedProperties is not the one signed is a matter of the XAdES profile, which is signature acceptance (section 5.2.2 NOTE, section 5.2.8) and comes after the X.509 finding (section 5.3.4 steps 4 to 6). DSS reports the signed data as not found."
+        "reason": "Every Reference names an element that exists, and each digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2). The profile trusts the signer, itself a trust anchor, directly (section 5.2.6.4 step 1 b)), and refuses the signature because the QualifyingProperties' own SignedProperties is not the one signed, which is signature acceptance (section 5.2.2 NOTE, section 5.2.8). DSS reports the signed data as not found."
       }
     },
     "dss-xades/src/test/resources/validation/xsw/XSW-enveloping-fake-manifest.xml": {

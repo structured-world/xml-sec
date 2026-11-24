@@ -12,7 +12,9 @@ mod long_term;
 
 use serde_json::{Value, json};
 use structured_asn1::memory::Memory;
-use structured_ltv::pki::status::{self as revocation, Query, Responder, Source, Status};
+use structured_ltv::pki::status::{
+    self as revocation, ExpiryEvidence, Query, Responder, Source, Status,
+};
 use structured_ltv::pki::{CheckedPath, CrlAuthority, PathOutcome};
 use structured_ltv::validation::SubIndication;
 use structured_ltv::validation::{
@@ -77,6 +79,9 @@ pub struct Inputs<'a> {
     pub requirements: &'a Requirements<'a>,
     /// Caller-approved UTC facts.
     pub utc: &'a LeapTable<'a>,
+    /// Whether the profile takes a signer that is itself an anchor as trusted
+    /// without further checks (clause 5.2.6.4 step 1(b)).
+    pub direct_trust: bool,
 }
 
 /// Freshness the comparison grants every status: DSS's policy ignores
@@ -534,7 +539,7 @@ fn status_of<'a, W: structured_asn1::memory::Work>(
     inputs: &Inputs<'_>,
     now: Instant,
     memory: &Memory,
-) -> Result<(Status, Vec<RevocationIssuer>, Vec<Record>), String> {
+) -> Result<Assessed, String> {
     let anchor_subject = path
         .anchor()
         .certificate()
@@ -608,19 +613,28 @@ fn status_of<'a, W: structured_asn1::memory::Work>(
         recognizer: &(),
     };
     let digest = session.cms_provider();
-    match revocation::assess(path, member, &sources, &query, &context, &verifier, &digest) {
-        Ok(assessment) => {
-            let (issuers, records) = statements(assessment.statements());
-            Ok((assessment.status(), issuers, records))
-        }
-        // A located PKIX failure is a source this member cannot use, such as
-        // a CRL marking its Issuing Distribution Point non-critical (RFC 5280
-        // section 5.2.5); `assess` ends the whole member on it, so no source
-        // establishes a status. Resource, provider and binding failures end
-        // the validation instead of standing for missing evidence.
-        Err(revocation::Error::Processing(_)) => Ok((Status::NoEvidence, Vec::new(), Vec::new())),
-        Err(error) => Err(format!("status assessment failed: {error:?}")),
-    }
+    // A source this member cannot use is part of the assessment; a failure of
+    // the assessment itself ends the validation.
+    let assessment =
+        revocation::assess(path, member, &sources, &query, &context, &verifier, &digest)
+            .map_err(|error| format!("status assessment failed: {error:?}"))?;
+    let (issuers, records) = statements(assessment.statements());
+    Ok(Assessed {
+        status: assessment.status(),
+        expiry: assessment.expiry_evidence(),
+        issuers,
+        records,
+    })
+}
+
+/// One member's assessed status and what it rests on.
+struct Assessed {
+    status: Status,
+    /// Support for non-revocation after the member expires (clause 5.2.6.4
+    /// step 7, NOTE 8).
+    expiry: ExpiryEvidence,
+    issuers: Vec<RevocationIssuer>,
+    records: Vec<Record>,
 }
 
 /// The certificates that authenticated `statements`, and each statement
@@ -748,6 +762,8 @@ struct PathFacts {
     issuers: Vec<Vec<RevocationIssuer>>,
     /// The signing certificate's status, as the first accepted chain reads it.
     signer_status: Status,
+    /// That status's support for non-revocation after expiry.
+    signer_expiry: ExpiryEvidence,
     /// Why each rejected chain was rejected, for review.
     rejections: Vec<String>,
     /// Every chain the shared processor accepts inside the signing
@@ -820,6 +836,7 @@ fn path_facts<'a, W: structured_asn1::memory::Work>(
         materials: Vec::new(),
         issuers: Vec::new(),
         signer_status: Status::NoEvidence,
+        signer_expiry: ExpiryEvidence::Unestablished,
         rejections: Vec::new(),
         history: Vec::new(),
     };
@@ -829,9 +846,15 @@ fn path_facts<'a, W: structured_asn1::memory::Work>(
         .any(|anchor| anchor.as_bytes() == signer.as_bytes())
     {
         // RFC 5280 6.1.1(d): a trust anchor is an input, not a path member,
-        // so it has neither a revocation status nor issuer material here;
-        // its validity is still the signing certificate's (step 7).
-        facts.chains.push(Chain::Valid);
+        // so it has neither a revocation status nor issuer material here.
+        // A profile that trusts it directly ends the X.509 block at step
+        // 1(b); otherwise its validity is still the signing certificate's
+        // (step 7).
+        facts.chains.push(if inputs.direct_trust {
+            Chain::DirectTrust
+        } else {
+            Chain::Valid
+        });
         facts.statuses.push(Vec::new());
         facts.materials.push(Vec::new());
         facts.issuers.push(Vec::new());
@@ -884,27 +907,19 @@ fn path_facts<'a, W: structured_asn1::memory::Work>(
         )?;
         if !accepted {
             facts.signer_status = members.signer;
+            facts.signer_expiry = members.signer_expiry;
         }
-        // Step 4 includes revocation checking for each certificate of the
-        // chain; with no status at all RFC 5280 6.1.3(a)(3) is not
-        // established, so path validation fails "with any other reason"
-        // (step 4(e)), while a status that exists but is stale or on hold is
-        // the process's own TRY_LATER (steps 4(a) and 4(c)). A CA member
-        // outside its validity at the validation time fails the shell model.
-        let undetermined = members
-            .statuses
-            .iter()
-            .chain([&members.signer])
-            .any(|status| matches!(status, Status::NoEvidence));
+        // A CA member outside its validity at the validation time fails the
+        // shell model (clause 5.2.6.4 step 4, RFC 5280 6.1.3(a)(2)).
         if !members_valid {
             facts
                 .rejections
                 .push("a CA member is outside its validity at the validation time".into());
         }
-        facts.chains.push(if undetermined || !members_valid {
-            Chain::GeneralFailure
-        } else {
+        facts.chains.push(if members_valid {
             Chain::Valid
+        } else {
+            Chain::GeneralFailure
         });
         facts.statuses.push(members.statuses);
         facts.issuers.push(members.issuers);
@@ -931,6 +946,7 @@ struct MemberFacts {
     issuers: Vec<RevocationIssuer>,
     materials: Vec<Material>,
     signer: Status,
+    signer_expiry: ExpiryEvidence,
     history: Vec<(Vec<u8>, Vec<Record>)>,
 }
 
@@ -954,10 +970,16 @@ fn member_facts<'a, W: structured_asn1::memory::Work>(
         issuers: Vec::new(),
         materials: Vec::new(),
         signer: Status::NoEvidence,
+        signer_expiry: ExpiryEvidence::Unestablished,
         history: Vec::new(),
     };
     for member in 0..count {
-        let (status, used, records) = status_of(
+        let Assessed {
+            status,
+            expiry,
+            issuers: used,
+            records,
+        } = status_of(
             session,
             checked,
             member,
@@ -970,6 +992,7 @@ fn member_facts<'a, W: structured_asn1::memory::Work>(
         facts.issuers.extend(used);
         if member + 1 == count {
             facts.signer = status;
+            facts.signer_expiry = expiry;
         } else {
             facts.statuses.push(status);
         }
@@ -1150,6 +1173,7 @@ fn authority_outcome<W: structured_asn1::memory::Work>(
             not_before,
             not_after,
             revocation: paths.signer_status,
+            expiry_evidence: paths.signer_expiry,
         }),
         references: &[],
         value: Computed::Verified,
@@ -1269,6 +1293,7 @@ pub fn indication<W: structured_asn1::memory::Work>(
             not_before,
             not_after,
             revocation: paths.signer_status,
+            expiry_evidence: paths.signer_expiry,
         }),
         references: &references,
         value,

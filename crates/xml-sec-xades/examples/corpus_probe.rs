@@ -36,7 +36,7 @@ use xml_sec::XmlDocument;
 use xml_sec::document::NodeIdentity;
 use xml_sec::policy::{
     Instant, PolicyCompileContext, PolicyCompiler, PolicyProfile, SignatureConstraints,
-    VerificationPolicy,
+    TrustAnchorSigner, VerificationPolicy,
 };
 use xml_sec::provider::RustCryptoProvider;
 use xml_sec::xmldsig::UriTypeSet;
@@ -505,6 +505,7 @@ fn facts(xml: &str, anchors: &Path, at: i64, profile: PolicyProfile) -> Result<V
     trusted.sort();
     let carried = pool(&text);
     let policy = profile_policy(profile, at, true)?;
+    let direct_trust = policy.key_trust.trust_anchor_signer == TrustAnchorSigner::Accepted;
     let resolver = DefaultKeyResolver::new(KeyResolverConfig {
         trusted_certs: trusted.clone(),
         ..KeyResolverConfig::default()
@@ -559,6 +560,7 @@ fn facts(xml: &str, anchors: &Path, at: i64, profile: PolicyProfile) -> Result<V
             now: at,
             requirements,
             utc: &utc,
+            direct_trust,
         };
         integrity(&document, &request, &account, at, &declared, &etsi_inputs)
     })?;
