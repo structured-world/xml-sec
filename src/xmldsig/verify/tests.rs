@@ -5954,6 +5954,44 @@ fn reference_with_wrong_digest_fails() {
 }
 
 #[test]
+fn reference_with_a_digest_of_another_length_fails_its_validation() {
+    // XMLDSig Core 1.1 §3.2.1 step 2: a DigestValue as long as a SHA-512
+    // digest under a SHA-256 DigestMethod cannot match, and that is a
+    // reference failure, not a refusal of the whole signature.
+    let xml = r#"<root>
+            <data>hello</data>
+            <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+                <ds:SignedInfo/>
+            </ds:Signature>
+        </root>"#;
+    let doc = Document::parse(xml).unwrap();
+    let resolver = UriReferenceResolver::new(&doc);
+    let sig_node = doc
+        .descendants()
+        .find(|n| n.is_element() && n.tag_name().name() == "Signature")
+        .unwrap();
+    let reference = make_reference(
+        "",
+        vec![Transform::Enveloped],
+        DigestAlgorithm::Sha256,
+        vec![0u8; 64],
+    );
+    let result = process_reference(
+        &reference,
+        &resolver,
+        sig_node,
+        ReferenceSet::SignedInfo,
+        0,
+        false,
+    )
+    .unwrap();
+    assert!(matches!(
+        result.status,
+        DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
+    ));
+}
+
+#[test]
 fn reference_with_wrong_digest_preserves_supplied_ref_index() {
     let xml = r#"<root>
             <data>hello</data>
