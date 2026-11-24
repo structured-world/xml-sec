@@ -1152,14 +1152,16 @@ fn own_materials(declared: &Declared, signer: &Certificate<'_>, memory: &Memory)
 
 /// The ETSI indication of one signature verified in `session` (whose policy
 /// trusts every carried key directly, so `result` is its integrity alone).
-/// `malformed` says the signature does not conform to its format (clause
-/// 5.2.2), which clause 5.3.4 step 1 decides first.
+/// `uncountersigned` says the signature is a countersignature none of whose
+/// references matches the countersigned `SignatureValue`, a signed data item
+/// of its own (EN 319 132-1 §5.2.7.2) whose hash then fails (clause 5.2.7.4
+/// step 2).
 pub fn indication<W: structured_asn1::memory::Work>(
     session: &VerifiedSession<'_, '_, '_, W>,
     result: &Result<VerifyResult, xml_sec::xmldsig::DsigError>,
     declared: &Declared,
     inputs: &Inputs<'_>,
-    malformed: bool,
+    uncountersigned: bool,
 ) -> Value {
     let result = match result {
         Ok(result) => result,
@@ -1199,12 +1201,12 @@ pub fn indication<W: structured_asn1::memory::Work>(
     if !declared.certificate_references.is_empty() {
         elements = elements.with(Element::SigningCertificate);
     }
+    let mut references = references;
+    if uncountersigned {
+        references.push(Reference::Mismatch);
+    }
     let facts = Facts {
-        format: if malformed {
-            Format::Malformed
-        } else {
-            Format::Conformant
-        },
+        format: Format::Conformant,
         context: Context::Ready,
         signer: Some(Signer {
             not_before,

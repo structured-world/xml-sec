@@ -833,16 +833,17 @@ fn integrity(
         for (index, entry) in session.evidence().signatures().iter().enumerate() {
             let declared = declared.get(index).unwrap_or(&unknown);
             // EN 319 132-1 §5.2.7.2: a CounterSignature property's signature
-            // shall reference the embedding signature's SignatureValue; one
-            // that does not is not of the format (EN 319 102-1 §5.2.2).
-            let malformed = matches!(
+            // signs the embedding signature's SignatureValue. Its format
+            // still lets it be verified (EN 319 102-1 §5.2.2.1), so one that
+            // covers no such value fails that data item's hash instead.
+            let uncountersigned = matches!(
                 validate_basic(&session, entry.identity(), &[], |_| ()),
                 Err(ValidationError::Enclosing(error))
                     if matches!(*error, EnclosingError::Counter(_))
             );
             found.push((
                 verification(entry),
-                etsi::indication(&session, entry.result(), declared, inputs, malformed),
+                etsi::indication(&session, entry.result(), declared, inputs, uncountersigned),
             ));
         }
         Ok(())
