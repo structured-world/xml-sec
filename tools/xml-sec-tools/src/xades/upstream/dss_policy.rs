@@ -93,13 +93,20 @@ pub(crate) fn policy(template: &str, constraints: &Value) -> Result<String, Stri
     if families.is_empty() || hashes.is_empty() {
         return Err(format!("the profile accepts no signature: {constraints}"));
     }
+    // The families a certificate may use are those xml-sec's certificate
+    // rules size, not the XML signature suites: a CA key outside the suites
+    // is restricted by its size alone on both sides.
+    let certificate_families = strings(&constraints["certificate"]["families"]);
+    if certificate_families.is_empty() {
+        return Err(format!("the profile accepts no certificate: {constraints}"));
+    }
     let minimum = &constraints["minimum_bits"];
     let certificate_hashes: Vec<String> = CERTIFICATE_HASHES
         .iter()
         .map(|hash| (*hash).to_owned())
         .collect();
     let signature = cryptographic(&families, &hashes, minimum);
-    let certificates = cryptographic(&families, &certificate_hashes, minimum);
+    let certificates = cryptographic(&certificate_families, &certificate_hashes, minimum);
     let document = xml::parse(template, "DSS validation policy")?;
     let mut ranges: Vec<(std::ops::Range<usize>, &str)> =
         xml::below(document.root_element(), "Cryptographic", None)

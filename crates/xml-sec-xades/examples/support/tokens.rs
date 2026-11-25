@@ -9,9 +9,95 @@ use structured_asn1::{Oid, Parser};
 use structured_cms::timestamp::{Accuracy, PolicyAccuracy, Token};
 use xml_sec_xades::AuthorityAccuracy;
 
-/// Every base64 value of an element whose name ends with `tag`.
-pub fn values(text: &str, tag: &str) -> Vec<Vec<u8>> {
-    values_at(text, tag)
+/// The `XMLDSig` namespace.
+pub const DS: &str = "http://www.w3.org/2000/09/xmldsig#";
+
+/// The ETSI `XAdES` namespaces: TS 101 903 V1.1.1 and V1.2.2, and the V1.3.2
+/// and V1.4.1 namespaces EN 319 132-1 section 4.2 uses.
+pub const XADES: [&str; 4] = [
+    "http://uri.etsi.org/01903/v1.1.1#",
+    "http://uri.etsi.org/01903/v1.2.2#",
+    "http://uri.etsi.org/01903/v1.3.2#",
+    "http://uri.etsi.org/01903/v1.4.1#",
+];
+
+/// Whether `node` is an element named `local` in one of the `XAdES`
+/// namespaces.
+pub fn is_xades(node: &roxmltree::Node<'_, '_>, local: &str) -> bool {
+    node.is_element()
+        && node.tag_name().name() == local
+        && node
+            .tag_name()
+            .namespace()
+            .is_some_and(|namespace| XADES.contains(&namespace))
+}
+
+/// A base64 field of a signature, by its expanded element names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Field {
+    /// `ds:X509Certificate` (`XMLDSig` 1.1 section 4.5.4) and `XAdES`
+    /// `EncapsulatedX509Certificate` (EN 319 132-1 section 5.4.2).
+    Certificate,
+    /// The `XAdES` element of this local name: `EncapsulatedTimeStamp`
+    /// (EN 319 132-1 section 5.1.4.3), `EncapsulatedCRLValue` or
+    /// `EncapsulatedOCSPValue` (section 5.4.3).
+    Xades(&'static str),
+}
+
+impl Field {
+    /// A timestamp token's field.
+    pub const TIMESTAMP: Self = Self::Xades("EncapsulatedTimeStamp");
+
+    /// Whether `node` is an element of this field. An application element
+    /// that only shares a suffix or a local name in another namespace is not.
+    fn holds(self, node: &roxmltree::Node<'_, '_>) -> bool {
+        match self {
+            Self::Certificate => {
+                (node.is_element()
+                    && node.tag_name().name() == "X509Certificate"
+                    && node.tag_name().namespace() == Some(DS))
+                    || is_xades(node, "EncapsulatedX509Certificate")
+            }
+            Self::Xades(local) => is_xades(node, local),
+        }
+    }
+}
+
+/// The character content of a simple-content element: its text and CDATA
+/// children in order, comments and processing instructions left out, as the
+/// XML Infoset gives an element's characters. None for an element with an
+/// element child, which carries no simple value.
+pub fn simple_text(node: roxmltree::Node<'_, '_>) -> Option<String> {
+    let mut text = String::new();
+    for child in node.children() {
+        if child.is_element() {
+            return None;
+        }
+        // The parser has already replaced character references, `&#13;`
+        // included (XML 1.0 section 4.1), and reads CDATA as text.
+        if let Some(part) = child.is_text().then(|| child.text()).flatten() {
+            text.push_str(part);
+        }
+    }
+    Some(text)
+}
+
+/// The base64 value of `node` (XML Schema `base64Binary`, whitespace
+/// collapsed), or why it is no such value.
+pub fn base64(node: roxmltree::Node<'_, '_>) -> Result<Vec<u8>, String> {
+    let text = simple_text(node).ok_or("the element has element content")?;
+    let compact: String = text
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect();
+    structured_base64::STANDARD
+        .decode(compact.as_bytes())
+        .map_err(|error| format!("{error:?}"))
+}
+
+/// Every base64 value of `field` in `text`.
+pub fn values(text: &str, field: Field) -> Vec<Vec<u8>> {
+    values_at(text, field)
         .into_iter()
         .map(|(_, value)| value)
         .collect()
@@ -23,7 +109,16 @@ pub fn values(text: &str, tag: &str) -> Vec<Vec<u8>> {
 /// Only elements count: the same text in a comment, a processing
 /// instruction or an attribute is no value. A document that does not parse
 /// carries none.
-pub fn values_at(text: &str, tag: &str) -> Vec<(usize, Vec<u8>)> {
+pub fn values_at(text: &str, field: Field) -> Vec<(usize, Vec<u8>)> {
+    encoded_at(text, field)
+        .into_iter()
+        .filter_map(|(at, value)| Some((at, value.ok()?)))
+        .collect()
+}
+
+/// Every element of `field` in `text` with its place in document order and
+/// its decoded value, or why it does not decode.
+pub fn encoded_at(text: &str, field: Field) -> Vec<(usize, Result<Vec<u8>, String>)> {
     let Ok(document) = roxmltree::Document::parse_with_options(
         text,
         roxmltree::ParsingOptions {
@@ -33,25 +128,11 @@ pub fn values_at(text: &str, tag: &str) -> Vec<(usize, Vec<u8>)> {
     ) else {
         return Vec::new();
     };
-    let mut found = Vec::new();
-    for element in document
+    document
         .descendants()
-        .filter(|node| node.is_element() && node.tag_name().name().ends_with(tag))
-    {
-        // The parser has already replaced character references, `&#13;`
-        // included (XML 1.0 section 4.1).
-        let compact: String = element
-            .descendants()
-            .filter(roxmltree::Node::is_text)
-            .filter_map(|node| node.text())
-            .flat_map(str::chars)
-            .filter(|character| !character.is_ascii_whitespace())
-            .collect();
-        if let Ok(value) = structured_base64::STANDARD.decode(compact.as_bytes()) {
-            found.push((node_order(element), value));
-        }
-    }
-    found
+        .filter(|node| field.holds(node))
+        .map(|element| (node_order(element), base64(element)))
+        .collect()
 }
 
 /// The place of `node` in document order: the parser numbers the nodes of
@@ -69,7 +150,16 @@ pub type Authority = (Vec<u8>, Vec<u8>);
 pub fn token_authorities(text: &str, carried: &[Vec<u8>]) -> (Vec<Authority>, Vec<String>) {
     let mut found = Vec::new();
     let mut failures = Vec::new();
-    for token in values(text, "EncapsulatedTimeStamp") {
+    for (_, token) in encoded_at(text, Field::TIMESTAMP) {
+        // A token whose base64 does not decode is as unreadable as one whose
+        // CMS does not parse.
+        let token = match token {
+            Ok(token) => token,
+            Err(error) => {
+                failures.push(format!("the token's base64 does not decode: {error}"));
+                continue;
+            }
+        };
         match token_policy_and_certificates(&token) {
             Ok((policy, own)) => {
                 for certificate in own.into_iter().chain(carried.iter().cloned()) {

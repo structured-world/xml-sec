@@ -21,7 +21,8 @@ import eu.europa.esig.dss.validation.reports.Reports;
  * validating it (an unsupported algorithm, say), leaves that refusal in
  * refused.txt; any other exception, which is a failure of the run rather
  * than an answer about the input, leaves its trace in error.txt instead of
- * reports. An input or a policy that cannot be read is such a failure: both
+ * reports. An input, its anchors or a policy that cannot be read is such a
+ * failure, written for that case alone; the input and the policy
  * are read before DSS selects a validator, so only an input DSS has in hand
  * can be refused, and DSS's wrapping of a policy read error never reads as
  * a refusal.
@@ -34,12 +35,25 @@ public class CorpusProbe {
             }
             var fields = line.split("\t", -1);
             var anchors = new ArrayList<byte[]>();
+            // Anchors that cannot be read fail this case under every policy,
+            // as an unreadable input does; the later cases still run.
+            String unreadAnchors = null;
             try (var files = Files.list(Path.of(fields[3]))) {
                 for (var file : files.sorted().toList()) {
                     anchors.add(Files.readAllBytes(file));
                 }
+            } catch (Exception error) {
+                var trace = new StringWriter();
+                error.printStackTrace(new PrintWriter(trace));
+                unreadAnchors = trace.toString();
             }
             for (int pair = 4; pair + 1 < fields.length; pair += 2) {
+                if (unreadAnchors != null) {
+                    var output = Path.of(fields[pair + 1]);
+                    Files.createDirectories(output);
+                    Files.writeString(output.resolve("error.txt"), unreadAnchors);
+                    continue;
+                }
                 var output = Path.of(fields[pair + 1]);
                 Files.createDirectories(output);
                 InMemoryDocument input;

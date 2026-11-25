@@ -44,10 +44,10 @@ use xml_sec::policy::{
 use xml_sec::provider::RustCryptoProvider;
 use xml_sec::xmldsig::UriTypeSet;
 use xml_sec::xmldsig::{
-    CallerTrustedSignatureKey, DefaultKeyResolver, DigestAlgorithm, DsigError, KeyInfo,
-    KeyInfoSource, KeyResolver, KeyResolverConfig, ResolvedVerificationKey, SignatureAlgorithm,
-    SignatureEvidence, VerificationKey, VerificationRequest, VerifyContext, VerifyingKey,
-    with_verified_request,
+    CallerTrustedSignatureKey, DefaultKeyResolver, DigestAlgorithm, DsigError, DsigStatus,
+    FailureReason, KeyInfo, KeyInfoSource, KeyResolver, KeyResolverConfig, ResolvedVerificationKey,
+    SignatureAlgorithm, SignatureEvidence, VerificationKey, VerificationRequest, VerifyContext,
+    VerifyingKey, with_verified_request,
 };
 use xml_sec_xades::{
     EnclosingError, Inputs, Level, Outcome, Requirements, Syntax, TimestampRole, TokenIntegrity,
@@ -137,7 +137,11 @@ fn signer_anchors(
         Ok(document) => document,
         Err(error) => return Ok((Vec::new(), Some(error.to_string()))),
     };
-    let declared = declarations(text);
+    let mut declared = declarations(text);
+    let expected = expected_targets(&document, text);
+    // The signer is the referenced certificate whose key verifies the
+    // signature, never a CA its references also name.
+    settle_signers(&document, &expected, &mut declared, pool, 0)?;
     // The session lends its certificate-signature verifier; no key or chain
     // of the document's own is trusted for it.
     let resolver = DefaultKeyResolver::new(KeyResolverConfig::default());
@@ -145,7 +149,6 @@ fn signer_anchors(
         .policy(profile_policy(PolicyProfile::XadesConformant, 0, false)?)
         .key_resolver(&resolver);
     let operation = account();
-    let expected = expected_targets(&document, text);
     let request = VerificationRequest {
         expected_targets: &expected,
         ..VerificationRequest::default()
@@ -185,13 +188,13 @@ fn signer_anchors(
         // each once.
         let places: Vec<usize> = (0..certificates.len()).collect();
         for signature in &declared {
-            let Some(signer) = etsi::signing_certificate(signature, &certificates, &memory) else {
+            let Some(start) = signature.signer.as_deref().and_then(|signer| {
+                certificates
+                    .iter()
+                    .position(|certificate| certificate.as_bytes() == signer)
+            }) else {
                 continue;
             };
-            let start = certificates
-                .iter()
-                .position(|certificate| certificate.as_bytes() == signer.as_bytes())
-                .expect("the signing certificate is one of the pool");
             let tops = match chain_tops(
                 start,
                 &places,
@@ -226,9 +229,10 @@ fn signer_anchors(
 
 /// Every certificate the document and its tokens carry, once.
 fn pool(text: &str) -> Vec<Vec<u8>> {
-    // Every element named *X509Certificate: XMLDSig's X509Certificate and
-    // XAdES's EncapsulatedX509Certificate (CertificateValues) alike.
-    let carried = tokens::values(text, "X509Certificate");
+    // XMLDSig's X509Certificate and XAdES's EncapsulatedX509Certificate
+    // alike, by their expanded names; an application field that only shares
+    // the name's suffix carries no certificate of the signature.
+    let carried = tokens::values(text, tokens::Field::Certificate);
     // A token that cannot be read carries no certificate the comparison could
     // anchor; the facts report why it could not be read.
     let (authorities, _) = tokens::token_authorities(text, &carried);
@@ -250,16 +254,12 @@ fn document_positions(text: &str) -> Vec<(Vec<u8>, usize)> {
             Some(known) => known.1 = known.1.min(at),
             None => found.push((value, at)),
         };
-    for tag in [
-        "X509Certificate",
-        "EncapsulatedCRLValue",
-        "EncapsulatedOCSPValue",
-    ] {
-        for (at, value) in tokens::values_at(text, tag) {
+    for field in [tokens::Field::Certificate, CRL, OCSP] {
+        for (at, value) in tokens::values_at(text, field) {
             add(value, at);
         }
     }
-    for (at, token) in tokens::values_at(text, "EncapsulatedTimeStamp") {
+    for (at, token) in tokens::values_at(text, tokens::Field::TIMESTAMP) {
         for certificate in etsi::token_details(&token)
             .map(|facts| facts.certificates)
             .unwrap_or_default()
@@ -270,12 +270,14 @@ fn document_positions(text: &str) -> Vec<(Vec<u8>, usize)> {
     found
 }
 
-/// The claimed signing time of the document's first signature that signs
-/// one, as Unix seconds.
-fn signing_time(text: &str) -> Option<i64> {
+/// The claimed signing time of each of the document's signatures, in
+/// document order, as Unix seconds; none for one that signs no such claim.
+/// Each signature is validated at its own time, never at another's.
+fn signing_times(text: &str) -> Vec<Option<i64>> {
     declarations(text)
         .iter()
-        .find_map(|declared| declared.signing_time)
+        .map(|declared| declared.signing_time)
+        .collect()
 }
 
 /// An `xs:dateTime` value (XML Schema 1.1 Part 2 section 3.3.7) as Unix
@@ -387,7 +389,7 @@ fn conditions(xml: &str, anchors: &Path) -> Result<Value, Failure> {
     }
     let mut found = json!({
         "anchors": ends.len(),
-        "signing_time": signing_time(&text),
+        "signing_times": signing_times(&text),
     });
     if let Some(unread) = unread {
         found["unread"] = unread.into();
@@ -395,20 +397,12 @@ fn conditions(xml: &str, anchors: &Path) -> Result<Value, Failure> {
     Ok(found)
 }
 
-const DS: &str = "http://www.w3.org/2000/09/xmldsig#";
-/// The common prefix of every ETSI `XAdES` namespace (v1.1.1, v1.2.2, v1.3.2,
-/// v1.4.1).
-const XADES_NAMESPACES: &str = "http://uri.etsi.org/01903/";
+use tokens::{DS, is_xades};
 
-/// Whether `node` is the `XAdES` element `name`, in any ETSI `XAdES` namespace.
-fn is_xades(node: &roxmltree::Node<'_, '_>, name: &str) -> bool {
-    node.is_element()
-        && node.tag_name().name() == name
-        && node
-            .tag_name()
-            .namespace()
-            .is_some_and(|namespace| namespace.starts_with(XADES_NAMESPACES))
-}
+/// The `XAdES` field of an incorporated CRL (EN 319 132-1 section 5.4.3).
+const CRL: tokens::Field = tokens::Field::Xades("EncapsulatedCRLValue");
+/// The `XAdES` field of an incorporated OCSP response (section 5.4.3).
+const OCSP: tokens::Field = tokens::Field::Xades("EncapsulatedOCSPValue");
 
 /// The first `XAdES` child `name` of `node`.
 fn xades_child<'a, 'i>(
@@ -436,15 +430,7 @@ fn declarations(text: &str) -> Vec<etsi::Declared> {
     let is_signature = |node: &roxmltree::Node<'_, '_>| {
         is(node, "Signature") && node.tag_name().namespace() == Some(DS)
     };
-    let base64 = |node: roxmltree::Node<'_, '_>| -> Option<Vec<u8>> {
-        let compact: String = node
-            .text()
-            .unwrap_or_default()
-            .chars()
-            .filter(|character| !character.is_ascii_whitespace())
-            .collect();
-        structured_base64::STANDARD.decode(compact.as_bytes()).ok()
-    };
+    let base64 = |node: roxmltree::Node<'_, '_>| tokens::base64(node).ok();
     let mut found = Vec::new();
     for signature in document.descendants().filter(is_signature) {
         let mut declared = etsi::Declared::default();
@@ -503,15 +489,19 @@ fn declarations(text: &str) -> Vec<etsi::Declared> {
 /// and Annex A), the properties `check_tokens` reads; the same names
 /// anywhere else stamp nothing.
 fn own_timestamps(signature: roxmltree::Node<'_, '_>, declared: &mut etsi::Declared) {
-    let base64 = |node: roxmltree::Node<'_, '_>| -> Option<Vec<u8>> {
-        let compact: String = node
-            .text()
-            .unwrap_or_default()
-            .chars()
-            .filter(|character| !character.is_ascii_whitespace())
-            .collect();
-        structured_base64::STANDARD.decode(compact.as_bytes()).ok()
-    };
+    // Each container holds its own timestamp properties: the signature and
+    // validation-data ones are unsigned signature properties, the content
+    // ones signed data-object properties (EN 319 132-1 sections 4.3.5,
+    // 4.3.6); a property in the other container is no timestamp of either.
+    const UNSIGNED: [&str; 6] = [
+        "SignatureTimeStamp",
+        "SigAndRefsTimeStamp",
+        "SigAndRefsTimeStampV2",
+        "RefsOnlyTimeStamp",
+        "RefsOnlyTimeStampV2",
+        "ArchiveTimeStamp",
+    ];
+    const CONTENT: [&str; 2] = ["AllDataObjectsTimeStamp", "IndividualDataObjectsTimeStamp"];
     let properties = qualifying_properties(signature);
     let unsigned = properties
         .and_then(|properties| xades_child(properties, "UnsignedProperties"))
@@ -521,19 +511,36 @@ fn own_timestamps(signature: roxmltree::Node<'_, '_>, declared: &mut etsi::Decla
         .and_then(|signed| xades_child(signed, "SignedDataObjectProperties"));
     let stamps = unsigned
         .into_iter()
-        .chain(content)
-        .flat_map(|container| container.children())
-        .filter(roxmltree::Node::is_element);
-    for property in stamps {
+        .flat_map(|container| {
+            container
+                .children()
+                .map(|property| (property, &UNSIGNED[..]))
+        })
+        .chain(content.into_iter().flat_map(|container| {
+            container
+                .children()
+                .map(|property| (property, &CONTENT[..]))
+        }));
+    for (property, allowed) in stamps {
         let name = property.tag_name().name();
-        if !is_xades(&property, name) {
+        if !is_xades(&property, name) || !allowed.contains(&name) {
             continue;
         }
         let encapsulated = property
             .children()
-            .filter(|token| is_xades(token, "EncapsulatedTimeStamp"))
-            .filter_map(base64);
-        for token in encapsulated {
+            .filter(|token| is_xades(token, "EncapsulatedTimeStamp"));
+        for element in encapsulated {
+            // A token whose base64 does not decode is still this signature's
+            // token: it is reported, never dropped from the census.
+            let token = match tokens::base64(element) {
+                Ok(token) => token,
+                Err(error) => {
+                    declared
+                        .undecodable_timestamps
+                        .push(format!("{name}: {error}"));
+                    continue;
+                }
+            };
             match name {
                 "SignatureTimeStamp" => declared.signature_timestamps.push(token),
                 "SigAndRefsTimeStamp" | "SigAndRefsTimeStampV2" => {
@@ -597,14 +604,33 @@ fn signed_claims(signature: roxmltree::Node<'_, '_>, declared: &mut etsi::Declar
             && node.tag_name().name() == name
             && node.tag_name().namespace() == Some(DS)
     };
-    let Some(signed) = qualifying_properties(signature)
+    let Some(properties) = qualifying_properties(signature)
         .and_then(|properties| xades_child(properties, "SignedProperties"))
-        .and_then(|signed| xades_child(signed, "SignedSignatureProperties"))
+    else {
+        return;
+    };
+    // The properties are signed only when a reference of the signature's own
+    // SignedInfo names them (EN 319 132-1 section 4.3.2); an unreferenced
+    // SignedProperties claims nothing the signature protects.
+    let covered = properties.attribute("Id").is_some_and(|id| {
+        signature
+            .children()
+            .filter(|info| ds(info, "SignedInfo"))
+            .flat_map(|info| info.children())
+            .filter(|reference| ds(reference, "Reference"))
+            .filter_map(|reference| reference.attribute("URI"))
+            .filter_map(|uri| uri.strip_prefix('#').and_then(unescaped))
+            .any(|fragment| fragment == id)
+    });
+    let Some(signed) = covered
+        .then(|| xades_child(properties, "SignedSignatureProperties"))
+        .flatten()
     else {
         return;
     };
     declared.signing_time = xades_child(signed, "SigningTime")
-        .and_then(|time| date_time(time.text().unwrap_or_default().trim()));
+        .and_then(tokens::simple_text)
+        .and_then(|time| date_time(time.trim()));
     let certificates = xades_child(signed, "SigningCertificateV2")
         .or_else(|| xades_child(signed, "SigningCertificate"));
     for digest in certificates
@@ -621,15 +647,7 @@ fn signed_claims(signature: roxmltree::Node<'_, '_>, declared: &mut etsi::Declar
         let value = digest
             .children()
             .find(|node| ds(node, "DigestValue"))
-            .and_then(|node| {
-                let compact: String = node
-                    .text()
-                    .unwrap_or_default()
-                    .chars()
-                    .filter(|character| !character.is_ascii_whitespace())
-                    .collect();
-                structured_base64::STANDARD.decode(compact.as_bytes()).ok()
-            });
+            .and_then(|node| tokens::base64(node).ok());
         if let Some(value) = value {
             declared.certificate_references.push((method, value));
         }
@@ -957,10 +975,17 @@ fn signature_row(
     let trust = verification(entry);
     // Each token's own timestamp validation, apart from the signature's: the
     // comparison sets it against DSS's per token.
-    let timestamps = computed
+    let mut timestamps = computed
         .as_object_mut()
         .and_then(|computed| computed.remove("tokens"))
         .unwrap_or(Value::Null);
+    // A token whose base64 does not decode is declared and not judged: its
+    // row keeps the comparison from passing a block it never read.
+    if let (Some(rows), Some(declared)) = (timestamps.as_array_mut(), declared) {
+        rows.extend(declared.undecodable_timestamps.iter().map(
+            |reason| json!({ "role": "Undecodable", "current": null, "undecodable": reason }),
+        ));
+    }
     let mut row = json!({
         "etsi": etsi::under_profile(computed, &trust),
         "verification": trust,
@@ -968,7 +993,8 @@ fn signature_row(
         "timestamps": timestamps,
     });
     if let Some(declared) = declared {
-        row["declared_timestamps"] = declared.tokens().len().into();
+        row["declared_timestamps"] =
+            (declared.tokens().len() + declared.undecodable_timestamps.len()).into();
         if let Some(refusal) = &declared.token_refusal {
             row["token_refusal"] = refusal.clone().into();
         }
@@ -1019,7 +1045,7 @@ fn facts(xml: &str, anchors: &Path, at: i64, profile: PolicyProfile) -> Result<V
         expected_targets: &expected,
         ..VerificationRequest::default()
     };
-    let mut declared = declarations(&text);
+    let mut declared = settled_declarations(&text, &document, &expected, [&carried, &trusted], at)?;
     establish_timestamps(
         &document,
         &request,
@@ -1028,8 +1054,8 @@ fn facts(xml: &str, anchors: &Path, at: i64, profile: PolicyProfile) -> Result<V
         &mut declared,
     )?;
     let rules = rules(&catalogue(&profile_policy(profile, at, true)?)?);
-    let crls = tokens::values(&text, "EncapsulatedCRLValue");
-    let responses = tokens::values(&text, "EncapsulatedOCSPValue");
+    let crls = tokens::values(&text, CRL);
+    let responses = tokens::values(&text, OCSP);
     let positions = document_positions(&text);
     let (integrity, integrity_refusal) = rules.lend(|requirements| {
         let etsi_inputs = etsi::Inputs {
@@ -1107,16 +1133,22 @@ fn establish_timestamps(
     // caller's own key for it, an archive timestamp made after that
     // certificate expired stays checkable, and one signature's newer token
     // never decides another's.
-    let carried: Vec<Vec<u8>> = level_inputs
-        .certificates
-        .iter()
-        .map(|certificate| certificate.to_vec())
-        .collect();
-    let direct = SigningKeys::new(declared, &carried);
+    let direct = SigningKeys::new(declared);
     let context = VerifyContext::new()
         .policy(profile_policy(PolicyProfile::XadesConformant, at, false)?)
         .key_resolver(&direct);
-    let bound = direct.bound(&context.signature_identities(document)?, declared);
+    // A document the discovery of signatures refuses leaves every token
+    // unjudged, for that reason.
+    let identities = match context.signature_identities(document) {
+        Ok(identities) => identities,
+        Err(error) => {
+            for declared in declared.iter_mut() {
+                declared.token_refusal = Some(format!("signature discovery: {error}"));
+            }
+            return Ok(());
+        }
+    };
+    let bound = direct.bound(&identities, declared);
     let trusted: Vec<CallerTrustedSignatureKey<'_>> = bound
         .iter()
         .map(|(signature, key)| CallerTrustedSignatureKey {
@@ -1290,9 +1322,122 @@ fn expected_targets(document: &XmlDocument, text: &str) -> Vec<NodeIdentity> {
         if found.is_empty() {
             found.push(view.root_element());
         }
-        found.dedup();
-        found
+        // Each node once, wherever its aliases stand (`URI=""` and the root's
+        // own Id name one node): the request refuses a repeated target.
+        let mut unique = Vec::with_capacity(found.len());
+        for node in found {
+            if !unique.contains(&node) {
+                unique.push(node);
+            }
+        }
+        unique
     })
+}
+
+/// [`declarations`] of `text` with each signer settled among the carried and
+/// anchor `certificates` ([`settle_signers`]).
+fn settled_declarations(
+    text: &str,
+    document: &XmlDocument,
+    targets: &[NodeIdentity],
+    certificates: [&[Vec<u8>]; 2],
+    at: i64,
+) -> Result<Vec<etsi::Declared>, Failure> {
+    let mut declared = declarations(text);
+    let known: Vec<Vec<u8>> = certificates.concat();
+    settle_signers(document, targets, &mut declared, &known, at)?;
+    Ok(declared)
+}
+
+/// Settles each signature's [`etsi::Declared::signer`]: of the certificates
+/// its signed references name, among `certificates`, the one whose key
+/// verifies its signature value (clause 5.2.3.4: a reference to a CA of the
+/// path makes that CA no signer). Each round binds every unsettled
+/// signature's next candidate as the caller's key for it, with no chain
+/// checked; a signature none of whose candidates verifies keeps no signer.
+fn settle_signers(
+    document: &XmlDocument,
+    targets: &[NodeIdentity],
+    declared: &mut [etsi::Declared],
+    certificates: &[Vec<u8>],
+    at: i64,
+) -> Result<(), Failure> {
+    let parser = Parser::der(account());
+    let pool: Vec<Certificate<'_>> = certificates
+        .iter()
+        .filter_map(|bytes| Certificate::read(&parser, bytes, 0).ok())
+        .collect();
+    let candidates: Vec<Vec<Vec<u8>>> = declared
+        .iter()
+        .map(|declared| {
+            etsi::signing_candidates(declared, &pool, parser.memory())
+                .into_iter()
+                .map(|certificate| certificate.as_bytes().to_vec())
+                .collect()
+        })
+        .collect();
+    let mut settled: Vec<Option<Vec<u8>>> = vec![None; declared.len()];
+    let rounds = candidates.iter().map(Vec::len).max().unwrap_or(0);
+    let mut policy = profile_policy(PolicyProfile::XadesConformant, at, false)?;
+    policy.signature_constraints = SignatureConstraints::General;
+    policy.uris.references = UriTypeSet::new(true, true, true);
+    for round in 0..rounds {
+        let keys = SigningKeys::candidates(&candidates, round, &settled);
+        let context = VerifyContext::new()
+            .policy(policy.clone())
+            .key_resolver(&keys);
+        let Ok(identities) = context.signature_identities(document) else {
+            break;
+        };
+        let bound = keys.bound(&identities, declared);
+        if bound.is_empty() {
+            continue;
+        }
+        let trusted: Vec<CallerTrustedSignatureKey<'_>> = bound
+            .iter()
+            .map(|(signature, key)| CallerTrustedSignatureKey {
+                signature: *signature,
+                key,
+            })
+            .collect();
+        let request = VerificationRequest {
+            expected_targets: targets,
+            trusted_keys: &trusted,
+            ..VerificationRequest::default()
+        };
+        let operation = account();
+        let run = with_verified_request(document, &context, &request, &operation, |session| {
+            for (index, entry) in session.evidence().signatures().iter().enumerate() {
+                let Some(key) = keys.signers.get(index).cloned().flatten() else {
+                    continue;
+                };
+                // XMLDSig checks the signature value before any reference,
+                // so every status but a value mismatch or a missing key means
+                // this key verified it.
+                let verified = entry.result().as_ref().is_ok_and(|result| {
+                    !matches!(
+                        result.status,
+                        DsigStatus::Invalid(
+                            FailureReason::SignatureMismatch | FailureReason::KeyNotFound
+                        )
+                    )
+                });
+                if verified {
+                    settled[index] = Some(key);
+                }
+            }
+            Ok(())
+        });
+        // A refused request refuses every later round alike; what is settled
+        // so far stands.
+        if run.is_err() {
+            break;
+        }
+    }
+    for (declared, signer) in declared.iter_mut().zip(settled) {
+        declared.signer = signer;
+    }
+    Ok(())
 }
 
 /// The signing certificate of each signature, identified as clause 5.2.3.4
@@ -1306,20 +1451,31 @@ struct SigningKeys {
 }
 
 impl SigningKeys {
-    fn new(declared: &[etsi::Declared], carried: &[Vec<u8>]) -> Self {
-        let parser = Parser::der(account());
-        let pool: Vec<Certificate<'_>> = carried
-            .iter()
-            .filter_map(|bytes| Certificate::read(&parser, bytes, 0).ok())
-            .collect();
-        let signers = declared
-            .iter()
-            .map(|declared| {
-                etsi::signing_certificate(declared, &pool, parser.memory())
-                    .map(|certificate| certificate.as_bytes().to_vec())
-            })
-            .collect();
-        Self { signers }
+    /// Each signature's settled signing certificate ([`settle_signers`]).
+    fn new(declared: &[etsi::Declared]) -> Self {
+        Self {
+            signers: declared
+                .iter()
+                .map(|declared| declared.signer.clone())
+                .collect(),
+        }
+    }
+
+    /// Keys bound to each signature in turn: the `round`th candidate of every
+    /// signature not yet settled.
+    fn candidates(candidates: &[Vec<Vec<u8>>], round: usize, settled: &[Option<Vec<u8>>]) -> Self {
+        Self {
+            signers: candidates
+                .iter()
+                .zip(settled)
+                .map(|(candidates, settled)| {
+                    settled
+                        .is_none()
+                        .then(|| candidates.get(round).cloned())
+                        .flatten()
+                })
+                .collect(),
+        }
     }
 
     /// The verification key of the certificate `der`, for `algorithm` as the
@@ -1404,7 +1560,7 @@ fn integrity(
     declared: &[etsi::Declared],
     inputs: &etsi::Inputs<'_>,
 ) -> Result<Established, Failure> {
-    let direct = SigningKeys::new(declared, inputs.pool);
+    let direct = SigningKeys::new(declared);
     // Format checking covers the base format only; conformance to a signature
     // profile such as XAdES is signature acceptance (EN 319 102-1 5.2.2 NOTE,
     // 5.2.8), so integrity is established over plain XMLDSig. External
@@ -1414,7 +1570,13 @@ fn integrity(
     policy.signature_constraints = SignatureConstraints::General;
     policy.uris.references = UriTypeSet::new(true, true, true);
     let context = VerifyContext::new().policy(policy).key_resolver(&direct);
-    let bound = direct.bound(&context.signature_identities(document)?, declared);
+    // A document the discovery of signatures refuses (a policy ceiling, say)
+    // is a refusal of the request, reported like any other.
+    let identities = match context.signature_identities(document) {
+        Ok(identities) => identities,
+        Err(error) => return Ok((Vec::new(), Some(refusal(&error)))),
+    };
+    let bound = direct.bound(&identities, declared);
     let trusted: Vec<CallerTrustedSignatureKey<'_>> = bound
         .iter()
         .map(|(signature, key)| CallerTrustedSignatureKey {
@@ -1456,11 +1618,13 @@ fn integrity(
         }
         Ok(())
     });
-    let refusal = run.err().map(|error| {
-        let debug = format!("{error:?}");
-        json!({ "error": kind(&debug), "detail": error.to_string() })
-    });
-    Ok((found, refusal))
+    Ok((found, run.err().map(|error| refusal(&error))))
+}
+
+/// A refused request as the facts report it: the error's kind and message.
+fn refusal(error: &DsigError) -> Value {
+    let debug = format!("{error:?}");
+    json!({ "error": kind(&debug), "detail": error.to_string() })
 }
 
 /// Until when a signature that passes now keeps passing over the evidence it
@@ -1605,14 +1769,25 @@ fn constraints(profile: PolicyProfile) -> Result<Value, Failure> {
         .collect();
     hashes.sort_unstable();
     hashes.dedup();
-    let minimum: Map<String, Value> = catalogue
+    // Certificates are restricted by key size alone over every family with
+    // a minimum, as [`rules`] restricts them: both validators take their
+    // certificate families from this one list.
+    let sized: Vec<(&str, u32)> = catalogue
         .minimum_bits
         .iter()
-        .filter(|(family, _)| families.contains(&dss_family(*family)))
-        .map(|(family, bits)| (dss_family(*family).to_owned(), json!(bits)))
+        .filter(|(family, _)| *family != Family::Other)
+        .map(|(family, bits)| (dss_family(*family), *bits))
+        .collect();
+    let mut certificate_families: Vec<&str> = sized.iter().map(|(family, _)| *family).collect();
+    certificate_families.sort_unstable();
+    certificate_families.dedup();
+    let minimum: Map<String, Value> = sized
+        .into_iter()
+        .map(|(family, bits)| (family.to_owned(), json!(bits)))
         .collect();
     Ok(json!({
         "signature": { "families": families, "hashes": hashes },
+        "certificate": { "families": certificate_families },
         "minimum_bits": minimum,
     }))
 }

@@ -506,7 +506,8 @@ fn the_dss_policy_takes_the_profiles_cryptography_and_keeps_the_rest() {
 </ConstraintsParameters>"#;
     let constraints = json!({
         "signature": { "families": ["ECDSA", "RSA"], "hashes": ["SHA256"] },
-        "minimum_bits": { "RSA": 2048, "ECDSA": 256 },
+        "certificate": { "families": ["DSA", "ECDSA", "RSA"] },
+        "minimum_bits": { "RSA": 2048, "DSA": 2048, "ECDSA": 256 },
     });
     let policy = super::dss_policy::policy(template, &constraints).unwrap();
     assert!(!policy.contains("MD5"), "{policy}");
@@ -544,6 +545,14 @@ fn the_dss_policy_takes_the_profiles_cryptography_and_keeps_the_rest() {
             vec!["SHA256".to_owned()]
         };
         assert_eq!(digests(element), expected, "{parent}/{grand}");
+        // A DSA CA key above the DSA minimum certifies an RSA XML signer in
+        // xml-sec's certificate rules, which size every family: DSS's
+        // certificate constraints must accept it too, and its signature
+        // constraint keeps only the XML suites.
+        let dsa = crate::xades::xml::below(element, "AcceptableEncryptionAlgo", None)
+            .flat_map(crate::xades::xml::elements)
+            .any(|algo| algo.text() == Some("DSA"));
+        assert_eq!(dsa, certificate, "{parent}/{grand}");
         // XMLDSig ECDSA values are r || s: DSS calls them PLAIN-ECDSA.
         assert!(
             crate::xades::xml::below(element, "MiniPublicKeySize", None)
@@ -640,14 +649,18 @@ fn the_validity_horizon_of_each_passing_signature_is_recorded_and_checked() {
     // observes: listed per signature where any has one, and a changed
     // horizon fails the check like a changed comparison.
     let facts = json!({ "signatures": [
-        { "etsi": { "indication": "TOTAL_PASSED", "valid_until": 1_820_055_894 } },
-        { "etsi": { "indication": "INDETERMINATE" } },
+        { "id": "A", "etsi": { "indication": "TOTAL_PASSED", "valid_until": 1_820_055_894 } },
+        { "id": "B", "etsi": { "indication": "INDETERMINATE" } },
     ] });
-    assert_eq!(super::horizons(&facts), Some(json!([1_820_055_894, null])));
+    let ours = facts["signatures"].as_array().unwrap().clone();
+    let rows = compare(&[theirs(Some("A"), "a"), theirs(Some("B"), "b")], &ours);
     assert_eq!(
-        super::horizons(&json!({ "signatures": [{ "etsi": {} }] })),
-        None
+        super::horizons(&rows, &facts),
+        Some(json!([1_820_055_894, null]))
     );
+    let unbounded = json!({ "signatures": [{ "etsi": {} }] });
+    let one = unbounded["signatures"].as_array().unwrap().clone();
+    assert_eq!(super::horizons(&compare(&[], &one), &unbounded), None);
     let mut summary = unreviewed_summary();
     summary["cases"]["a.xml"]["instant/strict"]["valid_until"] = json!([1]);
     let reviews = review("normative-difference", "EN 319 102-1 5.2.6.4 step 4");
@@ -663,6 +676,53 @@ fn the_validity_horizon_of_each_passing_signature_is_recorded_and_checked() {
     let mut changed = summary.clone();
     changed["cases"]["a.xml"]["instant/strict"]["valid_until"] = json!([2]);
     assert_eq!(differences(&recorded, &changed, &reviews).len(), 1);
+}
+
+#[test]
+fn each_signature_is_compared_at_its_own_claimed_time() {
+    // Two signatures claiming 2019 and 2021 are run once per time, since
+    // each validator takes one time for the whole document; the signing-time
+    // comparison takes each signature's row and facts from the run at its own
+    // claim, so the 2021 signature is never judged in 2019.
+    let at = |first: &str, second: &str| {
+        let facts = json!({ "signatures": [
+            { "id": "A", "etsi": { "indication": first } },
+            { "id": "B", "etsi": { "indication": second } },
+        ] });
+        let ours = facts["signatures"].as_array().unwrap().clone();
+        let rows = compare(
+            &[theirs(Some("A"), first), theirs(Some("B"), second)],
+            &ours,
+        );
+        (rows, facts)
+    };
+    let claimed = super::claimed_times(&json!({ "signing_times": [2019, 2021] }));
+    let times = super::distinct_times(&claimed);
+    assert_eq!(times, [2019, 2021]);
+    let runs = vec![
+        at("TOTAL_PASSED", "INDETERMINATE"),
+        at("INDETERMINATE", "TOTAL_PASSED"),
+    ];
+    let (rows, facts) = super::per_signature(runs, &times, &claimed);
+    assert_eq!(rows[0]["overall"]["ours"], "TOTAL_PASSED:-");
+    assert_eq!(rows[1]["overall"]["ours"], "TOTAL_PASSED:-");
+    assert_eq!(facts["signatures"][1]["etsi"]["indication"], "TOTAL_PASSED");
+    assert_eq!(super::time_run(0), "signing-time");
+    assert_eq!(super::time_run(1), "signing-time-2");
+}
+
+#[test]
+fn each_validity_horizon_names_the_signature_of_its_row() {
+    // The rows follow DSS's order of signatures, the facts xml-sec's; a
+    // horizon listed in facts order would give row 0 the bound of the
+    // signature xml-sec lists first, not of the row's own signature.
+    let facts = json!({ "signatures": [
+        { "id": "A", "etsi": { "indication": "TOTAL_PASSED", "valid_until": 1 } },
+        { "id": "B", "etsi": { "indication": "TOTAL_PASSED", "valid_until": 2 } },
+    ] });
+    let ours = facts["signatures"].as_array().unwrap().clone();
+    let rows = compare(&[theirs(Some("B"), "b"), theirs(Some("A"), "a")], &ours);
+    assert_eq!(super::horizons(&rows, &facts), Some(json!([2, 1])));
 }
 
 /// A DSS signature with `id`, whose overall indication names it.
@@ -722,23 +782,16 @@ fn distinct_inputs_get_distinct_result_directories() {
     assert!(!super::slug("dss-xades/src/x.xml").contains('/'));
 }
 
-#[cfg(unix)]
 #[test]
 fn a_symlinked_corpus_directory_is_not_read_twice() {
     // A directory alias would list its XML files under two names and count
-    // them as two corpus inputs.
-    let checkout = tempfile::tempdir().unwrap();
-    for source in super::SOURCES {
-        std::fs::create_dir_all(checkout.path().join(source)).unwrap();
-    }
-    let real = checkout.path().join(super::SOURCES[0]).join("real");
-    std::fs::create_dir_all(&real).unwrap();
-    std::fs::write(real.join("a.xml"), "<a/>").unwrap();
-    std::os::unix::fs::symlink(&real, checkout.path().join(super::SOURCES[0]).join("alias"))
-        .unwrap();
+    // them as two corpus inputs; the tree holds the alias as one link entry,
+    // which is no corpus file.
+    let listing = b"100644 blob aa\tdss-xades/src/test/resources/real/a.xml\0\
+120000 blob bb\tdss-xades/src/test/resources/alias\0";
     assert_eq!(
-        super::inputs(checkout.path()).unwrap(),
-        [format!("{}/real/a.xml", super::SOURCES[0])]
+        super::regular_files(listing).unwrap(),
+        ["dss-xades/src/test/resources/real/a.xml"]
     );
 }
 
@@ -746,17 +799,9 @@ fn a_symlinked_corpus_directory_is_not_read_twice() {
 fn an_xades_named_signature_is_a_corpus_input() {
     // DSS names some XML signatures `.xades` (validation/valid.xades); every
     // XML input must be classified, whatever its extension.
-    let checkout = tempfile::tempdir().unwrap();
-    for source in super::SOURCES {
-        std::fs::create_dir_all(checkout.path().join(source)).unwrap();
-    }
-    let directory = checkout.path().join(super::SOURCES[0]);
-    std::fs::write(directory.join("valid.xades"), "<a/>").unwrap();
-    std::fs::write(directory.join("notes.txt"), "text").unwrap();
-    assert_eq!(
-        super::inputs(checkout.path()).unwrap(),
-        [format!("{}/valid.xades", super::SOURCES[0])]
-    );
+    assert!(super::is_xml("dss-xades/src/test/resources/valid.xades"));
+    assert!(super::is_xml("dss-xades/src/test/resources/a.xml"));
+    assert!(!super::is_xml("dss-xades/src/test/resources/notes.txt"));
 }
 
 #[test]
@@ -954,6 +999,76 @@ fn a_review_moves_onto_the_new_form_of_the_comparison_it_explained() {
         revoked["cases"]["a.xml"][label]["observed"] = json!([{ "XCV": "INDETERMINATE:REVOKED_NO_POE/INDETERMINATE:TRY_LATER", "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:TRY_LATER" }]);
     }
     assert_eq!(super::carried(&previous, &revoked, &reviews), reviews);
+}
+
+#[test]
+fn the_inputs_are_the_regular_files_of_the_release_tree() {
+    // The tree of the verified commit names the inputs: a file the work tree
+    // adds (ignored, so `git status` is silent) is never listed, and a
+    // symbolic link or a submodule is no corpus file.
+    let listing = b"100644 blob aa\tdss-xades/src/test/resources/b.xml\0\
+120000 blob bb\tdss-xades/src/test/resources/link.xml\0\
+160000 commit cc\tdss-xades/src/test/resources/module\0\
+100755 blob dd\tdss-xades/src/test/resources/a.xades\0\
+100644 blob ee\tdss-xades/src/test/resources/sample.png\0";
+    let files = super::regular_files(listing).unwrap();
+    assert_eq!(
+        files,
+        [
+            "dss-xades/src/test/resources/a.xades",
+            "dss-xades/src/test/resources/b.xml",
+            "dss-xades/src/test/resources/sample.png",
+        ]
+    );
+    assert_eq!(
+        super::not_xml(&files),
+        json!({ "dss-xades/src/test/resources/sample.png": "not-xml" })
+    );
+}
+
+#[test]
+fn a_changed_set_of_files_that_are_not_xml_fails_the_check() {
+    // Every corpus file has a disposition; a file that is not XML, added or
+    // gone, is a change of the corpus the recording did not account for.
+    let mut summary = unreviewed_summary();
+    summary["not_xml"] = json!({ "sample.txt": "not-xml" });
+    let reviews = review("normative-difference", "EN 319 102-1 5.2.6.4 step 4");
+    let recorded = super::recorded(&summary, &reviews);
+    assert_eq!(recorded["not_xml"], summary["not_xml"]);
+    assert_eq!(
+        differences(&recorded, &summary, &reviews),
+        Vec::<String>::new()
+    );
+    let mut added = summary.clone();
+    added["not_xml"]["sample.png"] = "not-xml".into();
+    let found = differences(&recorded, &added, &reviews);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("not XML"), "{found:?}");
+}
+
+#[test]
+fn carrying_a_review_keeps_an_exact_approval_observed_under_another_pass() {
+    // A review approved A (strict) and B (conformant). The new run observes
+    // A' equivalent to A under strict, and B exactly, now under a signing-time
+    // pass. Carrying A' forward must not drop B: the reviewer approved that
+    // very observation, wherever it is now observed.
+    let overall = "TOTAL_PASSED:-/INDETERMINATE:TRY_LATER";
+    let a = json!([{ "XCV": "INDETERMINATE:TRY_LATER/fail", "OVERALL": overall }]);
+    let a_rewritten =
+        json!([{ "XCV": "INDETERMINATE:TRY_LATER/INDETERMINATE:TRY_LATER", "OVERALL": overall }]);
+    let b = json!([{ "XCV": "INDETERMINATE:TRY_LATER/fail", "SAV": "PASSED/fail", "OVERALL": overall }]);
+    let mut old = unreviewed_summary();
+    old["cases"]["a.xml"]["instant/strict"]["observed"] = a.clone();
+    old["cases"]["a.xml"]["instant/conformant"]["observed"] = b.clone();
+    let mut reviews = review("normative-difference", "EN 319 102-1 5.2.6.4 step 4");
+    reviews["a.xml"][0]["observed"] = json!([a, b]);
+    let previous = super::recorded(&old, &reviews);
+    let mut summary = unreviewed_summary();
+    summary["cases"]["a.xml"]["instant/strict"]["observed"] = a_rewritten.clone();
+    summary["cases"]["a.xml"]["signing-time/strict"] =
+        json!({ "observed": b, "class": "unreviewed" });
+    let moved = super::carried(&previous, &summary, &reviews);
+    assert_eq!(moved["a.xml"][0]["observed"], json!([b, a_rewritten]));
 }
 
 #[test]

@@ -10,8 +10,10 @@
 //! certificates of the signer chains the document carries, and the time is
 //! [`INSTANT`]. Under each profile whose run reached no validated path for any
 //! of the document's signatures at that instant and found no timestamp token
-//! over a signature value that proves its existence, a second pair of runs
-//! takes its claimed signing time, labelled `signing-time`.
+//! over a signature value that proves its existence, a second pass labelled
+//! `signing-time` validates each signature at its own claimed signing time:
+//! one pair of runs per distinct claimed time, each signature's comparison
+//! taken from the run at its time.
 //!
 //! `interop/xades/dss-corpus/expectations.json` holds the classification of
 //! every input; a run that observes another comparison, or an input it does
@@ -185,38 +187,70 @@ pub(crate) fn checkout_matches(
     Ok(())
 }
 
-/// Every XML file below the corpus sources (`.xml`, and `.xades` as DSS
-/// names some signatures), by its path inside the checkout.
-fn inputs(checkout: &Path) -> Result<Vec<String>, String> {
+/// Every file of the corpus sources at `commit`, as the release tree holds
+/// it: what the checkout's work tree adds (an ignored file, say) is no input.
+fn tree_files(
+    corpus: &Corpus,
+    checkout: &Path,
+    commit: &str,
+    logs: &Path,
+) -> Result<Vec<String>, String> {
+    let mut listing = line(&[
+        &"git",
+        &"-C",
+        &checkout,
+        &"ls-tree",
+        &"-r",
+        &"-z",
+        &"--full-tree",
+        &commit,
+        &"--",
+    ]);
+    listing.extend(SOURCES.iter().map(Into::into));
+    let run = corpus.require(&listing, &logs.join("corpus-tree"))?;
+    regular_files(&run.stdout)
+}
+
+/// The paths of the regular files of a `git ls-tree -r -z` listing, sorted:
+/// a symbolic link or a submodule is no corpus file.
+pub(crate) fn regular_files(listing: &[u8]) -> Result<Vec<String>, String> {
     let mut found = Vec::new();
-    let mut pending: Vec<PathBuf> = SOURCES.iter().map(|source| checkout.join(source)).collect();
-    while let Some(directory) = pending.pop() {
-        let entries = std::fs::read_dir(&directory)
-            .map_err(|error| format!("read {}: {error}", directory.display()))?;
-        for entry in entries {
-            let entry = entry.map_err(|error| format!("read {}: {error}", directory.display()))?;
-            let path = entry.path();
-            // The entry's own type, not its target's: a symlinked directory is
-            // an alias whose files the walk already lists, or a cycle.
-            let kind = entry
-                .file_type()
-                .map_err(|error| format!("read {}: {error}", path.display()))?;
-            if kind.is_dir() {
-                pending.push(path);
-            } else if kind.is_file()
-                && path
-                    .extension()
-                    .is_some_and(|extension| extension == "xml" || extension == "xades")
-            {
-                let relative = path
-                    .strip_prefix(checkout)
-                    .map_err(|error| error.to_string())?;
-                found.push(relative.to_string_lossy().into_owned());
-            }
+    for entry in listing
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let entry = std::str::from_utf8(entry).map_err(|error| error.to_string())?;
+        let (meta, path) = entry
+            .split_once('\t')
+            .ok_or_else(|| format!("unexpected ls-tree entry {entry:?}"))?;
+        let mut fields = meta.split(' ');
+        let (mode, kind) = (fields.next(), fields.next());
+        if kind == Some("blob") && matches!(mode, Some("100644" | "100755")) {
+            found.push(path.to_owned());
         }
     }
     found.sort();
     Ok(found)
+}
+
+/// Whether a corpus file is an XML input: `.xml`, and `.xades` as DSS names
+/// some signatures. Every other file is recorded as not XML.
+pub(crate) fn is_xml(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .is_some_and(|extension| extension == "xml" || extension == "xades")
+}
+
+/// The disposition of every corpus file that is not XML: `not-xml`, validated
+/// by neither validator.
+pub(crate) fn not_xml(files: &[String]) -> Value {
+    Value::Object(
+        files
+            .iter()
+            .filter(|path| !is_xml(path))
+            .map(|path| (path.clone(), "not-xml".into()))
+            .collect(),
+    )
 }
 
 /// A directory name for an input path, distinct for distinct paths: `_` is
@@ -611,7 +645,9 @@ fn reached(dss: &str, ours: &str) -> bool {
 
 /// The per-block comparison of one input: one entry per signature, matched by
 /// the `Id` of its `ds:Signature`, or by position when an `Id` is missing.
-/// A signature only xml-sec reads stands against an absent one.
+/// A signature only xml-sec reads stands against an absent one. Each entry's
+/// `position` is the index of its signature in xml-sec's facts, null for one
+/// only DSS reads.
 pub(crate) fn compare(dss: &[Value], ours: &[Value]) -> Vec<Value> {
     let mut paired = vec![false; ours.len()];
     // Every Id both sides carry is paired first, so a position never takes a
@@ -642,14 +678,24 @@ pub(crate) fn compare(dss: &[Value], ours: &[Value]) -> Vec<Value> {
     let mut rows: Vec<Value> = dss
         .iter()
         .zip(&counterpart)
-        .map(|(signature, position)| row(signature, position.map(|position| &ours[position])))
+        .map(|(signature, position)| {
+            let mut row = row(signature, position.map(|position| &ours[position]));
+            row["position"] = (*position).into();
+            row
+        })
         .collect();
-    for (facts, _) in ours.iter().zip(&paired).filter(|(_, paired)| !**paired) {
+    for (position, (facts, _)) in ours
+        .iter()
+        .zip(&paired)
+        .enumerate()
+        .filter(|(_, (_, paired))| !**paired)
+    {
         let absent = json!({ "id": facts["id"], "blocks": {} });
         let mut row = row(&absent, Some(facts));
         row["matched"] = false.into();
         row["overall"]["indication"] = false.into();
         row["overall"]["agrees"] = false.into();
+        row["position"] = position.into();
         rows.push(row);
     }
     rows
@@ -1002,17 +1048,18 @@ pub(crate) fn complete(saved: &Value, recompared: &Value) -> Result<(), String> 
 /// A corpus input: its name, path, result directory and validation time.
 type Case = (String, PathBuf, PathBuf, i64);
 
-/// Every input of `checkout` with its directory under `results`, and the
-/// conditions the probe derives from it.
+/// Every XML input of `files` in `checkout` with its directory under
+/// `results`, and the conditions the probe derives from it.
 fn conditions_of(
     corpus: &Corpus,
     probe: &Path,
     checkout: &Path,
+    files: &[String],
     results: &Path,
 ) -> Result<(Vec<Case>, Map<String, Value>), String> {
     let mut cases = Vec::new();
     let mut conditions = Map::new();
-    for input in inputs(checkout)? {
+    for input in files.iter().filter(|path| is_xml(path)).cloned() {
         let directory = results.join("cases").join(slug(&input));
         let path = checkout.join(&input);
         let anchors = directory.join("anchors");
@@ -1037,15 +1084,25 @@ fn conditions_of(
     Ok((cases, conditions))
 }
 
-/// Until when each signature of `facts` keeps passing (the probe's
-/// `valid_until`, Unix seconds, `null` for one that does not pass now or
-/// that no certificate bounds), when any signature has such a time.
-pub(crate) fn horizons(facts: &Value) -> Option<Value> {
-    let horizons: Vec<Value> = facts["signatures"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|signature| signature["etsi"]["valid_until"].clone())
+/// The index in xml-sec's facts of the signature of a comparison `row`.
+fn position(row: &Value) -> Option<usize> {
+    row["position"]
+        .as_u64()
+        .and_then(|position| usize::try_from(position).ok())
+}
+
+/// Until when the signature of each comparison row keeps passing (the
+/// probe's `valid_until` in `facts`, Unix seconds), in row order so each bound
+/// names the row's signature; `null` for one that does not pass now, that no
+/// certificate bounds or that only DSS reads. None when no row has such a time.
+pub(crate) fn horizons(rows: &[Value], facts: &Value) -> Option<Value> {
+    let horizons: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            position(row).map_or(Value::Null, |position| {
+                facts["signatures"][position]["etsi"]["valid_until"].clone()
+            })
+        })
         .collect();
     horizons
         .iter()
@@ -1065,7 +1122,7 @@ pub(crate) fn observation(rows: &[Value], facts: &Value, conditions: &Value) -> 
         "dss_passed": every_passed(rows, "dss"),
         "indication": every_overall(rows, "indication"),
     });
-    if let Some(horizons) = horizons(facts) {
+    if let Some(horizons) = horizons(rows, facts) {
         entry["valid_until"] = horizons;
     }
     // A failed run of either validator reads no signature, as an unsigned
@@ -1117,7 +1174,96 @@ pub(crate) fn recordable(summary: &Value) -> Result<(), String> {
     }
 }
 
-/// Every case's comparison in each pass it took part in.
+/// The claimed signing time of each signature of an input, in document order,
+/// as its `conditions` list them.
+pub(crate) fn claimed_times(conditions: &Value) -> Vec<Option<i64>> {
+    conditions["signing_times"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(Value::as_i64)
+        .collect()
+}
+
+/// Each distinct claimed signing time of an input once, in the order its
+/// signatures first claim them: one signing-time run per time, since each
+/// validator takes one validation time for the whole document.
+pub(crate) fn distinct_times(claimed: &[Option<i64>]) -> Vec<i64> {
+    let mut times = Vec::new();
+    for time in claimed.iter().flatten() {
+        if !times.contains(time) {
+            times.push(*time);
+        }
+    }
+    times
+}
+
+/// The result directory of the `index`th signing-time run of an input.
+pub(crate) fn time_run(index: usize) -> String {
+    if index == 0 {
+        "signing-time".to_owned()
+    } else {
+        format!("signing-time-{}", index + 1)
+    }
+}
+
+/// The signing-time comparison of one input from its `runs`, one per
+/// [`distinct_times`] entry: each signature's row and facts come from the run
+/// at its own claimed time. A signature that claims none, or one only DSS
+/// reads, keeps the first run's. The first run's failures stand, and a later
+/// run's failure is added where the first has none.
+pub(crate) fn per_signature(
+    mut runs: Vec<(Vec<Value>, Value)>,
+    times: &[i64],
+    claimed: &[Option<i64>],
+) -> (Vec<Value>, Value) {
+    let later = runs.split_off(1.min(runs.len()));
+    let Some((mut rows, mut facts)) = runs.pop() else {
+        return (Vec::new(), Value::Null);
+    };
+    // The facts list xml-sec's signatures in document order, the order the
+    // claimed times follow.
+    let run_of = |position: usize| {
+        claimed
+            .get(position)
+            .copied()
+            .flatten()
+            .and_then(|time| times.iter().position(|known| *known == time))
+            .filter(|run| *run > 0)
+            .and_then(|run| later.get(run - 1))
+    };
+    for row in &mut rows {
+        let Some(position) = position(row) else {
+            continue;
+        };
+        let own = run_of(position).and_then(|(later_rows, _)| {
+            later_rows
+                .iter()
+                .find(|candidate| candidate["position"] == row["position"])
+        });
+        if let Some(own) = own {
+            *row = own.clone();
+        }
+    }
+    if let Some(signatures) = facts["signatures"].as_array_mut() {
+        for (position, signature) in signatures.iter_mut().enumerate() {
+            if let Some((_, later_facts)) = run_of(position) {
+                *signature = later_facts["signatures"][position].clone();
+            }
+        }
+    }
+    for field in ["probe", "dss_error"] {
+        if facts[field].is_null()
+            && let Some((_, failed)) = later.iter().find(|(_, run)| !run[field].is_null())
+        {
+            facts[field] = failed[field].clone();
+        }
+    }
+    (rows, facts)
+}
+
+/// Every case's comparison in each pass it took part in. A profile whose own
+/// facts called for no signing-time pass did not take it.
 fn observations(
     cases: &[Case],
     conditions: &Map<String, Value>,
@@ -1125,28 +1271,86 @@ fn observations(
     let mut observations = Map::new();
     for (name, _, directory, _) in cases {
         let found = &conditions[name];
+        let claimed = claimed_times(found);
+        let times = distinct_times(&claimed);
         let mut row = Map::new();
-        for label in ["instant", "signing-time"] {
-            let pass = directory.join(label);
-            if !pass.exists() {
-                continue;
-            }
-            // A profile whose own facts called for no signing-time pass did
-            // not take it.
-            for (profile, _) in PROFILES {
-                if !pass.join(profile).exists() {
-                    continue;
-                }
-                let (rows, facts) = pass_rows(&pass, profile)?;
+        let instant = directory.join("instant");
+        for (profile, _) in PROFILES {
+            if instant.join(profile).exists() {
+                let (rows, facts) = pass_rows(&instant, profile)?;
                 row.insert(
-                    format!("{label}/{profile}"),
+                    format!("instant/{profile}"),
                     observation(&rows, &facts, found),
                 );
             }
         }
+        for (profile, _) in PROFILES {
+            let mut runs = Vec::new();
+            for index in 0..times.len() {
+                let run = directory.join(time_run(index));
+                if run.join(profile).exists() {
+                    runs.push(pass_rows(&run, profile)?);
+                }
+            }
+            if runs.is_empty() {
+                continue;
+            }
+            let (rows, facts) = per_signature(runs, &times, &claimed);
+            row.insert(
+                format!("signing-time/{profile}"),
+                observation(&rows, &facts, found),
+            );
+        }
         observations.insert(name.clone(), Value::Object(row));
     }
     Ok(observations)
+}
+
+/// A case at one validation time with the profiles that validate it.
+type Due = (Case, Vec<(&'static str, &'static str)>);
+
+/// The signing-time runs, after the instant pass: the `index`th holds every
+/// input's `index`th distinct claimed time, under the profiles its own
+/// instant facts call the pass for ([`signing_time_profiles`]).
+fn signing_time_runs(
+    cases: &[Case],
+    conditions: &Map<String, Value>,
+) -> Result<Vec<Vec<Due>>, String> {
+    let mut runs: Vec<Vec<Due>> = Vec::new();
+    for (name, path, directory, _) in cases {
+        let times = distinct_times(&claimed_times(&conditions[name]));
+        if times.is_empty() {
+            continue;
+        }
+        let mut facts = Vec::new();
+        for (label, _) in PROFILES {
+            let read: Value = serde_json::from_str(&xml::read(
+                &directory.join("instant").join(label).join("facts.json"),
+            )?)
+            .map_err(|error| error.to_string())?;
+            facts.push((label, read));
+        }
+        let borrowed: Vec<(&str, &Value)> =
+            facts.iter().map(|(label, facts)| (*label, facts)).collect();
+        let labels = signing_time_profiles(&borrowed);
+        if labels.is_empty() {
+            continue;
+        }
+        let due: Vec<(&str, &str)> = PROFILES
+            .into_iter()
+            .filter(|(label, _)| labels.contains(label))
+            .collect();
+        for (index, time) in times.into_iter().enumerate() {
+            if runs.len() == index {
+                runs.push(Vec::new());
+            }
+            runs[index].push((
+                (name.clone(), path.clone(), directory.clone(), time),
+                due.clone(),
+            ));
+        }
+    }
+    Ok(runs)
 }
 
 /// Runs both passes and checks or records every case's comparison.
@@ -1168,47 +1372,27 @@ fn execute(corpus: &Corpus, results: &Path, record: bool) -> Result<(), String> 
     )?;
     let policies = results.join("policies");
     write_policies(corpus, &probe, &release.dss, &policies)?;
-    let (cases, conditions) = conditions_of(corpus, &probe, &checkout, results)?;
-    let pass = |label| Pass {
-        corpus,
-        probe: &probe,
-        classpath: &classpath,
-        label,
-        policies: &policies,
+    let files = tree_files(corpus, &checkout, &commit, results)?;
+    let (cases, conditions) = conditions_of(corpus, &probe, &checkout, &files, results)?;
+    let pass = |label: &str, cases: &[(&Case, Vec<(&str, &str)>)]| {
+        Pass {
+            corpus,
+            probe: &probe,
+            classpath: &classpath,
+            label,
+            policies: &policies,
+        }
+        .run(cases, results)
     };
     let every: Vec<(&Case, Vec<(&str, &str)>)> =
         cases.iter().map(|case| (case, PROFILES.to_vec())).collect();
-    pass("instant").run(&every, results)?;
-    let mut later: Vec<Case> = Vec::new();
-    let mut due = Vec::new();
-    for (name, path, directory, _) in &cases {
-        let Some(time) = conditions[name]["signing_time"].as_i64() else {
-            continue;
-        };
-        let mut facts = Vec::new();
-        for (label, _) in PROFILES {
-            let read: Value = serde_json::from_str(&xml::read(
-                &directory.join("instant").join(label).join("facts.json"),
-            )?)
-            .map_err(|error| error.to_string())?;
-            facts.push((label, read));
-        }
-        let borrowed: Vec<(&str, &Value)> =
-            facts.iter().map(|(label, facts)| (*label, facts)).collect();
-        let labels = signing_time_profiles(&borrowed);
-        if !labels.is_empty() {
-            later.push((name.clone(), path.clone(), directory.clone(), time));
-            due.push(
-                PROFILES
-                    .into_iter()
-                    .filter(|(label, _)| labels.contains(label))
-                    .collect::<Vec<_>>(),
-            );
-        }
-    }
-    if !later.is_empty() {
-        let pairs: Vec<(&Case, Vec<(&str, &str)>)> = later.iter().zip(due).collect();
-        pass("signing-time").run(&pairs, results)?;
+    pass("instant", &every)?;
+    for (index, run) in signing_time_runs(&cases, &conditions)?.iter().enumerate() {
+        let pairs: Vec<(&Case, Vec<(&str, &str)>)> = run
+            .iter()
+            .map(|(case, profiles)| (case, profiles.clone()))
+            .collect();
+        pass(&time_run(index), &pairs)?;
     }
     let observations = observations(&cases, &conditions)?;
     let summary = json!({
@@ -1216,6 +1400,7 @@ fn execute(corpus: &Corpus, results: &Path, record: bool) -> Result<(), String> 
         "corpus_commit": commit,
         "instant": INSTANT,
         "cases": observations,
+        "not_xml": not_xml(&files),
     });
     write_json(&results.join("summary.json"), &summary)?;
     let path = expectations_path(corpus);
@@ -1256,6 +1441,30 @@ fn execute(corpus: &Corpus, results: &Path, record: bool) -> Result<(), String> 
 /// also trusts, how many agree with DSS on every block, and the classes.
 pub(crate) fn report(expectations: &Value) -> String {
     use std::fmt::Write as _;
+    let mut text = introduction(expectations);
+    for pass in ["instant", "signing-time"] {
+        let rows = pass_rows_of(expectations, pass);
+        if rows.is_empty() {
+            continue;
+        }
+        writeln!(
+            text,
+            "\n## Pass `{pass}`\n\n\
+             | Profile | Inputs | DSS passes | xml-sec passes | Same indication | Agreement | Classes |\n\
+             | --- | --- | --- | --- | --- | --- | --- |"
+        )
+        .expect("writing to a String cannot fail");
+        for row in rows {
+            text.push_str(&row);
+            text.push('\n');
+        }
+    }
+    text
+}
+
+/// The report's text before its tables: how the run is made and classified.
+fn introduction(expectations: &Value) -> String {
+    use std::fmt::Write as _;
     let mut text = String::from(
         "# EU DSS XAdES corpus\n\n\
          Generated by `cargo run -p xml-sec-tools -- xades dss-corpus --record \
@@ -1269,12 +1478,15 @@ pub(crate) fn report(expectations: &Value) -> String {
          `dss-cookbook/src/test/resources/signature-pool` at its release tag. \
          Both validators get the same trust anchors (the topmost certificate \
          of each signer chain the document carries) and the same time ({} \
-         Unix seconds; a second pass at the claimed signing time under each \
-         profile whose own run reached no validated path for any signature \
-         and found no timestamp token over a signature value that proves its \
-         existence).\n",
+         Unix seconds; a second pass, under each profile whose own run \
+         reached no validated path for any signature and found no timestamp \
+         token over a signature value that proves its existence, validates \
+         each signature at its own claimed signing time). The {} other files \
+         of those directories are not XML: each is recorded as *not-xml* and \
+         validated by neither, and a change to that set fails the check.\n",
         expectations["dss"].as_str().unwrap_or("?"),
         expectations["instant"],
+        expectations["not_xml"].as_object().map_or(0, Map::len),
     )
     .expect("writing to a String cannot fail");
     text.push_str(
@@ -1301,59 +1513,48 @@ pub(crate) fn report(expectations: &Value) -> String {
          signature that passes past every bound has none, and a pass where \
          no signature has one lists no `valid_until`.\n",
     );
-    for pass in ["instant", "signing-time"] {
-        let mut rows = Vec::new();
-        for (profile, name) in PROFILES {
-            let label = format!("{pass}/{profile}");
-            let entries: Vec<&Value> = expectations["cases"]
-                .as_object()
-                .into_iter()
-                .flatten()
-                .filter_map(|(_, passes)| passes.get(&label))
-                .collect();
-            if entries.is_empty() {
-                continue;
-            }
-            let count = |field: &str| entries.iter().filter(|entry| entry[field] == true).count();
-            let mut classes = std::collections::BTreeMap::<String, usize>::new();
-            for entry in &entries {
-                *classes
-                    .entry(entry["class"].as_str().unwrap_or("?").to_owned())
-                    .or_default() += 1;
-            }
-            let classes: Vec<String> = classes
-                .iter()
-                .map(|(class, count)| format!("{class} {count}"))
-                .collect();
-            rows.push(format!(
-                "| `{name}` | {} | {} | {} | {} | {} | {} |",
-                entries.len(),
-                count("dss_passed"),
-                count("passed"),
-                count("indication"),
-                classes
-                    .iter()
-                    .find(|class| class.starts_with("agreement "))
-                    .map_or("0", |class| &class["agreement ".len()..]),
-                classes.join(", "),
-            ));
-        }
-        if rows.is_empty() {
+    text
+}
+
+/// The table rows of one pass of the report, one per profile it ran under.
+fn pass_rows_of(expectations: &Value, pass: &str) -> Vec<String> {
+    let mut rows = Vec::new();
+    for (profile, name) in PROFILES {
+        let label = format!("{pass}/{profile}");
+        let entries: Vec<&Value> = expectations["cases"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(_, passes)| passes.get(&label))
+            .collect();
+        if entries.is_empty() {
             continue;
         }
-        writeln!(
-            text,
-            "\n## Pass `{pass}`\n\n\
-             | Profile | Inputs | DSS passes | xml-sec passes | Same indication | Agreement | Classes |\n\
-             | --- | --- | --- | --- | --- | --- | --- |"
-        )
-        .expect("writing to a String cannot fail");
-        for row in rows {
-            text.push_str(&row);
-            text.push('\n');
+        let count = |field: &str| entries.iter().filter(|entry| entry[field] == true).count();
+        let mut classes = std::collections::BTreeMap::<String, usize>::new();
+        for entry in &entries {
+            *classes
+                .entry(entry["class"].as_str().unwrap_or("?").to_owned())
+                .or_default() += 1;
         }
+        let classes: Vec<String> = classes
+            .iter()
+            .map(|(class, count)| format!("{class} {count}"))
+            .collect();
+        rows.push(format!(
+            "| `{name}` | {} | {} | {} | {} | {} | {} |",
+            entries.len(),
+            count("dss_passed"),
+            count("passed"),
+            count("indication"),
+            classes
+                .iter()
+                .find(|class| class.starts_with("agreement "))
+                .map_or("0", |class| &class["agreement ".len()..]),
+            classes.join(", "),
+        ));
     }
-    text
+    rows
 }
 
 /// Where the published result lives.
@@ -1377,6 +1578,7 @@ pub(crate) fn recorded(summary: &Value, reviews: &Value) -> Value {
         "corpus_commit": summary["corpus_commit"],
         "instant": summary["instant"],
         "cases": cases,
+        "not_xml": summary["not_xml"],
     })
 }
 
@@ -1442,6 +1644,14 @@ pub(crate) fn differences(expected: &Value, summary: &Value, reviews: &Value) ->
         found.push(format!(
             "the run validated at {} where the expectations record {}",
             summary["instant"], expected["instant"]
+        ));
+    }
+    // Every corpus file has a disposition: a file that is not XML, added or
+    // gone, changes the inventory the recording accounted for.
+    if expected["not_xml"] != summary["not_xml"] {
+        found.push(format!(
+            "the corpus files that are not XML are {} where {} is expected",
+            summary["not_xml"], expected["not_xml"]
         ));
     }
     let reviewed = &expected["cases"];
@@ -1561,15 +1771,30 @@ fn same_conclusions(old: &Value, new: &Value) -> bool {
 /// Each review of `reviews` moved onto the observations of `summary`: a
 /// review that explained a pass of the `previous` expectations explains the
 /// same pass now when every conclusion it explained is unchanged, whatever
-/// form the block results took ([`same_conclusions`]). A review whose passes
-/// now observe another conclusion, overall or of any block, is kept as it
-/// was, for the check to report and a reviewer to write again.
+/// form the block results took ([`same_conclusions`]). An approved
+/// observation still observed exactly, under any pass, stays approved beside
+/// those carried. A review whose passes now observe another conclusion,
+/// overall or of any block, is kept as it was, for the check to report and a
+/// reviewer to write again.
 pub(crate) fn carried(previous: &Value, summary: &Value, reviews: &Value) -> Value {
     let mut moved = Map::new();
     for (name, list) in reviews.as_object().into_iter().flatten() {
         let mut kept = Vec::new();
+        let current: Vec<&Value> = summary["cases"][name]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(_, pass)| &pass["observed"])
+            .collect();
         for review in list.as_array().into_iter().flatten() {
-            let mut observed: Vec<Value> = Vec::new();
+            let mut observed: Vec<Value> = review["observed"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|approved| current.contains(approved))
+                .cloned()
+                .collect();
+            let exact = observed.len();
             for (label, pass) in previous["cases"][name].as_object().into_iter().flatten() {
                 let explained = review["observed"]
                     .as_array()
@@ -1585,7 +1810,9 @@ pub(crate) fn carried(previous: &Value, summary: &Value, reviews: &Value) -> Val
                 }
             }
             let mut review = review.clone();
-            if !observed.is_empty() {
+            // Only a carried observation rewrites the list: a review still
+            // observed exactly as written stays as written.
+            if observed.len() > exact {
                 review["observed"] = Value::Array(observed);
             }
             kept.push(review);

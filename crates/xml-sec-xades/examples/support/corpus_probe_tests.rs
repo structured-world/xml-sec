@@ -98,6 +98,27 @@ fn tokens_a_failed_process_did_not_reach_stay_unjudged_beside_decided_ones() {
 }
 
 #[test]
+fn an_assessment_cut_short_lists_every_declared_token_unjudged() {
+    // A chain search over its step budget ends the signature's assessment
+    // before any token is placed: each declared token still has a row, so
+    // the report tells an incomplete assessment from no timestamps at all.
+    let declared = super::etsi::Declared {
+        signature_timestamps: vec![vec![1]],
+        archive_timestamps: vec![vec![3]],
+        ..super::etsi::Declared::default()
+    };
+    let rendered = super::etsi::incomplete(&declared, "candidate steps exceeded");
+    assert_eq!(rendered["sub"], "CUSTOM");
+    assert_eq!(
+        rendered["tokens"],
+        serde_json::json!([
+            { "role": "Signature", "current": null },
+            { "role": "Archive", "current": null }
+        ])
+    );
+}
+
+#[test]
 fn a_refs_only_timestamp_is_told_apart_from_a_sig_and_refs_one() {
     // A RefsOnlyTimeStamp covers the references alone, a SigAndRefs one also
     // the signature value and its timestamps (TS 101 903 V1.4.2 7.5.1,
@@ -166,6 +187,39 @@ fn every_verified_branch_of_a_chain_has_its_top_whatever_the_pool_order() {
     assert_eq!(super::chain_tops(5, &[5, 6], mutual, 100).unwrap(), [6]);
     // A search past its bound is an error, never a shorter chain.
     assert!(super::chain_tops(1, &[2, 3, 4], issues, 2).is_err());
+}
+
+#[test]
+fn a_ca_a_reference_names_is_never_the_signer() {
+    // EN 319 102-1 V1.4.1 clause 5.2.3.4: the references are checked against
+    // the signing certificate, the one whose key verifies the signature. A
+    // reference to a CA of the path, with the signer itself unavailable,
+    // identifies no signer; its key must not stand in for the signer's.
+    let document = xml_sec::XmlDocument::parse(B_T).unwrap();
+    let expected = super::expected_targets(&document, B_T);
+    let pool = super::pool(B_T);
+    let mut declared = declarations(B_T);
+    super::settle_signers(&document, &expected, &mut declared, &pool, 1_700_000_000).unwrap();
+    let signer = declared[0]
+        .signer
+        .clone()
+        .expect("the signer's key verifies");
+    assert_ne!(signer, ISSUER);
+    declared[0].signer = None;
+    declared[0].certificate_references = vec![(
+        Some(DigestAlgorithm::Sha256),
+        xml_sec::xmldsig::compute_digest(DigestAlgorithm::Sha256, ISSUER),
+    )];
+    let issuer_only = [ISSUER.to_vec()];
+    super::settle_signers(
+        &document,
+        &expected,
+        &mut declared,
+        &issuer_only,
+        1_700_000_000,
+    )
+    .unwrap();
+    assert_eq!(declared[0].signer, None);
 }
 
 #[test]
@@ -255,16 +309,132 @@ fn only_an_elements_value_is_read_and_where_the_element_is() {
     // A certificate in a comment carries nothing and has no place in the
     // document, which archive coverage reads; the element's character
     // references (`&#13;` in base64) are part of its value.
-    let text = "<a><!-- <X509Certificate>AQ==</X509Certificate> -->\
+    let text = "<a xmlns=\"http://www.w3.org/2000/09/xmldsig#\">\
+        <!-- <X509Certificate>AQ==</X509Certificate> -->\
         <b/><X509Certificate>A&#13;Q==</X509Certificate></a>";
-    let found = tokens::values_at(text, "X509Certificate");
+    let found = tokens::values_at(text, tokens::Field::Certificate);
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].1, vec![1]);
     let before = tokens::values_at(
-        "<a><X509Certificate>AQ==</X509Certificate><b/></a>",
-        "X509Certificate",
+        "<a xmlns=\"http://www.w3.org/2000/09/xmldsig#\">\
+         <X509Certificate>AQ==</X509Certificate><b/></a>",
+        tokens::Field::Certificate,
     );
     assert!(before[0].0 < found[0].0, "{before:?} {found:?}");
+}
+
+#[test]
+fn only_a_signature_certificate_field_carries_a_certificate() {
+    // XMLDSig's X509Certificate and XAdES's EncapsulatedX509Certificate are
+    // the certificate fields; an application element that only shares the
+    // suffix, or the local name in another namespace, carries none, or it
+    // could anchor a chain at a certificate the signature does not carry.
+    let text = "<r xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\" \
+        xmlns:x=\"http://uri.etsi.org/01903/v1.3.2#\" xmlns:a=\"urn:app\">\
+        <ds:X509Certificate>AQ==</ds:X509Certificate>\
+        <x:EncapsulatedX509Certificate>Ag==</x:EncapsulatedX509Certificate>\
+        <a:BackupX509Certificate>Aw==</a:BackupX509Certificate>\
+        <a:X509Certificate>BA==</a:X509Certificate>\
+        <x:Example xmlns:x=\"http://uri.etsi.org/01903/example\">\
+        <x:EncapsulatedX509Certificate>BQ==</x:EncapsulatedX509Certificate></x:Example></r>";
+    assert_eq!(
+        tokens::values(text, tokens::Field::Certificate),
+        [vec![1], vec![2]]
+    );
+}
+
+#[test]
+fn a_value_split_by_a_comment_is_read_whole() {
+    // The XML Infoset gives an element its characters, comments left out: a
+    // comment inside base64 or a date splits text nodes, not the value. An
+    // element with element content carries no simple value.
+    let split = "<ds:X509Certificate xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">\
+        AQ<!-- c -->ID</ds:X509Certificate>";
+    assert_eq!(
+        tokens::values(split, tokens::Field::Certificate),
+        [vec![1, 2, 3]]
+    );
+    let nested = "<ds:X509Certificate xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">\
+        AQ<i>ID</i></ds:X509Certificate>";
+    assert_eq!(
+        tokens::values(nested, tokens::Field::Certificate),
+        Vec::<Vec<u8>>::new()
+    );
+}
+
+#[test]
+fn a_token_whose_base64_does_not_decode_is_reported_not_dropped() {
+    // A malformed EncapsulatedTimeStamp is this signature's token all the
+    // same: the census declares it and the authority reader reports it, while
+    // a readable sibling keeps its own result.
+    let readable = include_str!("../../tests/fixtures/levels/b-t.xml");
+    let text = readable.replacen(
+        "<xades:EncapsulatedTimeStamp>",
+        "<xades:EncapsulatedTimeStamp>!!</xades:EncapsulatedTimeStamp>\
+         <xades:EncapsulatedTimeStamp>",
+        1,
+    );
+    let (authorities, failures) = tokens::token_authorities(&text, &[]);
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(failures[0].contains("base64"), "{failures:?}");
+    assert_eq!(authorities, tokens::token_authorities(readable, &[]).0);
+    let declared = declarations(&text);
+    assert_eq!(declared[0].signature_timestamps.len(), 1);
+    assert_eq!(declared[0].undecodable_timestamps.len(), 1);
+}
+
+#[test]
+fn a_timestamp_property_counts_only_in_its_own_container() {
+    // A SignatureTimeStamp is an unsigned signature property and a content
+    // timestamp a signed data-object property (EN 319 132-1 sections 4.3.5,
+    // 4.3.6); one placed in the other container is no timestamp of either.
+    let text = r##"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#" Id="sig">
+  <ds:SignedInfo/>
+  <ds:Object>
+    <x:QualifyingProperties xmlns:x="http://uri.etsi.org/01903/v1.3.2#" Target="#sig">
+      <x:SignedProperties><x:SignedDataObjectProperties>
+        <x:SignatureTimeStamp><x:EncapsulatedTimeStamp>AQ==</x:EncapsulatedTimeStamp></x:SignatureTimeStamp>
+        <x:AllDataObjectsTimeStamp><x:EncapsulatedTimeStamp>Ag==</x:EncapsulatedTimeStamp></x:AllDataObjectsTimeStamp>
+      </x:SignedDataObjectProperties></x:SignedProperties>
+      <x:UnsignedProperties><x:UnsignedSignatureProperties>
+        <x:AllDataObjectsTimeStamp><x:EncapsulatedTimeStamp>Aw==</x:EncapsulatedTimeStamp></x:AllDataObjectsTimeStamp>
+      </x:UnsignedSignatureProperties></x:UnsignedProperties>
+    </x:QualifyingProperties>
+  </ds:Object>
+</ds:Signature>"##;
+    let found = declarations(text);
+    assert_eq!(found[0].signature_timestamps, Vec::<Vec<u8>>::new());
+    assert_eq!(
+        found[0].content_timestamps,
+        [(xml_sec_xades::TimestampRole::AllDataObjects, vec![2])]
+    );
+}
+
+#[test]
+fn a_signing_time_counts_only_when_the_signature_signs_it() {
+    // SignedProperties is signed only when a reference of the signature's own
+    // SignedInfo names it (EN 319 132-1 section 4.3.2): an unreferenced one
+    // claims no time the signature protects.
+    let unreferenced = CLAIMS.replace("URI=\"#props\"", "URI=\"#other\"");
+    assert_ne!(unreferenced, CLAIMS);
+    assert_eq!(declarations(&unreferenced)[0].signing_time, None);
+    assert_eq!(declarations(CLAIMS)[0].signing_time, Some(1_577_836_800));
+}
+
+#[test]
+fn a_qualifying_properties_outside_the_xades_namespaces_is_not_the_signatures() {
+    // EN 319 132-1 section 4.2 names the XAdES namespaces; a namespace that
+    // only shares their prefix is another vocabulary, and its container must
+    // not stand in for the genuine one.
+    let decoy = CLAIMS.replace(
+        "<ds:Object>\n    <x:QualifyingProperties",
+        "<ds:Object><x:QualifyingProperties xmlns:x=\"http://uri.etsi.org/01903/example\" \
+         Target=\"#sig\"><x:SignedProperties Id=\"props\"><x:SignedSignatureProperties>\
+         <x:SigningTime>2030-01-01T00:00:00Z</x:SigningTime></x:SignedSignatureProperties>\
+         </x:SignedProperties></x:QualifyingProperties></ds:Object>\n  <ds:Object>\n    <x:QualifyingProperties",
+    );
+    assert_ne!(decoy, CLAIMS);
+    assert_eq!(declarations(&decoy)[0].signing_time, Some(1_577_836_800));
 }
 
 #[test]
@@ -273,11 +443,13 @@ fn an_entity_supplied_certificate_is_where_the_entity_is_referenced() {
     // data before it in the document. A certificate an internal entity
     // supplies after the timestamp is there, not at the entity declaration
     // before it.
-    let text = "<!DOCTYPE a [<!ENTITY c \"<X509Certificate>AQ==</X509Certificate>\">]>\
-        <a><ArchiveTimeStamp><EncapsulatedTimeStamp>Ag==</EncapsulatedTimeStamp>\
-        </ArchiveTimeStamp>&c;</a>";
-    let certificate = tokens::values_at(text, "X509Certificate");
-    let token = tokens::values_at(text, "EncapsulatedTimeStamp");
+    let text = "<!DOCTYPE a [<!ENTITY c \"<ds:X509Certificate>AQ==</ds:X509Certificate>\">]>\
+        <a xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\" \
+        xmlns:x=\"http://uri.etsi.org/01903/v1.4.1#\">\
+        <x:ArchiveTimeStamp><x:EncapsulatedTimeStamp>Ag==</x:EncapsulatedTimeStamp>\
+        </x:ArchiveTimeStamp>&c;</a>";
+    let certificate = tokens::values_at(text, tokens::Field::Certificate);
+    let token = tokens::values_at(text, tokens::Field::TIMESTAMP);
     assert_eq!(certificate.len(), 1);
     assert!(token[0].0 < certificate[0].0, "{token:?} {certificate:?}");
 }
@@ -319,6 +491,16 @@ fn only_the_signatures_own_timestamp_properties_are_counted_in_every_form() {
     assert_eq!(found[0].validation_timestamps, [vec![2], vec![3]]);
     assert_eq!(found[0].refs_only, [false, true]);
     assert_eq!(found[0].archive_timestamps, [vec![4], vec![5], vec![6]]);
+}
+
+#[test]
+fn a_certificate_only_the_caller_supplies_is_never_archived() {
+    // An archive imprint authenticates what the document holds before the
+    // property (EN 319 132-1 section 5.5.2); a trust anchor only the caller
+    // supplies has no place there, so no archive timestamp covers it.
+    let positions = [Some(3), None, Some(9)];
+    let covered: Vec<usize> = super::etsi::long_term::archived_before(&positions, 3, 5).collect();
+    assert_eq!(covered, [0]);
 }
 
 #[test]
@@ -405,10 +587,11 @@ const DECOYED: &str = r##"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmld
 const CLAIMS: &str = r##"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#" Id="sig">
   <ds:SignedInfo>
     <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+    <ds:Reference URI="#props" Type="http://uri.etsi.org/01903#SignedProperties"/>
   </ds:SignedInfo>
   <ds:Object>
     <x:QualifyingProperties xmlns:x="http://uri.etsi.org/01903/v1.3.2#" Target="#sig">
-      <x:SignedProperties>
+      <x:SignedProperties Id="props">
         <x:SignedSignatureProperties>
           <x:SigningTime>2020-01-01T00:00:00Z</x:SigningTime>
           <x:SigningCertificateV2><x:Cert><x:CertDigest>
@@ -473,6 +656,24 @@ fn an_escaped_fragment_names_the_element_the_verifier_resolves() {
 }
 
 #[test]
+fn every_expected_target_is_named_once_whatever_its_aliases() {
+    // `URI=""` and the root's own Id name one node; the verification request
+    // refuses a repeated target, so the root must stand once even when the
+    // two references are not adjacent.
+    let text = r##"<doc xmlns="urn:x" Id="doc"><payload Id="payload"/>
+<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+  <ds:SignedInfo>
+    <ds:Reference URI=""/>
+    <ds:Reference URI="#payload"/>
+    <ds:Reference URI="#doc"/>
+  </ds:SignedInfo>
+</ds:Signature></doc>"##;
+    let document = xml_sec::XmlDocument::parse(text).unwrap();
+    let found = super::expected_targets(&document, text);
+    assert_eq!(found.len(), 2, "{found:?}");
+}
+
+#[test]
 fn a_certificate_outside_the_signatures_key_info_is_no_key_info_certificate() {
     // ds:KeyInfo is a direct child of ds:Signature (XMLDSig 1.1 section 4.5);
     // a KeyInfo inside a ds:Object identifies nothing about this signature.
@@ -495,7 +696,7 @@ fn a_utf_16_document_is_read_as_the_parser_reads_it() {
         bytes.extend(unit.to_le_bytes());
     }
     let text = super::ascii_view(&bytes);
-    assert_eq!(super::signing_time(&text), Some(1_577_836_800));
+    assert_eq!(super::signing_times(&text), [Some(1_577_836_800)]);
 }
 
 #[test]

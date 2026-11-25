@@ -56,20 +56,29 @@ impl Catalogue<'_> {
     }
 
     /// Every certificate and status source an archive timestamp property at
-    /// place `at` in document order covers: the validation data incorporated before it (EN 319
-    /// 132-1 section 5.5.2), and what only the caller supplies, which the
-    /// document's order does not place.
+    /// place `at` in document order covers ([`archived_before`]).
     pub(super) fn material_before(&self, at: usize) -> impl Iterator<Item = Object> + '_ {
-        (0..self.certificates.len() + self.sources)
-            .filter(move |index| {
-                self.positions
-                    .get(*index)
-                    .copied()
-                    .flatten()
-                    .is_none_or(|position| position < at)
-            })
+        archived_before(&self.positions, self.certificates.len() + self.sources, at)
             .map(|index| Object(1 + self.tokens + index))
     }
+}
+
+/// The indexes, of `count` catalogued items placed at `positions`, an archive
+/// timestamp property at `at` covers: the validation data the document
+/// incorporates before it (EN 319 132-1 section 5.5.2). What only the caller
+/// supplies has no place in the document, so no archive imprint covers it.
+pub(crate) fn archived_before(
+    positions: &[Option<usize>],
+    count: usize,
+    at: usize,
+) -> impl Iterator<Item = usize> + '_ {
+    (0..count).filter(move |index| {
+        positions
+            .get(*index)
+            .copied()
+            .flatten()
+            .is_some_and(|position| position < at)
+    })
 }
 
 /// One non-anchor member and the revocation data about it.

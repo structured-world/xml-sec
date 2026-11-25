@@ -8,7 +8,7 @@
 //! the cryptographic material the profile's constraints judge.
 
 #[path = "etsi_long_term.rs"]
-mod long_term;
+pub(crate) mod long_term;
 
 use serde_json::{Value, json};
 use structured_asn1::memory::Memory;
@@ -86,6 +86,13 @@ pub struct Declared {
     /// token with its role, DER: they stamp the signed data objects, not the
     /// signature.
     pub content_timestamps: Vec<(TimestampRole, Vec<u8>)>,
+    /// Each timestamp token of this signature whose base64 does not decode,
+    /// with its property and why: declared, and never judged.
+    pub undecodable_timestamps: Vec<String>,
+    /// The signing certificate, DER: the candidate of
+    /// [`signing_candidates`] whose key verifies the signature value; none
+    /// when no candidate's key does (clause 5.2.3.4).
+    pub signer: Option<Vec<u8>>,
 }
 
 impl Declared {
@@ -271,10 +278,45 @@ fn scheme_of(certificate: &Certificate<'_>, rsa: Family, memory: &Memory) -> Opt
     None
 }
 
+/// The certificates that may be the signing certificate (clause 5.2.3.4),
+/// in reference order: each one a signed reference digests to. A reference
+/// list also names CAs of the signer's path, so which of them signed is the
+/// one whose key verifies the signature value; without such references, the
+/// copy the signature itself carries ([`signing_certificate`]).
+pub fn signing_candidates<'c>(
+    declared: &Declared,
+    pool: &'c [Certificate<'c>],
+    memory: &Memory,
+) -> Vec<&'c Certificate<'c>> {
+    if declared.certificate_references.is_empty() {
+        return signing_certificate(declared, pool, memory)
+            .into_iter()
+            .collect();
+    }
+    let mut found: Vec<&Certificate<'c>> = Vec::new();
+    for (method, value) in &declared.certificate_references {
+        let Some(method) = *method else {
+            continue;
+        };
+        for certificate in pool {
+            if compute_digest(method, certificate.as_bytes()) == *value
+                && !found
+                    .iter()
+                    .any(|known| known.as_bytes() == certificate.as_bytes())
+            {
+                found.push(certificate);
+            }
+        }
+    }
+    found
+}
+
 /// The signing certificate (clause 5.2.3.4): the one a signed reference
 /// digests to, trying every reference; without such references, the copy
 /// the signature itself carries, which is the leaf of its `KeyInfo`
-/// certificates (the one that issues none of the others).
+/// certificates (the one that issues none of the others). Which candidate
+/// signed is settled by the key that verifies the signature value
+/// ([`signing_candidates`]).
 pub fn signing_certificate<'c>(
     declared: &Declared,
     pool: &'c [Certificate<'c>],
@@ -996,6 +1038,7 @@ fn path_facts<'a, W: structured_asn1::memory::Work>(
         rejections: Vec::new(),
         history: Vec::new(),
     };
+    let mut accepted = false;
     if parsed
         .anchors
         .iter()
@@ -1004,8 +1047,9 @@ fn path_facts<'a, W: structured_asn1::memory::Work>(
         // RFC 5280 6.1.1(d): a trust anchor is an input, not a path member,
         // so it has neither a revocation status nor issuer material here.
         // A profile that trusts it directly ends the X.509 block at step
-        // 1(b); otherwise its validity is still the signing certificate's
-        // (step 7).
+        // 1(b); otherwise that one-member path is one prospective chain, its
+        // validity still the signing certificate's (step 7), and step 2
+        // builds the others, through any other anchor that issues it.
         facts.chains.push(if inputs.direct_trust {
             Chain::DirectTrust
         } else {
@@ -1018,10 +1062,12 @@ fn path_facts<'a, W: structured_asn1::memory::Work>(
             basis: 0,
             later: None,
         };
-        return Ok(facts);
+        if inputs.direct_trust {
+            return Ok(facts);
+        }
+        accepted = true;
     }
     let (not_before, not_after) = validity(signer);
-    let mut accepted = false;
     for (chain, anchor) in candidates(signer, parsed, memory)? {
         // The chain is checked where all its members are valid, as close to
         // `now` as they allow: clause 5.2.6.4 step 4 leaves the signing
@@ -1271,6 +1317,48 @@ fn authority<'a>(token: &[u8], parsed: &'a Parsed<'a>) -> Option<&'a Certificate
     })
 }
 
+/// The authenticated lower bound of the signature's creation a content
+/// timestamp gives (EN 319 102-1 V1.4.1 clause 5.3.4 steps 4 and 6): the
+/// latest generation time of a content token whose own checks held and whose
+/// TSA's certificate validates at `now`. It stamps the signed data, not the
+/// signature value, so it bounds the signature from below only.
+fn content_bound<W: structured_asn1::memory::Work>(
+    session: &VerifiedSession<'_, '_, '_, W>,
+    declared: &Declared,
+    parsed: &Parsed<'_>,
+    inputs: &Inputs<'_>,
+    now: Instant,
+    memory: &Memory,
+) -> Result<Option<Instant>, String> {
+    let mut bound = None;
+    let (mut all, mut individual) = (0, 0);
+    for (role, token) in &declared.content_timestamps {
+        let counter = if *role == TimestampRole::AllDataObjects {
+            &mut all
+        } else {
+            &mut individual
+        };
+        let occurrence = *counter;
+        *counter += 1;
+        let (Some(TokenFacts { generated, .. }), Some(TokenIntegrity::Intact)) = (
+            token_details(token),
+            declared.intact(*role, occurrence, token),
+        ) else {
+            continue;
+        };
+        let Some(tsa) = authority(token, parsed) else {
+            continue;
+        };
+        if authority_outcome(session, tsa, parsed, inputs, now, memory)?
+            .sub
+            .is_none()
+        {
+            bound = bound.max(Some(instant(generated)));
+        }
+    }
+    Ok(bound)
+}
+
 /// Each signature timestamp's result at `now` (clause 5.4, as clause 5.5.4
 /// step 3 consumes it): a token xml-sec-xades established passes when its
 /// TSA's certificate validates now, the X.509 building block deciding
@@ -1451,21 +1539,28 @@ pub fn indication<W: structured_asn1::memory::Work>(
     let memory = parser.memory().clone();
     let parsed = parse(&parser, inputs);
     let now = instant(inputs.now);
-    let Some(signer) = signing_certificate(declared, &parsed.pool, &memory)
-        .or_else(|| signing_certificate(declared, &parsed.anchors, &memory))
-    else {
+    // The certificate whose key verified the signature value, never another
+    // one a signed reference names, such as a CA of its path.
+    let Some(signer) = declared.signer.as_deref().and_then(|der| {
+        parsed
+            .pool
+            .iter()
+            .chain(&parsed.anchors)
+            .find(|certificate| certificate.as_bytes() == der)
+    }) else {
         // Clause 5.3.4 step 2.
         return verdict("INDETERMINATE", Some("NO_SIGNING_CERTIFICATE_FOUND"), "ISC");
     };
     let (not_before, not_after) = validity(signer);
     let stamped = path_facts(session, signer, &parsed, inputs, now, &memory).and_then(|paths| {
-        signature_timestamps(session, declared, &parsed, inputs, now, &memory)
-            .map(|stamps| (paths, stamps))
+        let stamps = signature_timestamps(session, declared, &parsed, inputs, now, &memory)?;
+        let lower = content_bound(session, declared, &parsed, inputs, now, &memory)?;
+        Ok((paths, (stamps, lower)))
     });
     // A process that could not complete decides nothing about the signature.
-    let (paths, stamps) = match stamped {
+    let (paths, (stamps, content_lower)) = match stamped {
         Ok(found) => found,
-        Err(error) => return verdict("INDETERMINATE", Some("CUSTOM"), error),
+        Err(error) => return incomplete(declared, error),
     };
     let etsi_paths = paths.lend();
     let (references, value) = integrity(result);
@@ -1499,7 +1594,7 @@ pub fn indication<W: structured_asn1::memory::Work>(
             after: None,
             before: None,
         },
-        content_timestamp: None,
+        content_timestamp: content_lower,
         paths: &etsi_paths,
         truncated: false,
         order: Order::Coherent,
@@ -1616,6 +1711,15 @@ pub(crate) fn earlier_archives(positions: &[usize], index: usize) -> Vec<usize> 
     (0..positions.len())
         .filter(|&other| positions[other] < at)
         .collect()
+}
+
+/// The verdict of a signature whose assessment could not complete (a chain
+/// search cut short, say): `CUSTOM`, with a row not judged for each token it
+/// declares, so the report tells it from a signature without timestamps.
+pub(crate) fn incomplete(declared: &Declared, error: impl Into<String>) -> Value {
+    let mut rendered = verdict("INDETERMINATE", Some("CUSTOM"), error);
+    rendered["tokens"] = Value::Array(with_unjudged_rest(declared, Vec::new()));
+    rendered
 }
 
 /// `each`, the rows of the tokens of `declared` a failed process reached, with

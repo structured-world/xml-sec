@@ -176,7 +176,7 @@ struct Material {
 impl Material {
     /// `ANCHOR_DER`, or with `-` where each carried chain ends.
     fn read(text: &str, anchor: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let carried = tokens::values(text, "X509Certificate");
+        let carried = tokens::values(text, tokens::Field::Certificate);
         let (authorities, unreadable) = tokens::token_authorities(text, &carried);
         if let Some(failure) = unreadable.into_iter().next() {
             return Err(failure.into());
