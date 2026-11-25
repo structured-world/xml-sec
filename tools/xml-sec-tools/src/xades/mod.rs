@@ -19,6 +19,7 @@ pub(crate) mod levels;
 pub(crate) mod lifecycle;
 pub(crate) mod package;
 pub(crate) mod process;
+pub(crate) mod ts101903;
 pub(crate) mod upstream;
 pub(crate) mod xml;
 

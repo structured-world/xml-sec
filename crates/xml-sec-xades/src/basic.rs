@@ -19,7 +19,7 @@ use structured_pkix::temporal::{Instant, LeapTable};
 use structured_xades::baseline::{self, Basic, BasicInput, LevelError};
 use structured_xades::binding::{self, BindingError};
 use structured_xades::certificate::{self, CheckedPathCertificate, KeyAssociation};
-use structured_xades::container::{self, ContainerError, DS, XADES};
+use structured_xades::container::{self, ContainerError, DS, Syntax, XADES};
 use structured_xades::counter::{self, WalkError};
 use structured_xades::credential;
 use structured_xades::hashes::{self, HashError, ParticipantBinding, ParticipantProblem};
@@ -87,6 +87,16 @@ pub enum Outcome<R> {
         /// Why it does not.
         failure: RenewalFailure,
     },
+    /// The signature's qualifying properties use another syntax than the
+    /// operation reads: EN 319 132-1 levels do not apply to a TS 101 903
+    /// V1.2.2 signature, which `validate_ts101903` validates, nor that
+    /// operation to an EN 319 132-1 one.
+    Syntax {
+        /// Original signature.
+        signature: NodeIdentity,
+        /// The syntax its qualifying properties use.
+        syntax: Syntax,
+    },
 }
 
 impl<R> Outcome<R> {
@@ -107,6 +117,7 @@ impl<R> Outcome<R> {
             Self::Credential { node } => Outcome::Credential { node },
             Self::Status(failure) => Outcome::Status(failure),
             Self::Renewal { property, failure } => Outcome::Renewal { property, failure },
+            Self::Syntax { signature, syntax } => Outcome::Syntax { signature, syntax },
         }
     }
 }
@@ -228,6 +239,9 @@ pub enum ValidationError {
     /// A `RenewedDigestsV2` property could not be processed.
     #[error("renewed digest processing failed: {0:?}")]
     Renewal(Box<renewed::CheckError<Error, Error, NodeIdentity, DocumentIdentity, u64>>),
+    /// A TS 101 903 V1.2.2 signature could not be processed.
+    #[error("TS 101 903 V1.2.2 processing failed: {0:?}")]
+    Ts101903(Box<crate::ts101903::Ts101903Error>),
 }
 
 /// A timestamp check that could not complete, with its original cause.
@@ -382,6 +396,12 @@ pub(crate) fn with_stage<W: Work, R>(
 
     let document = Document::new(session);
     let access = Access::new(&document, document.snapshot(), work);
+    if crate::ts101903::ts101903_signature(session, &access, signature) {
+        return Ok(Outcome::Syntax {
+            signature,
+            syntax: Syntax::Ts101903V122,
+        });
+    }
     let enclosing = enclosing_counter(&document, &access, signature)?;
     let prepared = prepare::prepare(&access, signature, requirements, enclosing.as_ref())
         .map_err(|error| ValidationError::Prepare(Box::new(error)))?;
