@@ -1832,7 +1832,13 @@ impl DefaultKeyResolver {
                         structured_pkix::Error::resource(reason, "certificate.path", 0),
                     ))
                 })?;
-            if trust.verify_x509_chains {
+            // A configured anchor named by a selector is the same anchor an
+            // embedded certificate is, so the policy's acceptance of an
+            // anchor signer (EN 319 102-1 V1.4.1 5.2.6.4 step 1(b)) holds here too.
+            if trust.verify_x509_chains
+                && !(signing_index < trusted_prefix_len
+                    && trust.trust_anchor_signer == crate::policy::TrustAnchorSigner::Accepted)
+            {
                 self.verify_x509_policy(&available, trust, provider, budget)?
             } else {
                 super::pkix::ValidatedX509Key {

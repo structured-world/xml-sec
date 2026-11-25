@@ -23,7 +23,12 @@ it inherits without restating the allowlists. Its arrays are `transforms`
 and `reference_uri_classes` (`empty`, `same_document`, `external`). Each value
 must name something the build knows, so a misspelt denial fails loading. A
 denial only withdraws: denying what the profile already refuses changes nothing,
-and a child that extends the profile keeps it.
+and a child that extends the profile keeps it. A denied signature URI withdraws
+the method it names in every parameterization: denying
+`http://www.w3.org/2007/05/xmldsig-more#rsa-pss` withdraws every RSA-PSS tuple
+(RFC 9231 2.3.10 carries the parameters in the element), whatever
+`parameterized_rsa_pss` or an explicit descriptor grants. The effective
+settings report the result as `denied_signature_algorithms`.
 
 Each operation optionally accepts `enabled` (boolean). `false` must be the
 only field in that operation table. Omission inherits; a child cannot re-enable
@@ -33,8 +38,9 @@ a disabled operation. Encryption tables require an encryption-enabled build.
 | --- | --- | --- |
 | `signature_algorithms` | verify, sign | Algorithm URI array or `"default"`; parameterized RSA-PSS descriptors described below |
 | `verify_only_signature_algorithms` | sign | Algorithm URI array: the verify-only methods (SHA-1 and weaker families) that `signature_algorithms` may list for signing; compilation refuses one listed there but not here. Empty by default; layers intersect |
+| `denied_signature_algorithms` | verify, sign | Algorithm URI array withdrawn by denials, before any grant; layers unite |
 | `digest_algorithms` | verify, sign | Digest URI array or `"default"` |
-| `parameterized_rsa_pss` | verify, sign | `ExactOnly`, `SecureSupported`, `AllSupported` |
+| `parameterized_rsa_pss` | verify, sign | `ExactOnly`, `SecureSupported`, `Sha1Supported` (also SHA-1, never MD5 or RIPEMD-160), `AllSupported` |
 | `signature_constraints` | verify, sign | `General`, `Saml`, `WsSecurity`, `Xades` |
 | `ecdsa_signature_value_encoding` | verify, sign | `XmlDsig`, `XmlSecAsn1Der` |
 | `manifest_processing` | verify, sign | `Ignore`, `Process` |
@@ -109,7 +115,7 @@ does not itself establish trust or supply a key.
 | `max_x509_chain_depth`, `max_x509_candidate_paths` | Nonnegative integer |
 | `rsa_keys`, `dsa_keys` | Tables with `minimum_modulus_bits` |
 | `allowed_legacy_signature_algorithms` | Exact signature-URI/descriptor array |
-| `parameterized_rsa_pss` | `ExactOnly`, `SecureSupported`, `AllSupported` |
+| `parameterized_rsa_pss` | `ExactOnly`, `SecureSupported`, `Sha1Supported`, `AllSupported` |
 | `certificate_signature_algorithms` | `"default"`, `"AllSupported"`, or descriptor array |
 | `allowed_extended_key_usages` | Purpose array, described below |
 | `verification_time` | `"system"` or explicit timestamp below |

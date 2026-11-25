@@ -200,6 +200,9 @@ fn family(a: RsaPssPermission, b: RsaPssPermission) -> RsaPssPermission {
         (RsaPssPermission::SecureSupported, _) | (_, RsaPssPermission::SecureSupported) => {
             RsaPssPermission::SecureSupported
         }
+        (RsaPssPermission::Sha1Supported, _) | (_, RsaPssPermission::Sha1Supported) => {
+            RsaPssPermission::Sha1Supported
+        }
         _ => RsaPssPermission::AllSupported,
     }
 }
@@ -530,6 +533,12 @@ fn verification(
             |v| a.check_signature_algorithm(v).is_ok(),
             |v| b.check_signature_algorithm(v).is_ok(),
         ),
+        // A method either layer withdraws stays withdrawn.
+        denied_signature_algorithms: a
+            .denied_signature_algorithms
+            .union(&b.denied_signature_algorithms)
+            .copied()
+            .collect(),
         digest_algorithms: algorithms(
             a.digest_algorithms.as_ref(),
             b.digest_algorithms.as_ref(),
@@ -606,6 +615,12 @@ fn signing(a: &SigningPolicy, b: &SigningPolicy) -> Result<SigningPolicy, Policy
             |v| a.check_signature_algorithm(v).is_ok(),
             |v| b.check_signature_algorithm(v).is_ok(),
         ),
+        // A method either layer withdraws stays withdrawn.
+        denied_signature_algorithms: a
+            .denied_signature_algorithms
+            .union(&b.denied_signature_algorithms)
+            .copied()
+            .collect(),
         // A verify-only method is signed with only when every layer lets it.
         verify_only_signature_algorithms: set(
             &a.verify_only_signature_algorithms,

@@ -489,6 +489,7 @@ fn key_trust(p: &mut KeyTrustPolicy, v: &Value) -> Result<(), Error> {
                     key,
                     RsaPssPermission::ExactOnly,
                     RsaPssPermission::SecureSupported,
+                    RsaPssPermission::Sha1Supported,
                     RsaPssPermission::AllSupported
                 );
             }
@@ -585,6 +586,9 @@ macro_rules! signature_fields {
             "validity" => validity(&mut $p.validity, $value)?,
             "signature_constraints" => $p.signature_constraints = signature_constraints($value)?,
             "signature_algorithms" => $p.signature_algorithms = optional($value, $key, signature)?,
+            "denied_signature_algorithms" => {
+                $p.denied_signature_algorithms = selected($value, $key, signature)?;
+            }
             "digest_algorithms" => $p.digest_algorithms = optional($value, $key, digest)?,
             "parameterized_rsa_pss" => {
                 $p.parameterized_rsa_pss = choice!(
@@ -592,6 +596,7 @@ macro_rules! signature_fields {
                     $key,
                     RsaPssPermission::ExactOnly,
                     RsaPssPermission::SecureSupported,
+                    RsaPssPermission::Sha1Supported,
                     RsaPssPermission::AllSupported
                 );
             }
@@ -1153,6 +1158,13 @@ macro_rules! signature_snapshot {
                 optional_value($p.signature_algorithms.as_ref(), signature_value),
             ),
             (
+                "denied_signature_algorithms".into(),
+                sorted(
+                    $p.denied_signature_algorithms.iter().copied(),
+                    signature_value,
+                ),
+            ),
+            (
                 "digest_algorithms".into(),
                 optional_value($p.digest_algorithms.as_ref(), |v| text(v.uri())),
             ),
@@ -1231,6 +1243,7 @@ fn verification_snapshot(p: &VerificationPolicy) -> Result<Value, Error> {
         key_establishment: _,
         parameterized_rsa_pss: _,
         signature_algorithms: _,
+        denied_signature_algorithms: _,
         digest_algorithms: _,
         hmac: _,
         ecdsa_signature_value_encoding: _,
@@ -1266,6 +1279,7 @@ fn signing_snapshot(p: &SigningPolicy) -> Result<Value, Error> {
         key_establishment: _,
         parameterized_rsa_pss: _,
         signature_algorithms: _,
+        denied_signature_algorithms: _,
         verify_only_signature_algorithms: _,
         digest_algorithms: _,
         hmac: _,
@@ -1531,6 +1545,14 @@ fn direction(field: &str, old: Option<&Value>, new: Option<&Value>) -> Direction
         }
     }
     if let (Some(Value::Array(a)), Some(Value::Array(b))) = (old, new) {
+        // A denial list narrows as it grows; every other list as it shrinks.
+        if last.starts_with("denied_") {
+            return if a.iter().all(|v| b.contains(v)) {
+                Restrictive
+            } else {
+                Relaxing
+            };
+        }
         return if b.iter().all(|v| a.contains(v)) {
             Restrictive
         } else {
@@ -1556,10 +1578,12 @@ fn direction(field: &str, old: Option<&Value>, new: Option<&Value>) -> Direction
                 | "ExactOnly"
                 | "Forbidden"
                 | "Declared"
+                | "Validated"
                 | "Refuse",
             ),
         )
-        | (Some("AllSupported"), Some("SecureSupported")) => Restrictive,
+        | (Some("AllSupported" | "Sha1Supported"), Some("SecureSupported"))
+        | (Some("AllSupported"), Some("Sha1Supported")) => Restrictive,
         _ => Relaxing,
     }
 }
@@ -1808,5 +1832,50 @@ mod tests {
             direction(field, Some(&declared), Some(&ber)),
             Direction::Relaxing
         );
+    }
+
+    #[test]
+    fn each_narrowing_the_composition_keeps_is_restrictive() {
+        // Composition keeps a validated anchor signer unless every layer
+        // accepts, orders the RSA-PSS family ExactOnly < SecureSupported <
+        // Sha1Supported < AllSupported and unions denials; the rollout report
+        // must classify the same changes the same way, in both directions.
+        let text = |value: &str| Value::String(value.into());
+        for (field, narrow, wide) in [
+            (
+                "verification.key_trust.trust_anchor_signer",
+                text("Validated"),
+                text("Accepted"),
+            ),
+            (
+                "verification.parameterized_rsa_pss",
+                text("Sha1Supported"),
+                text("AllSupported"),
+            ),
+            (
+                "verification.parameterized_rsa_pss",
+                text("SecureSupported"),
+                text("Sha1Supported"),
+            ),
+            (
+                "verification.denied_signature_algorithms",
+                Value::Array(vec![
+                    text("http://www.w3.org/2000/09/xmldsig#rsa-sha1"),
+                    text("http://www.w3.org/2000/09/xmldsig#dsa-sha1"),
+                ]),
+                Value::Array(vec![text("http://www.w3.org/2000/09/xmldsig#rsa-sha1")]),
+            ),
+        ] {
+            assert_eq!(
+                direction(field, Some(&wide), Some(&narrow)),
+                Direction::Restrictive,
+                "{field}: {wide:?} -> {narrow:?}"
+            );
+            assert_eq!(
+                direction(field, Some(&narrow), Some(&wide)),
+                Direction::Relaxing,
+                "{field}: {narrow:?} -> {wide:?}"
+            );
+        }
     }
 }

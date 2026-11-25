@@ -1627,6 +1627,12 @@ fn the_extended_profile_signs_and_verifies_an_xpath_selected_reference() {
 /// resolves from `KeyInfo` at `at` under `profile` with X.509 chains
 /// checked: `validated`, or the refusal.
 fn resolve_anchor_signer(profile: PolicyProfile, at: i64) -> String {
+    resolve_anchor_signer_in(profile, at, false)
+}
+
+/// [`resolve_anchor_signer`], with `KeyInfo` naming the anchor only by its
+/// subject name when `by_name` is set.
+fn resolve_anchor_signer_in(profile: PolicyProfile, at: i64, by_name: bool) -> String {
     use xml_sec::xmldsig::{
         DefaultKeyResolver, InspectedKeyCandidateBudget, KeyResolverConfig,
         ResolvedVerificationKey, parse_key_info,
@@ -1641,8 +1647,13 @@ fn resolve_anchor_signer(profile: PolicyProfile, at: i64) -> String {
         .filter(|line| !line.starts_with("-----"))
         .collect();
     let der = structured_base64::STANDARD.decode(body.as_bytes()).unwrap();
+    let identification = if by_name {
+        "<X509SubjectName>CN=Test Key rsa-2048,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509SubjectName>".to_owned()
+    } else {
+        format!("<X509Certificate>{body}</X509Certificate>")
+    };
     let xml = format!(
-        r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"><X509Data><X509Certificate>{body}</X509Certificate></X509Data></KeyInfo>"#
+        r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"><X509Data>{identification}</X509Data></KeyInfo>"#
     );
     let document = xml_sec::XmlDomDocument::parse(&xml).unwrap();
     let key_info = parse_key_info(document.root_element()).unwrap();
@@ -1686,6 +1697,14 @@ fn a_conformant_profile_accepts_a_signing_certificate_that_is_its_trust_anchor()
         "validated"
     );
     let refused = resolve_anchor_signer(PolicyProfile::Xades, LONG_AFTER_EXPIRY);
+    assert!(refused.contains("CertificateNotValid(0)"), "{refused}");
+    // The policy decides the anchor, however KeyInfo identifies it: by its
+    // subject name alone the same anchor is accepted and refused alike.
+    assert_eq!(
+        resolve_anchor_signer_in(PolicyProfile::XadesConformant, LONG_AFTER_EXPIRY, true),
+        "validated"
+    );
+    let refused = resolve_anchor_signer_in(PolicyProfile::Xades, LONG_AFTER_EXPIRY, true);
     assert!(refused.contains("CertificateNotValid(0)"), "{refused}");
     // A permission: a layer that validates the anchor-signer withdraws it.
     let conformant = compiler(PolicyProfile::XadesConformant);
@@ -1736,9 +1755,15 @@ fn a_denial_withdraws_exactly_the_named_permissions() {
     let transforms = verification.transforms.allowed_algorithms.clone().unwrap();
     assert!(!transforms.contains(FILTER2));
     assert!(transforms.contains(XPATH));
-    let methods = verification.signature_algorithms.clone().unwrap();
-    assert!(!methods.contains(&SignatureAlgorithm::RsaSha1));
-    assert!(methods.contains(&SignatureAlgorithm::DsaSha1));
+    assert!(
+        verification
+            .check_signature_algorithm(SignatureAlgorithm::RsaSha1)
+            .is_err()
+    );
+    assert_eq!(
+        verification.check_signature_algorithm(SignatureAlgorithm::DsaSha1),
+        Ok(())
+    );
     assert!(!verification.key_sources.contains(KeySourceKind::KeyValue));
     assert!(verification.key_sources.contains(KeySourceKind::X509Data));
     assert!(!verification.uris.references.allows("external.xml"));
@@ -1754,10 +1779,127 @@ fn a_denial_withdraws_exactly_the_named_permissions() {
     // Everything not named is unchanged.
     let mut expected = full.verification().unwrap().clone();
     expected.transforms.allowed_algorithms = Some(transforms);
-    expected.signature_algorithms = Some(methods);
+    expected.denied_signature_algorithms = [SignatureAlgorithm::RsaSha1].into();
+    // Composition keeps only what both layers admit, so the list drops it too.
+    if let Some(methods) = expected.signature_algorithms.as_mut() {
+        methods.remove(&SignatureAlgorithm::RsaSha1);
+    }
     expected.key_sources.remove(KeySourceKind::KeyValue);
     expected.uris.references = verification.uris.references;
     assert_eq!(format!("{verification:?}"), format!("{expected:?}"));
+}
+
+/// An RSA-PSS method over SHA-256 with `salt_len` octets of salt.
+fn pss(salt_len: usize) -> SignatureAlgorithm {
+    SignatureAlgorithm::RsaPss(xml_sec::xmldsig::RsaPssParameters {
+        salt_len,
+        ..xml_sec::xmldsig::RsaPssParameters::DEFAULT
+    })
+}
+
+#[test]
+fn a_denied_signature_method_wins_over_every_grant() {
+    // A denial withdraws the method its URI names (RFC 9231 2.3.10: the
+    // RSA-PSS URI carries its parameters in the element), in every
+    // parameterization and through the profile's RSA-PSS family grant, in
+    // signing and verification alike. Other methods stay admitted.
+    use xml_sec::policy::Denials;
+    let denied = compiler(PolicyProfile::Modern)
+        .deny(&Denials {
+            signature_algorithms: [pss(32)].into(),
+            ..Denials::default()
+        })
+        .unwrap()
+        .compile(&context())
+        .unwrap();
+    let (verification, signing) = (denied.verification().unwrap(), denied.signing().unwrap());
+    for method in [pss(32), pss(20)] {
+        assert!(
+            verification.check_signature_algorithm(method).is_err(),
+            "{method:?}"
+        );
+        assert!(
+            signing.check_signature_algorithm(method).is_err(),
+            "{method:?}"
+        );
+    }
+    assert_eq!(
+        verification.check_signature_algorithm(SignatureAlgorithm::RsaSha256),
+        Ok(())
+    );
+    assert_eq!(
+        signing.check_signature_algorithm(SignatureAlgorithm::RsaSha256),
+        Ok(())
+    );
+}
+
+#[test]
+fn a_denial_keeps_every_method_it_does_not_name() {
+    // Without an explicit list a policy admits RSA-PSS tuples no fixed list
+    // holds, such as a 20-octet salt; denying another method keeps them.
+    use xml_sec::policy::{Denials, RsaPssPermission};
+    let mut open = compiler(PolicyProfile::Modern).policies().clone();
+    if let Some(verification) = open.verification.as_mut() {
+        verification.signature_algorithms = None;
+        verification.parameterized_rsa_pss = RsaPssPermission::ExactOnly;
+    }
+    if let Some(signing) = open.signing.as_mut() {
+        signing.signature_algorithms = None;
+        signing.parameterized_rsa_pss = RsaPssPermission::ExactOnly;
+    }
+    let kept = PolicyCompiler::from_policies(PolicyProfile::Modern, &RustCryptoProvider, open)
+        .deny(&Denials {
+            signature_algorithms: [SignatureAlgorithm::RsaSha1].into(),
+            ..Denials::default()
+        })
+        .unwrap()
+        .compile(&context())
+        .unwrap();
+    assert_eq!(
+        kept.verification()
+            .unwrap()
+            .check_signature_algorithm(pss(20)),
+        Ok(())
+    );
+    assert_eq!(
+        kept.signing().unwrap().check_signature_algorithm(pss(20)),
+        Ok(())
+    );
+}
+
+#[test]
+fn the_conformant_profile_admits_rsa_pss_down_to_sha1_only() {
+    // XadesConformant adds SHA-1 signatures, not MD5 or RIPEMD-160: its
+    // RSA-PSS family grant stops at SHA-1 for the message and MGF1 digests.
+    use xml_sec::xmldsig::{DigestAlgorithm, RsaPssParameters};
+    let compiled = compiler(PolicyProfile::XadesConformant)
+        .compile(&context())
+        .unwrap();
+    let verification = compiled.verification().unwrap();
+    let with = |digest| {
+        SignatureAlgorithm::RsaPss(RsaPssParameters {
+            digest,
+            mgf_digest: digest,
+            salt_len: 20,
+        })
+    };
+    assert_eq!(
+        verification.check_signature_algorithm(with(DigestAlgorithm::Sha256)),
+        Ok(())
+    );
+    assert_eq!(
+        verification.check_signature_algorithm(with(DigestAlgorithm::Sha1)),
+        Ok(())
+    );
+    #[cfg(feature = "legacy-algorithms")]
+    for digest in [DigestAlgorithm::Md5, DigestAlgorithm::Ripemd160] {
+        assert!(
+            verification
+                .check_signature_algorithm(with(digest))
+                .is_err(),
+            "{digest:?}"
+        );
+    }
 }
 
 #[test]

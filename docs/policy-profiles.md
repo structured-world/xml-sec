@@ -12,7 +12,7 @@ conformance, certificate trust deployment or every XAdES signature level.
 | `WsSecurity` | SOAP Security-header placement and explicit authenticated target coverage |
 | `Xades` | Typed, authenticated SignedProperties references and explicit target coverage |
 | `XadesExtended` | `Xades` plus the XPath and XPath Filter 2.0 transforms; their references keep transformed-data coverage |
-| `XadesConformant` | `XadesExtended` plus verification of every signature ETSI EN 319 132-1 and XMLDSig 1.1 define: SHA-1 based methods and digests, RSA and DSA keys from 1024 bits and `KeyValue` keys, and a signing certificate that is itself a trust anchor accepted as trusted (ETSI EN 319 102-1 5.2.6.4 step 1(b)); signing stays modern |
+| `XadesConformant` | `XadesExtended` plus verification of every signature ETSI EN 319 132-1 and XMLDSig 1.1 define: SHA-1 based methods and digests (RSA-PSS with SHA-1 as well, never MD5 or RIPEMD-160), RSA and DSA keys from 1024 bits and `KeyValue` keys, and a signing certificate that is itself a trust anchor accepted as trusted (ETSI EN 319 102-1 5.2.6.4 step 1(b)); signing stays modern |
 | `LegacyVerify` | Verification only, requiring an auditable, expiring caller authorization |
 
 The strict signature profiles (`Modern`, `WsSecurity`, `Xades`) admit the
@@ -43,8 +43,10 @@ and reference URI classes, in every operation that has them. It is one more
 restrictive layer, so it never grants: denying what the profile refuses changes
 nothing, and the rest of the profile stays as it was. A profile without a
 transform allowlist (it admits every implemented transform) loses exactly the
-denied ones. `xml-sec-config` reads the same denials from a profile's `deny`
-table.
+denied ones. A denied signature method is withdrawn by its URI, in every
+parameterization and ahead of the RSA-PSS family grant, without rebuilding
+the admitted list, so every other method the profile admitted stays admitted.
+`xml-sec-config` reads the same denials from a profile's `deny` table.
 
 ```rust
 use xml_sec::policy::{Denials, KeySourceKind, PolicyCompileContext, PolicyCompiler, PolicyProfile};

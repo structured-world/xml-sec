@@ -33,7 +33,8 @@ use alloc::{collections::BTreeSet, string::String};
 pub struct Denials {
     /// Transform and canonicalization URIs no operation may run.
     pub transforms: BTreeSet<String>,
-    /// Signature methods no operation may use.
+    /// Signature methods no operation may use. Each withdraws every method of
+    /// its URI: denying one RSA-PSS tuple withdraws every parameterization.
     pub signature_algorithms: BTreeSet<SignatureAlgorithm>,
     /// Digest methods no operation may use.
     pub digest_algorithms: BTreeSet<DigestAlgorithm>,
@@ -105,13 +106,14 @@ impl PolicySet {
     /// restricts by.
     fn without(&self, denials: &Denials) -> Self {
         let mut layer = self.clone();
+        // A signature method is withdrawn as its own record rather than by
+        // removing it from the admitted list: the RSA-PSS family grant
+        // admits tuples no list holds, and a list rebuilt from the fixed
+        // methods would lose them.
         if let Some(policy) = layer.verification.as_mut() {
-            policy.signature_algorithms = without(
-                policy.signature_algorithms.as_ref(),
-                &SignatureAlgorithm::ALL,
-                |method| policy.check_signature_algorithm(method).is_ok(),
-                &denials.signature_algorithms,
-            );
+            policy
+                .denied_signature_algorithms
+                .extend(denials.signature_algorithms.iter().copied());
             policy.digest_algorithms = without(
                 policy.digest_algorithms.as_ref(),
                 &DigestAlgorithm::ALL,
@@ -125,12 +127,9 @@ impl PolicySet {
             denials.uris(&mut policy.uris);
         }
         if let Some(policy) = layer.signing.as_mut() {
-            policy.signature_algorithms = without(
-                policy.signature_algorithms.as_ref(),
-                &SignatureAlgorithm::ALL,
-                |method| policy.check_signature_algorithm(method).is_ok(),
-                &denials.signature_algorithms,
-            );
+            policy
+                .denied_signature_algorithms
+                .extend(denials.signature_algorithms.iter().copied());
             policy.digest_algorithms = without(
                 policy.digest_algorithms.as_ref(),
                 &DigestAlgorithm::ALL,

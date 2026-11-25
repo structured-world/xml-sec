@@ -67,6 +67,9 @@ pub enum RsaPssPermission {
     ExactOnly,
     /// Permit supported parameterized tuples using non-legacy hashes only.
     SecureSupported,
+    /// Also permit SHA-1 as the message or MGF1 digest, never a digest that
+    /// needs its own explicit permission (MD5, RIPEMD-160).
+    Sha1Supported,
     /// Permit every supported tuple; capability and key restrictions still apply.
     AllSupported,
 }
@@ -74,9 +77,18 @@ pub enum RsaPssPermission {
 #[cfg(feature = "xmldsig")]
 impl RsaPssPermission {
     fn permits(self, algorithm: SignatureAlgorithm) -> bool {
-        matches!(algorithm, SignatureAlgorithm::RsaPss(_))
-            && (self == Self::AllSupported
-                || (self == Self::SecureSupported && algorithm.signing_allowed()))
+        // The family is the parameterized RFC 9231 RSA-PSS method only.
+        let SignatureAlgorithm::RsaPss(parameters) = algorithm else {
+            return false;
+        };
+        match self {
+            Self::ExactOnly => false,
+            Self::SecureSupported => algorithm.signing_allowed(),
+            Self::Sha1Supported => [parameters.digest, parameters.mgf_digest]
+                .into_iter()
+                .all(|digest| !digest.requires_explicit_permission()),
+            Self::AllSupported => true,
+        }
     }
 }
 
@@ -1757,6 +1769,9 @@ pub struct VerificationPolicy {
     /// `None` accepts every implemented method subject to
     /// independent gates such as [`KeyTrustPolicy::allowed_legacy_signature_algorithms`].
     pub signature_algorithms: Option<BTreeSet<SignatureAlgorithm>>,
+    /// Signature methods withdrawn by a [`Denials`] layer. Each withdraws every
+    /// method of its URI, whatever its parameters, before any grant applies.
+    pub denied_signature_algorithms: BTreeSet<SignatureAlgorithm>,
     /// Allowed reference digest methods; `None` accepts every implemented method.
     pub digest_algorithms: Option<BTreeSet<DigestAlgorithm>>,
     /// HMAC secret and output-length requirements.
@@ -1866,6 +1881,12 @@ impl VerificationPolicy {
         &self,
         algorithm: SignatureAlgorithm,
     ) -> Result<(), PolicyViolation> {
+        if denies(&self.denied_signature_algorithms, algorithm) {
+            return Err(PolicyViolation::Algorithm {
+                operation: "verification",
+                algorithm: algorithm.uri().to_owned(),
+            });
+        }
         if (matches!(algorithm, SignatureAlgorithm::PostQuantum(_))
             || algorithm.requires_explicit_permission())
             && !self
@@ -1927,6 +1948,9 @@ pub struct SigningPolicy {
     /// Exact signing methods, supplemented by `parameterized_rsa_pss`.
     /// `None` uses the implemented secure defaults.
     pub signature_algorithms: Option<BTreeSet<SignatureAlgorithm>>,
+    /// Signature methods withdrawn by a [`Denials`] layer. Each withdraws every
+    /// method of its URI, whatever its parameters, before any grant applies.
+    pub denied_signature_algorithms: BTreeSet<SignatureAlgorithm>,
     /// Verify-only methods (SHA-1 and weaker families) that policy
     /// compilation accepts in `signature_algorithms`: a compiled policy lists
     /// one for signing only when it is named here too. Empty by default; a
@@ -1986,6 +2010,12 @@ impl SigningPolicy {
         &self,
         algorithm: SignatureAlgorithm,
     ) -> Result<(), PolicyViolation> {
+        if denies(&self.denied_signature_algorithms, algorithm) {
+            return Err(PolicyViolation::Algorithm {
+                operation: "signing",
+                algorithm: algorithm.uri().to_owned(),
+            });
+        }
         if self.parameterized_rsa_pss.permits(algorithm) {
             return Ok(());
         }
@@ -2012,6 +2042,15 @@ impl SigningPolicy {
             algorithm.uri(),
         )
     }
+}
+
+/// Whether `denied` withdraws `algorithm`: a denial names a method by its URI,
+/// and the RSA-PSS URI carries every parameterization (RFC 9231 2.3.10).
+/// <https://www.rfc-editor.org/rfc/rfc9231#section-2.3.10>
+#[cfg(feature = "xmldsig")]
+fn denies(denied: &BTreeSet<SignatureAlgorithm>, algorithm: SignatureAlgorithm) -> bool {
+    let uri = algorithm.uri();
+    denied.iter().any(|method| method.uri() == uri)
 }
 
 #[cfg(feature = "xmldsig")]

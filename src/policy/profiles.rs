@@ -528,8 +528,12 @@ fn verification_profile(
         validity: validity.cloned(),
         signature_constraints: constraints,
         signature_algorithms: Some(signatures),
-        parameterized_rsa_pss: if compatibility || conformant {
+        // The conformant additions are SHA-1 signatures, so its family grant
+        // stops at SHA-1; MD5 and RIPEMD-160 keep their own permission.
+        parameterized_rsa_pss: if compatibility {
             RsaPssPermission::AllSupported
+        } else if conformant {
+            RsaPssPermission::Sha1Supported
         } else {
             RsaPssPermission::SecureSupported
         },
