@@ -886,6 +886,25 @@ fn a_review_covers_every_difference_of_its_input_nothing_explains_yet() {
 }
 
 #[test]
+fn pruning_drops_only_the_reviews_no_pass_observes() {
+    // The check fails on a review that matches no observation; pruning
+    // removes exactly those and keeps every review a pass still takes.
+    let summary = unreviewed_summary();
+    let live = review("normative-difference", "r")["a.xml"][0].clone();
+    let stale = json!({ "overall": ["TOTAL_PASSED:-/TOTAL_PASSED:-"], "observed": [[]], "class": "dss-deviation", "reason": "r" });
+    let reviews = json!({ "a.xml": [live.clone(), stale], "gone.xml": [live.clone()] });
+    assert_eq!(
+        super::pruned(&summary, &reviews),
+        json!({ "a.xml": [live] })
+    );
+    let recorded = super::recorded(&summary, &super::pruned(&summary, &reviews));
+    assert_eq!(
+        differences(&recorded, &summary, &super::pruned(&summary, &reviews)),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
 fn a_manifest_field_cannot_split_its_line() {
     // The DSS probe splits each manifest line at tabs: a path holding one
     // would hand DSS a truncated anchor directory.

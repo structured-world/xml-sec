@@ -1274,6 +1274,33 @@ pub(crate) fn recorded(summary: &Value, reviews: &Value) -> Value {
     })
 }
 
+/// `reviews` without the reviews no pass of `summary` observes, the ones the
+/// check reports as matching no observation.
+pub(crate) fn pruned(summary: &Value, reviews: &Value) -> Value {
+    let mut kept = Map::new();
+    for (name, list) in reviews.as_object().into_iter().flatten() {
+        let live: Vec<Value> = list
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|review| {
+                summary["cases"][name]
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .any(|(_, pass)| {
+                        review_for(&json!({ name: [review] }), name, &pass["observed"]).is_some()
+                    })
+            })
+            .cloned()
+            .collect();
+        if !live.is_empty() {
+            kept.insert(name.clone(), Value::Array(live));
+        }
+    }
+    Value::Object(kept)
+}
+
 /// Every review that no pass of its input observes any more.
 fn stale_reviews(summary: &Value, reviews: &Value) -> Vec<String> {
     let mut found = Vec::new();
@@ -1530,6 +1557,19 @@ fn review(
     super::write(&report_path(corpus), report(&expectations))
 }
 
+/// Drops the reviews the completed run in `results` observes no more and
+/// records the expectations with the rest.
+fn prune(corpus: &Corpus, results: &Path) -> Result<(), String> {
+    let summary: Value = serde_json::from_str(&xml::read(&results.join("summary.json"))?)
+        .map_err(|error| error.to_string())?;
+    recordable(&summary)?;
+    let reviews = pruned(&summary, &read_reviews(&reviews_path(corpus))?);
+    write_json(&reviews_path(corpus), &reviews)?;
+    let expectations = recorded(&summary, &reviews);
+    write_json(&expectations_path(corpus), &expectations)?;
+    super::write(&report_path(corpus), report(&expectations))
+}
+
 /// Rewrites the reviews and the expectations from the completed run in
 /// `results`, compared again, the committed reviews carried from the
 /// committed expectations.
@@ -1569,6 +1609,7 @@ fn carry(corpus: &Corpus, results: &Path) -> Result<(), String> {
 pub(crate) fn run(corpus: &Corpus, args: &[String]) -> Result<(), crate::repo::Failure> {
     let usage = "usage: xades dss-corpus [--results DIR] [--record] \
          | xades dss-corpus --carry-reviews DIR \
+         | xades dss-corpus --prune-reviews DIR \
          | xades dss-corpus --review DIR INPUT CLASS REASON [PASS...]";
     let mut results = corpus.root.join("target/xades-dss-corpus");
     let mut record = false;
@@ -1592,6 +1633,13 @@ pub(crate) fn run(corpus: &Corpus, args: &[String]) -> Result<(), crate::repo::F
                     reason,
                     labels,
                 )?);
+            }
+            "--prune-reviews" => {
+                let completed = absolute(args.next().ok_or("--prune-reviews needs a directory")?)?;
+                if args.next().is_some() {
+                    return Err(usage.into());
+                }
+                return Ok(prune(corpus, &completed)?);
             }
             "--carry-reviews" => {
                 let completed = absolute(args.next().ok_or("--carry-reviews needs a directory")?)?;
