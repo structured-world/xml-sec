@@ -306,10 +306,11 @@
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": true,
         "dss_passed": true,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate and SignerRole, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2 and SignerRoleV2. xml-sec's B-B level refuses them as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits both (TS 101 903 V1.4.2 clauses 7.2.2 and 7.2.8), and passes SAV. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/dss-817-test.xml": {
@@ -1416,10 +1417,11 @@
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": true,
         "dss_passed": true,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/11068_signed.xml": {
@@ -1471,10 +1473,11 @@
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": true,
         "dss_passed": true,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/BaselineBWithCertificateValues.xml": {
@@ -2318,10 +2321,11 @@
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": true,
         "dss_passed": true,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/Signature-X-CZ_SEF-5.xml": {
@@ -3884,10 +3888,11 @@
             "OVERALL": "TOTAL_FAILED:HASH_FAILURE/TOTAL_FAILED:HASH_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The first signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. The overall results of both signatures are the same."
       }
     },
     "dss-xades/src/test/resources/validation/XAdESLTA.xml": {
@@ -4066,10 +4071,11 @@
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": true,
         "dss_passed": true,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/doubleSignedTest.xml": {
@@ -4386,10 +4392,11 @@
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": true,
         "dss_passed": true,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/dss-2506.xml": {
@@ -4863,10 +4870,11 @@
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": true,
         "dss_passed": true,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate and SignerRole, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2 and SignerRoleV2. xml-sec's B-B level refuses them as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits both (TS 101 903 V1.4.2 clauses 7.2.2 and 7.2.8), and passes SAV. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/dss1334/document-signed-xades-baseline-b--null-for-filename.xml": {
@@ -5537,10 +5545,11 @@
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": true,
         "dss_passed": true,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/dss1770/dss1770refUriRemoved.xml": {
@@ -7517,10 +7526,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signature was extended. xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes."
       },
       "signing-time/extended": {
         "observed": [
@@ -7534,10 +7544,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signature was extended. xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes."
       },
       "signing-time/conformant": {
         "observed": [
@@ -7551,10 +7562,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signature was extended. xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes."
       }
     },
     "dss-xades/src/test/resources/validation/dss2278/xades-with-multiple-alldatatimestamps.xml": {
@@ -7725,10 +7737,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signature was extended. xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes."
       },
       "signing-time/extended": {
         "observed": [
@@ -7742,10 +7755,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signature was extended. xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes."
       },
       "signing-time/conformant": {
         "observed": [
@@ -7759,10 +7773,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signature was extended. xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes."
       }
     },
     "dss-xades/src/test/resources/validation/dss2278/xades-with-multiple-signaturetimestamps.xml": {
@@ -9336,10 +9351,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signature was extended. xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes. The signature also carries the TS 101 903 v1.3.2 ArchiveTimeStamp, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of the v1.4.1 one; xml-sec's B-B level refuses it as signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.8), where DSS passes SAV."
       },
       "signing-time/extended": {
         "observed": [
@@ -9353,10 +9369,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signature was extended. xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes. The signature also carries the TS 101 903 v1.3.2 ArchiveTimeStamp, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of the v1.4.1 one; xml-sec's B-B level refuses it as signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.8), where DSS passes SAV."
       },
       "signing-time/conformant": {
         "observed": [
@@ -9370,10 +9387,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signature was extended. xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes. The signature also carries the TS 101 903 v1.3.2 ArchiveTimeStamp, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of the v1.4.1 one; xml-sec's B-B level refuses it as signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.8), where DSS passes SAV."
       }
     },
     "dss-xades/src/test/resources/validation/dss3732/xades-enveloping-arcTst132.xml": {
@@ -9443,10 +9461,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signature was extended. xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes. The signature also carries the TS 101 903 v1.3.2 ArchiveTimeStamp, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of the v1.4.1 one; xml-sec's B-B level refuses it as signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.8), where DSS passes SAV."
       },
       "signing-time/extended": {
         "observed": [
@@ -9460,10 +9479,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signature was extended. xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes. The signature also carries the TS 101 903 v1.3.2 ArchiveTimeStamp, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of the v1.4.1 one; xml-sec's B-B level refuses it as signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.8), where DSS passes SAV."
       },
       "signing-time/conformant": {
         "observed": [
@@ -9477,10 +9497,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signature was extended. xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes. The signature also carries the TS 101 903 v1.3.2 ArchiveTimeStamp, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of the v1.4.1 one; xml-sec's B-B level refuses it as signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.8), where DSS passes SAV."
       }
     },
     "dss-xades/src/test/resources/validation/dss3758/xades-bes-issuer-linebreaks-end-cr.xml": {
@@ -9638,10 +9659,11 @@
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": true,
         "dss_passed": true,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/dss3758/xades-bes-issuer-linebreaks.xml": {
@@ -9799,10 +9821,11 @@
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": true,
         "dss_passed": true,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/dss874/sellosFNMT-XAdES_A.xml": {
@@ -10645,10 +10668,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signatures were extended. For each signature xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes."
       },
       "signing-time/extended": {
         "observed": [
@@ -10671,10 +10695,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signatures were extended. For each signature xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes."
       },
       "signing-time/conformant": {
         "observed": [
@@ -10697,10 +10722,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signatures were extended. For each signature xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes."
       }
     },
     "dss-xades/src/test/resources/validation/evidence-record/X-E-ERS-DETACHED-LT-chain-renewal.xml": {
@@ -12340,10 +12366,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signatures were extended. For each signature xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes."
       },
       "signing-time/extended": {
         "observed": [
@@ -12366,10 +12393,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signatures were extended. For each signature xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes."
       },
       "signing-time/conformant": {
         "observed": [
@@ -12392,10 +12420,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signatures were extended. For each signature xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes."
       }
     },
     "dss-xades/src/test/resources/validation/evidence-record/XAdES-B_ER_Renewed_can.xml": {
@@ -13845,10 +13874,11 @@
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": true,
         "dss_passed": true,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries the reference-only unsigned properties CompleteCertificateRefs and RefsOnlyTimeStamp, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes (Table 2). xml-sec's B-B level refuses them as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits both (TS 101 903 V1.4.2 clauses 7.4.1 and 7.5.2), and passes SAV. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/sk-tsl.xml": {
@@ -16517,10 +16547,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signature was extended. xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes."
       },
       "signing-time/extended": {
         "observed": [
@@ -16534,10 +16565,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signature was extended. xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes."
       },
       "signing-time/conformant": {
         "observed": [
@@ -16551,10 +16583,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signature was extended. xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes."
       }
     },
     "dss-xades/src/test/resources/validation/xades-lta-corrupted-cert.xml": {
@@ -16624,10 +16657,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signature was extended. xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes."
       },
       "signing-time/extended": {
         "observed": [
@@ -16641,10 +16675,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signature was extended. xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes."
       },
       "signing-time/conformant": {
         "observed": [
@@ -16658,10 +16693,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signature was extended. xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes."
       }
     },
     "dss-xades/src/test/resources/validation/xades-lta-valid.xml": {
@@ -16731,10 +16767,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signature was extended. xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes."
       },
       "signing-time/extended": {
         "observed": [
@@ -16748,10 +16785,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signature was extended. xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes."
       },
       "signing-time/conformant": {
         "observed": [
@@ -16765,10 +16803,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signature was extended. xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes."
       }
     },
     "dss-xades/src/test/resources/validation/xades-lta-with-additional-cert-in-keyinfo.xml": {
@@ -16838,10 +16877,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signature was extended. xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes."
       },
       "signing-time/extended": {
         "observed": [
@@ -16855,10 +16895,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signature was extended. xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes."
       },
       "signing-time/conformant": {
         "observed": [
@@ -16872,10 +16913,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signature was extended. xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes."
       }
     },
     "dss-xades/src/test/resources/validation/xades-no-keyinfo-sign-cert.xml": {
@@ -19850,10 +19892,11 @@
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": true,
         "dss_passed": true,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/xsw/TSL-noID.xml": {

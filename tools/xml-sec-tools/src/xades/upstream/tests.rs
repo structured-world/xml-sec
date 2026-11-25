@@ -841,26 +841,34 @@ fn a_review_moves_onto_the_new_form_of_the_comparison_it_explained() {
 #[test]
 fn a_review_covers_every_difference_of_its_input_nothing_explains_yet() {
     // A reviewer classifies one input: each pass still unreviewed takes the
-    // review, one per overall comparison, and the recording then holds.
-    let summary = unreviewed_summary();
-    let reviews = super::reviewed(
+    // review, one per overall comparison, and the recording then holds; a
+    // review named for some passes leaves the others to their own.
+    let mut summary = unreviewed_summary();
+    summary["cases"]["a.xml"]["instant/conformant"]["observed"] =
+        json!([{ "OVERALL": "TOTAL_PASSED:-/TOTAL_FAILED:HASH_FAILURE" }]);
+    let strict = super::reviewed(
         &summary,
         &json!({}),
         "a.xml",
         "normative-difference",
         "EN 319 102-1 5.2.6.4 step 4",
+        &["instant/strict"],
     )
     .unwrap();
-    assert_eq!(reviews["a.xml"].as_array().map(Vec::len), Some(1));
+    let recorded = super::recorded(&summary, &strict);
+    assert_eq!(differences(&recorded, &summary, &strict).len(), 1);
+    let reviews = super::reviewed(&summary, &strict, "a.xml", "dss-deviation", "r", &[]).unwrap();
+    assert_eq!(reviews["a.xml"].as_array().map(Vec::len), Some(2));
     let recorded = super::recorded(&summary, &reviews);
     assert_eq!(
         differences(&recorded, &summary, &reviews),
         Vec::<String>::new()
     );
     // Nothing is left, and a review needs a reviewed class and a reason.
-    assert!(super::reviewed(&summary, &reviews, "a.xml", "normative-difference", "r").is_err());
-    assert!(super::reviewed(&summary, &json!({}), "a.xml", "agreement", "r").is_err());
-    assert!(super::reviewed(&summary, &json!({}), "a.xml", "normative-difference", " ").is_err());
+    let class = "normative-difference";
+    assert!(super::reviewed(&summary, &reviews, "a.xml", class, "r", &[]).is_err());
+    assert!(super::reviewed(&summary, &json!({}), "a.xml", "agreement", "r", &[]).is_err());
+    assert!(super::reviewed(&summary, &json!({}), "a.xml", class, " ", &[]).is_err());
 }
 
 #[test]

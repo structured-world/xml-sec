@@ -1421,13 +1421,15 @@ fn recompared(results: &Path) -> Result<Value, String> {
 
 /// `reviews` with one more review of input `name`, of `class` for `reason`,
 /// over each pass of `summary` that no review explains yet, one review per
-/// overall comparison those passes observe.
+/// overall comparison those passes observe; only the passes `labels` names
+/// when it names any.
 pub(crate) fn reviewed(
     summary: &Value,
     reviews: &Value,
     name: &str,
     class: &str,
     reason: &str,
+    labels: &[&str],
 ) -> Result<Value, String> {
     if !REVIEWED.contains(&class) || reason.trim().is_empty() {
         return Err(format!(
@@ -1439,8 +1441,11 @@ pub(crate) fn reviewed(
         .as_object()
         .ok_or_else(|| format!("{name} is not in the run"))?;
     let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
-    for pass in passes.values() {
-        if pass["class"] != "unreviewed" || review_for(reviews, name, &pass["observed"]).is_some() {
+    for (label, pass) in passes {
+        if pass["class"] != "unreviewed"
+            || review_for(reviews, name, &pass["observed"]).is_some()
+            || !(labels.is_empty() || labels.contains(&label.as_str()))
+        {
             continue;
         }
         let overall = overall_of(&pass["observed"]);
@@ -1481,6 +1486,7 @@ fn review(
     name: &str,
     class: &str,
     reason: &str,
+    labels: &[&str],
 ) -> Result<(), String> {
     let summary: Value = serde_json::from_str(&xml::read(&results.join("summary.json"))?)
         .map_err(|error| error.to_string())?;
@@ -1491,6 +1497,7 @@ fn review(
         name,
         class,
         reason,
+        labels,
     )?;
     write_json(&reviews_path(corpus), &reviews)?;
     let expectations = recorded(&summary, &reviews);
@@ -1537,7 +1544,7 @@ fn carry(corpus: &Corpus, results: &Path) -> Result<(), String> {
 pub(crate) fn run(corpus: &Corpus, args: &[String]) -> Result<(), crate::repo::Failure> {
     let usage = "usage: xades dss-corpus [--results DIR] [--record] \
          | xades dss-corpus --carry-reviews DIR \
-         | xades dss-corpus --review DIR INPUT CLASS REASON";
+         | xades dss-corpus --review DIR INPUT CLASS REASON [PASS...]";
     let mut results = corpus.root.join("target/xades-dss-corpus");
     let mut record = false;
     let mut args = args.iter();
@@ -1548,11 +1555,18 @@ pub(crate) fn run(corpus: &Corpus, args: &[String]) -> Result<(), crate::repo::F
                 results = absolute(args.next().ok_or("--results needs a directory")?)?;
             }
             "--review" => {
-                let rest: Vec<&String> = args.by_ref().collect();
-                let [completed, name, class, reason] = rest[..] else {
+                let rest: Vec<&str> = args.by_ref().map(String::as_str).collect();
+                let [completed, name, class, reason, ref labels @ ..] = rest[..] else {
                     return Err(usage.into());
                 };
-                return Ok(review(corpus, &absolute(completed)?, name, class, reason)?);
+                return Ok(review(
+                    corpus,
+                    &absolute(completed)?,
+                    name,
+                    class,
+                    reason,
+                    labels,
+                )?);
             }
             "--carry-reviews" => {
                 let completed = absolute(args.next().ok_or("--carry-reviews needs a directory")?)?;
