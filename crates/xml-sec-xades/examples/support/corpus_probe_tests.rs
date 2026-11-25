@@ -5,26 +5,58 @@ fn a_token_copied_into_another_property_keeps_that_propertys_result() {
     // The same token bytes under an ArchiveTimeStamp stamp other input than
     // under the SignatureTimeStamp they were made for; each property's own
     // result applies, never the first one found for those bytes.
-    use xml_sec_xades::TimestampRole;
+    use xml_sec_xades::{TimestampRole, TokenIntegrity};
     let token = vec![1, 2, 3];
     let declared = super::etsi::Declared {
         signature_timestamps: vec![token.clone()],
         archive_timestamps: vec![token.clone()],
         token_integrity: vec![
-            (TimestampRole::Signature, token.clone(), Some(true)),
-            (TimestampRole::Archive, token.clone(), Some(false)),
+            (
+                TimestampRole::Signature,
+                token.clone(),
+                Some(TokenIntegrity::Intact),
+            ),
+            (
+                TimestampRole::Archive,
+                token.clone(),
+                Some(TokenIntegrity::ImprintMismatch),
+            ),
         ],
         ..super::etsi::Declared::default()
     };
     assert_eq!(
         declared.intact(TimestampRole::Signature, 0, &token),
-        Some(true)
+        Some(TokenIntegrity::Intact)
     );
     assert_eq!(
         declared.intact(TimestampRole::Archive, 0, &token),
-        Some(false)
+        Some(TokenIntegrity::ImprintMismatch)
     );
     assert_eq!(declared.intact(TimestampRole::Archive, 0, &[9]), None);
+}
+
+#[test]
+fn a_rejected_token_keeps_its_cause_in_the_etsi_finding() {
+    // EN 319 102-1 V1.4.1 clause 5.2.7 tells a data hash mismatch (the
+    // token's imprint) apart from a signature that does not verify; a token
+    // that does not hold to its profile is a format failure.
+    use structured_ltv::validation::SubIndication;
+    use xml_sec_xades::TokenIntegrity;
+    for (integrity, sub) in [
+        (TokenIntegrity::ImprintMismatch, SubIndication::HashFailure),
+        (
+            TokenIntegrity::SignatureInvalid,
+            SubIndication::SigCryptoFailure,
+        ),
+        (TokenIntegrity::Rejected, SubIndication::FormatFailure),
+    ] {
+        assert_eq!(
+            super::etsi::token_finding(integrity),
+            Some(sub),
+            "{integrity:?}"
+        );
+    }
+    assert_eq!(super::etsi::token_finding(TokenIntegrity::Intact), None);
 }
 
 #[test]

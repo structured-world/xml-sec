@@ -227,14 +227,37 @@ fn every_token_is_checked_whatever_another_shows() {
         ),
         "{level:?}"
     );
+    // The tampered bytes are the TSA's signature over an imprint that still
+    // binds: a signature failure, not a hash failure (EN 319 102-1 V1.4.1
+    // clause 5.2.7).
     let checked = integrities(&xml);
     assert!(
         matches!(&checked, Ok(Outcome::Assessed(found))
-            if found == &[TokenIntegrity::Rejected, TokenIntegrity::Intact]),
+            if found == &[TokenIntegrity::SignatureInvalid, TokenIntegrity::Intact]),
         "{checked:?}"
     );
     assert!(
         matches!(&integrities(B_T), Ok(Outcome::Assessed(found)) if found == &[TokenIntegrity::Intact])
+    );
+}
+
+#[test]
+fn a_token_over_other_input_is_an_imprint_mismatch() {
+    // The signature timestamp stamps the canonical ds:SignatureValue element
+    // (EN 319 132-1 V1.3.1 clause 5.3); another Id on it changes that input
+    // but not the XMLDSig signature, which does not sign SignatureValue. The
+    // TSA's signature still verifies, and the imprint no longer binds: a hash
+    // failure (EN 319 102-1 V1.4.1 clause 5.2.7), not a signature failure.
+    let xml = B_T.replacen(
+        "<ds:SignatureValue Id=\"sig-value\"",
+        "<ds:SignatureValue Id=\"other-value\"",
+        1,
+    );
+    assert_ne!(xml, B_T, "the signature value element changed");
+    let checked = integrities(&xml);
+    assert!(
+        matches!(&checked, Ok(Outcome::Assessed(found)) if found == &[TokenIntegrity::ImprintMismatch]),
+        "{checked:?}"
     );
 }
 

@@ -5,7 +5,7 @@ use alloc::boxed::Box;
 use core::convert::Infallible;
 
 use crate::basic::{Outcome, ValidationError, enclosing_counter};
-use crate::level::{Inputs, OwnCheck, TimestampFailure, incorporated_certificates};
+use crate::level::{Inputs, OwnCheck, Refusal, incorporated_certificates};
 use crate::{Document, Error, accuracy, path};
 use structured_pkix::temporal::Instant;
 use structured_xades::container::Syntax;
@@ -35,7 +35,13 @@ const END_OF_TIME: Instant = match Instant::new(253_402_300_799, 0) {
 pub enum TokenIntegrity {
     /// The imprint binds and the named signer's key verifies the token.
     Intact,
-    /// The token's imprint, signature or profile facts did not hold.
+    /// The token's message imprint does not match what its property stamps
+    /// (clause 5.2.7: a hash failure).
+    ImprintMismatch,
+    /// The imprint binds, and the named signer's key does not verify the
+    /// token's signature (clause 5.2.7: a signature failure).
+    SignatureInvalid,
+    /// Another of the token's profile facts did not hold.
     Rejected,
     /// No available certificate is the one the token names as its signer.
     MissingSigner,
@@ -164,12 +170,12 @@ pub fn check_tokens<W: structured_asn1::memory::Work, R>(
                             .try_reserve_exact(sources.len())
                             .map_err(Error::from)?;
                         for (ordinal, source) in sources.iter().enumerate() {
-                            let integrity = match check.token(&cms, ordinal)? {
+                            let integrity = match check.checked(&cms, ordinal)? {
                                 Ok(_) => TokenIntegrity::Intact,
-                                Err(TimestampFailure::MissingSigner) => {
-                                    TokenIntegrity::MissingSigner
-                                }
-                                Err(_) => TokenIntegrity::Rejected,
+                                Err(Refusal::MissingSigner) => TokenIntegrity::MissingSigner,
+                                Err(Refusal::Imprint) => TokenIntegrity::ImprintMismatch,
+                                Err(Refusal::Signature) => TokenIntegrity::SignatureInvalid,
+                                Err(Refusal::Profile) => TokenIntegrity::Rejected,
                             };
                             results
                                 .try_push(TokenResult {

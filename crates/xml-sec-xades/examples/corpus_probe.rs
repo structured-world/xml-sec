@@ -1160,12 +1160,13 @@ fn establish_timestamps(
                         results
                             .iter()
                             .map(|result| {
-                                let intact = match result.integrity() {
-                                    TokenIntegrity::Intact => Some(true),
-                                    TokenIntegrity::Rejected => Some(false),
+                                // A token whose signer is not available stays
+                                // unjudged; every other result is its finding.
+                                let integrity = match result.integrity() {
                                     TokenIntegrity::MissingSigner => None,
+                                    judged => Some(judged),
                                 };
-                                (result.role(), result.token().to_vec(), intact)
+                                (result.role(), result.token().to_vec(), integrity)
                             })
                             .collect::<Vec<_>>()
                     },

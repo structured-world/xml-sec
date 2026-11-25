@@ -33,7 +33,21 @@ use xml_sec::xmldsig::{
     DigestAlgorithm, DsigStatus, FailureReason, SignatureAlgorithm, VerifiedSession, VerifyResult,
     compute_digest,
 };
-use xml_sec_xades::TimestampRole;
+use xml_sec_xades::{TimestampRole, TokenIntegrity};
+
+/// The finding a token's own checks give (EN 319 102-1 V1.4.1 clause 5.4,
+/// building on 5.2.7): a data hash mismatch is the token's imprint, a
+/// signature that does not verify is a cryptographic failure, and a token
+/// that does not hold to its profile is a format failure; none when they
+/// held.
+pub(crate) fn token_finding(integrity: TokenIntegrity) -> Option<SubIndication> {
+    match integrity {
+        TokenIntegrity::ImprintMismatch => Some(SubIndication::HashFailure),
+        TokenIntegrity::SignatureInvalid => Some(SubIndication::SigCryptoFailure),
+        TokenIntegrity::Rejected => Some(SubIndication::FormatFailure),
+        TokenIntegrity::Intact | TokenIntegrity::MissingSigner => None,
+    }
+}
 
 /// What one `ds:Signature` declares, read from the document text.
 #[derive(Default)]
@@ -52,9 +66,9 @@ pub struct Declared {
     pub signature_timestamps: Vec<Vec<u8>>,
     /// Each token of this signature's own properties xml-sec-xades checked
     /// on its own, in document order: its property's role, the token DER and
-    /// whether its imprint and TSA signature held (EN 319 102-1 V1.4.1
-    /// clause 5.4), none when it could not judge it.
-    pub token_integrity: Vec<(TimestampRole, Vec<u8>, Option<bool>)>,
+    /// what its own checks established (EN 319 102-1 V1.4.1 clause 5.4), none
+    /// when it could not judge it.
+    pub token_integrity: Vec<(TimestampRole, Vec<u8>, Option<TokenIntegrity>)>,
     /// Why xml-sec-xades checked none of this signature's tokens, when it
     /// refused to: each token then stays unjudged.
     pub token_refusal: Option<String>,
@@ -75,11 +89,16 @@ pub struct Declared {
 }
 
 impl Declared {
-    /// Whether the own checks of the `occurrence`th token of `role`, which is
-    /// `token`, held, when xml-sec-xades judged it. Each property is told
-    /// apart by its role and place, so a token copied into another property
-    /// does not take the first one's result.
-    pub fn intact(&self, role: TimestampRole, occurrence: usize, token: &[u8]) -> Option<bool> {
+    /// What the own checks of the `occurrence`th token of `role`, which is
+    /// `token`, established, when xml-sec-xades judged it. Each property is
+    /// told apart by its role and place, so a token copied into another
+    /// property does not take the first one's result.
+    pub fn intact(
+        &self,
+        role: TimestampRole,
+        occurrence: usize,
+        token: &[u8],
+    ) -> Option<TokenIntegrity> {
         let (_, checked, intact) = self
             .token_integrity
             .iter()
@@ -1272,7 +1291,7 @@ fn signature_timestamps<W: structured_asn1::memory::Work>(
             continue;
         };
         match declared.intact(TimestampRole::Signature, index, token) {
-            Some(true) => {
+            Some(TokenIntegrity::Intact) => {
                 let Some(tsa) = authority(token, parsed) else {
                     continue;
                 };
@@ -1285,7 +1304,19 @@ fn signature_timestamps<W: structured_asn1::memory::Work>(
                     },
                 });
             }
-            Some(false) => found.push(SignatureTimestamp::ImprintMismatch),
+            // A token whose imprint does not bind this signature is
+            // discarded; one that binds and fails is a finding about it.
+            Some(TokenIntegrity::ImprintMismatch) => {
+                found.push(SignatureTimestamp::ImprintMismatch);
+            }
+            Some(integrity) => {
+                if let Some(sub) = token_finding(integrity) {
+                    found.push(SignatureTimestamp::Finding {
+                        sub,
+                        required: false,
+                    });
+                }
+            }
             None => {}
         }
     }
@@ -1665,7 +1696,7 @@ impl<W: structured_asn1::memory::Work> TokenContext<'_, '_, '_, '_, '_, W> {
         for (index, (role, occurrence, der)) in declared.tokens().into_iter().enumerate() {
             let role_name = format!("{role:?}");
             each.push(json!({ "role": role_name, "current": null }));
-            let (Some(facts), Some(intact)) =
+            let (Some(facts), Some(integrity)) =
                 (token_details(der), declared.intact(role, occurrence, der))
             else {
                 continue;
@@ -1685,7 +1716,7 @@ impl<W: structured_asn1::memory::Work> TokenContext<'_, '_, '_, '_, '_, W> {
                     | TimestampRole::AllDataObjects
                     | TimestampRole::IndividualDataObjects
             ) {
-                let (current, past) = self.token_outcomes(der, intact, object, pasts)?;
+                let (current, past) = self.token_outcomes(der, integrity, object, pasts)?;
                 let Some(current) = current else {
                     continue;
                 };
@@ -1736,7 +1767,7 @@ impl<W: structured_asn1::memory::Work> TokenContext<'_, '_, '_, '_, '_, W> {
                         .map(long_term::Covered::Direct),
                 );
             }
-            let (current, past) = self.token_outcomes(der, intact, object, pasts)?;
+            let (current, past) = self.token_outcomes(der, integrity, object, pasts)?;
             let Some(current) = current else {
                 continue;
             };
@@ -1758,13 +1789,13 @@ impl<W: structured_asn1::memory::Work> TokenContext<'_, '_, '_, '_, '_, W> {
     fn token_outcomes(
         &self,
         der: &[u8],
-        intact: bool,
+        integrity: TokenIntegrity,
         object: long_term::Object,
         pasts: &mut Vec<long_term::Past>,
     ) -> Result<(Option<long_term::Decision>, Option<usize>), String> {
         let tsa = authority(der, self.parsed);
-        let current = if !intact {
-            Some(long_term::Decision::Finding(SubIndication::HashFailure))
+        let current = if let Some(sub) = token_finding(integrity) {
+            Some(long_term::Decision::Finding(sub))
         } else if let Some(tsa) = tsa {
             Some(long_term::Decision::from(authority_outcome(
                 self.session,

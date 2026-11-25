@@ -11,8 +11,10 @@ use crate::{Document, Error, Outcome, Report};
 use structured_asn1::memory::{Execution, Memory, OwnedVec, Work};
 use structured_asn1::{Parser, Reader};
 use structured_cms::directory::{CertificateAgreement, matches_certificate_in};
+use structured_cms::provider::SignatureAnswer;
 use structured_cms::timestamp::{
-    CheckContext, IntervalError, PolicyAccuracy, TokenExtension, interval_in,
+    CheckContext, CheckedTimestamp, ImprintAgreement, IntervalError, PolicyAccuracy,
+    TokenExtension, TokenSignature, interval_in,
 };
 use structured_ltv::baseline::{self as composed, LongTerm, Timed};
 use structured_ltv::credential::Authentication;
@@ -466,6 +468,34 @@ pub(crate) struct OwnCheck<'p, 't, 'a, 'v, 's, 'i, W: Work> {
     pub(crate) supplied_parent: &'p Reader<'t>,
 }
 
+/// Why a token's own checks gave no actor (EN 319 102-1 V1.4.1 clause 5.4,
+/// building on 5.2.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// No available certificate is the one the token names as its signer.
+    MissingSigner,
+    /// The message imprint does not match what its property stamps.
+    Imprint,
+    /// The imprint binds and the signer's key does not verify the token.
+    Signature,
+    /// Another profile fact of the token did not hold.
+    Profile,
+}
+
+/// The cause a completed check reports when it retains no actor: a hash
+/// failure before a signature failure, as clause 5.2.7 orders them.
+fn refusal(checked: &CheckedTimestamp<'_>) -> Refusal {
+    if matches!(checked.imprint, ImprintAgreement::Differs) {
+        return Refusal::Imprint;
+    }
+    match &checked.signature {
+        TokenSignature::Checked(signer) if signer.signature() != Some(SignatureAnswer::Valid) => {
+            Refusal::Signature
+        }
+        _ => Refusal::Profile,
+    }
+}
+
 impl<'p, 't, W: Work> OwnCheck<'p, 't, '_, '_, '_, '_, W> {
     /// Check token `ordinal` with its named signer's own key: its imprint,
     /// signature and profile facts, before any path. A completed negative
@@ -475,13 +505,29 @@ impl<'p, 't, W: Work> OwnCheck<'p, 't, '_, '_, '_, '_, W> {
         cms: &CmsProvider<'_>,
         ordinal: usize,
     ) -> Result<Result<TokenActor<'p, 't>, TimestampFailure>, ValidationError> {
+        Ok(self
+            .checked(cms, ordinal)?
+            .map_err(|refusal| match refusal {
+                Refusal::MissingSigner => TimestampFailure::MissingSigner,
+                Refusal::Imprint | Refusal::Signature | Refusal::Profile => {
+                    TimestampFailure::Rejected
+                }
+            }))
+    }
+
+    /// [`Self::token`] with the cause of a completed negative check.
+    pub(crate) fn checked(
+        &self,
+        cms: &CmsProvider<'_>,
+        ordinal: usize,
+    ) -> Result<Result<TokenActor<'p, 't>, Refusal>, ValidationError> {
         let tokens = self.tokens;
         let roots = self.prepared.timestamps();
         let source = &tokens.sources()[ordinal];
         let Some((certificate, parent)) =
             token_signer(tokens, ordinal, self.supplied, self.supplied_parent)?
         else {
-            return Ok(Err(TimestampFailure::MissingSigner));
+            return Ok(Err(Refusal::MissingSigner));
         };
         let reading = &tokens.readings()[ordinal];
         let policy_accuracy =
@@ -504,22 +550,23 @@ impl<'p, 't, W: Work> OwnCheck<'p, 't, '_, '_, '_, '_, W> {
         // The pool's entry carries the token in the encoding its profile
         // accepted, so neither branch re-reads it in another encoding.
         let entry = tokens.entry(ordinal).expect("ordinal within the pool");
-        let actor = if let Some(stamp) = roots.get(source.stamp_index()) {
-            check.retain_actor_from(
+        let (cause, actor) = if let Some(stamp) = roots.get(source.stamp_index()) {
+            check.check_actor_from(
                 self.prepared.bound(),
                 stamp,
                 entry,
                 self.operation,
                 unrecognized(),
+                refusal,
             )
         } else if let Some(stamps) = self.stamps {
             let counter = &stamps.entries()[source.stamp_index() - roots.len()];
-            check.retain_counter_from(counter, entry, self.operation, unrecognized())
+            check.check_counter_from(counter, entry, self.operation, unrecognized(), refusal)
         } else {
             unreachable!("a pool without countersignature properties holds only root tokens")
         }
         .map_err(|error| ValidationError::Timestamp(Box::new(error)))?;
-        Ok(actor.ok_or(TimestampFailure::Rejected))
+        Ok(actor.ok_or(cause))
     }
 }
 
