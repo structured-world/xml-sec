@@ -857,10 +857,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificates' OCSP responses are signed by ocsp-responder, which root-ca issued, while good-ca issued the certificates in question. RFC 6960 section 4.2.2.2 authorizes only the issuing CA, a responder it delegated to or one the relying party trusts locally, so xml-sec takes those responses as unusable, the signing certificates' status is not established and X.509 validation returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE at the claimed signing time (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4); DSS accepts the responses and passes."
       },
       "signing-time/extended": {
         "observed": [
@@ -883,10 +884,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificates' OCSP responses are signed by ocsp-responder, which root-ca issued, while good-ca issued the certificates in question. RFC 6960 section 4.2.2.2 authorizes only the issuing CA, a responder it delegated to or one the relying party trusts locally, so xml-sec takes those responses as unusable, the signing certificates' status is not established and X.509 validation returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE at the claimed signing time (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4); DSS accepts the responses and passes."
       },
       "signing-time/conformant": {
         "observed": [
@@ -909,10 +911,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificates' OCSP responses are signed by ocsp-responder, which root-ca issued, while good-ca issued the certificates in question. RFC 6960 section 4.2.2.2 authorizes only the issuing CA, a responder it delegated to or one the relying party trusts locally, so xml-sec takes those responses as unusable, the signing certificates' status is not established and X.509 validation returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE at the claimed signing time (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4); DSS accepts the responses and passes."
       }
     },
     "dss-xades/src/test/resources/sample-duplicate-ids.xml": {
@@ -14715,10 +14718,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate's OCSP response is signed by ocsp-responder, which root-ca issued, while good-ca issued the certificate in question. RFC 6960 section 4.2.2.2 authorizes only the issuing CA, a responder it delegated to or one the relying party trusts locally, so xml-sec takes that response as unusable, the signing certificate's status is not established and X.509 validation returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE at the claimed signing time (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4); DSS accepts the response and passes. The signature also carries attribute-authority validation data while claiming no attribute certificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes; xml-sec's B-B level refuses it as signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.8), where DSS passes SAV."
       },
       "signing-time/extended": {
         "observed": [
@@ -14732,10 +14736,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate's OCSP response is signed by ocsp-responder, which root-ca issued, while good-ca issued the certificate in question. RFC 6960 section 4.2.2.2 authorizes only the issuing CA, a responder it delegated to or one the relying party trusts locally, so xml-sec takes that response as unusable, the signing certificate's status is not established and X.509 validation returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE at the claimed signing time (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4); DSS accepts the response and passes. The signature also carries attribute-authority validation data while claiming no attribute certificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes; xml-sec's B-B level refuses it as signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.8), where DSS passes SAV."
       },
       "signing-time/conformant": {
         "observed": [
@@ -14749,10 +14754,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificate's OCSP response is signed by ocsp-responder, which root-ca issued, while good-ca issued the certificate in question. RFC 6960 section 4.2.2.2 authorizes only the issuing CA, a responder it delegated to or one the relying party trusts locally, so xml-sec takes that response as unusable, the signing certificate's status is not established and X.509 validation returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE at the claimed signing time (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4); DSS accepts the response and passes. The signature also carries attribute-authority validation data while claiming no attribute certificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes; xml-sec's B-B level refuses it as signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.8), where DSS passes SAV."
       }
     },
     "dss-xades/src/test/resources/validation/xades-b-copied-cnttst.xml": {
@@ -14998,10 +15004,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificates' OCSP responses are signed by ocsp-responder, which root-ca issued, while good-ca issued the certificates in question. RFC 6960 section 4.2.2.2 authorizes only the issuing CA, a responder it delegated to or one the relying party trusts locally, so xml-sec takes those responses as unusable, the status is not established and X.509 validation returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE at the claimed signing time (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4); DSS accepts the responses and passes. The first signature's countersignature carries a signature timestamp copied from another signature, so xml-sec does not verify that countersignature and refuses the first signature's qualifying properties for it (TS 101 903 V1.4.2 clause 7.2.4), where DSS passes FC."
       },
       "signing-time/extended": {
         "observed": [
@@ -15033,10 +15040,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificates' OCSP responses are signed by ocsp-responder, which root-ca issued, while good-ca issued the certificates in question. RFC 6960 section 4.2.2.2 authorizes only the issuing CA, a responder it delegated to or one the relying party trusts locally, so xml-sec takes those responses as unusable, the status is not established and X.509 validation returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE at the claimed signing time (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4); DSS accepts the responses and passes. The first signature's countersignature carries a signature timestamp copied from another signature, so xml-sec does not verify that countersignature and refuses the first signature's qualifying properties for it (TS 101 903 V1.4.2 clause 7.2.4), where DSS passes FC."
       },
       "signing-time/conformant": {
         "observed": [
@@ -15068,10 +15076,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": false
+        "indication": false,
+        "reason": "The signing certificates' OCSP responses are signed by ocsp-responder, which root-ca issued, while good-ca issued the certificates in question. RFC 6960 section 4.2.2.2 authorizes only the issuing CA, a responder it delegated to or one the relying party trusts locally, so xml-sec takes those responses as unusable, the status is not established and X.509 validation returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE at the claimed signing time (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4); DSS accepts the responses and passes. The first signature's countersignature carries a signature timestamp copied from another signature, so xml-sec does not verify that countersignature and refuses the first signature's qualifying properties for it (TS 101 903 V1.4.2 clause 7.2.4), where DSS passes FC."
       }
     },
     "dss-xades/src/test/resources/validation/xades-counter-signature-injected.xml": {
