@@ -192,6 +192,9 @@ fn validity(
     }
 }
 
+/// The narrower of two RSA-PSS family grants. Taking the lower level is an
+/// intersection only because `RsaPssPermission::permits` admits a subset at
+/// each lower level, digests that need their own permission included.
 fn family(a: RsaPssPermission, b: RsaPssPermission) -> RsaPssPermission {
     match (a, b) {
         (RsaPssPermission::ExactOnly, _) | (_, RsaPssPermission::ExactOnly) => {
