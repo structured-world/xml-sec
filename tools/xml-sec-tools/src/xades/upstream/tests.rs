@@ -379,6 +379,20 @@ fn the_validity_horizon_of_each_passing_signature_is_recorded_and_checked() {
 }
 
 #[test]
+fn a_probe_failure_fails_the_check_even_where_dss_finds_no_signature() {
+    // A probe that panics on an input DSS also refuses reads no signature,
+    // like an unsigned input: the failure itself must reach the check, so a
+    // crash can neither pass as `not-a-signature` nor be recorded away.
+    let facts = json!({ "probe": { "code": 101, "stderr": "panicked at probe" } });
+    let entry = super::observation(&[], &facts, 0);
+    let summary = json!({ "cases": { "a.xml": { "instant/strict": entry } } });
+    let recorded = super::recorded(&summary, &json!({}));
+    let found = differences(&recorded, &summary, &json!({}));
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("the probe failed"), "{found:?}");
+}
+
+#[test]
 fn a_review_no_observation_matches_fails() {
     // A review whose comparison is no longer observed would otherwise
     // outlive the difference it explains.

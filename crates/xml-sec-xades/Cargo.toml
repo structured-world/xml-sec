@@ -46,6 +46,11 @@ xml-backend-roxmltree = ["xml-sec/xml-backend-roxmltree"]
 # in a separate build whose timings are never reported. The library is unchanged.
 allocation-profile = []
 
+# The corpus probe's own unit tests run with the package's tests.
+[[example]]
+name = "corpus_probe"
+test = true
+
 [[example]]
 name = "create_probe"
 required-features = ["produce"]

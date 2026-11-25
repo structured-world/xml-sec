@@ -20,6 +20,9 @@
 
 #[path = "support/etsi.rs"]
 mod etsi;
+#[cfg(test)]
+#[path = "support/corpus_probe_tests.rs"]
+mod tests;
 #[path = "support/tokens.rs"]
 mod tokens;
 
@@ -208,25 +211,38 @@ fn declarations(text: &str) -> Vec<etsi::Declared> {
             .filter(|node| node.ancestors().skip(1).find(is_signature) == Some(signature))
             .collect();
         let mut declared = etsi::Declared::default();
+        // The signature's algorithms are those of its own ds:SignedInfo, the
+        // direct child (XMLDSig 1.1 section 4.4); a same-named element in an
+        // Object declares nothing about this signature.
+        let is_ds = |node: &roxmltree::Node<'_, '_>, name: &str| {
+            is(node, name) && node.tag_name().namespace() == Some(DS)
+        };
+        if let Some(info) = signature
+            .children()
+            .find(|child| is_ds(child, "SignedInfo"))
+        {
+            declared.method = info
+                .children()
+                .find(|child| is_ds(child, "SignatureMethod"))
+                .and_then(|method| method.attribute("Algorithm"))
+                .and_then(SignatureAlgorithm::from_uri);
+            declared.digests = info
+                .children()
+                .filter(|child| is_ds(child, "Reference"))
+                .filter_map(|reference| {
+                    reference
+                        .children()
+                        .find(|child| is_ds(child, "DigestMethod"))
+                })
+                .map(|method| {
+                    method
+                        .attribute("Algorithm")
+                        .and_then(DigestAlgorithm::from_uri)
+                })
+                .collect();
+        }
         for node in &own {
-            if is(node, "SignatureMethod") {
-                declared.method = node
-                    .attribute("Algorithm")
-                    .and_then(SignatureAlgorithm::from_uri);
-            } else if is(node, "DigestMethod")
-                && node
-                    .parent()
-                    .is_some_and(|reference| is(&reference, "Reference"))
-                && node
-                    .parent()
-                    .and_then(|reference| reference.parent())
-                    .is_some_and(|info| is(&info, "SignedInfo"))
-            {
-                declared.digests.push(
-                    node.attribute("Algorithm")
-                        .and_then(DigestAlgorithm::from_uri),
-                );
-            } else if is(node, "SigningTime") {
+            if is(node, "SigningTime") {
                 declared.signing_time = date_time(node.text().unwrap_or_default().trim());
             } else if is(node, "CertDigest") {
                 let method = node
@@ -671,11 +687,17 @@ fn establish_timestamps(
                 // are the ETSI process's to judge; a token whose own checks
                 // failed is refused as Rejected. A refusal before the tokens
                 // (the signer's path, a countersignature, the hashes)
-                // establishes nothing about them.
+                // establishes nothing about them, and neither does a token
+                // without its signer's certificate: the checks stop there,
+                // so it and every later token went unchecked.
                 Ok(Outcome::Timestamp {
                     failure: xml_sec_xades::TimestampFailure::Rejected,
                     ..
                 }) => Some(false),
+                Ok(Outcome::Timestamp {
+                    failure: xml_sec_xades::TimestampFailure::MissingSigner,
+                    ..
+                }) => None,
                 Ok(
                     Outcome::Assessed(_)
                     | Outcome::Timestamp { .. }

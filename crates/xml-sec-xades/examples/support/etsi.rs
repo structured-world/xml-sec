@@ -1327,13 +1327,7 @@ pub fn indication<W: structured_asn1::memory::Work>(
         inputs,
         now,
         memory: &memory,
-        catalogue: &long_term::Catalogue {
-            tokens: declared.signature_timestamps.len()
-                + declared.validation_timestamps.len()
-                + declared.archive_timestamps.len(),
-            certificates: parsed.pool.iter().chain(&parsed.anchors).collect(),
-            sources: parsed.crls.len() + parsed.responses.len(),
-        },
+        catalogue: &catalogue(&parsed, declared),
     };
     let mut rendered = context.long_term(&facts, signer, &paths, declared);
     rendered["detail"] = json!({
@@ -1346,6 +1340,31 @@ pub fn indication<W: structured_asn1::memory::Work>(
         "revocation": format!("{:?} {:?}", paths.signer_status, paths.statuses),
     });
     rendered
+}
+
+/// Every token, certificate and status source the historical process of one
+/// signature may cite.
+fn catalogue<'a>(parsed: &'a Parsed<'a>, declared: &Declared) -> long_term::Catalogue<'a> {
+    long_term::Catalogue {
+        tokens: declared.signature_timestamps.len()
+            + declared.validation_timestamps.len()
+            + declared.archive_timestamps.len(),
+        // A delegated responder's certificate may travel only inside its
+        // response (RFC 6960 4.2.2.2); `authority_paths` accepts it from
+        // there, so the records it signs must find it here too.
+        certificates: parsed
+            .pool
+            .iter()
+            .chain(&parsed.anchors)
+            .chain(
+                parsed
+                    .responses
+                    .iter()
+                    .flat_map(BasicResponse::certificates),
+            )
+            .collect(),
+        sources: parsed.crls.len() + parsed.responses.len(),
+    }
 }
 
 /// A completed ETSI decision in DSS's spelling.

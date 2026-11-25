@@ -307,6 +307,15 @@ pub(crate) fn our_blocks(facts: &Value, stamped: bool) -> Map<String, Value> {
             format!("trust {}", verification["trust"]),
         ),
     );
+    basic_blocks(facts, &mut blocks);
+    if stamped && let Some(timestamps) = timestamp_block(&facts["timestamped"]) {
+        blocks.insert("TIMESTAMPS".into(), timestamps);
+    }
+    blocks
+}
+
+/// The FC, ISC and SAV verdicts of one signature's basic facts.
+fn basic_blocks(facts: &Value, blocks: &mut Map<String, Value>) {
     // A TS 101 903 V1.2.2 signature has BES facts in place of EN 319 132-1
     // B-B ones: they decide whether its signing certificate is protected.
     let bes = &facts["ts101903_bes"];
@@ -366,25 +375,26 @@ pub(crate) fn our_blocks(facts: &Value, stamped: bool) -> Map<String, Value> {
             ),
         );
     }
-    if stamped {
-        let timestamped = &facts["timestamped"];
-        let (value, detail) = match timestamped["assessed"].as_bool() {
-            Some(true) => ("pass", "B-T requirements".to_owned()),
-            Some(false) => ("fail", "B-T requirements unmet".to_owned()),
-            None => (
-                "fail",
-                format!(
-                    "{}{}",
-                    timestamped["negative"].as_str().unwrap_or_default(),
-                    timestamped["error"].as_str().unwrap_or_default()
-                ),
-            ),
-        };
-        if !timestamped.is_null() {
-            blocks.insert("TIMESTAMPS".into(), verdict(value, detail));
-        }
+}
+
+/// The TIMESTAMPS verdict of a signature's B-T facts, when it has them.
+fn timestamp_block(timestamped: &Value) -> Option<Value> {
+    if timestamped.is_null() {
+        return None;
     }
-    blocks
+    let (value, detail) = match timestamped["assessed"].as_bool() {
+        Some(true) => ("pass", "B-T requirements".to_owned()),
+        Some(false) => ("fail", "B-T requirements unmet".to_owned()),
+        None => (
+            "fail",
+            format!(
+                "{}{}",
+                timestamped["negative"].as_str().unwrap_or_default(),
+                timestamped["error"].as_str().unwrap_or_default()
+            ),
+        ),
+    };
+    Some(verdict(value, detail))
 }
 
 /// Whether a DSS indication and one of our verdicts say the same thing.
@@ -734,6 +744,29 @@ pub(crate) fn horizons(facts: &Value) -> Option<Value> {
         .then(|| Value::Array(horizons))
 }
 
+/// What one pass of one input under one profile observes: the comparison
+/// `rows` against DSS and our `facts`, for an input whose document carries
+/// `anchors` trust anchors.
+pub(crate) fn observation(rows: &[Value], facts: &Value, anchors: u64) -> Value {
+    let mut entry = json!({
+        "observed": observed(rows),
+        "class": automatic_class(rows, anchors),
+        "passed": every_passed(rows, "ours")
+            && facts["signatures"].as_array().is_some_and(|s| !s.is_empty()),
+        "dss_passed": every_passed(rows, "dss"),
+        "indication": every_overall(rows, "indication"),
+    });
+    if let Some(horizons) = horizons(facts) {
+        entry["valid_until"] = horizons;
+    }
+    // A failed probe reads no signature, as an unsigned input does; the
+    // failure is kept so the check can tell the two apart.
+    if !facts["probe"].is_null() {
+        entry["probe"] = facts["probe"].clone();
+    }
+    entry
+}
+
 /// Every case's comparison in each pass it took part in.
 fn observations(
     cases: &[Case],
@@ -752,18 +785,10 @@ fn observations(
             }
             for (profile, _) in PROFILES {
                 let (rows, facts) = pass_rows(&pass, profile, stamped)?;
-                let mut entry = json!({
-                    "observed": observed(&rows),
-                    "class": automatic_class(&rows, anchors),
-                    "passed": every_passed(&rows, "ours")
-                        && facts["signatures"].as_array().is_some_and(|s| !s.is_empty()),
-                    "dss_passed": every_passed(&rows, "dss"),
-                    "indication": every_overall(&rows, "indication"),
-                });
-                if let Some(horizons) = horizons(&facts) {
-                    entry["valid_until"] = horizons;
-                }
-                row.insert(format!("{label}/{profile}"), entry);
+                row.insert(
+                    format!("{label}/{profile}"),
+                    observation(&rows, &facts, anchors),
+                );
             }
         }
         observations.insert(name.clone(), Value::Object(row));
@@ -994,6 +1019,15 @@ pub(crate) fn differences(expected: &Value, summary: &Value, reviews: &Value) ->
     let reviewed = &expected["cases"];
     for (name, passes) in summary["cases"].as_object().into_iter().flatten() {
         for (label, pass) in passes.as_object().into_iter().flatten() {
+            // A probe failure is a defect of xml-sec, never a classification
+            // a review or a recording can accept.
+            if !pass["probe"].is_null() {
+                found.push(format!(
+                    "{name} {label}: the probe failed with code {}",
+                    pass["probe"]["code"]
+                ));
+                continue;
+            }
             let entry = &reviewed[name][label];
             if entry.is_null() {
                 found.push(format!("{name} {label}: not in the expectations"));
