@@ -162,23 +162,67 @@ fn each_block_compares_with_its_own_fact() {
 }
 
 #[test]
-fn a_policy_refusal_lands_on_the_block_the_etsi_decision_names() {
-    // The ETSI decision over the same facts reads a profile refusal as a
-    // constraint of signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.8),
-    // a structural one included; both producers must name the same block.
-    let refused = |detail: &str| json!({ "verification": { "error": "Policy", "detail": detail } });
-    let transform = our_blocks(&refused(
-        "verification transform policy rejects algorithm http://www.w3.org/TR/1999/REC-xpath-19991116",
-    ));
-    assert_eq!(transform["SAV"]["verdict"], "fail");
-    assert_eq!(transform["FC"]["verdict"], "not-reached");
-    let structure = our_blocks(&refused("XAdES requires SignedProperties"));
+fn a_refusal_lands_on_the_block_the_etsi_decision_names() {
+    // A refused signature's block is the one of the ETSI decision the probe
+    // reports for it (EN 319 102-1 V1.4.1 Table 6): an external reference
+    // the comparison supplies no bytes for is signed data not found (CV),
+    // not a constraint, though the policy is what refused it; a profile
+    // constraint is acceptance; a bound of the implementation is no finding.
+    let refused = |sub: Value| {
+        json!({
+            "verification": { "error": "Policy", "detail": "reference URI class is not permitted" },
+            "etsi": { "indication": "INDETERMINATE", "sub": sub },
+        })
+    };
+    let external = our_blocks(&refused(json!("SIGNED_DATA_NOT_FOUND")));
+    assert_eq!(external["CV"]["verdict"], "fail");
+    assert_eq!(external["SAV"]["verdict"], "not-reached");
+    let structure = our_blocks(&refused(json!("SIG_CONSTRAINTS_FAILURE")));
     assert_eq!(structure["SAV"]["verdict"], "fail");
     assert_eq!(structure["FC"]["verdict"], "not-reached");
-    let key = our_blocks(&refused("no authorized key for the signature"));
+    let key = our_blocks(&refused(json!("NO_SIGNING_CERTIFICATE_FOUND")));
     assert_eq!(key["ISC"]["verdict"], "fail");
+    let bound = our_blocks(&refused(json!("CUSTOM")));
+    for name in ["FC", "ISC", "CV", "XCV", "SAV"] {
+        assert_eq!(bound[name]["verdict"], "not-reached", "{name}");
+    }
     // Without a timestamp in the signature there is nothing to compare.
     assert_eq!(structure["TIMESTAMPS"]["verdict"], "none");
+}
+
+#[test]
+fn the_block_the_etsi_decision_fails_does_not_pass() {
+    // A path the XMLDSig verification validated at the instant may still
+    // fail the X.509 validation block, which also needs each member's status
+    // (EN 319 102-1 V1.4.1 clause 5.2.6.4 step 4); when the ETSI decision
+    // over the same facts names that block, the block failed.
+    let mut facts = verified();
+    facts["etsi"] =
+        json!({ "indication": "INDETERMINATE", "sub": "CERTIFICATE_CHAIN_GENERAL_FAILURE" });
+    assert_eq!(our_blocks(&facts)["XCV"]["verdict"], "fail");
+    assert_eq!(our_blocks(&facts)["CV"]["verdict"], "pass");
+    facts["etsi"] = json!({ "indication": "TOTAL_PASSED" });
+    assert_eq!(our_blocks(&facts)["XCV"]["verdict"], "pass");
+}
+
+#[test]
+fn a_b_b_refusal_lands_on_the_block_it_concerns() {
+    // A property the baseline profile forbids is an acceptance finding, not
+    // a format failure; a value that did not verify is CV's, which already
+    // fails; a schema refusal is the format's.
+    let refused = |detail: &str| {
+        let mut facts = verified();
+        facts["basic"] = json!({ "error": "Prepare", "detail": detail });
+        our_blocks(&facts)
+    };
+    let forbidden = refused("Prepare(Property(Forbidden { node: N }))");
+    assert_eq!(forbidden["SAV"]["verdict"], "fail");
+    assert_eq!(forbidden["FC"]["verdict"], "not-reached");
+    let invalid = refused("Prepare(Binding(Signature { node: N, status: Invalid }))");
+    assert_eq!(invalid["FC"]["verdict"], "not-reached");
+    assert_eq!(invalid["SAV"]["verdict"], "not-reached");
+    let schema = refused("Prepare(Timestamp(Duplicate { node: N }))");
+    assert_eq!(schema["FC"]["verdict"], "fail");
 }
 
 #[test]
@@ -225,29 +269,25 @@ fn agreement_needs_the_overall_result_and_every_block_both_reached() {
     // overall result can hide a defect another refusal masks. A block only
     // one side reached is recorded and checked, not reviewed.
     let signatures = dss_signatures(DIAGNOSTIC, DETAILED, SIMPLE).unwrap();
+    let signatures = &signatures[..1];
     let mut facts = verified();
     facts["etsi"] = json!({ "indication": "INDETERMINATE", "sub": "TRY_LATER" });
-    let rows = compare(&signatures, &[facts.clone()]);
-    assert_eq!(rows[0]["blocks"]["XCV"]["agrees"], false);
-    assert_eq!(rows[0]["blocks"]["XCV"]["reached"], true);
+    // SAV reached by both and different: a difference to review.
+    let mut unmet = facts.clone();
+    unmet["basic"]["assessed"] = false.into();
+    let rows = compare(signatures, &[unmet]);
+    assert_eq!(rows[0]["blocks"]["SAV"]["reached"], true);
+    assert_eq!(rows[0]["blocks"]["SAV"]["agrees"], false);
     assert_eq!(automatic_class(&rows, 1), "unreviewed");
-    // Our facts stopping before XCV leave the overall match standing.
+    // Our facts stopping before FC, ISC, CV and SAV leave the overall match
+    // standing: those blocks are recorded, not reviewed.
     let mut stopped = facts.clone();
     stopped["verification"] =
         json!({ "error": "Policy", "detail": "XAdES requires SignedProperties" });
-    stopped["etsi"] = json!({ "indication": "INDETERMINATE", "sub": "TRY_LATER" });
-    let rows = compare(&signatures, &[stopped]);
-    assert_eq!(rows[0]["blocks"]["XCV"]["reached"], false);
-    // SAV was reached by both and differs: still a difference to review.
-    assert_eq!(rows[0]["blocks"]["SAV"]["agrees"], false);
-    assert_eq!(automatic_class(&rows, 1), "unreviewed");
+    let rows = compare(signatures, &[stopped]);
+    assert_eq!(rows[0]["blocks"]["SAV"]["reached"], false);
+    assert_eq!(automatic_class(&rows, 1), "agreement");
     // Every reached block agreeing, the same overall result is agreement.
-    let passing = DETAILED.replace(
-        "<Indication>INDETERMINATE</Indication><SubIndication>TRY_LATER</SubIndication></Conclusion></XCV>",
-        "<Indication>PASSED</Indication></Conclusion></XCV>",
-    );
-    let signatures = dss_signatures(DIAGNOSTIC, &passing, SIMPLE).unwrap();
-    let signatures = &signatures[..1];
     let rows = compare(signatures, &[facts.clone()]);
     assert_eq!(automatic_class(&rows, 1), "agreement");
     assert_eq!(
@@ -785,6 +825,9 @@ fn a_review_moves_onto_the_new_form_of_the_comparison_it_explained() {
         recorded["cases"]["a.xml"]["instant/conformant"]["class"],
         "unreviewed"
     );
+    // Carrying again over the same run moves nothing back: the review that
+    // already lists the new form still explains it.
+    assert_eq!(super::carried(&previous, &summary, &moved), moved);
     // Nothing it explained is observed with the same overall result: the
     // review stays as written.
     let mut changed = unreviewed_summary();
@@ -793,6 +836,31 @@ fn a_review_moves_onto_the_new_form_of_the_comparison_it_explained() {
             json!([{ "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-" }]);
     }
     assert_eq!(super::carried(&previous, &changed, &reviews), reviews);
+}
+
+#[test]
+fn a_review_covers_every_difference_of_its_input_nothing_explains_yet() {
+    // A reviewer classifies one input: each pass still unreviewed takes the
+    // review, one per overall comparison, and the recording then holds.
+    let summary = unreviewed_summary();
+    let reviews = super::reviewed(
+        &summary,
+        &json!({}),
+        "a.xml",
+        "normative-difference",
+        "EN 319 102-1 5.2.6.4 step 4",
+    )
+    .unwrap();
+    assert_eq!(reviews["a.xml"].as_array().map(Vec::len), Some(1));
+    let recorded = super::recorded(&summary, &reviews);
+    assert_eq!(
+        differences(&recorded, &summary, &reviews),
+        Vec::<String>::new()
+    );
+    // Nothing is left, and a review needs a reviewed class and a reason.
+    assert!(super::reviewed(&summary, &reviews, "a.xml", "normative-difference", "r").is_err());
+    assert!(super::reviewed(&summary, &json!({}), "a.xml", "agreement", "r").is_err());
+    assert!(super::reviewed(&summary, &json!({}), "a.xml", "normative-difference", " ").is_err());
 }
 
 #[test]

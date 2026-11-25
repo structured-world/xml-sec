@@ -7,10 +7,10 @@
       "observed": [
         [
           {
-            "FC": "PASSED/fail",
+            "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
-            "CV": "INDETERMINATE/not-reached",
-            "XCV": "PASSED/not-reached",
+            "CV": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/not-reached",
+            "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
             "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
@@ -27,18 +27,18 @@
       "observed": [
         [
           {
-            "FC": "PASSED/fail",
+            "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
-            "CV": "INDETERMINATE/not-reached",
+            "CV": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/not-reached",
             "XCV": "PASSED/not-reached",
-            "SAV": "PASSED/not-reached",
+            "SAV": "PASSED/fail",
             "TIMESTAMPS": "none/none",
             "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:SIG_CONSTRAINTS_FAILURE"
           }
         ]
       ],
       "class": "dss-deviation",
-      "reason": "XMLDSig Core 1.1 section 4.4.3.3 and the ds:Object schema (Id of type ID): #refetsi names the ds:Object Id=\"refetsi\", so the signed data is obtained and its digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2); DSS does not find it. The X.509 validation passes (the profile trusts the signer, itself a trust anchor, directly: section 5.2.6.4 step 1 b)) and xml-sec's profile refuses the TS 101 903 v1.1.1 namespace, which EN 319 132-1 section 4.2 does not define (signature acceptance, EN 319 102-1 section 5.2.8)."
+      "reason": "XMLDSig Core 1.1 section 4.4.3.3 and the ds:Object schema (Id of type ID): #refetsi names the ds:Object Id=\"refetsi\", so the signed data is obtained and its digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2); DSS does not find it. The X.509 validation passes: under the conformant profile the signer, itself a trust anchor, is trusted directly (section 5.2.6.4 step 1 b)); under the strict and extended profiles it is held to its validity over the signing time (section 5.2.6.4 step 1), which the claimed signing time satisfies. xml-sec's profile refuses the TS 101 903 v1.1.1 namespace, which EN 319 132-1 section 4.2 does not define (signature acceptance, EN 319 102-1 section 5.2.8)."
     }
   ],
   "dss-xades/src/test/resources/validation/Signature-X-FR_NOT-3.xml": [
@@ -49,10 +49,10 @@
       "observed": [
         [
           {
-            "FC": "PASSED/fail",
+            "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "PASSED/not-reached",
+            "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
@@ -75,28 +75,28 @@
           {
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
-            "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/fail",
-            "SAV": "INDETERMINATE/not-reached",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
+            "CV": "PASSED/fail",
+            "XCV": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/not-reached",
+            "SAV": "INDETERMINATE:CRYPTO_CONSTRAINTS_FAILURE_NO_POE/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/not-reached",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:SIGNED_DATA_NOT_FOUND"
           },
           {
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
-            "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/fail",
-            "SAV": "INDETERMINATE/not-reached",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
+            "CV": "PASSED/fail",
+            "XCV": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/not-reached",
+            "SAV": "INDETERMINATE:CRYPTO_CONSTRAINTS_FAILURE_NO_POE/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/not-reached",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:SIGNED_DATA_NOT_FOUND"
           },
           {
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
-            "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/fail",
-            "SAV": "INDETERMINATE/not-reached",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
+            "CV": "PASSED/fail",
+            "XCV": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/not-reached",
+            "SAV": "INDETERMINATE:CRYPTO_CONSTRAINTS_FAILURE_NO_POE/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/not-reached",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:SIGNED_DATA_NOT_FOUND"
           }
         ],
@@ -104,28 +104,28 @@
           {
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
-            "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/fail",
+            "CV": "PASSED/fail",
+            "XCV": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/not-reached",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/not-reached",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:SIGNED_DATA_NOT_FOUND"
           },
           {
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
-            "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/fail",
+            "CV": "PASSED/fail",
+            "XCV": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/not-reached",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/not-reached",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:SIGNED_DATA_NOT_FOUND"
           },
           {
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
-            "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/fail",
+            "CV": "PASSED/fail",
+            "XCV": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/not-reached",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/not-reached",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:SIGNED_DATA_NOT_FOUND"
           }
         ]
@@ -177,20 +177,20 @@
           {
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
-            "CV": "INDETERMINATE/not-reached",
-            "XCV": "INDETERMINATE/fail",
-            "SAV": "INDETERMINATE/not-reached",
+            "CV": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/fail",
+            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
+            "SAV": "INDETERMINATE:CRYPTO_CONSTRAINTS_FAILURE_NO_POE/not-reached",
             "TIMESTAMPS": "none/none",
             "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/TOTAL_FAILED:SIG_CRYPTO_FAILURE"
           }
         ],
         [
           {
-            "FC": "PASSED/fail",
+            "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
-            "CV": "INDETERMINATE/fail",
-            "XCV": "INDETERMINATE/pass",
-            "SAV": "INDETERMINATE/not-reached",
+            "CV": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/fail",
+            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/pass",
+            "SAV": "INDETERMINATE:CRYPTO_CONSTRAINTS_FAILURE_NO_POE/not-reached",
             "TIMESTAMPS": "none/none",
             "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/TOTAL_FAILED:SIG_CRYPTO_FAILURE"
           }
@@ -254,10 +254,10 @@
           {
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
-            "CV": "FAILED/not-reached",
-            "XCV": "INDETERMINATE/fail",
+            "CV": "FAILED:HASH_FAILURE/fail",
+            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "PASSED/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/not-reached",
             "OVERALL": "TOTAL_FAILED:HASH_FAILURE/TOTAL_FAILED:SIG_CRYPTO_FAILURE"
           }
         ]
@@ -276,10 +276,10 @@
           {
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
-            "CV": "FAILED/not-reached",
-            "XCV": "INDETERMINATE/fail",
+            "CV": "FAILED:HASH_FAILURE/fail",
+            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "PASSED/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/not-reached",
             "OVERALL": "TOTAL_FAILED:HASH_FAILURE/TOTAL_FAILED:SIG_CRYPTO_FAILURE"
           }
         ]
@@ -298,10 +298,10 @@
           {
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
-            "CV": "INDETERMINATE/not-reached",
-            "XCV": "INDETERMINATE/not-reached",
-            "SAV": "PASSED/fail",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
+            "CV": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/not-reached",
+            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
+            "SAV": "PASSED/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/not-reached",
             "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:CUSTOM"
           }
         ]
@@ -320,10 +320,10 @@
           {
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
-            "CV": "INDETERMINATE/not-reached",
-            "XCV": "INDETERMINATE/not-reached",
-            "SAV": "PASSED/fail",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
+            "CV": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/not-reached",
+            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
+            "SAV": "PASSED/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/not-reached",
             "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:CUSTOM"
           }
         ]
@@ -414,10 +414,10 @@
       "observed": [
         [
           {
-            "FC": "PASSED/not-reached",
+            "FC": "PASSED/fail",
             "ISC": "PASSED/not-reached",
-            "CV": "FAILED/not-reached",
-            "XCV": "INDETERMINATE/fail",
+            "CV": "FAILED:SIG_CRYPTO_FAILURE/not-reached",
+            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_FAILED:SIG_CRYPTO_FAILURE/TOTAL_FAILED:FORMAT_FAILURE"
@@ -436,11 +436,11 @@
       "observed": [
         [
           {
-            "FC": "PASSED/not-reached",
+            "FC": "PASSED/fail",
             "ISC": "PASSED/not-reached",
-            "CV": "FAILED/not-reached",
-            "XCV": "INDETERMINATE/fail",
-            "SAV": "INDETERMINATE/not-reached",
+            "CV": "FAILED:HASH_FAILURE/not-reached",
+            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
+            "SAV": "INDETERMINATE:CRYPTO_CONSTRAINTS_FAILURE_NO_POE/not-reached",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_FAILED:HASH_FAILURE/TOTAL_FAILED:FORMAT_FAILURE"
           }
@@ -460,9 +460,9 @@
           {
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
-            "CV": "INDETERMINATE/not-reached",
-            "XCV": "INDETERMINATE/fail",
-            "SAV": "INDETERMINATE/not-reached",
+            "CV": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/not-reached",
+            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
+            "SAV": "INDETERMINATE:CRYPTO_CONSTRAINTS_FAILURE_NO_POE/not-reached",
             "TIMESTAMPS": "none/none",
             "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:CUSTOM"
           }
@@ -483,7 +483,7 @@
             "FC": "absent/not-reached",
             "ISC": "absent/not-reached",
             "CV": "absent/not-reached",
-            "XCV": "absent/fail",
+            "XCV": "absent/not-reached",
             "SAV": "absent/not-reached",
             "TIMESTAMPS": "absent/none",
             "OVERALL": "absent:-/INDETERMINATE:CUSTOM"
@@ -502,11 +502,11 @@
       "observed": [
         [
           {
-            "FC": "FAILED/not-reached",
+            "FC": "FAILED:FORMAT_FAILURE/not-reached",
             "ISC": "PASSED/not-reached",
-            "CV": "FAILED/not-reached",
-            "XCV": "INDETERMINATE/not-reached",
-            "SAV": "PASSED/fail",
+            "CV": "FAILED:HASH_FAILURE/fail",
+            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
+            "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_FAILED:FORMAT_FAILURE/INDETERMINATE:SIGNED_DATA_NOT_FOUND"
           }
@@ -526,9 +526,9 @@
           {
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
-            "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/not-reached",
-            "SAV": "PASSED/fail",
+            "CV": "PASSED/fail",
+            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
+            "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/TOTAL_FAILED:HASH_FAILURE"
           }
@@ -546,11 +546,11 @@
       "observed": [
         [
           {
-            "FC": "PASSED/fail",
+            "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
-            "CV": "INDETERMINATE/not-reached",
-            "XCV": "PASSED/not-reached",
-            "SAV": "INDETERMINATE/not-reached",
+            "CV": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/not-reached",
+            "XCV": "PASSED/fail",
+            "SAV": "INDETERMINATE:SIG_CONSTRAINTS_FAILURE/not-reached",
             "TIMESTAMPS": "none/none",
             "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
@@ -566,11 +566,11 @@
       "observed": [
         [
           {
-            "FC": "PASSED/fail",
+            "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
-            "CV": "INDETERMINATE/not-reached",
+            "CV": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/not-reached",
             "XCV": "PASSED/not-reached",
-            "SAV": "INDETERMINATE/not-reached",
+            "SAV": "INDETERMINATE:SIG_CONSTRAINTS_FAILURE/fail",
             "TIMESTAMPS": "none/none",
             "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:SIG_CONSTRAINTS_FAILURE"
           }
@@ -590,8 +590,8 @@
           {
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
-            "CV": "INDETERMINATE/not-reached",
-            "XCV": "INDETERMINATE/fail",
+            "CV": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/not-reached",
+            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
             "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
@@ -612,10 +612,10 @@
           {
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
-            "CV": "INDETERMINATE/not-reached",
-            "XCV": "INDETERMINATE/fail",
+            "CV": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/not-reached",
+            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/fail",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "none/not-reached",
+            "TIMESTAMPS": "FAILED:HASH_FAILURE/not-reached",
             "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ]
@@ -634,19 +634,8 @@
           {
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
-            "CV": "INDETERMINATE/not-reached",
-            "XCV": "INDETERMINATE/not-reached",
-            "SAV": "PASSED/fail",
-            "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
-          }
-        ],
-        [
-          {
-            "FC": "PASSED/not-reached",
-            "ISC": "PASSED/not-reached",
-            "CV": "INDETERMINATE/not-reached",
-            "XCV": "INDETERMINATE/fail",
+            "CV": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/not-reached",
+            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
             "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
@@ -669,9 +658,9 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/fail",
+            "XCV": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/fail",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/fail",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           },
           {
@@ -680,7 +669,7 @@
             "CV": "absent/not-reached",
             "XCV": "absent/fail",
             "SAV": "absent/not-reached",
-            "TIMESTAMPS": "none/not-reached",
+            "TIMESTAMPS": "none/none",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ]
@@ -700,9 +689,9 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/fail",
+            "XCV": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/fail",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/not-reached",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ]
@@ -723,38 +712,18 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/not-reached",
-            "SAV": "PASSED/fail",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
+            "XCV": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/fail",
+            "SAV": "PASSED/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/not-reached",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           },
           {
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/not-reached",
-            "SAV": "PASSED/fail",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
-            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
-          }
-        ],
-        [
-          {
-            "FC": "PASSED/not-reached",
-            "ISC": "PASSED/not-reached",
-            "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/fail",
+            "XCV": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/fail",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
-            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
-          },
-          {
-            "FC": "PASSED/not-reached",
-            "ISC": "PASSED/not-reached",
-            "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/fail",
-            "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/not-reached",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ]
@@ -774,9 +743,9 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/fail",
+            "XCV": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/fail",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/not-reached",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ]
@@ -818,9 +787,9 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/fail",
+            "XCV": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/fail",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "FAILED/not-reached",
+            "TIMESTAMPS": "FAILED:HASH_FAILURE/not-reached",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ]
@@ -840,9 +809,9 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/fail",
+            "XCV": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/fail",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/not-reached",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ]
@@ -863,9 +832,9 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/fail",
+            "XCV": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/fail",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "PASSED/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/fail",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           },
           {
@@ -874,7 +843,7 @@
             "CV": "absent/not-reached",
             "XCV": "absent/fail",
             "SAV": "absent/not-reached",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/not-reached",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ]
@@ -895,9 +864,9 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/fail",
+            "XCV": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/fail",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "PASSED/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/fail",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           },
           {
@@ -906,7 +875,7 @@
             "CV": "absent/not-reached",
             "XCV": "absent/fail",
             "SAV": "absent/not-reached",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/not-reached",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ]
@@ -926,9 +895,9 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/fail",
+            "XCV": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/fail",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/not-reached",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ]
@@ -948,9 +917,9 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/fail",
+            "XCV": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/fail",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/not-reached",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ]
@@ -972,9 +941,9 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/fail",
+            "XCV": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/fail",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/fail",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           },
           {
@@ -983,7 +952,7 @@
             "CV": "absent/not-reached",
             "XCV": "absent/fail",
             "SAV": "absent/not-reached",
-            "TIMESTAMPS": "FAILED/not-reached",
+            "TIMESTAMPS": "FAILED:HASH_FAILURE/not-reached",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           },
           {
@@ -992,7 +961,7 @@
             "CV": "absent/not-reached",
             "XCV": "absent/fail",
             "SAV": "absent/not-reached",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ]
@@ -1012,9 +981,9 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/fail",
-            "SAV": "INDETERMINATE/not-reached",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
+            "XCV": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/fail",
+            "SAV": "INDETERMINATE:SIG_CONSTRAINTS_FAILURE/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/not-reached",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ]
@@ -1034,9 +1003,9 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/fail",
+            "XCV": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/fail",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "FAILED/not-reached",
+            "TIMESTAMPS": "FAILED:HASH_FAILURE/fail",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ]
@@ -1056,9 +1025,9 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/fail",
+            "XCV": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/fail",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "FAILED/not-reached",
+            "TIMESTAMPS": "FAILED:HASH_FAILURE/not-reached",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ]
@@ -1078,9 +1047,9 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/fail",
+            "XCV": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/fail",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/fail",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ]
@@ -1100,9 +1069,9 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/fail",
+            "XCV": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/fail",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "FAILED/not-reached",
+            "TIMESTAMPS": "FAILED:HASH_FAILURE/fail",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ]
@@ -1122,9 +1091,9 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/fail",
+            "XCV": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/fail",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "PASSED/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:CRYPTO_CONSTRAINTS_FAILURE_NO_POE/not-reached",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ]
@@ -1144,9 +1113,9 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/not-reached",
-            "SAV": "PASSED/fail",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
+            "XCV": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/fail",
+            "SAV": "PASSED/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ]
@@ -1166,9 +1135,9 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/not-reached",
-            "SAV": "PASSED/fail",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
+            "XCV": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/fail",
+            "SAV": "PASSED/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ]
@@ -1185,12 +1154,12 @@
       "observed": [
         [
           {
-            "FC": "PASSED/fail",
+            "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/fail",
-            "XCV": "INDETERMINATE/fail",
+            "XCV": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/fail",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "INDETERMINATE/fail",
+            "TIMESTAMPS": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ]
@@ -1210,9 +1179,9 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/not-reached",
-            "SAV": "PASSED/fail",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
+            "XCV": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/fail",
+            "SAV": "PASSED/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ]
@@ -1232,20 +1201,9 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/not-reached",
-            "SAV": "PASSED/fail",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
-            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
-          }
-        ],
-        [
-          {
-            "FC": "PASSED/not-reached",
-            "ISC": "PASSED/not-reached",
-            "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/fail",
+            "XCV": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/fail",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/not-reached",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ]
@@ -1265,20 +1223,9 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/not-reached",
-            "SAV": "PASSED/fail",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
-            "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
-          }
-        ],
-        [
-          {
-            "FC": "PASSED/not-reached",
-            "ISC": "PASSED/not-reached",
-            "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/fail",
+            "XCV": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/fail",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/not-reached",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ]
@@ -1298,9 +1245,9 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE/fail",
+            "XCV": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/fail",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/not-reached",
             "OVERALL": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ]
@@ -1366,7 +1313,7 @@
             "CV": "PASSED/not-reached",
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "PASSED/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:CRYPTO_CONSTRAINTS_FAILURE_NO_POE/not-reached",
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ]
@@ -1452,8 +1399,8 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "PASSED/not-reached",
-            "SAV": "PASSED/fail",
+            "XCV": "PASSED/fail",
+            "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
@@ -1562,17 +1509,6 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "PASSED/not-reached",
-            "SAV": "PASSED/fail",
-            "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
-          }
-        ],
-        [
-          {
-            "FC": "PASSED/not-reached",
-            "ISC": "PASSED/not-reached",
-            "CV": "PASSED/not-reached",
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
@@ -1590,17 +1526,6 @@
         "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
       ],
       "observed": [
-        [
-          {
-            "FC": "PASSED/not-reached",
-            "ISC": "PASSED/not-reached",
-            "CV": "PASSED/not-reached",
-            "XCV": "PASSED/not-reached",
-            "SAV": "PASSED/fail",
-            "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
-          }
-        ],
         [
           {
             "FC": "PASSED/not-reached",
@@ -1628,17 +1553,6 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "PASSED/not-reached",
-            "SAV": "PASSED/fail",
-            "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
-          }
-        ],
-        [
-          {
-            "FC": "PASSED/not-reached",
-            "ISC": "PASSED/not-reached",
-            "CV": "PASSED/not-reached",
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
@@ -1656,17 +1570,6 @@
         "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
       ],
       "observed": [
-        [
-          {
-            "FC": "PASSED/not-reached",
-            "ISC": "PASSED/not-reached",
-            "CV": "PASSED/not-reached",
-            "XCV": "PASSED/not-reached",
-            "SAV": "PASSED/fail",
-            "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
-          }
-        ],
         [
           {
             "FC": "PASSED/not-reached",
@@ -1694,17 +1597,6 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "PASSED/not-reached",
-            "SAV": "PASSED/fail",
-            "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
-          }
-        ],
-        [
-          {
-            "FC": "PASSED/not-reached",
-            "ISC": "PASSED/not-reached",
-            "CV": "PASSED/not-reached",
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
@@ -1722,17 +1614,6 @@
         "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
       ],
       "observed": [
-        [
-          {
-            "FC": "PASSED/not-reached",
-            "ISC": "PASSED/not-reached",
-            "CV": "PASSED/not-reached",
-            "XCV": "PASSED/not-reached",
-            "SAV": "PASSED/fail",
-            "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
-          }
-        ],
         [
           {
             "FC": "PASSED/not-reached",
@@ -1760,17 +1641,6 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "PASSED/not-reached",
-            "SAV": "PASSED/fail",
-            "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
-          }
-        ],
-        [
-          {
-            "FC": "PASSED/not-reached",
-            "ISC": "PASSED/not-reached",
-            "CV": "PASSED/not-reached",
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
@@ -1788,17 +1658,6 @@
         "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
       ],
       "observed": [
-        [
-          {
-            "FC": "PASSED/not-reached",
-            "ISC": "PASSED/not-reached",
-            "CV": "PASSED/not-reached",
-            "XCV": "PASSED/not-reached",
-            "SAV": "PASSED/fail",
-            "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
-          }
-        ],
         [
           {
             "FC": "PASSED/not-reached",
@@ -1826,17 +1685,6 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "PASSED/not-reached",
-            "SAV": "PASSED/fail",
-            "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
-          }
-        ],
-        [
-          {
-            "FC": "PASSED/not-reached",
-            "ISC": "PASSED/not-reached",
-            "CV": "PASSED/not-reached",
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
@@ -1854,17 +1702,6 @@
         "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
       ],
       "observed": [
-        [
-          {
-            "FC": "PASSED/not-reached",
-            "ISC": "PASSED/not-reached",
-            "CV": "PASSED/not-reached",
-            "XCV": "PASSED/not-reached",
-            "SAV": "PASSED/fail",
-            "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
-          }
-        ],
         [
           {
             "FC": "PASSED/not-reached",
@@ -1892,20 +1729,9 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "PASSED/not-reached",
-            "SAV": "PASSED/fail",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
-          }
-        ],
-        [
-          {
-            "FC": "PASSED/not-reached",
-            "ISC": "PASSED/not-reached",
-            "CV": "PASSED/not-reached",
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
+            "TIMESTAMPS": "FAILED:HASH_FAILURE/not-reached",
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ]
@@ -1927,7 +1753,7 @@
             "CV": "PASSED/not-reached",
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "INDETERMINATE/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/not-reached",
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ]
@@ -1948,26 +1774,6 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "PASSED/not-reached",
-            "SAV": "PASSED/fail",
-            "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
-          },
-          {
-            "FC": "absent/not-reached",
-            "ISC": "absent/not-reached",
-            "CV": "absent/not-reached",
-            "XCV": "absent/not-reached",
-            "SAV": "absent/fail",
-            "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_FAILED:HASH_FAILURE/TOTAL_FAILED:HASH_FAILURE"
-          }
-        ],
-        [
-          {
-            "FC": "PASSED/not-reached",
-            "ISC": "PASSED/not-reached",
-            "CV": "PASSED/not-reached",
             "XCV": "PASSED/fail",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
@@ -1976,8 +1782,8 @@
           {
             "FC": "absent/not-reached",
             "ISC": "absent/not-reached",
-            "CV": "absent/not-reached",
-            "XCV": "absent/fail",
+            "CV": "absent/fail",
+            "XCV": "absent/not-reached",
             "SAV": "absent/not-reached",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_FAILED:HASH_FAILURE/TOTAL_FAILED:HASH_FAILURE"
@@ -1999,8 +1805,8 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "PASSED/not-reached",
-            "SAV": "INDETERMINATE/fail",
+            "XCV": "PASSED/fail",
+            "SAV": "INDETERMINATE:CRYPTO_CONSTRAINTS_FAILURE_NO_POE/not-reached",
             "TIMESTAMPS": "none/none",
             "OVERALL": "INDETERMINATE:CRYPTO_CONSTRAINTS_FAILURE_NO_POE/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
@@ -2021,9 +1827,9 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "PASSED/not-reached",
-            "SAV": "INDETERMINATE/fail",
-            "TIMESTAMPS": "PASSED/not-reached",
+            "XCV": "PASSED/fail",
+            "SAV": "INDETERMINATE:CRYPTO_CONSTRAINTS_FAILURE_NO_POE/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:CRYPTO_CONSTRAINTS_FAILURE_NO_POE/not-reached",
             "OVERALL": "INDETERMINATE:CRYPTO_CONSTRAINTS_FAILURE_NO_POE/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ]
@@ -2043,8 +1849,8 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "PASSED/not-reached",
-            "SAV": "INDETERMINATE/fail",
+            "XCV": "PASSED/fail",
+            "SAV": "INDETERMINATE:CRYPTO_CONSTRAINTS_FAILURE_NO_POE/not-reached",
             "TIMESTAMPS": "none/none",
             "OVERALL": "INDETERMINATE:CRYPTO_CONSTRAINTS_FAILURE_NO_POE/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
@@ -2062,12 +1868,12 @@
       "observed": [
         [
           {
-            "FC": "PASSED/fail",
+            "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "PASSED/not-reached",
-            "SAV": "INDETERMINATE/not-reached",
-            "TIMESTAMPS": "none/not-reached",
+            "XCV": "PASSED/fail",
+            "SAV": "INDETERMINATE:SIG_CONSTRAINTS_FAILURE/not-reached",
+            "TIMESTAMPS": "FAILED:HASH_FAILURE/not-reached",
             "OVERALL": "INDETERMINATE:SIG_CONSTRAINTS_FAILURE/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ]
@@ -2084,11 +1890,11 @@
       "observed": [
         [
           {
-            "FC": "PASSED/fail",
+            "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "PASSED/not-reached",
-            "SAV": "INDETERMINATE/not-reached",
+            "XCV": "PASSED/fail",
+            "SAV": "INDETERMINATE:SIG_CONSTRAINTS_FAILURE/not-reached",
             "TIMESTAMPS": "none/none",
             "OVERALL": "INDETERMINATE:SIG_CONSTRAINTS_FAILURE/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }

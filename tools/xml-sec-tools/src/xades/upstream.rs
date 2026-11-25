@@ -325,6 +325,32 @@ pub(crate) fn dss_signatures(
     Ok(found)
 }
 
+/// The building block whose result an ETSI decision's sub-indication is
+/// (EN 319 102-1 V1.4.1 clauses 5.2.2 to 5.2.8, Table 6): none for one that
+/// is no finding about the signature (`CUSTOM`) or that no block names alone.
+fn decision_block(decision: &Value) -> Option<&'static str> {
+    match decision["sub"].as_str()? {
+        "FORMAT_FAILURE" => Some("FC"),
+        "NO_SIGNING_CERTIFICATE_FOUND" => Some("ISC"),
+        "SIGNED_DATA_NOT_FOUND" | "HASH_FAILURE" | "SIG_CRYPTO_FAILURE" => Some("CV"),
+        "SIG_CONSTRAINTS_FAILURE"
+        | "CRYPTO_CONSTRAINTS_FAILURE"
+        | "CRYPTO_CONSTRAINTS_FAILURE_NO_POE" => Some("SAV"),
+        "NO_CERTIFICATE_CHAIN_FOUND"
+        | "CERTIFICATE_CHAIN_GENERAL_FAILURE"
+        | "CHAIN_CONSTRAINTS_FAILURE"
+        | "REVOKED_NO_POE"
+        | "REVOKED_CA_NO_POE"
+        | "REVOKED"
+        | "OUT_OF_BOUNDS_NO_POE"
+        | "OUT_OF_BOUNDS_NOT_REVOKED"
+        | "REVOCATION_OUT_OF_BOUNDS_NO_POE"
+        | "NOT_YET_VALID"
+        | "TRY_LATER" => Some("XCV"),
+        _ => None,
+    }
+}
+
 fn verdict(value: &str, detail: impl Into<String>) -> Value {
     json!({ "verdict": value, "detail": detail.into() })
 }
@@ -345,16 +371,12 @@ pub(crate) fn our_blocks(facts: &Value) -> Map<String, Value> {
     let verification = &facts["verification"];
     if let Some(error) = verification["error"].as_str() {
         let detail = verification["detail"].as_str().unwrap_or_default();
-        // The block the ETSI decision over the same facts names: a refusal
-        // of the profile is a constraint of signature acceptance (EN 319
-        // 102-1 V1.4.1 clause 5.2.8, its NOTE in 5.2.2 included), an
-        // unauthorized key one of signer identification (clause 5.3.4).
-        let block = match error {
-            "Policy" if detail.contains("authorized key") => "ISC",
-            "Policy" => "SAV",
-            _ => "XCV",
-        };
-        blocks.insert(block.into(), verdict("fail", format!("{error}: {detail}")));
+        // The block of the ETSI decision the probe reports for the same
+        // signature, so both producers read one decision; a refusal that is
+        // no finding about the signature fails no block.
+        if let Some(block) = decision_block(&facts["etsi"]) {
+            blocks.insert(block.into(), verdict("fail", format!("{error}: {detail}")));
+        }
         return blocks;
     }
     let references_valid = verification["references"]
@@ -377,6 +399,25 @@ pub(crate) fn our_blocks(facts: &Value) -> Map<String, Value> {
         ),
     );
     basic_blocks(facts, &mut blocks);
+    // The block the ETSI decision over the same facts names as the one that
+    // ended it did not pass, whatever a narrower fact read: a path the
+    // verification validated still fails X.509 validation without the
+    // members' statuses (EN 319 102-1 V1.4.1 clause 5.2.6.4 step 4).
+    if facts["etsi"]["indication"] != "TOTAL_PASSED"
+        && let Some(block) = decision_block(&facts["etsi"])
+        && blocks[block]["verdict"] == "pass"
+    {
+        blocks.insert(
+            block.into(),
+            verdict(
+                "fail",
+                format!(
+                    "ETSI decision {}",
+                    facts["etsi"]["sub"].as_str().unwrap_or_default()
+                ),
+            ),
+        );
+    }
     blocks
 }
 
@@ -433,13 +474,20 @@ fn basic_blocks(facts: &Value, blocks: &mut Map<String, Value>) {
             verdict("fail", basic["detail"].as_str().unwrap_or_default()),
         );
     } else if let Some(error) = basic["error"].as_str() {
-        blocks.insert(
-            "FC".into(),
-            verdict(
-                "fail",
-                format!("{error}: {}", basic["detail"].as_str().unwrap_or_default()),
-            ),
-        );
+        let detail = basic["detail"].as_str().unwrap_or_default();
+        // A property the baseline profile forbids (EN 319 132-1 clause 6)
+        // breaks no XAdES format: the profile's rules are signature
+        // acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, 5.2.8). A
+        // signature whose value did not verify stops B-B, and CV already
+        // reports it. Every other refusal is the format's.
+        let block = if detail.starts_with("Prepare(Property(Forbidden") {
+            "SAV"
+        } else if detail.starts_with("Prepare(Binding(Signature") {
+            return;
+        } else {
+            "FC"
+        };
+        blocks.insert(block.into(), verdict("fail", format!("{error}: {detail}")));
     }
 }
 
@@ -1341,29 +1389,145 @@ pub(crate) fn carried(previous: &Value, summary: &Value, reviews: &Value) -> Val
     Value::Object(moved)
 }
 
-/// Rewrites the reviews and the expectations from the completed run in
-/// `results`, the reviews carried from the committed expectations.
-fn carry(corpus: &Corpus, results: &Path) -> Result<(), String> {
+/// The summary of the completed run in `results`, compared again from the
+/// facts and reports it kept: the comparison reads them as it does now.
+fn recompared(results: &Path) -> Result<Value, String> {
+    let mut summary: Value = serde_json::from_str(&xml::read(&results.join("summary.json"))?)
+        .map_err(|error| error.to_string())?;
+    let mut cases = Vec::new();
+    let mut conditions = Map::new();
+    for name in summary["cases"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(name, _)| name)
+    {
+        let directory = results.join("cases").join(slug(name));
+        let written = xml::read(&directory.join("conditions.stdout"))?;
+        // A conditions probe that failed wrote no JSON; its run records why.
+        let found = serde_json::from_str(&written).unwrap_or_else(|_| {
+            json!({
+                "anchors": 0,
+                "probe": xml::read(&directory.join("conditions.stderr")).unwrap_or_default(),
+            })
+        });
+        cases.push((name.clone(), PathBuf::new(), directory, INSTANT));
+        conditions.insert(name.clone(), found);
+    }
+    summary["cases"] = Value::Object(observations(&cases, &conditions)?);
+    write_json(&results.join("summary.json"), &summary)?;
+    Ok(summary)
+}
+
+/// `reviews` with one more review of input `name`, of `class` for `reason`,
+/// over each pass of `summary` that no review explains yet, one review per
+/// overall comparison those passes observe.
+pub(crate) fn reviewed(
+    summary: &Value,
+    reviews: &Value,
+    name: &str,
+    class: &str,
+    reason: &str,
+) -> Result<Value, String> {
+    if !REVIEWED.contains(&class) || reason.trim().is_empty() {
+        return Err(format!(
+            "a review takes one of {} and a reason",
+            REVIEWED.join(", ")
+        ));
+    }
+    let passes = summary["cases"][name]
+        .as_object()
+        .ok_or_else(|| format!("{name} is not in the run"))?;
+    let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
+    for pass in passes.values() {
+        if pass["class"] != "unreviewed" || review_for(reviews, name, &pass["observed"]).is_some() {
+            continue;
+        }
+        let overall = overall_of(&pass["observed"]);
+        match groups.iter_mut().find(|(known, _)| *known == overall) {
+            Some((_, observed)) if !observed.contains(&pass["observed"]) => {
+                observed.push(pass["observed"].clone());
+            }
+            Some(_) => {}
+            None => groups.push((overall, vec![pass["observed"].clone()])),
+        }
+    }
+    if groups.is_empty() {
+        return Err(format!("{name} has no difference left to review"));
+    }
+    let mut reviews = reviews.clone();
+    if reviews[name].is_null() {
+        reviews[name] = json!([]);
+    }
+    let list = reviews[name]
+        .as_array_mut()
+        .ok_or_else(|| format!("the reviews of {name} are not a list"))?;
+    for (overall, observed) in groups {
+        list.push(json!({
+            "overall": overall,
+            "observed": observed,
+            "class": class,
+            "reason": reason,
+        }));
+    }
+    Ok(reviews)
+}
+
+/// Adds a review of `name` to the reviews and records the expectations of
+/// the completed run in `results` with them.
+fn review(
+    corpus: &Corpus,
+    results: &Path,
+    name: &str,
+    class: &str,
+    reason: &str,
+) -> Result<(), String> {
     let summary: Value = serde_json::from_str(&xml::read(&results.join("summary.json"))?)
         .map_err(|error| error.to_string())?;
     recordable(&summary)?;
-    let path = expectations_path(corpus);
-    let relative = path
-        .strip_prefix(&corpus.root)
-        .map_err(|error| error.to_string())?;
-    let committed = corpus.require(
-        &line(&[
-            &"git",
-            &"-C",
-            &corpus.root,
-            &"show",
-            &format!("HEAD:{}", relative.display()),
-        ]),
-        &results.join("committed-expectations"),
+    let reviews = reviewed(
+        &summary,
+        &read_reviews(&reviews_path(corpus))?,
+        name,
+        class,
+        reason,
     )?;
-    let previous: Value =
-        serde_json::from_slice(&committed.stdout).map_err(|error| error.to_string())?;
-    let reviews = carried(&previous, &summary, &read_reviews(&reviews_path(corpus))?);
+    write_json(&reviews_path(corpus), &reviews)?;
+    let expectations = recorded(&summary, &reviews);
+    write_json(&expectations_path(corpus), &expectations)?;
+    super::write(&report_path(corpus), report(&expectations))
+}
+
+/// Rewrites the reviews and the expectations from the completed run in
+/// `results`, compared again, the committed reviews carried from the
+/// committed expectations.
+fn carry(corpus: &Corpus, results: &Path) -> Result<(), String> {
+    let summary = recompared(results)?;
+    recordable(&summary)?;
+    // Both from the commit, so carrying again starts where the first did.
+    let committed = |path: &Path, log: &str| -> Result<Value, String> {
+        let relative = path
+            .strip_prefix(&corpus.root)
+            .map_err(|error| error.to_string())?;
+        let shown = corpus.require(
+            &line(&[
+                &"git",
+                &"-C",
+                &corpus.root,
+                &"show",
+                &format!("HEAD:{}", relative.display()),
+            ]),
+            &results.join(log),
+        )?;
+        serde_json::from_slice(&shown.stdout).map_err(|error| error.to_string())
+    };
+    let path = expectations_path(corpus);
+    let previous = committed(&path, "committed-expectations")?;
+    let reviews = carried(
+        &previous,
+        &summary,
+        &committed(&reviews_path(corpus), "committed-reviews")?,
+    );
     write_json(&reviews_path(corpus), &reviews)?;
     let expectations = recorded(&summary, &reviews);
     write_json(&path, &expectations)?;
@@ -1371,8 +1535,9 @@ fn carry(corpus: &Corpus, results: &Path) -> Result<(), String> {
 }
 
 pub(crate) fn run(corpus: &Corpus, args: &[String]) -> Result<(), crate::repo::Failure> {
-    let usage =
-        "usage: xades dss-corpus [--results DIR] [--record] | xades dss-corpus --carry-reviews DIR";
+    let usage = "usage: xades dss-corpus [--results DIR] [--record] \
+         | xades dss-corpus --carry-reviews DIR \
+         | xades dss-corpus --review DIR INPUT CLASS REASON";
     let mut results = corpus.root.join("target/xades-dss-corpus");
     let mut record = false;
     let mut args = args.iter();
@@ -1381,6 +1546,13 @@ pub(crate) fn run(corpus: &Corpus, args: &[String]) -> Result<(), crate::repo::F
             "--record" => record = true,
             "--results" => {
                 results = absolute(args.next().ok_or("--results needs a directory")?)?;
+            }
+            "--review" => {
+                let rest: Vec<&String> = args.by_ref().collect();
+                let [completed, name, class, reason] = rest[..] else {
+                    return Err(usage.into());
+                };
+                return Ok(review(corpus, &absolute(completed)?, name, class, reason)?);
             }
             "--carry-reviews" => {
                 let completed = absolute(args.next().ok_or("--carry-reviews needs a directory")?)?;
