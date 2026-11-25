@@ -26,7 +26,7 @@ use structured_pkix::Certificate;
 use structured_pkix::crl::CertificateList;
 use structured_pkix::ocsp::{BasicResponse, Response};
 use structured_pkix::path::{
-    Anchor, BuildError, EffectiveKey, Interval, Policy, ValidationContext,
+    Anchor, Bounds, BuildError, EffectiveKey, Interval, Policy, ValidationContext, prospective,
 };
 use structured_pkix::temporal::{Instant, LeapTable};
 use xml_sec::xmldsig::{
@@ -278,6 +278,43 @@ fn scheme_of(certificate: &Certificate<'_>, rsa: Family, memory: &Memory) -> Opt
     None
 }
 
+/// Whether a signed certificate reference of `declared` names no certificate
+/// of `pool`: the certificate it names, perhaps the signer's own, is not
+/// available.
+pub fn unresolved_reference(declared: &Declared, pool: &[Certificate<'_>]) -> bool {
+    declared
+        .certificate_references
+        .iter()
+        .any(|(method, value)| {
+            method.is_none_or(|method| {
+                !pool
+                    .iter()
+                    .any(|certificate| compute_digest(method, certificate.as_bytes()) == *value)
+            })
+        })
+}
+
+/// The first of `certificates` that issues none of the others, the end of
+/// the path they form; the first one when each issues another.
+pub fn leaf<'c>(
+    certificates: &[&'c Certificate<'c>],
+    memory: &Memory,
+) -> Option<&'c Certificate<'c>> {
+    let issues = |issuer: &Certificate<'_>, subject: &Certificate<'_>| {
+        issuer.as_bytes() != subject.as_bytes()
+            && subject
+                .tbs()
+                .issuer()
+                .matches(issuer.tbs().subject(), memory)
+                .unwrap_or(false)
+    };
+    certificates
+        .iter()
+        .find(|candidate| !certificates.iter().any(|other| issues(candidate, other)))
+        .or(certificates.first())
+        .copied()
+}
+
 /// The certificates that may be the signing certificate (clause 5.2.3.4),
 /// in reference order: each one a signed reference digests to. A reference
 /// list also names CAs of the signer's path, so which of them signed is the
@@ -332,23 +369,7 @@ pub fn signing_certificate<'c>(
                     .any(|bytes| bytes.as_slice() == certificate.as_bytes())
             })
             .collect();
-        let issues = |issuer: &Certificate<'_>, subject: &Certificate<'_>| {
-            issuer.as_bytes() != subject.as_bytes()
-                && subject
-                    .tbs()
-                    .issuer()
-                    .matches(issuer.tbs().subject(), memory)
-                    .unwrap_or(false)
-        };
-        let leaves: Vec<_> = carried
-            .iter()
-            .filter(|candidate| !carried.iter().any(|other| issues(candidate, other)))
-            .collect();
-        return leaves
-            .first()
-            .or(carried.first().as_ref())
-            .copied()
-            .copied();
+        return leaf(&carried, memory);
     }
     declared
         .certificate_references
@@ -561,20 +582,24 @@ fn validity(certificate: &Certificate<'_>) -> (Instant, Instant) {
 /// the anchor certificate it ends at.
 type Candidate<'a> = (Vec<&'a Certificate<'a>>, &'a Certificate<'a>);
 
-/// The deepest prospective chain the comparison builds.
-const CHAIN_DEPTH: usize = 8;
-
-/// How many issuer candidates the search for one signer's chains may
-/// consider, each anchor and pool certificate tried at each step counted.
-/// Certificates sharing their names multiply the orderings; a search past
-/// this bound ends as an incomplete process, never as "no chain".
-pub(crate) const CANDIDATE_STEPS: usize = 100_000;
+/// How far the comparison searches one signer's chains: the deepest chain
+/// it builds and the candidates it may consider. Certificates sharing their
+/// names multiply the orderings; a search past these bounds ends as an
+/// incomplete process, never as "no chain".
+pub(crate) fn search_bounds() -> Bounds {
+    Bounds {
+        depth: 8,
+        visited: 100_000,
+        edges: 100_000,
+        work: 100_000_000,
+        paths: 1_024,
+        ..Bounds::default()
+    }
+}
 
 /// Every prospective chain (clause 5.2.6.4 step 2) from `signer` to an
-/// anchor: each issuer named by the subject before it, with no condition on
-/// time. The shared builder holds every certificate to one interval, which
-/// is step 4's and step 7's check, not step 2's; `check` then validates each
-/// chain in full. A search that exceeds [`CANDIDATE_STEPS`] is an error.
+/// anchor, as the shared builder enumerates them before any time or
+/// constraint check; `check` then validates each chain in full.
 fn candidates<'a>(
     signer: &'a Certificate<'a>,
     parsed: &'a Parsed<'a>,
@@ -585,86 +610,39 @@ fn candidates<'a>(
         &parsed.pool,
         &parsed.anchors,
         memory,
-        CANDIDATE_STEPS,
+        search_bounds(),
     )
 }
 
-/// [`candidates`] over `pool` and `anchors`, considering at most `limit`
-/// candidates.
+/// [`candidates`] over `pool` and `anchors` within `bounds`. An anchor
+/// is a chain's end, never one of its members.
 pub(super) fn candidates_within<'a>(
     signer: &'a Certificate<'a>,
     pool: &'a [Certificate<'a>],
     anchors: &'a [Certificate<'a>],
     memory: &Memory,
-    limit: usize,
+    bounds: Bounds,
 ) -> Result<Vec<Candidate<'a>>, String> {
-    struct Search<'a, 'm> {
-        pool: &'a [Certificate<'a>],
-        anchors: &'a [Certificate<'a>],
-        memory: &'m Memory,
-        found: Vec<Candidate<'a>>,
-        steps: usize,
-        limit: usize,
-    }
-    impl<'a> Search<'a, '_> {
-        fn names(&self, subject: &Certificate<'_>, issuer: &Certificate<'_>) -> bool {
-            subject
-                .tbs()
-                .issuer()
-                .matches(issuer.tbs().subject(), self.memory)
-                .unwrap_or(false)
-        }
-        /// Counts one considered candidate, before it is compared or kept.
-        fn step(&mut self) -> Result<(), String> {
-            // At most `limit` + 1, a count of considered certificates.
-            self.steps += 1;
-            if self.steps > self.limit {
-                return Err(format!(
-                    "the chain search exceeded {} candidates",
-                    self.limit
-                ));
-            }
-            Ok(())
-        }
-        fn extend(&mut self, chain: &mut Vec<&'a Certificate<'a>>) -> Result<(), String> {
-            let last = *chain.last().expect("a chain starts at the signer");
-            for anchor in self.anchors {
-                self.step()?;
-                if anchor.as_bytes() != last.as_bytes() && self.names(last, anchor) {
-                    self.found.push((chain.clone(), anchor));
-                }
-            }
-            if chain.len() >= CHAIN_DEPTH {
-                return Ok(());
-            }
-            for issuer in self.pool {
-                self.step()?;
-                let used = chain
-                    .iter()
-                    .any(|member| member.as_bytes() == issuer.as_bytes());
-                let anchored = self
-                    .anchors
-                    .iter()
-                    .any(|anchor| anchor.as_bytes() == issuer.as_bytes());
-                if !used && !anchored && self.names(last, issuer) {
-                    chain.push(issuer);
-                    self.extend(chain)?;
-                    chain.pop();
-                }
-            }
-            Ok(())
-        }
-    }
-    let mut search = Search {
-        pool,
-        anchors,
-        memory,
-        found: Vec::new(),
-        steps: 0,
-        limit,
-    };
-    search.extend(&mut vec![signer])?;
-    Ok(search.found)
+    let issuers: Vec<&Certificate<'a>> = pool
+        .iter()
+        .filter(|issuer| {
+            !anchors
+                .iter()
+                .any(|anchor| anchor.as_bytes() == issuer.as_bytes())
+        })
+        .collect();
+    let offered: Vec<Anchor<'a>> = anchors.iter().map(Anchor::from_certificate).collect();
+    let found = prospective::enumerate(signer, &issuers, &offered, bounds, memory)
+        .map_err(|error| format!("the chain search stopped: {error}"))?;
+    Ok(found
+        .iter()
+        .filter_map(|candidate| {
+            Some((
+                candidate.certificates().to_vec(),
+                candidate.anchor().certificate()?,
+            ))
+        })
+        .collect())
 }
 
 /// `chain` checked by the shared processor over `at` with the
@@ -841,12 +819,13 @@ fn statements(statements: &[revocation::Statement<'_>]) -> (Vec<RevocationIssuer
     let mut issuers = Vec::new();
     let mut records = Vec::new();
     for statement in statements {
-        let Some(
-            revocation::Authentication::Crl { signer, .. }
-            | revocation::Authentication::Ocsp { signer, .. },
-        ) = statement.authentication
-        else {
-            continue;
+        let (signer, base_signer) = match statement.authentication {
+            Some(revocation::Authentication::Crl {
+                signer,
+                base_signer,
+            }) => (signer, base_signer),
+            Some(revocation::Authentication::Ocsp { signer, .. }) => (signer, None),
+            None => continue,
         };
         let (not_before, not_after) = validity(signer);
         issuers.push(RevocationIssuer {
@@ -858,9 +837,17 @@ fn statements(statements: &[revocation::Statement<'_>]) -> (Vec<RevocationIssuer
             revocation::Finding::Revoked(revoked) => Some((revoked.at.instant(), revoked.reason)),
             _ => continue,
         };
+        // A delta CRL's finding stands only with its complete CRL: both
+        // sources, and both signers, are its provenance.
+        let base = statement
+            .sources
+            .base
+            .zip(base_signer)
+            .map(|(source, signer)| (source, signer.as_bytes().to_vec()));
         records.push(Record {
             source: statement.sources.primary,
             signer: signer.as_bytes().to_vec(),
+            base,
             issued: statement.issued.instant(),
             revoked,
         });
@@ -870,14 +857,16 @@ fn statements(statements: &[revocation::Statement<'_>]) -> (Vec<RevocationIssuer
 
 /// One authenticated status statement about one path member, as the
 /// long-term process reads it: its source (CRLs first, then OCSP responses,
-/// in the document's order), the certificate that signed it, when it was
-/// issued and what it says.
+/// in the document's order), the certificate that signed it, the complete
+/// CRL and its signer when a delta CRL produced it, when it was issued and
+/// what it says.
 #[derive(Debug, Clone)]
-struct Record {
-    source: usize,
-    signer: Vec<u8>,
-    issued: Instant,
-    revoked: Option<(Instant, Option<structured_pkix::crl::Reason>)>,
+pub(crate) struct Record {
+    pub(crate) source: usize,
+    pub(crate) signer: Vec<u8>,
+    pub(crate) base: Option<(usize, Vec<u8>)>,
+    pub(crate) issued: Instant,
+    pub(crate) revoked: Option<(Instant, Option<structured_pkix::crl::Reason>)>,
 }
 
 /// Every checked path that ends at a CA member of `path` or at a responder

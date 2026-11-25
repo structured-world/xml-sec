@@ -6,8 +6,8 @@
 use super::{History, Record, TokenFacts, instant};
 use structured_asn1::memory::Memory;
 use structured_ltv::validation::long_term::{
-    self, Candidate, Inputs, Member, RetryCause, Revocation, RevocationCheck, RevocationData,
-    Signature, Stage, Timestamp, Validity, ValidityModel,
+    self, BaseCrl, Candidate, Inputs, Member, RetryCause, Revocation, RevocationCheck,
+    RevocationData, Signature, Stage, Timestamp, Validity, ValidityModel,
 };
 pub(super) use structured_ltv::validation::long_term::{Covered, Decision, Object};
 use structured_ltv::validation::{Chain, Facts, Requirements};
@@ -16,13 +16,13 @@ use structured_pkix::Certificate;
 /// The original objects of one validation, each numbered once: the
 /// signature value, its tokens, the certificates the comparison knows and
 /// the document's CRLs and OCSP responses.
-pub(super) struct Catalogue<'c> {
-    pub(super) tokens: usize,
-    pub(super) certificates: Vec<&'c Certificate<'c>>,
-    pub(super) sources: usize,
+pub(crate) struct Catalogue<'c> {
+    pub(crate) tokens: usize,
+    pub(crate) certificates: Vec<&'c Certificate<'c>>,
+    pub(crate) sources: usize,
     /// Where the document carries each certificate, then each source, in
     /// document order; none for what only the caller supplies (the anchors).
-    pub(super) positions: Vec<Option<usize>>,
+    pub(crate) positions: Vec<Option<usize>>,
 }
 
 impl Catalogue<'_> {
@@ -47,7 +47,7 @@ impl Catalogue<'_> {
         ))
     }
 
-    pub(super) fn source(&self, index: usize) -> Object {
+    pub(crate) fn source(&self, index: usize) -> Object {
         Object(1 + self.tokens + self.certificates.len() + index)
     }
 
@@ -93,13 +93,29 @@ pub(super) struct Past {
 }
 
 /// The authenticated statements of one member as revocation data.
-fn data(records: &[Record], catalogue: &Catalogue<'_>) -> Vec<RevocationData<'static>> {
+pub(crate) fn data(records: &[Record], catalogue: &Catalogue<'_>) -> Vec<RevocationData<'static>> {
     records
         .iter()
         .filter_map(|record| {
             let (issuer, issuer_validity) = catalogue.certificate(&record.signer)?;
+            // A delta's complete CRL whose signer the comparison does not
+            // know cannot be proven in the past: the delta's finding with it.
+            let base = match &record.base {
+                Some((source, signer)) => {
+                    let (issuer, issuer_validity) = catalogue.certificate(signer)?;
+                    Some(BaseCrl {
+                        object: catalogue.source(*source),
+                        issuer,
+                        issuer_validity,
+                        crypto: &[],
+                        delegated: None,
+                    })
+                }
+                None => None,
+            };
             Some(RevocationData {
                 object: catalogue.source(record.source),
+                base,
                 issuer,
                 issuer_validity,
                 issued: record.issued,

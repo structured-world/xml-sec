@@ -169,27 +169,6 @@ fn the_anchor_is_the_top_of_the_signers_chain() {
 }
 
 #[test]
-fn every_verified_branch_of_a_chain_has_its_top_whatever_the_pool_order() {
-    // Two certificates of one subject and key, cross-certified by different
-    // CAs, both verify the subordinate; carried order is no evidence of the
-    // intended chain, so the top of each branch is an end.
-    // 1 is issued by 2 and by 3; 2 is issued by 4.
-    let issues = |issuer: u8, subject: u8| matches!((issuer, subject), (2 | 3, 1) | (4, 2));
-    for pool in [[2, 3, 4], [3, 2, 4], [4, 3, 2]] {
-        let mut tops = super::chain_tops(1, &pool, issues, 100).unwrap();
-        tops.sort_unstable();
-        assert_eq!(tops, [3, 4], "{pool:?}");
-    }
-    // One chain keeps its one top, and certificates issuing each other end
-    // where the walk would repeat itself.
-    assert_eq!(super::chain_tops(1, &[2, 4], issues, 100).unwrap(), [4]);
-    let mutual = |issuer: u8, subject: u8| matches!((issuer, subject), (6, 5) | (5, 6));
-    assert_eq!(super::chain_tops(5, &[5, 6], mutual, 100).unwrap(), [6]);
-    // A search past its bound is an error, never a shorter chain.
-    assert!(super::chain_tops(1, &[2, 3, 4], issues, 2).is_err());
-}
-
-#[test]
 fn a_ca_a_reference_names_is_never_the_signer() {
     // EN 319 102-1 V1.4.1 clause 5.2.3.4: the references are checked against
     // the signing certificate, the one whose key verifies the signature. A
@@ -205,11 +184,16 @@ fn a_ca_a_reference_names_is_never_the_signer() {
         .clone()
         .expect("the signer's key verifies");
     assert_ne!(signer, ISSUER);
+    // The references name the signer and its CA; only the CA is available.
     declared[0].signer = None;
-    declared[0].certificate_references = vec![(
-        Some(DigestAlgorithm::Sha256),
-        xml_sec::xmldsig::compute_digest(DigestAlgorithm::Sha256, ISSUER),
-    )];
+    declared[0].certificate_references = [signer.as_slice(), ISSUER]
+        .map(|certificate| {
+            (
+                Some(DigestAlgorithm::Sha256),
+                xml_sec::xmldsig::compute_digest(DigestAlgorithm::Sha256, certificate),
+            )
+        })
+        .to_vec();
     let issuer_only = [ISSUER.to_vec()];
     super::settle_signers(
         &document,
@@ -223,6 +207,36 @@ fn a_ca_a_reference_names_is_never_the_signer() {
 }
 
 #[test]
+fn an_altered_value_keeps_the_signer_its_references_identify() {
+    // No key verifies an altered SignatureValue, yet the references still
+    // identify the signing certificate (EN 319 102-1 V1.4.1 clause 5.2.3.4):
+    // the signature fails its value check (SIG_CRYPTO_FAILURE), never the
+    // identification of its signer.
+    let document = xml_sec::XmlDocument::parse(B_T).unwrap();
+    let expected = super::expected_targets(&document, B_T);
+    let pool = super::pool(B_T);
+    let mut declared = declarations(B_T);
+    super::settle_signers(&document, &expected, &mut declared, &pool, 1_700_000_000).unwrap();
+    let signer = declared[0]
+        .signer
+        .clone()
+        .expect("the signer's key verifies");
+    let start = B_T.find("<ds:SignatureValue").unwrap();
+    let value = start + B_T[start..].find('>').unwrap() + 1;
+    let flipped = if B_T.as_bytes()[value] == b'A' {
+        "B"
+    } else {
+        "A"
+    };
+    let altered = format!("{}{flipped}{}", &B_T[..value], &B_T[value + 1..]);
+    let document = xml_sec::XmlDocument::parse(&altered).unwrap();
+    let expected = super::expected_targets(&document, &altered);
+    let mut declared = declarations(&altered);
+    super::settle_signers(&document, &expected, &mut declared, &pool, 1_700_000_000).unwrap();
+    assert_eq!(declared[0].signer, Some(signer));
+}
+
+#[test]
 fn a_certificate_that_only_shares_the_issuers_name_issues_nothing() {
     // RFC 5280 6.1.3 (a)(1): the issuer's key verifies the certificate. A
     // certificate named like the absent Root must not end the chain in place
@@ -231,6 +245,42 @@ fn a_certificate_that_only_shares_the_issuers_name_issues_nothing() {
     pool.push(IMPOSTOR.to_vec());
     let (anchors, _) = super::signer_anchors(B_T.as_bytes(), B_T, &pool).unwrap();
     assert_eq!(anchors, [ISSUER.to_vec()]);
+}
+
+#[test]
+fn a_delta_crl_finding_keeps_its_complete_crl_as_provenance() {
+    // A delta CRL's status stands only with the complete CRL it is read
+    // against: the long-term process must prove both in the past, so the
+    // base CRL and its signer travel with the finding, and a finding whose
+    // base signer the comparison does not know cannot be used at all.
+    let memory = super::account();
+    let parser = structured_asn1::Parser::der(memory);
+    let issuer = structured_pkix::Certificate::read(&parser, ISSUER, 0).unwrap();
+    let root = structured_pkix::Certificate::read(&parser, ROOT, 0).unwrap();
+    let catalogue = super::etsi::long_term::Catalogue {
+        tokens: 0,
+        certificates: vec![&issuer, &root],
+        sources: 2,
+        positions: Vec::new(),
+    };
+    let record = |base: Option<(usize, Vec<u8>)>| super::etsi::Record {
+        source: 1,
+        signer: ISSUER.to_vec(),
+        base,
+        issued: structured_pkix::temporal::Instant::new(1_700_000_000, 0).unwrap(),
+        revoked: None,
+    };
+    let data = super::etsi::long_term::data(&[record(Some((0, ROOT.to_vec())))], &catalogue);
+    let base = data[0].base.expect("the delta keeps its complete CRL");
+    assert_eq!(base.object, catalogue.source(0));
+    assert_ne!(base.issuer, data[0].issuer);
+    assert!(
+        super::etsi::long_term::data(&[record(None)], &catalogue)[0]
+            .base
+            .is_none()
+    );
+    let unknown = super::etsi::long_term::data(&[record(Some((0, b"other".to_vec())))], &catalogue);
+    assert!(unknown.is_empty());
 }
 
 #[test]
@@ -248,10 +298,14 @@ fn a_chain_search_past_its_bound_is_an_error_not_an_absent_chain() {
     let declared = declarations(B_T);
     let signer = super::etsi::signing_certificate(&declared[0], &pool, &memory).unwrap();
     let issuers = [structured_pkix::Certificate::read(&parser, ISSUER, 0).unwrap()];
-    let found = super::etsi::candidates_within(signer, &issuers, &anchors, &memory, 100).unwrap();
+    let bounds = super::etsi::search_bounds();
+    let found =
+        super::etsi::candidates_within(signer, &issuers, &anchors, &memory, bounds).unwrap();
     assert_eq!(found.len(), 1);
-    let cut = super::etsi::candidates_within(signer, &issuers, &anchors, &memory, 2).unwrap_err();
-    assert!(cut.contains("exceeded 2"), "{cut}");
+    let tight = structured_pkix::path::Bounds { edges: 1, ..bounds };
+    let cut =
+        super::etsi::candidates_within(signer, &issuers, &anchors, &memory, tight).unwrap_err();
+    assert!(cut.contains("stopped"), "{cut}");
 }
 
 #[test]

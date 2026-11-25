@@ -79,53 +79,14 @@ fn readable_key(certificate: &Certificate<'_>, account: &Memory) -> bool {
     }
 }
 
-/// The top of every chain from `start` through `pool`, once each: along every
-/// issuer `issues` confirms, the certificate past which no issuer outside its
-/// own chain continues. Two issuers of one subordinate (a self-signed CA and
-/// its cross-certificate, two cross-certificates) are two branches, and the
-/// order the document carries them in prefers neither. More than `limit`
-/// issuer tests is an error, not a shorter chain.
-fn chain_tops<T: Copy + PartialEq>(
-    start: T,
-    pool: &[T],
-    issues: impl Fn(T, T) -> bool,
-    limit: usize,
-) -> Result<Vec<T>, String> {
-    let mut tops = Vec::new();
-    let mut chains = vec![vec![start]];
-    let mut steps = 0usize;
-    while let Some(chain) = chains.pop() {
-        let subject = *chain.last().expect("a chain starts with its subject");
-        let mut continued = false;
-        for &issuer in pool {
-            if chain.contains(&issuer) {
-                continue;
-            }
-            steps += 1;
-            if steps > limit {
-                return Err(format!("the chain search exceeded {limit} issuer tests"));
-            }
-            if issues(issuer, subject) {
-                let mut longer = chain.clone();
-                longer.push(issuer);
-                chains.push(longer);
-                continued = true;
-            }
-        }
-        if !continued && !tops.contains(&subject) {
-            tops.push(subject);
-        }
-    }
-    Ok(tops)
-}
-
 /// The topmost certificate of each signature's signer chain the document
 /// carries, once each: from the signing certificate, each issuer in `pool`
 /// that the subject names and whose key verifies the subject's signature
 /// (RFC 5280 6.1.3 (a)(1) and (a)(4)), up to a certificate with no such
-/// issuer, the top of every such branch ([`chain_tops`]). A certificate that
-/// only shares the issuer's name issues
-/// nothing, and a timestamp authority's chain anchors no signer. Only a
+/// issuer, the top of every such branch, as the shared builder's
+/// `verified_tops` finds them. Two issuers of one subordinate are two
+/// branches, and a certificate that only shares the issuer's name issues
+/// nothing; a timestamp authority's chain anchors no signer. Only a
 /// certificate whose key decodes is such an end. The second value says why
 /// the document's signatures could not be read, when they could not.
 fn signer_anchors(
@@ -164,50 +125,33 @@ fn signer_anchors(
             .iter()
             .filter_map(|der| Certificate::read(&parser, der, 0).ok())
             .collect();
-        let issues = |issuer: &Certificate<'_>, subject: &Certificate<'_>| {
-            use structured_pkix::path::{EffectiveKey, Verified, Verify};
-            let named = subject
-                .tbs()
-                .issuer()
-                .matches(issuer.tbs().subject(), &memory)
-                .unwrap_or(false);
-            let chain = [subject];
-            named
-                && Verify::<Memory>::verify(
-                    &session.certificate_path_verifier(&chain, issuer),
-                    &subject.signature_algorithm(),
-                    EffectiveKey::standing(issuer.tbs().public_key()),
-                    subject.signed_bytes(),
-                    subject.signature_value(),
-                    &memory,
-                )
-                .is_ok_and(|answer| answer == Verified::Yes)
-        };
-        // Each certificate by its place in the pool, which tells two equal
-        // certificates apart no better than their bytes do: the pool holds
-        // each once.
-        let places: Vec<usize> = (0..certificates.len()).collect();
+        let issuers: Vec<&Certificate<'_>> = certificates.iter().collect();
         for signature in &declared {
             let Some(start) = signature.signer.as_deref().and_then(|signer| {
                 certificates
                     .iter()
-                    .position(|certificate| certificate.as_bytes() == signer)
+                    .find(|certificate| certificate.as_bytes() == signer)
             }) else {
                 continue;
             };
-            let tops = match chain_tops(
+            // Each edge is verified with the session's certificate-signature
+            // verifier under the profile's key policy; the pool stands as the
+            // path its issuer keys come from.
+            let verifier = session.certificate_path_verifier(&issuers, start);
+            let tops = match structured_pkix::path::prospective::verified_tops(
                 start,
-                &places,
-                |issuer, subject| issues(&certificates[issuer], &certificates[subject]),
-                etsi::CANDIDATE_STEPS,
+                &issuers,
+                etsi::search_bounds(),
+                &memory,
+                &verifier,
             ) {
                 Ok(tops) => tops,
                 Err(error) => {
-                    search = Some(error);
+                    search = Some(format!("the signer chain search stopped: {error:?}"));
                     return Ok(());
                 }
             };
-            for top in tops.into_iter().map(|top| &certificates[top]) {
+            for top in tops.iter().copied() {
                 if readable_key(top, &memory) && !found.iter().any(|known| known == top.as_bytes())
                 {
                     found.push(top.as_bytes().to_vec());
@@ -1354,7 +1298,9 @@ fn settled_declarations(
 /// verifies its signature value (clause 5.2.3.4: a reference to a CA of the
 /// path makes that CA no signer). Each round binds every unsettled
 /// signature's next candidate as the caller's key for it, with no chain
-/// checked; a signature none of whose candidates verifies keeps no signer.
+/// checked; a signature none of whose candidates verifies takes the
+/// candidate the references identify as the end of the path, unless a
+/// reference names a certificate that is not available.
 fn settle_signers(
     document: &XmlDocument,
     targets: &[NodeIdentity],
@@ -1367,11 +1313,14 @@ fn settle_signers(
         .iter()
         .filter_map(|bytes| Certificate::read(&parser, bytes, 0).ok())
         .collect();
-    let candidates: Vec<Vec<Vec<u8>>> = declared
+    let found: Vec<Vec<&Certificate<'_>>> = declared
         .iter()
-        .map(|declared| {
-            etsi::signing_candidates(declared, &pool, parser.memory())
-                .into_iter()
+        .map(|declared| etsi::signing_candidates(declared, &pool, parser.memory()))
+        .collect();
+    let candidates: Vec<Vec<Vec<u8>>> = found
+        .iter()
+        .map(|each| {
+            each.iter()
                 .map(|certificate| certificate.as_bytes().to_vec())
                 .collect()
         })
@@ -1434,8 +1383,20 @@ fn settle_signers(
             break;
         }
     }
-    for (declared, signer) in declared.iter_mut().zip(settled) {
-        declared.signer = signer;
+    // A value no candidate's key verifies (altered, or under a key the
+    // provider cannot use) settles nothing: the references alone identify
+    // the signer then (clause 5.2.3.4), the candidate that issues none of the
+    // others, and the value's own check reports the failure. A reference to
+    // a certificate that is not available may name the signer itself, whose
+    // CAs the available candidates then are: no signer is identified.
+    for ((declared, signer), each) in declared.iter_mut().zip(settled).zip(&found) {
+        let identified = signer.or_else(|| {
+            if etsi::unresolved_reference(declared, &pool) {
+                return None;
+            }
+            etsi::leaf(each, parser.memory()).map(|certificate| certificate.as_bytes().to_vec())
+        });
+        declared.signer = identified;
     }
     Ok(())
 }

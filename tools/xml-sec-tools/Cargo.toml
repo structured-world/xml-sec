@@ -17,7 +17,7 @@ regex = "1"
 # survive a read and rewrite unchanged.
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 sha2 = "0.11"
-structured-base64 = { version = "0.29", features = ["alloc"] }
+structured-base64 = { version = "0.30", features = ["alloc"] }
 tar = "0.4"
 tempfile = "3"
 # Executes the WebAssembly smoke build without a JavaScript host.

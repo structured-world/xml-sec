@@ -41,10 +41,10 @@ rsa = { version = "0.10", default-features = false, features = ["sha1", "hazmat"
 der = "0.8"
 pkcs8 = { version = "0.11", features = ["encryption", "pem"] }
 x509-parser = "0.18"
-structured-asn1 = { version = "0.29", default-features = false, features = ["alloc", "std"] }
-structured-pkix = { version = "0.29", default-features = false, features = ["alloc", "std"] }
+structured-asn1 = { version = "0.30", default-features = false, features = ["alloc", "std"] }
+structured-pkix = { version = "0.30", default-features = false, features = ["alloc", "std"] }
 zeroize = "1"
-structured-base64 = { version = "0.29", features = ["alloc"] }
+structured-base64 = { version = "0.30", features = ["alloc"] }
 thiserror = "2"
 
 [features]
