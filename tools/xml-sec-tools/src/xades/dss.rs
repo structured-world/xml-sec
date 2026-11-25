@@ -333,6 +333,26 @@ pub(crate) fn build(corpus: &Corpus, logs: &Path) -> Result<Built, String> {
     Ok(Built { release, classpath })
 }
 
+/// The command that runs the DSS probe `class` on `classpath` with
+/// `arguments`. The JVM runs in UTC, the zone every corpus time is written
+/// in: DSS's choice of the latest acceptable revocation data depends on the
+/// JVM's default time zone, so the host's zone would change its validation
+/// result (EU DSS `OJ_C_2017_173_FULL` gives `OUT_OF_BOUNDS_NO_POE` under EET
+/// and `OUT_OF_BOUNDS_NOT_REVOKED` under UTC).
+pub(crate) fn java(
+    classpath: &str,
+    class: &str,
+    arguments: &[&dyn AsRef<std::ffi::OsStr>],
+) -> Vec<std::ffi::OsString> {
+    let mut command = line(&[&"java", &"-Duser.timezone=UTC", &"-cp", &classpath, &class]);
+    command.extend(
+        arguments
+            .iter()
+            .map(|argument| argument.as_ref().to_owned()),
+    );
+    command
+}
+
 /// Builds the probe and validates every case with DSS.
 pub(crate) fn execute(corpus: &Corpus, logs: &Path) -> Result<(), String> {
     if logs.exists() {
@@ -350,15 +370,15 @@ pub(crate) fn execute(corpus: &Corpus, logs: &Path) -> Result<(), String> {
             .find(|case| case["name"] == name)
             .and_then(|case| case["file"].as_str())
             .ok_or_else(|| format!("no corpus case {name}"))?;
-        let probe = line(&[
-            &"java",
-            &"-cp",
+        let probe = java(
             &classpath,
-            &"Probe",
-            &package.join(file),
-            &package.join("fixtures/baseline/root.der"),
-            &logs.join(name),
-        ]);
+            "Probe",
+            &[
+                &package.join(file),
+                &package.join("fixtures/baseline/root.der"),
+                &logs.join(name),
+            ],
+        );
         corpus.require(&probe, &logs.join(format!("{name}-run")))?;
     }
     if summarize(logs)?

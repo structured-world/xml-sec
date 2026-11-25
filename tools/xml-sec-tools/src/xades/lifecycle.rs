@@ -636,7 +636,7 @@ impl Run<'_> {
     }
 
     fn java(&self, class: &str) -> Vec<OsString> {
-        line(&[&"java", &"-cp", &self.classpath, &class])
+        super::dss::java(&self.classpath, class, &[])
     }
 
     /// Makes `step` from `input` into its output. A refusal is an outcome,

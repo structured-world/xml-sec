@@ -946,7 +946,7 @@ impl Pass<'_> {
         let file = logs.join(format!("{}-manifest.tsv", self.label));
         super::write(&file, manifest)?;
         self.corpus.require(
-            &line(&[&"java", &"-cp", &self.classpath, &"CorpusProbe", &file]),
+            &super::dss::java(self.classpath, "CorpusProbe", &[&file]),
             &logs.join(format!("{}-dss", self.label)),
         )?;
         Ok(())

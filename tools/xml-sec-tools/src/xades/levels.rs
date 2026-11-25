@@ -778,16 +778,16 @@ pub(crate) fn execute(corpus: &super::Corpus, results: &std::path::Path) -> Resu
         .join("crates/xml-sec-xades/tests/fixtures/levels");
     let mut failures = Vec::new();
     for (file, format, indication) in VERDICTS {
-        let mut probe = super::line(&[
-            &"java",
-            &"-cp",
+        let mut probe = super::dss::java(
             &classpath,
-            &"LevelProbe",
-            &fixtures.join(file),
-            &fixtures.join("root.der"),
-            &"1800000000",
-            &results.join(file),
-        ]);
+            "LevelProbe",
+            &[
+                &fixtures.join(file),
+                &fixtures.join("root.der"),
+                &"1800000000",
+                &results.join(file),
+            ],
+        );
         if file == "b-lt-detached.xml" {
             probe.push(fixtures.join("detached.txt").into());
         }

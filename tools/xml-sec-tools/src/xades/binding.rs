@@ -274,16 +274,16 @@ fn strict_policy(corpus: &Corpus, output: &Path) -> Result<(), String> {
                 result.display()
             ));
         }
-        let probe = line(&[
-            &"java",
-            &"-cp",
+        let probe = super::dss::java(
             &classpath,
-            &"BindingProbe",
-            &directory.join("signed.xml"),
-            &package.join("fixtures/baseline/root.der"),
-            &result,
-            &"structure-fail",
-        ]);
+            "BindingProbe",
+            &[
+                &directory.join("signed.xml"),
+                &package.join("fixtures/baseline/root.der"),
+                &result,
+                &"structure-fail",
+            ],
+        );
         corpus.require(&probe, &directory.join("dss-structure-fail-probe"))?;
         let (indication, subindication, blocks) = conclusions(&Reports::read(&result)?)?;
         results.push(json!({ "name": name, "indication": indication, "subindication": subindication, "blocks": blocks }));
@@ -338,15 +338,7 @@ fn investigate_case(corpus: &Corpus, case: &Case, setup: &Setup<'_>) -> Result<V
         &directory.join("rust-probe"),
     )?;
     let dss = directory.join("dss");
-    let probe = line(&[
-        &"java",
-        &"-cp",
-        &setup.classpath,
-        &"BindingProbe",
-        &signed,
-        &root_der,
-        &dss,
-    ]);
+    let probe = super::dss::java(setup.classpath, "BindingProbe", &[&signed, &root_der, &dss]);
     corpus.require(&probe, &directory.join("dss-probe"))?;
     let reports = Reports::read(&dss)?;
     let (indication, subindication, blocks) = conclusions(&reports)?;
