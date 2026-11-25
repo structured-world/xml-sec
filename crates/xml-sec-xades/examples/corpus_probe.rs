@@ -41,13 +41,13 @@ use xml_sec::policy::{
     Instant, PolicyCompileContext, PolicyCompiler, PolicyProfile, SignatureConstraints,
     TrustAnchorSigner, VerificationPolicy,
 };
-use xml_sec::provider::RustCryptoProvider;
+use xml_sec::provider::{ProviderError, RustCryptoProvider};
 use xml_sec::xmldsig::UriTypeSet;
 use xml_sec::xmldsig::{
     CallerTrustedSignatureKey, DefaultKeyResolver, DigestAlgorithm, DsigError, DsigStatus,
     FailureReason, KeyInfo, KeyInfoSource, KeyResolver, KeyResolverConfig, ResolvedVerificationKey,
     SignatureAlgorithm, SignatureEvidence, VerificationKey, VerificationRequest, VerifyContext,
-    VerifyingKey, with_verified_request,
+    VerifyingKey, X509ChainError, with_verified_request,
 };
 use xml_sec_xades::{
     EnclosingError, Inputs, Level, Outcome, Requirements, Syntax, TimestampRole, TokenIntegrity,
@@ -76,6 +76,39 @@ fn readable_key(certificate: &Certificate<'_>, account: &Memory) -> bool {
         rsa::read(info, account).is_ok()
     } else {
         true
+    }
+}
+
+/// The session's certificate-signature verifier as the chain-top search
+/// asks it: an issuer whose algorithm the provider does not implement, or
+/// whose key the profile's key policy refuses, establishes no edge; any
+/// other failure stops the search.
+struct EdgeVerifier<'v, V>(&'v V);
+
+impl<W, V> structured_pkix::path::Verify<W> for EdgeVerifier<'_, V>
+where
+    W: structured_asn1::memory::Work,
+    V: structured_pkix::path::Verify<W, Error = X509ChainError>,
+{
+    type Error = X509ChainError;
+
+    fn verify(
+        &self,
+        algorithm: &structured_pkix::algorithm::AlgorithmIdentifier<'_>,
+        key: structured_pkix::path::EffectiveKey<'_>,
+        signed: &[u8],
+        signature: structured_pkix::signature::SignatureValue<'_>,
+        execution: &W,
+    ) -> Result<structured_pkix::path::Verified, Self::Error> {
+        use structured_pkix::path::Verified;
+        match self.0.verify(algorithm, key, signed, signature, execution) {
+            Err(
+                X509ChainError::Provider(ProviderError::Unsupported { .. })
+                | X509ChainError::UnsupportedSignature(_),
+            ) => Ok(Verified::Unsupported),
+            Err(X509ChainError::Policy(_)) => Ok(Verified::No),
+            answer => answer,
+        }
     }
 }
 
@@ -137,7 +170,8 @@ fn signer_anchors(
             // Each edge is verified with the session's certificate-signature
             // verifier under the profile's key policy; the pool stands as the
             // path its issuer keys come from.
-            let verifier = session.certificate_path_verifier(&issuers, start);
+            let path = session.certificate_path_verifier(&issuers, start);
+            let verifier = EdgeVerifier(&path);
             let tops = match structured_pkix::path::prospective::verified_tops(
                 start,
                 &issuers,

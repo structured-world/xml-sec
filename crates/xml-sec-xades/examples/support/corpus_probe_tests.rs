@@ -248,6 +248,54 @@ fn a_certificate_that_only_shares_the_issuers_name_issues_nothing() {
 }
 
 #[test]
+fn an_issuer_the_provider_cannot_verify_establishes_no_edge() {
+    // structured-pkix's chain-top search treats a verifier error as a failed
+    // search and an Unsupported answer as no edge. An issuer signing with an
+    // algorithm the provider does not implement (SHA3 RSA in a DSS input)
+    // must end that branch, not the conditions of the whole document; a key
+    // the profile's policy refuses is no edge either, and any other failure
+    // still stops the search.
+    use structured_pkix::path::{EffectiveKey, Verified, Verify};
+    use xml_sec::provider::{ProviderError, ProviderOperation};
+    use xml_sec::xmldsig::X509ChainError;
+    struct Failing(fn() -> X509ChainError);
+    impl<W: structured_asn1::memory::Work> Verify<W> for Failing {
+        type Error = X509ChainError;
+        fn verify(
+            &self,
+            _: &structured_pkix::algorithm::AlgorithmIdentifier<'_>,
+            _: EffectiveKey<'_>,
+            _: &[u8],
+            _: structured_pkix::signature::SignatureValue<'_>,
+            _: &W,
+        ) -> Result<Verified, X509ChainError> {
+            Err((self.0)())
+        }
+    }
+    let memory = super::account();
+    let parser = structured_asn1::Parser::der(memory.clone());
+    let issuer = structured_pkix::Certificate::read(&parser, ISSUER, 0).unwrap();
+    let ask = |inner: &Failing| {
+        super::EdgeVerifier(inner).verify(
+            &issuer.signature_algorithm(),
+            EffectiveKey::standing(issuer.tbs().public_key()),
+            issuer.signed_bytes(),
+            issuer.signature_value(),
+            &memory,
+        )
+    };
+    let unsupported = Failing(|| {
+        X509ChainError::Provider(ProviderError::Unsupported {
+            operation: ProviderOperation::VerifyCertificate,
+            algorithm: Some("2.16.840.1.101.3.4.3.14".into()),
+        })
+    });
+    assert_eq!(ask(&unsupported).unwrap(), Verified::Unsupported);
+    let other = Failing(|| X509ChainError::InvalidDepth);
+    assert!(ask(&other).is_err());
+}
+
+#[test]
 fn a_delta_crl_finding_keeps_its_complete_crl_as_provenance() {
     // A delta CRL's status stands only with the complete CRL it is read
     // against: the long-term process must prove both in the past, so the
