@@ -49,19 +49,26 @@ pub struct Declared {
     pub key_info: Vec<Vec<u8>>,
     /// Each `SignatureTimeStamp` token, DER.
     pub signature_timestamps: Vec<Vec<u8>>,
-    /// Whether xml-sec-xades established every signature timestamp of this
-    /// signature (imprint, TSA signature and TSA path at its generation
-    /// time, EN 319 132-1 B-T), when it could validate the signature at all.
-    pub timestamps_intact: Option<bool>,
+    /// Each token xml-sec-xades checked on its own, DER, with whether its
+    /// imprint and TSA signature held (EN 319 102-1 V1.4.1 clause 5.4); a
+    /// token it could not judge is absent.
+    pub token_integrity: Vec<(Vec<u8>, bool)>,
     /// Each `SigAndRefsTimeStamp` and `RefsOnlyTimeStamp` token, DER.
     pub validation_timestamps: Vec<Vec<u8>>,
     /// Each `ArchiveTimeStamp` token, DER.
     pub archive_timestamps: Vec<Vec<u8>>,
     /// Where each `ArchiveTimeStamp` is in the document, as a byte offset.
     pub archive_positions: Vec<usize>,
-    /// Whether xml-sec-xades established the archive timestamps (B-LTA),
-    /// when it could validate the signature at all.
-    pub archive_intact: Option<bool>,
+}
+
+impl Declared {
+    /// Whether `token`'s own checks held, when xml-sec-xades judged it.
+    pub fn intact(&self, token: &[u8]) -> Option<bool> {
+        self.token_integrity
+            .iter()
+            .find(|(checked, _)| checked.as_slice() == token)
+            .map(|(_, intact)| *intact)
+    }
 }
 
 /// The conditions and constraints every signature of one comparison shares.
@@ -1159,7 +1166,7 @@ fn signature_timestamps<W: structured_asn1::memory::Work>(
         let Some(TokenFacts { generated, .. }) = token_details(token) else {
             continue;
         };
-        match declared.timestamps_intact {
+        match declared.intact(token) {
             Some(true) => {
                 let Some(tsa) = authority(token, parsed) else {
                     continue;
@@ -1363,8 +1370,14 @@ pub fn indication<W: structured_asn1::memory::Work>(
         "chains": format!("{:?}", paths.chains),
         "rejections": paths.rejections,
         "timestamps": format!(
-            "{:?}/{:?} {stamps:?}",
-            declared.timestamps_intact, declared.archive_intact
+            "{:?} {stamps:?}",
+            declared
+                .signature_timestamps
+                .iter()
+                .chain(&declared.validation_timestamps)
+                .chain(&declared.archive_timestamps)
+                .map(|token| declared.intact(token))
+                .collect::<Vec<_>>()
         ),
         "revocation": format!("{:?} {:?}", paths.signer_status, paths.statuses),
     });
@@ -1490,19 +1503,9 @@ impl<W: structured_asn1::memory::Work> TokenContext<'_, '_, '_, '_, '_, W> {
         let kinds = declared
             .signature_timestamps
             .iter()
-            .map(|token| (token, declared.timestamps_intact))
-            .chain(
-                declared
-                    .validation_timestamps
-                    .iter()
-                    .map(|token| (token, declared.timestamps_intact)),
-            )
-            .chain(
-                declared
-                    .archive_timestamps
-                    .iter()
-                    .map(|token| (token, declared.archive_intact)),
-            );
+            .chain(&declared.validation_timestamps)
+            .chain(&declared.archive_timestamps)
+            .map(|token| (token, declared.intact(token)));
         for (index, (der, intact)) in kinds.enumerate() {
             let (Some(facts), Some(intact)) = (token_details(der), intact) else {
                 continue;

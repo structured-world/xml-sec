@@ -7,6 +7,8 @@
 //! no signature is verified again. [`validate_basic`] runs the B-B checks of
 //! ETSI EN 319 132-1 for one selected signature, and [`validate`] any level up
 //! to B-LTA over the document's own timestamps and validation material.
+//! [`check_tokens`] reports each timestamp token's own checks, every token
+//! answered, where [`validate`] stops at the first that fails.
 //! Under a policy that admits ETSI TS 101 903 V1.2.2, [`validate_ts101903`]
 //! validates the BES form of a signature in that syntax, to which the
 //! EN 319 132-1 levels do not apply.
@@ -95,7 +97,8 @@ pub use create::{
 #[cfg(feature = "produce")]
 pub use draft::{Draft, DraftError};
 pub use level::{
-    ConfiguredResponder, Inputs, Level, NoCredential, RenewalFailure, TimestampFailure, validate,
+    ConfiguredResponder, Inputs, Level, NoCredential, RenewalFailure, TimestampFailure,
+    TokenIntegrity, TokenResult, check_tokens, validate,
 };
 pub use path::CounterPathError;
 pub use status::{StatusError, StatusFailure};

@@ -22,7 +22,8 @@ use xml_sec::xmldsig::{
 };
 use xml_sec_xades::{
     AuthorityAccuracy, ConfiguredResponder, Inputs, Level, Outcome, RenewalFailure, Requirements,
-    StatusFailure, TimestampFailure, ValidationError, validate,
+    StatusFailure, TimestampFailure, TokenIntegrity, TokenResult, ValidationError, check_tokens,
+    validate,
 };
 
 const ROOT: &[u8] = include_bytes!("fixtures/levels/root.der");
@@ -159,6 +160,81 @@ fn met(
     given: &Given<'_>,
 ) -> Result<Outcome<bool>, ValidationError> {
     level_in(xml, requirements, given, AMPLE, all_met).expect("fixture verifies as XMLDSig")
+}
+
+/// [`check_tokens`] over the first signature of `xml`: each token's integrity.
+fn integrities(xml: &str) -> Result<Outcome<Vec<TokenIntegrity>>, ValidationError> {
+    let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+        trusted_certs: vec![ROOT.to_vec()],
+        ..KeyResolverConfig::default()
+    });
+    let mut policy = VerificationPolicy::default();
+    policy.key_trust.verify_x509_chains = true;
+    policy.key_trust.verification_time = Instant::new(AT, 0);
+    let context = VerifyContext::new().policy(policy).key_resolver(&resolver);
+    let document = XmlDocument::parse(xml).expect("fixture parses");
+    let account = Memory::new(Arc::new(MemoryAccount::new(AMPLE.0, AMPLE.1)));
+    let utc = LeapTable::new(-2_208_988_800, 4_102_444_800, &[]).expect("UTC coverage");
+    with_verified_request(
+        &document,
+        &context,
+        &VerificationRequest::default(),
+        &account,
+        |session| {
+            let signature = session.evidence().signatures()[0].identity();
+            let inputs = Inputs {
+                requirements: Requirements::Timestamped,
+                anchors: &[ROOT],
+                certificates: &[],
+                utc: &utc,
+                accuracies: &[],
+                responders: &[],
+                crls: &[],
+                responses: &[],
+            };
+            Ok(check_tokens(&session, signature, &inputs, |results| {
+                results.iter().map(TokenResult::integrity).collect()
+            }))
+        },
+    )
+    .expect("fixture verifies as XMLDSig")
+}
+
+#[test]
+fn every_token_is_checked_whatever_another_shows() {
+    // A broken first signature timestamp stops the level at that token; each
+    // token's own checks (EN 319 102-1 V1.4.1 clause 5.4) still answer for
+    // every token, the intact one after it included.
+    let start = B_T
+        .find("<xades:SignatureTimeStamp")
+        .expect("a signature timestamp");
+    let end = B_T.find("</xades:SignatureTimeStamp>").expect("its end")
+        + "</xades:SignatureTimeStamp>".len();
+    let broken = B_T[start..end]
+        .replace("Id=\"ts\"", "Id=\"ts-broken\"")
+        .replace("ADozW5ea", "ADozX5ea");
+    assert_ne!(broken, &B_T[start..end], "the token's signature changed");
+    let xml = format!("{}{broken}{}", &B_T[..start], &B_T[start..]);
+    let level = level(&xml, Requirements::Timestamped, &[ROOT], &[]);
+    assert!(
+        matches!(
+            level,
+            Ok(Outcome::Timestamp {
+                failure: TimestampFailure::Rejected,
+                ..
+            })
+        ),
+        "{level:?}"
+    );
+    let checked = integrities(&xml);
+    assert!(
+        matches!(&checked, Ok(Outcome::Assessed(found))
+            if found == &[TokenIntegrity::Rejected, TokenIntegrity::Intact]),
+        "{checked:?}"
+    );
+    assert!(
+        matches!(&integrities(B_T), Ok(Outcome::Assessed(found)) if found == &[TokenIntegrity::Intact])
+    );
 }
 
 #[test]

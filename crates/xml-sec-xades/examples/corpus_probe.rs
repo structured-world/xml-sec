@@ -50,8 +50,8 @@ use xml_sec::xmldsig::{
     with_verified_request,
 };
 use xml_sec_xades::{
-    EnclosingError, Inputs, Level, Outcome, Requirements, Syntax, ValidationError, validate,
-    validate_basic, validate_ts101903,
+    EnclosingError, Inputs, Level, Outcome, Requirements, Syntax, TokenIntegrity, ValidationError,
+    check_tokens, validate, validate_basic, validate_ts101903,
 };
 
 type Failure = Box<dyn std::error::Error>;
@@ -792,12 +792,11 @@ fn facts(xml: &str, anchors: &Path, at: i64, profile: PolicyProfile) -> Result<V
     Ok(facts)
 }
 
-/// Sets each signature's [`etsi::Declared::timestamps_intact`] and
-/// [`etsi::Declared::archive_intact`]: xml-sec-xades validates B-T and B-LTA
-/// at the latest token's generation time, since it refuses any token
-/// generated after the time it validates at, and so establishes each token's
-/// imprint and TSA signature once, for the ETSI process to place against the
-/// validation time.
+/// Sets each signature's [`etsi::Declared::token_integrity`]: xml-sec-xades
+/// checks the tokens at the latest token's generation time, since it refuses
+/// any token generated after the time it validates at, and so establishes
+/// each token's imprint and TSA signature once, for the ETSI process to place
+/// against the validation time.
 fn establish_timestamps(
     document: &XmlDocument,
     request: &VerificationRequest<'_>,
@@ -843,43 +842,47 @@ fn establish_timestamps(
             if entry.result().is_err() || declared.signature_timestamps.is_empty() {
                 continue;
             }
-            let established = |requirements| match validate(
-                &session,
-                entry.identity(),
-                &Inputs {
-                    requirements,
-                    ..inputs
-                },
-                met,
-            ) {
-                // Every token's imprint and signature are checked before
-                // their paths, statuses and the level's requirements, which
-                // are the ETSI process's to judge; a token whose own checks
-                // failed is refused as Rejected. A refusal before the tokens
-                // (the signer's path, a countersignature, the hashes)
-                // establishes nothing about them, and neither does a token
-                // without its signer's certificate: the checks stop there,
-                // so it and every later token went unchecked.
-                Ok(Outcome::Timestamp {
-                    failure: xml_sec_xades::TimestampFailure::Rejected,
-                    ..
-                }) => Some(false),
-                Ok(Outcome::Timestamp {
-                    failure: xml_sec_xades::TimestampFailure::MissingSigner,
-                    ..
-                }) => None,
-                Ok(
-                    Outcome::Assessed(_)
-                    | Outcome::Timestamp { .. }
-                    | Outcome::Status(_)
-                    | Outcome::Credential { .. }
-                    | Outcome::Renewal { .. },
-                ) => Some(true),
-                _ => None,
-            };
-            declared.timestamps_intact = established(Requirements::Timestamped);
+            // Each token's own imprint and signature, checked token by token
+            // (EN 319 102-1 V1.4.1 clause 5.4); its paths, statuses and the
+            // level's requirements are the ETSI process's to judge. A token
+            // without its signer's certificate establishes nothing, and a
+            // refusal before the tokens (the signer's path, a
+            // countersignature, the hashes) none of them. The archive
+            // timestamps are read where their level prepares them.
+            let mut levels = vec![Requirements::Timestamped];
             if !declared.archive_timestamps.is_empty() {
-                declared.archive_intact = established(Requirements::Archival);
+                levels.push(Requirements::Archival);
+            }
+            for requirements in levels {
+                let checked = check_tokens(
+                    &session,
+                    entry.identity(),
+                    &Inputs {
+                        requirements,
+                        ..inputs
+                    },
+                    |results| {
+                        results
+                            .iter()
+                            .filter(|result| result.signature() == entry.identity())
+                            .filter_map(|result| {
+                                let intact = match result.integrity() {
+                                    TokenIntegrity::Intact => true,
+                                    TokenIntegrity::Rejected => false,
+                                    TokenIntegrity::MissingSigner => return None,
+                                };
+                                Some((result.token().to_vec(), intact))
+                            })
+                            .collect::<Vec<_>>()
+                    },
+                );
+                if let Ok(Outcome::Assessed(found)) = checked {
+                    for (token, intact) in found {
+                        if declared.intact(&token).is_none() {
+                            declared.token_integrity.push((token, intact));
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -887,7 +890,7 @@ fn establish_timestamps(
     // A refused request establishes no token of any signature.
     if run.is_err() {
         for declared in declared.iter_mut() {
-            declared.timestamps_intact = None;
+            declared.token_integrity.clear();
         }
     }
     Ok(())

@@ -202,6 +202,136 @@ pub fn validate<W: Work, R>(
     validate_with(session, signature, inputs, visitor)
 }
 
+/// What a level above B-B reads `session`'s timestamp tokens with.
+fn timing<'t, W: Work>(
+    session: &VerifiedSession<'_, '_, '_, W>,
+    inputs: &Inputs<'t>,
+) -> Timing<'t> {
+    Timing {
+        utc: inputs.utc,
+        accuracies: inputs.accuracies,
+        profile: match session.timestamp_token_encoding() {
+            TimestampTokenEncoding::Declared => TokenProfile::Etsi,
+            TimestampTokenEncoding::Ber => TokenProfile::Cms,
+        },
+    }
+}
+
+/// What the own checks of one timestamp token established (ETSI EN 319 102-1
+/// V1.4.1 clause 5.4, building on 5.2.7): its message imprint and its named
+/// signer's signature, before any path of that signer is checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenIntegrity {
+    /// The imprint binds and the named signer's key verifies the token.
+    Intact,
+    /// The token's imprint, signature or profile facts did not hold.
+    Rejected,
+    /// No available certificate is the one the token names as its signer.
+    MissingSigner,
+}
+
+/// One timestamp token of a signature and what its own checks established.
+#[derive(Debug, Clone, Copy)]
+pub struct TokenResult<'a> {
+    signature: N,
+    property: N,
+    token: &'a [u8],
+    integrity: TokenIntegrity,
+}
+
+impl<'a> TokenResult<'a> {
+    /// The signature, root or countersignature, whose property holds it.
+    #[must_use]
+    pub fn signature(&self) -> N {
+        self.signature
+    }
+
+    /// Its timestamp property.
+    #[must_use]
+    pub fn property(&self) -> N {
+        self.property
+    }
+
+    /// The token as the document carries it, decoded from its element.
+    #[must_use]
+    pub fn token(&self) -> &'a [u8] {
+        self.token
+    }
+
+    /// What its own checks established.
+    #[must_use]
+    pub fn integrity(&self) -> TokenIntegrity {
+        self.integrity
+    }
+}
+
+/// Check every timestamp token of `signature`, its countersignatures'
+/// included, each on its own (EN 319 102-1 V1.4.1 clause 5.4): unlike
+/// [`validate`], which stops at the first token that fails, no token is left
+/// unchecked by another's failure. The stages before the tokens run as
+/// [`validate`] runs them at `inputs.requirements`, and a refusal there is
+/// its completed fact.
+///
+/// # Errors
+/// Returns the original cause of the stage that could not complete.
+pub fn check_tokens<W: Work, R>(
+    session: &VerifiedSession<'_, '_, '_, W>,
+    signature: N,
+    inputs: &Inputs<'_>,
+    visitor: impl for<'a> FnOnce(&[TokenResult<'a>]) -> R,
+) -> Result<Outcome<R>, ValidationError> {
+    with_stage(
+        session,
+        signature,
+        inputs.requirements,
+        [inputs.anchors, inputs.certificates],
+        Some(timing(session, inputs)),
+        |stage, _| {
+            with_pools(stage, |pools| {
+                let memory = stage.parser.memory();
+                let supplied = read_certificates(stage.parser, inputs.certificates)?;
+                let supplied_parent = stage
+                    .parser
+                    .read(&[], 0)
+                    .map_err(ValidationError::Operation)?;
+                let document_der = incorporated_certificates(pools, memory)?;
+                let incorporated = read_certificates(stage.parser, &document_der)?;
+                let cms = session.cms_provider();
+                let sources = pools.tokens.sources();
+                let mut results = memory.vector();
+                results
+                    .try_reserve_exact(sources.len())
+                    .map_err(Error::from)?;
+                for (ordinal, source) in sources.iter().enumerate() {
+                    let checked = token_check(
+                        stage,
+                        inputs,
+                        pools,
+                        [&supplied, &incorporated],
+                        &supplied_parent,
+                        &cms,
+                        ordinal,
+                    )?;
+                    let integrity = match checked {
+                        Ok(_) => TokenIntegrity::Intact,
+                        Err(TimestampFailure::MissingSigner) => TokenIntegrity::MissingSigner,
+                        Err(_) => TokenIntegrity::Rejected,
+                    };
+                    results
+                        .try_push(TokenResult {
+                            signature: source.signature(),
+                            property: source.property(),
+                            token: source.bytes(),
+                            integrity,
+                        })
+                        .map_err(Error::from)?;
+                }
+                Ok(Outcome::Assessed(visitor(&results.into_owned())))
+            })
+        },
+    )
+}
+
 /// [`validate`] for any [`Visit`]or.
 pub(crate) fn validate_with<W: Work, V: Visit<W>>(
     session: &VerifiedSession<'_, '_, '_, W>,
@@ -210,14 +340,7 @@ pub(crate) fn validate_with<W: Work, V: Visit<W>>(
     visitor: V,
 ) -> Result<Outcome<V::Output>, ValidationError> {
     let requirements = inputs.requirements;
-    let timing = (requirements != Requirements::Basic).then_some(Timing {
-        utc: inputs.utc,
-        accuracies: inputs.accuracies,
-        profile: match session.timestamp_token_encoding() {
-            TimestampTokenEncoding::Declared => TokenProfile::Etsi,
-            TimestampTokenEncoding::Ber => TokenProfile::Cms,
-        },
-    });
+    let timing = (requirements != Requirements::Basic).then(|| timing(session, inputs));
     with_stage(
         session,
         signature,
@@ -268,6 +391,14 @@ fn timed<W: Work, V: Visit<W>>(
     inputs: &Inputs<'_>,
     visitor: V,
 ) -> Result<Outcome<V::Output>, ValidationError> {
+    with_pools(stage, |pools| frozen(stage, basic, inputs, pools, visitor))
+}
+
+/// `then` over the signature's frozen token and material pools.
+fn with_pools<W: Work, R>(
+    stage: &Stage<'_, '_, '_, '_, W>,
+    then: impl FnOnce(&Pools<'_, '_>) -> Result<Outcome<R>, ValidationError>,
+) -> Result<Outcome<R>, ValidationError> {
     let stamps = timestamp::counter_timestamps(stage.access, stage.counters)
         .map_err(|error| ValidationError::Stamps(Box::new(error)))?;
     timestamp::with_counter_tokens(
@@ -290,7 +421,7 @@ fn timed<W: Work, V: Visit<W>>(
                             tokens: &tokens,
                             view: &view,
                         };
-                        Ok::<_, Infallible>(frozen(stage, basic, inputs, &pools, visitor))
+                        Ok::<_, Infallible>(then(&pools))
                     },
                 )
                 .map_err(|error| ValidationError::Material(Box::new(error)))
@@ -393,6 +524,42 @@ fn token_actors<'p, 't, W: Work>(
     supplied_parent: &'p Reader<'t>,
     cms: &CmsProvider<'_>,
 ) -> Result<Result<OwnedVec<TokenActor<'p, 't>>, TokenFailure>, ValidationError> {
+    let mut actors = stage.parser.memory().vector();
+    actors
+        .try_reserve_exact(pools.tokens.sources().len())
+        .map_err(Error::from)?;
+    for ordinal in 0..pools.tokens.sources().len() {
+        match token_check(
+            stage,
+            inputs,
+            pools,
+            supplied,
+            supplied_parent,
+            cms,
+            ordinal,
+        )? {
+            Ok(actor) => actors.try_push(actor).map_err(Error::from)?,
+            Err(failure) => {
+                let property = pools.tokens.sources()[ordinal].property();
+                return Ok(Err((property, failure)));
+            }
+        }
+    }
+    Ok(Ok(actors.into_owned()))
+}
+
+/// Check token `ordinal` of the document with its named signer's own key:
+/// its imprint, signature and profile facts, before any path. A completed
+/// negative fact is `Ok(Err(..))`.
+fn token_check<'p, 't, W: Work>(
+    stage: &'p Stage<'_, '_, '_, '_, W>,
+    inputs: &'p Inputs<'t>,
+    pools: &'p Pools<'p, 't>,
+    supplied: [&'p [Certificate<'t>]; 2],
+    supplied_parent: &'p Reader<'t>,
+    cms: &CmsProvider<'_>,
+    ordinal: usize,
+) -> Result<Result<TokenActor<'p, 't>, TimestampFailure>, ValidationError> {
     let Pools {
         stamps,
         operation,
@@ -400,62 +567,52 @@ fn token_actors<'p, 't, W: Work>(
         ..
     } = *pools;
     let roots = stage.prepared.timestamps();
-    let mut actors = stage.parser.memory().vector();
-    actors
-        .try_reserve_exact(tokens.sources().len())
-        .map_err(Error::from)?;
-    for ordinal in 0..tokens.sources().len() {
-        let source = &tokens.sources()[ordinal];
-        let Some((certificate, parent)) = token_signer(pools, ordinal, supplied, supplied_parent)?
-        else {
-            return Ok(Err((source.property(), TimestampFailure::MissingSigner)));
-        };
-        let reading = &tokens.readings()[ordinal];
-        let policy_accuracy = accuracy::select_outside(
-            stage.stated,
-            reading.token(),
-            reading.reader(),
-            stage.operation,
-        )?;
-        let context = CheckContext {
-            certificate,
-            certificate_parent: parent,
-            key: EffectiveKey::standing(certificate.tbs().public_key()),
-            // An incorporated token is archived evidence: this instant only
-            // refuses one generated after the time being validated at.
-            requested: None,
-            utc: inputs.utc,
-            reference: Some(stage.signer_time),
-            window: None,
-            policy_accuracy,
-        };
-        let check = Check {
-            xml: stage.document,
-            provider: cms,
-            context: &context,
-        };
-        // The pool's entry carries the token in the encoding its profile
-        // accepted, so neither branch re-reads it in another encoding.
-        let entry = tokens.entry(ordinal).expect("ordinal within the pool");
-        let actor = if let Some(stamp) = roots.get(source.stamp_index()) {
-            check.retain_actor_from(
-                stage.prepared.bound(),
-                stamp,
-                entry,
-                operation,
-                unrecognized(),
-            )
-        } else {
-            let counter = &stamps.entries()[source.stamp_index() - roots.len()];
-            check.retain_counter_from(counter, entry, operation, unrecognized())
-        }
-        .map_err(|error| ValidationError::Timestamp(Box::new(error)))?;
-        let Some(actor) = actor else {
-            return Ok(Err((source.property(), TimestampFailure::Rejected)));
-        };
-        actors.try_push(actor).map_err(Error::from)?;
+    let source = &tokens.sources()[ordinal];
+    let Some((certificate, parent)) = token_signer(pools, ordinal, supplied, supplied_parent)?
+    else {
+        return Ok(Err(TimestampFailure::MissingSigner));
+    };
+    let reading = &tokens.readings()[ordinal];
+    let policy_accuracy = accuracy::select_outside(
+        stage.stated,
+        reading.token(),
+        reading.reader(),
+        stage.operation,
+    )?;
+    let context = CheckContext {
+        certificate,
+        certificate_parent: parent,
+        key: EffectiveKey::standing(certificate.tbs().public_key()),
+        // An incorporated token is archived evidence: this instant only
+        // refuses one generated after the time being validated at.
+        requested: None,
+        utc: inputs.utc,
+        reference: Some(stage.signer_time),
+        window: None,
+        policy_accuracy,
+    };
+    let check = Check {
+        xml: stage.document,
+        provider: cms,
+        context: &context,
+    };
+    // The pool's entry carries the token in the encoding its profile
+    // accepted, so neither branch re-reads it in another encoding.
+    let entry = tokens.entry(ordinal).expect("ordinal within the pool");
+    let actor = if let Some(stamp) = roots.get(source.stamp_index()) {
+        check.retain_actor_from(
+            stage.prepared.bound(),
+            stamp,
+            entry,
+            operation,
+            unrecognized(),
+        )
+    } else {
+        let counter = &stamps.entries()[source.stamp_index() - roots.len()];
+        check.retain_counter_from(counter, entry, operation, unrecognized())
     }
-    Ok(Ok(actors.into_owned()))
+    .map_err(|error| ValidationError::Timestamp(Box::new(error)))?;
+    Ok(actor.ok_or(TimestampFailure::Rejected))
 }
 
 /// Each actor's path over its token's whole stated generation interval.
