@@ -17463,10 +17463,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The intermediate CA's OCSP response is signed by its issuer, AddTrust External CA Root, whose keyUsage asserts keyCertSign and cRLSign only. An OCSP response's signature is neither a certificate nor a CRL signature, so the key that makes it needs digitalSignature or contentCommitment (RFC 5280 sections 4.2.1.3 and 4.2.1.12); xml-sec takes the response as unusable, the CA's status is not established and X.509 validation returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE at the claimed signing time (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4); DSS accepts the response and passes."
       },
       "signing-time/extended": {
         "observed": [
@@ -17480,10 +17481,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The intermediate CA's OCSP response is signed by its issuer, AddTrust External CA Root, whose keyUsage asserts keyCertSign and cRLSign only. An OCSP response's signature is neither a certificate nor a CRL signature, so the key that makes it needs digitalSignature or contentCommitment (RFC 5280 sections 4.2.1.3 and 4.2.1.12); xml-sec takes the response as unusable, the CA's status is not established and X.509 validation returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE at the claimed signing time (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4); DSS accepts the response and passes."
       },
       "signing-time/conformant": {
         "observed": [
@@ -17497,10 +17499,11 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
-        "indication": false
+        "indication": false,
+        "reason": "The intermediate CA's OCSP response is signed by its issuer, AddTrust External CA Root, whose keyUsage asserts keyCertSign and cRLSign only. An OCSP response's signature is neither a certificate nor a CRL signature, so the key that makes it needs digitalSignature or contentCommitment (RFC 5280 sections 4.2.1.3 and 4.2.1.12); xml-sec takes the response as unusable, the CA's status is not established and X.509 validation returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE at the claimed signing time (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4); DSS accepts the response and passes."
       }
     },
     "dss-xades/src/test/resources/validation/xades-sigPolicy-with-SPDocSpecification.xml": {

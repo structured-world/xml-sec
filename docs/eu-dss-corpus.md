@@ -20,6 +20,6 @@ For every signature xml-sec passes, the expectations record until when it keeps 
 
 | Profile | Inputs | DSS passes | xml-sec passes | Same indication | Agreement | Classes |
 | --- | --- | --- | --- | --- | --- | --- |
-| `xades` | 153 | 27 | 3 | 124 | 69 | agreement 69, dss-deviation 10, no-usable-anchor 5, normative-difference 62, policy-refusal 3, unreviewed 1, unsupported 3 |
-| `xades-extended` | 153 | 27 | 3 | 124 | 69 | agreement 69, dss-deviation 10, no-usable-anchor 5, normative-difference 62, policy-refusal 3, unreviewed 1, unsupported 3 |
-| `xades-conformant` | 153 | 29 | 4 | 123 | 67 | agreement 67, dss-deviation 10, no-usable-anchor 5, normative-difference 64, policy-refusal 3, unreviewed 1, unsupported 3 |
+| `xades` | 153 | 27 | 3 | 124 | 69 | agreement 69, dss-deviation 10, no-usable-anchor 5, normative-difference 63, policy-refusal 3, unsupported 3 |
+| `xades-extended` | 153 | 27 | 3 | 124 | 69 | agreement 69, dss-deviation 10, no-usable-anchor 5, normative-difference 63, policy-refusal 3, unsupported 3 |
+| `xades-conformant` | 153 | 29 | 4 | 123 | 67 | agreement 67, dss-deviation 10, no-usable-anchor 5, normative-difference 65, policy-refusal 3, unsupported 3 |
