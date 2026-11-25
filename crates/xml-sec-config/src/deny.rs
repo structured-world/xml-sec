@@ -39,6 +39,9 @@ impl Deny {
             }
             denials.transforms.insert(uri.clone());
         }
+        // A denied URI withdraws its method in every parameterization: the
+        // policy matches denials by URI, so the RSA-PSS URI covers every
+        // tuple (RFC 9231 2.3.10), not only the default one parsed here.
         for uri in &self.signature_algorithms {
             let method = SignatureAlgorithm::from_uri(uri)
                 .ok_or_else(|| unknown("signature_algorithms", uri))?;
