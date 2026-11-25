@@ -609,6 +609,17 @@ pub(crate) fn xml_failed(here: Here, object: *const c_char, failed: &CStr) {
     );
 }
 
+/// [`xml_failed`] for an edit of `node`, which libxmlsec1 reports under the
+/// node's name.
+///
+/// # Safety
+/// `node` is null or a live node.
+pub(crate) unsafe fn xml_failed_at(here: Here, node: *const XmlNode, failed: &CStr) {
+    // SAFETY: by the caller's contract.
+    let name = std::ffi::CString::new(unsafe { node_name(node) }).unwrap_or_default();
+    xml_failed(here, name.as_ptr(), failed);
+}
+
 /// libxmlsec1's `xmlSecXmlError2`: as [`xml_failed`], after `detail`.
 pub(crate) fn xml_failed_with(here: Here, object: *const c_char, failed: &CStr, detail: &str) {
     report(
@@ -623,9 +634,14 @@ pub(crate) fn xml_failed_with(here: Here, object: *const c_char, failed: &CStr, 
 /// libxmlsec1's `XMLSEC_SAFE_CAST_SIZE_TO_INT` failure: `value` does not
 /// fit an `int`.
 pub(crate) fn size_to_int_impossible(here: Here, value: usize) {
+    size_to_int_impossible_for(here, std::ptr::null(), value);
+}
+
+/// [`size_to_int_impossible`] reported for `object`.
+pub(crate) fn size_to_int_impossible_for(here: Here, object: *const c_char, value: usize) {
     report(
         here,
-        std::ptr::null(),
+        object,
         std::ptr::null(),
         R_CAST_IMPOSSIBLE,
         &format!(

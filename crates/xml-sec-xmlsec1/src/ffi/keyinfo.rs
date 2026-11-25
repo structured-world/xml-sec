@@ -1168,9 +1168,10 @@ pub(crate) unsafe extern "C" fn value_xml_read(
             let data_id = child_klass(ctx, cur, USAGE_KEY_VALUE_NODE_READ);
             if !data_id.is_null() {
                 if xmlSecKeyDataXmlRead(data_id, key.cast(), cur.cast(), ctx.cast()) < 0 {
+                    // Reported for the klass of the child that failed.
                     errors::internal_with(
                         here,
-                        object,
+                        klass_name(data_id),
                         c"xmlSecKeyDataXmlRead",
                         &format!("node={}", node_name(cur)),
                     );
@@ -1272,7 +1273,7 @@ pub(crate) unsafe extern "C" fn value_xml_write(
             );
             // xmlNodeSetContent(node, NULL): the old value goes first.
             if nodes::set_content(node, "").is_err() {
-                errors::xml_failed(here, std::ptr::null(), c"xmlNodeSetContent");
+                errors::xml_failed_at(here, node, c"xmlNodeSetContent");
                 return -1;
             }
             let cur = xmlSecAddChild(node, klass.data_node_name, klass.data_node_ns);

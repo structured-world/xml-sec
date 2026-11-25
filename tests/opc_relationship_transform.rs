@@ -391,6 +391,54 @@ fn a_relationships_namespace_target_mode_follows_the_policy() {
     }
 }
 
+#[test]
+fn relationships_namespace_attributes_follow_the_policy() {
+    // The libxmlsec1 reading takes every Relationships-namespace attribute of
+    // a Relationship as the unprefixed one (an unprefixed one present on the
+    // same element wins) and writes it unprefixed; the specification reading
+    // refuses them, as the schema declares the attributes unqualified.
+    use xml_sec::policy::RelationshipTargetModeSemantics;
+    let kind = "urn:t";
+    let run = |attributes: &str, semantics| {
+        let xml = format!(
+            "<Relationships xmlns=\"{REL}\" xmlns:rel=\"{REL}\"><Relationship {attributes}/></Relationships>"
+        );
+        let document = Document::parse(&xml).unwrap();
+        let mut policy = VerificationPolicy::default();
+        policy.transforms.relationship_target_mode_semantics = semantics;
+        xml_sec::xmldsig::execute_transforms_with_policy(
+            document.root_element(),
+            TransformData::NodeSet(NodeSet::entire_document_with_comments(&document).unwrap()),
+            &[
+                Transform::Relationship(vec![RelationshipSelector::SourceId("rId1".into())]),
+                Transform::C14n(C14nAlgorithm::new(C14nMode::Inclusive1_0, false)),
+            ],
+            &policy,
+        )
+        .map_err(|error| error.to_string())
+    };
+    let expected = format!(
+        "<Relationships xmlns=\"{REL}\"><Relationship Id=\"rId1\" Target=\"a\" TargetMode=\"Internal\" Type=\"{kind}\"></Relationship></Relationships>"
+    );
+    let qualified = format!("rel:Id=\"rId1\" rel:Type=\"{kind}\" rel:Target=\"a\"");
+    assert_eq!(
+        run(&qualified, RelationshipTargetModeSemantics::Libxmlsec1).unwrap(),
+        expected.as_bytes()
+    );
+    let both =
+        format!("Id=\"rId1\" rel:Id=\"other\" Type=\"{kind}\" Target=\"a\" rel:Target=\"b\"");
+    assert_eq!(
+        run(&both, RelationshipTargetModeSemantics::Libxmlsec1).unwrap(),
+        expected.as_bytes()
+    );
+    let error = run(&qualified, RelationshipTargetModeSemantics::Specification)
+        .expect_err("the schema has no qualified Relationship attributes");
+    assert!(
+        error.contains("unexpected Relationships part attribute"),
+        "{error}"
+    );
+}
+
 /// A part whose only relationship carries a Relationships-namespace `TargetMode`.
 fn qualified_target_mode_part() -> String {
     format!(

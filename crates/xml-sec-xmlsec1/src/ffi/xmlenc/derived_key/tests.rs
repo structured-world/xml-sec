@@ -387,6 +387,48 @@ fn generated_name(
 }
 
 #[test]
+fn a_key_an_earlier_element_gave_its_value_skips_derivation_and_agreement() {
+    // An earlier KeyInfo child already set the key's value: a DerivedKey or
+    // AgreementMethod after it is skipped, as an EncryptedKey is, rather
+    // than run against the nesting limit or replace the value.
+    with_library(|| {
+        // SAFETY: a document, key and context created and released here.
+        unsafe {
+            let xml = template("master", "");
+            let doc = xsReadMemory(
+                xml.as_ptr().cast(),
+                c_int::try_from(xml.len()).expect("a short document"),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+            );
+            let node = crate::ffi::xmltree::xmlSecFindNode(
+                xsDocGetRootElement(doc).cast(),
+                strings::xmlSecNodeDerivedKey.as_ptr(),
+                strings::xmlSecEnc11Ns.as_ptr(),
+            );
+            let key = xmlSecKeyReadMemory(symkeys::aes(), [7_u8; 32].as_ptr(), 32);
+            assert!(!key.is_null());
+            let value = (*key).value;
+            let ctx = xmlSecEncCtxCreate(std::ptr::null_mut());
+            let key_info = &raw mut (*ctx).key_info_read_ctx;
+            (*key_info).cur_encrypted_key_level = (*key_info).max_encrypted_key_level;
+            for klass in [
+                crate::ffi::keysdata::xmlSecKeyDataDerivedKeyGetKlass(),
+                crate::ffi::keysdata::xmlSecKeyDataAgreementMethodGetKlass(),
+            ] {
+                let read = (*klass).xml_read.expect("a reading klass");
+                assert_eq!(read(klass, key.cast(), node.cast(), key_info.cast()), 0);
+                assert_eq!((*key).value, value);
+            }
+            xmlSecEncCtxDestroy(ctx);
+            xmlSecKeyDestroy(key);
+            xsFreeDoc(doc);
+        }
+    });
+}
+
+#[test]
 fn the_derived_key_is_named_by_its_derived_key_name() {
     // The derived key carries the DerivedKeyName, as libxmlsec1 names it.
     with_library(|| {

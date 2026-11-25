@@ -826,9 +826,9 @@ pub(crate) unsafe extern "C" fn xmlSecBufferBase64NodeContentWrite(
             free(content.cast());
             // The encoding is ASCII, so it is text.
             if text.is_none_or(|text| super::tree::nodes::add_content(node, &text).is_err()) {
-                errors::xml_failed(
+                errors::xml_failed_at(
                     here!("xmlSecBufferBase64NodeContentWrite"),
-                    std::ptr::null(),
+                    node,
                     c"xmlNodeAddContent",
                 );
                 return -1;

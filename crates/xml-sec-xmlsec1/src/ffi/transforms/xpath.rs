@@ -431,7 +431,9 @@ unsafe extern "C" fn xpath2_read_node(
             let Some(filter) =
                 c_text(xmlSecAttrFilter.as_ptr()).and_then(|name| nodes::property(current, name))
             else {
-                errors::invalid_node_attribute(here, current, c"Filter", name, "empty");
+                // The attribute is required; only its absence reaches here,
+                // as reading a present one cannot fail on this tree.
+                errors::invalid_node_attribute(here, current, c"Filter", name, "missing");
                 return -1;
             };
             let op = [

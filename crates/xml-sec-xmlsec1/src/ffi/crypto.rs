@@ -400,6 +400,17 @@ fn create_library(name: &[u8]) -> *mut Library {
     }))
 }
 
+/// Whether `xmlSecCryptoDLInit` made the loaded list (libxmlsec1's
+/// `xmlSecPtrListIsValid`); `failed` reports libxmlsec1's error otherwise.
+fn libraries_ready(here: errors::Here, failed: &CStr) -> bool {
+    // SAFETY: the list has a fixed address.
+    let ready = std::ptr::eq(unsafe { (*LIBRARIES.get()).id }, &raw const LIBRARY_LIST);
+    if !ready {
+        errors::internal(here, c"not initialized".as_ptr(), failed);
+    }
+    ready
+}
+
 /// The position of the library `name` in the loaded list.
 fn find_library(name: &[u8]) -> Option<usize> {
     // SAFETY: the list has a fixed address.
@@ -505,6 +516,9 @@ pub(crate) unsafe extern "C" fn xmlSecCryptoDLGetLibraryFunctions(
             null
         );
         let here = here!("xmlSecCryptoDLGetLibraryFunctions");
+        if !libraries_ready(here, c"xmlSecCryptoDLGetLibraryFunctions") {
+            return null;
+        }
         // SAFETY: `crypto` is NUL-terminated.
         let name = unsafe { CStr::from_ptr(crypto.cast()) }.to_bytes();
         if let Some(position) = find_library(name) {
@@ -550,6 +564,12 @@ pub(crate) unsafe extern "C" fn xmlSecCryptoDLUnloadLibrary(crypto: *const u8) -
             c"crypto != NULL",
             -1
         );
+        if !libraries_ready(
+            here!("xmlSecCryptoDLUnloadLibrary"),
+            c"xmlSecCryptoDLUnloadLibrary",
+        ) {
+            return -1;
+        }
         // SAFETY: `crypto` is NUL-terminated.
         let name = unsafe { CStr::from_ptr(crypto.cast()) }.to_bytes();
         // libxmlsec1 treats a library that is not loaded as unloaded.

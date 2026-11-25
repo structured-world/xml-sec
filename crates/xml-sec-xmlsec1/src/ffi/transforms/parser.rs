@@ -265,6 +265,29 @@ unsafe extern "C" fn pop_xml(
                 return -1;
             }
         }
+        // Any failure from here on fails the transform, as libxmlsec1 marks it.
+        let popped = pop_working(object, nodes, ctx, original, here);
+        if popped < 0 {
+            object.status = STATUS_FAIL;
+        }
+        popped
+    }
+}
+
+/// The working part of [`pop_xml`]: reads everything the previous transform
+/// pops and parses it as one document.
+///
+/// # Safety
+/// As for [`pop_xml`], with the transform working.
+unsafe fn pop_working(
+    object: &mut XmlSecTransform,
+    nodes: *mut *mut XmlSecNodeSet,
+    ctx: *mut XmlSecTransformCtx,
+    original: c_int,
+    here: errors::Here,
+) -> c_int {
+    // SAFETY: by the caller's contract.
+    unsafe {
         if object.prev.is_null() {
             errors::report(
                 here,

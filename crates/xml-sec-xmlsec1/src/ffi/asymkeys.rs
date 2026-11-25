@@ -949,7 +949,7 @@ unsafe extern "C" fn der_xml_write(
                 c_text(text).is_some_and(|encoded| nodes::add_content(node, encoded).is_ok());
             free(text.cast());
             if !added {
-                errors::xml_failed(here, object_name, c"xmlNodeAddContent");
+                errors::xml_failed_at(here, node, c"xmlNodeAddContent");
                 return -1;
             }
         }

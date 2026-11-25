@@ -440,9 +440,17 @@ fn read_relationship<'a, S: Scratch, D: crate::xml::dom::storage::Storage>(
     // https://ecma-international.org/publications-and-standards/standards/ecma-376/
     let qualified_mode = reading.target_mode == RelationshipTargetModeSemantics::Libxmlsec1;
     validate_relationship_attributes(node, qualified_mode, budget)?;
-    let id = budget
-        .attribute(node, None, "Id")?
-        .ok_or_else(|| invalid("missing relationship Id"))?;
+    // libxmlsec1 takes a Relationships-namespace attribute as the unprefixed
+    // one, preferring an unprefixed one on the same element, and normalization
+    // writes it unprefixed.
+    let read = |name| -> Result<Option<&'a str>, TransformError> {
+        match budget.attribute(node, None, name)? {
+            Some(value) => Ok(Some(value)),
+            None if qualified_mode => budget.attribute(node, Some(REL), name),
+            None => Ok(None),
+        }
+    };
+    let id = read("Id")?.ok_or_else(|| invalid("missing relationship Id"))?;
     budget.node_filter.charge(id.len())?;
     // XSD 1.0 §§3.3.8, 4.3.6: ID's whiteSpace facet is collapse.
     // Schema validation does not replace lexical attribute content
@@ -452,22 +460,11 @@ fn read_relationship<'a, S: Scratch, D: crate::xml::dom::storage::Storage>(
         return Err(invalid("relationship Id must be an xsd:ID"));
     }
     let padded = id != id.trim_matches(xml_whitespace);
-    let kind = budget
-        .attribute(node, None, "Type")?
-        .ok_or_else(|| invalid("missing relationship Type"))?;
+    let kind = read("Type")?.ok_or_else(|| invalid("missing relationship Type"))?;
     budget.node_filter.charge(kind.len())?;
     validate_relationship_type_iri(kind)?;
-    let target = budget
-        .attribute(node, None, "Target")?
-        .ok_or_else(|| invalid("missing relationship Target"))?;
-    // libxmlsec1 prefers the unprefixed TargetMode and otherwise takes the
-    // Relationships-namespace one; normalization writes it unprefixed.
-    let mode = match budget.attribute(node, None, "TargetMode")? {
-        Some(mode) => Some(mode),
-        None if qualified_mode => budget.attribute(node, Some(REL), "TargetMode")?,
-        None => None,
-    }
-    .unwrap_or("Internal");
+    let target = read("Target")?.ok_or_else(|| invalid("missing relationship Target"))?;
+    let mode = read("TargetMode")?.unwrap_or("Internal");
     if mode != "Internal" && mode != "External" {
         return Err(invalid("invalid relationship TargetMode"));
     }
@@ -1052,8 +1049,8 @@ fn validate_attributes<S: Scratch, D: crate::xml::dom::storage::Storage>(
     Ok(())
 }
 
-/// [`validate_attributes`] for a `Relationship` element, also admitting a
-/// Relationships-namespace `TargetMode` when `qualified_mode` is set.
+/// [`validate_attributes`] for a `Relationship` element, also admitting the
+/// Relationships-namespace forms of its attributes when `qualified_mode` is set.
 fn validate_relationship_attributes<S: Scratch, D: crate::xml::dom::storage::Storage>(
     node: Node<'_, '_, D>,
     qualified_mode: bool,
@@ -1066,7 +1063,7 @@ fn validate_relationship_attributes<S: Scratch, D: crate::xml::dom::storage::Sto
         budget.node_filter.charge(1)?;
         match attribute.namespace() {
             Some(MC) => {}
-            Some(REL) if attribute.name() == "TargetMode" => {}
+            Some(REL) if matches!(attribute.name(), "Id" | "Type" | "Target" | "TargetMode") => {}
             Some(uri) if uri != REL && ignorable(node, Some(uri), budget)? => {}
             None if matches!(attribute.name(), "Id" | "Type" | "Target" | "TargetMode") => {}
             _ => return Err(invalid("unexpected Relationships part attribute")),

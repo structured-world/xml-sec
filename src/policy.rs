@@ -1269,19 +1269,20 @@ pub enum XsltStylesheetSemantics {
     Libxmlsec1,
 }
 
-/// How the Relationship transform reads a `TargetMode` attribute bound to the
-/// Relationships namespace (`rel:TargetMode`).
+/// How the Relationship transform reads a `Relationship` attribute bound to
+/// the Relationships namespace (`rel:TargetMode`, `rel:Id`, `rel:Type`,
+/// `rel:Target`).
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum RelationshipTargetModeSemantics {
     /// ECMA-376 Part 2 schema: the attributes of `CT_Relationship` are
-    /// unqualified and no `anyAttribute` is declared, so a qualified
-    /// `TargetMode` is an unexpected attribute and the part is refused.
+    /// unqualified and no `anyAttribute` is declared, so a qualified one is
+    /// an unexpected attribute and the part is refused.
     #[default]
     Specification,
-    /// libxmlsec1: a Relationships-namespace `TargetMode` is the
-    /// `TargetMode` attribute; an unprefixed one present on the same element
-    /// takes precedence, and the output carries one unprefixed `TargetMode`.
+    /// libxmlsec1: a Relationships-namespace `TargetMode`, `Id`, `Type` or
+    /// `Target` is that attribute; an unprefixed one present on the same
+    /// element takes precedence, and the output carries it unprefixed.
     Libxmlsec1,
 }
 

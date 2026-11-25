@@ -401,7 +401,7 @@ pub(crate) unsafe extern "C" fn xmlSecEnsureEmptyChild(
                     here!("xmlSecEnsureEmptyChild"),
                     std::ptr::null(),
                     c"xmlSecAddChild or xmlSecAddNextSibling",
-                    &format!("node={}", CStr::from_ptr(name.cast()).to_string_lossy()),
+                    &format!("nodeName={}", CStr::from_ptr(name.cast()).to_string_lossy()),
                 );
             }
             cur

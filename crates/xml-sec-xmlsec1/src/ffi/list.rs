@@ -392,19 +392,21 @@ pub(crate) unsafe extern "C" fn xmlSecPtrListCopy(
         match (duplicate.is_some(), destroy.is_some()) {
             // Shared pointers that both lists would destroy.
             (false, true) => {
-                errors::internal(
+                errors::internal_with(
                     here,
                     name,
-                    c"list klass is not copyable (destroyItem set without duplicateItem)",
+                    c"xmlSecPtrListCopy",
+                    "list klass is not copyable (destroyItem set without duplicateItem)",
                 );
                 return -1;
             }
             // Copies that a failure halfway could not release.
             (true, false) => {
-                errors::internal(
+                errors::internal_with(
                     here,
                     name,
-                    c"list klass is not copyable (duplicateItem set without destroyItem)",
+                    c"xmlSecPtrListCopy",
+                    "list klass is not copyable (duplicateItem set without destroyItem)",
                 );
                 return -1;
             }

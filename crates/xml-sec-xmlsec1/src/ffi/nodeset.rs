@@ -600,15 +600,8 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetWalk(
             errors::assertion(here!("xmlSecNodeSetWalk"), c"walkFunc != NULL");
             return -1;
         };
-        let walk = Walk {
-            set,
-            callback,
-            data,
-            interrupted: Cell::new(false),
-        };
-        let walk_data = (&raw const walk).cast_mut().cast::<c_void>();
         // SAFETY: a live node set.
-        let starts = match unsafe { start_nodes(set) } {
+        let (starts, walker) = match unsafe { start_nodes(set) } {
             Some(listed) => {
                 let mut starts = Vec::new();
                 for node in nodes::node_set_members(listed) {
@@ -624,26 +617,62 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetWalk(
                         starts.push(node);
                     }
                 }
-                starts
+                (starts, true)
             }
-            None => children(member.doc),
+            None => (children(member.doc), false),
         };
-        for start in starts {
-            // SAFETY: the walk outlives the call.
-            if unsafe { xmlSecDepthFirstTreeWalk(start, Some(walk_node), walk_data) } < 0 {
-                errors::internal(
-                    here!("xmlSecNodeSetWalk"),
-                    std::ptr::null(),
-                    c"xmlSecNodeSetWalkRecursive",
-                );
-                return -1;
-            }
-            if walk.interrupted.get() {
-                break;
-            }
+        if walk_from(set, &starts, callback, data, walker) < 0 {
+            let name = if walker {
+                c"xmlSecNodeSetWalkFast"
+            } else {
+                c"xmlSecNodeSetWalkSlow"
+            };
+            errors::internal(here!("xmlSecNodeSetWalk"), std::ptr::null(), name);
+            return -1;
         }
         0
     })
+}
+
+/// Walks the subtrees of `starts` in order, calling `callback` for every
+/// node of `set`, until the callback interrupts: from listed nodes when
+/// `fast`, otherwise from the document's top-level nodes, as libxmlsec1's
+/// fast and slow walks report their failures.
+fn walk_from(
+    set: *mut XmlSecNodeSet,
+    starts: &[*mut XmlNode],
+    callback: unsafe extern "C" fn(
+        *mut XmlSecNodeSet,
+        *mut XmlNode,
+        *mut XmlNode,
+        *mut c_void,
+    ) -> c_int,
+    data: *mut c_void,
+    fast: bool,
+) -> c_int {
+    let walk = Walk {
+        set,
+        callback,
+        data,
+        interrupted: Cell::new(false),
+    };
+    let walk_data = (&raw const walk).cast_mut().cast::<c_void>();
+    for &start in starts {
+        // SAFETY: the walk outlives the call.
+        if unsafe { xmlSecDepthFirstTreeWalk(start, Some(walk_node), walk_data) } < 0 {
+            let here = if fast {
+                here!("xmlSecNodeSetWalkFast")
+            } else {
+                here!("xmlSecNodeSetWalkSlow")
+            };
+            errors::internal(here, std::ptr::null(), c"xmlSecNodeSetWalkRecursive");
+            return -1;
+        }
+        if walk.interrupted.get() {
+            break;
+        }
+    }
+    0
 }
 
 /// A text dump: its output buffer, and whether a write failed. A failed
@@ -703,6 +732,14 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetDumpTextNodes(
             c"nset != NULL",
             -1
         );
+        // SAFETY: the caller passes a live node set.
+        let doc = unsafe { (*set).doc };
+        check!(
+            !doc.is_null(),
+            "xmlSecNodeSetDumpTextNodes",
+            c"nset->doc != NULL",
+            -1
+        );
         check!(
             !out.is_null(),
             "xmlSecNodeSetDumpTextNodes",
@@ -713,14 +750,21 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetDumpTextNodes(
             out,
             failed: Cell::new(false),
         };
-        // SAFETY: as the caller passes; the dump outlives the walk.
-        let walked =
-            unsafe { xmlSecNodeSetWalk(set, Some(dump_text), (&raw const dump).cast_mut().cast()) };
+        // The whole document in document order: a walk from the listed
+        // nodes follows their list order, which an XPath result need not
+        // keep (libxmlsec1 forces its slow walk here).
+        let walked = walk_from(
+            set,
+            &children(doc),
+            dump_text,
+            (&raw const dump).cast_mut().cast(),
+            false,
+        );
         if walked < 0 {
             errors::internal(
                 here!("xmlSecNodeSetDumpTextNodes"),
                 std::ptr::null(),
-                c"xmlSecNodeSetWalk",
+                c"xmlSecNodeSetWalkSlow",
             );
             return -1;
         }
