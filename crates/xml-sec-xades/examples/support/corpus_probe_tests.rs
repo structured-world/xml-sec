@@ -1,6 +1,59 @@
 use super::{date_time, declarations, tokens};
 
 #[test]
+fn a_token_copied_into_another_property_keeps_that_propertys_result() {
+    // The same token bytes under an ArchiveTimeStamp stamp other input than
+    // under the SignatureTimeStamp they were made for; each property's own
+    // result applies, never the first one found for those bytes.
+    use xml_sec_xades::TimestampRole;
+    let token = vec![1, 2, 3];
+    let declared = super::etsi::Declared {
+        signature_timestamps: vec![token.clone()],
+        archive_timestamps: vec![token.clone()],
+        token_integrity: vec![
+            (TimestampRole::Signature, token.clone(), Some(true)),
+            (TimestampRole::Archive, token.clone(), Some(false)),
+        ],
+        ..super::etsi::Declared::default()
+    };
+    assert_eq!(
+        declared.intact(TimestampRole::Signature, 0, &token),
+        Some(true)
+    );
+    assert_eq!(
+        declared.intact(TimestampRole::Archive, 0, &token),
+        Some(false)
+    );
+    assert_eq!(declared.intact(TimestampRole::Archive, 0, &[9]), None);
+}
+
+#[test]
+fn a_refs_only_timestamp_is_told_apart_from_a_sig_and_refs_one() {
+    // A RefsOnlyTimeStamp covers the references alone, a SigAndRefs one also
+    // the signature value and its timestamps (TS 101 903 V1.4.2 7.5.1,
+    // 7.5.2): the two must reach the process under their own roles.
+    use xml_sec_xades::TimestampRole;
+    let declared = super::etsi::Declared {
+        validation_timestamps: vec![vec![1], vec![2], vec![3]],
+        refs_only: vec![false, true, false],
+        ..super::etsi::Declared::default()
+    };
+    let roles: Vec<_> = declared
+        .tokens()
+        .into_iter()
+        .map(|(role, occurrence, _)| (role, occurrence))
+        .collect();
+    assert_eq!(
+        roles,
+        [
+            (TimestampRole::SignatureAndReferences, 0),
+            (TimestampRole::ReferencesOnly, 0),
+            (TimestampRole::SignatureAndReferences, 1),
+        ]
+    );
+}
+
+#[test]
 fn a_reference_digest_the_profile_refuses_is_unknown_to_the_process() {
     // The strict profiles admit RSA-SHA224 signatures but not a SHA-224
     // reference digest; the one hash list of the constraints holds SHA-224

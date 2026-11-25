@@ -357,8 +357,9 @@ fn declarations(text: &str) -> Vec<etsi::Declared> {
                 };
                 match node.parent().map(|parent| parent.tag_name().name()) {
                     Some("SignatureTimeStamp") => declared.signature_timestamps.push(token),
-                    Some("SigAndRefsTimeStamp" | "RefsOnlyTimeStamp") => {
+                    Some(kind @ ("SigAndRefsTimeStamp" | "RefsOnlyTimeStamp")) => {
                         declared.validation_timestamps.push(token);
+                        declared.refs_only.push(kind == "RefsOnlyTimeStamp");
                     }
                     Some("ArchiveTimeStamp") => {
                         declared.archive_timestamps.push(token);
@@ -825,70 +826,77 @@ fn establish_timestamps(
     else {
         return Ok(());
     };
-    let anchors: Vec<Vec<u8>> = level_inputs
-        .anchors
+    // A token's own checks need neither the signer's path nor its validity
+    // when the token was generated, so no chain is checked here: each
+    // signature is verified with its signing certificate's key as the
+    // caller's own key for it, an archive timestamp made after that
+    // certificate expired stays checkable, and one signature's newer token
+    // never decides another's.
+    let carried: Vec<Vec<u8>> = level_inputs
+        .certificates
         .iter()
-        .map(|anchor| anchor.to_vec())
+        .map(|certificate| certificate.to_vec())
         .collect();
-    let resolver = DefaultKeyResolver::new(KeyResolverConfig {
-        trusted_certs: anchors,
-        ..KeyResolverConfig::default()
-    });
+    let direct = SigningKeys::new(declared, &carried);
     let context = VerifyContext::new()
-        .policy(profile_policy(PolicyProfile::XadesConformant, at, true)?)
-        .key_resolver(&resolver);
-    let inputs = Inputs {
-        requirements: Requirements::Timestamped,
-        ..*level_inputs
+        .policy(profile_policy(PolicyProfile::XadesConformant, at, false)?)
+        .key_resolver(&direct);
+    let bound = direct.bound(&context.signature_identities(document)?, declared);
+    let trusted: Vec<CallerTrustedSignatureKey<'_>> = bound
+        .iter()
+        .map(|(signature, key)| CallerTrustedSignatureKey {
+            signature: *signature,
+            key,
+        })
+        .collect();
+    let request = VerificationRequest {
+        expected_targets: request.expected_targets,
+        trusted_keys: &trusted,
+        ..VerificationRequest::default()
     };
-    let run = with_verified_request(document, &context, request, account, |session| {
+    let run = with_verified_request(document, &context, &request, account, |session| {
         for (index, entry) in session.evidence().signatures().iter().enumerate() {
             let Some(declared) = declared.get_mut(index) else {
                 continue;
             };
-            if entry.result().is_err() || declared.signature_timestamps.is_empty() {
+            if declared.tokens().is_empty() {
                 continue;
             }
             // Each token's own imprint and signature, checked token by token
             // (EN 319 102-1 V1.4.1 clause 5.4); its paths, statuses and the
-            // level's requirements are the ETSI process's to judge. A token
-            // without its signer's certificate establishes nothing, and a
-            // refusal before the tokens (the signer's path, a
-            // countersignature, the hashes) none of them. The archive
-            // timestamps are read where their level prepares them.
-            let mut levels = vec![Requirements::Timestamped];
-            if !declared.archive_timestamps.is_empty() {
-                levels.push(Requirements::Archival);
-            }
+            // level's requirements are the ETSI process's to judge. The
+            // archive level prepares every timestamp property; a signature
+            // without archive timestamps is read at B-T.
+            let levels = if declared.archive_timestamps.is_empty() {
+                &[Requirements::Timestamped][..]
+            } else {
+                &[Requirements::Archival, Requirements::Timestamped][..]
+            };
             for requirements in levels {
                 let checked = check_tokens(
                     &session,
                     entry.identity(),
                     &Inputs {
-                        requirements,
-                        ..inputs
+                        requirements: *requirements,
+                        ..*level_inputs
                     },
                     |results| {
                         results
                             .iter()
-                            .filter(|result| result.signature() == entry.identity())
-                            .filter_map(|result| {
+                            .map(|result| {
                                 let intact = match result.integrity() {
-                                    TokenIntegrity::Intact => true,
-                                    TokenIntegrity::Rejected => false,
-                                    TokenIntegrity::MissingSigner => return None,
+                                    TokenIntegrity::Intact => Some(true),
+                                    TokenIntegrity::Rejected => Some(false),
+                                    TokenIntegrity::MissingSigner => None,
                                 };
-                                Some((result.token().to_vec(), intact))
+                                (result.role(), result.token().to_vec(), intact)
                             })
                             .collect::<Vec<_>>()
                     },
                 );
                 if let Ok(Outcome::Assessed(found)) = checked {
-                    for (token, intact) in found {
-                        if declared.intact(&token).is_none() {
-                            declared.token_integrity.push((token, intact));
-                        }
-                    }
+                    declared.token_integrity = found;
+                    break;
                 }
             }
         }

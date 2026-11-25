@@ -6,10 +6,10 @@
 use super::{History, Record, TokenFacts, instant};
 use structured_asn1::memory::Memory;
 use structured_ltv::validation::long_term::{
-    self, Candidate, Inputs, Member, Object, RetryCause, Revocation, RevocationCheck,
-    RevocationData, Signature, Stage, Timestamp, Validity, ValidityModel,
+    self, Candidate, Inputs, Member, RetryCause, Revocation, RevocationCheck, RevocationData,
+    Signature, Stage, Timestamp, Validity, ValidityModel,
 };
-pub(super) use structured_ltv::validation::long_term::{Covered, Decision};
+pub(super) use structured_ltv::validation::long_term::{Covered, Decision, Object};
 use structured_ltv::validation::{Chain, Facts, Requirements};
 use structured_pkix::Certificate;
 

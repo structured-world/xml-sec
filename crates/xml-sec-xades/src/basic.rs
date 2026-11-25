@@ -337,7 +337,7 @@ fn counter_fact<R>(error: CounterError) -> Result<Outcome<R>, ValidationError> {
 /// countersigned-value reference from `DataObjectFormat` coverage, and only
 /// this binding proves which reference covers the parent's `SignatureValue`.
 /// <https://www.etsi.org/deliver/etsi_en/319100_319199/31913201/01.03.01_60/en_31913201v010301p.pdf>
-fn enclosing_counter<'a, 'v, 's, 'i, W: Work, Q: Work>(
+pub(crate) fn enclosing_counter<'a, 'v, 's, 'i, W: Work, Q: Work>(
     document: &Document<'a, 'v, 's, 'i, W>,
     access: &Access<'_, Document<'a, 'v, 's, 'i, W>, Q>,
     signature: NodeIdentity,

@@ -238,6 +238,136 @@ fn every_token_is_checked_whatever_another_shows() {
 }
 
 #[test]
+fn a_token_stays_checkable_after_the_signers_certificate_expired() {
+    // A token's own checks are its imprint over the verified signature and
+    // its TSA's signature; long after every certificate of the signer's
+    // chain expired, which is what the token preserves, they still answer.
+    // The level needs the signer's path there and cannot be assessed.
+    let expired = 4_000_000_000;
+    let level = level_at(B_T, expired);
+    assert!(!matches!(level, Ok(Outcome::Assessed(true))), "{level:?}");
+    let checked = signer_trusted_integrities(B_T, expired);
+    assert!(
+        matches!(&checked, Ok(Outcome::Assessed(found)) if found == &[TokenIntegrity::Intact]),
+        "{checked:?}"
+    );
+}
+
+/// [`check_tokens`] over the first signature of `xml`, verified at `at` with
+/// its `KeyInfo` certificate's key as the caller's own trusted key for that
+/// signature, so no chain of the signer is checked.
+fn signer_trusted_integrities(
+    xml: &str,
+    at: i64,
+) -> Result<Outcome<Vec<TokenIntegrity>>, ValidationError> {
+    use xml_sec::xmldsig::{CallerTrustedSignatureKey, SignatureAlgorithm, VerificationKey};
+    let source = roxmltree::Document::parse(xml).expect("fixture parses");
+    let element = |name: &str| {
+        source
+            .descendants()
+            .find(|node| node.tag_name().name() == name)
+            .expect("the fixture names its signer")
+    };
+    let der = structured_base64::STANDARD
+        .decode(
+            element("X509Certificate")
+                .text()
+                .unwrap_or_default()
+                .split_ascii_whitespace()
+                .collect::<String>()
+                .as_bytes(),
+        )
+        .expect("base64 certificate");
+    let algorithm = element("SignatureMethod")
+        .attribute("Algorithm")
+        .and_then(SignatureAlgorithm::from_uri)
+        .expect("a known signature method");
+    let parser =
+        structured_asn1::Parser::der(Memory::new(Arc::new(MemoryAccount::new(AMPLE.0, AMPLE.1))));
+    let certificate =
+        structured_pkix::Certificate::read(&parser, &der, 0).expect("the signer certificate reads");
+    let key = VerificationKey {
+        algorithm,
+        public_key_bytes: certificate.tbs().public_key().as_bytes().to_vec(),
+        certificate_der: Some(der.clone()),
+        name: None,
+    };
+    let mut policy = VerificationPolicy::default();
+    policy.key_trust.verify_x509_chains = false;
+    policy.key_trust.verification_time = Instant::new(at, 0);
+    let context = VerifyContext::new().policy(policy);
+    let document = XmlDocument::parse(xml).expect("fixture parses");
+    let keys = [CallerTrustedSignatureKey {
+        signature: context
+            .signature_identities(&document)
+            .expect("one signature")[0],
+        key: &key,
+    }];
+    let request = VerificationRequest {
+        trusted_keys: &keys,
+        ..VerificationRequest::default()
+    };
+    let account = Memory::new(Arc::new(MemoryAccount::new(AMPLE.0, AMPLE.1)));
+    let utc = LeapTable::new(-2_208_988_800, 4_102_444_800, &[]).expect("UTC coverage");
+    with_verified_request(&document, &context, &request, &account, |session| {
+        let signature = session.evidence().signatures()[0].identity();
+        let inputs = Inputs {
+            requirements: Requirements::Timestamped,
+            anchors: &[ROOT],
+            certificates: &[],
+            utc: &utc,
+            accuracies: &[],
+            responders: &[],
+            crls: &[],
+            responses: &[],
+        };
+        Ok(check_tokens(&session, signature, &inputs, |results| {
+            results.iter().map(TokenResult::integrity).collect()
+        }))
+    })
+    .expect("fixture verifies as XMLDSig")
+}
+
+/// Whether B-T holds for the first signature of `xml` with its chain
+/// checked at `at`, or what stopped it.
+fn level_at(xml: &str, at: i64) -> Result<Outcome<bool>, String> {
+    let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+        trusted_certs: vec![ROOT.to_vec()],
+        ..KeyResolverConfig::default()
+    });
+    let mut policy = VerificationPolicy::default();
+    policy.key_trust.verify_x509_chains = true;
+    policy.key_trust.verification_time = Instant::new(at, 0);
+    let context = VerifyContext::new().policy(policy).key_resolver(&resolver);
+    let document = XmlDocument::parse(xml).expect("fixture parses");
+    let account = Memory::new(Arc::new(MemoryAccount::new(AMPLE.0, AMPLE.1)));
+    let utc = LeapTable::new(-2_208_988_800, 4_102_444_800, &[]).expect("UTC coverage");
+    with_verified_request(
+        &document,
+        &context,
+        &VerificationRequest::default(),
+        &account,
+        |session| {
+            let signature = session.evidence().signatures()[0].identity();
+            let inputs = Inputs {
+                requirements: Requirements::Timestamped,
+                anchors: &[ROOT],
+                certificates: &[],
+                utc: &utc,
+                accuracies: &[],
+                responders: &[],
+                crls: &[],
+                responses: &[],
+            };
+            Ok(validate(&session, signature, &inputs, all_met)
+                .map_err(|error| format!("{error:?}")))
+        },
+    )
+    .map_err(|error| format!("{error:?}"))
+    .and_then(core::convert::identity)
+}
+
+#[test]
 fn a_real_timestamp_token_meets_b_t() {
     // OpenSSL's TSA stamped libxml2's canonical SignatureValue: the imprint,
     // the CMS signature and the TSA path to the caller's anchor all hold.

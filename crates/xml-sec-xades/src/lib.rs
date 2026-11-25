@@ -74,6 +74,7 @@ mod path;
 mod placement;
 mod signature;
 mod status;
+mod tokens;
 mod ts101903;
 mod xml;
 
@@ -97,13 +98,13 @@ pub use create::{
 #[cfg(feature = "produce")]
 pub use draft::{Draft, DraftError};
 pub use level::{
-    ConfiguredResponder, Inputs, Level, NoCredential, RenewalFailure, TimestampFailure,
-    TokenIntegrity, TokenResult, check_tokens, validate,
+    ConfiguredResponder, Inputs, Level, NoCredential, RenewalFailure, TimestampFailure, validate,
 };
 pub use path::CounterPathError;
 pub use status::{StatusError, StatusFailure};
 pub use structured_xades::container::Syntax;
 pub use structured_xades::unsigned::Requirements;
+pub use tokens::{TimestampRole, TokenIntegrity, TokenResult, check_tokens};
 pub use ts101903::{Ts101903Error, Ts101903Report, validate_ts101903};
 
 /// Original document identity and generation, as seen by the shared core.
