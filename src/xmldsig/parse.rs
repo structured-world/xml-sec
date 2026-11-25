@@ -28,7 +28,9 @@ use alloc::{
 
 #[cfg(test)]
 use super::digest::compute_digest;
-use super::digest::{DigestAlgorithm, compute_digest_with_provider, constant_time_eq};
+use super::digest::{
+    DigestAlgorithm, MAX_DIGEST_OUTPUT, compute_digest_with_provider, constant_time_eq,
+};
 use super::pkix::X509DataSource;
 use super::transforms::{self, Transform};
 use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_text};
@@ -920,19 +922,6 @@ pub enum ParseError {
     #[error("base64 decode error: {0}")]
     Base64(String),
 
-    /// `DigestValue` length did not match the declared `DigestMethod`.
-    #[error(
-        "digest length mismatch for {algorithm}: expected {expected} bytes, got {actual} bytes"
-    )]
-    DigestLengthMismatch {
-        /// Digest algorithm URI/name used for diagnostics.
-        algorithm: &'static str,
-        /// Expected decoded digest length in bytes.
-        expected: usize,
-        /// Actual decoded digest length in bytes.
-        actual: usize,
-    },
-
     /// Transform parsing error.
     #[error("transform error: {0}")]
     Transform(#[from] super::types::TransformError),
@@ -1438,9 +1427,9 @@ fn parse_reference_with_pending_digest(
         .find(|(node, _)| *node == digest_value_node.id())
         .filter(|_| digest_value_node.children().next().is_none());
     let digest_value = if let Some((_, content)) = pending {
-        base64_decode_digest(content, digest_method)?
+        base64_decode_digest(content)?
     } else {
-        decode_digest_value_children(digest_value_node, digest_method)?
+        decode_digest_value_children(digest_value_node)?
     };
     finish_reference_children(&mut children)?;
 
@@ -4269,9 +4258,12 @@ fn parse_x509_issuer_serial(node: Node<'_, '_>) -> Result<(String, String), Pars
 /// Base64-decode a digest value string, stripping whitespace.
 ///
 /// `XMLDSig` allows whitespace within base64 content (line-wrapped encodings).
-fn base64_decode_digest(b64: &str, digest_method: DigestAlgorithm) -> Result<Vec<u8>, ParseError> {
-    decode_digest_text(b64, digest_method, [b64.as_bytes()])
+fn base64_decode_digest(b64: &str) -> Result<Vec<u8>, ParseError> {
+    decode_digest_text(b64, [b64.as_bytes()])
 }
+
+/// The longest base64 text a `DigestValue` can match a digest with.
+const MAX_DIGEST_VALUE_BASE64: usize = MAX_DIGEST_OUTPUT.div_ceil(3) * 4;
 
 /// A Base64 decoding failure of the text `texts` hold, as a parse error that
 /// locates it in that text.
@@ -4288,45 +4280,34 @@ fn located_base64_error<'t>(
 }
 
 /// Decode `b64`, the whitespace-normalized or raw text of `texts`.
+///
+/// A value of another length than its `DigestMethod`'s output is kept: it is
+/// base64Binary as the schema requires and fails reference validation, not
+/// parsing (`XMLDSig` Core 1.1 §3.2.1 step 2). One longer than any digest
+/// matches none and is refused before it is decoded.
 fn decode_digest_text<'t>(
     b64: &str,
-    digest_method: DigestAlgorithm,
     texts: impl IntoIterator<Item = &'t [u8]>,
 ) -> Result<Vec<u8>, ParseError> {
-    let expected = digest_method.output_len();
-    let max_base64_len = expected.div_ceil(3) * 4;
-    let mut cleaned = String::with_capacity(b64.len().min(max_base64_len));
+    let mut cleaned = String::with_capacity(b64.len().min(MAX_DIGEST_VALUE_BASE64));
     normalize_xml_base64_text(b64, &mut cleaned).map_err(|err| {
         ParseError::Base64(format!(
             "invalid XML whitespace U+{:04X} in DigestValue",
             err.invalid_byte
         ))
     })?;
-    if cleaned.len() > max_base64_len {
+    if cleaned.len() > MAX_DIGEST_VALUE_BASE64 {
         return Err(ParseError::Base64(
             "DigestValue exceeds maximum allowed base64 length".into(),
         ));
     }
-    let digest = structured_base64::STANDARD
+    structured_base64::STANDARD
         .decode(cleaned.as_bytes())
-        .map_err(|error| located_base64_error(error, texts))?;
-    let actual = digest.len();
-    if actual != expected {
-        return Err(ParseError::DigestLengthMismatch {
-            algorithm: digest_method.uri(),
-            expected,
-            actual,
-        });
-    }
-    Ok(digest)
+        .map_err(|error| located_base64_error(error, texts))
 }
 
-fn decode_digest_value_children(
-    digest_value_node: Node<'_, '_>,
-    digest_method: DigestAlgorithm,
-) -> Result<Vec<u8>, ParseError> {
-    let max_base64_len = digest_method.output_len().div_ceil(3) * 4;
-    let mut cleaned = String::with_capacity(max_base64_len);
+fn decode_digest_value_children(digest_value_node: Node<'_, '_>) -> Result<Vec<u8>, ParseError> {
+    let mut cleaned = String::with_capacity(MAX_DIGEST_VALUE_BASE64);
 
     for child in digest_value_node.children() {
         if child.is_element() {
@@ -4341,7 +4322,7 @@ fn decode_digest_value_children(
                     err.invalid_byte
                 ))
             })?;
-            if cleaned.len() > max_base64_len {
+            if cleaned.len() > MAX_DIGEST_VALUE_BASE64 {
                 return Err(ParseError::Base64(
                     "DigestValue exceeds maximum allowed base64 length".into(),
                 ));
@@ -4351,7 +4332,6 @@ fn decode_digest_value_children(
 
     decode_digest_text(
         &cleaned,
-        digest_method,
         digest_value_node
             .children()
             .filter_map(Node::text)
@@ -7545,26 +7525,34 @@ BA== </Modulus>
     }
 
     #[test]
-    fn digest_value_length_must_match_digest_method() {
-        let xml = r#"<SignedInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+    fn digest_value_of_another_length_is_kept_for_reference_validation() {
+        // XMLDSig Core 1.1 §3.2.1 step 2: a DigestValue that does not match
+        // the digest fails reference validation; its schema type is
+        // base64Binary of any length, so the SignedInfo still parses. A value
+        // as long as the longest digest is kept, though it names SHA-256.
+        let doc = |value: &str| {
+            format!(
+                r#"<SignedInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
             <CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
             <SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
             <Reference URI="">
                 <DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
-                <DigestValue>dGVzdA==</DigestValue>
+                <DigestValue>{value}</DigestValue>
             </Reference>
-        </SignedInfo>"#;
-        let doc = Document::parse(xml).unwrap();
-
-        let result = parse_signed_info(doc.root_element());
-        assert!(matches!(
-            result.unwrap_err(),
-            ParseError::DigestLengthMismatch {
-                algorithm: "http://www.w3.org/2001/04/xmlenc#sha256",
-                expected: 32,
-                actual: 4,
-            }
-        ));
+        </SignedInfo>"#
+            )
+        };
+        let short = doc("dGVzdA==");
+        let parsed = parse_signed_info(Document::parse(&short).unwrap().root_element()).unwrap();
+        assert_eq!(parsed.references[0].digest_value, b"test");
+        let longest = doc(&structured_base64::STANDARD
+            .encode(&[7_u8; MAX_DIGEST_OUTPUT])
+            .expect("a digest-sized value encodes"));
+        let parsed = parse_signed_info(Document::parse(&longest).unwrap().root_element()).unwrap();
+        assert_eq!(
+            parsed.references[0].digest_value,
+            vec![7_u8; MAX_DIGEST_OUTPUT]
+        );
     }
 
     #[test]
@@ -7681,19 +7669,15 @@ BA== </Modulus>
 
     #[test]
     fn base64_decode_digest_accepts_xml_whitespace_chars() {
-        let digest =
-            base64_decode_digest("AAAA\tAAAA\rAAAA\nAAAA AAAAAAAAAAA=", DigestAlgorithm::Sha1)
-                .expect("XML whitespace in DigestValue must be accepted");
+        let digest = base64_decode_digest("AAAA\tAAAA\rAAAA\nAAAA AAAAAAAAAAA=")
+            .expect("XML whitespace in DigestValue must be accepted");
         assert_eq!(digest, vec![0u8; 20]);
     }
 
     #[test]
     fn base64_decode_digest_rejects_non_xml_ascii_whitespace() {
-        let err = base64_decode_digest(
-            "AAAA\u{000C}AAAAAAAAAAAAAAAAAAAAAAA=",
-            DigestAlgorithm::Sha1,
-        )
-        .expect_err("form-feed/vertical-tab in DigestValue must be rejected");
+        let err = base64_decode_digest("AAAA\u{000C}AAAAAAAAAAAAAAAAAAAAAAA=")
+            .expect_err("form-feed/vertical-tab in DigestValue must be rejected");
         assert!(matches!(err, ParseError::Base64(_)));
     }
 
@@ -7704,7 +7688,7 @@ BA== </Modulus>
         let located = |error: structured_base64::Base64Error| ParseError::Base64(error.to_string());
         let digest = Document::parse("<DigestValue>AAAA \n!AAA</DigestValue>").unwrap();
         assert_eq!(
-            decode_digest_value_children(digest.root_element(), DigestAlgorithm::Sha1)
+            decode_digest_value_children(digest.root_element())
                 .unwrap_err()
                 .to_string(),
             located(structured_base64::Base64Error::InvalidByte(6, b'!')).to_string()
@@ -7718,16 +7702,17 @@ BA== </Modulus>
             located(structured_base64::Base64Error::InvalidByte(4, b'!')).to_string()
         );
         assert_eq!(
-            base64_decode_digest("AAAA\tQ R==", DigestAlgorithm::Sha1)
-                .unwrap_err()
-                .to_string(),
+            base64_decode_digest("AAAA\tQ R==").unwrap_err().to_string(),
             located(structured_base64::Base64Error::InvalidLastSymbol(7, b'R')).to_string()
         );
     }
 
     #[test]
     fn base64_decode_digest_rejects_oversized_base64_before_decode() {
-        let err = base64_decode_digest("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", DigestAlgorithm::Sha1)
+        // Longer than the longest digest's encoding: no digest can match, and
+        // reading it would only spend memory.
+        let oversized = "A".repeat(MAX_DIGEST_OUTPUT.div_ceil(3) * 4 + 4);
+        let err = base64_decode_digest(&oversized)
             .expect_err("oversized DigestValue base64 must fail before decode");
         match err {
             ParseError::Base64(message) => {

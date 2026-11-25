@@ -264,8 +264,7 @@ impl<'e, 'x, W: Work> Engine<'e, 'x, '_, '_, '_, W> {
         extra: &mut OwnedVec<CheckedPath<'x>, structured_asn1::memory::Memory>,
     ) -> Result<Result<usize, PathFailure>, StatusError> {
         for (index, path) in extra.iter().enumerate() {
-            let member = path.members().last().expect("a checked path has a target");
-            if member.certificate().as_bytes() == target.as_bytes() {
+            if path.target().certificate().as_bytes() == target.as_bytes() {
                 return Ok(Ok(roots + index));
             }
         }

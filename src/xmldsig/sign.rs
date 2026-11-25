@@ -2027,7 +2027,12 @@ impl<'a> SignContext<'a> {
             )?;
             parse_signature_children(signature)
                 .map_err(|error| SigningDigestError::InvalidStructure(error.to_string()))?;
-            self.policy.signature_constraints.check(signature, budget)?;
+            // Signing writes ETSI EN 319 132-1 only.
+            self.policy.signature_constraints.check(
+                crate::policy::XadesSyntax::En319132,
+                signature,
+                budget,
+            )?;
             let (algorithm, output_bits, canonicalization) =
                 validate_signing_signed_info_methods(signature, &self.policy)?;
             self.policy.check_signature_algorithm(algorithm)?;

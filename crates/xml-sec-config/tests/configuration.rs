@@ -371,6 +371,35 @@ fn a_profile_overlay_cannot_relax_the_timestamp_token_encoding() {
 }
 
 #[test]
+fn a_profile_overlay_narrows_but_cannot_widen_the_xades_syntax() {
+    // XadesConformant also reads ETSI TS 101 903 V1.2.2; an overlay may keep
+    // EN 319 132-1 alone, and cannot add V1.2.2 to a profile without it.
+    use xml_sec::policy::XadesSyntax;
+    let syntax = |base: &str, value: &str| {
+        let config = Configuration::from_str(
+            &format!(
+                "schema_version=1\n[profiles.team]\nbase='{base}'\n[profiles.team.verification]\nxades_syntax='{value}'"
+            ),
+            LoadLimits::default(),
+        )
+        .unwrap();
+        let policy = effective(&config, "team");
+        let output = policy.to_toml().unwrap();
+        (
+            policy.compiled().verification().unwrap().xades_syntax,
+            output,
+        )
+    };
+    let (narrowed, output) = syntax("XadesConformant", "En319132");
+    assert_eq!(narrowed, XadesSyntax::En319132);
+    assert!(output.contains("xades_syntax = \"En319132\""), "{output}");
+    let (kept, _) = syntax("XadesConformant", "WithTs101903V122");
+    assert_eq!(kept, XadesSyntax::WithTs101903V122);
+    let (refused, _) = syntax("Xades", "WithTs101903V122");
+    assert_eq!(refused, XadesSyntax::En319132);
+}
+
+#[test]
 fn bounded_readers_and_paths_admit_bytes_before_parsing() {
     // The exact boundary passes, one extra byte fails without heap growth for
     // that byte, and caller-selected paths are the only files consulted.

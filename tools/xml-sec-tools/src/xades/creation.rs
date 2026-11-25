@@ -252,8 +252,7 @@ pub(crate) fn execute(corpus: &Corpus, results: &Path) -> Result<(), String> {
         probe.extend(line(&[&fixtures.join(directory), &signed]));
         corpus.require(&probe, &results.join(example))?;
     }
-    super::dss::build(corpus, results)?;
-    let classpath = super::dss::classpath(corpus)?;
+    let classpath = super::dss::build(corpus, results)?.classpath;
     let mut summary = Vec::new();
     for case in &CASES {
         let reports = results.join(case.name);

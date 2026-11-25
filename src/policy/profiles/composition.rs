@@ -5,7 +5,7 @@ use crate::policy::{
     KeyEstablishmentPolicy, KeySourcePolicy, KeyTrustPolicy, ManifestProcessing, PolicyViolation,
     ResourcePolicy, RsaKeyPolicy, RsaPssPermission, SigningPolicy, TimestampTokenEncoding,
     TransformPolicy, TrustAnchorSigner, UriPolicy, VerificationPolicy, VerificationTrustMode,
-    XmlInputPolicy,
+    XadesSyntax, XmlInputPolicy,
 };
 #[cfg(feature = "xmlenc")]
 use crate::policy::{
@@ -504,6 +504,10 @@ fn key_trust(a: &KeyTrustPolicy, b: &KeyTrustPolicy) -> Result<KeyTrustPolicy, P
         } else {
             TrustAnchorSigner::Validated
         },
+        // Neither model is narrower: chain accepts a path through an issuer
+        // that expired after issuing, shell one that issued before its own
+        // validity began. Layers must agree.
+        validity_model: equal(a.validity_model, b.validity_model)?,
     })
 }
 
@@ -568,10 +572,21 @@ fn verification(
             a.timestamp_token_encoding,
             b.timestamp_token_encoding,
         ),
+        xades_syntax: xades_syntax(a.xades_syntax, b.xades_syntax),
         xml: xml(a.xml, b.xml)?,
         resources: resources(&a.resources, &b.resources),
     })
 }
+
+/// TS 101 903 V1.2.2 is read only when both layers read it.
+fn xades_syntax(a: XadesSyntax, b: XadesSyntax) -> XadesSyntax {
+    if a == XadesSyntax::WithTs101903V122 && b == XadesSyntax::WithTs101903V122 {
+        XadesSyntax::WithTs101903V122
+    } else {
+        XadesSyntax::En319132
+    }
+}
+
 /// BER is read only when both layers read it.
 fn token_encoding(a: TimestampTokenEncoding, b: TimestampTokenEncoding) -> TimestampTokenEncoding {
     if a == TimestampTokenEncoding::Ber && b == TimestampTokenEncoding::Ber {

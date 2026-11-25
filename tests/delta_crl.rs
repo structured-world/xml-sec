@@ -199,6 +199,7 @@ fn verify_with_utc(info: &X509DataInfo, root: &Issuer, utc: bool) -> Result<(), 
             rsa_keys: xml_sec::policy::RsaKeyPolicy::default(),
             dsa_keys: xml_sec::policy::DsaKeyPolicy::default(),
             certificate_signature_algorithms: None,
+            validity_model: xml_sec::policy::CertificateValidityModel::Shell,
         },
     )
 }
@@ -468,6 +469,7 @@ fn exhausted_work_during_delta_evaluation_stays_a_resource_refusal() {
         rsa_keys: xml_sec::policy::RsaKeyPolicy::default(),
         dsa_keys: xml_sec::policy::DsaKeyPolicy::default(),
         certificate_signature_algorithms: None,
+        validity_model: xml_sec::policy::CertificateValidityModel::Shell,
     };
     let mut completed = false;
     for max_x509_work in (1..200_000).step_by(64) {
@@ -524,6 +526,7 @@ fn openssl_pair(delta: &[u8]) -> Result<(), X509ChainError> {
             rsa_keys: xml_sec::policy::RsaKeyPolicy::default(),
             dsa_keys: xml_sec::policy::DsaKeyPolicy::default(),
             certificate_signature_algorithms: None,
+            validity_model: xml_sec::policy::CertificateValidityModel::Shell,
         },
     )
 }

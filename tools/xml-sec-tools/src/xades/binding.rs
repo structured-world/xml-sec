@@ -3,7 +3,7 @@
 //! without changing either engine, on independently signed minimal inputs.
 
 use super::corpus::base64;
-use super::dss::{classpath, maven, tools};
+use super::dss::build;
 use super::{
     Corpus, DS, EXC, SP, absolute, compare, debug_buffer, digest, line, read, write, write_json,
     xml,
@@ -262,20 +262,7 @@ fn strict_policy(corpus: &Corpus, output: &Path) -> Result<(), String> {
     let summary: Value = serde_json::from_str(&xml::read(&output.join("summary.json"))?)
         .map_err(|error| error.to_string())?;
     let package = corpus.package();
-    let build = line(&[
-        &maven(corpus),
-        &"-B",
-        &"-o",
-        &"-f",
-        &package.join("dss/pom.xml"),
-        &format!(
-            "-Dmaven.repo.local={}",
-            tools(corpus).join("repository").display()
-        ),
-        &"compile",
-    ]);
-    corpus.require(&build, &output.join("dss-strict-build"))?;
-    let classpath = classpath(corpus)?;
+    let classpath = build(corpus, &output.join("dss-strict-build"))?.classpath;
     let mut results = Vec::new();
     for case in summary["cases"].as_array().into_iter().flatten() {
         let name = case["name"].as_str().ok_or("case without a name")?;
@@ -422,29 +409,8 @@ fn investigate(corpus: &Corpus, output: &Path, generate: bool) -> Result<(), Str
     std::fs::create_dir_all(output)
         .map_err(|error| format!("create {}: {error}", output.display()))?;
     let binary = corpus.build_probe(&output.join("rust-build"))?;
-    let mvn = maven(corpus);
-    require(
-        mvn.exists(),
-        "first bootstrap the pinned oracle with `xades dss`",
-    )?;
     let package = corpus.package();
-    let tools = tools(corpus);
-    let build = line(&[
-        &mvn,
-        &"-B",
-        &"-o",
-        &"-f",
-        &package.join("dss/pom.xml"),
-        &format!("-Dmaven.repo.local={}", tools.join("repository").display()),
-        &"compile",
-        &"dependency:build-classpath",
-        &format!(
-            "-Dmdep.outputFile={}",
-            tools.join("classpath.txt").display()
-        ),
-    ]);
-    corpus.require(&build, &output.join("dss-build"))?;
-    let classpath = classpath(corpus)?;
+    let classpath = build(corpus, &output.join("dss-build"))?.classpath;
     let setup = Setup {
         output,
         binary: &binary,
