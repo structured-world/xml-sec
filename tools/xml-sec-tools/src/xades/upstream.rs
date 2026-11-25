@@ -307,8 +307,25 @@ pub(crate) fn our_blocks(facts: &Value, stamped: bool) -> Map<String, Value> {
             format!("trust {}", verification["trust"]),
         ),
     );
-    let basic = &facts["basic"];
-    if let Some(bound) = basic["bound"].as_bool() {
+    // A TS 101 903 V1.2.2 signature has BES facts in place of EN 319 132-1
+    // B-B ones: they decide whether its signing certificate is protected.
+    let bes = &facts["ts101903_bes"];
+    let basic = if bes.is_null() { &facts["basic"] } else { bes };
+    if let Some(met) = bes["assessed"].as_bool() {
+        blocks.insert(
+            "FC".into(),
+            verdict("pass", "TS 101 903 V1.2.2 properties prepared"),
+        );
+        for block in ["ISC", "SAV"] {
+            blocks.insert(
+                block.into(),
+                verdict(
+                    if met { "pass" } else { "fail" },
+                    "TS 101 903 V1.2.2 BES requirements",
+                ),
+            );
+        }
+    } else if let Some(bound) = basic["bound"].as_bool() {
         blocks.insert(
             "FC".into(),
             verdict("pass", "qualifying properties prepared"),

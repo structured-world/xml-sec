@@ -46,7 +46,8 @@ use xml_sec::xmldsig::{
     VerificationKey, VerificationRequest, VerifyContext, VerifyingKey, with_verified_request,
 };
 use xml_sec_xades::{
-    EnclosingError, Inputs, Level, Outcome, Requirements, ValidationError, validate, validate_basic,
+    EnclosingError, Inputs, Level, Outcome, Requirements, Syntax, ValidationError, validate,
+    validate_basic, validate_ts101903,
 };
 
 type Failure = Box<dyn std::error::Error>;
@@ -716,6 +717,19 @@ fn level_facts<'i, W: structured_asn1::memory::Work>(
     }) {
         Ok(Outcome::Assessed((bound, included, met))) => {
             json!({ "bound": bound, "included": included, "assessed": met })
+        }
+        // EN 319 132-1 levels do not apply to a TS 101 903 V1.2.2 signature;
+        // its BES form (V1.2.2 section 4.4.1) is what it can meet.
+        Ok(Outcome::Syntax {
+            syntax: Syntax::Ts101903V122,
+            ..
+        }) => {
+            return vec![(
+                "ts101903_bes",
+                level(validate_ts101903(session, identity, caller, |report| {
+                    report.bes_met()
+                })),
+            )];
         }
         other => level(other.map(|outcome| outcome.map(|_| false))),
     };

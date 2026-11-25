@@ -99,6 +99,26 @@ fn a_policy_refusal_lands_on_the_block_it_concerns() {
 }
 
 #[test]
+fn a_ts_101_903_signature_is_read_by_its_bes_facts() {
+    // EN 319 132-1 B-B does not apply to a TS 101 903 V1.2.2 signature; its
+    // BES facts decide the format, signing-certificate and acceptance blocks.
+    let facts = |met: bool| {
+        json!({
+            "verification": { "status": "Valid", "trust": "ValidatedX509", "references": ["Valid"] },
+            "ts101903_bes": { "assessed": met },
+        })
+    };
+    let met = our_blocks(&facts(true), false);
+    for name in ["FC", "ISC", "SAV"] {
+        assert_eq!(met[name]["verdict"], "pass", "{name}");
+    }
+    let unmet = our_blocks(&facts(false), false);
+    assert_eq!(unmet["FC"]["verdict"], "pass");
+    assert_eq!(unmet["ISC"]["verdict"], "fail");
+    assert_eq!(unmet["SAV"]["verdict"], "fail");
+}
+
+#[test]
 fn agreement_is_the_overall_indication_and_sub_indication() {
     // The verdict compared is DSS's simple report against the ETSI process
     // over xml-sec's facts; the blocks only diagnose a difference, so an

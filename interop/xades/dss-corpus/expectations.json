@@ -2141,11 +2141,11 @@
       "instant/conformant": {
         "observed": [
           {
-            "FC": "PASSED/fail",
-            "ISC": "PASSED/not-reached",
+            "FC": "PASSED/pass",
+            "ISC": "PASSED/pass",
             "CV": "PASSED/pass",
             "XCV": "PASSED/pass",
-            "SAV": "PASSED/not-reached",
+            "SAV": "PASSED/pass",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
