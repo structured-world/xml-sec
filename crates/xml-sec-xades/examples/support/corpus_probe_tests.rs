@@ -1,6 +1,24 @@
 use super::{date_time, declarations, tokens};
 
 #[test]
+fn a_reference_digest_the_profile_refuses_is_unknown_to_the_process() {
+    // The strict profiles admit RSA-SHA224 signatures but not a SHA-224
+    // reference digest; the one hash list of the constraints holds SHA-224
+    // for the suite, so the reference digest must not be presented as it.
+    use structured_ltv::validation::Hash;
+    let references = [Hash::Sha256, Hash::Sha384, Hash::Sha512];
+    assert_eq!(
+        super::etsi::reference_hash(Some(DigestAlgorithm::Sha224), &references),
+        Hash::Other
+    );
+    assert_eq!(
+        super::etsi::reference_hash(Some(DigestAlgorithm::Sha256), &references),
+        Hash::Sha256
+    );
+    assert_eq!(super::etsi::reference_hash(None, &references), Hash::Other);
+}
+
+#[test]
 fn certificate_values_join_the_pool() {
     // EN 319 132-1 section 5.5.1: CertificateValues carries the issuers as
     // EncapsulatedX509Certificate; without them a signer in KeyInfo would

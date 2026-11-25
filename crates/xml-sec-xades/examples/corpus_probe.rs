@@ -439,6 +439,11 @@ struct Rules {
     hashes: Vec<structured_ltv::validation::HashRule>,
     schemes: Vec<structured_ltv::validation::SchemeRule>,
     suites: Vec<(Family, Vec<Hash>)>,
+    /// The digests the profile accepts in a `Reference`. The ETSI
+    /// vocabulary, like DSS's, has one hash list for every material, so it
+    /// also holds the suites' hashes; a reference digest outside this list
+    /// is presented to it as unknown.
+    reference_digests: Vec<Hash>,
 }
 
 impl Rules {
@@ -503,6 +508,7 @@ fn rules(catalogue: &Catalogue) -> Rules {
             })
             .collect(),
         suites,
+        reference_digests: catalogue.digests.clone(),
     }
 }
 
@@ -755,6 +761,7 @@ fn facts(xml: &str, anchors: &Path, at: i64, profile: PolicyProfile) -> Result<V
             utc: &utc,
             direct_trust,
             positions: &positions,
+            reference_digests: &rules.reference_digests,
         };
         integrity(&document, &request, &account, at, &declared, &etsi_inputs)
     })?;

@@ -95,6 +95,9 @@ pub struct Inputs<'a> {
     /// (certificate, CRL, OCSP response), the place an archive timestamp's
     /// coverage is decided by.
     pub positions: &'a [(Vec<u8>, usize)],
+    /// The digests the profile accepts in a `Reference`, apart from the
+    /// suites' hashes the requirements' one hash list also holds.
+    pub reference_digests: &'a [Hash],
 }
 
 /// Freshness the comparison grants every status: DSS's policy ignores
@@ -1245,9 +1248,26 @@ fn authority_outcome<W: structured_asn1::memory::Work>(
         .map_err(|error| format!("timestamp authority validation failed: {error:?}"))
 }
 
+/// The hash a `Reference` digest presents to clause 5.2.8: its own, when the
+/// profile accepts it in a reference, otherwise none the constraints know.
+/// One hash list serves every material there, as in DSS's policy, so a hash
+/// a signature suite admits would otherwise pass as a reference digest the
+/// profile refuses.
+pub fn reference_hash(digest: Option<DigestAlgorithm>, permitted: &[Hash]) -> Hash {
+    digest
+        .map(hash_of)
+        .filter(|hash| permitted.contains(hash))
+        .unwrap_or(Hash::Other)
+}
+
 /// The signature value's material (its suite, sized by the signing
 /// certificate's key) and each reference digest's, for clause 5.2.8.
-fn own_materials(declared: &Declared, signer: &Certificate<'_>, memory: &Memory) -> Vec<Material> {
+fn own_materials(
+    declared: &Declared,
+    signer: &Certificate<'_>,
+    permitted: &[Hash],
+    memory: &Memory,
+) -> Vec<Material> {
     let suite = declared.method.and_then(crate::suite_of);
     let family = suite.map_or(Family::Other, |(family, _)| family);
     let mut materials = vec![Material {
@@ -1259,7 +1279,7 @@ fn own_materials(declared: &Declared, signer: &Certificate<'_>, memory: &Memory)
     }];
     for digest in &declared.digests {
         materials.push(Material {
-            hash: Some(digest.map_or(Hash::Other, hash_of)),
+            hash: Some(reference_hash(*digest, permitted)),
             scheme: None,
         });
     }
@@ -1316,7 +1336,7 @@ pub fn indication<W: structured_asn1::memory::Work>(
     };
     let etsi_paths = paths.lend();
     let (references, value) = integrity(result);
-    let materials = own_materials(declared, signer, &memory);
+    let materials = own_materials(declared, signer, inputs.reference_digests, &memory);
     let mut elements = Elements::NONE;
     if declared.signing_time.is_some() {
         elements = elements.with(Element::ClaimedSigningTime);

@@ -15,6 +15,11 @@ const CERTIFICATE_HASHES: [&str; 8] = [
 
 /// One `Cryptographic` constraint element: families, hashes and minimum
 /// sizes, none of them expiring (the profiles have no time dimension).
+/// DSS's policy keeps one digest list for the signature's hash and the
+/// reference digests alike, so `hashes` admits a hash a signature suite needs
+/// even where the profile refuses it as a reference digest; a reference the
+/// profile refuses for that reason is a reviewed policy difference, which the
+/// ETSI process over xml-sec's facts keeps by presenting it as unknown.
 fn cryptographic(families: &[String], hashes: &[String], minimum: &Value) -> String {
     let mut families = families.to_vec();
     // XMLDSig 1.1 §6.4.3 writes ECDSA values as r || s, which DSS names
