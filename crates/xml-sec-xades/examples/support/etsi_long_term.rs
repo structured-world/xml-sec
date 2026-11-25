@@ -20,9 +20,10 @@ pub(crate) struct Catalogue<'c> {
     pub(crate) tokens: usize,
     pub(crate) certificates: Vec<&'c Certificate<'c>>,
     pub(crate) sources: usize,
-    /// Where the document carries each certificate, then each source, in
-    /// document order; none for what only the caller supplies (the anchors).
-    pub(crate) positions: Vec<Option<usize>>,
+    /// Every place the document carries each certificate, then each source,
+    /// in document order; none for what only the caller supplies (the
+    /// anchors).
+    pub(crate) positions: Vec<Vec<usize>>,
 }
 
 impl Catalogue<'_> {
@@ -55,29 +56,39 @@ impl Catalogue<'_> {
         1 + self.tokens + self.certificates.len() + self.sources
     }
 
-    /// Every certificate and status source an archive timestamp property at
-    /// place `at` in document order covers ([`archived_before`]).
-    pub(super) fn material_before(&self, at: usize) -> impl Iterator<Item = Object> + '_ {
-        archived_before(&self.positions, self.certificates.len() + self.sources, at)
-            .map(|index| Object(1 + self.tokens + index))
+    /// Every certificate and status source an archive timestamp whose
+    /// imprint takes in `imprint` covers ([`archived_within`]).
+    pub(super) fn material_within<'s>(
+        &'s self,
+        imprint: &'s [(usize, usize)],
+    ) -> impl Iterator<Item = Object> + 's {
+        archived_within(
+            &self.positions,
+            self.certificates.len() + self.sources,
+            imprint,
+        )
+        .map(|index| Object(1 + self.tokens + index))
     }
 }
 
 /// The indexes, of `count` catalogued items placed at `positions`, an archive
-/// timestamp property at `at` covers: the validation data the document
-/// incorporates before it (EN 319 132-1 section 5.5.2). What only the caller
-/// supplies has no place in the document, so no archive imprint covers it.
-pub(crate) fn archived_before(
-    positions: &[Option<usize>],
+/// timestamp covers: those with a place inside the ranges of document order
+/// its imprint takes in (`imprint`, EN 319 132-1 section 5.5.2). Another
+/// signature's data outside the referenced objects is not in it, and what
+/// only the caller supplies has no place in the document at all.
+pub(crate) fn archived_within<'p>(
+    positions: &'p [Vec<usize>],
     count: usize,
-    at: usize,
-) -> impl Iterator<Item = usize> + '_ {
+    imprint: &'p [(usize, usize)],
+) -> impl Iterator<Item = usize> + 'p {
     (0..count).filter(move |index| {
-        positions
-            .get(*index)
-            .copied()
-            .flatten()
-            .is_some_and(|position| position < at)
+        positions.get(*index).is_some_and(|places| {
+            places.iter().any(|place| {
+                imprint
+                    .iter()
+                    .any(|(first, last)| first <= place && place <= last)
+            })
+        })
     })
 }
 

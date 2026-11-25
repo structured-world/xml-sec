@@ -82,6 +82,10 @@ pub struct Declared {
     /// Where the `ArchiveTimeStamp` of each of [`Self::archive_timestamps`]
     /// is, in document order.
     pub archive_positions: Vec<usize>,
+    /// What each `ArchiveTimeStamp` token's imprint takes in, as inclusive
+    /// ranges of document order (EN 319 132-1 section 5.5.2), index-aligned
+    /// with [`Self::archive_timestamps`].
+    pub archive_coverage: Vec<Vec<(usize, usize)>>,
     /// Each `AllDataObjectsTimeStamp` and `IndividualDataObjectsTimeStamp`
     /// token with its role, DER: they stamp the signed data objects, not the
     /// signature.
@@ -169,9 +173,9 @@ pub struct Inputs<'a> {
     /// without further checks (clause 5.2.6.4 step 1(b)).
     pub direct_trust: bool,
     /// The first place in document order at which the document carries each
-    /// DER value (certificate, CRL, OCSP response), the place an archive
+    /// DER value (certificate, CRL, OCSP response), the places an archive
     /// timestamp's coverage is decided by.
-    pub positions: &'a [(Vec<u8>, usize)],
+    pub positions: &'a [(Vec<u8>, Vec<usize>)],
     /// The digests the profile accepts in a `Reference`, apart from the
     /// suites' hashes the requirements' one hash list also holds.
     pub reference_digests: &'a [Hash],
@@ -318,17 +322,25 @@ pub fn leaf<'c>(
 /// The certificates that may be the signing certificate (clause 5.2.3.4),
 /// in reference order: each one a signed reference digests to. A reference
 /// list also names CAs of the signer's path, so which of them signed is the
-/// one whose key verifies the signature value; without such references, the
-/// copy the signature itself carries ([`signing_certificate`]).
+/// one whose key verifies the signature value; without such references,
+/// every certificate the signature's own `KeyInfo` carries, the leaf of
+/// their path first ([`signing_certificate`]): unrelated certificates may
+/// stand there, and the one whose key verifies the value is the signer.
 pub fn signing_candidates<'c>(
     declared: &Declared,
     pool: &'c [Certificate<'c>],
     memory: &Memory,
 ) -> Vec<&'c Certificate<'c>> {
     if declared.certificate_references.is_empty() {
-        return signing_certificate(declared, pool, memory)
-            .into_iter()
-            .collect();
+        let first = signing_certificate(declared, pool, memory);
+        let rest = pool.iter().filter(|certificate| {
+            declared
+                .key_info
+                .iter()
+                .any(|bytes| bytes.as_slice() == certificate.as_bytes())
+                && first.is_none_or(|first| first.as_bytes() != certificate.as_bytes())
+        });
+        return first.into_iter().chain(rest).collect();
     }
     let mut found: Vec<&Certificate<'c>> = Vec::new();
     for (method, value) in &declared.certificate_references {
@@ -1634,11 +1646,12 @@ fn catalogue<'a>(
             .positions
             .iter()
             .find(|(value, _)| value.as_slice() == der)
-            .map(|(_, at)| *at)
+            .map(|(_, at)| at.clone())
+            .unwrap_or_default()
     };
     let mut certificates: Vec<&Certificate<'a>> =
         parsed.pool.iter().chain(&parsed.anchors).collect();
-    let mut positions: Vec<Option<usize>> = certificates
+    let mut positions: Vec<Vec<usize>> = certificates
         .iter()
         .map(|certificate| position(certificate.as_bytes()))
         .collect();
@@ -1849,14 +1862,13 @@ impl<W: structured_asn1::memory::Work> TokenContext<'_, '_, '_, '_, '_, W> {
                             ))
                         }),
                 );
-                let at = declared
-                    .archive_positions
+                let imprint = declared
+                    .archive_coverage
                     .get(archive)
-                    .copied()
-                    .unwrap_or(usize::MAX);
+                    .map_or(&[][..], Vec::as_slice);
                 covered.extend(
                     self.catalogue
-                        .material_before(at)
+                        .material_within(imprint)
                         .map(long_term::Covered::Direct),
                 );
             }
@@ -1877,8 +1889,9 @@ impl<W: structured_asn1::memory::Work> TokenContext<'_, '_, '_, '_, '_, W> {
     }
 
     /// The current decision about token `der` (none when its TSA is not
-    /// among the known certificates and its checks held) and the index of
-    /// its TSA's past-validation inputs, appended to `pasts`.
+    /// among the known certificates and its checks held) and, for a token
+    /// whose checks held, the index of its TSA's past-validation inputs,
+    /// appended to `pasts`.
     fn token_outcomes(
         &self,
         der: &[u8],
@@ -1887,9 +1900,13 @@ impl<W: structured_asn1::memory::Work> TokenContext<'_, '_, '_, '_, '_, W> {
         pasts: &mut Vec<long_term::Past>,
     ) -> Result<(Option<long_term::Decision>, Option<usize>), String> {
         let tsa = authority(der, self.parsed);
-        let current = if let Some(sub) = token_finding(integrity) {
-            Some(long_term::Decision::Finding(sub))
-        } else if let Some(tsa) = tsa {
+        // A token whose own checks failed proves no existence: its finding
+        // stands without the TSA's history, which a search cut short must
+        // not withhold.
+        if let Some(sub) = token_finding(integrity) {
+            return Ok((Some(long_term::Decision::Finding(sub)), None));
+        }
+        let current = if let Some(tsa) = tsa {
             Some(long_term::Decision::from(authority_outcome(
                 self.session,
                 tsa,

@@ -737,6 +737,43 @@ fn each_signature_is_compared_at_its_own_claimed_time() {
 }
 
 #[test]
+fn a_recorded_pass_flag_the_run_does_not_show_fails_the_check() {
+    // The report's totals count dss_passed, passed and indication; a
+    // recorded flag that differs from the run would publish counts the run
+    // does not observe, even with an identical observation.
+    let mut summary = unreviewed_summary();
+    summary["cases"]["a.xml"]["instant/strict"]["dss_passed"] = true.into();
+    let reviews = review("normative-difference", "EN 319 102-1 5.2.6.4 step 4");
+    let mut recorded = super::recorded(&summary, &reviews);
+    assert_eq!(
+        differences(&recorded, &summary, &reviews),
+        Vec::<String>::new()
+    );
+    recorded["cases"]["a.xml"]["instant/strict"]["dss_passed"] = false.into();
+    let found = differences(&recorded, &summary, &reviews);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("dss_passed"), "{found:?}");
+}
+
+#[test]
+fn a_profile_missing_one_of_its_time_runs_is_refused() {
+    // Saved results that lost one signing-time run would otherwise shift the
+    // remaining runs onto the wrong claimed times; a profile that took no
+    // signing-time pass stays absent.
+    let case = tempfile::tempdir().unwrap();
+    assert_eq!(super::time_runs(case.path(), "strict", 2).unwrap(), None);
+    std::fs::create_dir_all(case.path().join("signing-time-2/strict")).unwrap();
+    assert!(super::time_runs(case.path(), "strict", 2).is_err());
+    std::fs::create_dir_all(case.path().join("signing-time/strict")).unwrap();
+    assert_eq!(
+        super::time_runs(case.path(), "strict", 2)
+            .unwrap()
+            .map(|runs| runs.len()),
+        Some(2)
+    );
+}
+
+#[test]
 fn each_validity_horizon_names_the_signature_of_its_row() {
     // The rows follow DSS's order of signatures, the facts xml-sec's; a
     // horizon listed in facts order would give row 0 the bound of the
@@ -1069,6 +1106,30 @@ fn a_changed_set_of_files_that_are_not_xml_fails_the_check() {
     let found = differences(&recorded, &added, &reviews);
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(found[0].contains("not XML"), "{found:?}");
+}
+
+#[test]
+fn a_carried_refinement_never_takes_over_an_exact_approval() {
+    // Review A approves X1; review B, written later, approves X2, which
+    // refines X1 with the same conclusions. Carrying must not append X2 to A,
+    // or A, listed first, would give X2 its class and reason instead of B's.
+    let overall = "TOTAL_PASSED:-/INDETERMINATE:TRY_LATER";
+    let x1 = json!([{ "XCV": "INDETERMINATE:TRY_LATER/fail", "OVERALL": overall }]);
+    let x2 =
+        json!([{ "XCV": "INDETERMINATE:TRY_LATER/INDETERMINATE:TRY_LATER", "OVERALL": overall }]);
+    let mut old = unreviewed_summary();
+    old["cases"]["a.xml"]["instant/strict"]["observed"] = x1.clone();
+    let reviews = json!({ "a.xml": [
+        { "overall": [overall], "observed": [x1], "class": "normative-difference", "reason": "A" },
+        { "overall": [overall], "observed": [x2], "class": "dss-deviation", "reason": "B" },
+    ] });
+    let previous = super::recorded(&old, &reviews);
+    let mut summary = unreviewed_summary();
+    summary["cases"]["a.xml"]["instant/strict"]["observed"] = x2.clone();
+    let moved = super::carried(&previous, &summary, &reviews);
+    assert_eq!(moved["a.xml"][0]["observed"], json!([x1]));
+    let recorded = super::recorded(&summary, &moved);
+    assert_eq!(recorded["cases"]["a.xml"]["instant/strict"]["reason"], "B");
 }
 
 #[test]

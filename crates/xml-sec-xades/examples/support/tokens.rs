@@ -49,7 +49,10 @@ impl Field {
     pub const TIMESTAMP: Self = Self::Xades("EncapsulatedTimeStamp");
 
     /// Whether `node` is an element of this field. An application element
-    /// that only shares a suffix or a local name in another namespace is not.
+    /// that only shares a suffix or a local name in another namespace is not,
+    /// nor is a token, CRL or OCSP value outside a signature's
+    /// `QualifyingProperties` (EN 319 132-1 section 4.3.5), such as a
+    /// payload element that reuses the name: its content is no token to read.
     fn holds(self, node: &roxmltree::Node<'_, '_>) -> bool {
         match self {
             Self::Certificate => {
@@ -58,7 +61,12 @@ impl Field {
                     && node.tag_name().namespace() == Some(DS))
                     || is_xades(node, "EncapsulatedX509Certificate")
             }
-            Self::Xades(local) => is_xades(node, local),
+            Self::Xades(local) => {
+                is_xades(node, local)
+                    && node
+                        .ancestors()
+                        .any(|ancestor| is_xades(&ancestor, "QualifyingProperties"))
+            }
         }
     }
 }

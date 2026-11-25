@@ -207,6 +207,35 @@ fn a_ca_a_reference_names_is_never_the_signer() {
 }
 
 #[test]
+fn without_references_every_key_info_certificate_is_tried() {
+    // With no signed certificate reference, KeyInfo may carry unrelated
+    // certificates; the leaf heuristic alone picks the first of them (the
+    // Root here, which issues none of the others), whose key does not verify.
+    // The signer is the one whose key verifies the value.
+    let document = xml_sec::XmlDocument::parse(B_T).unwrap();
+    let expected = super::expected_targets(&document, B_T);
+    let mut declared = declarations(B_T);
+    super::settle_signers(
+        &document,
+        &expected,
+        &mut declared,
+        &super::pool(B_T),
+        1_700_000_000,
+    )
+    .unwrap();
+    let signer = declared[0]
+        .signer
+        .clone()
+        .expect("the signer's key verifies");
+    declared[0].signer = None;
+    declared[0].certificate_references.clear();
+    declared[0].key_info = vec![ROOT.to_vec(), signer.clone()];
+    let pool = [ROOT.to_vec(), signer.clone()];
+    super::settle_signers(&document, &expected, &mut declared, &pool, 1_700_000_000).unwrap();
+    assert_eq!(declared[0].signer, Some(signer));
+}
+
+#[test]
 fn an_altered_value_keeps_the_signer_its_references_identify() {
     // No key verifies an altered SignatureValue, yet the references still
     // identify the signing certificate (EN 319 102-1 V1.4.1 clause 5.2.3.4):
@@ -291,6 +320,22 @@ fn an_issuer_the_provider_cannot_verify_establishes_no_edge() {
         })
     });
     assert_eq!(ask(&unsupported).unwrap(), Verified::Unsupported);
+    // An issuer key below the profile's strength minimum is no edge, so the
+    // search goes on to the other issuers.
+    let weak = Failing(|| X509ChainError::KeyPolicy {
+        position: 1,
+        source: xml_sec::policy::PolicyViolation::KeyTrust { reason: "weak" },
+    });
+    assert_eq!(ask(&weak).unwrap(), Verified::No);
+    // An exhausted budget leaves the issuer unchecked: not an end of the
+    // branch, so the search stops.
+    let exhausted = Failing(|| {
+        X509ChainError::Policy(xml_sec::policy::PolicyViolation::ResourceLimitExceeded {
+            resource: "certificate bytes",
+            maximum: 1,
+        })
+    });
+    assert!(ask(&exhausted).is_err());
     let other = Failing(|| X509ChainError::InvalidDepth);
     assert!(ask(&other).is_err());
 }
@@ -486,6 +531,25 @@ fn a_token_whose_base64_does_not_decode_is_reported_not_dropped() {
 }
 
 #[test]
+fn a_payload_element_named_like_a_token_is_no_token() {
+    // EncapsulatedTimeStamp carries a token only inside a signature's
+    // QualifyingProperties (EN 319 132-1 section 4.3.5); a payload element
+    // that reuses the name is application data, and its content, readable
+    // or not, neither stops the authority reader nor adds an authority.
+    let readable = include_str!("../../tests/fixtures/levels/b-t.xml");
+    let text = readable.replacen(
+        "<Data Id=\"payload\">",
+        "<xades:EncapsulatedTimeStamp xmlns:xades=\"http://uri.etsi.org/01903/v1.3.2#\">!!\
+         </xades:EncapsulatedTimeStamp><Data Id=\"payload\">",
+        1,
+    );
+    assert_ne!(text, readable);
+    let (authorities, failures) = tokens::token_authorities(&text, &[]);
+    assert_eq!(failures, Vec::<String>::new());
+    assert_eq!(authorities, tokens::token_authorities(readable, &[]).0);
+}
+
+#[test]
 fn a_timestamp_property_counts_only_in_its_own_container() {
     // A SignatureTimeStamp is an unsigned signature property and a content
     // timestamp a signed data-object property (EN 319 132-1 sections 4.3.5,
@@ -521,6 +585,11 @@ fn a_signing_time_counts_only_when_the_signature_signs_it() {
     assert_ne!(unreferenced, CLAIMS);
     assert_eq!(declarations(&unreferenced)[0].signing_time, None);
     assert_eq!(declarations(CLAIMS)[0].signing_time, Some(1_577_836_800));
+    // The XPointer id() form names the same element as the bare name, as
+    // the verifier resolves it.
+    let xpointer = CLAIMS.replace("URI=\"#props\"", "URI=\"#xpointer(id('props'))\"");
+    assert_ne!(xpointer, CLAIMS);
+    assert_eq!(declarations(&xpointer)[0].signing_time, Some(1_577_836_800));
 }
 
 #[test]
@@ -548,8 +617,9 @@ fn an_entity_supplied_certificate_is_where_the_entity_is_referenced() {
     let text = "<!DOCTYPE a [<!ENTITY c \"<ds:X509Certificate>AQ==</ds:X509Certificate>\">]>\
         <a xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\" \
         xmlns:x=\"http://uri.etsi.org/01903/v1.4.1#\">\
-        <x:ArchiveTimeStamp><x:EncapsulatedTimeStamp>Ag==</x:EncapsulatedTimeStamp>\
-        </x:ArchiveTimeStamp>&c;</a>";
+        <x:QualifyingProperties><x:ArchiveTimeStamp>\
+        <x:EncapsulatedTimeStamp>Ag==</x:EncapsulatedTimeStamp>\
+        </x:ArchiveTimeStamp></x:QualifyingProperties>&c;</a>";
     let certificate = tokens::values_at(text, tokens::Field::Certificate);
     let token = tokens::values_at(text, tokens::Field::TIMESTAMP);
     assert_eq!(certificate.len(), 1);
@@ -597,12 +667,67 @@ fn only_the_signatures_own_timestamp_properties_are_counted_in_every_form() {
 
 #[test]
 fn a_certificate_only_the_caller_supplies_is_never_archived() {
-    // An archive imprint authenticates what the document holds before the
-    // property (EN 319 132-1 section 5.5.2); a trust anchor only the caller
-    // supplies has no place there, so no archive timestamp covers it.
-    let positions = [Some(3), None, Some(9)];
-    let covered: Vec<usize> = super::etsi::long_term::archived_before(&positions, 3, 5).collect();
+    // An archive imprint authenticates what the document holds inside it
+    // (EN 319 132-1 section 5.5.2); a trust anchor only the caller supplies
+    // has no place in the document, so no archive timestamp covers it.
+    let positions = [vec![3], Vec::new(), vec![9]];
+    let covered: Vec<usize> =
+        super::etsi::long_term::archived_within(&positions, 3, &[(0, 5)]).collect();
     assert_eq!(covered, [0]);
+}
+
+/// Two signatures: the first carries a CRL before its archive timestamp;
+/// the second references a data object that stands after its own archive
+/// timestamp and carries a certificate.
+const SIBLINGS: &str = r##"<doc xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:x="http://uri.etsi.org/01903/v1.3.2#">
+<ds:Signature Id="a">
+  <ds:SignedInfo/>
+  <ds:Object><x:QualifyingProperties Target="#a"><x:UnsignedProperties><x:UnsignedSignatureProperties>
+    <x:RevocationValues><x:CRLValues><x:EncapsulatedCRLValue>AQ==</x:EncapsulatedCRLValue></x:CRLValues></x:RevocationValues>
+    <x:ArchiveTimeStamp><x:EncapsulatedTimeStamp>Ag==</x:EncapsulatedTimeStamp></x:ArchiveTimeStamp>
+  </x:UnsignedSignatureProperties></x:UnsignedProperties></x:QualifyingProperties></ds:Object>
+</ds:Signature>
+<ds:Signature Id="b">
+  <ds:SignedInfo><ds:Reference URI="#data"/></ds:SignedInfo>
+  <ds:Object><x:QualifyingProperties Target="#b"><x:UnsignedProperties><x:UnsignedSignatureProperties>
+    <x:ArchiveTimeStamp><x:EncapsulatedTimeStamp>Aw==</x:EncapsulatedTimeStamp></x:ArchiveTimeStamp>
+  </x:UnsignedSignatureProperties></x:UnsignedProperties></x:QualifyingProperties></ds:Object>
+</ds:Signature>
+<Data Id="data"><ds:X509Certificate>BA==</ds:X509Certificate></Data>
+</doc>"##;
+
+#[test]
+fn an_archive_timestamp_covers_what_its_imprint_takes_in() {
+    // EN 319 132-1 section 5.5.2: an archive imprint takes in this
+    // signature's referenced data objects, KeyInfo, other ds:Objects and the
+    // unsigned properties before the timestamp. Document order alone would
+    // hand the second signature the first one's CRL, which its imprint never
+    // read, and withhold the certificate in the data object it references,
+    // which stands after the timestamp.
+    let found = declarations(SIBLINGS);
+    let positions = super::document_positions(SIBLINGS);
+    let places = |value: &[u8]| {
+        positions
+            .iter()
+            .find(|(known, _)| known.as_slice() == value)
+            .map(|(_, places)| places.clone())
+            .unwrap()
+    };
+    let covers = |imprint: &[(usize, usize)], value: &[u8]| {
+        places(value).iter().any(|place| {
+            imprint
+                .iter()
+                .any(|(first, last)| first <= place && place <= last)
+        })
+    };
+    let first = &found[0].archive_coverage[0];
+    let second = &found[1].archive_coverage[0];
+    assert!(covers(first, &[1]), "its own earlier CRL");
+    assert!(!covers(second, &[1]), "another signature's CRL");
+    assert!(
+        covers(second, &[4]),
+        "a later certificate its reference names"
+    );
 }
 
 #[test]

@@ -234,7 +234,8 @@ pub(crate) fn regular_files(listing: &[u8]) -> Result<Vec<String>, String> {
 }
 
 /// Whether a corpus file is an XML input: `.xml`, and `.xades` as DSS names
-/// some signatures. Every other file is recorded as not XML.
+/// some signatures. Every other file, an XML schema included, is recorded as
+/// `not-xml`: no XML signature input.
 pub(crate) fn is_xml(path: &str) -> bool {
     Path::new(path)
         .extension()
@@ -1264,6 +1265,29 @@ pub(crate) fn per_signature(
     (rows, facts)
 }
 
+/// The signing-time run directories of `profile` in a case `directory`, one
+/// per distinct claimed time, in order; none when the profile took no
+/// signing-time pass. A profile with some runs but not all is an error:
+/// combining the rest would give a signature another signature's time.
+pub(crate) fn time_runs(
+    directory: &Path,
+    profile: &str,
+    times: usize,
+) -> Result<Option<Vec<PathBuf>>, String> {
+    let runs: Vec<PathBuf> = (0..times)
+        .map(|index| directory.join(time_run(index)))
+        .collect();
+    let present = runs.iter().filter(|run| run.join(profile).exists()).count();
+    match present {
+        0 => Ok(None),
+        all if all == runs.len() => Ok(Some(runs)),
+        _ => Err(format!(
+            "{}: {profile} has {present} of its {times} signing-time runs",
+            directory.display()
+        )),
+    }
+}
+
 /// Every case's comparison in each pass it took part in. A profile whose own
 /// facts called for no signing-time pass did not take it.
 fn observations(
@@ -1287,16 +1311,13 @@ fn observations(
             }
         }
         for (profile, _) in PROFILES {
-            let mut runs = Vec::new();
-            for index in 0..times.len() {
-                let run = directory.join(time_run(index));
-                if run.join(profile).exists() {
-                    runs.push(pass_rows(&run, profile)?);
-                }
-            }
-            if runs.is_empty() {
+            let Some(directories) = time_runs(directory, profile, times.len())? else {
                 continue;
-            }
+            };
+            let runs = directories
+                .iter()
+                .map(|run| pass_rows(run, profile))
+                .collect::<Result<Vec<_>, _>>()?;
             let (rows, facts) = per_signature(runs, &times, &claimed);
             row.insert(
                 format!("signing-time/{profile}"),
@@ -1484,8 +1505,10 @@ fn introduction(expectations: &Value) -> String {
          reached no validated path for any signature and found no timestamp \
          token over a signature value that proves its existence, validates \
          each signature at its own claimed signing time). The {} other files \
-         of those directories are not XML: each is recorded as *not-xml* and \
-         validated by neither, and a change to that set fails the check.\n",
+         of those directories carry neither extension (images, keystores, \
+         text, and XML that is no signature input such as an XSD schema): \
+         each is recorded as *not-xml*, meaning not an XML signature input, \
+         and validated by neither, and a change to that set fails the check.\n",
         expectations["dss"].as_str().unwrap_or("?"),
         expectations["instant"],
         expectations["not_xml"].as_object().map_or(0, Map::len),
@@ -1687,6 +1710,16 @@ pub(crate) fn differences(expected: &Value, summary: &Value, reviews: &Value) ->
                 ));
                 continue;
             }
+            // The published totals count these flags: a recorded flag the run
+            // no longer shows would publish a pass count it does not observe.
+            let flags = ["passed", "dss_passed", "indication"];
+            if let Some(flag) = flags.iter().find(|flag| entry[**flag] != pass[**flag]) {
+                found.push(format!(
+                    "{name} {label}: {flag} is {} where {} is expected",
+                    pass[*flag], entry[*flag]
+                ));
+                continue;
+            }
             if entry["valid_until"] != pass["valid_until"] {
                 found.push(format!(
                     "{name} {label}: valid until {} where {} is expected",
@@ -1811,8 +1844,18 @@ pub(crate) fn carried(previous: &Value, summary: &Value, reviews: &Value) -> Val
                     .as_array()
                     .is_some_and(|approved| approved.contains(&pass["observed"]));
                 let now = &summary["cases"][name][label]["observed"];
+                // An observation another review approves exactly keeps that
+                // review's class and reason: a carried refinement must not
+                // take it over, whichever review comes first.
+                let approved_elsewhere = list.as_array().into_iter().flatten().any(|other| {
+                    other != review
+                        && other["observed"]
+                            .as_array()
+                            .is_some_and(|approved| approved.contains(now))
+                });
                 if explained
                     && !now.is_null()
+                    && !approved_elsewhere
                     && overall_of(now) == review["overall"]
                     && same_conclusions(&pass["observed"], now)
                     && !observed.contains(now)

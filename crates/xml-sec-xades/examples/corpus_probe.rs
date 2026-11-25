@@ -38,8 +38,8 @@ use structured_pkix::temporal::LeapTable;
 use xml_sec::XmlDocument;
 use xml_sec::document::NodeIdentity;
 use xml_sec::policy::{
-    Instant, PolicyCompileContext, PolicyCompiler, PolicyProfile, SignatureConstraints,
-    TrustAnchorSigner, VerificationPolicy,
+    Instant, PolicyCompileContext, PolicyCompiler, PolicyProfile, PolicyViolation,
+    SignatureConstraints, TrustAnchorSigner, VerificationPolicy,
 };
 use xml_sec::provider::{ProviderError, RustCryptoProvider};
 use xml_sec::xmldsig::UriTypeSet;
@@ -81,8 +81,9 @@ fn readable_key(certificate: &Certificate<'_>, account: &Memory) -> bool {
 
 /// The session's certificate-signature verifier as the chain-top search
 /// asks it: an issuer whose algorithm the provider does not implement, or
-/// whose key the profile's key policy refuses, establishes no edge; any
-/// other failure stops the search.
+/// whose key or method the profile's policy refuses, establishes no edge.
+/// An exhausted resource budget, like any other failure, stops the search:
+/// an issuer not checked to the end is no evidence the branch ends there.
 struct EdgeVerifier<'v, V>(&'v V);
 
 impl<W, V> structured_pkix::path::Verify<W> for EdgeVerifier<'_, V>
@@ -106,7 +107,10 @@ where
                 X509ChainError::Provider(ProviderError::Unsupported { .. })
                 | X509ChainError::UnsupportedSignature(_),
             ) => Ok(Verified::Unsupported),
-            Err(X509ChainError::Policy(_)) => Ok(Verified::No),
+            exhausted @ Err(X509ChainError::Policy(PolicyViolation::ResourceLimitExceeded {
+                ..
+            })) => exhausted,
+            Err(X509ChainError::KeyPolicy { .. } | X509ChainError::Policy(_)) => Ok(Verified::No),
             answer => answer,
         }
     }
@@ -221,16 +225,18 @@ fn pool(text: &str) -> Vec<Vec<u8>> {
     pool
 }
 
-/// The first place in document order at which `text` carries each
-/// certificate, CRL and OCSP response: its own element, or the timestamp
-/// token that carries the certificate. [`declarations`] places archive
-/// timestamps in the same order of the same parse.
-fn document_positions(text: &str) -> Vec<(Vec<u8>, usize)> {
-    let mut found: Vec<(Vec<u8>, usize)> = Vec::new();
+/// Every place in document order at which `text` carries each certificate,
+/// CRL and OCSP response: its own element, or the timestamp token that
+/// carries the certificate. One value may stand in several signatures, and
+/// an archive timestamp covers it when any of its places lies in that
+/// timestamp's imprint. [`declarations`] places archive timestamps in the
+/// same order of the same parse.
+fn document_positions(text: &str) -> Vec<(Vec<u8>, Vec<usize>)> {
+    let mut found: Vec<(Vec<u8>, Vec<usize>)> = Vec::new();
     let mut add =
         |value: Vec<u8>, at: usize| match found.iter_mut().find(|(known, _)| *known == value) {
-            Some(known) => known.1 = known.1.min(at),
-            None => found.push((value, at)),
+            Some(known) => known.1.push(at),
+            None => found.push((value, vec![at])),
         };
     for field in [tokens::Field::Certificate, CRL, OCSP] {
         for (at, value) in tokens::values_at(text, field) {
@@ -542,11 +548,95 @@ fn own_timestamps(signature: roxmltree::Node<'_, '_>, declared: &mut etsi::Decla
                     declared
                         .archive_positions
                         .push(tokens::node_order(property));
+                    declared
+                        .archive_coverage
+                        .push(archive_coverage(signature, property));
                 }
                 _ => {}
             }
         }
     }
+}
+
+/// Whether `node` is the `XMLDSig` element `local`.
+fn is_ds_element(node: &roxmltree::Node<'_, '_>, local: &str) -> bool {
+    node.is_element() && node.tag_name().name() == local && node.tag_name().namespace() == Some(DS)
+}
+
+/// The first and last place in document order of `node` and its
+/// descendants.
+fn span(node: roxmltree::Node<'_, '_>) -> (usize, usize) {
+    let first = tokens::node_order(node);
+    (
+        first,
+        node.descendants()
+            .next_back()
+            .map_or(first, tokens::node_order),
+    )
+}
+
+/// The places, as inclusive ranges in document order, an archive timestamp
+/// `property` of `signature` takes into its imprint (EN 319 132-1 section
+/// 5.5.2): the data objects its `SignedInfo` references name, wherever they
+/// stand, the signature itself left out of a whole-document reference as the
+/// enveloped-signature transform leaves it out; its `KeyInfo`; its
+/// `ds:Object`s other than the one holding its `QualifyingProperties`; and
+/// each unsigned signature property before `property`. Another signature's
+/// validation data is covered only as part of a referenced data object.
+fn archive_coverage(
+    signature: roxmltree::Node<'_, '_>,
+    property: roxmltree::Node<'_, '_>,
+) -> Vec<(usize, usize)> {
+    let document = signature.document();
+    let (signature_first, signature_last) = span(signature);
+    let qualifying = qualifying_properties(signature);
+    let mut ranges = Vec::new();
+    let references = signature
+        .children()
+        .filter(|info| is_ds_element(info, "SignedInfo"))
+        .flat_map(|info| info.children())
+        .filter(|reference| is_ds_element(reference, "Reference"))
+        .filter_map(|reference| reference.attribute("URI"))
+        .filter_map(uri_target);
+    for target in references {
+        match target {
+            Target::Root => {
+                let (first, last) = span(document.root_element());
+                if first < signature_first {
+                    ranges.push((first, signature_first - 1));
+                }
+                if signature_last < last {
+                    ranges.push((signature_last + 1, last));
+                }
+            }
+            Target::Id(id) => {
+                let named = document.descendants().find(|node| {
+                    node.is_element()
+                        && ["Id", "ID", "id"]
+                            .iter()
+                            .any(|name| node.attribute(*name) == Some(id.as_str()))
+                });
+                ranges.extend(named.map(span));
+            }
+        }
+    }
+    for child in signature.children().filter(roxmltree::Node::is_element) {
+        let holds_properties = qualifying
+            .is_some_and(|properties| properties.ancestors().any(|ancestor| ancestor == child));
+        if is_ds_element(&child, "KeyInfo")
+            || (is_ds_element(&child, "Object") && !holds_properties)
+        {
+            ranges.push(span(child));
+        }
+    }
+    ranges.extend(
+        property
+            .prev_siblings()
+            .skip(1)
+            .filter(roxmltree::Node::is_element)
+            .map(span),
+    );
+    ranges
 }
 
 /// The `QualifyingProperties` of `signature`: in one of its own `ds:Object`s,
@@ -597,8 +687,8 @@ fn signed_claims(signature: roxmltree::Node<'_, '_>, declared: &mut etsi::Declar
             .flat_map(|info| info.children())
             .filter(|reference| ds(reference, "Reference"))
             .filter_map(|reference| reference.attribute("URI"))
-            .filter_map(|uri| uri.strip_prefix('#').and_then(unescaped))
-            .any(|fragment| fragment == id)
+            .filter_map(uri_target)
+            .any(|target| target == Target::Id(id.to_owned()))
     });
     let Some(signed) = covered
         .then(|| xades_child(properties, "SignedSignatureProperties"))
@@ -814,48 +904,52 @@ fn targets(text: &str) -> Vec<Target> {
             )
     });
     for reference in references {
-        let target = match reference.attribute("URI") {
-            Some("" | "#xpointer(/)") => Target::Root,
-            Some(uri) => {
-                let Some(fragment) = uri.strip_prefix('#').and_then(unescaped) else {
-                    continue;
-                };
-                // XPointer's id() takes either quote, as the verifier reads it;
-                // `^` escapes a parenthesis or itself in its scheme data
-                // (XPointer Framework section 3.1).
-                let id = ["'", "\""].iter().find_map(|quote| {
-                    fragment
-                        .strip_prefix(&format!("xpointer(id({quote}"))
-                        .and_then(|rest| rest.strip_suffix(&format!("{quote}))")))
-                });
-                let id = match id {
-                    Some(id) => {
-                        let mut literal = String::with_capacity(id.len());
-                        let mut characters = id.chars();
-                        while let Some(character) = characters.next() {
-                            literal.extend(if character == '^' {
-                                characters.next()
-                            } else {
-                                Some(character)
-                            });
-                        }
-                        literal
-                    }
-                    None => fragment,
-                };
-                if id == "xpointer(/)" {
-                    Target::Root
-                } else {
-                    Target::Id(id)
-                }
-            }
-            None => continue,
+        let Some(target) = reference.attribute("URI").and_then(uri_target) else {
+            continue;
         };
         if !found.contains(&target) {
             found.push(target);
         }
     }
     found
+}
+
+/// What a same-document Reference `uri` names: the whole document, or the
+/// element of an ID in either the bare-name or the `XPointer` `id()` form;
+/// none for any other URI or a malformed escape.
+fn uri_target(uri: &str) -> Option<Target> {
+    if matches!(uri, "" | "#xpointer(/)") {
+        return Some(Target::Root);
+    }
+    let fragment = uri.strip_prefix('#').and_then(unescaped)?;
+    // XPointer's id() takes either quote, as the verifier reads it; `^`
+    // escapes a parenthesis or itself in its scheme data (XPointer Framework
+    // section 3.1).
+    let id = ["'", "\""].iter().find_map(|quote| {
+        fragment
+            .strip_prefix(&format!("xpointer(id({quote}"))
+            .and_then(|rest| rest.strip_suffix(&format!("{quote}))")))
+    });
+    let id = match id {
+        Some(id) => {
+            let mut literal = String::with_capacity(id.len());
+            let mut characters = id.chars();
+            while let Some(character) = characters.next() {
+                literal.extend(if character == '^' {
+                    characters.next()
+                } else {
+                    Some(character)
+                });
+            }
+            literal
+        }
+        None => fragment,
+    };
+    Some(if id == "xpointer(/)" {
+        Target::Root
+    } else {
+        Target::Id(id)
+    })
 }
 
 /// Whether every requirement of the requested level holds.
