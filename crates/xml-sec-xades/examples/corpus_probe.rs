@@ -2,9 +2,9 @@
 //! one of the `XAdES` policy profiles.
 //!
 //! `corpus_probe conditions XML ANCHORS_DIR` writes, as `0.der`, `1.der`, ...
-//! in `ANCHORS_DIR`, which must be empty or absent, every certificate where a
-//! chain the document carries ends, and prints the document's claimed signing time and whether it
-//! carries a timestamp.
+//! in `ANCHORS_DIR`, which must be empty or absent, the topmost certificate of
+//! each signer chain the document carries, and prints the document's claimed
+//! signing time.
 //!
 //! `corpus_probe facts XML ANCHORS_DIR UNIX_TIME PROFILE` verifies the
 //! document at that time with those certificates as the only trust anchors
@@ -50,8 +50,8 @@ use xml_sec::xmldsig::{
     with_verified_request,
 };
 use xml_sec_xades::{
-    EnclosingError, Inputs, Level, Outcome, Requirements, Syntax, TokenIntegrity, ValidationError,
-    check_tokens, validate, validate_basic, validate_ts101903,
+    EnclosingError, Inputs, Level, Outcome, Requirements, Syntax, TimestampRole, TokenIntegrity,
+    ValidationError, check_tokens, validate, validate_basic, validate_ts101903,
 };
 
 type Failure = Box<dyn std::error::Error>;
@@ -79,32 +79,87 @@ fn readable_key(certificate: &Certificate<'_>, account: &Memory) -> bool {
     }
 }
 
-/// Where the chain of `certificate` ends among `pool`: it is self-issued, or
-/// `pool` holds no other certificate naming its issuer. Only a certificate
-/// whose key decodes is such an end.
-fn terminal(certificate: &[u8], pool: &[Vec<u8>]) -> bool {
-    let account = account();
-    let parser = Parser::der(account.clone());
-    let Ok(parsed) = Certificate::read(&parser, certificate, 0) else {
-        return false;
+/// The topmost certificate of each signature's signer chain the document
+/// carries, once each: from the signing certificate, each issuer in `pool`
+/// that the subject names and whose key verifies the subject's signature
+/// (RFC 5280 6.1.3 (a)(1) and (a)(4)), up to the first certificate with no
+/// such issuer. A certificate that only shares the issuer's name issues
+/// nothing, and a timestamp authority's chain anchors no signer. Only a
+/// certificate whose key decodes is such an end. The second value says why
+/// the document's signatures could not be read, when they could not.
+fn signer_anchors(
+    bytes: &[u8],
+    text: &str,
+    pool: &[Vec<u8>],
+) -> Result<(Vec<Vec<u8>>, Option<String>), Failure> {
+    let document = match XmlDocument::parse_bytes(bytes) {
+        Ok(document) => document,
+        Err(error) => return Ok((Vec::new(), Some(error.to_string()))),
     };
-    if !readable_key(&parsed, &account) {
-        return false;
-    }
-    let issuer = parsed.tbs().issuer();
-    let names = |other: &Certificate<'_>| {
-        other
-            .tbs()
-            .subject()
-            .matches(issuer, &account)
-            .unwrap_or(false)
+    let declared = declarations(text);
+    // The session lends its certificate-signature verifier; no key or chain
+    // of the document's own is trusted for it.
+    let resolver = DefaultKeyResolver::new(KeyResolverConfig::default());
+    let context = VerifyContext::new()
+        .policy(profile_policy(PolicyProfile::XadesConformant, 0, false)?)
+        .key_resolver(&resolver);
+    let operation = account();
+    let expected = expected_targets(&document, text);
+    let request = VerificationRequest {
+        expected_targets: &expected,
+        ..VerificationRequest::default()
     };
-    names(&parsed)
-        || !pool
+    let mut found: Vec<Vec<u8>> = Vec::new();
+    let run = with_verified_request(&document, &context, &request, &operation, |session| {
+        let memory = account();
+        let parser = Parser::der(memory.clone());
+        let certificates: Vec<Certificate<'_>> = pool
             .iter()
-            .filter(|other| other.as_slice() != certificate)
-            .filter_map(|other| Certificate::read(&parser, other, 0).ok())
-            .any(|other| names(&other))
+            .filter_map(|der| Certificate::read(&parser, der, 0).ok())
+            .collect();
+        let issues = |issuer: &Certificate<'_>, subject: &Certificate<'_>| {
+            use structured_pkix::path::{EffectiveKey, Verified, Verify};
+            let named = subject
+                .tbs()
+                .issuer()
+                .matches(issuer.tbs().subject(), &memory)
+                .unwrap_or(false);
+            let chain = [subject];
+            named
+                && Verify::<Memory>::verify(
+                    &session.certificate_path_verifier(&chain, issuer),
+                    &subject.signature_algorithm(),
+                    EffectiveKey::standing(issuer.tbs().public_key()),
+                    subject.signed_bytes(),
+                    subject.signature_value(),
+                    &memory,
+                )
+                .is_ok_and(|answer| answer == Verified::Yes)
+        };
+        for signature in &declared {
+            let Some(mut top) = etsi::signing_certificate(signature, &certificates, &memory) else {
+                continue;
+            };
+            let mut seen = vec![top.as_bytes()];
+            while let Some(issuer) = certificates
+                .iter()
+                .find(|issuer| !seen.contains(&issuer.as_bytes()) && issues(issuer, top))
+            {
+                seen.push(issuer.as_bytes());
+                top = issuer;
+            }
+            if readable_key(top, &memory) && !found.iter().any(|known| known == top.as_bytes()) {
+                found.push(top.as_bytes().to_vec());
+            }
+        }
+        Ok(())
+    });
+    // A document whose signatures cannot be read carries no signer chain;
+    // why it could not be read stays with the conditions.
+    match run {
+        Ok(()) => Ok((found, None)),
+        Err(error) => Ok((Vec::new(), Some(error.to_string()))),
+    }
 }
 
 /// Every certificate the document and its tokens carry, once.
@@ -113,7 +168,7 @@ fn pool(text: &str) -> Vec<Vec<u8>> {
     // XAdES's EncapsulatedX509Certificate (CertificateValues) alike.
     let carried = tokens::values(text, "X509Certificate");
     // A token that cannot be read carries no certificate the comparison could
-    // anchor; the verification reports the token itself.
+    // anchor; the facts report why it could not be read.
     let (authorities, _) = tokens::token_authorities(text, &carried);
     let mut pool = carried;
     pool.extend(authorities.into_iter().map(|(certificate, _)| certificate));
@@ -199,17 +254,21 @@ fn date_time(value: &str) -> Option<i64> {
         let end = fraction
             .find(|character: char| !character.is_ascii_digit())
             .unwrap_or(fraction.len());
-        if end == 0 {
+        // 24:00:00 has no time after it within the day: a fraction there
+        // is zero only.
+        if end == 0 || (midnight && fraction[..end].bytes().any(|digit| digit != b'0')) {
             return None;
         }
         zone = &fraction[end..];
     }
     let offset = match zone.as_bytes() {
         [] | [b'Z'] => 0,
-        [sign @ (b'+' | b'-'), _, _, b':', _, _] => {
+        [sign @ (b'+' | b'-'), h1, h2, b':', m1, m2]
+            if [h1, h2, m1, m2].iter().all(|byte| byte.is_ascii_digit()) =>
+        {
             let (hours, minutes) = (
-                zone.get(1..3)?.parse::<i64>().ok()?,
-                zone.get(4..6)?.parse::<i64>().ok()?,
+                i64::from((h1 - b'0') * 10 + (h2 - b'0')),
+                i64::from((m1 - b'0') * 10 + (m2 - b'0')),
             );
             if hours > 14 || minutes > 59 || (hours == 14 && minutes != 0) {
                 return None;
@@ -231,14 +290,27 @@ fn date_time(value: &str) -> Option<i64> {
 }
 
 /// The document's text for reading its ASCII values (base64, `SigningTime`,
-/// IDs): a byte outside UTF-8, as in a Latin-1 document, becomes U+FFFD,
-/// which none of those values contains. The verification parses the bytes.
+/// IDs), decoded by the encoding rules the verification parses it under
+/// (XML 1.0 section 4.3.3: byte order mark or declaration). Bytes those rules
+/// refuse are read as UTF-8 with U+FFFD for what is not, which none of those
+/// values contains; the verification then refuses the document itself.
 fn ascii_view(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
+    // One source octet decodes to at most three UTF-8 octets (a BMP code
+    // point from a single-byte encoding); a length that bound overflows has
+    // no decoding to fit.
+    bytes
+        .len()
+        .checked_mul(3)
+        .and_then(|maximum| xml_sec::encoding::decode_xml_octets(bytes, maximum).ok())
+        .map_or_else(
+            || String::from_utf8_lossy(bytes).into_owned(),
+            std::borrow::Cow::into_owned,
+        )
 }
 
 fn conditions(xml: &str, anchors: &Path) -> Result<Value, Failure> {
-    let text = ascii_view(&std::fs::read(xml)?);
+    let bytes = std::fs::read(xml)?;
+    let text = ascii_view(&bytes);
     let pool = pool(&text);
     std::fs::create_dir_all(anchors)?;
     // `facts` trusts every file of the directory, so one left by another
@@ -246,15 +318,18 @@ fn conditions(xml: &str, anchors: &Path) -> Result<Value, Failure> {
     if std::fs::read_dir(anchors)?.next().is_some() {
         return Err(format!("{} is not empty", anchors.display()).into());
     }
-    let ends: Vec<&Vec<u8>> = pool.iter().filter(|c| terminal(c, &pool)).collect();
+    let (ends, unread) = signer_anchors(&bytes, &text, &pool)?;
     for (index, certificate) in ends.iter().enumerate() {
         std::fs::write(anchors.join(format!("{index}.der")), certificate)?;
     }
-    Ok(json!({
+    let mut found = json!({
         "anchors": ends.len(),
         "signing_time": signing_time(&text),
-        "timestamps": text.contains("EncapsulatedTimeStamp"),
-    }))
+    });
+    if let Some(unread) = unread {
+        found["unread"] = unread.into();
+    }
+    Ok(found)
 }
 
 const DS: &str = "http://www.w3.org/2000/09/xmldsig#";
@@ -346,12 +421,20 @@ fn declarations(text: &str) -> Vec<etsi::Declared> {
                 .collect();
         }
         signed_claims(signature, &mut declared);
+        // The signature's own ds:KeyInfo is its direct child (XMLDSig 1.1
+        // section 4.5); a KeyInfo inside an Object identifies nothing here.
+        for key_info in signature.children().filter(|child| is_ds(child, "KeyInfo")) {
+            for data in key_info.children().filter(|child| is_ds(child, "X509Data")) {
+                for certificate in data
+                    .children()
+                    .filter(|child| is_ds(child, "X509Certificate"))
+                {
+                    declared.key_info.extend(base64(certificate));
+                }
+            }
+        }
         for node in &own {
-            if is(node, "X509Certificate")
-                && node.ancestors().any(|ancestor| is(&ancestor, "KeyInfo"))
-            {
-                declared.key_info.extend(base64(*node));
-            } else if is(node, "EncapsulatedTimeStamp") {
+            if is(node, "EncapsulatedTimeStamp") {
                 let Some(token) = base64(*node) else {
                     continue;
                 };
@@ -361,6 +444,12 @@ fn declarations(text: &str) -> Vec<etsi::Declared> {
                         declared.validation_timestamps.push(token);
                         declared.refs_only.push(kind == "RefsOnlyTimeStamp");
                     }
+                    Some("AllDataObjectsTimeStamp") => declared
+                        .content_timestamps
+                        .push((TimestampRole::AllDataObjects, token)),
+                    Some("IndividualDataObjectsTimeStamp") => declared
+                        .content_timestamps
+                        .push((TimestampRole::IndividualDataObjects, token)),
                     Some("ArchiveTimeStamp") => {
                         declared.archive_timestamps.push(token);
                         declared.archive_positions.push(node.range().start);
@@ -598,9 +687,14 @@ fn targets(text: &str) -> Vec<Target> {
                 let Some(fragment) = uri.strip_prefix('#') else {
                     continue;
                 };
-                let id = fragment
-                    .strip_prefix("xpointer(id('")
-                    .and_then(|rest| rest.strip_suffix("'))"))
+                // XPointer's id() takes either quote, as the verifier reads it.
+                let id = ["'", "\""]
+                    .iter()
+                    .find_map(|quote| {
+                        fragment
+                            .strip_prefix(&format!("xpointer(id({quote}"))
+                            .and_then(|rest| rest.strip_suffix(&format!("{quote}))")))
+                    })
                     .unwrap_or(fragment);
                 Target::Id(id.to_owned())
             }
@@ -697,6 +791,36 @@ fn read_anchors(directory: &Path) -> Result<Vec<Vec<u8>>, Failure> {
     Ok(trusted)
 }
 
+/// One signature's verification, its ETSI decision under the compared
+/// profile and what its tokens established, from the widest profile's
+/// integrity facts (`own`, `computed`) and what it declares.
+fn signature_row(
+    entry: &SignatureEvidence,
+    (own, mut computed): (Value, Value),
+    declared: Option<&etsi::Declared>,
+) -> Value {
+    let trust = verification(entry);
+    // Each token's own timestamp validation, apart from the signature's: the
+    // comparison sets it against DSS's per token.
+    let timestamps = computed
+        .as_object_mut()
+        .and_then(|computed| computed.remove("tokens"))
+        .unwrap_or(Value::Null);
+    let mut row = json!({
+        "etsi": etsi::under_profile(computed, &trust),
+        "verification": trust,
+        "integrity": own,
+        "timestamps": timestamps,
+    });
+    if let Some(declared) = declared {
+        row["declared_timestamps"] = declared.tokens().len().into();
+        if let Some(refusal) = &declared.token_refusal {
+            row["token_refusal"] = refusal.clone().into();
+        }
+    }
+    row
+}
+
 fn facts(xml: &str, anchors: &Path, at: i64, profile: PolicyProfile) -> Result<Value, Failure> {
     let bytes = std::fs::read(xml)?;
     let text = ascii_view(&bytes);
@@ -715,8 +839,9 @@ fn facts(xml: &str, anchors: &Path, at: i64, profile: PolicyProfile) -> Result<V
     };
     let utc = LeapTable::new(-2_208_988_800, 4_102_444_800, &[])
         .map_err(|error| format!("UTC coverage: {error:?}"))?;
-    // An unreadable token is the verification's to report.
-    let (authorities, _) = tokens::token_authorities(&text, &carried);
+    // An unreadable token carries no authority; why it could not be read
+    // stays in the facts, since no later step reports it.
+    let (authorities, unreadable) = tokens::token_authorities(&text, &carried);
     let accuracies = tokens::stated(&authorities, 0)?;
     let anchor_refs: Vec<&[u8]> = trusted.iter().map(Vec::as_slice).collect();
     let others: Vec<&[u8]> = carried.iter().map(Vec::as_slice).collect();
@@ -771,15 +896,13 @@ fn facts(xml: &str, anchors: &Path, at: i64, profile: PolicyProfile) -> Result<V
         // Ids are reported only when both readings see the same signatures.
         let aligned = ids.len() == entries.len();
         for (index, entry) in entries.iter().enumerate() {
-            let trust = verification(entry);
-            let (own, computed) = integrity.get(index).cloned().unwrap_or_default();
-            let mut row = json!({
-                "index": index,
-                "id": if aligned { ids[index].clone() } else { None },
-                "etsi": etsi::under_profile(computed, &trust),
-                "verification": trust,
-                "integrity": own,
-            });
+            let mut row = signature_row(
+                entry,
+                integrity.get(index).cloned().unwrap_or_default(),
+                declared.get(index),
+            );
+            row["index"] = index.into();
+            row["id"] = json!(if aligned { ids[index].clone() } else { None });
             if entry.result().is_ok() {
                 for (name, value) in level_facts(&session, entry.identity(), &caller, &inputs) {
                     row[name] = value;
@@ -790,6 +913,9 @@ fn facts(xml: &str, anchors: &Path, at: i64, profile: PolicyProfile) -> Result<V
         Ok(())
     });
     let mut facts = json!({ "signatures": signatures });
+    if !unreadable.is_empty() {
+        facts["unreadable_timestamps"] = json!(unreadable);
+    }
     if let Some(refusal) = integrity_refusal {
         facts["integrity_request"] = refusal;
     }
@@ -800,10 +926,9 @@ fn facts(xml: &str, anchors: &Path, at: i64, profile: PolicyProfile) -> Result<V
     Ok(facts)
 }
 
-/// Sets each signature's [`etsi::Declared::token_integrity`]: xml-sec-xades
-/// checks the tokens at the latest token's generation time, since it refuses
-/// any token generated after the time it validates at, and so establishes
-/// each token's imprint and TSA signature once, for the ETSI process to place
+/// Sets each signature's [`etsi::Declared::token_integrity`], or why none of
+/// its tokens was checked: xml-sec-xades establishes each token's imprint and
+/// TSA signature once, at no time of its own, for the ETSI process to place
 /// against the validation time.
 fn establish_timestamps(
     document: &XmlDocument,
@@ -814,14 +939,8 @@ fn establish_timestamps(
 ) -> Result<(), Failure> {
     let Some(at) = declared
         .iter()
-        .flat_map(|declared| {
-            declared
-                .signature_timestamps
-                .iter()
-                .chain(&declared.validation_timestamps)
-                .chain(&declared.archive_timestamps)
-        })
-        .filter_map(|token| etsi::token_details(token).map(|token| token.generated))
+        .flat_map(etsi::Declared::tokens)
+        .filter_map(|(_, _, token)| etsi::token_details(token).map(|token| token.generated))
         .max()
     else {
         return Ok(());
@@ -872,6 +991,7 @@ fn establish_timestamps(
             } else {
                 &[Requirements::Archival, Requirements::Timestamped][..]
             };
+            let mut refusals = Vec::new();
             for requirements in levels {
                 let checked = check_tokens(
                     &session,
@@ -894,18 +1014,27 @@ fn establish_timestamps(
                             .collect::<Vec<_>>()
                     },
                 );
-                if let Ok(Outcome::Assessed(found)) = checked {
-                    declared.token_integrity = found;
-                    break;
+                match checked {
+                    Ok(Outcome::Assessed(found)) => {
+                        declared.token_integrity = found;
+                        refusals.clear();
+                        break;
+                    }
+                    Ok(outcome) => refusals.push(format!("{requirements:?}: {outcome:?}")),
+                    Err(error) => refusals.push(format!("{requirements:?}: {error:?}")),
                 }
+            }
+            if !refusals.is_empty() {
+                declared.token_refusal = Some(refusals.join("; "));
             }
         }
         Ok(())
     });
     // A refused request establishes no token of any signature.
-    if run.is_err() {
+    if let Err(error) = run {
         for declared in declared.iter_mut() {
             declared.token_integrity.clear();
+            declared.token_refusal = Some(format!("{error:?}"));
         }
     }
     Ok(())

@@ -53,6 +53,62 @@ fn a_refs_only_timestamp_is_told_apart_from_a_sig_and_refs_one() {
     );
 }
 
+/// The B-T fixture: a signer issued by the levels Issuer, which the document
+/// carries without its Root, and a timestamp of a TSA the Root issued.
+const B_T: &str = include_str!("../../tests/fixtures/levels/b-t.xml");
+const ISSUER: &[u8] = include_bytes!("../../tests/fixtures/levels/issuer.der");
+const ROOT: &[u8] = include_bytes!("../../tests/fixtures/levels/root.der");
+/// A self-signed certificate named like the levels Root, with another key.
+const IMPOSTOR: &[u8] = include_bytes!("../../tests/fixtures/levels/impostor-root.der");
+
+#[test]
+fn the_anchor_is_the_top_of_the_signers_chain() {
+    // The comparison anchors the topmost certificate of the signer chain the
+    // document carries; the timestamp authority's certificate anchors no
+    // signer, so it is no anchor of its own.
+    let pool = super::pool(B_T);
+    let (anchors, unread) = super::signer_anchors(B_T.as_bytes(), B_T, &pool).unwrap();
+    assert_eq!(unread, None);
+    assert_eq!(anchors, [ISSUER.to_vec()]);
+    // The Root the signer chain reaches is its top once it is carried.
+    let mut with_root = pool.clone();
+    with_root.push(ROOT.to_vec());
+    let (anchors, _) = super::signer_anchors(B_T.as_bytes(), B_T, &with_root).unwrap();
+    assert_eq!(anchors, [ROOT.to_vec()]);
+}
+
+#[test]
+fn a_certificate_that_only_shares_the_issuers_name_issues_nothing() {
+    // RFC 5280 6.1.3 (a)(1): the issuer's key verifies the certificate. A
+    // certificate named like the absent Root must not end the chain in place
+    // of the Issuer it does not sign.
+    let mut pool = super::pool(B_T);
+    pool.push(IMPOSTOR.to_vec());
+    let (anchors, _) = super::signer_anchors(B_T.as_bytes(), B_T, &pool).unwrap();
+    assert_eq!(anchors, [ISSUER.to_vec()]);
+}
+
+#[test]
+fn a_chain_search_past_its_bound_is_an_error_not_an_absent_chain() {
+    // Certificates sharing their names multiply the orderings the search
+    // tries; one cut short must not read as "no valid path".
+    let memory = super::account();
+    let parser = structured_asn1::Parser::der(memory.clone());
+    let carried = super::pool(B_T);
+    let pool: Vec<_> = carried
+        .iter()
+        .map(|der| structured_pkix::Certificate::read(&parser, der, 0).unwrap())
+        .collect();
+    let anchors = [structured_pkix::Certificate::read(&parser, ROOT, 0).unwrap()];
+    let declared = declarations(B_T);
+    let signer = super::etsi::signing_certificate(&declared[0], &pool, &memory).unwrap();
+    let issuers = [structured_pkix::Certificate::read(&parser, ISSUER, 0).unwrap()];
+    let found = super::etsi::candidates_within(signer, &issuers, &anchors, &memory, 100).unwrap();
+    assert_eq!(found.len(), 1);
+    let cut = super::etsi::candidates_within(signer, &issuers, &anchors, &memory, 2).unwrap_err();
+    assert!(cut.contains("exceeded 2"), "{cut}");
+}
+
 #[test]
 fn a_reference_digest_the_profile_refuses_is_unknown_to_the_process() {
     // The strict profiles admit RSA-SHA224 signatures but not a SHA-224
@@ -76,34 +132,42 @@ fn certificate_values_join_the_pool() {
     // EN 319 132-1 section 5.5.1: CertificateValues carries the issuers as
     // EncapsulatedX509Certificate; without them a signer in KeyInfo would
     // look like the end of its own chain.
-    let text = "<ds:Signature><ds:KeyInfo><ds:X509Data><ds:X509Certificate>AQ==\
-        </ds:X509Certificate></ds:X509Data></ds:KeyInfo><xades:CertificateValues>\
-        <xades:EncapsulatedX509Certificate>Ag==</xades:EncapsulatedX509Certificate>\
-        </xades:CertificateValues></ds:Signature>";
+    let text = "<ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\" \
+        xmlns:xades=\"http://uri.etsi.org/01903/v1.3.2#\"><ds:KeyInfo><ds:X509Data>\
+        <ds:X509Certificate>AQ==</ds:X509Certificate></ds:X509Data></ds:KeyInfo>\
+        <xades:CertificateValues><xades:EncapsulatedX509Certificate>Ag==\
+        </xades:EncapsulatedX509Certificate></xades:CertificateValues></ds:Signature>";
     assert_eq!(super::pool(text), [vec![1], vec![2]]);
 }
 
 #[test]
 fn a_readable_token_keeps_its_authorities_when_another_is_unreadable() {
-    // An unreadable token is reported on its own; the certificates of the
-    // readable ones still count.
-    let (authorities, failures) =
-        tokens::token_authorities("<EncapsulatedTimeStamp>AQ==</EncapsulatedTimeStamp>", &[]);
-    assert_eq!(authorities.len(), 0);
-    assert_eq!(failures.len(), 1);
+    // An unreadable token is reported on its own; the certificates and policy
+    // of a readable one after it still count.
+    let readable = include_str!("../../tests/fixtures/levels/b-t.xml");
+    let (alone, none) = tokens::token_authorities(readable, &[]);
+    assert!(none.is_empty(), "{none:?}");
+    assert_ne!(alone.len(), 0);
+    let text = readable.replacen(
+        "<xades:EncapsulatedTimeStamp>",
+        "<xades:EncapsulatedTimeStamp>AQ==</xades:EncapsulatedTimeStamp>\
+         <xades:EncapsulatedTimeStamp>",
+        1,
+    );
+    let (authorities, failures) = tokens::token_authorities(&text, &[]);
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert_eq!(authorities, alone);
 }
 
 #[test]
-fn an_unterminated_character_reference_is_kept_as_text_in_one_pass() {
-    // Each `&#` without its `;` used to scan the rest of the value again.
-    let text = "&#1".repeat(20_000) + "&#65;";
-    let decoded = tokens::character_references(&text);
-    assert!(decoded.ends_with('A'));
-    assert_eq!(decoded.len(), 20_000 * 3 + 1);
-    assert_eq!(
-        tokens::character_references("a&#xD;b&#13;c&#x;d"),
-        "a\rb\rc&#x;d"
-    );
+fn only_an_elements_value_is_read_and_where_the_element_is() {
+    // A certificate in a comment carries nothing and has no place in the
+    // document, which archive coverage reads; the element's character
+    // references (`&#13;` in base64) are part of its value.
+    let text = "<a><!-- <X509Certificate>AQ==</X509Certificate> -->\
+        <X509Certificate>A&#13;Q==</X509Certificate></a>";
+    let found = tokens::values_at(text, "X509Certificate");
+    assert_eq!(found, [(text.rfind("<X509Certificate").unwrap(), vec![1])]);
 }
 
 #[test]
@@ -117,6 +181,7 @@ fn only_a_lexical_xs_date_time_reads_as_an_instant() {
         Some(1_772_280_000)
     );
     assert_eq!(date_time("2024-02-29T00:00:00"), Some(1_709_164_800));
+    assert_eq!(date_time("2026-02-28T24:00:00.0Z"), Some(1_772_323_200));
     for invalid in [
         "2026-02-30T12:00:00Z",
         "2025-02-29T00:00:00Z",
@@ -129,6 +194,11 @@ fn only_a_lexical_xs_date_time_reads_as_an_instant() {
         "2026-02-28T12:00:00+0100",
         "2026-02-28T12:00:00Zjunk",
         "2026-02-28T12:00:00.Z",
+        // Only 24:00:00 itself names the end of the day, no fraction past it.
+        "2026-02-28T24:00:00.1Z",
+        // Each zone field is two digits, without a sign of its own.
+        "2026-02-28T12:00:00+-1:00",
+        "2026-02-28T12:00:00+01:-1",
     ] {
         assert_eq!(date_time(invalid), None, "{invalid}");
     }
@@ -189,6 +259,51 @@ const CLAIMS: &str = r##"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmlds
     <y:CertDigest xmlns:y="urn:other"><ds:DigestValue>Aw==</ds:DigestValue></y:CertDigest>
   </ds:Object>
 </ds:Signature>"##;
+
+#[test]
+fn a_double_quoted_xpointer_id_names_its_element() {
+    // XPointer's id() takes either quote (XMLDSig 1.1 section 4.4.3.3); the
+    // verifier resolves both, so the expected target must be the element.
+    let text = r##"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+  <ds:SignedInfo>
+    <ds:Reference URI='#xpointer(id("payload"))'/>
+    <ds:Reference URI="#xpointer(id('other'))"/>
+  </ds:SignedInfo>
+</ds:Signature>"##;
+    assert_eq!(
+        super::targets(text),
+        [
+            super::Target::Id("payload".into()),
+            super::Target::Id("other".into())
+        ]
+    );
+}
+
+#[test]
+fn a_certificate_outside_the_signatures_key_info_is_no_key_info_certificate() {
+    // ds:KeyInfo is a direct child of ds:Signature (XMLDSig 1.1 section 4.5);
+    // a KeyInfo inside a ds:Object identifies nothing about this signature.
+    let text = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+  <ds:SignedInfo/>
+  <ds:KeyInfo><ds:X509Data><ds:X509Certificate>AQ==</ds:X509Certificate></ds:X509Data></ds:KeyInfo>
+  <ds:Object><ds:KeyInfo><ds:X509Data><ds:X509Certificate>Ag==</ds:X509Certificate></ds:X509Data></ds:KeyInfo></ds:Object>
+</ds:Signature>"#;
+    let found = declarations(text);
+    assert_eq!(found[0].key_info, [vec![1]]);
+}
+
+#[test]
+fn a_utf_16_document_is_read_as_the_parser_reads_it() {
+    // XML 1.0 section 4.3.3: a byte order mark selects UTF-16, and the
+    // verification parses the document so; its text view must hold the same
+    // signing time, or the facts would miss what the signature claims.
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in CLAIMS.encode_utf16() {
+        bytes.extend(unit.to_le_bytes());
+    }
+    let text = super::ascii_view(&bytes);
+    assert_eq!(super::signing_time(&text), Some(1_577_836_800));
+}
 
 #[test]
 fn claims_are_read_only_from_the_signatures_signed_properties() {

@@ -5,7 +5,7 @@ import java.util.ArrayList;
 import java.util.Date;
 import eu.europa.esig.dss.enumerations.ValidationLevel;
 import eu.europa.esig.dss.model.DSSException;
-import eu.europa.esig.dss.model.FileDocument;
+import eu.europa.esig.dss.model.InMemoryDocument;
 import eu.europa.esig.dss.validation.SignedDocumentValidator;
 import eu.europa.esig.dss.validation.reports.Reports;
 
@@ -20,7 +20,9 @@ import eu.europa.esig.dss.validation.reports.Reports;
  * validating it (an unsupported algorithm, say), leaves that refusal in
  * refused.txt; any other exception, which is a failure of the run rather
  * than an answer about the input, leaves its trace in error.txt instead of
- * reports.
+ * reports. An input that cannot be read is such a failure: it is read
+ * before DSS selects a validator, so only an input DSS has in hand can be
+ * refused.
  */
 public class CorpusProbe {
     public static void main(String[] args) throws Exception {
@@ -38,9 +40,18 @@ public class CorpusProbe {
             for (int pair = 4; pair + 1 < fields.length; pair += 2) {
                 var output = Path.of(fields[pair + 1]);
                 Files.createDirectories(output);
+                InMemoryDocument input;
+                try {
+                    input = new InMemoryDocument(Files.readAllBytes(Path.of(fields[1])), Path.of(fields[1]).getFileName().toString());
+                } catch (Exception error) {
+                    var trace = new StringWriter();
+                    error.printStackTrace(new PrintWriter(trace));
+                    Files.writeString(output.resolve("error.txt"), trace.toString());
+                    continue;
+                }
                 SignedDocumentValidator validator;
                 try {
-                    validator = SignedDocumentValidator.fromDocument(new FileDocument(fields[1]));
+                    validator = SignedDocumentValidator.fromDocument(input);
                 } catch (Exception refusal) {
                     Files.writeString(output.resolve("refused.txt"), String.valueOf(refusal.getMessage()));
                     continue;

@@ -2,21 +2,23 @@
 //! corpus, validated by DSS and by `xml-sec-xades` under the strict `Xades`
 //! policy profile, compared per ETSI EN 319 102-1 building block.
 //!
-//! The corpus is every XML file of `dss-xades/src/test/resources` and of
+//! The corpus is every XML file (`.xml` and `.xades`) of
+//! `dss-xades/src/test/resources` and of
 //! `dss-cookbook/src/test/resources/signature-pool`, read from the tag of the
 //! DSS release the probes are built against. Both validators receive the same
-//! conditions, derived from each input: the trust anchors are the
-//! certificates where the chains the document carries end, and the time is
+//! conditions, derived from each input: the trust anchors are the topmost
+//! certificates of the signer chains the document carries, and the time is
 //! [`INSTANT`]. When none of the document's signatures reaches a validated
-//! path at that instant and the document carries no timestamp, a second pair
-//! of runs takes its claimed signing time, labelled `signing-time`.
+//! path at that instant and no timestamp token proves its existence, a second
+//! pair of runs takes its claimed signing time, labelled `signing-time`.
 //!
 //! `interop/xades/dss-corpus/expectations.json` holds the classification of
 //! every input; a run that observes another comparison, or an input it does
-//! not list, fails. `interop/xades/dss-corpus/reviews.json` holds the reviews
-//! of differences, each for one input's overall comparison, so one review
-//! covers every pass and profile that observes it. `--record` writes the
-//! observations with the reviews that apply instead of checking them.
+//! not list, fails. The DSS release and corpus commit it names are its
+//! provenance. `interop/xades/dss-corpus/reviews.json` holds the reviews of
+//! differences, each for one input's comparison, so one review covers every
+//! pass and profile that observes it. `--record` writes the observations with
+//! the reviews that apply instead of checking them.
 
 use super::{Build, Corpus, absolute, line, write_json, xml};
 use serde_json::{Map, Value, json};
@@ -182,7 +184,8 @@ pub(crate) fn checkout_matches(
     Ok(())
 }
 
-/// Every XML file below the corpus sources, by its path inside the checkout.
+/// Every XML file below the corpus sources (`.xml`, and `.xades` as DSS
+/// names some signatures), by its path inside the checkout.
 fn inputs(checkout: &Path) -> Result<Vec<String>, String> {
     let mut found = Vec::new();
     let mut pending: Vec<PathBuf> = SOURCES.iter().map(|source| checkout.join(source)).collect();
@@ -199,7 +202,10 @@ fn inputs(checkout: &Path) -> Result<Vec<String>, String> {
                 .map_err(|error| format!("read {}: {error}", path.display()))?;
             if kind.is_dir() {
                 pending.push(path);
-            } else if kind.is_file() && path.extension().is_some_and(|extension| extension == "xml")
+            } else if kind.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "xml" || extension == "xades")
             {
                 let relative = path
                     .strip_prefix(checkout)
@@ -227,19 +233,36 @@ pub(crate) fn slug(input: &str) -> String {
     name
 }
 
-/// The indication of a DSS building block, or `absent`.
+/// The conclusion of a DSS building block as `INDICATION` or
+/// `INDICATION:SUB_INDICATION`, or `absent`: the sub-indication says why a
+/// block did not pass (EN 319 102-1 V1.4.1 clause 5.1.3), so a change of it
+/// is a change of the block's result.
 fn indication(block: Option<xml::Node<'_, '_>>) -> String {
-    block
-        .and_then(|block| xml::text_at(block, &["Conclusion", "Indication"]))
-        .unwrap_or_else(|| "absent".into())
+    let Some(indication) =
+        block.and_then(|block| xml::text_at(block, &["Conclusion", "Indication"]))
+    else {
+        return "absent".into();
+    };
+    match block.and_then(|block| xml::text_at(block, &["Conclusion", "SubIndication"])) {
+        Some(sub) => format!("{indication}:{sub}"),
+        None => indication,
+    }
 }
 
-/// The worst of `indications`: FAILED over INDETERMINATE over PASSED, `none`
-/// when there are none.
-fn worst(indications: &[String]) -> String {
+/// The indication part of a block conclusion [`indication`] spelled.
+fn main_indication(conclusion: &str) -> &str {
+    conclusion.split(':').next().unwrap_or_default()
+}
+
+/// The worst of `conclusions`, FAILED over INDETERMINATE over PASSED, with
+/// its sub-indication; `none` when there are none.
+fn worst(conclusions: &[String]) -> String {
     for level in ["FAILED", "INDETERMINATE", "absent", "PASSED"] {
-        if indications.iter().any(|indication| indication == level) {
-            return level.into();
+        if let Some(found) = conclusions
+            .iter()
+            .find(|conclusion| main_indication(conclusion) == level)
+        {
+            return found.clone();
         }
     }
     "none".into()
@@ -284,19 +307,12 @@ pub(crate) fn dss_signatures(
             let block = own.first().and_then(|block| xml::child(*block, name));
             row.insert(name.into(), indication(block).into());
         }
-        let stamps: Vec<String> = xml::below(diagnostic.root_element(), "Timestamp", None)
-            .filter(|stamp| {
-                xml::below(*stamp, "TimestampedObject", None).any(|object| {
-                    object.attribute("Category") == Some("SIGNATURE")
-                        && object.attribute("Token") == Some(token.as_str())
-                })
-            })
-            .map(|stamp| {
-                let id = stamp.attribute("Id").unwrap_or_default();
-                let blocks = blocks(id, "TIMESTAMP");
-                let conclusion = blocks.first().copied();
-                indication(conclusion)
-            })
+        // DSS attaches each token to the signature that carries it through
+        // FoundTimestamps, whatever the token stamps: a RefsOnlyTimeStamp
+        // covers no SIGNATURE object, yet it is this signature's.
+        let stamps: Vec<String> = xml::below(signature, "FoundTimestamp", None)
+            .filter_map(|found| found.attribute("Timestamp"))
+            .map(|id| indication(blocks(id, "TIMESTAMP").first().copied()))
             .collect();
         row.insert("TIMESTAMPS".into(), worst(&stamps).into());
         found.push(json!({
@@ -309,39 +325,32 @@ pub(crate) fn dss_signatures(
     Ok(found)
 }
 
-/// Whether a refusal of the strict profile concerns `XAdES` structure (format
-/// checking) rather than an algorithm or transform (acceptability).
-fn structural(detail: &str) -> bool {
-    [
-        "XAdES",
-        "SignedProperties",
-        "QualifyingProperties",
-        "Signature requires",
-    ]
-    .iter()
-    .any(|word| detail.contains(word))
-}
-
 fn verdict(value: &str, detail: impl Into<String>) -> Value {
     json!({ "verdict": value, "detail": detail.into() })
 }
 
 /// The block verdicts of one signature's facts: `pass`, `fail` or
-/// `not-reached`, each with the fact it reads. `stamped` says whether the
-/// document carries a timestamp at all.
-pub(crate) fn our_blocks(facts: &Value, stamped: bool) -> Map<String, Value> {
+/// `not-reached`, each with the fact it reads; TIMESTAMPS is `none` for a
+/// signature that carries no timestamp.
+pub(crate) fn our_blocks(facts: &Value) -> Map<String, Value> {
     let mut blocks = Map::new();
     for name in BLOCKS {
         blocks.insert(name.into(), verdict("not-reached", ""));
     }
-    if !stamped {
+    if facts["declared_timestamps"].as_u64().unwrap_or(0) == 0 {
         blocks.insert("TIMESTAMPS".into(), verdict("none", ""));
+    } else if let Some(timestamps) = timestamp_block(&facts["timestamps"]) {
+        blocks.insert("TIMESTAMPS".into(), timestamps);
     }
     let verification = &facts["verification"];
     if let Some(error) = verification["error"].as_str() {
         let detail = verification["detail"].as_str().unwrap_or_default();
+        // The block the ETSI decision over the same facts names: a refusal
+        // of the profile is a constraint of signature acceptance (EN 319
+        // 102-1 V1.4.1 clause 5.2.8, its NOTE in 5.2.2 included), an
+        // unauthorized key one of signer identification (clause 5.3.4).
         let block = match error {
-            "Policy" if structural(detail) => "FC",
+            "Policy" if detail.contains("authorized key") => "ISC",
             "Policy" => "SAV",
             _ => "XCV",
         };
@@ -368,9 +377,6 @@ pub(crate) fn our_blocks(facts: &Value, stamped: bool) -> Map<String, Value> {
         ),
     );
     basic_blocks(facts, &mut blocks);
-    if stamped && let Some(timestamps) = timestamp_block(&facts["timestamped"]) {
-        blocks.insert("TIMESTAMPS".into(), timestamps);
-    }
     blocks
 }
 
@@ -437,28 +443,45 @@ fn basic_blocks(facts: &Value, blocks: &mut Map<String, Value>) {
     }
 }
 
-/// The TIMESTAMPS verdict of a signature's B-T facts, when it has them.
-fn timestamp_block(timestamped: &Value) -> Option<Value> {
-    if timestamped.is_null() {
-        return None;
+/// The TIMESTAMPS verdict over each of a signature's tokens, the scope DSS
+/// reports: every token's own timestamp validation at the validation time
+/// (EN 319 102-1 V1.4.1 clause 5.4), archive and validation-data tokens
+/// included. One that failed or stayed indeterminate fails the block; one
+/// the process could not judge leaves it not reached; none when the facts
+/// carry no per-token decision.
+fn timestamp_block(tokens: &Value) -> Option<Value> {
+    let tokens = tokens.as_array()?;
+    let mut unjudged = 0;
+    for token in tokens {
+        let current = &token["current"];
+        match current["indication"].as_str() {
+            None => unjudged += 1,
+            Some("PASSED") => {}
+            Some(indication) => {
+                return Some(verdict(
+                    "fail",
+                    format!(
+                        "{} {indication}:{}",
+                        token["role"].as_str().unwrap_or_default(),
+                        current["sub"].as_str().unwrap_or("-")
+                    ),
+                ));
+            }
+        }
     }
-    let (value, detail) = match timestamped["assessed"].as_bool() {
-        Some(true) => ("pass", "B-T requirements".to_owned()),
-        Some(false) => ("fail", "B-T requirements unmet".to_owned()),
-        None => (
-            "fail",
-            format!(
-                "{}{}",
-                timestamped["negative"].as_str().unwrap_or_default(),
-                timestamped["error"].as_str().unwrap_or_default()
-            ),
-        ),
-    };
-    Some(verdict(value, detail))
+    if unjudged > 0 {
+        return Some(verdict(
+            "not-reached",
+            format!("{unjudged} of {} tokens not judged", tokens.len()),
+        ));
+    }
+    Some(verdict("pass", format!("{} tokens", tokens.len())))
 }
 
-/// Whether a DSS indication and one of our verdicts say the same thing.
+/// Whether a DSS block conclusion and one of our verdicts say the same
+/// thing; our verdicts carry no sub-indication to compare.
 fn agrees(dss: &str, ours: &str) -> bool {
+    let dss = main_indication(dss);
     match ours {
         "pass" => dss == "PASSED",
         "fail" => dss == "FAILED" || dss == "INDETERMINATE",
@@ -467,10 +490,16 @@ fn agrees(dss: &str, ours: &str) -> bool {
     }
 }
 
+/// Whether both validators reached a block: neither side lacks it and ours
+/// did not stop before it.
+fn reached(dss: &str, ours: &str) -> bool {
+    dss != "absent" && ours != "absent" && ours != "not-reached"
+}
+
 /// The per-block comparison of one input: one entry per signature, matched by
 /// the `Id` of its `ds:Signature`, or by position when an `Id` is missing.
 /// A signature only xml-sec reads stands against an absent one.
-pub(crate) fn compare(dss: &[Value], ours: &[Value], stamped: bool) -> Vec<Value> {
+pub(crate) fn compare(dss: &[Value], ours: &[Value]) -> Vec<Value> {
     let mut paired = vec![false; ours.len()];
     // Every Id both sides carry is paired first, so a position never takes a
     // signature an Id names.
@@ -500,13 +529,11 @@ pub(crate) fn compare(dss: &[Value], ours: &[Value], stamped: bool) -> Vec<Value
     let mut rows: Vec<Value> = dss
         .iter()
         .zip(&counterpart)
-        .map(|(signature, position)| {
-            row(signature, position.map(|position| &ours[position]), stamped)
-        })
+        .map(|(signature, position)| row(signature, position.map(|position| &ours[position])))
         .collect();
     for (facts, _) in ours.iter().zip(&paired).filter(|(_, paired)| !**paired) {
         let absent = json!({ "id": facts["id"], "blocks": {} });
-        let mut row = row(&absent, Some(facts), stamped);
+        let mut row = row(&absent, Some(facts));
         row["matched"] = false.into();
         row["overall"]["indication"] = false.into();
         row["overall"]["agrees"] = false.into();
@@ -516,8 +543,8 @@ pub(crate) fn compare(dss: &[Value], ours: &[Value], stamped: bool) -> Vec<Value
 }
 
 /// The comparison of one DSS signature with its counterpart, if any.
-fn row(signature: &Value, matched: Option<&Value>, stamped: bool) -> Value {
-    let mine = matched.map_or_else(Map::new, |facts| our_blocks(facts, stamped));
+fn row(signature: &Value, matched: Option<&Value>) -> Value {
+    let mine = matched.map_or_else(Map::new, our_blocks);
     let spelled = |value: &Value| {
         format!(
             "{}:{}",
@@ -542,7 +569,12 @@ fn row(signature: &Value, matched: Option<&Value>, stamped: bool) -> Value {
             .unwrap_or("absent");
         blocks.insert(
             name.into(),
-            json!({ "dss": theirs, "ours": verdict, "agrees": agrees(theirs, verdict) }),
+            json!({
+                "dss": theirs,
+                "ours": verdict,
+                "agrees": agrees(theirs, verdict),
+                "reached": reached(theirs, verdict),
+            }),
         );
     }
     json!({
@@ -590,9 +622,11 @@ pub(crate) fn observed(rows: &[Value]) -> Value {
 }
 
 /// The class a comparison takes without review: every signature reaches
-/// DSS's overall indication and sub-indication (the building blocks are the
-/// diagnosis of a difference, not the verdict), neither side found a
-/// signature, or the document carries no anchor.
+/// DSS's overall indication and sub-indication and agrees on every building
+/// block both validators reached, neither side found a signature, or the
+/// document carries no anchor. A block one side did not reach stays in the
+/// observation, which the check compares, but needs no review: xml-sec's
+/// facts stop at the first refusal where DSS goes on.
 pub(crate) fn automatic_class(rows: &[Value], anchors: u64) -> &'static str {
     if rows.is_empty() {
         return "not-a-signature";
@@ -600,7 +634,13 @@ pub(crate) fn automatic_class(rows: &[Value], anchors: u64) -> &'static str {
     if anchors == 0 {
         return "no-usable-anchor";
     }
-    if every_overall(rows, "agrees") {
+    let blocks_agree = rows.iter().all(|row| {
+        BLOCKS.iter().all(|name| {
+            let block = &row["blocks"][*name];
+            block["reached"] != true || block["agrees"] == true
+        })
+    });
+    if every_overall(rows, "agrees") && blocks_agree {
         "agreement"
     } else {
         "unreviewed"
@@ -671,33 +711,51 @@ fn write_policies(
     Ok(())
 }
 
+/// `text` as one field of the DSS probe's manifest, whose fields are
+/// tab-separated on one line each: a tab or a line break inside it would
+/// split it, so it is refused.
+pub(crate) fn manifest_field(text: &str) -> Result<&str, String> {
+    if text.contains(['\t', '\n', '\r']) {
+        return Err(format!(
+            "{text:?} contains a tab or a line break, which the DSS manifest cannot carry"
+        ));
+    }
+    Ok(text)
+}
+
 impl Pass<'_> {
     /// Validates every `(name, input, directory, at)`: the probe's facts and
     /// DSS's reports (or its refusal) under each profile land in the case's
     /// directory for this pass.
     fn run(&self, cases: &[(String, PathBuf, PathBuf, i64)], logs: &Path) -> Result<(), String> {
         use std::fmt::Write as _;
+        // Every line first, so a field the manifest cannot carry stops the
+        // pass before either validator runs.
         let mut manifest = String::new();
         for (name, input, directory, at) in cases {
             let output = directory.join(self.label);
-            std::fs::create_dir_all(&output).map_err(|error| error.to_string())?;
             write!(
                 manifest,
-                "{name}\t{}\t{at}\t{}",
-                input.display(),
-                directory.join("anchors").display(),
+                "{}\t{}\t{at}\t{}",
+                manifest_field(name)?,
+                manifest_field(&input.to_string_lossy())?,
+                manifest_field(&directory.join("anchors").to_string_lossy())?,
             )
             .map_err(|error| error.to_string())?;
             for (label, _) in PROFILES {
                 write!(
                     manifest,
                     "\t{}\t{}",
-                    self.policies.join(format!("{label}.xml")).display(),
-                    output.join(label).join("dss").display()
+                    manifest_field(&self.policies.join(format!("{label}.xml")).to_string_lossy())?,
+                    manifest_field(&output.join(label).join("dss").to_string_lossy())?,
                 )
                 .map_err(|error| error.to_string())?;
             }
             manifest.push('\n');
+        }
+        for (_, input, directory, at) in cases {
+            let output = directory.join(self.label);
+            std::fs::create_dir_all(&output).map_err(|error| error.to_string())?;
             for (label, profile) in PROFILES {
                 let directory_of_profile = output.join(label);
                 std::fs::create_dir_all(&directory_of_profile)
@@ -738,7 +796,7 @@ impl Pass<'_> {
 
 /// Reads one pass of one case under the profile `label` into its comparison
 /// rows and our facts.
-fn pass_rows(directory: &Path, label: &str, stamped: bool) -> Result<(Vec<Value>, Value), String> {
+fn pass_rows(directory: &Path, label: &str) -> Result<(Vec<Value>, Value), String> {
     let dss = directory.join(label).join("dss");
     let mut facts: Value =
         serde_json::from_str(&xml::read(&directory.join(label).join("facts.json"))?)
@@ -759,7 +817,7 @@ fn pass_rows(directory: &Path, label: &str, stamped: bool) -> Result<(Vec<Value>
             &xml::read(&dss.join("simple.xml"))?,
         )?
     };
-    Ok((compare(&signatures, &ours, stamped), facts))
+    Ok((compare(&signatures, &ours), facts))
 }
 
 /// Whether no signature of a pass reached a validated path.
@@ -770,6 +828,19 @@ fn unvalidated(facts: &Value) -> bool {
                 .iter()
                 .all(|signature| signature["verification"]["trust"] != "ValidatedX509")
     })
+}
+
+/// Whether a pass established a proof of existence for any signature: one
+/// of its timestamp tokens passed its own validation at the validation time
+/// (EN 319 102-1 V1.4.1 clause 5.4). A token that is present but rejected,
+/// unjudged or merely written in the text proves nothing.
+pub(crate) fn proves_existence(facts: &Value) -> bool {
+    facts["signatures"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|signature| signature["timestamps"].as_array().into_iter().flatten())
+        .any(|token| token["current"]["indication"] == "PASSED")
 }
 
 /// A corpus input: its name, path, result directory and validation time.
@@ -801,7 +872,6 @@ fn conditions_of(
         } else {
             json!({
                 "anchors": 0,
-                "timestamps": false,
                 "probe": String::from_utf8_lossy(&probe_run.stderr),
             })
         };
@@ -899,7 +969,6 @@ fn observations(
     let mut observations = Map::new();
     for (name, _, directory, _) in cases {
         let found = &conditions[name];
-        let stamped = found["timestamps"] == true;
         let mut row = Map::new();
         for label in ["instant", "signing-time"] {
             let pass = directory.join(label);
@@ -907,7 +976,7 @@ fn observations(
                 continue;
             }
             for (profile, _) in PROFILES {
-                let (rows, facts) = pass_rows(&pass, profile, stamped)?;
+                let (rows, facts) = pass_rows(&pass, profile)?;
                 row.insert(
                     format!("{label}/{profile}"),
                     observation(&rows, &facts, found),
@@ -924,6 +993,8 @@ fn execute(corpus: &Corpus, results: &Path, record: bool) -> Result<(), String> 
     if results.exists() {
         return Err("results already exist; select a fresh --results directory".into());
     }
+    // Every case path of the DSS manifest lies below it.
+    manifest_field(&results.to_string_lossy())?;
     std::fs::create_dir_all(results).map_err(|error| error.to_string())?;
     let release = super::dss::build(corpus, &results.join("dss-build"))?;
     let (checkout, commit) = fetch(corpus, &release.dss, results)?;
@@ -957,7 +1028,7 @@ fn execute(corpus: &Corpus, results: &Path, record: bool) -> Result<(), String> 
         )?)
         .map_err(|error| error.to_string())?;
         if let Some(time) = found["signing_time"].as_i64()
-            && found["timestamps"] == false
+            && !proves_existence(&facts)
             && unvalidated(&facts)
         {
             later.push((name.clone(), path.clone(), directory.clone(), time));
@@ -1020,12 +1091,14 @@ pub(crate) fn report(expectations: &Value) -> String {
     );
     writeln!(
         text,
-        "EU DSS {}, every XML input of `dss-xades/src/test/resources` and \
+        "Recorded with EU DSS {}, every XML input (`.xml` and `.xades`) of \
+         `dss-xades/src/test/resources` and \
          `dss-cookbook/src/test/resources/signature-pool` at its release tag. \
-         Both validators get the same trust anchors (where each chain the \
-         document carries ends) and the same time ({} Unix seconds; a second \
-         pass at the claimed signing time when no signature reaches a \
-         validated path and the document carries no timestamp).\n",
+         Both validators get the same trust anchors (the topmost certificate \
+         of each signer chain the document carries) and the same time ({} \
+         Unix seconds; a second pass at the claimed signing time when no \
+         signature reaches a validated path and no timestamp token proves its \
+         existence).\n",
         expectations["dss"].as_str().unwrap_or("?"),
         expectations["instant"],
     )
@@ -1036,7 +1109,8 @@ pub(crate) fn report(expectations: &Value) -> String {
          when every signature reaches TOTAL_PASSED (ETSI EN 319 102-1 V1.4.1: \
          DSS's simple report, and the shared EN 319 102-1 process over \
          xml-sec's facts); it is in *agreement* when every signature reaches \
-         DSS's indication and sub-indication. Two classes come before that \
+         DSS's indication and sub-indication and every building block both \
+         validators reached says the same. Two classes come before that \
          rule and need no review: *not-a-signature* when neither side reads a \
          signature, and *no-usable-anchor* when the document carries no \
          certificate a chain ends at, whatever the indications. Each other \
@@ -1154,15 +1228,15 @@ fn stale_reviews(summary: &Value, reviews: &Value) -> Vec<String> {
 /// with `reviews`.
 pub(crate) fn differences(expected: &Value, summary: &Value, reviews: &Value) -> Vec<String> {
     let mut found = stale_reviews(summary, reviews);
-    // The release resolves at run time; a new one, or a tag moved to another
-    // commit, is reviewed and recorded rather than accepted under the old name.
-    for field in ["dss", "corpus_commit"] {
-        if expected[field] != summary[field] {
-            found.push(format!(
-                "the run used {field} {} where the expectations record {}",
-                summary[field], expected[field]
-            ));
-        }
+    // The release and the corpus commit resolve at run time and are the
+    // provenance of the recording, not a condition of it: a new release that
+    // observes every input as recorded passes, and its new or changed inputs
+    // fail below. The validation instant is a condition of every observation.
+    if expected["instant"] != summary["instant"] {
+        found.push(format!(
+            "the run validated at {} where the expectations record {}",
+            summary["instant"], expected["instant"]
+        ));
     }
     let reviewed = &expected["cases"];
     for (name, passes) in summary["cases"].as_object().into_iter().flatten() {
@@ -1231,7 +1305,74 @@ pub(crate) fn differences(expected: &Value, summary: &Value, reviews: &Value) ->
     found
 }
 
+/// Each review of `reviews` moved onto the observations of `summary`: a
+/// review that explained a pass of the `previous` expectations explains the
+/// same pass now when its overall comparison is unchanged, whatever form the
+/// block results took. A review whose passes now observe another overall
+/// comparison is kept as it was, for the check to report and a reviewer to
+/// write again.
+pub(crate) fn carried(previous: &Value, summary: &Value, reviews: &Value) -> Value {
+    let mut moved = Map::new();
+    for (name, list) in reviews.as_object().into_iter().flatten() {
+        let mut kept = Vec::new();
+        for review in list.as_array().into_iter().flatten() {
+            let mut observed: Vec<Value> = Vec::new();
+            for (label, pass) in previous["cases"][name].as_object().into_iter().flatten() {
+                let explained = review["observed"]
+                    .as_array()
+                    .is_some_and(|approved| approved.contains(&pass["observed"]));
+                let now = &summary["cases"][name][label]["observed"];
+                if explained
+                    && !now.is_null()
+                    && overall_of(now) == review["overall"]
+                    && !observed.contains(now)
+                {
+                    observed.push(now.clone());
+                }
+            }
+            let mut review = review.clone();
+            if !observed.is_empty() {
+                review["observed"] = Value::Array(observed);
+            }
+            kept.push(review);
+        }
+        moved.insert(name.clone(), Value::Array(kept));
+    }
+    Value::Object(moved)
+}
+
+/// Rewrites the reviews and the expectations from the completed run in
+/// `results`, the reviews carried from the committed expectations.
+fn carry(corpus: &Corpus, results: &Path) -> Result<(), String> {
+    let summary: Value = serde_json::from_str(&xml::read(&results.join("summary.json"))?)
+        .map_err(|error| error.to_string())?;
+    recordable(&summary)?;
+    let path = expectations_path(corpus);
+    let relative = path
+        .strip_prefix(&corpus.root)
+        .map_err(|error| error.to_string())?;
+    let committed = corpus.require(
+        &line(&[
+            &"git",
+            &"-C",
+            &corpus.root,
+            &"show",
+            &format!("HEAD:{}", relative.display()),
+        ]),
+        &results.join("committed-expectations"),
+    )?;
+    let previous: Value =
+        serde_json::from_slice(&committed.stdout).map_err(|error| error.to_string())?;
+    let reviews = carried(&previous, &summary, &read_reviews(&reviews_path(corpus))?);
+    write_json(&reviews_path(corpus), &reviews)?;
+    let expectations = recorded(&summary, &reviews);
+    write_json(&path, &expectations)?;
+    super::write(&report_path(corpus), report(&expectations))
+}
+
 pub(crate) fn run(corpus: &Corpus, args: &[String]) -> Result<(), crate::repo::Failure> {
+    let usage =
+        "usage: xades dss-corpus [--results DIR] [--record] | xades dss-corpus --carry-reviews DIR";
     let mut results = corpus.root.join("target/xades-dss-corpus");
     let mut record = false;
     let mut args = args.iter();
@@ -1241,7 +1382,14 @@ pub(crate) fn run(corpus: &Corpus, args: &[String]) -> Result<(), crate::repo::F
             "--results" => {
                 results = absolute(args.next().ok_or("--results needs a directory")?)?;
             }
-            _ => return Err("usage: xades dss-corpus [--results DIR] [--record]".into()),
+            "--carry-reviews" => {
+                let completed = absolute(args.next().ok_or("--carry-reviews needs a directory")?)?;
+                if args.next().is_some() {
+                    return Err(usage.into());
+                }
+                return Ok(carry(corpus, &completed)?);
+            }
+            _ => return Err(usage.into()),
         }
     }
     Ok(execute(corpus, &results, record)?)

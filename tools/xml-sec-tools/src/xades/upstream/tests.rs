@@ -3,16 +3,38 @@ use super::{
 };
 use serde_json::{Value, json};
 
+/// A diagnostic report shaped as DSS 6.5.1 writes it: each signature lists
+/// the tokens it carries under `FoundTimestamps`, and each token lists what
+/// it stamps. T-1 is S-1's signature timestamp, T-3 its `RefsOnlyTimeStamp`,
+/// which stamps certificates and revocation data but no SIGNATURE object,
+/// and T-2 belongs to another signature although it stamps S-1 too.
 const DIAGNOSTIC: &str = r#"<DiagnosticData xmlns="http://dss.esig.europa.eu/validation/diagnostic">
   <Signatures>
-    <Signature Id="S-1"><DAIdentifier>sig</DAIdentifier></Signature>
+    <Signature Id="S-1">
+      <DAIdentifier>sig</DAIdentifier>
+      <FoundTimestamps>
+        <FoundTimestamp Timestamp="T-1"/>
+        <FoundTimestamp Timestamp="T-3"/>
+      </FoundTimestamps>
+    </Signature>
+    <Signature Id="S-other">
+      <DAIdentifier>other</DAIdentifier>
+      <FoundTimestamps>
+        <FoundTimestamp Timestamp="T-2"/>
+      </FoundTimestamps>
+    </Signature>
   </Signatures>
   <UsedTimestamps>
-    <Timestamp Id="T-1"><TimestampedObjects>
+    <Timestamp Type="SIGNATURE_TIMESTAMP" Id="T-1"><TimestampedObjects>
       <TimestampedObject Token="S-1" Category="SIGNATURE"/>
     </TimestampedObjects></Timestamp>
-    <Timestamp Id="T-2"><TimestampedObjects>
+    <Timestamp Type="SIGNATURE_TIMESTAMP" Id="T-2"><TimestampedObjects>
       <TimestampedObject Token="S-other" Category="SIGNATURE"/>
+      <TimestampedObject Token="S-1" Category="SIGNATURE"/>
+    </TimestampedObjects></Timestamp>
+    <Timestamp Type="VALIDATION_DATA_REFSONLY_TIMESTAMP" Id="T-3"><TimestampedObjects>
+      <TimestampedObject Token="C-1" Category="CERTIFICATE"/>
+      <TimestampedObject Token="R-1" Category="REVOCATION"/>
     </TimestampedObjects></Timestamp>
   </UsedTimestamps>
 </DiagnosticData>"#;
@@ -22,14 +44,17 @@ const DETAILED: &str = r#"<DetailedReport xmlns="http://dss.esig.europa.eu/valid
     <FC><Conclusion><Indication>PASSED</Indication></Conclusion></FC>
     <ISC><Conclusion><Indication>PASSED</Indication></Conclusion></ISC>
     <CV><Conclusion><Indication>PASSED</Indication></Conclusion></CV>
-    <XCV><Conclusion><Indication>INDETERMINATE</Indication></Conclusion></XCV>
+    <XCV><Conclusion><Indication>INDETERMINATE</Indication><SubIndication>TRY_LATER</SubIndication></Conclusion></XCV>
     <SAV><Conclusion><Indication>PASSED</Indication></Conclusion></SAV>
   </BasicBuildingBlocks>
   <BasicBuildingBlocks Id="T-1" Type="TIMESTAMP">
     <Conclusion><Indication>PASSED</Indication></Conclusion>
   </BasicBuildingBlocks>
   <BasicBuildingBlocks Id="T-2" Type="TIMESTAMP">
-    <Conclusion><Indication>FAILED</Indication></Conclusion>
+    <Conclusion><Indication>FAILED</Indication><SubIndication>HASH_FAILURE</SubIndication></Conclusion>
+  </BasicBuildingBlocks>
+  <BasicBuildingBlocks Id="T-3" Type="TIMESTAMP">
+    <Conclusion><Indication>PASSED</Indication></Conclusion>
   </BasicBuildingBlocks>
 </DetailedReport>"#;
 
@@ -40,62 +65,137 @@ const SIMPLE: &str = r#"<SimpleReport xmlns="http://dss.esig.europa.eu/validatio
   </Signature>
 </SimpleReport>"#;
 
-/// Facts of a signature that verified with a validated path and met B-B and B-T.
+/// `DETAILED` with S-1's `RefsOnlyTimeStamp` failed.
+fn refs_only_failed() -> String {
+    DETAILED.replace(
+        r#"<BasicBuildingBlocks Id="T-3" Type="TIMESTAMP">
+    <Conclusion><Indication>PASSED</Indication></Conclusion>"#,
+        r#"<BasicBuildingBlocks Id="T-3" Type="TIMESTAMP">
+    <Conclusion><Indication>FAILED</Indication><SubIndication>HASH_FAILURE</SubIndication></Conclusion>"#,
+    )
+}
+
+/// One token's decision as the probe reports it.
+fn token(indication: Option<&str>) -> Value {
+    json!({
+        "role": "Signature",
+        "current": indication.map(|indication| json!({ "indication": indication, "sub": null })),
+    })
+}
+
+/// Facts of a signature that verified with a validated path, met B-B and
+/// whose two tokens passed their own validation.
 fn verified() -> Value {
     json!({
         "id": "sig",
         "verification": { "status": "Valid", "trust": "ValidatedX509", "references": ["Valid", "Valid"] },
         "basic": { "bound": true, "included": true, "assessed": true },
-        "timestamped": { "assessed": true },
+        "declared_timestamps": 2,
+        "timestamps": [token(Some("PASSED")), token(Some("PASSED"))],
     })
 }
 
 #[test]
-fn a_signature_keeps_only_the_timestamps_that_cover_it() {
-    // T-2 covers another signature; its FAILED block must not reach S-1.
+fn a_signature_keeps_the_timestamps_it_carries() {
+    // T-2 is another signature's token, though it also stamps S-1; its
+    // FAILED block must not reach S-1. S-1's RefsOnlyTimeStamp stamps no
+    // SIGNATURE object and is S-1's all the same.
     let signatures = dss_signatures(DIAGNOSTIC, DETAILED, SIMPLE).unwrap();
-    assert_eq!(signatures.len(), 1);
+    assert_eq!(signatures.len(), 2);
     assert_eq!(signatures[0]["id"], "sig");
-    assert_eq!(signatures[0]["blocks"]["XCV"], "INDETERMINATE");
     assert_eq!(signatures[0]["blocks"]["TIMESTAMPS"], "PASSED");
+    assert_eq!(signatures[1]["blocks"]["TIMESTAMPS"], "FAILED:HASH_FAILURE");
     // The overall verdict is the simple report's, found by the same token.
     assert_eq!(signatures[0]["overall"]["indication"], "INDETERMINATE");
     assert_eq!(signatures[0]["overall"]["sub"], "TRY_LATER");
 }
 
 #[test]
+fn a_failed_refs_only_timestamp_reaches_its_own_signature_only() {
+    // Linking tokens by their SIGNATURE coverage left a RefsOnlyTimeStamp
+    // out, so its failure could not fail the block of the signature it is in.
+    let signatures = dss_signatures(DIAGNOSTIC, &refs_only_failed(), SIMPLE).unwrap();
+    assert_eq!(signatures[0]["blocks"]["TIMESTAMPS"], "FAILED:HASH_FAILURE");
+    let other = dss_signatures(DIAGNOSTIC, &refs_only_failed(), SIMPLE).unwrap();
+    assert_eq!(other[1]["blocks"]["TIMESTAMPS"], "FAILED:HASH_FAILURE");
+    let unchanged = dss_signatures(DIAGNOSTIC, DETAILED, SIMPLE).unwrap();
+    assert_eq!(
+        unchanged[1]["blocks"]["TIMESTAMPS"],
+        other[1]["blocks"]["TIMESTAMPS"]
+    );
+}
+
+#[test]
+fn a_block_keeps_its_sub_indication() {
+    // EN 319 102-1 V1.4.1 clause 5.1.3: the sub-indication says why a block
+    // did not pass; TRY_LATER and REVOKED_NO_POE are different results.
+    let signatures = dss_signatures(DIAGNOSTIC, DETAILED, SIMPLE).unwrap();
+    assert_eq!(signatures[0]["blocks"]["XCV"], "INDETERMINATE:TRY_LATER");
+    let revoked = DETAILED.replace(
+        "TRY_LATER</SubIndication></Conclusion></XCV>",
+        "REVOKED_NO_POE</SubIndication></Conclusion></XCV>",
+    );
+    let changed = dss_signatures(DIAGNOSTIC, &revoked, SIMPLE).unwrap();
+    let rows = |signatures: &[Value]| observed(&compare(signatures, &[verified()]));
+    assert_ne!(rows(&signatures), rows(&changed));
+    assert_eq!(
+        rows(&changed)[0]["XCV"],
+        "INDETERMINATE:REVOKED_NO_POE/pass"
+    );
+}
+
+#[test]
 fn each_block_compares_with_its_own_fact() {
     let signatures = dss_signatures(DIAGNOSTIC, DETAILED, SIMPLE).unwrap();
-    let rows = compare(&signatures, &[verified()], true);
+    let rows = compare(&signatures, &[verified()]);
     let blocks = &rows[0]["blocks"];
     for name in ["FC", "ISC", "CV", "SAV", "TIMESTAMPS"] {
         assert_eq!(blocks[name]["agrees"], true, "{name}");
     }
     // DSS cannot conclude the chain without revocation data, while the path
     // xml-sec validated needs none: a difference that stays visible.
-    assert_eq!(blocks["XCV"]["dss"], "INDETERMINATE");
+    assert_eq!(blocks["XCV"]["dss"], "INDETERMINATE:TRY_LATER");
     assert_eq!(blocks["XCV"]["ours"], "pass");
     assert_eq!(blocks["XCV"]["agrees"], false);
     assert_eq!(automatic_class(&rows, 1), "unreviewed");
-    assert_eq!(observed(&rows)[0]["XCV"], "INDETERMINATE/pass");
+    assert_eq!(observed(&rows)[0]["XCV"], "INDETERMINATE:TRY_LATER/pass");
 }
 
 #[test]
-fn a_policy_refusal_lands_on_the_block_it_concerns() {
+fn a_policy_refusal_lands_on_the_block_the_etsi_decision_names() {
+    // The ETSI decision over the same facts reads a profile refusal as a
+    // constraint of signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.8),
+    // a structural one included; both producers must name the same block.
     let refused = |detail: &str| json!({ "verification": { "error": "Policy", "detail": detail } });
-    let transform = our_blocks(
-        &refused(
-            "verification transform policy rejects algorithm http://www.w3.org/TR/1999/REC-xpath-19991116",
-        ),
-        false,
-    );
+    let transform = our_blocks(&refused(
+        "verification transform policy rejects algorithm http://www.w3.org/TR/1999/REC-xpath-19991116",
+    ));
     assert_eq!(transform["SAV"]["verdict"], "fail");
     assert_eq!(transform["FC"]["verdict"], "not-reached");
-    let structure = our_blocks(&refused("XAdES requires SignedProperties"), false);
-    assert_eq!(structure["FC"]["verdict"], "fail");
-    assert_eq!(structure["SAV"]["verdict"], "not-reached");
-    // Without a timestamp in the document there is nothing to compare.
+    let structure = our_blocks(&refused("XAdES requires SignedProperties"));
+    assert_eq!(structure["SAV"]["verdict"], "fail");
+    assert_eq!(structure["FC"]["verdict"], "not-reached");
+    let key = our_blocks(&refused("no authorized key for the signature"));
+    assert_eq!(key["ISC"]["verdict"], "fail");
+    // Without a timestamp in the signature there is nothing to compare.
     assert_eq!(structure["TIMESTAMPS"]["verdict"], "none");
+}
+
+#[test]
+fn the_timestamps_block_reads_every_token_of_the_signature() {
+    // DSS's block covers each token the signature carries, archive and
+    // validation-data ones included; a B-T result alone would pass a
+    // signature whose archive token failed.
+    let mut facts = verified();
+    facts["timestamps"] = json!([token(Some("PASSED")), token(Some("INDETERMINATE"))]);
+    assert_eq!(our_blocks(&facts)["TIMESTAMPS"]["verdict"], "fail");
+    facts["timestamps"] = json!([token(Some("PASSED")), token(None)]);
+    assert_eq!(our_blocks(&facts)["TIMESTAMPS"]["verdict"], "not-reached");
+    facts["timestamps"] = json!([token(Some("PASSED")), token(Some("PASSED"))]);
+    assert_eq!(our_blocks(&facts)["TIMESTAMPS"]["verdict"], "pass");
+    // Declared tokens without per-token decisions were not reached.
+    facts["timestamps"] = Value::Null;
+    assert_eq!(our_blocks(&facts)["TIMESTAMPS"]["verdict"], "not-reached");
 }
 
 #[test]
@@ -108,34 +208,55 @@ fn a_ts_101_903_signature_is_read_by_its_bes_facts() {
             "ts101903_bes": { "assessed": met },
         })
     };
-    let met = our_blocks(&facts(true), false);
+    let met = our_blocks(&facts(true));
     for name in ["FC", "ISC", "SAV"] {
         assert_eq!(met[name]["verdict"], "pass", "{name}");
     }
-    let unmet = our_blocks(&facts(false), false);
+    let unmet = our_blocks(&facts(false));
     assert_eq!(unmet["FC"]["verdict"], "pass");
     assert_eq!(unmet["ISC"]["verdict"], "fail");
     assert_eq!(unmet["SAV"]["verdict"], "fail");
 }
 
 #[test]
-fn agreement_is_the_overall_indication_and_sub_indication() {
-    // The verdict compared is DSS's simple report against the ETSI process
-    // over xml-sec's facts; the blocks only diagnose a difference, so an
-    // XCV difference alone does not deny agreement, and the same indication
-    // with another sub-indication is not agreement.
+fn agreement_needs_the_overall_result_and_every_block_both_reached() {
+    // The overall indication and sub-indication must match, and so must
+    // every block both validators reached: a block difference under the same
+    // overall result can hide a defect another refusal masks. A block only
+    // one side reached is recorded and checked, not reviewed.
     let signatures = dss_signatures(DIAGNOSTIC, DETAILED, SIMPLE).unwrap();
     let mut facts = verified();
     facts["etsi"] = json!({ "indication": "INDETERMINATE", "sub": "TRY_LATER" });
-    let rows = compare(&signatures, &[facts.clone()], true);
+    let rows = compare(&signatures, &[facts.clone()]);
     assert_eq!(rows[0]["blocks"]["XCV"]["agrees"], false);
+    assert_eq!(rows[0]["blocks"]["XCV"]["reached"], true);
+    assert_eq!(automatic_class(&rows, 1), "unreviewed");
+    // Our facts stopping before XCV leave the overall match standing.
+    let mut stopped = facts.clone();
+    stopped["verification"] =
+        json!({ "error": "Policy", "detail": "XAdES requires SignedProperties" });
+    stopped["etsi"] = json!({ "indication": "INDETERMINATE", "sub": "TRY_LATER" });
+    let rows = compare(&signatures, &[stopped]);
+    assert_eq!(rows[0]["blocks"]["XCV"]["reached"], false);
+    // SAV was reached by both and differs: still a difference to review.
+    assert_eq!(rows[0]["blocks"]["SAV"]["agrees"], false);
+    assert_eq!(automatic_class(&rows, 1), "unreviewed");
+    // Every reached block agreeing, the same overall result is agreement.
+    let passing = DETAILED.replace(
+        "<Indication>INDETERMINATE</Indication><SubIndication>TRY_LATER</SubIndication></Conclusion></XCV>",
+        "<Indication>PASSED</Indication></Conclusion></XCV>",
+    );
+    let signatures = dss_signatures(DIAGNOSTIC, &passing, SIMPLE).unwrap();
+    let signatures = &signatures[..1];
+    let rows = compare(signatures, &[facts.clone()]);
     assert_eq!(automatic_class(&rows, 1), "agreement");
     assert_eq!(
         observed(&rows)[0]["OVERALL"],
         "INDETERMINATE:TRY_LATER/INDETERMINATE:TRY_LATER"
     );
+    // The same indication with another sub-indication is not agreement.
     facts["etsi"]["sub"] = json!("CERTIFICATE_CHAIN_GENERAL_FAILURE");
-    let rows = compare(&signatures, &[facts], true);
+    let rows = compare(signatures, &[facts]);
     assert_eq!(rows[0]["overall"]["indication"], true);
     assert_eq!(automatic_class(&rows, 1), "unreviewed");
 }
@@ -144,7 +265,7 @@ fn agreement_is_the_overall_indication_and_sub_indication() {
 fn a_tampered_signature_fails_cryptographic_verification_only() {
     let mut facts = verified();
     facts["verification"]["references"] = json!(["Invalid", "Valid"]);
-    let blocks = our_blocks(&facts, false);
+    let blocks = our_blocks(&facts);
     assert_eq!(blocks["CV"]["verdict"], "fail");
     assert_eq!(blocks["XCV"]["verdict"], "pass");
 }
@@ -154,17 +275,14 @@ fn an_unmatched_or_missing_signature_never_counts_as_agreement() {
     let signatures = dss_signatures(DIAGNOSTIC, DETAILED, SIMPLE).unwrap();
     let mut other = verified();
     other["id"] = json!("elsewhere");
-    let rows = compare(&signatures, &[other], true);
+    let rows = compare(&signatures[..1], &[other]);
     assert_eq!(rows[0]["matched"], false);
     assert_eq!(automatic_class(&rows, 1), "unreviewed");
     // Neither side found a signature, whether DSS refused the input or
     // reported none: the input is not one.
-    assert_eq!(
-        automatic_class(&compare(&[], &[], true), 0),
-        "not-a-signature"
-    );
+    assert_eq!(automatic_class(&compare(&[], &[]), 0), "not-a-signature");
     // A document without a chain to anchor is classified as such.
-    let agreeing = compare(&signatures, &[verified()], true);
+    let agreeing = compare(&signatures, &[verified()]);
     assert_eq!(automatic_class(&agreeing, 0), "no-usable-anchor");
 }
 
@@ -175,7 +293,7 @@ fn a_signature_only_xml_sec_reads_stays_a_difference() {
     // nor "not a signature".
     let mut facts = verified();
     facts["etsi"] = json!({ "indication": "TOTAL_PASSED" });
-    let rows = compare(&[], &[facts], true);
+    let rows = compare(&[], &[facts]);
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["matched"], false);
     assert_eq!(rows[0]["overall"]["dss"], "absent:-");
@@ -186,7 +304,7 @@ fn a_signature_only_xml_sec_reads_stays_a_difference() {
 #[test]
 fn every_block_is_compared() {
     let signatures = dss_signatures(DIAGNOSTIC, DETAILED, SIMPLE).unwrap();
-    let rows = compare(&signatures, &[verified()], true);
+    let rows = compare(&signatures, &[verified()]);
     for name in BLOCKS {
         assert!(rows[0]["blocks"][name].is_object(), "{name}");
     }
@@ -214,7 +332,7 @@ fn the_report_counts_each_profile_of_each_pass() {
         },
     });
     let text = report(&expectations);
-    assert!(text.contains("EU DSS 6.5.1"), "{text}");
+    assert!(text.contains("Recorded with EU DSS 6.5.1"), "{text}");
     assert!(
         text.contains("| `xades` | 2 | 2 | 1 | 1 | 1 | agreement 1, policy-refusal 1 |"),
         "{text}"
@@ -434,7 +552,6 @@ fn an_identified_signature_is_paired_once_before_any_positional_match() {
     let rows = compare(
         &[theirs(None, "first"), theirs(Some("B"), "b")],
         &[mine(Some("B"), "b"), mine(None, "second")],
-        false,
     );
     assert_eq!(pairs(&rows), ["first/absent", "b/b", "absent/second"]);
 }
@@ -443,9 +560,9 @@ fn an_identified_signature_is_paired_once_before_any_positional_match() {
 fn a_signature_only_one_side_identifies_is_paired_by_position() {
     // An Id on one side and none on the other does not contradict a pairing;
     // two different Ids do.
-    let rows = compare(&[theirs(Some("S"), "s")], &[mine(None, "s")], false);
+    let rows = compare(&[theirs(Some("S"), "s")], &[mine(None, "s")]);
     assert_eq!(pairs(&rows), ["s/s"]);
-    let rows = compare(&[theirs(Some("S"), "s")], &[mine(Some("T"), "t")], false);
+    let rows = compare(&[theirs(Some("S"), "s")], &[mine(Some("T"), "t")]);
     assert_eq!(pairs(&rows), ["s/absent", "absent/t"]);
 }
 
@@ -476,6 +593,23 @@ fn a_symlinked_corpus_directory_is_not_read_twice() {
     assert_eq!(
         super::inputs(checkout.path()).unwrap(),
         [format!("{}/real/a.xml", super::SOURCES[0])]
+    );
+}
+
+#[test]
+fn an_xades_named_signature_is_a_corpus_input() {
+    // DSS names some XML signatures `.xades` (validation/valid.xades); every
+    // XML input must be classified, whatever its extension.
+    let checkout = tempfile::tempdir().unwrap();
+    for source in super::SOURCES {
+        std::fs::create_dir_all(checkout.path().join(source)).unwrap();
+    }
+    let directory = checkout.path().join(super::SOURCES[0]);
+    std::fs::write(directory.join("valid.xades"), "<a/>").unwrap();
+    std::fs::write(directory.join("notes.txt"), "text").unwrap();
+    assert_eq!(
+        super::inputs(checkout.path()).unwrap(),
+        [format!("{}/valid.xades", super::SOURCES[0])]
     );
 }
 
@@ -549,14 +683,14 @@ fn each_validator_passes_by_its_own_signatures() {
     let passed =
         |id| json!({ "id": id, "blocks": {}, "overall": { "indication": "TOTAL_PASSED" } });
     let ours = [json!({ "id": "A", "etsi": { "indication": "TOTAL_PASSED" } })];
-    let rows = compare(&[passed("A"), passed("B")], &ours, false);
+    let rows = compare(&[passed("A"), passed("B")], &ours);
     let facts = json!({ "signatures": ours });
     let entry = super::observation(&rows, &facts, &json!({ "anchors": 1 }));
     assert_eq!(entry["passed"], true);
     assert_eq!(entry["dss_passed"], true);
     assert_eq!(entry["class"], "unreviewed");
     // And the other way round.
-    let rows = compare(&[passed("A")], &[ours[0].clone(), ours[0].clone()], false);
+    let rows = compare(&[passed("A")], &[ours[0].clone(), ours[0].clone()]);
     let entry = super::observation(
         &rows,
         &json!({ "signatures": [ours[0], ours[0]] }),
@@ -566,24 +700,31 @@ fn each_validator_passes_by_its_own_signatures() {
 }
 
 #[test]
-fn a_run_of_another_corpus_release_or_commit_differs() {
-    // Equal observations from another release would otherwise pass under
-    // expectations, and a report, that name the old one.
+fn the_release_is_provenance_and_the_instant_a_condition() {
+    // The release and the corpus commit resolve at run time: a new release
+    // that observes every input as recorded passes, or CI would hold the
+    // corpus to the recorded release. A run at another instant observes
+    // under other conditions than the recording, so it differs.
     let mut summary = unreviewed_summary();
     summary["dss"] = "6.5.1".into();
     summary["corpus_commit"] = "a".into();
+    summary["instant"] = 1_800_000_000.into();
     let reviews = review("normative-difference", "EN 319 102-1 5.2.6.4 step 4");
     let recorded = super::recorded(&summary, &reviews);
-    assert_eq!(
-        differences(&recorded, &summary, &reviews),
-        Vec::<String>::new()
-    );
-    for (field, value) in [("dss", "6.6"), ("corpus_commit", "b")] {
+    for (field, value) in [("dss", json!("6.6")), ("corpus_commit", json!("b"))] {
         let mut other = summary.clone();
-        other[field] = value.into();
-        let found = differences(&recorded, &other, &reviews);
-        assert_eq!(found.len(), 1, "{field}: {found:?}");
+        other[field] = value;
+        assert_eq!(
+            differences(&recorded, &other, &reviews),
+            Vec::<String>::new(),
+            "{field}"
+        );
     }
+    let mut moved = summary.clone();
+    moved["instant"] = 1_900_000_000.into();
+    let found = differences(&recorded, &moved, &reviews);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("validated at"), "{found:?}");
 }
 
 #[test]
@@ -615,4 +756,67 @@ fn a_review_no_observation_matches_fails() {
     let found = differences(&recorded, &summary, &reviews);
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(found[0].contains("matches no observation"), "{found:?}");
+}
+
+#[test]
+fn a_review_moves_onto_the_new_form_of_the_comparison_it_explained() {
+    // A change of how blocks are written leaves the difference a review
+    // explains in place; a pass that now observes another overall result is
+    // a new difference, which keeps the review as it was for the check.
+    let previous = super::recorded(
+        &unreviewed_summary(),
+        &review("normative-difference", "EN 319 102-1 5.2.6.4 step 4"),
+    );
+    let mut summary = unreviewed_summary();
+    let rewritten = json!([{ "XCV": "INDETERMINATE:TRY_LATER/pass", "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:TRY_LATER" }]);
+    summary["cases"]["a.xml"]["instant/strict"]["observed"] = rewritten.clone();
+    summary["cases"]["a.xml"]["instant/conformant"]["observed"] =
+        json!([{ "XCV": "PASSED/pass", "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-" }]);
+    let reviews = review("normative-difference", "EN 319 102-1 5.2.6.4 step 4");
+    let moved = super::carried(&previous, &summary, &reviews);
+    assert_eq!(moved["a.xml"][0]["observed"], json!([rewritten]));
+    assert_eq!(moved["a.xml"][0]["reason"], reviews["a.xml"][0]["reason"]);
+    let recorded = super::recorded(&summary, &moved);
+    assert_eq!(
+        recorded["cases"]["a.xml"]["instant/strict"]["class"],
+        "normative-difference"
+    );
+    assert_eq!(
+        recorded["cases"]["a.xml"]["instant/conformant"]["class"],
+        "unreviewed"
+    );
+    // Nothing it explained is observed with the same overall result: the
+    // review stays as written.
+    let mut changed = unreviewed_summary();
+    for label in ["instant/strict", "instant/conformant"] {
+        changed["cases"]["a.xml"][label]["observed"] =
+            json!([{ "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-" }]);
+    }
+    assert_eq!(super::carried(&previous, &changed, &reviews), reviews);
+}
+
+#[test]
+fn a_manifest_field_cannot_split_its_line() {
+    // The DSS probe splits each manifest line at tabs: a path holding one
+    // would hand DSS a truncated anchor directory.
+    assert_eq!(super::manifest_field("/tmp/a b"), Ok("/tmp/a b"));
+    for field in ["/tmp/a\tb", "/tmp/a\nb", "/tmp/a\rb"] {
+        assert!(super::manifest_field(field).is_err(), "{field:?}");
+    }
+}
+
+#[test]
+fn only_a_token_that_passed_proves_existence() {
+    // EN 319 102-1 V1.4.1 clause 5.4: a proof of existence is a timestamp
+    // that validated. Text naming a token, a rejected token or an unjudged
+    // one leaves the signing-time pass due.
+    let facts = |tokens: Value| json!({ "signatures": [{ "timestamps": tokens }] });
+    assert!(super::proves_existence(&facts(json!([token(Some(
+        "PASSED"
+    ))]))));
+    assert!(!super::proves_existence(&facts(json!([
+        token(Some("INDETERMINATE")),
+        token(None)
+    ]))));
+    assert!(!super::proves_existence(&facts(Value::Null)));
 }

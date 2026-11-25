@@ -19,27 +19,49 @@ const MAVEN_METADATA: &str =
 /// Maven Central's version list of the logging binding DSS's reports go through.
 const SLF4J_METADATA: &str =
     "https://repo.maven.apache.org/maven2/org/slf4j/slf4j-simple/maven-metadata.xml";
+/// Maven Central's version list of the plugin that writes the classpath and
+/// the dependency tree. No lifecycle phase binds it, so its version is
+/// resolved here and named in each call, as the others are.
+const DEPENDENCY_PLUGIN_METADATA: &str = "https://repo.maven.apache.org/maven2/org/apache/maven/plugins/maven-dependency-plugin/maven-metadata.xml";
+/// The Maven line the build runs on.
+const MAVEN_MAJOR: u64 = 3;
 
-/// The DSS, Maven and slf4j releases one run builds against, resolved from
-/// Maven Central when it starts: nothing in the repository fixes any of them.
+/// The DSS, Maven, slf4j and dependency-plugin releases one run builds
+/// against, resolved from Maven Central when it starts: nothing in the
+/// repository fixes any of them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Release {
     pub(crate) dss: String,
     pub(crate) maven: String,
     pub(crate) slf4j: String,
+    pub(crate) dependency_plugin: String,
 }
 
 impl Release {
     /// The versions as the run records them.
     pub(crate) fn json(&self) -> Value {
-        json!({ "dss": self.dss, "maven": self.maven, "slf4j": self.slf4j })
+        json!({
+            "dss": self.dss,
+            "maven": self.maven,
+            "slf4j": self.slf4j,
+            "maven-dependency-plugin": self.dependency_plugin,
+        })
+    }
+
+    /// The dependency plugin's `goal`, at the resolved version.
+    fn dependency(&self, goal: &str) -> String {
+        format!(
+            "org.apache.maven.plugins:maven-dependency-plugin:{}:{goal}",
+            self.dependency_plugin
+        )
     }
 }
 
-/// The highest release a Maven `metadata` document lists: a version whose
-/// every dot-separated part is a number. A pre-release (`6.5.RC1`,
-/// `4.0.0-rc-7`, `3.0-alpha-2`) is not a release.
-pub(crate) fn newest_release(metadata: &str) -> Result<String, String> {
+/// The highest release a Maven `metadata` document lists, among those of the
+/// major version `major` when one is named: a version whose every
+/// dot-separated part is a number. A pre-release (`6.5.RC1`, `4.0.0-rc-7`,
+/// `3.0-alpha-2`) is not a release.
+pub(crate) fn newest_release_of(metadata: &str, major: Option<u64>) -> Result<String, String> {
     let document = xml::parse(metadata, "Maven metadata")?;
     let parts = |version: &str| -> Option<Vec<u64>> {
         version.split('.').map(|part| part.parse().ok()).collect()
@@ -49,6 +71,7 @@ pub(crate) fn newest_release(metadata: &str) -> Result<String, String> {
             let version = node.text()?.trim();
             Some((parts(version)?, version.to_owned()))
         })
+        .filter(|(parts, _)| major.is_none_or(|major| parts.first() == Some(&major)))
         .max()
         .map(|(_, version)| version)
         .ok_or_else(|| "Maven metadata lists no release".to_owned())
@@ -95,17 +118,19 @@ pub(crate) fn fetch(url: &str, output: &Path) -> Vec<std::ffi::OsString> {
     ])
 }
 
-/// The current DSS, Maven and slf4j releases, read from Maven Central into `logs`.
+/// The current DSS, Maven 3, slf4j and dependency-plugin releases, read from
+/// Maven Central into `logs`.
 pub(crate) fn resolve(corpus: &Corpus, logs: &Path) -> Result<Release, String> {
-    let newest = |url: &str, name: &str| -> Result<String, String> {
+    let newest = |url: &str, name: &str, major: Option<u64>| -> Result<String, String> {
         let file = logs.join(format!("{name}-metadata.xml"));
         corpus.require(&fetch(url, &file), &logs.join(format!("{name}-metadata")))?;
-        newest_release(&xml::read(&file)?)
+        newest_release_of(&xml::read(&file)?, major)
     };
     Ok(Release {
-        dss: newest(DSS_METADATA, "dss")?,
-        maven: newest(MAVEN_METADATA, "maven")?,
-        slf4j: newest(SLF4J_METADATA, "slf4j")?,
+        dss: newest(DSS_METADATA, "dss", None)?,
+        maven: newest(MAVEN_METADATA, "maven", Some(MAVEN_MAJOR))?,
+        slf4j: newest(SLF4J_METADATA, "slf4j", None)?,
+        dependency_plugin: newest(DEPENDENCY_PLUGIN_METADATA, "maven-dependency-plugin", None)?,
     })
 }
 
@@ -288,7 +313,7 @@ pub(crate) fn build(corpus: &Corpus, logs: &Path) -> Result<Release, String> {
     let mut build = maven.clone();
     build.extend(line(&[
         &"compile",
-        &"dependency:build-classpath",
+        &release.dependency("build-classpath"),
         &format!(
             "-Dmdep.outputFile={}",
             tools.join("classpath.txt").display()
@@ -297,7 +322,7 @@ pub(crate) fn build(corpus: &Corpus, logs: &Path) -> Result<Release, String> {
     corpus.require(&build, &logs.join("build"))?;
     corpus.require(&line(&[&mvn, &"-v"]), &logs.join("versions"))?;
     maven.extend(line(&[
-        &"dependency:tree",
+        &release.dependency("tree"),
         &"-DoutputType=json",
         &format!("-DoutputFile={}", logs.join("dependencies.json").display()),
     ]));

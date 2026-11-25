@@ -246,19 +246,71 @@ fn a_token_stays_checkable_after_the_signers_certificate_expired() {
     let expired = 4_000_000_000;
     let level = level_at(B_T, expired);
     assert!(!matches!(level, Ok(Outcome::Assessed(true))), "{level:?}");
-    let checked = signer_trusted_integrities(B_T, expired);
+    let checked = signer_trusted_integrities(B_T, expired, &[ROOT]);
     assert!(
         matches!(&checked, Ok(Outcome::Assessed(found)) if found == &[TokenIntegrity::Intact]),
         "{checked:?}"
     );
 }
 
+#[test]
+fn a_token_signer_the_caller_supplies_only_as_an_anchor_is_found() {
+    // RFC 5652 5.1 lets the token omit its signer's certificate; with the
+    // document's own copies removed, the caller's anchors are where it is.
+    // Finding it there checks the token's signature, not its TSA's path.
+    let mut xml = B_LT_UNCERTIFIED_TOKEN.to_owned();
+    let mut removed = Vec::new();
+    for (open, close) in [
+        (
+            "<xadesv141:TimeStampValidationData>",
+            "</xadesv141:TimeStampValidationData>",
+        ),
+        ("<xades:CertificateValues>", "</xades:CertificateValues>"),
+    ] {
+        while let Some(start) = xml.find(open) {
+            let end = xml[start..].find(close).expect("closed") + start + close.len();
+            removed.push(xml[start..end].to_owned());
+            xml.replace_range(start..end, "");
+        }
+    }
+    let removed = removed.concat();
+    let certificates: Vec<Vec<u8>> = removed
+        .split("<xades:EncapsulatedX509Certificate>")
+        .skip(1)
+        .map(|value| {
+            let value = value
+                .split("</xades:EncapsulatedX509Certificate>")
+                .next()
+                .unwrap_or_default();
+            let compact: String = value.split_ascii_whitespace().collect();
+            structured_base64::STANDARD
+                .decode(compact.as_bytes())
+                .expect("base64 certificate")
+        })
+        .collect();
+    assert_ne!(certificates.len(), 0);
+    let missing = signer_trusted_integrities(&xml, AT, &[ROOT]);
+    assert!(
+        matches!(&missing, Ok(Outcome::Assessed(found)) if found == &[TokenIntegrity::MissingSigner]),
+        "{missing:?}"
+    );
+    let mut anchors: Vec<&[u8]> = certificates.iter().map(Vec::as_slice).collect();
+    anchors.push(ROOT);
+    let found = signer_trusted_integrities(&xml, AT, &anchors);
+    assert!(
+        matches!(&found, Ok(Outcome::Assessed(found)) if found == &[TokenIntegrity::Intact]),
+        "{found:?}"
+    );
+}
+
 /// [`check_tokens`] over the first signature of `xml`, verified at `at` with
 /// its `KeyInfo` certificate's key as the caller's own trusted key for that
-/// signature, so no chain of the signer is checked.
+/// signature, so no chain of the signer is checked, and `anchors` as the
+/// caller's trust anchors.
 fn signer_trusted_integrities(
     xml: &str,
     at: i64,
+    anchors: &[&[u8]],
 ) -> Result<Outcome<Vec<TokenIntegrity>>, ValidationError> {
     use xml_sec::xmldsig::{CallerTrustedSignatureKey, SignatureAlgorithm, VerificationKey};
     let source = roxmltree::Document::parse(xml).expect("fixture parses");
@@ -313,7 +365,7 @@ fn signer_trusted_integrities(
         let signature = session.evidence().signatures()[0].identity();
         let inputs = Inputs {
             requirements: Requirements::Timestamped,
-            anchors: &[ROOT],
+            anchors,
             certificates: &[],
             utc: &utc,
             accuracies: &[],

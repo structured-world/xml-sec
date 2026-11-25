@@ -17,9 +17,10 @@ All validation runs are local; fixtures are never uploaded to online validators.
   which also builds the OpenSSL it links. This is not this
   repository's Rust `tools/xmlsec1`. The corpus refuses any other oracle version.
 - Independent profile diagnostics: the **current EU DSS release**, built with the current
-  Maven release and OpenJDK 21. Each run resolves both from Maven Central's version lists
-  (pre-releases excluded) and records them, with the slf4j binding, in `versions.json` of its
-  DSS build directory; nothing in the repository fixes them.
+  Maven 3 release and OpenJDK 21. Each run resolves both from Maven Central's version lists
+  (pre-releases excluded, Maven limited to its major version 3) and records them, with the
+  slf4j binding and the dependency plugin it calls, in `versions.json` of its DSS build
+  directory; nothing in the repository fixes them.
   Expectations are in `dss-evidence/expectations.json` and
   `dss-investigation/*expectations.json`; CI compares fresh observations with them.
   Dependency trees, actual outputs and full reports are run artifacts, excluded from Git and the bundle.

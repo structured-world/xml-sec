@@ -2,8 +2,9 @@
   <modelVersion>4.0.0</modelVersion>
   <groupId>world.structured.interop</groupId><artifactId>xades-offline-probe</artifactId><version>1.0</version>
   <!-- `xml-sec-tools xades` passes the current DSS and slf4j releases as
-       dss.version and slf4j.version; the plugins are the ones the current
-       Maven binds by default. -->
+       dss.version and slf4j.version, and calls the dependency plugin by its
+       current release, which it records with the others; the compiler is
+       the one the current Maven binds to the compile phase. -->
   <properties><maven.compiler.release>17</maven.compiler.release><project.build.sourceEncoding>UTF-8</project.build.sourceEncoding></properties>
   <dependencies>
     <dependency><groupId>eu.europa.ec.joinup.sd-dss</groupId><artifactId>dss-xades</artifactId><version>${dss.version}</version></dependency>

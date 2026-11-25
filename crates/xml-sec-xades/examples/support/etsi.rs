@@ -55,6 +55,9 @@ pub struct Declared {
     /// whether its imprint and TSA signature held (EN 319 102-1 V1.4.1
     /// clause 5.4), none when it could not judge it.
     pub token_integrity: Vec<(TimestampRole, Vec<u8>, Option<bool>)>,
+    /// Why xml-sec-xades checked none of this signature's tokens, when it
+    /// refused to: each token then stays unjudged.
+    pub token_refusal: Option<String>,
     /// Each `SigAndRefsTimeStamp` and `RefsOnlyTimeStamp` token, DER.
     pub validation_timestamps: Vec<Vec<u8>>,
     /// Whether each of [`Self::validation_timestamps`] is a
@@ -64,6 +67,10 @@ pub struct Declared {
     pub archive_timestamps: Vec<Vec<u8>>,
     /// Where each `ArchiveTimeStamp` is in the document, as a byte offset.
     pub archive_positions: Vec<usize>,
+    /// Each `AllDataObjectsTimeStamp` and `IndividualDataObjectsTimeStamp`
+    /// token with its role, DER: they stamp the signed data objects, not the
+    /// signature.
+    pub content_timestamps: Vec<(TimestampRole, Vec<u8>)>,
 }
 
 impl Declared {
@@ -99,6 +106,16 @@ impl Declared {
         }
         for (index, token) in self.archive_timestamps.iter().enumerate() {
             found.push((TimestampRole::Archive, index, token.as_slice()));
+        }
+        let (mut all, mut individual) = (0, 0);
+        for (role, token) in &self.content_timestamps {
+            let counter = if *role == TimestampRole::AllDataObjects {
+                &mut all
+            } else {
+                &mut individual
+            };
+            found.push((*role, *counter, token.as_slice()));
+            *counter += 1;
         }
         found
     }
@@ -485,56 +502,107 @@ type Candidate<'a> = (Vec<&'a Certificate<'a>>, &'a Certificate<'a>);
 /// The deepest prospective chain the comparison builds.
 const CHAIN_DEPTH: usize = 8;
 
+/// How many issuer candidates the search for one signer's chains may
+/// consider, each anchor and pool certificate tried at each step counted.
+/// Certificates sharing their names multiply the orderings; a search past
+/// this bound ends as an incomplete process, never as "no chain".
+const CANDIDATE_STEPS: usize = 100_000;
+
 /// Every prospective chain (clause 5.2.6.4 step 2) from `signer` to an
 /// anchor: each issuer named by the subject before it, with no condition on
 /// time. The shared builder holds every certificate to one interval, which
 /// is step 4's and step 7's check, not step 2's; `check` then validates each
-/// chain in full.
+/// chain in full. A search that exceeds [`CANDIDATE_STEPS`] is an error.
 fn candidates<'a>(
     signer: &'a Certificate<'a>,
     parsed: &'a Parsed<'a>,
     memory: &Memory,
-) -> Vec<Candidate<'a>> {
-    fn names(subject: &Certificate<'_>, issuer: &Certificate<'_>, memory: &Memory) -> bool {
-        subject
-            .tbs()
-            .issuer()
-            .matches(issuer.tbs().subject(), memory)
-            .unwrap_or(false)
+) -> Result<Vec<Candidate<'a>>, String> {
+    candidates_within(
+        signer,
+        &parsed.pool,
+        &parsed.anchors,
+        memory,
+        CANDIDATE_STEPS,
+    )
+}
+
+/// [`candidates`] over `pool` and `anchors`, considering at most `limit`
+/// candidates.
+pub(super) fn candidates_within<'a>(
+    signer: &'a Certificate<'a>,
+    pool: &'a [Certificate<'a>],
+    anchors: &'a [Certificate<'a>],
+    memory: &Memory,
+    limit: usize,
+) -> Result<Vec<Candidate<'a>>, String> {
+    struct Search<'a, 'm> {
+        pool: &'a [Certificate<'a>],
+        anchors: &'a [Certificate<'a>],
+        memory: &'m Memory,
+        found: Vec<Candidate<'a>>,
+        steps: usize,
+        limit: usize,
     }
-    fn extend<'a>(
-        chain: &mut Vec<&'a Certificate<'a>>,
-        parsed: &'a Parsed<'a>,
-        memory: &Memory,
-        found: &mut Vec<Candidate<'a>>,
-    ) {
-        let last = *chain.last().expect("a chain starts at the signer");
-        for anchor in &parsed.anchors {
-            if anchor.as_bytes() != last.as_bytes() && names(last, anchor, memory) {
-                found.push((chain.clone(), anchor));
-            }
+    impl<'a> Search<'a, '_> {
+        fn names(&self, subject: &Certificate<'_>, issuer: &Certificate<'_>) -> bool {
+            subject
+                .tbs()
+                .issuer()
+                .matches(issuer.tbs().subject(), self.memory)
+                .unwrap_or(false)
         }
-        if chain.len() >= CHAIN_DEPTH {
-            return;
-        }
-        for issuer in &parsed.pool {
-            let used = chain
-                .iter()
-                .any(|member| member.as_bytes() == issuer.as_bytes());
-            let anchored = parsed
-                .anchors
-                .iter()
-                .any(|anchor| anchor.as_bytes() == issuer.as_bytes());
-            if !used && !anchored && names(last, issuer, memory) {
-                chain.push(issuer);
-                extend(chain, parsed, memory, found);
-                chain.pop();
+        /// Counts one considered candidate, before it is compared or kept.
+        fn step(&mut self) -> Result<(), String> {
+            // At most `limit` + 1, a count of considered certificates.
+            self.steps += 1;
+            if self.steps > self.limit {
+                return Err(format!(
+                    "the chain search exceeded {} candidates",
+                    self.limit
+                ));
             }
+            Ok(())
+        }
+        fn extend(&mut self, chain: &mut Vec<&'a Certificate<'a>>) -> Result<(), String> {
+            let last = *chain.last().expect("a chain starts at the signer");
+            for anchor in self.anchors {
+                self.step()?;
+                if anchor.as_bytes() != last.as_bytes() && self.names(last, anchor) {
+                    self.found.push((chain.clone(), anchor));
+                }
+            }
+            if chain.len() >= CHAIN_DEPTH {
+                return Ok(());
+            }
+            for issuer in self.pool {
+                self.step()?;
+                let used = chain
+                    .iter()
+                    .any(|member| member.as_bytes() == issuer.as_bytes());
+                let anchored = self
+                    .anchors
+                    .iter()
+                    .any(|anchor| anchor.as_bytes() == issuer.as_bytes());
+                if !used && !anchored && self.names(last, issuer) {
+                    chain.push(issuer);
+                    self.extend(chain)?;
+                    chain.pop();
+                }
+            }
+            Ok(())
         }
     }
-    let mut found = Vec::new();
-    extend(&mut vec![signer], parsed, memory, &mut found);
-    found
+    let mut search = Search {
+        pool,
+        anchors,
+        memory,
+        found: Vec::new(),
+        steps: 0,
+        limit,
+    };
+    search.extend(&mut vec![signer])?;
+    Ok(search.found)
 }
 
 /// `chain` checked by the shared processor over `at` with the
@@ -934,7 +1002,7 @@ fn path_facts<'a, W: structured_asn1::memory::Work>(
     }
     let (not_before, not_after) = validity(signer);
     let mut accepted = false;
-    for (chain, anchor) in candidates(signer, parsed, memory) {
+    for (chain, anchor) in candidates(signer, parsed, memory)? {
         // The chain is checked where all its members are valid, as close to
         // `now` as they allow: clause 5.2.6.4 step 4 leaves the signing
         // certificate's own validity to step 7, the shell model holds every
@@ -1468,9 +1536,7 @@ fn catalogue<'a>(
     }
     positions.extend(parsed.sources.iter().map(|der| position(der)));
     long_term::Catalogue {
-        tokens: declared.signature_timestamps.len()
-            + declared.validation_timestamps.len()
-            + declared.archive_timestamps.len(),
+        tokens: declared.tokens().len(),
         certificates,
         sources: parsed.sources.len(),
         positions,
@@ -1492,6 +1558,14 @@ fn decided(decision: long_term::Decision, basis: &str) -> Value {
         }
     };
     json!({ "indication": indication, "sub": sub, "basis": basis })
+}
+
+/// Sets the current decision of the token `each` names last.
+fn record(each: &mut [Value], current: long_term::Decision) {
+    if let Some(entry) = each.last_mut() {
+        let decision = decided(current, "");
+        entry["current"] = json!({ "indication": decision["indication"], "sub": decision["sub"] });
+    }
 }
 
 /// What establishing one signature's timestamp tokens reads.
@@ -1521,11 +1595,12 @@ impl<W: structured_asn1::memory::Work> TokenContext<'_, '_, '_, '_, '_, W> {
             &paths.history,
             self.catalogue,
         )];
-        if let Err(error) = self.tokens(declared, &mut tokens, &mut pasts) {
+        let mut each = Vec::new();
+        if let Err(error) = self.tokens(declared, &mut tokens, &mut pasts, &mut each) {
             return verdict("INDETERMINATE", Some("CUSTOM"), error);
         }
         let long_term_attributes = !tokens.is_empty() || self.catalogue.sources > 0;
-        match long_term::validate(
+        let mut rendered = match long_term::validate(
             current,
             self.inputs.requirements,
             self.catalogue,
@@ -1536,22 +1611,30 @@ impl<W: structured_asn1::memory::Work> TokenContext<'_, '_, '_, '_, '_, W> {
         ) {
             Ok((decision, stage)) => decided(decision, &format!("{stage:?}")),
             Err(error) => verdict("INDETERMINATE", Some("CUSTOM"), error),
-        }
+        };
+        rendered["tokens"] = Value::Array(each);
+        rendered
     }
 
     /// Every token of `declared` the long-term process can place, with its
     /// TSA's past-validation inputs appended to `pasts`. A token xml-sec-xades
     /// refused has a broken imprint or signature (clause 5.4 via 5.2.7); one
     /// it could not judge is left out; a process failure ends the validation.
+    /// `each` receives every token's current decision in declaration order,
+    /// none for one that is left out: the timestamp validation of each token
+    /// at the validation time (clause 5.4), as DSS reports it per token.
     fn tokens(
         &self,
         declared: &Declared,
         tokens: &mut Vec<long_term::Token>,
         pasts: &mut Vec<long_term::Past>,
+        each: &mut Vec<Value>,
     ) -> Result<(), String> {
         let signature = declared.signature_timestamps.len();
         let validation = declared.validation_timestamps.len();
         for (index, (role, occurrence, der)) in declared.tokens().into_iter().enumerate() {
+            let role_name = format!("{role:?}");
+            each.push(json!({ "role": role_name, "current": null }));
             let (Some(facts), Some(intact)) =
                 (token_details(der), declared.intact(role, occurrence, der))
             else {
@@ -1563,12 +1646,20 @@ impl<W: structured_asn1::memory::Work> TokenContext<'_, '_, '_, '_, '_, W> {
             // timestamps; an archive timestamp covers all of these, the
             // earlier archive timestamps and the incorporated validation
             // data. A RefsOnly timestamp covers the certificate and revocation
-            // references alone (TS 101 903 V1.4.2 7.5.2), no object here.
-            if role == TimestampRole::ReferencesOnly {
+            // references alone (TS 101 903 V1.4.2 7.5.2), no object here,
+            // and a content timestamp the signed data objects before signing
+            // (EN 319 132-1 5.2.8), no object of the signature either.
+            if matches!(
+                role,
+                TimestampRole::ReferencesOnly
+                    | TimestampRole::AllDataObjects
+                    | TimestampRole::IndividualDataObjects
+            ) {
                 let (current, past) = self.token_outcomes(der, intact, object, pasts)?;
                 let Some(current) = current else {
                     continue;
                 };
+                record(each, current);
                 tokens.push(long_term::Token {
                     object,
                     facts,
@@ -1615,6 +1706,7 @@ impl<W: structured_asn1::memory::Work> TokenContext<'_, '_, '_, '_, '_, W> {
             let Some(current) = current else {
                 continue;
             };
+            record(each, current);
             tokens.push(long_term::Token {
                 object,
                 facts,

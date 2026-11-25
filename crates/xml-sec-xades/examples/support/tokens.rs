@@ -9,51 +9,6 @@ use structured_asn1::{Oid, Parser};
 use structured_cms::timestamp::{Accuracy, PolicyAccuracy, Token};
 use xml_sec_xades::AuthorityAccuracy;
 
-/// `text` with its XML character references (XML 1.0 §4.1, `&#13;` and
-/// `&#xD;` as signers write line breaks in base64) replaced by the
-/// characters they name; any other text stays as it is.
-pub fn character_references(text: &str) -> String {
-    let mut found = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find("&#") {
-        found.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        // The digits are scanned once and the `;` must follow them, so text
-        // with many unterminated references is read in one pass.
-        let (hex, digits_start) = match after.as_bytes().first() {
-            Some(b'x' | b'X') => (true, 1),
-            _ => (false, 0),
-        };
-        let digits_end = digits_start
-            + after[digits_start..]
-                .bytes()
-                .take_while(|byte| {
-                    if hex {
-                        byte.is_ascii_hexdigit()
-                    } else {
-                        byte.is_ascii_digit()
-                    }
-                })
-                .count();
-        let decoded = (after.as_bytes().get(digits_end) == Some(&b';'))
-            .then_some(())
-            .and_then(|()| {
-                let digits = &after[digits_start..digits_end];
-                let value = u32::from_str_radix(digits, if hex { 16 } else { 10 }).ok()?;
-                Some((char::from_u32(value)?, digits_end))
-            });
-        if let Some((character, end)) = decoded {
-            found.push(character);
-            rest = &after[end + 1..];
-        } else {
-            found.push_str("&#");
-            rest = after;
-        }
-    }
-    found.push_str(rest);
-    found
-}
-
 /// Every base64 value of an element whose name ends with `tag`.
 pub fn values(text: &str, tag: &str) -> Vec<Vec<u8>> {
     values_at(text, tag)
@@ -63,26 +18,35 @@ pub fn values(text: &str, tag: &str) -> Vec<Vec<u8>> {
 }
 
 /// [`values`], each with the byte offset of its element in `text`, which
-/// orders the elements as the document does.
+/// orders the elements as the document does. Only elements count: the same
+/// text in a comment, a processing instruction or an attribute is no value.
+/// A document that does not parse carries none.
 pub fn values_at(text: &str, tag: &str) -> Vec<(usize, Vec<u8>)> {
+    let Ok(document) = roxmltree::Document::parse_with_options(
+        text,
+        roxmltree::ParsingOptions {
+            allow_dtd: true,
+            ..roxmltree::ParsingOptions::default()
+        },
+    ) else {
+        return Vec::new();
+    };
     let mut found = Vec::new();
-    for (start, _) in text.match_indices(tag) {
-        let closing = text[..start]
-            .rfind('<')
-            .is_some_and(|tag| text[tag..].starts_with("</"));
-        let Some(open) = text[start..].find('>').filter(|_| !closing) else {
-            continue;
-        };
-        let body = start + open + 1;
-        let Some(end) = text[body..].find('<') else {
-            continue;
-        };
-        let compact: String = character_references(&text[body..body + end])
-            .chars()
+    for element in document
+        .descendants()
+        .filter(|node| node.is_element() && node.tag_name().name().ends_with(tag))
+    {
+        // The parser has already replaced character references, `&#13;`
+        // included (XML 1.0 section 4.1).
+        let compact: String = element
+            .descendants()
+            .filter(roxmltree::Node::is_text)
+            .filter_map(|node| node.text())
+            .flat_map(str::chars)
             .filter(|character| !character.is_ascii_whitespace())
             .collect();
         if let Ok(value) = structured_base64::STANDARD.decode(compact.as_bytes()) {
-            found.push((start, value));
+            found.push((element.range().start, value));
         }
     }
     found

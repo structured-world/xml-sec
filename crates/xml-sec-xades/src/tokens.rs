@@ -88,7 +88,8 @@ impl<'a> TokenResult<'a> {
 /// signature's authenticated references, so the signature itself must have
 /// verified. A countersignature's tokens belong to its own signature. The
 /// signer of a token is found among the certificates it carries, the
-/// caller's [`Inputs::certificates`] and the document's validation data.
+/// caller's [`Inputs::certificates`] and [`Inputs::anchors`], and the
+/// document's validation data; `Intact` says nothing of its path.
 ///
 /// # Errors
 /// Returns the original cause of a stage that could not complete, and
@@ -116,7 +117,17 @@ pub fn check_tokens<W: structured_asn1::memory::Work, R>(
     let memory = parser.memory();
     let reader = parser.read(&[], 0).map_err(ValidationError::Operation)?;
     let stated = accuracy::read(&parser, inputs.accuracies)?;
-    let supplied = crate::level::read_certificates(&parser, inputs.certificates)?;
+    // The token's signer may be any certificate the caller supplies, its
+    // anchors included: finding it checks the token's signature only.
+    let mut candidates = memory.vector();
+    // Both are slices in memory, so their lengths' sum fits a usize.
+    candidates
+        .try_reserve_exact(inputs.certificates.len() + inputs.anchors.len())
+        .map_err(Error::from)?;
+    for certificate in inputs.certificates.iter().chain(inputs.anchors) {
+        candidates.try_push(*certificate).map_err(Error::from)?;
+    }
+    let supplied = crate::level::read_certificates(&parser, &candidates)?;
     let supplied_parent = parser.read(&[], 0).map_err(ValidationError::Operation)?;
     let cms = session.cms_provider();
     let profile = match session.timestamp_token_encoding() {
