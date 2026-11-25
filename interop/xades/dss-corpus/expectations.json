@@ -1725,7 +1725,7 @@
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. The document carries no revocation status for the intermediate CA. EN 319 102-1 V1.4.1 section 5.2.6.4 establishes each chain member's status in step 4 before it checks the signing certificate's validity in step 7, so xml-sec's X.509 block ends at step 4 e) with CERTIFICATE_CHAIN_GENERAL_FAILURE. DSS's default policy takes a CA without revocation data as a warning there, so its X.509 block goes on to the signing certificate's expiry at the fixed instant, OUT_OF_BOUNDS_NO_POE (step 7), and only its overall result reaches CERTIFICATE_CHAIN_GENERAL_FAILURE, as xml-sec's does."
+        "reason": "The document carries no revocation status for the intermediate CA. EN 319 102-1 V1.4.1 section 5.2.6.4 establishes each chain member's status in step 4 before it checks the signing certificate's validity in step 7, so xml-sec's X.509 block ends at step 4 e) with CERTIFICATE_CHAIN_GENERAL_FAILURE. DSS's default policy takes a CA without revocation data as a warning there, so its X.509 block goes on to the signing certificate's expiry at the fixed instant, OUT_OF_BOUNDS_NO_POE (step 7), and only its overall result reaches CERTIFICATE_CHAIN_GENERAL_FAILURE, as xml-sec's does."
       },
       "instant/extended": {
         "observed": [
@@ -1743,7 +1743,7 @@
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. The document carries no revocation status for the intermediate CA. EN 319 102-1 V1.4.1 section 5.2.6.4 establishes each chain member's status in step 4 before it checks the signing certificate's validity in step 7, so xml-sec's X.509 block ends at step 4 e) with CERTIFICATE_CHAIN_GENERAL_FAILURE. DSS's default policy takes a CA without revocation data as a warning there, so its X.509 block goes on to the signing certificate's expiry at the fixed instant, OUT_OF_BOUNDS_NO_POE (step 7), and only its overall result reaches CERTIFICATE_CHAIN_GENERAL_FAILURE, as xml-sec's does."
+        "reason": "The document carries no revocation status for the intermediate CA. EN 319 102-1 V1.4.1 section 5.2.6.4 establishes each chain member's status in step 4 before it checks the signing certificate's validity in step 7, so xml-sec's X.509 block ends at step 4 e) with CERTIFICATE_CHAIN_GENERAL_FAILURE. DSS's default policy takes a CA without revocation data as a warning there, so its X.509 block goes on to the signing certificate's expiry at the fixed instant, OUT_OF_BOUNDS_NO_POE (step 7), and only its overall result reaches CERTIFICATE_CHAIN_GENERAL_FAILURE, as xml-sec's does."
       },
       "instant/conformant": {
         "observed": [
@@ -1761,7 +1761,7 @@
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. The document carries no revocation status for the intermediate CA. EN 319 102-1 V1.4.1 section 5.2.6.4 establishes each chain member's status in step 4 before it checks the signing certificate's validity in step 7, so xml-sec's X.509 block ends at step 4 e) with CERTIFICATE_CHAIN_GENERAL_FAILURE. DSS's default policy takes a CA without revocation data as a warning there, so its X.509 block goes on to the signing certificate's expiry at the fixed instant, OUT_OF_BOUNDS_NO_POE (step 7), and only its overall result reaches CERTIFICATE_CHAIN_GENERAL_FAILURE, as xml-sec's does."
+        "reason": "The document carries no revocation status for the intermediate CA. EN 319 102-1 V1.4.1 section 5.2.6.4 establishes each chain member's status in step 4 before it checks the signing certificate's validity in step 7, so xml-sec's X.509 block ends at step 4 e) with CERTIFICATE_CHAIN_GENERAL_FAILURE. DSS's default policy takes a CA without revocation data as a warning there, so its X.509 block goes on to the signing certificate's expiry at the fixed instant, OUT_OF_BOUNDS_NO_POE (step 7), and only its overall result reaches CERTIFICATE_CHAIN_GENERAL_FAILURE, as xml-sec's does."
       },
       "signing-time/strict": {
         "observed": [
@@ -1835,7 +1835,7 @@
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. A CA of the signer's chain is outside its validity at the fixed instant. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE. DSS's X.509 block does not check that CA's validity at the validation time; it goes on to the signing certificate's own expiry, OUT_OF_BOUNDS_NO_POE (step 7), and only its overall result reaches CERTIFICATE_CHAIN_GENERAL_FAILURE, as xml-sec's does."
+        "reason": "A CA of the signer's chain is outside its validity at the fixed instant. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE. DSS's X.509 block does not check that CA's validity at the validation time; it goes on to the signing certificate's own expiry, OUT_OF_BOUNDS_NO_POE (step 7), and only its overall result reaches CERTIFICATE_CHAIN_GENERAL_FAILURE, as xml-sec's does."
       },
       "instant/extended": {
         "observed": [
@@ -1853,7 +1853,7 @@
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. A CA of the signer's chain is outside its validity at the fixed instant. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE. DSS's X.509 block does not check that CA's validity at the validation time; it goes on to the signing certificate's own expiry, OUT_OF_BOUNDS_NO_POE (step 7), and only its overall result reaches CERTIFICATE_CHAIN_GENERAL_FAILURE, as xml-sec's does."
+        "reason": "A CA of the signer's chain is outside its validity at the fixed instant. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE. DSS's X.509 block does not check that CA's validity at the validation time; it goes on to the signing certificate's own expiry, OUT_OF_BOUNDS_NO_POE (step 7), and only its overall result reaches CERTIFICATE_CHAIN_GENERAL_FAILURE, as xml-sec's does."
       },
       "instant/conformant": {
         "observed": [
@@ -1871,7 +1871,7 @@
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. A CA of the signer's chain is outside its validity at the fixed instant. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE. DSS's X.509 block does not check that CA's validity at the validation time; it goes on to the signing certificate's own expiry, OUT_OF_BOUNDS_NO_POE (step 7), and only its overall result reaches CERTIFICATE_CHAIN_GENERAL_FAILURE, as xml-sec's does."
+        "reason": "A CA of the signer's chain is outside its validity at the fixed instant. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE. DSS's X.509 block does not check that CA's validity at the validation time; it goes on to the signing certificate's own expiry, OUT_OF_BOUNDS_NO_POE (step 7), and only its overall result reaches CERTIFICATE_CHAIN_GENERAL_FAILURE, as xml-sec's does."
       },
       "signing-time/strict": {
         "observed": [
@@ -1964,60 +1964,6 @@
         "reason": "XMLDSig Core 1.1 section 4.4.3.3 and the ds:Object schema (Id of type ID): #refetsi names the ds:Object Id=\"refetsi\", whose XPath Filter 2.0 intersect selects the SignedProperties, so the signed data is obtained and its digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2); DSS does not find it. xml-sec's indication is its X.509 finding (section 5.3.4 step 5 f)): the signing certificate is itself a trust anchor, which this profile holds to its validity (section 5.2.6.4 steps 1 and 7), and it has expired with no status issued after its expiry (NOTE 8)."
       },
       "instant/conformant": {
-        "observed": [
-          {
-            "FC": "PASSED/not-reached",
-            "ISC": "PASSED/not-reached",
-            "CV": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/not-reached",
-            "XCV": "PASSED/not-reached",
-            "SAV": "PASSED/INDETERMINATE:SIG_CONSTRAINTS_FAILURE",
-            "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:SIG_CONSTRAINTS_FAILURE"
-          }
-        ],
-        "class": "dss-deviation",
-        "passed": false,
-        "dss_passed": false,
-        "indication": true,
-        "reason": "XMLDSig Core 1.1 section 4.4.3.3 and the ds:Object schema (Id of type ID): #refetsi names the ds:Object Id=\"refetsi\", so the signed data is obtained and its digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2); DSS does not find it. The X.509 validation passes: under the conformant profile the signer, itself a trust anchor, is trusted directly (section 5.2.6.4 step 1 b)); under the strict and extended profiles it is held to its validity over the signing time (section 5.2.6.4 step 1), which the claimed signing time satisfies. xml-sec's profile refuses the TS 101 903 v1.1.1 namespace, which EN 319 132-1 section 4.2 does not define (signature acceptance, EN 319 102-1 section 5.2.8)."
-      },
-      "signing-time/strict": {
-        "observed": [
-          {
-            "FC": "PASSED/not-reached",
-            "ISC": "PASSED/not-reached",
-            "CV": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/not-reached",
-            "XCV": "PASSED/not-reached",
-            "SAV": "PASSED/INDETERMINATE:SIG_CONSTRAINTS_FAILURE",
-            "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:SIG_CONSTRAINTS_FAILURE"
-          }
-        ],
-        "class": "dss-deviation",
-        "passed": false,
-        "dss_passed": false,
-        "indication": true,
-        "reason": "XMLDSig Core 1.1 section 4.4.3.3 and the ds:Object schema (Id of type ID): #refetsi names the ds:Object Id=\"refetsi\", so the signed data is obtained and its digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2); DSS does not find it. The X.509 validation passes: under the conformant profile the signer, itself a trust anchor, is trusted directly (section 5.2.6.4 step 1 b)); under the strict and extended profiles it is held to its validity over the signing time (section 5.2.6.4 step 1), which the claimed signing time satisfies. xml-sec's profile refuses the TS 101 903 v1.1.1 namespace, which EN 319 132-1 section 4.2 does not define (signature acceptance, EN 319 102-1 section 5.2.8)."
-      },
-      "signing-time/extended": {
-        "observed": [
-          {
-            "FC": "PASSED/not-reached",
-            "ISC": "PASSED/not-reached",
-            "CV": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/not-reached",
-            "XCV": "PASSED/not-reached",
-            "SAV": "PASSED/INDETERMINATE:SIG_CONSTRAINTS_FAILURE",
-            "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:SIG_CONSTRAINTS_FAILURE"
-          }
-        ],
-        "class": "dss-deviation",
-        "passed": false,
-        "dss_passed": false,
-        "indication": true,
-        "reason": "XMLDSig Core 1.1 section 4.4.3.3 and the ds:Object schema (Id of type ID): #refetsi names the ds:Object Id=\"refetsi\", so the signed data is obtained and its digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2); DSS does not find it. The X.509 validation passes: under the conformant profile the signer, itself a trust anchor, is trusted directly (section 5.2.6.4 step 1 b)); under the strict and extended profiles it is held to its validity over the signing time (section 5.2.6.4 step 1), which the claimed signing time satisfies. xml-sec's profile refuses the TS 101 903 v1.1.1 namespace, which EN 319 132-1 section 4.2 does not define (signature acceptance, EN 319 102-1 section 5.2.8)."
-      },
-      "signing-time/conformant": {
         "observed": [
           {
             "FC": "PASSED/not-reached",
@@ -2896,7 +2842,7 @@
         "passed": false,
         "dss_passed": true,
         "indication": false,
-        "reason": "At the claimed signing time the strict and extended profiles refuse the signature as XAdES because it carries no SignedProperties: every EN 319 132-1 V1.3.1 level requires the signed SigningTime and SigningCertificateV2 properties (clause 6.3, Table 2), and which signatures a profile accepts is signature acceptance (EN 319 102-1 V1.4.1 section 5.2.8). DSS validates it and passes."
+        "reason": "At the claimed signing time the strict and extended profiles refuse the signature as XAdES: its SignedProperties, which carries the SigningTime that schedules this pass, is in the ETSI TS 101 903 V1.2.2 namespace, which only the xades-conformant profile reads (VerificationPolicy::xades_syntax), so these profiles find no EN 319 132-1 SignedProperties, while every EN 319 132-1 V1.3.1 level requires the signed SigningTime and SigningCertificateV2 properties (clause 6.3, Table 2), and which signatures a profile accepts is signature acceptance (EN 319 102-1 V1.4.1 section 5.2.8). DSS validates it and passes."
       },
       "signing-time/extended": {
         "observed": [
@@ -2914,7 +2860,7 @@
         "passed": false,
         "dss_passed": true,
         "indication": false,
-        "reason": "At the claimed signing time the strict and extended profiles refuse the signature as XAdES because it carries no SignedProperties: every EN 319 132-1 V1.3.1 level requires the signed SigningTime and SigningCertificateV2 properties (clause 6.3, Table 2), and which signatures a profile accepts is signature acceptance (EN 319 102-1 V1.4.1 section 5.2.8). DSS validates it and passes."
+        "reason": "At the claimed signing time the strict and extended profiles refuse the signature as XAdES: its SignedProperties, which carries the SigningTime that schedules this pass, is in the ETSI TS 101 903 V1.2.2 namespace, which only the xades-conformant profile reads (VerificationPolicy::xades_syntax), so these profiles find no EN 319 132-1 SignedProperties, while every EN 319 132-1 V1.3.1 level requires the signed SigningTime and SigningCertificateV2 properties (clause 6.3, Table 2), and which signatures a profile accepts is signature acceptance (EN 319 102-1 V1.4.1 section 5.2.8). DSS validates it and passes."
       }
     },
     "dss-xades/src/test/resources/validation/Signature-X-HR_FIN-1.xml": {
@@ -4593,7 +4539,7 @@
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. A CA of the signer's chain is outside its validity at the fixed instant. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE. DSS's X.509 block does not check that CA's validity at the validation time; it goes on to the signing certificate's own expiry, OUT_OF_BOUNDS_NO_POE (step 7), and only its overall result reaches CERTIFICATE_CHAIN_GENERAL_FAILURE, as xml-sec's does."
+        "reason": "A CA of the signer's chain is outside its validity at the fixed instant. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE. DSS's X.509 block does not check that CA's validity at the validation time; it goes on to the signing certificate's own expiry, OUT_OF_BOUNDS_NO_POE (step 7), and only its overall result reaches CERTIFICATE_CHAIN_GENERAL_FAILURE, as xml-sec's does."
       },
       "instant/extended": {
         "observed": [
@@ -4611,7 +4557,7 @@
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. A CA of the signer's chain is outside its validity at the fixed instant. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE. DSS's X.509 block does not check that CA's validity at the validation time; it goes on to the signing certificate's own expiry, OUT_OF_BOUNDS_NO_POE (step 7), and only its overall result reaches CERTIFICATE_CHAIN_GENERAL_FAILURE, as xml-sec's does."
+        "reason": "A CA of the signer's chain is outside its validity at the fixed instant. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE. DSS's X.509 block does not check that CA's validity at the validation time; it goes on to the signing certificate's own expiry, OUT_OF_BOUNDS_NO_POE (step 7), and only its overall result reaches CERTIFICATE_CHAIN_GENERAL_FAILURE, as xml-sec's does."
       },
       "instant/conformant": {
         "observed": [
@@ -4629,7 +4575,7 @@
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. A CA of the signer's chain is outside its validity at the fixed instant. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE. DSS's X.509 block does not check that CA's validity at the validation time; it goes on to the signing certificate's own expiry, OUT_OF_BOUNDS_NO_POE (step 7), and only its overall result reaches CERTIFICATE_CHAIN_GENERAL_FAILURE, as xml-sec's does."
+        "reason": "A CA of the signer's chain is outside its validity at the fixed instant. Under the shell model, which DSS's policy also selects (Model SHELL), path validation then fails (RFC 5280 section 6.1.3 (a)(2), EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)) with CERTIFICATE_CHAIN_GENERAL_FAILURE. DSS's X.509 block does not check that CA's validity at the validation time; it goes on to the signing certificate's own expiry, OUT_OF_BOUNDS_NO_POE (step 7), and only its overall result reaches CERTIFICATE_CHAIN_GENERAL_FAILURE, as xml-sec's does."
       },
       "signing-time/strict": {
         "observed": [
@@ -5034,57 +4980,6 @@
         "indication": true
       },
       "instant/conformant": {
-        "observed": [
-          {
-            "FC": "PASSED/not-reached",
-            "ISC": "PASSED/not-reached",
-            "CV": "FAILED:SIG_CRYPTO_FAILURE/FAILED:SIG_CRYPTO_FAILURE",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
-            "SAV": "INDETERMINATE:SIG_CONSTRAINTS_FAILURE/not-reached",
-            "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_FAILED:SIG_CRYPTO_FAILURE/TOTAL_FAILED:SIG_CRYPTO_FAILURE"
-          }
-        ],
-        "class": "agreement",
-        "passed": false,
-        "dss_passed": false,
-        "indication": true
-      },
-      "signing-time/strict": {
-        "observed": [
-          {
-            "FC": "PASSED/not-reached",
-            "ISC": "PASSED/not-reached",
-            "CV": "FAILED:SIG_CRYPTO_FAILURE/FAILED:SIG_CRYPTO_FAILURE",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
-            "SAV": "INDETERMINATE:SIG_CONSTRAINTS_FAILURE/not-reached",
-            "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_FAILED:SIG_CRYPTO_FAILURE/TOTAL_FAILED:SIG_CRYPTO_FAILURE"
-          }
-        ],
-        "class": "agreement",
-        "passed": false,
-        "dss_passed": false,
-        "indication": true
-      },
-      "signing-time/extended": {
-        "observed": [
-          {
-            "FC": "PASSED/not-reached",
-            "ISC": "PASSED/not-reached",
-            "CV": "FAILED:SIG_CRYPTO_FAILURE/FAILED:SIG_CRYPTO_FAILURE",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
-            "SAV": "INDETERMINATE:SIG_CONSTRAINTS_FAILURE/not-reached",
-            "TIMESTAMPS": "none/none",
-            "OVERALL": "TOTAL_FAILED:SIG_CRYPTO_FAILURE/TOTAL_FAILED:SIG_CRYPTO_FAILURE"
-          }
-        ],
-        "class": "agreement",
-        "passed": false,
-        "dss_passed": false,
-        "indication": true
-      },
-      "signing-time/conformant": {
         "observed": [
           {
             "FC": "PASSED/not-reached",
@@ -10824,17 +10719,17 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:REVOCATION_OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND",
-            "OVERALL": "INDETERMINATE:REVOCATION_OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
         "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "The document carries no revocation status for the intermediate CA, so at either validation time xml-sec's X.509 validation cannot establish that member's status and returns CERTIFICATE_CHAIN_GENERAL_FAILURE (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)), as DSS does at the fixed instant. At the claimed signing times the signing certificates' statuses the document carries were issued later; DSS reports that first, as REVOCATION_OUT_OF_BOUNDS_NO_POE."
+        "reason": "Each signature is validated at its own claimed signing time. The document carries no revocation status for the intermediate CA, so at either time xml-sec's X.509 validation cannot establish that member's status and returns CERTIFICATE_CHAIN_GENERAL_FAILURE (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)). At the first signature's time the signing certificate's statuses the document carries were issued later, and DSS reports that first, as REVOCATION_OUT_OF_BOUNDS_NO_POE; at the second signature's time DSS reaches CERTIFICATE_CHAIN_GENERAL_FAILURE too."
       },
       "signing-time/extended": {
         "observed": [
@@ -10851,17 +10746,17 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:REVOCATION_OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND",
-            "OVERALL": "INDETERMINATE:REVOCATION_OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
         "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "The document carries no revocation status for the intermediate CA, so at either validation time xml-sec's X.509 validation cannot establish that member's status and returns CERTIFICATE_CHAIN_GENERAL_FAILURE (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)), as DSS does at the fixed instant. At the claimed signing times the signing certificates' statuses the document carries were issued later; DSS reports that first, as REVOCATION_OUT_OF_BOUNDS_NO_POE."
+        "reason": "Each signature is validated at its own claimed signing time. The document carries no revocation status for the intermediate CA, so at either time xml-sec's X.509 validation cannot establish that member's status and returns CERTIFICATE_CHAIN_GENERAL_FAILURE (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)). At the first signature's time the signing certificate's statuses the document carries were issued later, and DSS reports that first, as REVOCATION_OUT_OF_BOUNDS_NO_POE; at the second signature's time DSS reaches CERTIFICATE_CHAIN_GENERAL_FAILURE too."
       },
       "signing-time/conformant": {
         "observed": [
@@ -10878,17 +10773,17 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:REVOCATION_OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND",
-            "OVERALL": "INDETERMINATE:REVOCATION_OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
         "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "The document carries no revocation status for the intermediate CA, so at either validation time xml-sec's X.509 validation cannot establish that member's status and returns CERTIFICATE_CHAIN_GENERAL_FAILURE (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)), as DSS does at the fixed instant. At the claimed signing times the signing certificates' statuses the document carries were issued later; DSS reports that first, as REVOCATION_OUT_OF_BOUNDS_NO_POE."
+        "reason": "Each signature is validated at its own claimed signing time. The document carries no revocation status for the intermediate CA, so at either time xml-sec's X.509 validation cannot establish that member's status and returns CERTIFICATE_CHAIN_GENERAL_FAILURE (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)). At the first signature's time the signing certificate's statuses the document carries were issued later, and DSS reports that first, as REVOCATION_OUT_OF_BOUNDS_NO_POE; at the second signature's time DSS reaches CERTIFICATE_CHAIN_GENERAL_FAILURE too."
       }
     },
     "dss-xades/src/test/resources/validation/evidence-record/Signature-X-LT-5b5edd31-344d-4d66-8e95-79f9acaab566.xml": {
@@ -10988,17 +10883,17 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:REVOCATION_OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND",
-            "OVERALL": "INDETERMINATE:REVOCATION_OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
         "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "The document carries no revocation status for the intermediate CA, so at either validation time xml-sec's X.509 validation cannot establish that member's status and returns CERTIFICATE_CHAIN_GENERAL_FAILURE (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)), as DSS does at the fixed instant. At the claimed signing times the signing certificates' statuses the document carries were issued later; DSS reports that first, as REVOCATION_OUT_OF_BOUNDS_NO_POE."
+        "reason": "Each signature is validated at its own claimed signing time. The document carries no revocation status for the intermediate CA, so at either time xml-sec's X.509 validation cannot establish that member's status and returns CERTIFICATE_CHAIN_GENERAL_FAILURE (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)). At the first signature's time the signing certificate's statuses the document carries were issued later, and DSS reports that first, as REVOCATION_OUT_OF_BOUNDS_NO_POE; at the second signature's time DSS reaches CERTIFICATE_CHAIN_GENERAL_FAILURE too."
       },
       "signing-time/extended": {
         "observed": [
@@ -11015,17 +10910,17 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:REVOCATION_OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND",
-            "OVERALL": "INDETERMINATE:REVOCATION_OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
         "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "The document carries no revocation status for the intermediate CA, so at either validation time xml-sec's X.509 validation cannot establish that member's status and returns CERTIFICATE_CHAIN_GENERAL_FAILURE (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)), as DSS does at the fixed instant. At the claimed signing times the signing certificates' statuses the document carries were issued later; DSS reports that first, as REVOCATION_OUT_OF_BOUNDS_NO_POE."
+        "reason": "Each signature is validated at its own claimed signing time. The document carries no revocation status for the intermediate CA, so at either time xml-sec's X.509 validation cannot establish that member's status and returns CERTIFICATE_CHAIN_GENERAL_FAILURE (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)). At the first signature's time the signing certificate's statuses the document carries were issued later, and DSS reports that first, as REVOCATION_OUT_OF_BOUNDS_NO_POE; at the second signature's time DSS reaches CERTIFICATE_CHAIN_GENERAL_FAILURE too."
       },
       "signing-time/conformant": {
         "observed": [
@@ -11042,17 +10937,17 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:REVOCATION_OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND",
-            "OVERALL": "INDETERMINATE:REVOCATION_OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
         "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "The document carries no revocation status for the intermediate CA, so at either validation time xml-sec's X.509 validation cannot establish that member's status and returns CERTIFICATE_CHAIN_GENERAL_FAILURE (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)), as DSS does at the fixed instant. At the claimed signing times the signing certificates' statuses the document carries were issued later; DSS reports that first, as REVOCATION_OUT_OF_BOUNDS_NO_POE."
+        "reason": "Each signature is validated at its own claimed signing time. The document carries no revocation status for the intermediate CA, so at either time xml-sec's X.509 validation cannot establish that member's status and returns CERTIFICATE_CHAIN_GENERAL_FAILURE (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)). At the first signature's time the signing certificate's statuses the document carries were issued later, and DSS reports that first, as REVOCATION_OUT_OF_BOUNDS_NO_POE; at the second signature's time DSS reaches CERTIFICATE_CHAIN_GENERAL_FAILURE too."
       }
     },
     "dss-xades/src/test/resources/validation/evidence-record/Signature-X-LTA-5b5edd31-344d-4d66-8e95-79f9acaab566.xml": {
@@ -11152,17 +11047,17 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:REVOCATION_OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/not-reached",
-            "OVERALL": "INDETERMINATE:REVOCATION_OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
         "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "The document carries no revocation status for the intermediate CA, so at either validation time xml-sec's X.509 validation cannot establish that member's status and returns CERTIFICATE_CHAIN_GENERAL_FAILURE (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)), as DSS does at the fixed instant. At the claimed signing times the signing certificates' statuses the document carries were issued later; DSS reports that first, as REVOCATION_OUT_OF_BOUNDS_NO_POE."
+        "reason": "Each signature is validated at its own claimed signing time. The document carries no revocation status for the intermediate CA, so at either time xml-sec's X.509 validation cannot establish that member's status and returns CERTIFICATE_CHAIN_GENERAL_FAILURE (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)). At the first signature's time the signing certificate's statuses the document carries were issued later, and DSS reports that first, as REVOCATION_OUT_OF_BOUNDS_NO_POE; at the second signature's time DSS reaches CERTIFICATE_CHAIN_GENERAL_FAILURE too."
       },
       "signing-time/extended": {
         "observed": [
@@ -11179,17 +11074,17 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:REVOCATION_OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/not-reached",
-            "OVERALL": "INDETERMINATE:REVOCATION_OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
         "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "The document carries no revocation status for the intermediate CA, so at either validation time xml-sec's X.509 validation cannot establish that member's status and returns CERTIFICATE_CHAIN_GENERAL_FAILURE (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)), as DSS does at the fixed instant. At the claimed signing times the signing certificates' statuses the document carries were issued later; DSS reports that first, as REVOCATION_OUT_OF_BOUNDS_NO_POE."
+        "reason": "Each signature is validated at its own claimed signing time. The document carries no revocation status for the intermediate CA, so at either time xml-sec's X.509 validation cannot establish that member's status and returns CERTIFICATE_CHAIN_GENERAL_FAILURE (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)). At the first signature's time the signing certificate's statuses the document carries were issued later, and DSS reports that first, as REVOCATION_OUT_OF_BOUNDS_NO_POE; at the second signature's time DSS reaches CERTIFICATE_CHAIN_GENERAL_FAILURE too."
       },
       "signing-time/conformant": {
         "observed": [
@@ -11206,17 +11101,17 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:REVOCATION_OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/not-reached",
-            "OVERALL": "INDETERMINATE:REVOCATION_OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
         "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "The document carries no revocation status for the intermediate CA, so at either validation time xml-sec's X.509 validation cannot establish that member's status and returns CERTIFICATE_CHAIN_GENERAL_FAILURE (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)), as DSS does at the fixed instant. At the claimed signing times the signing certificates' statuses the document carries were issued later; DSS reports that first, as REVOCATION_OUT_OF_BOUNDS_NO_POE."
+        "reason": "Each signature is validated at its own claimed signing time. The document carries no revocation status for the intermediate CA, so at either time xml-sec's X.509 validation cannot establish that member's status and returns CERTIFICATE_CHAIN_GENERAL_FAILURE (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)). At the first signature's time the signing certificate's statuses the document carries were issued later, and DSS reports that first, as REVOCATION_OUT_OF_BOUNDS_NO_POE; at the second signature's time DSS reaches CERTIFICATE_CHAIN_GENERAL_FAILURE too."
       }
     },
     "dss-xades/src/test/resources/validation/evidence-record/X-B-B-DETACHED-1-extended-xades-baseline-lt.xml": {
@@ -11513,17 +11408,21 @@
             "FC": "absent/pass",
             "ISC": "absent/pass",
             "CV": "absent/pass",
-            "XCV": "absent/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "XCV": "absent/pass",
             "SAV": "absent/pass",
             "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/not-reached",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
         "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
         "indication": false,
-        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signatures were extended. For each signature xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes."
+        "valid_until": [
+          null,
+          1770387458
+        ],
+        "reason": "Each signature is validated at its own claimed signing time. Every revocation status the document carries for the signature's CA was issued after that time, when the signature was extended: xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes. The countersignature, validated at its own claimed signing time, passes on both sides."
       },
       "signing-time/extended": {
         "observed": [
@@ -11540,17 +11439,21 @@
             "FC": "absent/pass",
             "ISC": "absent/pass",
             "CV": "absent/pass",
-            "XCV": "absent/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "XCV": "absent/pass",
             "SAV": "absent/pass",
             "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/not-reached",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
         "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
         "indication": false,
-        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signatures were extended. For each signature xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes."
+        "valid_until": [
+          null,
+          1770387458
+        ],
+        "reason": "Each signature is validated at its own claimed signing time. Every revocation status the document carries for the signature's CA was issued after that time, when the signature was extended: xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes. The countersignature, validated at its own claimed signing time, passes on both sides."
       },
       "signing-time/conformant": {
         "observed": [
@@ -11567,17 +11470,21 @@
             "FC": "absent/pass",
             "ISC": "absent/pass",
             "CV": "absent/pass",
-            "XCV": "absent/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "XCV": "absent/pass",
             "SAV": "absent/pass",
             "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/not-reached",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
         "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
         "indication": false,
-        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signatures were extended. For each signature xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes."
+        "valid_until": [
+          null,
+          1770387458
+        ],
+        "reason": "Each signature is validated at its own claimed signing time. Every revocation status the document carries for the signature's CA was issued after that time, when the signature was extended: xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes. The countersignature, validated at its own claimed signing time, passes on both sides."
       }
     },
     "dss-xades/src/test/resources/validation/evidence-record/X-E-ERS-DETACHED-LT-chain-renewal.xml": {
@@ -12509,17 +12416,17 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:REVOCATION_OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND",
-            "OVERALL": "INDETERMINATE:REVOCATION_OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
         "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "The document carries no revocation status for the intermediate CA, so at either validation time xml-sec's X.509 validation cannot establish that member's status and returns CERTIFICATE_CHAIN_GENERAL_FAILURE (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)), as DSS does at the fixed instant. At the claimed signing times the signing certificates' statuses the document carries were issued later; DSS reports that first, as REVOCATION_OUT_OF_BOUNDS_NO_POE."
+        "reason": "Each signature is validated at its own claimed signing time. The document carries no revocation status for the intermediate CA, so at either time xml-sec's X.509 validation cannot establish that member's status and returns CERTIFICATE_CHAIN_GENERAL_FAILURE (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)). At the first signature's time the signing certificate's statuses the document carries were issued later, and DSS reports that first, as REVOCATION_OUT_OF_BOUNDS_NO_POE; at the second signature's time DSS reaches CERTIFICATE_CHAIN_GENERAL_FAILURE too."
       },
       "signing-time/extended": {
         "observed": [
@@ -12536,17 +12443,17 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:REVOCATION_OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND",
-            "OVERALL": "INDETERMINATE:REVOCATION_OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
         "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "The document carries no revocation status for the intermediate CA, so at either validation time xml-sec's X.509 validation cannot establish that member's status and returns CERTIFICATE_CHAIN_GENERAL_FAILURE (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)), as DSS does at the fixed instant. At the claimed signing times the signing certificates' statuses the document carries were issued later; DSS reports that first, as REVOCATION_OUT_OF_BOUNDS_NO_POE."
+        "reason": "Each signature is validated at its own claimed signing time. The document carries no revocation status for the intermediate CA, so at either time xml-sec's X.509 validation cannot establish that member's status and returns CERTIFICATE_CHAIN_GENERAL_FAILURE (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)). At the first signature's time the signing certificate's statuses the document carries were issued later, and DSS reports that first, as REVOCATION_OUT_OF_BOUNDS_NO_POE; at the second signature's time DSS reaches CERTIFICATE_CHAIN_GENERAL_FAILURE too."
       },
       "signing-time/conformant": {
         "observed": [
@@ -12563,17 +12470,17 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:REVOCATION_OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND",
-            "OVERALL": "INDETERMINATE:REVOCATION_OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
         "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "The document carries no revocation status for the intermediate CA, so at either validation time xml-sec's X.509 validation cannot establish that member's status and returns CERTIFICATE_CHAIN_GENERAL_FAILURE (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)), as DSS does at the fixed instant. At the claimed signing times the signing certificates' statuses the document carries were issued later; DSS reports that first, as REVOCATION_OUT_OF_BOUNDS_NO_POE."
+        "reason": "Each signature is validated at its own claimed signing time. The document carries no revocation status for the intermediate CA, so at either time xml-sec's X.509 validation cannot establish that member's status and returns CERTIFICATE_CHAIN_GENERAL_FAILURE (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)). At the first signature's time the signing certificate's statuses the document carries were issued later, and DSS reports that first, as REVOCATION_OUT_OF_BOUNDS_NO_POE; at the second signature's time DSS reaches CERTIFICATE_CHAIN_GENERAL_FAILURE too."
       }
     },
     "dss-xades/src/test/resources/validation/evidence-record/X-E-ERS-MANIFEST.xml": {
@@ -13524,17 +13431,21 @@
             "FC": "absent/pass",
             "ISC": "absent/pass",
             "CV": "absent/pass",
-            "XCV": "absent/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "XCV": "absent/pass",
             "SAV": "absent/pass",
             "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/not-reached",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
         "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
         "indication": false,
-        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signatures were extended. For each signature xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes."
+        "valid_until": [
+          null,
+          1770387458
+        ],
+        "reason": "Each signature is validated at its own claimed signing time. Every revocation status the document carries for the signature's CA was issued after that time, when the signature was extended: xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes. The countersignature, validated at its own claimed signing time, passes on both sides."
       },
       "signing-time/extended": {
         "observed": [
@@ -13551,17 +13462,21 @@
             "FC": "absent/pass",
             "ISC": "absent/pass",
             "CV": "absent/pass",
-            "XCV": "absent/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "XCV": "absent/pass",
             "SAV": "absent/pass",
             "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/not-reached",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
         "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
         "indication": false,
-        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signatures were extended. For each signature xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes."
+        "valid_until": [
+          null,
+          1770387458
+        ],
+        "reason": "Each signature is validated at its own claimed signing time. Every revocation status the document carries for the signature's CA was issued after that time, when the signature was extended: xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes. The countersignature, validated at its own claimed signing time, passes on both sides."
       },
       "signing-time/conformant": {
         "observed": [
@@ -13578,17 +13493,21 @@
             "FC": "absent/pass",
             "ISC": "absent/pass",
             "CV": "absent/pass",
-            "XCV": "absent/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "XCV": "absent/pass",
             "SAV": "absent/pass",
             "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/not-reached",
-            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
         "class": "normative-difference",
         "passed": false,
         "dss_passed": true,
         "indication": false,
-        "reason": "The second pass validates at the claimed signing time, and every revocation status the document carries for the chain's CA was issued after it, when the signatures were extended. For each signature xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes."
+        "valid_until": [
+          null,
+          1770387458
+        ],
+        "reason": "Each signature is validated at its own claimed signing time. Every revocation status the document carries for the signature's CA was issued after that time, when the signature was extended: xml-sec's X.509 validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4), finds none for that member and returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)); DSS takes the later status as the member's at that time and passes. The countersignature, validated at its own claimed signing time, passes on both sides."
       }
     },
     "dss-xades/src/test/resources/validation/evidence-record/XAdES-B_ER_Renewed_can.xml": {
@@ -14164,17 +14083,17 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:REVOCATION_OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND",
-            "OVERALL": "INDETERMINATE:REVOCATION_OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
         "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "The document carries no revocation status for the intermediate CA, so at either validation time xml-sec's X.509 validation cannot establish that member's status and returns CERTIFICATE_CHAIN_GENERAL_FAILURE (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)), as DSS does at the fixed instant. At the claimed signing times the signing certificates' statuses the document carries were issued later; DSS reports that first, as REVOCATION_OUT_OF_BOUNDS_NO_POE."
+        "reason": "Each signature is validated at its own claimed signing time. The document carries no revocation status for the intermediate CA, so at either time xml-sec's X.509 validation cannot establish that member's status and returns CERTIFICATE_CHAIN_GENERAL_FAILURE (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)). At the first signature's time the signing certificate's statuses the document carries were issued later, and DSS reports that first, as REVOCATION_OUT_OF_BOUNDS_NO_POE; at the second signature's time DSS reaches CERTIFICATE_CHAIN_GENERAL_FAILURE too."
       },
       "signing-time/extended": {
         "observed": [
@@ -14191,17 +14110,17 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:REVOCATION_OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND",
-            "OVERALL": "INDETERMINATE:REVOCATION_OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
         "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "The document carries no revocation status for the intermediate CA, so at either validation time xml-sec's X.509 validation cannot establish that member's status and returns CERTIFICATE_CHAIN_GENERAL_FAILURE (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)), as DSS does at the fixed instant. At the claimed signing times the signing certificates' statuses the document carries were issued later; DSS reports that first, as REVOCATION_OUT_OF_BOUNDS_NO_POE."
+        "reason": "Each signature is validated at its own claimed signing time. The document carries no revocation status for the intermediate CA, so at either time xml-sec's X.509 validation cannot establish that member's status and returns CERTIFICATE_CHAIN_GENERAL_FAILURE (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)). At the first signature's time the signing certificate's statuses the document carries were issued later, and DSS reports that first, as REVOCATION_OUT_OF_BOUNDS_NO_POE; at the second signature's time DSS reaches CERTIFICATE_CHAIN_GENERAL_FAILURE too."
       },
       "signing-time/conformant": {
         "observed": [
@@ -14218,17 +14137,17 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:REVOCATION_OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND",
-            "OVERALL": "INDETERMINATE:REVOCATION_OUT_OF_BOUNDS_NO_POE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
         "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
         "indication": true,
-        "reason": "The document carries no revocation status for the intermediate CA, so at either validation time xml-sec's X.509 validation cannot establish that member's status and returns CERTIFICATE_CHAIN_GENERAL_FAILURE (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)), as DSS does at the fixed instant. At the claimed signing times the signing certificates' statuses the document carries were issued later; DSS reports that first, as REVOCATION_OUT_OF_BOUNDS_NO_POE."
+        "reason": "Each signature is validated at its own claimed signing time. The document carries no revocation status for the intermediate CA, so at either time xml-sec's X.509 validation cannot establish that member's status and returns CERTIFICATE_CHAIN_GENERAL_FAILURE (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4 e)). At the first signature's time the signing certificate's statuses the document carries were issued later, and DSS reports that first, as REVOCATION_OUT_OF_BOUNDS_NO_POE; at the second signature's time DSS reaches CERTIFICATE_CHAIN_GENERAL_FAILURE too."
       }
     },
     "dss-xades/src/test/resources/validation/evidence-record/incorporation/XAdES-B.xml": {
@@ -14650,57 +14569,6 @@
         "reason": "The signing certificate is itself a trust anchor of the comparison and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). That X.509 finding is returned before signature acceptance (section 5.3.4 step 5 f)), which DSS, trusting the anchor directly, reaches and fails, as the xades-conformant profile does."
       },
       "instant/conformant": {
-        "observed": [
-          {
-            "FC": "PASSED/not-reached",
-            "ISC": "PASSED/not-reached",
-            "CV": "PASSED/not-reached",
-            "XCV": "PASSED/not-reached",
-            "SAV": "INDETERMINATE:SIG_CONSTRAINTS_FAILURE/INDETERMINATE:SIG_CONSTRAINTS_FAILURE",
-            "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:SIG_CONSTRAINTS_FAILURE/INDETERMINATE:SIG_CONSTRAINTS_FAILURE"
-          }
-        ],
-        "class": "agreement",
-        "passed": false,
-        "dss_passed": false,
-        "indication": true
-      },
-      "signing-time/strict": {
-        "observed": [
-          {
-            "FC": "PASSED/not-reached",
-            "ISC": "PASSED/not-reached",
-            "CV": "PASSED/not-reached",
-            "XCV": "PASSED/not-reached",
-            "SAV": "INDETERMINATE:SIG_CONSTRAINTS_FAILURE/INDETERMINATE:SIG_CONSTRAINTS_FAILURE",
-            "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:SIG_CONSTRAINTS_FAILURE/INDETERMINATE:SIG_CONSTRAINTS_FAILURE"
-          }
-        ],
-        "class": "agreement",
-        "passed": false,
-        "dss_passed": false,
-        "indication": true
-      },
-      "signing-time/extended": {
-        "observed": [
-          {
-            "FC": "PASSED/not-reached",
-            "ISC": "PASSED/not-reached",
-            "CV": "PASSED/not-reached",
-            "XCV": "PASSED/not-reached",
-            "SAV": "INDETERMINATE:SIG_CONSTRAINTS_FAILURE/INDETERMINATE:SIG_CONSTRAINTS_FAILURE",
-            "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:SIG_CONSTRAINTS_FAILURE/INDETERMINATE:SIG_CONSTRAINTS_FAILURE"
-          }
-        ],
-        "class": "agreement",
-        "passed": false,
-        "dss_passed": false,
-        "indication": true
-      },
-      "signing-time/conformant": {
         "observed": [
           {
             "FC": "PASSED/not-reached",
@@ -16129,9 +15997,9 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           },
           {
-            "FC": "absent/not-reached",
+            "FC": "absent/fail",
             "ISC": "absent/not-reached",
-            "CV": "absent/not-reached",
+            "CV": "absent/pass",
             "XCV": "absent/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "SAV": "absent/not-reached",
             "TIMESTAMPS": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
@@ -16142,7 +16010,7 @@
         "passed": false,
         "dss_passed": false,
         "indication": false,
-        "reason": "The signing certificates' OCSP responses are signed by ocsp-responder, which root-ca issued, while good-ca issued the certificates in question. RFC 6960 section 4.2.2.2 authorizes only the issuing CA, a responder it delegated to or one the relying party trusts locally, so xml-sec takes those responses as unusable, the status is not established and X.509 validation returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE at the claimed signing time (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4); DSS accepts the responses and passes. The first signature's countersignature carries a signature timestamp copied from another signature, so xml-sec does not verify that countersignature and refuses the first signature's qualifying properties for it (TS 101 903 V1.4.2 clause 7.2.4), where DSS passes FC."
+        "reason": "Each signature is validated at its own claimed signing time. The signing certificates' OCSP responses are signed by ocsp-responder, which root-ca issued, while good-ca issued the certificates in question. RFC 6960 section 4.2.2.2 authorizes only the issuing CA, a responder it delegated to or one the relying party trusts locally, so xml-sec takes those responses as unusable, the status is not established and X.509 validation returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4); DSS accepts the responses and passes. The first signature's countersignature carries a signature timestamp copied from another signature, so xml-sec does not verify that countersignature and refuses the qualifying properties of the signatures that carry it (TS 101 903 V1.4.2 clause 7.2.4), where DSS passes FC."
       },
       "signing-time/extended": {
         "observed": [
@@ -16165,9 +16033,9 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           },
           {
-            "FC": "absent/not-reached",
+            "FC": "absent/fail",
             "ISC": "absent/not-reached",
-            "CV": "absent/not-reached",
+            "CV": "absent/pass",
             "XCV": "absent/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "SAV": "absent/not-reached",
             "TIMESTAMPS": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
@@ -16178,7 +16046,7 @@
         "passed": false,
         "dss_passed": false,
         "indication": false,
-        "reason": "The signing certificates' OCSP responses are signed by ocsp-responder, which root-ca issued, while good-ca issued the certificates in question. RFC 6960 section 4.2.2.2 authorizes only the issuing CA, a responder it delegated to or one the relying party trusts locally, so xml-sec takes those responses as unusable, the status is not established and X.509 validation returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE at the claimed signing time (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4); DSS accepts the responses and passes. The first signature's countersignature carries a signature timestamp copied from another signature, so xml-sec does not verify that countersignature and refuses the first signature's qualifying properties for it (TS 101 903 V1.4.2 clause 7.2.4), where DSS passes FC."
+        "reason": "Each signature is validated at its own claimed signing time. The signing certificates' OCSP responses are signed by ocsp-responder, which root-ca issued, while good-ca issued the certificates in question. RFC 6960 section 4.2.2.2 authorizes only the issuing CA, a responder it delegated to or one the relying party trusts locally, so xml-sec takes those responses as unusable, the status is not established and X.509 validation returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4); DSS accepts the responses and passes. The first signature's countersignature carries a signature timestamp copied from another signature, so xml-sec does not verify that countersignature and refuses the qualifying properties of the signatures that carry it (TS 101 903 V1.4.2 clause 7.2.4), where DSS passes FC."
       },
       "signing-time/conformant": {
         "observed": [
@@ -16201,9 +16069,9 @@
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           },
           {
-            "FC": "absent/not-reached",
+            "FC": "absent/fail",
             "ISC": "absent/not-reached",
-            "CV": "absent/not-reached",
+            "CV": "absent/pass",
             "XCV": "absent/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "SAV": "absent/not-reached",
             "TIMESTAMPS": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
@@ -16214,7 +16082,7 @@
         "passed": false,
         "dss_passed": false,
         "indication": false,
-        "reason": "The signing certificates' OCSP responses are signed by ocsp-responder, which root-ca issued, while good-ca issued the certificates in question. RFC 6960 section 4.2.2.2 authorizes only the issuing CA, a responder it delegated to or one the relying party trusts locally, so xml-sec takes those responses as unusable, the status is not established and X.509 validation returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE at the claimed signing time (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4); DSS accepts the responses and passes. The first signature's countersignature carries a signature timestamp copied from another signature, so xml-sec does not verify that countersignature and refuses the first signature's qualifying properties for it (TS 101 903 V1.4.2 clause 7.2.4), where DSS passes FC."
+        "reason": "Each signature is validated at its own claimed signing time. The signing certificates' OCSP responses are signed by ocsp-responder, which root-ca issued, while good-ca issued the certificates in question. RFC 6960 section 4.2.2.2 authorizes only the issuing CA, a responder it delegated to or one the relying party trusts locally, so xml-sec takes those responses as unusable, the status is not established and X.509 validation returns INDETERMINATE CERTIFICATE_CHAIN_GENERAL_FAILURE (EN 319 102-1 V1.4.1 section 5.2.6.4 step 4); DSS accepts the responses and passes. The first signature's countersignature carries a signature timestamp copied from another signature, so xml-sec does not verify that countersignature and refuses the qualifying properties of the signatures that carry it (TS 101 903 V1.4.2 clause 7.2.4), where DSS passes FC."
       }
     },
     "dss-xades/src/test/resources/validation/xades-counter-signature-injected.xml": {
@@ -21317,16 +21185,17 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "XCV": "PASSED/INDETERMINATE:OUT_OF_BOUNDS_NO_POE",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "agreement",
+        "class": "policy-refusal",
         "passed": false,
-        "dss_passed": false,
-        "indication": true
+        "dss_passed": true,
+        "indication": false,
+        "reason": "The signing certificate is itself the comparison's only trust anchor (the document carries no certificate above it) and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/extended": {
         "observed": [
@@ -21334,33 +21203,35 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "XCV": "PASSED/INDETERMINATE:OUT_OF_BOUNDS_NO_POE",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "agreement",
+        "class": "policy-refusal",
         "passed": false,
-        "dss_passed": false,
-        "indication": true
+        "dss_passed": true,
+        "indication": false,
+        "reason": "The signing certificate is itself the comparison's only trust anchor (the document carries no certificate above it) and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/conformant": {
         "observed": [
           {
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
-            "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
-            "SAV": "PASSED/not-reached",
+            "CV": "PASSED/pass",
+            "XCV": "PASSED/pass",
+            "SAV": "PASSED/fail",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "agreement",
-        "passed": false,
-        "dss_passed": false,
-        "indication": true
+        "class": "normative-difference",
+        "passed": true,
+        "dss_passed": true,
+        "indication": true,
+        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. The overall results are the same."
       },
       "signing-time/strict": {
         "observed": [
@@ -21368,16 +21239,19 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "XCV": "PASSED/not-reached",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
         "class": "agreement",
-        "passed": false,
-        "dss_passed": false,
-        "indication": true
+        "passed": true,
+        "dss_passed": true,
+        "indication": true,
+        "valid_until": [
+          1611079088
+        ]
       },
       "signing-time/extended": {
         "observed": [
@@ -21385,33 +21259,19 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "XCV": "PASSED/not-reached",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
         "class": "agreement",
-        "passed": false,
-        "dss_passed": false,
-        "indication": true
-      },
-      "signing-time/conformant": {
-        "observed": [
-          {
-            "FC": "PASSED/not-reached",
-            "ISC": "PASSED/not-reached",
-            "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
-            "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
-          }
-        ],
-        "class": "agreement",
-        "passed": false,
-        "dss_passed": false,
-        "indication": true
+        "passed": true,
+        "dss_passed": true,
+        "indication": true,
+        "valid_until": [
+          1611079088
+        ]
       }
     },
     "dss-xades/src/test/resources/validation/xsw/XSW-enveloped-fake-content-misplaced.xml": {
@@ -21421,16 +21281,17 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "XCV": "PASSED/INDETERMINATE:OUT_OF_BOUNDS_NO_POE",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "agreement",
+        "class": "policy-refusal",
         "passed": false,
-        "dss_passed": false,
-        "indication": true
+        "dss_passed": true,
+        "indication": false,
+        "reason": "The signing certificate is itself the comparison's only trust anchor (the document carries no certificate above it) and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/extended": {
         "observed": [
@@ -21438,16 +21299,17 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "XCV": "PASSED/INDETERMINATE:OUT_OF_BOUNDS_NO_POE",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "agreement",
+        "class": "policy-refusal",
         "passed": false,
-        "dss_passed": false,
-        "indication": true
+        "dss_passed": true,
+        "indication": false,
+        "reason": "The signing certificate is itself the comparison's only trust anchor (the document carries no certificate above it) and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/conformant": {
         "observed": [
@@ -21455,15 +21317,15 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "XCV": "PASSED/not-reached",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
         "class": "agreement",
-        "passed": false,
-        "dss_passed": false,
+        "passed": true,
+        "dss_passed": true,
         "indication": true
       },
       "signing-time/strict": {
@@ -21472,16 +21334,17 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
-            "SAV": "PASSED/not-reached",
+            "XCV": "PASSED/not-reached",
+            "SAV": "PASSED/INDETERMINATE:SIG_CONSTRAINTS_FAILURE",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:SIG_CONSTRAINTS_FAILURE"
           }
         ],
-        "class": "agreement",
+        "class": "policy-refusal",
         "passed": false,
-        "dss_passed": false,
-        "indication": true
+        "dss_passed": true,
+        "indication": false,
+        "reason": "At the claimed signing time the signing certificate, the comparison's only trust anchor, is within its validity, but this profile does not trust it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), and the signature's other key source, its KeyValue, is one the profile disables as untrusted key material. The profile refuses the signature, which is signature acceptance (section 5.2.8). DSS trusts the anchor directly and passes, as the xades-conformant profile does."
       },
       "signing-time/extended": {
         "observed": [
@@ -21489,16 +21352,17 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
-            "SAV": "PASSED/not-reached",
+            "XCV": "PASSED/not-reached",
+            "SAV": "PASSED/INDETERMINATE:SIG_CONSTRAINTS_FAILURE",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:SIG_CONSTRAINTS_FAILURE"
           }
         ],
-        "class": "agreement",
+        "class": "policy-refusal",
         "passed": false,
-        "dss_passed": false,
-        "indication": true
+        "dss_passed": true,
+        "indication": false,
+        "reason": "At the claimed signing time the signing certificate, the comparison's only trust anchor, is within its validity, but this profile does not trust it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), and the signature's other key source, its KeyValue, is one the profile disables as untrusted key material. The profile refuses the signature, which is signature acceptance (section 5.2.8). DSS trusts the anchor directly and passes, as the xades-conformant profile does."
       },
       "signing-time/conformant": {
         "observed": [
@@ -21506,15 +21370,15 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "XCV": "PASSED/not-reached",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
         "class": "agreement",
-        "passed": false,
-        "dss_passed": false,
+        "passed": true,
+        "dss_passed": true,
         "indication": true
       }
     },
@@ -21525,7 +21389,7 @@
             "FC": "FAILED:FORMAT_FAILURE/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "FAILED:HASH_FAILURE/INDETERMINATE:SIGNED_DATA_NOT_FOUND",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
+            "XCV": "PASSED/not-reached",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_FAILED:FORMAT_FAILURE/INDETERMINATE:SIGNED_DATA_NOT_FOUND"
@@ -21543,7 +21407,7 @@
             "FC": "FAILED:FORMAT_FAILURE/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "FAILED:HASH_FAILURE/INDETERMINATE:SIGNED_DATA_NOT_FOUND",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
+            "XCV": "PASSED/not-reached",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_FAILED:FORMAT_FAILURE/INDETERMINATE:SIGNED_DATA_NOT_FOUND"
@@ -21561,7 +21425,7 @@
             "FC": "FAILED:FORMAT_FAILURE/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "FAILED:HASH_FAILURE/INDETERMINATE:SIGNED_DATA_NOT_FOUND",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
+            "XCV": "PASSED/not-reached",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_FAILED:FORMAT_FAILURE/INDETERMINATE:SIGNED_DATA_NOT_FOUND"
@@ -21579,7 +21443,7 @@
             "FC": "FAILED:FORMAT_FAILURE/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "FAILED:HASH_FAILURE/INDETERMINATE:SIGNED_DATA_NOT_FOUND",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
+            "XCV": "PASSED/not-reached",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_FAILED:FORMAT_FAILURE/INDETERMINATE:SIGNED_DATA_NOT_FOUND"
@@ -21597,7 +21461,7 @@
             "FC": "FAILED:FORMAT_FAILURE/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "FAILED:HASH_FAILURE/INDETERMINATE:SIGNED_DATA_NOT_FOUND",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
+            "XCV": "PASSED/not-reached",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_FAILED:FORMAT_FAILURE/INDETERMINATE:SIGNED_DATA_NOT_FOUND"
@@ -21615,7 +21479,7 @@
             "FC": "FAILED:FORMAT_FAILURE/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "FAILED:HASH_FAILURE/INDETERMINATE:SIGNED_DATA_NOT_FOUND",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
+            "XCV": "PASSED/not-reached",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_FAILED:FORMAT_FAILURE/INDETERMINATE:SIGNED_DATA_NOT_FOUND"
@@ -21635,15 +21499,15 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/FAILED:HASH_FAILURE",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
+            "XCV": "PASSED/not-reached",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/TOTAL_FAILED:HASH_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_FAILED:HASH_FAILURE"
           }
         ],
         "class": "dss-deviation",
         "passed": false,
-        "dss_passed": false,
+        "dss_passed": true,
         "indication": false,
         "reason": "The referenced TLISK-102 list was moved inside the ds:Signature. The enveloped-signature transform removes every node of the Signature that contains it (XMLDSig Core 1.1 section 6.6.4, by its equivalent XPath), the moved list included, so the digest does not match (EN 319 102-1 V1.4.1 section 5.2.7.4 step 2). DSS digests the moved list."
       },
@@ -21653,15 +21517,15 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/FAILED:HASH_FAILURE",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
+            "XCV": "PASSED/not-reached",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/TOTAL_FAILED:HASH_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_FAILED:HASH_FAILURE"
           }
         ],
         "class": "dss-deviation",
         "passed": false,
-        "dss_passed": false,
+        "dss_passed": true,
         "indication": false,
         "reason": "The referenced TLISK-102 list was moved inside the ds:Signature. The enveloped-signature transform removes every node of the Signature that contains it (XMLDSig Core 1.1 section 6.6.4, by its equivalent XPath), the moved list included, so the digest does not match (EN 319 102-1 V1.4.1 section 5.2.7.4 step 2). DSS digests the moved list."
       },
@@ -21671,15 +21535,15 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/FAILED:HASH_FAILURE",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
+            "XCV": "PASSED/not-reached",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/TOTAL_FAILED:HASH_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_FAILED:HASH_FAILURE"
           }
         ],
         "class": "dss-deviation",
         "passed": false,
-        "dss_passed": false,
+        "dss_passed": true,
         "indication": false,
         "reason": "The referenced TLISK-102 list was moved inside the ds:Signature. The enveloped-signature transform removes every node of the Signature that contains it (XMLDSig Core 1.1 section 6.6.4, by its equivalent XPath), the moved list included, so the digest does not match (EN 319 102-1 V1.4.1 section 5.2.7.4 step 2). DSS digests the moved list."
       },
@@ -21689,15 +21553,15 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/FAILED:HASH_FAILURE",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
+            "XCV": "PASSED/not-reached",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/TOTAL_FAILED:HASH_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_FAILED:HASH_FAILURE"
           }
         ],
         "class": "dss-deviation",
         "passed": false,
-        "dss_passed": false,
+        "dss_passed": true,
         "indication": false,
         "reason": "The referenced TLISK-102 list was moved inside the ds:Signature. The enveloped-signature transform removes every node of the Signature that contains it (XMLDSig Core 1.1 section 6.6.4, by its equivalent XPath), the moved list included, so the digest does not match (EN 319 102-1 V1.4.1 section 5.2.7.4 step 2). DSS digests the moved list."
       },
@@ -21707,15 +21571,15 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/FAILED:HASH_FAILURE",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
+            "XCV": "PASSED/not-reached",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/TOTAL_FAILED:HASH_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_FAILED:HASH_FAILURE"
           }
         ],
         "class": "dss-deviation",
         "passed": false,
-        "dss_passed": false,
+        "dss_passed": true,
         "indication": false,
         "reason": "The referenced TLISK-102 list was moved inside the ds:Signature. The enveloped-signature transform removes every node of the Signature that contains it (XMLDSig Core 1.1 section 6.6.4, by its equivalent XPath), the moved list included, so the digest does not match (EN 319 102-1 V1.4.1 section 5.2.7.4 step 2). DSS digests the moved list."
       },
@@ -21725,15 +21589,15 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/FAILED:HASH_FAILURE",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
+            "XCV": "PASSED/not-reached",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/TOTAL_FAILED:HASH_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_FAILED:HASH_FAILURE"
           }
         ],
         "class": "dss-deviation",
         "passed": false,
-        "dss_passed": false,
+        "dss_passed": true,
         "indication": false,
         "reason": "The referenced TLISK-102 list was moved inside the ds:Signature. The enveloped-signature transform removes every node of the Signature that contains it (XMLDSig Core 1.1 section 6.6.4, by its equivalent XPath), the moved list included, so the digest does not match (EN 319 102-1 V1.4.1 section 5.2.7.4 step 2). DSS digests the moved list."
       }
@@ -21776,60 +21640,6 @@
         "reason": "Every Reference names an element that exists, and each digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2). That the QualifyingProperties' own SignedProperties is not the one signed is a matter of the XAdES profile, which is signature acceptance (section 5.2.2 NOTE, section 5.2.8) and comes after the X.509 finding (section 5.3.4 steps 4 to 6): the signing certificate is itself a trust anchor, which this profile holds to its validity (section 5.2.6.4 steps 1 and 7), and it is outside it with no status issued after its expiry (NOTE 8). DSS reports the signed data as not found."
       },
       "instant/conformant": {
-        "observed": [
-          {
-            "FC": "PASSED/not-reached",
-            "ISC": "PASSED/not-reached",
-            "CV": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/not-reached",
-            "XCV": "PASSED/not-reached",
-            "SAV": "INDETERMINATE:SIG_CONSTRAINTS_FAILURE/INDETERMINATE:SIG_CONSTRAINTS_FAILURE",
-            "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:SIG_CONSTRAINTS_FAILURE"
-          }
-        ],
-        "class": "dss-deviation",
-        "passed": false,
-        "dss_passed": false,
-        "indication": true,
-        "reason": "Every Reference names an element that exists, and each digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2). The profile trusts the signer, itself a trust anchor, directly (section 5.2.6.4 step 1 b)), and refuses the signature because the QualifyingProperties' own SignedProperties is not the one signed, which is signature acceptance (section 5.2.2 NOTE, section 5.2.8). DSS reports the signed data as not found."
-      },
-      "signing-time/strict": {
-        "observed": [
-          {
-            "FC": "PASSED/not-reached",
-            "ISC": "PASSED/not-reached",
-            "CV": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/not-reached",
-            "XCV": "PASSED/INDETERMINATE:OUT_OF_BOUNDS_NO_POE",
-            "SAV": "INDETERMINATE:SIG_CONSTRAINTS_FAILURE/not-reached",
-            "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
-          }
-        ],
-        "class": "dss-deviation",
-        "passed": false,
-        "dss_passed": false,
-        "indication": true,
-        "reason": "Every Reference names an element that exists, and each digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2). That the QualifyingProperties' own SignedProperties is not the one signed is a matter of the XAdES profile, which is signature acceptance (section 5.2.2 NOTE, section 5.2.8) and comes after the X.509 finding (section 5.3.4 steps 4 to 6): the signing certificate is itself a trust anchor, which this profile holds to its validity (section 5.2.6.4 steps 1 and 7), and it is outside it with no status issued after its expiry (NOTE 8). DSS reports the signed data as not found."
-      },
-      "signing-time/extended": {
-        "observed": [
-          {
-            "FC": "PASSED/not-reached",
-            "ISC": "PASSED/not-reached",
-            "CV": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/not-reached",
-            "XCV": "PASSED/INDETERMINATE:OUT_OF_BOUNDS_NO_POE",
-            "SAV": "INDETERMINATE:SIG_CONSTRAINTS_FAILURE/not-reached",
-            "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:SIGNED_DATA_NOT_FOUND/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
-          }
-        ],
-        "class": "dss-deviation",
-        "passed": false,
-        "dss_passed": false,
-        "indication": true,
-        "reason": "Every Reference names an element that exists, and each digest matches (EN 319 102-1 V1.4.1 section 5.2.7.4 steps 1 and 2). That the QualifyingProperties' own SignedProperties is not the one signed is a matter of the XAdES profile, which is signature acceptance (section 5.2.2 NOTE, section 5.2.8) and comes after the X.509 finding (section 5.3.4 steps 4 to 6): the signing certificate is itself a trust anchor, which this profile holds to its validity (section 5.2.6.4 steps 1 and 7), and it is outside it with no status issued after its expiry (NOTE 8). DSS reports the signed data as not found."
-      },
-      "signing-time/conformant": {
         "observed": [
           {
             "FC": "PASSED/not-reached",
@@ -22185,16 +21995,17 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "XCV": "PASSED/INDETERMINATE:OUT_OF_BOUNDS_NO_POE",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "agreement",
+        "class": "policy-refusal",
         "passed": false,
-        "dss_passed": false,
-        "indication": true
+        "dss_passed": true,
+        "indication": false,
+        "reason": "The signing certificate is itself the comparison's only trust anchor (the document carries no certificate above it) and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/extended": {
         "observed": [
@@ -22202,16 +22013,17 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "XCV": "PASSED/INDETERMINATE:OUT_OF_BOUNDS_NO_POE",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:OUT_OF_BOUNDS_NO_POE"
           }
         ],
-        "class": "agreement",
+        "class": "policy-refusal",
         "passed": false,
-        "dss_passed": false,
-        "indication": true
+        "dss_passed": true,
+        "indication": false,
+        "reason": "The signing certificate is itself the comparison's only trust anchor (the document carries no certificate above it) and has expired at the validation time. This profile takes such a signer as the one-certificate path it forms rather than trusting it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), so step 7 checks its validity and, with no revocation status issued after its expiry, returns OUT_OF_BOUNDS_NO_POE (NOTE 8). DSS trusts the anchor directly, as the xades-conformant profile does."
       },
       "instant/conformant": {
         "observed": [
@@ -22219,15 +22031,15 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "XCV": "PASSED/not-reached",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
         "class": "agreement",
-        "passed": false,
-        "dss_passed": false,
+        "passed": true,
+        "dss_passed": true,
         "indication": true
       },
       "signing-time/strict": {
@@ -22236,16 +22048,17 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
-            "SAV": "PASSED/not-reached",
+            "XCV": "PASSED/not-reached",
+            "SAV": "PASSED/INDETERMINATE:SIG_CONSTRAINTS_FAILURE",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:SIG_CONSTRAINTS_FAILURE"
           }
         ],
-        "class": "agreement",
+        "class": "policy-refusal",
         "passed": false,
-        "dss_passed": false,
-        "indication": true
+        "dss_passed": true,
+        "indication": false,
+        "reason": "At the claimed signing time the signing certificate, the comparison's only trust anchor, is within its validity, but this profile does not trust it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), and the signature's other key source, its KeyValue, is one the profile disables as untrusted key material. The profile refuses the signature, which is signature acceptance (section 5.2.8). DSS trusts the anchor directly and passes, as the xades-conformant profile does."
       },
       "signing-time/extended": {
         "observed": [
@@ -22253,16 +22066,17 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
-            "SAV": "PASSED/not-reached",
+            "XCV": "PASSED/not-reached",
+            "SAV": "PASSED/INDETERMINATE:SIG_CONSTRAINTS_FAILURE",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:SIG_CONSTRAINTS_FAILURE"
           }
         ],
-        "class": "agreement",
+        "class": "policy-refusal",
         "passed": false,
-        "dss_passed": false,
-        "indication": true
+        "dss_passed": true,
+        "indication": false,
+        "reason": "At the claimed signing time the signing certificate, the comparison's only trust anchor, is within its validity, but this profile does not trust it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), and the signature's other key source, its KeyValue, is one the profile disables as untrusted key material. The profile refuses the signature, which is signature acceptance (section 5.2.8). DSS trusts the anchor directly and passes, as the xades-conformant profile does."
       },
       "signing-time/conformant": {
         "observed": [
@@ -22270,15 +22084,15 @@
             "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "XCV": "PASSED/not-reached",
             "SAV": "PASSED/not-reached",
             "TIMESTAMPS": "none/none",
-            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+            "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
         "class": "agreement",
-        "passed": false,
-        "dss_passed": false,
+        "passed": true,
+        "dss_passed": true,
         "indication": true
       }
     },
@@ -22305,5 +22119,64 @@
         "indication": false
       }
     }
+  },
+  "not_xml": {
+    "dss-cookbook/src/test/resources/signature-pool/cache/http___tl_nbu_gov_sk_kca_tsl_tsl_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___crc_bg_files__en_TSL_BG_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___dec_dmrid_gov_cy_dmrid_dec_ws_dec_nsf_all_5064247FF4FC3DCCC2258506002EEA17__file_TSL_CY_sign_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___dp_trustedlist_fi_fi_tl_v6_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___ec_europa_eu_tools_lotl_Final_EU_TSL_UKsigned_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___ec_europa_eu_tools_lotl_eu_lotl_pivot_282_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___ec_europa_eu_tools_lotl_eu_lotl_pivot_300_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___ec_europa_eu_tools_lotl_eu_lotl_pivot_335_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___ec_europa_eu_tools_lotl_eu_lotl_pivot_341_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___ec_europa_eu_tools_lotl_eu_lotl_pivot_378_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___ec_europa_eu_tools_lotl_eu_lotl_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___eidas_agid_gov_it_TL_TSL_IT_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___eidas_gov_ie_Irelandtslsignedv6_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___gov_hr_UserDocsImages_Usluge_povjerenja_Pouzdani_popis_RH_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___messervices_cyber_gouv_fr_visas_tl_fr_v6_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___nkom_no_files_TL_NO_TL_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___rrt_lt_static_files_LT_TSL_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___sr_riik_ee_tsl_estonian_tsl_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___tl_bundesnetzagentur_de_TL_DE_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___trusted_list_lu_tsl_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___trustedlist_adr_gov_ro_trustedlist_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___trustedlist_pts_se_tlv6_SE_TL_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___trustlist_gov_lv_tsl_latvian_tsl_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___tsl_belgium_be_tsl_be_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___tsl_digital_gob_es_TSL_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___tsl_fjarskiptastofa_is_library_skrar_tsl_tsl_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___tsl_gov_cz_publ_TSL_CZ_xtsl": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___tsl_mca_org_mt_MT_TSL_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___www_digst_dk_TSLDK_v6xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___www_eett_gr_tsl_tl_el_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___www_gns_gov_pt_media_TSLPT_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___www_llv_li_serviceportal2_amtsstellen_amt_fuer_kommunikation_trustedlist_li_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___www_nccert_pl_tsl_PL_TSL_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___www_nmhh_hu_tl_pub_HU_TL_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___www_rdi_nl_site_binaries_content_assets_site_content_bestanden_current_tsl_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___www_signatur_rtr_at_vertrauensliste_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/cache/https___www_tl_gov_si_SI_TL_xml": "not-xml",
+    "dss-cookbook/src/test/resources/signature-pool/signedCadesB.p7m": "not-xml",
+    "dss-xades/src/test/resources/ExternalXSDForAsic.xsd": "not-xml",
+    "dss-xades/src/test/resources/cert-conflict/currentKeystore.pfx": "not-xml",
+    "dss-xades/src/test/resources/cert-conflict/previousKeystore.pfx": "not-xml",
+    "dss-xades/src/test/resources/dss-messages_fr.properties": "not-xml",
+    "dss-xades/src/test/resources/htmlISO8859-1.html": "not-xml",
+    "dss-xades/src/test/resources/htmlUTF8.html": "not-xml",
+    "dss-xades/src/test/resources/sample.png": "not-xml",
+    "dss-xades/src/test/resources/sample.txt": "not-xml",
+    "dss-xades/src/test/resources/signature-policy.der": "not-xml",
+    "dss-xades/src/test/resources/validation/Signature-X-EE-3.ddoc": "not-xml",
+    "dss-xades/src/test/resources/validation/dss1135/politica_de_firma.pdf": "not-xml",
+    "dss-xades/src/test/resources/validation/dss1788/signCert.cer": "not-xml",
+    "dss-xades/src/test/resources/validation/dss874/policy.pdf": "not-xml",
+    "dss-xades/src/test/resources/validation/evidence-record/evidence-record-X-E-ERS-LT.ers": "not-xml",
+    "dss-xades/src/test/resources/validation/evidence-record/evidence-record-detached.ers": "not-xml",
+    "dss-xades/src/test/resources/validation/evidence-record/incorporation/evidence-record-X-B-B-no-hashtree.ers": "not-xml",
+    "dss-xades/src/test/resources/validation/evidence-record/incorporation/evidence-record-X-B-B.ers": "not-xml",
+    "dss-xades/src/test/resources/validation/evidence-record/incorporation/evidence-record-second-X-B-B.ers": "not-xml",
+    "dss-xades/src/test/resources/validation/evidence-record/incorporation/evidence-record-second-on-xml-X-B-B.ers": "not-xml"
   }
 }
