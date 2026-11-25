@@ -421,6 +421,22 @@ pub(crate) fn our_blocks(facts: &Value) -> Map<String, Value> {
     blocks
 }
 
+/// `detail` with each `NodeIdentity { ... }` written `N`, so its shape reads
+/// the same for every node.
+fn node_free(detail: &str) -> String {
+    let mut shape = String::with_capacity(detail.len());
+    let mut rest = detail;
+    while let Some(start) = rest.find("NodeIdentity {") {
+        shape.push_str(&rest[..start]);
+        shape.push('N');
+        rest = rest[start..]
+            .find('}')
+            .map_or("", |end| &rest[start + end + 1..]);
+    }
+    shape.push_str(rest);
+    shape
+}
+
 /// The FC, ISC and SAV verdicts of one signature's basic facts.
 fn basic_blocks(facts: &Value, blocks: &mut Map<String, Value>) {
     // A TS 101 903 V1.2.2 signature has BES facts in place of EN 319 132-1
@@ -475,12 +491,21 @@ fn basic_blocks(facts: &Value, blocks: &mut Map<String, Value>) {
         );
     } else if let Some(error) = basic["error"].as_str() {
         let detail = basic["detail"].as_str().unwrap_or_default();
-        // A property the baseline profile forbids (EN 319 132-1 clause 6)
+        // A requirement of the baseline profile (EN 319 132-1 V1.3.1 clause
+        // 6.3: no excluded property, a format for every object (k), MimeType
+        // (Table 2), an explicit timestamp canonicalization method (n))
         // breaks no XAdES format: the profile's rules are signature
         // acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, 5.2.8). A
         // signature whose value did not verify stops B-B, and CV already
         // reports it. Every other refusal is the format's.
-        let block = if detail.starts_with("Prepare(Property(Forbidden") {
+        let baseline = [
+            "Prepare(Property(Forbidden",
+            "Prepare(Format(Missing {",
+            "Prepare(Format(Format(Property(Missing { parent: N, local: \"MimeType\"",
+            "Prepare(Timestamp(Missing { node: N, local: \"CanonicalizationMethod\"",
+        ];
+        let shape = node_free(detail);
+        let block = if baseline.iter().any(|prefix| shape.starts_with(prefix)) {
             "SAV"
         } else if detail.starts_with("Prepare(Binding(Signature") {
             return;

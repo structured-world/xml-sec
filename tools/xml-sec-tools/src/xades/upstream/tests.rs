@@ -223,6 +223,20 @@ fn a_b_b_refusal_lands_on_the_block_it_concerns() {
     assert_eq!(invalid["SAV"]["verdict"], "not-reached");
     let schema = refused("Prepare(Timestamp(Duplicate { node: N }))");
     assert_eq!(schema["FC"]["verdict"], "fail");
+    // The baseline's own requirements (EN 319 132-1 V1.3.1 clause 6.3):
+    // format coverage of every object, MimeType, an explicit timestamp
+    // canonicalization method. The schema's ObjectReference is the format's.
+    for baseline in [
+        "Prepare(Format(Missing { reference: N }))",
+        "Prepare(Format(Format(Property(Missing { parent: N, local: \"MimeType\" }))))",
+        "Prepare(Timestamp(Missing { node: N, local: \"CanonicalizationMethod\" }))",
+    ] {
+        assert_eq!(refused(baseline)["SAV"]["verdict"], "fail", "{baseline}");
+    }
+    let reference = refused(
+        "Prepare(Format(Format(Property(Missing { parent: N, local: \"ObjectReference\" }))))",
+    );
+    assert_eq!(reference["FC"]["verdict"], "fail");
 }
 
 #[test]

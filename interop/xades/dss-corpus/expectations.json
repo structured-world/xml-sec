@@ -377,10 +377,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A DataObjectFormat qualifies a Reference inside the signed Manifest, whose URI (urn:lu.luxtrust.tspserviceprovider:files:pdf:fileName) names data the comparison supplies to neither validator. A Manifest's references are not part of core validation (XMLDSig 1.1 section 5.1), and xml-sec's B-B level takes a DataObjectFormat over data XMLDSig did not check as unbound (EN 319 132-1 V1.3.1 clause 5.2.4: it qualifies the data object of its reference), so format checking fails; DSS passes FC. The overall results are the same."
       },
       "signing-time/extended": {
         "observed": [
@@ -394,10 +395,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A DataObjectFormat qualifies a Reference inside the signed Manifest, whose URI (urn:lu.luxtrust.tspserviceprovider:files:pdf:fileName) names data the comparison supplies to neither validator. A Manifest's references are not part of core validation (XMLDSig 1.1 section 5.1), and xml-sec's B-B level takes a DataObjectFormat over data XMLDSig did not check as unbound (EN 319 132-1 V1.3.1 clause 5.2.4: it qualifies the data object of its reference), so format checking fails; DSS passes FC. The overall results are the same."
       },
       "signing-time/conformant": {
         "observed": [
@@ -411,10 +413,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "A DataObjectFormat qualifies a Reference inside the signed Manifest, whose URI (urn:lu.luxtrust.tspserviceprovider:files:pdf:fileName) names data the comparison supplies to neither validator. A Manifest's references are not part of core validation (XMLDSig 1.1 section 5.1), and xml-sec's B-B level takes a DataObjectFormat over data XMLDSig did not check as unbound (EN 319 132-1 V1.3.1 clause 5.2.4: it qualifies the data object of its reference), so format checking fails; DSS passes FC. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/empty.xml": {
@@ -1648,10 +1651,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. The overall results are the same."
       },
       "signing-time/extended": {
         "observed": [
@@ -1665,10 +1669,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. The overall results are the same."
       },
       "signing-time/conformant": {
         "observed": [
@@ -1682,10 +1687,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/OJ_L_2016_294_FULL.xml": {
@@ -1786,10 +1792,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/Signature-X-AT-1.xml": {
@@ -3668,10 +3675,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate, SignatureProductionPlace and SignerRole, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of their V2 forms. xml-sec's B-B level refuses them as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits all three (TS 101 903 V1.4.2 clauses 7.2.2, 7.2.7 and 7.2.8), and passes SAV. The overall results are the same."
       },
       "signing-time/extended": {
         "observed": [
@@ -3685,10 +3693,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate, SignatureProductionPlace and SignerRole, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of their V2 forms. xml-sec's B-B level refuses them as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits all three (TS 101 903 V1.4.2 clauses 7.2.2, 7.2.7 and 7.2.8), and passes SAV. The overall results are the same."
       },
       "signing-time/conformant": {
         "observed": [
@@ -3702,10 +3711,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate, SignatureProductionPlace and SignerRole, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of their V2 forms. xml-sec's B-B level refuses them as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits all three (TS 101 903 V1.4.2 clauses 7.2.2, 7.2.7 and 7.2.8), and passes SAV. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/Signature-X-UK_ELD-4.xml": {
@@ -4303,10 +4313,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. The overall results are the same."
       },
       "signing-time/extended": {
         "observed": [
@@ -4320,10 +4331,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. The overall results are the same."
       },
       "signing-time/conformant": {
         "observed": [
@@ -4337,10 +4349,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/dss-2293.xml": {
@@ -7410,53 +7423,56 @@
       "signing-time/strict": {
         "observed": [
           {
-            "FC": "PASSED/fail",
+            "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/pass",
             "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/fail",
-            "SAV": "PASSED/not-reached",
+            "SAV": "PASSED/fail",
             "TIMESTAMPS": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature's content timestamp has no ds:CanonicalizationMethod. The EN 319 132-1 V1.3.1 clause 6.3 (n) baseline requires the canonicalization method to be stated, and xml-sec's B-B level refuses its absence as a baseline requirement, which is signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS applies the default canonicalization of TS 101 903 V1.4.2 clause 7.1.4.3 and passes SAV. The overall results are the same."
       },
       "signing-time/extended": {
         "observed": [
           {
-            "FC": "PASSED/fail",
+            "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/pass",
             "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/fail",
-            "SAV": "PASSED/not-reached",
+            "SAV": "PASSED/fail",
             "TIMESTAMPS": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature's content timestamp has no ds:CanonicalizationMethod. The EN 319 132-1 V1.3.1 clause 6.3 (n) baseline requires the canonicalization method to be stated, and xml-sec's B-B level refuses its absence as a baseline requirement, which is signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS applies the default canonicalization of TS 101 903 V1.4.2 clause 7.1.4.3 and passes SAV. The overall results are the same."
       },
       "signing-time/conformant": {
         "observed": [
           {
-            "FC": "PASSED/fail",
+            "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/pass",
             "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/fail",
-            "SAV": "PASSED/not-reached",
+            "SAV": "PASSED/fail",
             "TIMESTAMPS": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/not-reached",
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature's content timestamp has no ds:CanonicalizationMethod. The EN 319 132-1 V1.3.1 clause 6.3 (n) baseline requires the canonicalization method to be stated, and xml-sec's B-B level refuses its absence as a baseline requirement, which is signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS applies the default canonicalization of TS 101 903 V1.4.2 clause 7.1.4.3 and passes SAV. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/dss2208/xades-tsts-empty-c14n.xml": {
@@ -7844,10 +7860,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "One SignatureTimeStamp carries three EncapsulatedTimeStamp tokens. EN 319 132-1 V1.3.1 clause 5.3 has a SignatureTimeStamp carry one time-stamp token (each further token is a further SignatureTimeStamp), so xml-sec's format check refuses the property; DSS reads the tokens and passes FC. The overall results are the same."
       },
       "signing-time/extended": {
         "observed": [
@@ -7861,10 +7878,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "One SignatureTimeStamp carries three EncapsulatedTimeStamp tokens. EN 319 132-1 V1.3.1 clause 5.3 has a SignatureTimeStamp carry one time-stamp token (each further token is a further SignatureTimeStamp), so xml-sec's format check refuses the property; DSS reads the tokens and passes FC. The overall results are the same."
       },
       "signing-time/conformant": {
         "observed": [
@@ -7878,10 +7896,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "One SignatureTimeStamp carries three EncapsulatedTimeStamp tokens. EN 319 132-1 V1.3.1 clause 5.3 has a SignatureTimeStamp carry one time-stamp token (each further token is a further SignatureTimeStamp), so xml-sec's format check refuses the property; DSS reads the tokens and passes FC. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/dss2329/xades-with-enveloped-manifest.xml": {
@@ -7948,10 +7967,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The DataObjectFormat qualifies the signed Manifest, whose own references name files (sample.png, sample.txt) the comparison supplies to neither validator. A Manifest's references are not part of core validation (XMLDSig 1.1 section 5.1), and xml-sec's B-B level takes a DataObjectFormat over data XMLDSig did not check as unbound (EN 319 132-1 V1.3.1 clause 5.2.4: it qualifies the data object of its reference), so format checking fails; DSS passes FC. The overall results are the same."
       },
       "signing-time/extended": {
         "observed": [
@@ -7965,10 +7985,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The DataObjectFormat qualifies the signed Manifest, whose own references name files (sample.png, sample.txt) the comparison supplies to neither validator. A Manifest's references are not part of core validation (XMLDSig 1.1 section 5.1), and xml-sec's B-B level takes a DataObjectFormat over data XMLDSig did not check as unbound (EN 319 132-1 V1.3.1 clause 5.2.4: it qualifies the data object of its reference), so format checking fails; DSS passes FC. The overall results are the same."
       },
       "signing-time/conformant": {
         "observed": [
@@ -7982,10 +8003,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The DataObjectFormat qualifies the signed Manifest, whose own references name files (sample.png, sample.txt) the comparison supplies to neither validator. A Manifest's references are not part of core validation (XMLDSig 1.1 section 5.1), and xml-sec's B-B level takes a DataObjectFormat over data XMLDSig did not check as unbound (EN 319 132-1 V1.3.1 clause 5.2.4: it qualifies the data object of its reference), so format checking fails; DSS passes FC. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/dss2329/xades-with-manifest-with-duplicated-reference.xml": {
@@ -8052,10 +8074,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The DataObjectFormat qualifies the signed Manifest, whose own references name data the comparison supplies to neither validator. A Manifest's references are not part of core validation (XMLDSig 1.1 section 5.1), and xml-sec's B-B level takes a DataObjectFormat over data XMLDSig did not check as unbound (EN 319 132-1 V1.3.1 clause 5.2.4: it qualifies the data object of its reference), so format checking fails; DSS passes FC. The overall results are the same."
       },
       "signing-time/extended": {
         "observed": [
@@ -8069,10 +8092,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The DataObjectFormat qualifies the signed Manifest, whose own references name data the comparison supplies to neither validator. A Manifest's references are not part of core validation (XMLDSig 1.1 section 5.1), and xml-sec's B-B level takes a DataObjectFormat over data XMLDSig did not check as unbound (EN 319 132-1 V1.3.1 clause 5.2.4: it qualifies the data object of its reference), so format checking fails; DSS passes FC. The overall results are the same."
       },
       "signing-time/conformant": {
         "observed": [
@@ -8086,10 +8110,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The DataObjectFormat qualifies the signed Manifest, whose own references name data the comparison supplies to neither validator. A Manifest's references are not part of core validation (XMLDSig 1.1 section 5.1), and xml-sec's B-B level takes a DataObjectFormat over data XMLDSig did not check as unbound (EN 319 132-1 V1.3.1 clause 5.2.4: it qualifies the data object of its reference), so format checking fails; DSS passes FC. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/dss2329/xades-with-manifest-with-object-reference.xml": {
@@ -8156,10 +8181,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The DataObjectFormat qualifies the signed Manifest, whose own references name data the comparison supplies to neither validator. A Manifest's references are not part of core validation (XMLDSig 1.1 section 5.1), and xml-sec's B-B level takes a DataObjectFormat over data XMLDSig did not check as unbound (EN 319 132-1 V1.3.1 clause 5.2.4: it qualifies the data object of its reference), so format checking fails; DSS passes FC. The overall results are the same."
       },
       "signing-time/extended": {
         "observed": [
@@ -8173,10 +8199,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The DataObjectFormat qualifies the signed Manifest, whose own references name data the comparison supplies to neither validator. A Manifest's references are not part of core validation (XMLDSig 1.1 section 5.1), and xml-sec's B-B level takes a DataObjectFormat over data XMLDSig did not check as unbound (EN 319 132-1 V1.3.1 clause 5.2.4: it qualifies the data object of its reference), so format checking fails; DSS passes FC. The overall results are the same."
       },
       "signing-time/conformant": {
         "observed": [
@@ -8190,10 +8217,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The DataObjectFormat qualifies the signed Manifest, whose own references name data the comparison supplies to neither validator. A Manifest's references are not part of core validation (XMLDSig 1.1 section 5.1), and xml-sec's B-B level takes a DataObjectFormat over data XMLDSig did not check as unbound (EN 319 132-1 V1.3.1 clause 5.2.4: it qualifies the data object of its reference), so format checking fails; DSS passes FC. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/dss2517/xades-dataobject-format-refer-nothing.xml": {
@@ -8260,10 +8288,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The DataObjectFormat's ObjectReference is #r-nothing, which names no ds:Reference of the signature. EN 319 132-1 V1.3.1 clause 5.2.4 requires it to reference the ds:Reference of the data object the property qualifies, so xml-sec's format check fails; DSS passes FC. The overall results are the same."
       },
       "signing-time/extended": {
         "observed": [
@@ -8277,10 +8306,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The DataObjectFormat's ObjectReference is #r-nothing, which names no ds:Reference of the signature. EN 319 132-1 V1.3.1 clause 5.2.4 requires it to reference the ds:Reference of the data object the property qualifies, so xml-sec's format check fails; DSS passes FC. The overall results are the same."
       },
       "signing-time/conformant": {
         "observed": [
@@ -8294,10 +8324,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The DataObjectFormat's ObjectReference is #r-nothing, which names no ds:Reference of the signature. EN 319 132-1 V1.3.1 clause 5.2.4 requires it to reference the ds:Reference of the data object the property qualifies, so xml-sec's format check fails; DSS passes FC. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/dss2517/xades-dataobjectformat-no-mandatory-attrs.xml": {
@@ -8355,53 +8386,56 @@
       "signing-time/strict": {
         "observed": [
           {
-            "FC": "PASSED/fail",
+            "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/pass",
             "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/fail",
-            "SAV": "PASSED/not-reached",
+            "SAV": "PASSED/fail",
             "TIMESTAMPS": "none/none",
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature's DataObjectFormat has no MimeType, which the EN 319 132-1 V1.3.1 clause 6.3 baseline requires (Table 2) although the base schema leaves it optional. xml-sec's B-B level refuses its absence as a baseline requirement, which is signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format and passes SAV. The overall results are the same."
       },
       "signing-time/extended": {
         "observed": [
           {
-            "FC": "PASSED/fail",
+            "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/pass",
             "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/fail",
-            "SAV": "PASSED/not-reached",
+            "SAV": "PASSED/fail",
             "TIMESTAMPS": "none/none",
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature's DataObjectFormat has no MimeType, which the EN 319 132-1 V1.3.1 clause 6.3 baseline requires (Table 2) although the base schema leaves it optional. xml-sec's B-B level refuses its absence as a baseline requirement, which is signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format and passes SAV. The overall results are the same."
       },
       "signing-time/conformant": {
         "observed": [
           {
-            "FC": "PASSED/fail",
+            "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/pass",
             "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/fail",
-            "SAV": "PASSED/not-reached",
+            "SAV": "PASSED/fail",
             "TIMESTAMPS": "none/none",
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature's DataObjectFormat has no MimeType, which the EN 319 132-1 V1.3.1 clause 6.3 baseline requires (Table 2) although the base schema leaves it optional. xml-sec's B-B level refuses its absence as a baseline requirement, which is signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format and passes SAV. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/dss2517/xades-dataobjectformat-no-mimetype.xml": {
@@ -8459,53 +8493,56 @@
       "signing-time/strict": {
         "observed": [
           {
-            "FC": "PASSED/fail",
+            "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/pass",
             "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/fail",
-            "SAV": "PASSED/not-reached",
+            "SAV": "PASSED/fail",
             "TIMESTAMPS": "none/none",
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature's DataObjectFormat has no MimeType, which the EN 319 132-1 V1.3.1 clause 6.3 baseline requires (Table 2) although the base schema leaves it optional. xml-sec's B-B level refuses its absence as a baseline requirement, which is signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format and passes SAV. The overall results are the same."
       },
       "signing-time/extended": {
         "observed": [
           {
-            "FC": "PASSED/fail",
+            "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/pass",
             "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/fail",
-            "SAV": "PASSED/not-reached",
+            "SAV": "PASSED/fail",
             "TIMESTAMPS": "none/none",
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature's DataObjectFormat has no MimeType, which the EN 319 132-1 V1.3.1 clause 6.3 baseline requires (Table 2) although the base schema leaves it optional. xml-sec's B-B level refuses its absence as a baseline requirement, which is signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format and passes SAV. The overall results are the same."
       },
       "signing-time/conformant": {
         "observed": [
           {
-            "FC": "PASSED/fail",
+            "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/pass",
             "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/fail",
-            "SAV": "PASSED/not-reached",
+            "SAV": "PASSED/fail",
             "TIMESTAMPS": "none/none",
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature's DataObjectFormat has no MimeType, which the EN 319 132-1 V1.3.1 clause 6.3 baseline requires (Table 2) although the base schema leaves it optional. xml-sec's B-B level refuses its absence as a baseline requirement, which is signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format and passes SAV. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/dss2517/xades-invalid-mime-type.xml": {
@@ -8557,10 +8594,11 @@
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": true,
         "dss_passed": true,
-        "indication": true
+        "indication": true,
+        "reason": "The DataObjectFormat states MimeType text/xml for a ds:Object whose MimeType attribute is text/plain. EN 319 132-1 V1.3.1 clause 5.2.4 requires a DataObjectFormat qualifying a ds:Object to carry the same values as its attributes, so xml-sec's format check fails; DSS passes FC. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/dss2517/xades-invalid-objectreference.xml": {
@@ -8627,10 +8665,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The DataObjectFormat's ObjectReference is r-sample.xml, a relative URI without a fragment: it names a resource outside the document rather than a ds:Reference of the signature (EN 319 132-1 V1.3.1 clause 5.2.4). xml-sec resolves it as the URI it is, which the profile refuses to fetch, so format checking fails; DSS passes FC. The overall results are the same."
       },
       "signing-time/extended": {
         "observed": [
@@ -8644,10 +8683,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The DataObjectFormat's ObjectReference is r-sample.xml, a relative URI without a fragment: it names a resource outside the document rather than a ds:Reference of the signature (EN 319 132-1 V1.3.1 clause 5.2.4). xml-sec resolves it as the URI it is, which the profile refuses to fetch, so format checking fails; DSS passes FC. The overall results are the same."
       },
       "signing-time/conformant": {
         "observed": [
@@ -8661,10 +8701,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The DataObjectFormat's ObjectReference is r-sample.xml, a relative URI without a fragment: it names a resource outside the document rather than a ds:Reference of the signature (EN 319 132-1 V1.3.1 clause 5.2.4). xml-sec resolves it as the URI it is, which the profile refuses to fetch, so format checking fails; DSS passes FC. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/dss2517/xades-invalid-reference.xml": {
@@ -8716,10 +8757,11 @@
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": true,
         "dss_passed": true,
-        "indication": true
+        "indication": true,
+        "reason": "The DataObjectFormat's ObjectReference is #null, which names no ds:Reference of the signature. EN 319 132-1 V1.3.1 clause 5.2.4 requires it to reference the ds:Reference of the data object the property qualifies, so xml-sec's format check fails; DSS passes FC. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/dss2517/xades-no-objectreference.xml": {
@@ -8786,10 +8828,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The DataObjectFormat has no ObjectReference attribute, which the XAdES schema makes required (EN 319 132-1 V1.3.1 clause 5.2.4 and Annex C), so xml-sec's format check fails; DSS passes FC. The overall results are the same."
       },
       "signing-time/extended": {
         "observed": [
@@ -8803,10 +8846,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The DataObjectFormat has no ObjectReference attribute, which the XAdES schema makes required (EN 319 132-1 V1.3.1 clause 5.2.4 and Annex C), so xml-sec's format check fails; DSS passes FC. The overall results are the same."
       },
       "signing-time/conformant": {
         "observed": [
@@ -8820,10 +8864,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The DataObjectFormat has no ObjectReference attribute, which the XAdES schema makes required (EN 319 132-1 V1.3.1 clause 5.2.4 and Annex C), so xml-sec's format check fails; DSS passes FC. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/dss2517/xades-valid-object.xml": {
@@ -8866,19 +8911,20 @@
       "instant/conformant": {
         "observed": [
           {
-            "FC": "PASSED/fail",
+            "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/pass",
             "XCV": "PASSED/pass",
-            "SAV": "PASSED/not-reached",
+            "SAV": "PASSED/fail",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": true,
         "dss_passed": true,
-        "indication": true
+        "indication": true,
+        "reason": "The signature's Reference to the document (URI=\"\") has no DataObjectFormat; only its Object reference has one. The EN 319 132-1 V1.3.1 clause 6.3 (k) baseline requires one for every signed data object, and xml-sec's B-B level refuses its absence as a baseline requirement, which is signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, where DataObjectFormat is optional (EN 319 132-1 clause 5.2.4), and passes SAV. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/dss2517/xades-valid-reference.xml": {
@@ -9000,10 +9046,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The DataObjectFormat is empty: it has no ObjectReference attribute, which the XAdES schema makes required (EN 319 132-1 V1.3.1 clause 5.2.4 and Annex C), so xml-sec's format check fails; DSS passes FC. The overall results are the same."
       },
       "signing-time/extended": {
         "observed": [
@@ -9017,10 +9064,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The DataObjectFormat is empty: it has no ObjectReference attribute, which the XAdES schema makes required (EN 319 132-1 V1.3.1 clause 5.2.4 and Annex C), so xml-sec's format check fails; DSS passes FC. The overall results are the same."
       },
       "signing-time/conformant": {
         "observed": [
@@ -9034,10 +9082,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The DataObjectFormat is empty: it has no ObjectReference attribute, which the XAdES schema makes required (EN 319 132-1 V1.3.1 clause 5.2.4 and Annex C), so xml-sec's format check fails; DSS passes FC. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/dss3732/xades-enveloped-arcTst132-no-objects.xml": {
@@ -9568,10 +9617,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. The overall results are the same."
       },
       "signing-time/extended": {
         "observed": [
@@ -9585,10 +9635,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. The overall results are the same."
       },
       "signing-time/conformant": {
         "observed": [
@@ -9602,10 +9653,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/dss3758/xades-bes-issuer-linebreaks-end.xml": {
@@ -9730,10 +9782,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. The overall results are the same."
       },
       "signing-time/extended": {
         "observed": [
@@ -9747,10 +9800,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. The overall results are the same."
       },
       "signing-time/conformant": {
         "observed": [
@@ -9764,10 +9818,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/dss3758/xades-bes-issuer-no-linebreaks.xml": {
@@ -11783,10 +11838,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The DataObjectFormat qualifies the signed Manifest, whose own references name files (sample.png, sample.txt, sample.xml) the comparison supplies to neither validator. A Manifest's references are not part of core validation (XMLDSig 1.1 section 5.1), and xml-sec's B-B level takes a DataObjectFormat over data XMLDSig did not check as unbound (EN 319 132-1 V1.3.1 clause 5.2.4: it qualifies the data object of its reference), so format checking fails; DSS passes FC. The overall results are the same."
       },
       "signing-time/extended": {
         "observed": [
@@ -11800,10 +11856,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The DataObjectFormat qualifies the signed Manifest, whose own references name files (sample.png, sample.txt, sample.xml) the comparison supplies to neither validator. A Manifest's references are not part of core validation (XMLDSig 1.1 section 5.1), and xml-sec's B-B level takes a DataObjectFormat over data XMLDSig did not check as unbound (EN 319 132-1 V1.3.1 clause 5.2.4: it qualifies the data object of its reference), so format checking fails; DSS passes FC. The overall results are the same."
       },
       "signing-time/conformant": {
         "observed": [
@@ -11817,10 +11874,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The DataObjectFormat qualifies the signed Manifest, whose own references name files (sample.png, sample.txt, sample.xml) the comparison supplies to neither validator. A Manifest's references are not part of core validation (XMLDSig 1.1 section 5.1), and xml-sec's B-B level takes a DataObjectFormat over data XMLDSig did not check as unbound (EN 319 132-1 V1.3.1 clause 5.2.4: it qualifies the data object of its reference), so format checking fails; DSS passes FC. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/evidence-record/X-E-ERS-basic-asn1.xml": {
@@ -15117,11 +15175,11 @@
       "instant/strict": {
         "observed": [
           {
-            "FC": "PASSED/fail",
+            "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/pass",
             "XCV": "PASSED/pass",
-            "SAV": "PASSED/not-reached",
+            "SAV": "PASSED/fail",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           },
@@ -15135,23 +15193,24 @@
             "OVERALL": "TOTAL_FAILED:HASH_FAILURE/TOTAL_FAILED:HASH_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
         "indication": true,
         "valid_until": [
           1820055894,
           null
-        ]
+        ],
+        "reason": "The countersigned signature's Reference to the document (URI=\"\") has no DataObjectFormat, which the EN 319 132-1 V1.3.1 clause 6.3 (k) baseline requires for every signed data object. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, where DataObjectFormat is optional (EN 319 132-1 clause 5.2.4), and passes SAV. The overall results of both signatures are the same."
       },
       "instant/extended": {
         "observed": [
           {
-            "FC": "PASSED/fail",
+            "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/pass",
             "XCV": "PASSED/pass",
-            "SAV": "PASSED/not-reached",
+            "SAV": "PASSED/fail",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           },
@@ -15165,23 +15224,24 @@
             "OVERALL": "TOTAL_FAILED:HASH_FAILURE/TOTAL_FAILED:HASH_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
         "indication": true,
         "valid_until": [
           1820055894,
           null
-        ]
+        ],
+        "reason": "The countersigned signature's Reference to the document (URI=\"\") has no DataObjectFormat, which the EN 319 132-1 V1.3.1 clause 6.3 (k) baseline requires for every signed data object. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, where DataObjectFormat is optional (EN 319 132-1 clause 5.2.4), and passes SAV. The overall results of both signatures are the same."
       },
       "instant/conformant": {
         "observed": [
           {
-            "FC": "PASSED/fail",
+            "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/pass",
             "XCV": "PASSED/pass",
-            "SAV": "PASSED/not-reached",
+            "SAV": "PASSED/fail",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           },
@@ -15195,21 +15255,22 @@
             "OVERALL": "TOTAL_FAILED:HASH_FAILURE/TOTAL_FAILED:HASH_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The countersigned signature's Reference to the document (URI=\"\") has no DataObjectFormat, which the EN 319 132-1 V1.3.1 clause 6.3 (k) baseline requires for every signed data object. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, where DataObjectFormat is optional (EN 319 132-1 clause 5.2.4), and passes SAV. The overall results of both signatures are the same."
       }
     },
     "dss-xades/src/test/resources/validation/xades-counter-signature-no-type.xml": {
       "instant/strict": {
         "observed": [
           {
-            "FC": "PASSED/fail",
+            "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/pass",
             "XCV": "PASSED/pass",
-            "SAV": "PASSED/not-reached",
+            "SAV": "PASSED/fail",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           },
@@ -15223,23 +15284,24 @@
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": true,
         "dss_passed": true,
         "indication": true,
         "valid_until": [
           1820055894,
           1820055894
-        ]
+        ],
+        "reason": "The countersigned signature's Reference to the document (URI=\"\") has no DataObjectFormat, which the EN 319 132-1 V1.3.1 clause 6.3 (k) baseline requires for every signed data object. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, where DataObjectFormat is optional (EN 319 132-1 clause 5.2.4), and passes SAV. The overall results of both signatures are the same."
       },
       "instant/extended": {
         "observed": [
           {
-            "FC": "PASSED/fail",
+            "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/pass",
             "XCV": "PASSED/pass",
-            "SAV": "PASSED/not-reached",
+            "SAV": "PASSED/fail",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           },
@@ -15253,23 +15315,24 @@
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": true,
         "dss_passed": true,
         "indication": true,
         "valid_until": [
           1820055894,
           1820055894
-        ]
+        ],
+        "reason": "The countersigned signature's Reference to the document (URI=\"\") has no DataObjectFormat, which the EN 319 132-1 V1.3.1 clause 6.3 (k) baseline requires for every signed data object. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, where DataObjectFormat is optional (EN 319 132-1 clause 5.2.4), and passes SAV. The overall results of both signatures are the same."
       },
       "instant/conformant": {
         "observed": [
           {
-            "FC": "PASSED/fail",
+            "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/pass",
             "XCV": "PASSED/pass",
-            "SAV": "PASSED/not-reached",
+            "SAV": "PASSED/fail",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           },
@@ -15283,21 +15346,22 @@
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": true,
         "dss_passed": true,
-        "indication": true
+        "indication": true,
+        "reason": "The countersigned signature's Reference to the document (URI=\"\") has no DataObjectFormat, which the EN 319 132-1 V1.3.1 clause 6.3 (k) baseline requires for every signed data object. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, where DataObjectFormat is optional (EN 319 132-1 clause 5.2.4), and passes SAV. The overall results of both signatures are the same."
       }
     },
     "dss-xades/src/test/resources/validation/xades-counter-signature-with-type-invalid.xml": {
       "instant/strict": {
         "observed": [
           {
-            "FC": "PASSED/fail",
+            "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/pass",
             "XCV": "PASSED/pass",
-            "SAV": "PASSED/not-reached",
+            "SAV": "PASSED/fail",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           },
@@ -15311,23 +15375,24 @@
             "OVERALL": "TOTAL_FAILED:HASH_FAILURE/TOTAL_FAILED:HASH_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
         "indication": true,
         "valid_until": [
           1820055894,
           null
-        ]
+        ],
+        "reason": "The countersigned signature's Reference to the document (URI=\"\") has no DataObjectFormat, which the EN 319 132-1 V1.3.1 clause 6.3 (k) baseline requires for every signed data object. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, where DataObjectFormat is optional (EN 319 132-1 clause 5.2.4), and passes SAV. The overall results of both signatures are the same."
       },
       "instant/extended": {
         "observed": [
           {
-            "FC": "PASSED/fail",
+            "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/pass",
             "XCV": "PASSED/pass",
-            "SAV": "PASSED/not-reached",
+            "SAV": "PASSED/fail",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           },
@@ -15341,23 +15406,24 @@
             "OVERALL": "TOTAL_FAILED:HASH_FAILURE/TOTAL_FAILED:HASH_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
         "indication": true,
         "valid_until": [
           1820055894,
           null
-        ]
+        ],
+        "reason": "The countersigned signature's Reference to the document (URI=\"\") has no DataObjectFormat, which the EN 319 132-1 V1.3.1 clause 6.3 (k) baseline requires for every signed data object. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, where DataObjectFormat is optional (EN 319 132-1 clause 5.2.4), and passes SAV. The overall results of both signatures are the same."
       },
       "instant/conformant": {
         "observed": [
           {
-            "FC": "PASSED/fail",
+            "FC": "PASSED/not-reached",
             "ISC": "PASSED/not-reached",
             "CV": "PASSED/pass",
             "XCV": "PASSED/pass",
-            "SAV": "PASSED/not-reached",
+            "SAV": "PASSED/fail",
             "TIMESTAMPS": "none/none",
             "OVERALL": "TOTAL_PASSED:-/TOTAL_PASSED:-"
           },
@@ -15371,10 +15437,11 @@
             "OVERALL": "TOTAL_FAILED:HASH_FAILURE/TOTAL_FAILED:HASH_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The countersigned signature's Reference to the document (URI=\"\") has no DataObjectFormat, which the EN 319 132-1 V1.3.1 clause 6.3 (k) baseline requires for every signed data object. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, where DataObjectFormat is optional (EN 319 132-1 clause 5.2.4), and passes SAV. The overall results of both signatures are the same."
       }
     },
     "dss-xades/src/test/resources/validation/xades-detached-with-object-type-ref.xml": {
@@ -16336,10 +16403,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries the reference-only unsigned properties CompleteCertificateRefsV2, SigAndRefsTimeStampV2 and RefsOnlyTimeStampV2, forms the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes as validation material (Table 2). xml-sec's B-B level refuses them as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits them (EN 319 132-2 Annex A), and passes SAV. The overall results are the same."
       },
       "signing-time/extended": {
         "observed": [
@@ -16353,10 +16421,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries the reference-only unsigned properties CompleteCertificateRefsV2, SigAndRefsTimeStampV2 and RefsOnlyTimeStampV2, forms the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes as validation material (Table 2). xml-sec's B-B level refuses them as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits them (EN 319 132-2 Annex A), and passes SAV. The overall results are the same."
       },
       "signing-time/conformant": {
         "observed": [
@@ -16370,10 +16439,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries the reference-only unsigned properties CompleteCertificateRefsV2, SigAndRefsTimeStampV2 and RefsOnlyTimeStampV2, forms the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes as validation material (Table 2). xml-sec's B-B level refuses them as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits them (EN 319 132-2 Annex A), and passes SAV. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/xades-lt-with-expired-ocsp-responder.xml": {
@@ -17513,10 +17583,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. The overall results are the same."
       },
       "signing-time/extended": {
         "observed": [
@@ -17530,10 +17601,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. The overall results are the same."
       },
       "signing-time/conformant": {
         "observed": [
@@ -17547,10 +17619,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes in favour of SigningCertificateV2. xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits SigningCertificate (TS 101 903 V1.4.2 clause 7.2.2), and passes SAV. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/xades-sign-cert-v2-wrong-digest.xml": {
@@ -17617,10 +17690,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The SigningCertificateV2 CertDigest's DigestValue is the text ..., which is not base64Binary, the type of ds:DigestValue (XMLDSig 1.1 section 4.4.3.3). xml-sec refuses the property as malformed, so format checking fails; DSS reads it as a digest that matches no certificate and passes FC. The overall results are the same."
       },
       "signing-time/extended": {
         "observed": [
@@ -17634,10 +17708,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The SigningCertificateV2 CertDigest's DigestValue is the text ..., which is not base64Binary, the type of ds:DigestValue (XMLDSig 1.1 section 4.4.3.3). xml-sec refuses the property as malformed, so format checking fails; DSS reads it as a digest that matches no certificate and passes FC. The overall results are the same."
       },
       "signing-time/conformant": {
         "observed": [
@@ -17651,10 +17726,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The SigningCertificateV2 CertDigest's DigestValue is the text ..., which is not base64Binary, the type of ds:DigestValue (XMLDSig 1.1 section 4.4.3.3). xml-sec refuses the property as malformed, so format checking fails; DSS reads it as a digest that matches no certificate and passes FC. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/xades-sign-cert-v2-wrong-issuer-serial.xml": {
@@ -17721,10 +17797,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The SigningCertificateV2 IssuerSerialV2 is the text ..., which is not base64Binary, its type (EN 319 132-1 V1.3.1 clause 5.2.2). xml-sec refuses the property as malformed, so format checking fails; DSS reads it as an issuer and serial that match no certificate and passes FC. The overall results are the same."
       },
       "signing-time/extended": {
         "observed": [
@@ -17738,10 +17815,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The SigningCertificateV2 IssuerSerialV2 is the text ..., which is not base64Binary, its type (EN 319 132-1 V1.3.1 clause 5.2.2). xml-sec refuses the property as malformed, so format checking fails; DSS reads it as an issuer and serial that match no certificate and passes FC. The overall results are the same."
       },
       "signing-time/conformant": {
         "observed": [
@@ -17755,10 +17833,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The SigningCertificateV2 IssuerSerialV2 is the text ..., which is not base64Binary, its type (EN 319 132-1 V1.3.1 clause 5.2.2). xml-sec refuses the property as malformed, so format checking fails; DSS reads it as an issuer and serial that match no certificate and passes FC. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/xades-t-copied-sigtst.xml": {
@@ -17929,10 +18008,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "One SignatureTimeStamp carries two EncapsulatedTimeStamp tokens. EN 319 132-1 V1.3.1 clause 5.3 has a SignatureTimeStamp carry one time-stamp token (each further token is a further SignatureTimeStamp), so xml-sec's format check refuses the property; DSS reads the tokens and passes FC. The overall results are the same."
       },
       "signing-time/extended": {
         "observed": [
@@ -17946,10 +18026,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "One SignatureTimeStamp carries two EncapsulatedTimeStamp tokens. EN 319 132-1 V1.3.1 clause 5.3 has a SignatureTimeStamp carry one time-stamp token (each further token is a further SignatureTimeStamp), so xml-sec's format check refuses the property; DSS reads the tokens and passes FC. The overall results are the same."
       },
       "signing-time/conformant": {
         "observed": [
@@ -17963,10 +18044,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "One SignatureTimeStamp carries two EncapsulatedTimeStamp tokens. EN 319 132-1 V1.3.1 clause 5.3 has a SignatureTimeStamp carry one time-stamp token (each further token is a further SignatureTimeStamp), so xml-sec's format check refuses the property; DSS reads the tokens and passes FC. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/xades-t-duplicated-sigtst.xml": {
@@ -19434,10 +19516,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries the reference-only unsigned property SigAndRefsTimeStamp of TS 101 903 v1.3.2, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes (Table 2). xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits it (TS 101 903 V1.4.2 clause 7.5.1), and passes SAV. The overall results are the same."
       },
       "signing-time/extended": {
         "observed": [
@@ -19451,10 +19534,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries the reference-only unsigned property SigAndRefsTimeStamp of TS 101 903 v1.3.2, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes (Table 2). xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits it (TS 101 903 V1.4.2 clause 7.5.1), and passes SAV. The overall results are the same."
       },
       "signing-time/conformant": {
         "observed": [
@@ -19468,10 +19552,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries the reference-only unsigned property SigAndRefsTimeStamp of TS 101 903 v1.3.2, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes (Table 2). xml-sec's B-B level refuses it as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits it (TS 101 903 V1.4.2 clause 7.5.1), and passes SAV. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/xades-x-level-v2.xml": {
@@ -19642,10 +19727,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate and the reference-only unsigned property CompleteCertificateRefs, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes (SigningCertificateV2 in place of the first; Table 2 for the other). xml-sec's B-B level refuses them as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits them (TS 101 903 V1.4.2 clauses 7.2.2 and 7.4.1), and passes SAV. The overall results are the same."
       },
       "signing-time/extended": {
         "observed": [
@@ -19659,10 +19745,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate and the reference-only unsigned property CompleteCertificateRefs, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes (SigningCertificateV2 in place of the first; Table 2 for the other). xml-sec's B-B level refuses them as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits them (TS 101 903 V1.4.2 clauses 7.2.2 and 7.4.1), and passes SAV. The overall results are the same."
       },
       "signing-time/conformant": {
         "observed": [
@@ -19676,10 +19763,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate and the reference-only unsigned property CompleteCertificateRefs, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes (SigningCertificateV2 in place of the first; Table 2 for the other). xml-sec's B-B level refuses them as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits them (TS 101 903 V1.4.2 clauses 7.2.2 and 7.4.1), and passes SAV. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/xades-x-level.xml": {
@@ -19746,10 +19834,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate and the reference-only unsigned properties CompleteCertificateRefs and SigAndRefsTimeStamp, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes (SigningCertificateV2 in place of the first; Table 2 for the others). xml-sec's B-B level refuses them as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits them (TS 101 903 V1.4.2 clauses 7.2.2, 7.4.1 and 7.5.1), and passes SAV. The overall results are the same."
       },
       "signing-time/extended": {
         "observed": [
@@ -19763,10 +19852,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate and the reference-only unsigned properties CompleteCertificateRefs and SigAndRefsTimeStamp, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes (SigningCertificateV2 in place of the first; Table 2 for the others). xml-sec's B-B level refuses them as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits them (TS 101 903 V1.4.2 clauses 7.2.2, 7.4.1 and 7.5.1), and passes SAV. The overall results are the same."
       },
       "signing-time/conformant": {
         "observed": [
@@ -19780,10 +19870,11 @@
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
-        "class": "unreviewed",
+        "class": "normative-difference",
         "passed": false,
         "dss_passed": false,
-        "indication": true
+        "indication": true,
+        "reason": "The signature carries SigningCertificate and the reference-only unsigned properties CompleteCertificateRefs and SigAndRefsTimeStamp, which the EN 319 132-1 V1.3.1 clause 6.3 baseline excludes (SigningCertificateV2 in place of the first; Table 2 for the others). xml-sec's B-B level refuses them as a baseline requirement, and a profile's requirements are signature acceptance (EN 319 102-1 V1.4.1 clause 5.2.2 NOTE, clause 5.2.8); DSS checks the XAdES format, whose schema admits them (TS 101 903 V1.4.2 clauses 7.2.2, 7.4.1 and 7.5.1), and passes SAV. The overall results are the same."
       }
     },
     "dss-xades/src/test/resources/validation/xmldsig-only.xml": {

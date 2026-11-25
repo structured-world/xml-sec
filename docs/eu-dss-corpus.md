@@ -12,14 +12,14 @@ For every signature xml-sec passes, the expectations record until when it keeps 
 
 | Profile | Inputs | DSS passes | xml-sec passes | Same indication | Agreement | Classes |
 | --- | --- | --- | --- | --- | --- | --- |
-| `xades` | 250 | 34 | 7 | 165 | 110 | agreement 110, dss-deviation 29, no-usable-anchor 7, normative-difference 8, not-a-signature 52, policy-refusal 34, unreviewed 8, unsupported 2 |
-| `xades-extended` | 250 | 34 | 9 | 167 | 112 | agreement 112, dss-deviation 29, no-usable-anchor 7, normative-difference 8, not-a-signature 52, policy-refusal 32, unreviewed 8, unsupported 2 |
-| `xades-conformant` | 250 | 37 | 36 | 192 | 126 | agreement 126, dss-deviation 29, no-usable-anchor 7, normative-difference 21, not-a-signature 52, policy-refusal 2, unreviewed 11, unsupported 2 |
+| `xades` | 250 | 34 | 7 | 165 | 110 | agreement 110, dss-deviation 29, no-usable-anchor 7, normative-difference 11, not-a-signature 52, policy-refusal 34, unreviewed 5, unsupported 2 |
+| `xades-extended` | 250 | 34 | 9 | 167 | 112 | agreement 112, dss-deviation 29, no-usable-anchor 7, normative-difference 11, not-a-signature 52, policy-refusal 32, unreviewed 5, unsupported 2 |
+| `xades-conformant` | 250 | 37 | 36 | 192 | 126 | agreement 126, dss-deviation 29, no-usable-anchor 7, normative-difference 27, not-a-signature 52, policy-refusal 2, unreviewed 5, unsupported 2 |
 
 ## Pass `signing-time`
 
 | Profile | Inputs | DSS passes | xml-sec passes | Same indication | Agreement | Classes |
 | --- | --- | --- | --- | --- | --- | --- |
-| `xades` | 153 | 27 | 3 | 124 | 69 | agreement 69, dss-deviation 9, no-usable-anchor 5, normative-difference 13, policy-refusal 2, unreviewed 53, unsupported 2 |
-| `xades-extended` | 153 | 27 | 3 | 124 | 69 | agreement 69, dss-deviation 9, no-usable-anchor 5, normative-difference 13, policy-refusal 2, unreviewed 53, unsupported 2 |
-| `xades-conformant` | 153 | 29 | 4 | 123 | 67 | agreement 67, dss-deviation 9, no-usable-anchor 5, normative-difference 13, policy-refusal 2, unreviewed 55, unsupported 2 |
+| `xades` | 153 | 27 | 3 | 124 | 69 | agreement 69, dss-deviation 9, no-usable-anchor 5, normative-difference 39, policy-refusal 2, unreviewed 27, unsupported 2 |
+| `xades-extended` | 153 | 27 | 3 | 124 | 69 | agreement 69, dss-deviation 9, no-usable-anchor 5, normative-difference 39, policy-refusal 2, unreviewed 27, unsupported 2 |
+| `xades-conformant` | 153 | 29 | 4 | 123 | 67 | agreement 67, dss-deviation 9, no-usable-anchor 5, normative-difference 40, policy-refusal 2, unreviewed 28, unsupported 2 |
