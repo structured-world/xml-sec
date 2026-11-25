@@ -81,12 +81,16 @@ impl RsaPssPermission {
         let SignatureAlgorithm::RsaPss(parameters) = algorithm else {
             return false;
         };
+        // A digest that needs its own permission (MD5, RIPEMD-160, GOST,
+        // DSTU) is outside every graded grant, so each grant contains the
+        // one below it and composition keeps the narrower.
+        let explicit = [parameters.digest, parameters.mgf_digest]
+            .into_iter()
+            .any(DigestAlgorithm::requires_explicit_permission);
         match self {
             Self::ExactOnly => false,
-            Self::SecureSupported => algorithm.signing_allowed(),
-            Self::Sha1Supported => [parameters.digest, parameters.mgf_digest]
-                .into_iter()
-                .all(|digest| !digest.requires_explicit_permission()),
+            Self::SecureSupported => !explicit && algorithm.signing_allowed(),
+            Self::Sha1Supported => !explicit,
             Self::AllSupported => true,
         }
     }

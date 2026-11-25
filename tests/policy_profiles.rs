@@ -1903,6 +1903,30 @@ fn the_conformant_profile_admits_rsa_pss_down_to_sha1_only() {
 }
 
 #[test]
+#[cfg(feature = "dstu4145")]
+fn no_rsa_pss_family_grant_admits_a_digest_that_needs_its_own_permission() {
+    // GOST 34.311 and DSTU 7564 need an explicit digest permission; neither
+    // the secure nor the SHA-1 RSA-PSS family grant may admit them, so the
+    // grants stay ordered SecureSupported < Sha1Supported under composition.
+    use xml_sec::xmldsig::{DigestAlgorithm, RsaPssParameters};
+    for profile in [PolicyProfile::Modern, PolicyProfile::XadesConformant] {
+        let compiled = compiler(profile).compile(&context()).unwrap();
+        let verification = compiled.verification().unwrap();
+        for digest in [DigestAlgorithm::Gost34311, DigestAlgorithm::Dstu7564_256] {
+            let method = SignatureAlgorithm::RsaPss(RsaPssParameters {
+                digest,
+                mgf_digest: digest,
+                salt_len: 32,
+            });
+            assert!(
+                verification.check_signature_algorithm(method).is_err(),
+                "{profile:?} {digest:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn a_denial_never_grants_and_reaches_absent_allowlists() {
     // Denying what a profile already refuses changes nothing. A profile that
     // admits every implemented transform (no allowlist) still loses exactly
