@@ -12,9 +12,9 @@ For every signature xml-sec passes, the expectations record until when it keeps 
 
 | Profile | Inputs | DSS passes | xml-sec passes | Same indication | Agreement | Classes |
 | --- | --- | --- | --- | --- | --- | --- |
-| `xades` | 250 | 38 | 7 | 162 | 95 | agreement 95, dss-deviation 30, no-usable-anchor 7, normative-difference 25, not-a-signature 52, policy-refusal 38, unsupported 3 |
-| `xades-extended` | 250 | 38 | 9 | 164 | 97 | agreement 97, dss-deviation 30, no-usable-anchor 7, normative-difference 25, not-a-signature 52, policy-refusal 36, unsupported 3 |
-| `xades-conformant` | 250 | 41 | 39 | 192 | 112 | agreement 112, dss-deviation 30, no-usable-anchor 7, normative-difference 43, not-a-signature 52, policy-refusal 3, unsupported 3 |
+| `xades` | 250 | 38 | 7 | 162 | 95 | agreement 95, dss-deviation 31, no-usable-anchor 7, normative-difference 24, not-a-signature 52, policy-refusal 38, unsupported 3 |
+| `xades-extended` | 250 | 38 | 9 | 164 | 97 | agreement 97, dss-deviation 31, no-usable-anchor 7, normative-difference 24, not-a-signature 52, policy-refusal 36, unsupported 3 |
+| `xades-conformant` | 250 | 41 | 39 | 192 | 112 | agreement 112, dss-deviation 31, no-usable-anchor 7, normative-difference 42, not-a-signature 52, policy-refusal 3, unsupported 3 |
 
 ## Pass `signing-time`
 

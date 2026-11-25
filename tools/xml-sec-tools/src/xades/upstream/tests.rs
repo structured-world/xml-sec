@@ -583,6 +583,31 @@ fn review(class: &str, reason: &str) -> Value {
 }
 
 #[test]
+fn a_run_may_observe_any_variant_its_review_approves() {
+    // DSS concludes the X.509 block of EU DSS OJ_C_2017_173_FULL as
+    // OUT_OF_BOUNDS_NO_POE in one process and OUT_OF_BOUNDS_NOT_REVOKED in
+    // another. A review that approves both makes either one the recorded
+    // difference; an observation no review approves still fails the check.
+    let summary = unreviewed_summary();
+    let first = summary["cases"]["a.xml"]["instant/strict"]["observed"].clone();
+    let other =
+        json!([{ "XCV": "OTHER/pass", "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:TRY_LATER" }]);
+    let mut reviews = review("dss-deviation", "DSS varies between runs");
+    reviews["a.xml"][0]["observed"] = json!([first, other]);
+    let recorded = super::recorded(&summary, &reviews);
+    let mut varied = summary.clone();
+    varied["cases"]["a.xml"]["instant/strict"]["observed"] = other;
+    assert_eq!(
+        differences(&recorded, &varied, &reviews),
+        Vec::<String>::new()
+    );
+    let mut unapproved = summary.clone();
+    unapproved["cases"]["a.xml"]["instant/strict"]["observed"] =
+        json!([{ "XCV": "THIRD/pass", "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:TRY_LATER" }]);
+    assert_eq!(differences(&recorded, &unapproved, &reviews).len(), 1);
+}
+
+#[test]
 fn a_review_approves_only_the_block_results_it_lists() {
     // A review explains a difference block by block; the same overall pair
     // over other block results is a difference it never covered, and stays

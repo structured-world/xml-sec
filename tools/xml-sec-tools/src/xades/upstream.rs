@@ -945,24 +945,12 @@ impl Pass<'_> {
                 super::write(&directory_of_profile.join("facts.json"), facts)?;
             }
         }
-        super::write(
-            &logs.join(format!("{}-manifest.tsv", self.label)),
-            manifests.concat(),
+        let file = logs.join(format!("{}-manifest.tsv", self.label));
+        super::write(&file, manifests.concat())?;
+        self.corpus.require(
+            &super::dss::java(self.classpath, "CorpusProbe", &[&file]),
+            &logs.join(format!("{}-dss", self.label)),
         )?;
-        // Each case in a JVM of its own: DSS's result for one document
-        // depends on what the same JVM validated before it (EU DSS
-        // OJ_C_2017_173_FULL reports OUT_OF_BOUNDS_NOT_REVOKED alone and
-        // OUT_OF_BOUNDS_NO_POE after the rest of the corpus), so a shared JVM
-        // would make each comparison depend on the others and on the host.
-        for (((_, _, directory, _), _), manifest) in cases.iter().zip(manifests) {
-            let output = directory.join(self.label);
-            let file = output.join("manifest.tsv");
-            super::write(&file, manifest)?;
-            self.corpus.require(
-                &super::dss::java(self.classpath, "CorpusProbe", &[&file]),
-                &output.join("dss-run"),
-            )?;
-        }
         Ok(())
     }
 }
@@ -1683,7 +1671,16 @@ pub(crate) fn differences(expected: &Value, summary: &Value, reviews: &Value) ->
                 found.push(format!("{name} {label}: not in the expectations"));
                 continue;
             }
-            if entry["observed"] != pass["observed"] {
+            // A review may approve several observations of one difference,
+            // where DSS itself concludes a block differently from run to run
+            // on the same input: the recorded one and another that review
+            // approves are the same reviewed difference.
+            let same_review = || {
+                review_for(reviews, name, &pass["observed"]).is_some_and(|review| {
+                    review_for(reviews, name, &entry["observed"]) == Some(review)
+                })
+            };
+            if entry["observed"] != pass["observed"] && !same_review() {
                 found.push(format!(
                     "{name} {label}: observed {} where {} is expected",
                     pass["observed"], entry["observed"]

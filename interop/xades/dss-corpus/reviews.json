@@ -3182,10 +3182,21 @@
             "TIMESTAMPS": "INDETERMINATE:CRYPTO_CONSTRAINTS_FAILURE_NO_POE/not-reached",
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
+        ],
+        [
+          {
+            "FC": "PASSED/not-reached",
+            "ISC": "PASSED/not-reached",
+            "CV": "PASSED/not-reached",
+            "XCV": "INDETERMINATE:OUT_OF_BOUNDS_NOT_REVOKED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "SAV": "PASSED/not-reached",
+            "TIMESTAMPS": "INDETERMINATE:CRYPTO_CONSTRAINTS_FAILURE_NO_POE/not-reached",
+            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
+          }
         ]
       ],
-      "class": "normative-difference",
-      "reason": "The document carries no revocation status for the intermediate CA. EN 319 102-1 V1.4.1 section 5.2.6.4 establishes each chain member's status in step 4 before it checks the signing certificate's validity in step 7, so xml-sec's X.509 block ends at step 4 e) with CERTIFICATE_CHAIN_GENERAL_FAILURE. DSS's default policy takes a CA without revocation data as a warning there, so its X.509 block goes on to the signing certificate's expiry at the fixed instant, OUT_OF_BOUNDS_NO_POE (step 7), and only its overall result reaches CERTIFICATE_CHAIN_GENERAL_FAILURE, as xml-sec's does."
+      "class": "dss-deviation",
+      "reason": "The document carries no revocation status for the intermediate CA. EN 319 102-1 V1.4.1 section 5.2.6.4 establishes each chain member's status in step 4 before it checks the signing certificate's validity in step 7, so xml-sec's X.509 block ends at step 4 e) with CERTIFICATE_CHAIN_GENERAL_FAILURE. DSS's default policy takes a CA without revocation data as a warning there and goes on to the signing certificate's expiry at the fixed instant (step 7); only its overall result reaches CERTIFICATE_CHAIN_GENERAL_FAILURE, as xml-sec's does. At step 7 DSS is not deterministic on this input: of the two OCSP responses the document carries for the signer, both issued on 2017-06-01, which one it takes as the latest acceptable varies between processes over the same bytes, so its X.509 block reports OUT_OF_BOUNDS_NO_POE in one run and OUT_OF_BOUNDS_NOT_REVOKED in another. NOT_REVOKED is wrong: NOTE 8 grants it only on a status issued after the certificate's expiry, and the certificate expires on 2019-06-09."
     }
   ],
   "dss-xades/src/test/resources/validation/OJ_L_2016_294_FULL.xml": [
