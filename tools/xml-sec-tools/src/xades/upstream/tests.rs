@@ -1002,26 +1002,6 @@ fn a_review_moves_onto_the_new_form_of_the_comparison_it_explained() {
 }
 
 #[test]
-fn every_dss_run_takes_the_same_time_zone() {
-    // DSS's choice of the latest acceptable revocation data follows the
-    // JVM's default time zone: OJ_C_2017_173_FULL concludes differently under
-    // EET and UTC, so a run must not inherit the host's zone.
-    let command = crate::xades::dss::java("cp", "CorpusProbe", &[&"manifest.tsv"]);
-    let words: Vec<&str> = command.iter().filter_map(|word| word.to_str()).collect();
-    assert_eq!(
-        words,
-        [
-            "java",
-            "-Duser.timezone=UTC",
-            "-cp",
-            "cp",
-            "CorpusProbe",
-            "manifest.tsv"
-        ]
-    );
-}
-
-#[test]
 fn the_inputs_are_the_regular_files_of_the_release_tree() {
     // The tree of the verified commit names the inputs: a file the work tree
     // adds (ignored, so `git status` is silent) is never listed, and a

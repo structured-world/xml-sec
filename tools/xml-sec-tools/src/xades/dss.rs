@@ -334,17 +334,13 @@ pub(crate) fn build(corpus: &Corpus, logs: &Path) -> Result<Built, String> {
 }
 
 /// The command that runs the DSS probe `class` on `classpath` with
-/// `arguments`. The JVM runs in UTC, the zone every corpus time is written
-/// in: DSS's choice of the latest acceptable revocation data depends on the
-/// JVM's default time zone, so the host's zone would change its validation
-/// result (EU DSS `OJ_C_2017_173_FULL` gives `OUT_OF_BOUNDS_NO_POE` under EET
-/// and `OUT_OF_BOUNDS_NOT_REVOKED` under UTC).
+/// `arguments`.
 pub(crate) fn java(
     classpath: &str,
     class: &str,
     arguments: &[&dyn AsRef<std::ffi::OsStr>],
 ) -> Vec<std::ffi::OsString> {
-    let mut command = line(&[&"java", &"-Duser.timezone=UTC", &"-cp", &classpath, &class]);
+    let mut command = line(&[&"java", &"-cp", &classpath, &class]);
     command.extend(
         arguments
             .iter()

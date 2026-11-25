@@ -890,9 +890,10 @@ impl Pass<'_> {
         use std::fmt::Write as _;
         // Every line first, so a field the manifest cannot carry stops the
         // pass before either validator runs.
-        let mut manifest = String::new();
+        let mut manifests = Vec::with_capacity(cases.len());
         for ((name, input, directory, at), profiles) in cases {
             let output = directory.join(self.label);
+            let mut manifest = String::new();
             write!(
                 manifest,
                 "{}\t{}\t{at}\t{}",
@@ -911,6 +912,7 @@ impl Pass<'_> {
                 .map_err(|error| error.to_string())?;
             }
             manifest.push('\n');
+            manifests.push(manifest);
         }
         for ((_, input, directory, at), profiles) in cases {
             let output = directory.join(self.label);
@@ -943,12 +945,24 @@ impl Pass<'_> {
                 super::write(&directory_of_profile.join("facts.json"), facts)?;
             }
         }
-        let file = logs.join(format!("{}-manifest.tsv", self.label));
-        super::write(&file, manifest)?;
-        self.corpus.require(
-            &super::dss::java(self.classpath, "CorpusProbe", &[&file]),
-            &logs.join(format!("{}-dss", self.label)),
+        super::write(
+            &logs.join(format!("{}-manifest.tsv", self.label)),
+            manifests.concat(),
         )?;
+        // Each case in a JVM of its own: DSS's result for one document
+        // depends on what the same JVM validated before it (EU DSS
+        // OJ_C_2017_173_FULL reports OUT_OF_BOUNDS_NOT_REVOKED alone and
+        // OUT_OF_BOUNDS_NO_POE after the rest of the corpus), so a shared JVM
+        // would make each comparison depend on the others and on the host.
+        for (((_, _, directory, _), _), manifest) in cases.iter().zip(manifests) {
+            let output = directory.join(self.label);
+            let file = output.join("manifest.tsv");
+            super::write(&file, manifest)?;
+            self.corpus.require(
+                &super::dss::java(self.classpath, "CorpusProbe", &[&file]),
+                &output.join("dss-run"),
+            )?;
+        }
         Ok(())
     }
 }
