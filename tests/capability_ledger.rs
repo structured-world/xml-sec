@@ -178,7 +178,7 @@ fn complete_surface_categories_are_stable() {
             ("header", 59),
             ("internal-export", 70),
             ("key-format", 11),
-            ("macro", 1_669),
+            ("macro", 1_678),
             ("registry", 15),
             ("struct-layout", 25),
             ("test-family", 29),

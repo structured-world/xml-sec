@@ -270,7 +270,7 @@ fn report_final_failure(here: errors::Here, encode: bool, error: Base64Error, ou
             std::ptr::null(),
             std::ptr::null(),
             errors::R_INVALID_SIZE,
-            "invalid size: invalid base64 buffer size",
+            "invalid size: output base64 buffer size is too small",
         );
     }
     errors::internal_with(

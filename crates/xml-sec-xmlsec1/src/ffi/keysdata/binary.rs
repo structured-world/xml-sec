@@ -409,9 +409,9 @@ pub(crate) unsafe extern "C" fn value_xml_write(
             zeroize::Zeroize::zeroize(std::slice::from_raw_parts_mut(text, length));
             free(text.cast());
             if !set {
-                errors::xml_failed(
+                errors::xml_failed_at(
                     here!("xmlSecKeyDataBinaryValueXmlWrite"),
-                    klass_name(id),
+                    node,
                     c"xmlNodeSetContent",
                 );
                 return -1;
@@ -437,13 +437,19 @@ pub(crate) unsafe extern "C" fn value_bin_read(
     let (key, ctx) = (key.cast::<XmlSecKey>(), ctx.cast::<XmlSecKeyInfoCtx>());
     contain(-1, || {
         method_arguments!("xmlSecKeyDataBinaryValueBinRead", id, key);
-        check!(
-            // SAFETY: a key.
-            unsafe { xmlSecKeyGetValue(key) }.is_null(),
-            "xmlSecKeyDataBinaryValueBinRead",
-            c"xmlSecKeyGetValue(key) == NULL",
-            -1
-        );
+        // A key that already holds a value is the caller's error, which
+        // libxmlsec1 reports as such rather than as a broken assertion.
+        // SAFETY: a key.
+        if unsafe { !xmlSecKeyGetValue(key).is_null() } {
+            errors::other(
+                here!("xmlSecKeyDataBinaryValueBinRead"),
+                errors::R_INVALID_KEY_DATA,
+                // SAFETY: a klass, checked above.
+                unsafe { (*id).name.cast() },
+                Some("key already has a value"),
+            );
+            return -1;
+        }
         check!(
             !buf.is_null(),
             "xmlSecKeyDataBinaryValueBinRead",

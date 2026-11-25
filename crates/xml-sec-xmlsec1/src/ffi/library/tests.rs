@@ -160,6 +160,29 @@ fn default_crypto_loads_the_builtin_table() {
     }
 }
 
+/// Before the library list is initialized, looking a library up or unloading
+/// one fails with libxmlsec1's single "not initialized" report rather than
+/// a failed list check followed by a library created into no list.
+#[test]
+fn crypto_library_calls_before_init_report_not_initialized() {
+    own_process();
+    // SAFETY: the callback has the callback's signature; nothing else runs.
+    unsafe {
+        xmlSecErrorsSetCallback(Some(record as ErrorsCallback));
+        take();
+        let name = xmlSecGetDefaultCrypto();
+        assert!(crate::ffi::crypto::xmlSecCryptoDLGetLibraryFunctions(name).is_null());
+        assert_eq!(crate::ffi::crypto::xmlSecCryptoDLUnloadLibrary(name), -1);
+    }
+    assert_eq!(
+        take(),
+        [
+            ("xmlSecCryptoDLGetLibraryFunctions".to_owned(), 1),
+            ("xmlSecCryptoDLUnloadLibrary".to_owned(), 1),
+        ]
+    );
+}
+
 /// How many reports the reentering callback has handled.
 static DEPTH: Mutex<u32> = Mutex::new(0);
 

@@ -11,7 +11,7 @@ use super::{
     DigestAlgorithm, KemContentAuthentication, KemSignatureTrust, KeyAgreementAlgorithm,
     KeyDerivationAlgorithm, KeyEstablishmentPolicy, KeySourceKind, KeySourcePolicy,
     PolicyViolation, RelationshipTargetModeSemantics, RequestSelections, RsaPssPermission,
-    SameDocumentIdSemantics, SignatureAlgorithm, SigningPolicy, TransformPolicy,
+    SameDocumentIdSemantics, SignatureAlgorithm, SigningPolicy, TransformPolicy, TrustAnchorSigner,
     UnknownX509CertificateSemantics, UriPolicy, UriTypeSet, VerificationPolicy,
     XsltStylesheetSemantics,
 };
@@ -20,6 +20,9 @@ use alloc::{borrow::ToOwned, collections::BTreeSet, string::String, sync::Arc};
 
 mod composition;
 mod constraints;
+mod denials;
+
+pub use denials::Denials;
 
 /// XML Security presets, selected only by trusted application code.
 /// These names do not certify full SAML, SOAP or `XAdES` conformance.
@@ -35,6 +38,16 @@ pub enum PolicyProfile {
     WsSecurity,
     /// XML signatures with authenticated, typed `SignedProperties` references.
     Xades,
+    /// [`Self::Xades`] that also verifies and signs references selected by the
+    /// `XPath` and `XPath` Filter 2.0 transforms, whose coverage stays
+    /// transformed data rather than a proven element.
+    XadesExtended,
+    /// [`Self::XadesExtended`] that verifies every signature ETSI EN 319 132-1
+    /// and `XMLDSig` 1.1 define: SHA-1 based signatures and digests, RSA and
+    /// DSA keys from 1024 bits and `KeyValue` keys. A weak algorithm is a fact
+    /// for the caller's acceptability assessment, not a refusal; signing stays
+    /// modern. No libxmlsec1 interpretation and no XSLT.
+    XadesConformant,
     /// Compatibility verification only, requiring expiring authorization.
     LegacyVerify,
 }
@@ -402,11 +415,23 @@ fn profile_policies(
     let constraints = match profile {
         PolicyProfile::SecureSaml => SignatureConstraints::Saml,
         PolicyProfile::WsSecurity => SignatureConstraints::WsSecurity,
-        PolicyProfile::Xades => SignatureConstraints::Xades,
+        PolicyProfile::Xades | PolicyProfile::XadesExtended | PolicyProfile::XadesConformant => {
+            SignatureConstraints::Xades
+        }
         _ => SignatureConstraints::General,
     };
-    let (verification, transforms) =
-        verification_profile(provider, compatibility, constraints, validity.as_ref());
+    let breadth = match profile {
+        PolicyProfile::XadesExtended => Breadth::Extended,
+        PolicyProfile::XadesConformant => Breadth::Conformant,
+        _ => Breadth::Strict,
+    };
+    let (verification, transforms) = verification_profile(
+        provider,
+        compatibility,
+        constraints,
+        breadth,
+        validity.as_ref(),
+    );
     let legacy = profile == PolicyProfile::LegacyVerify;
     #[cfg(feature = "xmlenc")]
     let encryption = (!legacy).then(|| encryption_profile(provider, validity.clone()));
@@ -445,17 +470,46 @@ fn profile_policies(
     }
 }
 
+/// How far a modern profile reaches beyond its strict permissions. Each step
+/// only adds values of existing policy fields, so the narrower profile is the
+/// wider one restricted by the narrower one's policies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Breadth {
+    /// Enveloped-signature, Base64 and canonicalization transforms; modern
+    /// algorithms and key sizes.
+    Strict,
+    /// Strict plus the `XPath` and `XPath` Filter 2.0 transforms.
+    Extended,
+    /// Extended plus verification of SHA-1 based signatures and digests,
+    /// 1024-bit RSA and DSA keys and `KeyValue` keys.
+    Conformant,
+}
+
+/// The asymmetric SHA-1 signature methods `XMLDSig` 1.1 (§6.4) and RFC 9231
+/// define, which [`Breadth::Conformant`] verifies; HMAC-SHA1 stays below the
+/// profile's HMAC minimum.
+/// <https://www.w3.org/TR/xmldsig-core1/#sec-SignatureAlg>
+const SHA1_SIGNATURES: [SignatureAlgorithm; 4] = [
+    SignatureAlgorithm::RsaSha1,
+    SignatureAlgorithm::DsaSha1,
+    SignatureAlgorithm::EcdsaSha1,
+    SignatureAlgorithm::RsaPssSha1,
+];
+
 fn verification_profile(
     provider: &dyn CryptoProvider,
     compatibility: bool,
     constraints: SignatureConstraints,
+    breadth: Breadth,
     validity: Option<&PolicyValidity>,
 ) -> (VerificationPolicy, TransformPolicy) {
+    let conformant = breadth == Breadth::Conformant;
     let signatures: BTreeSet<_> = SignatureAlgorithm::ALL
         .into_iter()
         .filter(|a| provider.supports(ProviderCapability::Verify(*a)))
         .filter(|a| {
             compatibility
+                || (conformant && SHA1_SIGNATURES.contains(a))
                 || (a.signing_allowed() && a.hmac_output_bits().is_none_or(|bits| bits >= 256))
         })
         .filter(|a| !matches!(a, SignatureAlgorithm::PostQuantum(_)))
@@ -463,15 +517,23 @@ fn verification_profile(
     let digests: BTreeSet<_> = DigestAlgorithm::ALL
         .into_iter()
         .filter(|a| provider.supports(ProviderCapability::Digest(*a)))
-        .filter(|a| compatibility || (a.signing_allowed() && a.output_len() >= 32))
+        .filter(|a| {
+            compatibility
+                || (conformant && !a.requires_explicit_permission())
+                || (a.signing_allowed() && a.output_len() >= 32)
+        })
         .collect();
-    let transforms = profile_transforms(compatibility);
+    let transforms = profile_transforms(compatibility, breadth);
     let mut verification = VerificationPolicy {
         validity: validity.cloned(),
         signature_constraints: constraints,
         signature_algorithms: Some(signatures),
+        // The conformant additions are SHA-1 signatures, so its family grant
+        // stops at SHA-1; MD5 and RIPEMD-160 keep their own permission.
         parameterized_rsa_pss: if compatibility {
             RsaPssPermission::AllSupported
+        } else if conformant {
+            RsaPssPermission::Sha1Supported
         } else {
             RsaPssPermission::SecureSupported
         },
@@ -480,6 +542,19 @@ fn verification_profile(
         ..VerificationPolicy::default()
     };
     verification.key_trust.parameterized_rsa_pss = verification.parameterized_rsa_pss;
+    if conformant {
+        verification.key_trust.allowed_legacy_signature_algorithms = verification
+            .signature_algorithms
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|a| SHA1_SIGNATURES.contains(a))
+            .collect();
+        verification.key_trust.rsa_keys.minimum_modulus_bits = 1024;
+        verification.key_trust.dsa_keys.minimum_modulus_bits = 1024;
+        // ETSI EN 319 102-1 V1.4.1 5.2.6.4 step 1(b), as EU DSS applies it.
+        verification.key_trust.trust_anchor_signer = TrustAnchorSigner::Accepted;
+    }
     if compatibility {
         verification.key_trust.allowed_legacy_signature_algorithms = verification
             .signature_algorithms
@@ -504,6 +579,11 @@ fn verification_profile(
             KeySourceKind::KeyName,
             KeySourceKind::X509Data,
         ]);
+        // XMLDSig 1.1 §4.5.2 lets KeyValue carry the verification key; a key
+        // read there is trusted only as the key resolver decides.
+        if conformant {
+            verification.key_sources.insert(KeySourceKind::KeyValue);
+        }
     }
     if constraints == SignatureConstraints::Saml {
         verification.uris.references = UriTypeSet::new(false, true, false);
@@ -521,7 +601,7 @@ fn verification_profile(
     (verification, transforms)
 }
 
-fn profile_transforms(compatibility: bool) -> TransformPolicy {
+fn profile_transforms(compatibility: bool, breadth: Breadth) -> TransformPolicy {
     if compatibility {
         // Signers, verifiers and decryptors in this profile must agree with
         // libxmlsec1 on the output of XSLT and Relationship transforms. Signing
@@ -534,20 +614,34 @@ fn profile_transforms(compatibility: bool) -> TransformPolicy {
             ..TransformPolicy::default()
         }
     } else {
+        // Base64 is a required transform (XMLDSig 1.1 §6.6.2) that decodes
+        // octets and selects no nodes, so it widens no coverage question.
+        // XPath and XPath Filter 2.0 select node sets, so only the extended
+        // profiles admit them, and their references keep transformed-data
+        // coverage; XSLT, which rewrites the data, stays outside them all.
+        // https://www.w3.org/TR/xmldsig-core1/#sec-Base-64
+        let strict = [
+            "http://www.w3.org/2000/09/xmldsig#base64",
+            "http://www.w3.org/2000/09/xmldsig#enveloped-signature",
+            "http://www.w3.org/2001/10/xml-exc-c14n#",
+            "http://www.w3.org/2001/10/xml-exc-c14n#WithComments",
+            "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+            "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments",
+            "http://www.w3.org/2006/12/xml-c14n11",
+            "http://www.w3.org/2006/12/xml-c14n11#WithComments",
+        ];
+        let selecting = [
+            "http://www.w3.org/TR/1999/REC-xpath-19991116",
+            "http://www.w3.org/2002/06/xmldsig-filter2",
+        ];
+        let extended = breadth != Breadth::Strict;
         TransformPolicy {
             allowed_algorithms: Some(
-                [
-                    "http://www.w3.org/2000/09/xmldsig#enveloped-signature",
-                    "http://www.w3.org/2001/10/xml-exc-c14n#",
-                    "http://www.w3.org/2001/10/xml-exc-c14n#WithComments",
-                    "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
-                    "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments",
-                    "http://www.w3.org/2006/12/xml-c14n11",
-                    "http://www.w3.org/2006/12/xml-c14n11#WithComments",
-                ]
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
+                strict
+                    .into_iter()
+                    .chain(selecting.into_iter().filter(|_| extended))
+                    .map(str::to_owned)
+                    .collect(),
             ),
             ..TransformPolicy::default()
         }
@@ -837,7 +931,7 @@ fn decryption_profile(
         oaep_digests: Some(oaep_digests),
         // A CipherReference's transforms read as the profile's signatures do.
         transforms: if compatibility {
-            profile_transforms(true)
+            profile_transforms(true, Breadth::Strict)
         } else {
             DecryptionPolicy::default().transforms
         },

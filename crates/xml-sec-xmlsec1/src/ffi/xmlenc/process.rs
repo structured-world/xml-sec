@@ -816,7 +816,7 @@ unsafe fn write_enc_data(ctx: &mut XmlSecEncCtx) -> c_int {
                 String::from_utf8_lossy(std::slice::from_raw_parts(data, size)).into_owned()
             };
             if nodes::set_content(ctx.cipher_value_node, &text).is_err() {
-                errors::xml_failed(here, std::ptr::null(), c"xmlNodeSetContentLen");
+                errors::xml_failed_at(here, ctx.cipher_value_node, c"xmlNodeSetContentLen");
                 return -1;
             }
             ctx.result_replaced = 1;

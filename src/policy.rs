@@ -53,7 +53,7 @@ pub use audit::{
 mod profiles;
 #[cfg(feature = "xmldsig")]
 pub use profiles::{
-    CompiledPolicies, PolicyCompileContext, PolicyCompiler, PolicyProfile, PolicySet,
+    CompiledPolicies, Denials, PolicyCompileContext, PolicyCompiler, PolicyProfile, PolicySet,
     PolicyValidity, SignatureConstraints,
 };
 
@@ -67,6 +67,9 @@ pub enum RsaPssPermission {
     ExactOnly,
     /// Permit supported parameterized tuples using non-legacy hashes only.
     SecureSupported,
+    /// Also permit SHA-1 as the message or MGF1 digest, never a digest that
+    /// needs its own explicit permission (MD5, RIPEMD-160).
+    Sha1Supported,
     /// Permit every supported tuple; capability and key restrictions still apply.
     AllSupported,
 }
@@ -74,9 +77,22 @@ pub enum RsaPssPermission {
 #[cfg(feature = "xmldsig")]
 impl RsaPssPermission {
     fn permits(self, algorithm: SignatureAlgorithm) -> bool {
-        matches!(algorithm, SignatureAlgorithm::RsaPss(_))
-            && (self == Self::AllSupported
-                || (self == Self::SecureSupported && algorithm.signing_allowed()))
+        // The family is the parameterized RFC 9231 RSA-PSS method only.
+        let SignatureAlgorithm::RsaPss(parameters) = algorithm else {
+            return false;
+        };
+        // A digest that needs its own permission (MD5, RIPEMD-160, GOST,
+        // DSTU) is outside every graded grant, so each grant contains the
+        // one below it and composition keeps the narrower.
+        let explicit = [parameters.digest, parameters.mgf_digest]
+            .into_iter()
+            .any(DigestAlgorithm::requires_explicit_permission);
+        match self {
+            Self::ExactOnly => false,
+            Self::SecureSupported => !explicit && algorithm.signing_allowed(),
+            Self::Sha1Supported => !explicit,
+            Self::AllSupported => true,
+        }
     }
 }
 
@@ -1253,19 +1269,20 @@ pub enum XsltStylesheetSemantics {
     Libxmlsec1,
 }
 
-/// How the Relationship transform reads a `TargetMode` attribute bound to the
-/// Relationships namespace (`rel:TargetMode`).
+/// How the Relationship transform reads a `Relationship` attribute bound to
+/// the Relationships namespace (`rel:TargetMode`, `rel:Id`, `rel:Type`,
+/// `rel:Target`).
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum RelationshipTargetModeSemantics {
     /// ECMA-376 Part 2 schema: the attributes of `CT_Relationship` are
-    /// unqualified and no `anyAttribute` is declared, so a qualified
-    /// `TargetMode` is an unexpected attribute and the part is refused.
+    /// unqualified and no `anyAttribute` is declared, so a qualified one is
+    /// an unexpected attribute and the part is refused.
     #[default]
     Specification,
-    /// libxmlsec1: a Relationships-namespace `TargetMode` is the
-    /// `TargetMode` attribute; an unprefixed one present on the same element
-    /// takes precedence, and the output carries one unprefixed `TargetMode`.
+    /// libxmlsec1: a Relationships-namespace `TargetMode`, `Id`, `Type` or
+    /// `Target` is that attribute; an unprefixed one present on the same
+    /// element takes precedence, and the output carries it unprefixed.
     Libxmlsec1,
 }
 
@@ -1407,6 +1424,22 @@ pub enum UnknownX509CertificateSemantics {
     Libxmlsec1,
 }
 
+/// How X.509 validation treats a signing certificate that is itself one of
+/// the caller's trust anchors (ETSI EN 319 102-1 V1.4.1 5.2.6.4 step 1).
+/// <https://www.etsi.org/deliver/etsi_en/319100_319199/31910201/01.04.01_60/en_31910201v010401p.pdf>
+#[cfg(feature = "xmldsig")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TrustAnchorSigner {
+    /// Validated as the one-certificate path it forms, its validity period
+    /// included (step 1 "go to the next step", then step 7).
+    #[default]
+    Validated,
+    /// Accepted as trusted without further checks, the anchor's validity
+    /// period included (step 1(b), as RFC 5280 6.1.1(d) leaves an anchor's
+    /// validity to the relying party).
+    Accepted,
+}
+
 /// X.509 and key-resolution decisions for verification.
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1447,6 +1480,8 @@ pub struct KeyTrustPolicy {
     /// Which `X509Data` children a lookup stopping on an unknown certificate
     /// refuses.
     pub unknown_x509_certificate: UnknownX509CertificateSemantics,
+    /// How a signing certificate that is itself a trust anchor validates.
+    pub trust_anchor_signer: TrustAnchorSigner,
 }
 
 #[cfg(feature = "xmldsig")]
@@ -1466,6 +1501,7 @@ impl Default for KeyTrustPolicy {
             check_crls: false,
             verification_time: None,
             unknown_x509_certificate: UnknownX509CertificateSemantics::References,
+            trust_anchor_signer: TrustAnchorSigner::Validated,
         }
     }
 }
@@ -1738,6 +1774,9 @@ pub struct VerificationPolicy {
     /// `None` accepts every implemented method subject to
     /// independent gates such as [`KeyTrustPolicy::allowed_legacy_signature_algorithms`].
     pub signature_algorithms: Option<BTreeSet<SignatureAlgorithm>>,
+    /// Signature methods withdrawn by a [`Denials`] layer. Each withdraws every
+    /// method of its URI, whatever its parameters, before any grant applies.
+    pub denied_signature_algorithms: BTreeSet<SignatureAlgorithm>,
     /// Allowed reference digest methods; `None` accepts every implemented method.
     pub digest_algorithms: Option<BTreeSet<DigestAlgorithm>>,
     /// HMAC secret and output-length requirements.
@@ -1847,6 +1886,12 @@ impl VerificationPolicy {
         &self,
         algorithm: SignatureAlgorithm,
     ) -> Result<(), PolicyViolation> {
+        if denies(&self.denied_signature_algorithms, algorithm) {
+            return Err(PolicyViolation::Algorithm {
+                operation: "verification",
+                algorithm: algorithm.uri().to_owned(),
+            });
+        }
         if (matches!(algorithm, SignatureAlgorithm::PostQuantum(_))
             || algorithm.requires_explicit_permission())
             && !self
@@ -1908,6 +1953,9 @@ pub struct SigningPolicy {
     /// Exact signing methods, supplemented by `parameterized_rsa_pss`.
     /// `None` uses the implemented secure defaults.
     pub signature_algorithms: Option<BTreeSet<SignatureAlgorithm>>,
+    /// Signature methods withdrawn by a [`Denials`] layer. Each withdraws every
+    /// method of its URI, whatever its parameters, before any grant applies.
+    pub denied_signature_algorithms: BTreeSet<SignatureAlgorithm>,
     /// Verify-only methods (SHA-1 and weaker families) that policy
     /// compilation accepts in `signature_algorithms`: a compiled policy lists
     /// one for signing only when it is named here too. Empty by default; a
@@ -1967,6 +2015,12 @@ impl SigningPolicy {
         &self,
         algorithm: SignatureAlgorithm,
     ) -> Result<(), PolicyViolation> {
+        if denies(&self.denied_signature_algorithms, algorithm) {
+            return Err(PolicyViolation::Algorithm {
+                operation: "signing",
+                algorithm: algorithm.uri().to_owned(),
+            });
+        }
         if self.parameterized_rsa_pss.permits(algorithm) {
             return Ok(());
         }
@@ -1993,6 +2047,15 @@ impl SigningPolicy {
             algorithm.uri(),
         )
     }
+}
+
+/// Whether `denied` withdraws `algorithm`: a denial names a method by its URI,
+/// and the RSA-PSS URI carries every parameterization (RFC 9231 2.3.10).
+/// <https://www.rfc-editor.org/rfc/rfc9231#section-2.3.10>
+#[cfg(feature = "xmldsig")]
+fn denies(denied: &BTreeSet<SignatureAlgorithm>, algorithm: SignatureAlgorithm) -> bool {
+    let uri = algorithm.uri();
+    denied.iter().any(|method| method.uri() == uri)
 }
 
 #[cfg(feature = "xmldsig")]

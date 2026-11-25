@@ -4,7 +4,8 @@ use crate::policy::{
     HmacPolicy, KemContentAuthentication, KemSignatureTrust, KeyDerivationAlgorithm,
     KeyEstablishmentPolicy, KeySourcePolicy, KeyTrustPolicy, ManifestProcessing, PolicyViolation,
     ResourcePolicy, RsaKeyPolicy, RsaPssPermission, SigningPolicy, TimestampTokenEncoding,
-    TransformPolicy, UriPolicy, VerificationPolicy, VerificationTrustMode, XmlInputPolicy,
+    TransformPolicy, TrustAnchorSigner, UriPolicy, VerificationPolicy, VerificationTrustMode,
+    XmlInputPolicy,
 };
 #[cfg(feature = "xmlenc")]
 use crate::policy::{
@@ -191,6 +192,9 @@ fn validity(
     }
 }
 
+/// The narrower of two RSA-PSS family grants. Taking the lower level is an
+/// intersection only because `RsaPssPermission::permits` admits a subset at
+/// each lower level, digests that need their own permission included.
 fn family(a: RsaPssPermission, b: RsaPssPermission) -> RsaPssPermission {
     match (a, b) {
         (RsaPssPermission::ExactOnly, _) | (_, RsaPssPermission::ExactOnly) => {
@@ -198,6 +202,9 @@ fn family(a: RsaPssPermission, b: RsaPssPermission) -> RsaPssPermission {
         }
         (RsaPssPermission::SecureSupported, _) | (_, RsaPssPermission::SecureSupported) => {
             RsaPssPermission::SecureSupported
+        }
+        (RsaPssPermission::Sha1Supported, _) | (_, RsaPssPermission::Sha1Supported) => {
+            RsaPssPermission::Sha1Supported
         }
         _ => RsaPssPermission::AllSupported,
     }
@@ -488,6 +495,15 @@ fn key_trust(a: &KeyTrustPolicy, b: &KeyTrustPolicy) -> Result<KeyTrustPolicy, P
         verification_time,
         // An interpretation, not a level: layers must agree on it.
         unknown_x509_certificate: equal(a.unknown_x509_certificate, b.unknown_x509_certificate)?,
+        // A permission: a restricting layer that validates the anchor-signer
+        // keeps the check.
+        trust_anchor_signer: if a.trust_anchor_signer == TrustAnchorSigner::Accepted
+            && b.trust_anchor_signer == TrustAnchorSigner::Accepted
+        {
+            TrustAnchorSigner::Accepted
+        } else {
+            TrustAnchorSigner::Validated
+        },
     })
 }
 
@@ -520,6 +536,12 @@ fn verification(
             |v| a.check_signature_algorithm(v).is_ok(),
             |v| b.check_signature_algorithm(v).is_ok(),
         ),
+        // A method either layer withdraws stays withdrawn.
+        denied_signature_algorithms: a
+            .denied_signature_algorithms
+            .union(&b.denied_signature_algorithms)
+            .copied()
+            .collect(),
         digest_algorithms: algorithms(
             a.digest_algorithms.as_ref(),
             b.digest_algorithms.as_ref(),
@@ -596,6 +618,12 @@ fn signing(a: &SigningPolicy, b: &SigningPolicy) -> Result<SigningPolicy, Policy
             |v| a.check_signature_algorithm(v).is_ok(),
             |v| b.check_signature_algorithm(v).is_ok(),
         ),
+        // A method either layer withdraws stays withdrawn.
+        denied_signature_algorithms: a
+            .denied_signature_algorithms
+            .union(&b.denied_signature_algorithms)
+            .copied()
+            .collect(),
         // A verify-only method is signed with only when every layer lets it.
         verify_only_signature_algorithms: set(
             &a.verify_only_signature_algorithms,

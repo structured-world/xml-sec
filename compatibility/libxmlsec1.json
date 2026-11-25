@@ -37320,7 +37320,7 @@
       "kind": "macro",
       "name": "XMLSEC_BN_FROM_STRING_MAX_LEN",
       "source": "include/xmlsec/private.h",
-      "detail": "# define XMLSEC_BN_FROM_STRING_MAX_LEN ((xmlSecSize)64)",
+      "detail": "#define XMLSEC_BN_FROM_STRING_MAX_LEN ((xmlSecSize)64)",
       "conditions": [
         "#ifndef XMLSEC_PRIVATE_H",
         "#ifndef XMLSEC_BN_FROM_STRING_MAX_LEN"
@@ -37334,6 +37334,17 @@
       "detail": "#define XMLSEC_BN_H",
       "conditions": [
         "#ifndef XMLSEC_BN_H"
+      ],
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "macro",
+      "name": "XMLSEC_BN_TO_STRING_MAX_SIZE",
+      "source": "include/xmlsec/private.h",
+      "detail": "#define XMLSEC_BN_TO_STRING_MAX_SIZE ((xmlSecSize)32)",
+      "conditions": [
+        "#ifndef XMLSEC_PRIVATE_H",
+        "#ifndef XMLSEC_BN_TO_STRING_MAX_SIZE"
       ],
       "classification": "binary-c-surface"
     },
@@ -38631,6 +38642,63 @@
       "detail": "#define XMLSEC_IO_H",
       "conditions": [
         "#ifndef XMLSEC_IO_H"
+      ],
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "macro",
+      "name": "XMLSEC_KEYINFO_DEFAULT_MAX_CERT_VERIFICATION_DEPTH",
+      "source": "include/xmlsec/private.h",
+      "detail": "#define XMLSEC_KEYINFO_DEFAULT_MAX_CERT_VERIFICATION_DEPTH 9",
+      "conditions": [
+        "#ifndef XMLSEC_PRIVATE_H",
+        "#ifndef XMLSEC_NO_X509",
+        "#if !defined(XMLSEC_KEYINFO_DEFAULT_MAX_CERT_VERIFICATION_DEPTH)"
+      ],
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "macro",
+      "name": "XMLSEC_KEYINFO_DEFAULT_MAX_ENCRYPTED_KEY_LEVEL",
+      "source": "include/xmlsec/private.h",
+      "detail": "#define XMLSEC_KEYINFO_DEFAULT_MAX_ENCRYPTED_KEY_LEVEL 1",
+      "conditions": [
+        "#ifndef XMLSEC_PRIVATE_H",
+        "#ifndef XMLSEC_NO_XMLENC",
+        "#if !defined(XMLSEC_KEYINFO_DEFAULT_MAX_ENCRYPTED_KEY_LEVEL)"
+      ],
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "macro",
+      "name": "XMLSEC_KEYINFO_DEFAULT_MAX_KEYINFO_CHILDREN",
+      "source": "include/xmlsec/private.h",
+      "detail": "#define XMLSEC_KEYINFO_DEFAULT_MAX_KEYINFO_CHILDREN 10",
+      "conditions": [
+        "#ifndef XMLSEC_PRIVATE_H",
+        "#if !defined(XMLSEC_KEYINFO_DEFAULT_MAX_KEYINFO_CHILDREN)"
+      ],
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "macro",
+      "name": "XMLSEC_KEYINFO_DEFAULT_MAX_KEYINFO_REFERENCE_LEVEL",
+      "source": "include/xmlsec/private.h",
+      "detail": "#define XMLSEC_KEYINFO_DEFAULT_MAX_KEYINFO_REFERENCE_LEVEL 1",
+      "conditions": [
+        "#ifndef XMLSEC_PRIVATE_H",
+        "#if !defined(XMLSEC_KEYINFO_DEFAULT_MAX_KEYINFO_REFERENCE_LEVEL)"
+      ],
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "macro",
+      "name": "XMLSEC_KEYINFO_DEFAULT_MAX_RETRIEVAL_METHOD_LEVEL",
+      "source": "include/xmlsec/private.h",
+      "detail": "#define XMLSEC_KEYINFO_DEFAULT_MAX_RETRIEVAL_METHOD_LEVEL 1",
+      "conditions": [
+        "#ifndef XMLSEC_PRIVATE_H",
+        "#if !defined(XMLSEC_KEYINFO_DEFAULT_MAX_RETRIEVAL_METHOD_LEVEL)"
       ],
       "classification": "binary-c-surface"
     },
@@ -40228,6 +40296,39 @@
       "detail": "#define XMLSEC_TRANSFORMS_H",
       "conditions": [
         "#ifndef XMLSEC_TRANSFORMS_H"
+      ],
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "macro",
+      "name": "XMLSEC_TRANSFORM_CTX_DEFAULT_BINARY_CHUNK_SIZE",
+      "source": "include/xmlsec/private.h",
+      "detail": "#define XMLSEC_TRANSFORM_CTX_DEFAULT_BINARY_CHUNK_SIZE ((xmlSecSize)64*1024)",
+      "conditions": [
+        "#ifndef XMLSEC_PRIVATE_H",
+        "#if !defined(XMLSEC_TRANSFORM_CTX_DEFAULT_BINARY_CHUNK_SIZE)"
+      ],
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "macro",
+      "name": "XMLSEC_TRANSFORM_CTX_DEFAULT_MAX_DEPTH",
+      "source": "include/xmlsec/private.h",
+      "detail": "#define XMLSEC_TRANSFORM_CTX_DEFAULT_MAX_DEPTH 16u",
+      "conditions": [
+        "#ifndef XMLSEC_PRIVATE_H",
+        "#if !defined(XMLSEC_TRANSFORM_CTX_DEFAULT_MAX_DEPTH)"
+      ],
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "macro",
+      "name": "XMLSEC_TRANSFORM_CTX_DEFAULT_XPATH_OPS_LIMIT",
+      "source": "include/xmlsec/private.h",
+      "detail": "#define XMLSEC_TRANSFORM_CTX_DEFAULT_XPATH_OPS_LIMIT ((xmlSecSize)1000000)",
+      "conditions": [
+        "#ifndef XMLSEC_PRIVATE_H",
+        "#if !defined(XMLSEC_TRANSFORM_CTX_DEFAULT_XPATH_OPS_LIMIT)"
       ],
       "classification": "binary-c-surface"
     },

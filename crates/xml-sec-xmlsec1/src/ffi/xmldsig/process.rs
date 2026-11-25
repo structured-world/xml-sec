@@ -1138,7 +1138,7 @@ pub(super) unsafe fn reference_node(
                 return -1;
             };
             if nodes::set_content(read.digest_value, &value).is_err() {
-                errors::xml_failed(here, std::ptr::null(), c"xmlNodeSetContentLen");
+                errors::xml_failed_at(here, read.digest_value, c"xmlNodeSetContentLen");
                 return -1;
             }
             reference.status = STATUS_SUCCEEDED;

@@ -1372,6 +1372,608 @@ fn xades_profile_authenticates_nonempty_ordered_properties() {
     }
 }
 
+/// `xades_template` with one more `Reference`, to a `ds:Object` holding
+/// base64 text, under `transform`.
+fn xades_with_object_reference(transform: &str) -> String {
+    xades_template(
+        "<x:SignedSignatureProperties><x:SigningTime>2026-10-14T00:00:00Z</x:SigningTime></x:SignedSignatureProperties>",
+    )
+    .replace(
+        "</ds:SignedInfo>",
+        &format!(
+            r##"<ds:Reference URI="#binary"><ds:Transforms><ds:Transform Algorithm="{transform}"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo>"##
+        ),
+    )
+    .replace(
+        "</ds:Signature>",
+        r#"<ds:Object Id="binary">YmluYXJ5IHBheWxvYWQ=</ds:Object></ds:Signature>"#,
+    )
+}
+
+#[test]
+fn strict_profiles_admit_the_base64_transform_but_no_node_set_selection() {
+    // XMLDSig 1.1 §6.6.2 makes Base64 a required transform: enveloping
+    // signatures over binary data, which EU DSS writes by default, carry it.
+    // It decodes octets and selects no nodes, so the strict profiles admit it
+    // for signing and verification, while XPath keeps its refusal.
+    // https://www.w3.org/TR/xmldsig-core1/#sec-Base-64
+    let compiled = compiler(PolicyProfile::Xades).compile(&context()).unwrap();
+    let key = HmacSigningKey::new(vec![0x53; 32]).unwrap();
+    let verifier = HmacVerificationKey::new(vec![0x53; 32]).unwrap();
+    let xml = SignContext::new(&key)
+        .policy(compiled.signing().unwrap().clone())
+        .sign_template(&xades_with_object_reference(
+            "http://www.w3.org/2000/09/xmldsig#base64",
+        ))
+        .unwrap()
+        .output;
+    let document = XmlDocument::parse(xml).unwrap();
+    let targets = document.with_view(|view| [view.root_element()]);
+    let evidence = VerifyContext::new()
+        .key(&verifier)
+        .policy(compiled.verification().unwrap().clone())
+        .verify_request(
+            &document,
+            &VerificationRequest {
+                expected_targets: &targets,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(evidence.all_valid());
+    // SecureSaml keeps its own narrower list: SAML Core §5.4.4 admits only the
+    // enveloped-signature and exclusive canonicalization transforms.
+    // https://docs.oasis-open.org/security/saml/v2.0/saml-core-2.0-os.pdf
+    for profile in [
+        PolicyProfile::Modern,
+        PolicyProfile::WsSecurity,
+        PolicyProfile::Xades,
+    ] {
+        let compiled = compiler(profile).compile(&context()).unwrap();
+        let transforms = &compiled.verification().unwrap().transforms;
+        let admitted = |uri: &str| {
+            transforms
+                .allowed_algorithms
+                .as_ref()
+                .is_some_and(|methods| methods.contains(uri))
+        };
+        assert!(
+            admitted("http://www.w3.org/2000/09/xmldsig#base64"),
+            "{profile:?}"
+        );
+        for refused in [
+            "http://www.w3.org/TR/1999/REC-xpath-19991116",
+            "http://www.w3.org/2002/06/xmldsig-filter2",
+            "http://www.w3.org/TR/1999/REC-xslt-19991116",
+        ] {
+            assert!(!admitted(refused), "{profile:?} admits {refused}");
+        }
+        assert_eq!(
+            compiled.signing().unwrap().transforms.allowed_algorithms,
+            transforms.allowed_algorithms,
+            "{profile:?}"
+        );
+    }
+    assert!(matches!(
+        SignContext::new(&key)
+            .policy(compiled.signing().unwrap().clone())
+            .sign_template(&xades_with_object_reference(
+                "http://www.w3.org/TR/1999/REC-xpath-19991116"
+            )),
+        Err(xml_sec::xmldsig::SigningError::Policy(_))
+    ));
+}
+
+#[test]
+fn each_xades_profile_is_the_wider_one_restricted_by_its_policies() {
+    // A named profile is only a set of policy values: restricting the wider
+    // profile by the narrower one's policies compiles to exactly the narrower
+    // profile, so a deployment reaches any of them with layers alone.
+    for (wider, narrower) in [
+        (PolicyProfile::XadesConformant, PolicyProfile::XadesExtended),
+        (PolicyProfile::XadesExtended, PolicyProfile::Xades),
+    ] {
+        let layer = compiler(narrower).policies().clone();
+        let restricted = compiler(wider)
+            .restrict(&layer)
+            .unwrap()
+            .compile(&context())
+            .unwrap();
+        let named = compiler(narrower).compile(&context()).unwrap();
+        assert_eq!(
+            format!("{:?}", restricted.verification()),
+            format!("{:?}", named.verification()),
+            "{wider:?} -> {narrower:?} verification"
+        );
+        assert_eq!(
+            format!("{:?}", restricted.signing()),
+            format!("{:?}", named.signing()),
+            "{wider:?} -> {narrower:?} signing"
+        );
+    }
+}
+
+#[test]
+fn the_xades_profiles_widen_one_step_at_a_time() {
+    // Xades, XadesExtended and XadesConformant differ in exactly the values
+    // their contracts name: node-set transforms, then SHA-1 based
+    // verification, 1024-bit keys and KeyValue keys. Signing stays modern.
+    use xml_sec::policy::KeySourceKind;
+    use xml_sec::xmldsig::{DigestAlgorithm, SignatureAlgorithm};
+    let compiled = |profile| compiler(profile).compile(&context()).unwrap();
+    let (strict, extended, conformant) = (
+        compiled(PolicyProfile::Xades),
+        compiled(PolicyProfile::XadesExtended),
+        compiled(PolicyProfile::XadesConformant),
+    );
+    let transforms = |policies: &xml_sec::policy::CompiledPolicies, uri: &str| {
+        policies
+            .verification()
+            .unwrap()
+            .transforms
+            .allowed_algorithms
+            .as_ref()
+            .is_some_and(|methods| methods.contains(uri))
+    };
+    for uri in [
+        "http://www.w3.org/TR/1999/REC-xpath-19991116",
+        "http://www.w3.org/2002/06/xmldsig-filter2",
+    ] {
+        assert!(!transforms(&strict, uri), "{uri}");
+        assert!(transforms(&extended, uri), "{uri}");
+        assert!(transforms(&conformant, uri), "{uri}");
+    }
+    for policies in [&strict, &extended, &conformant] {
+        assert!(!transforms(
+            policies,
+            "http://www.w3.org/TR/1999/REC-xslt-19991116"
+        ));
+    }
+    let verifies = |policies: &xml_sec::policy::CompiledPolicies, method| {
+        policies
+            .verification()
+            .unwrap()
+            .signature_algorithms
+            .as_ref()
+            .is_some_and(|methods| methods.contains(&method))
+    };
+    assert!(!verifies(&extended, SignatureAlgorithm::RsaSha1));
+    assert!(verifies(&conformant, SignatureAlgorithm::RsaSha1));
+    assert!(!verifies(&conformant, SignatureAlgorithm::HmacSha1));
+    let digests = |policies: &xml_sec::policy::CompiledPolicies| {
+        policies
+            .verification()
+            .unwrap()
+            .digest_algorithms
+            .clone()
+            .unwrap()
+    };
+    assert!(!digests(&extended).contains(&DigestAlgorithm::Sha1));
+    assert!(digests(&conformant).contains(&DigestAlgorithm::Sha1));
+    let trust = |policies: &xml_sec::policy::CompiledPolicies| {
+        policies.verification().unwrap().key_trust.clone()
+    };
+    assert_eq!(
+        trust(&extended).rsa_keys.minimum_modulus_bits,
+        trust(&strict).rsa_keys.minimum_modulus_bits
+    );
+    assert_eq!(trust(&conformant).rsa_keys.minimum_modulus_bits, 1024);
+    let sources =
+        |policies: &xml_sec::policy::CompiledPolicies| policies.verification().unwrap().key_sources;
+    assert!(!sources(&extended).contains(KeySourceKind::KeyValue));
+    assert!(sources(&conformant).contains(KeySourceKind::KeyValue));
+    // Signing is the same modern set in all three.
+    for policies in [&extended, &conformant] {
+        assert_eq!(
+            format!("{:?}", policies.signing().unwrap().signature_algorithms),
+            format!("{:?}", strict.signing().unwrap().signature_algorithms)
+        );
+    }
+}
+
+#[test]
+fn the_extended_profile_signs_and_verifies_an_xpath_selected_reference() {
+    // XadesExtended admits node-set selection through the public operations;
+    // Xades refuses the same signature with a typed policy violation.
+    let transform = r#"<ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>true()</ds:XPath></ds:Transform>"#;
+    let template = xades_template(
+        "<x:SignedSignatureProperties><x:SigningTime>2026-10-14T00:00:00Z</x:SigningTime></x:SignedSignatureProperties>",
+    )
+    .replace(
+        "</ds:SignedInfo>",
+        &format!(
+            r##"<ds:Reference URI="#binary"><ds:Transforms>{transform}</ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo>"##
+        ),
+    )
+    .replace(
+        "</ds:Signature>",
+        r#"<ds:Object Id="binary">selected</ds:Object></ds:Signature>"#,
+    );
+    let key = HmacSigningKey::new(vec![0x53; 32]).unwrap();
+    let verifier = HmacVerificationKey::new(vec![0x53; 32]).unwrap();
+    let extended = compiler(PolicyProfile::XadesExtended)
+        .compile(&context())
+        .unwrap();
+    let xml = SignContext::new(&key)
+        .policy(extended.signing().unwrap().clone())
+        .sign_template(&template)
+        .unwrap()
+        .output;
+    let document = XmlDocument::parse(xml).unwrap();
+    let targets = document.with_view(|view| [view.root_element()]);
+    let request = VerificationRequest {
+        expected_targets: &targets,
+        ..Default::default()
+    };
+    let evidence = VerifyContext::new()
+        .key(&verifier)
+        .policy(extended.verification().unwrap().clone())
+        .verify_request(&document, &request)
+        .unwrap();
+    assert!(evidence.all_valid());
+    let strict = compiler(PolicyProfile::Xades).compile(&context()).unwrap();
+    let refused = VerifyContext::new()
+        .key(&verifier)
+        .policy(strict.verification().unwrap().clone())
+        .verify_request(&document, &request);
+    let refused = format!("{refused:?}");
+    assert!(
+        refused.contains("REC-xpath-19991116"),
+        "Xades must refuse the XPath transform: {refused}"
+    );
+}
+
+/// How a signing certificate the caller configured as its trust anchor
+/// resolves from `KeyInfo` at `at` under `profile` with X.509 chains
+/// checked: `validated`, or the refusal.
+fn resolve_anchor_signer(profile: PolicyProfile, at: i64) -> String {
+    resolve_anchor_signer_in(profile, at, false)
+}
+
+/// [`resolve_anchor_signer`], with `KeyInfo` naming the anchor only by its
+/// subject name when `by_name` is set.
+fn resolve_anchor_signer_in(profile: PolicyProfile, at: i64, by_name: bool) -> String {
+    use xml_sec::xmldsig::{
+        DefaultKeyResolver, InspectedKeyCandidateBudget, KeyResolverConfig,
+        ResolvedVerificationKey, parse_key_info,
+    };
+    let pem = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/keys/rsa/rsa-2048-cert.pem"),
+    )
+    .unwrap();
+    let body: String = pem
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect();
+    let der = structured_base64::STANDARD.decode(body.as_bytes()).unwrap();
+    let identification = if by_name {
+        "<X509SubjectName>CN=Test Key rsa-2048,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509SubjectName>".to_owned()
+    } else {
+        format!("<X509Certificate>{body}</X509Certificate>")
+    };
+    let xml = format!(
+        r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"><X509Data>{identification}</X509Data></KeyInfo>"#
+    );
+    let document = xml_sec::XmlDomDocument::parse(&xml).unwrap();
+    let key_info = parse_key_info(document.root_element()).unwrap();
+    let mut policy = compiler(profile)
+        .compile(&context())
+        .unwrap()
+        .verification()
+        .unwrap()
+        .clone();
+    policy.key_trust.verify_x509_chains = true;
+    policy.key_trust.verification_time = Some(Instant::new(at, 0).unwrap());
+    let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+        trusted_certs: vec![der],
+        ..KeyResolverConfig::default()
+    });
+    let mut budget = InspectedKeyCandidateBudget::new(&policy);
+    match resolver.resolve_with_candidate_budget(
+        Some(&key_info),
+        SignatureAlgorithm::RsaSha256,
+        &policy,
+        &RustCryptoProvider,
+        &mut budget,
+    ) {
+        Ok(Some(ResolvedVerificationKey::Validated(_))) => "validated".into(),
+        Ok(Some(_)) => "unvalidated key".into(),
+        Ok(None) => "no key".into(),
+        Err(error) => format!("{error:?}"),
+    }
+}
+
+#[test]
+fn a_conformant_profile_accepts_a_signing_certificate_that_is_its_trust_anchor() {
+    // ETSI EN 319 102-1 V1.4.1 5.2.6.4 step 1(b): when the signing
+    // certificate is itself a trust anchor, the policy may pass X.509
+    // validation without step 7's validity check. XadesConformant does, as
+    // EU DSS does; the stricter profiles keep the check, so the same expired
+    // anchor-signer is refused there.
+    const LONG_AFTER_EXPIRY: i64 = 7_258_118_400; // 2200-01-01
+    assert_eq!(
+        resolve_anchor_signer(PolicyProfile::XadesConformant, LONG_AFTER_EXPIRY),
+        "validated"
+    );
+    let refused = resolve_anchor_signer(PolicyProfile::Xades, LONG_AFTER_EXPIRY);
+    assert!(refused.contains("CertificateNotValid(0)"), "{refused}");
+    // The policy decides the anchor, however KeyInfo identifies it: by its
+    // subject name alone the same anchor is accepted and refused alike.
+    assert_eq!(
+        resolve_anchor_signer_in(PolicyProfile::XadesConformant, LONG_AFTER_EXPIRY, true),
+        "validated"
+    );
+    let refused = resolve_anchor_signer_in(PolicyProfile::Xades, LONG_AFTER_EXPIRY, true);
+    assert!(refused.contains("CertificateNotValid(0)"), "{refused}");
+    // A permission: a layer that validates the anchor-signer withdraws it.
+    let conformant = compiler(PolicyProfile::XadesConformant);
+    let mut layer = conformant.policies().clone();
+    if let Some(verification) = layer.verification.as_mut() {
+        verification.key_trust.trust_anchor_signer = xml_sec::policy::TrustAnchorSigner::Validated;
+    }
+    let narrowed = conformant
+        .restrict(&layer)
+        .unwrap()
+        .compile(&context())
+        .unwrap();
+    assert_eq!(
+        narrowed
+            .verification()
+            .unwrap()
+            .key_trust
+            .trust_anchor_signer,
+        xml_sec::policy::TrustAnchorSigner::Validated
+    );
+}
+
+#[test]
+fn a_denial_withdraws_exactly_the_named_permissions() {
+    // A deployment narrows any profile without restating it: each denied
+    // permission disappears from every operation that had it, and the rest
+    // of the profile stays as it was.
+    use xml_sec::policy::{Denials, KeySourceKind};
+    use xml_sec::xmldsig::{SignatureAlgorithm, UriClass};
+    const FILTER2: &str = "http://www.w3.org/2002/06/xmldsig-filter2";
+    const XPATH: &str = "http://www.w3.org/TR/1999/REC-xpath-19991116";
+    let denials = Denials {
+        transforms: [FILTER2.to_owned()].into(),
+        signature_algorithms: [SignatureAlgorithm::RsaSha1].into(),
+        key_sources: vec![KeySourceKind::KeyValue],
+        reference_uri_classes: vec![UriClass::External],
+        ..Denials::default()
+    };
+    let denied = compiler(PolicyProfile::XadesConformant)
+        .deny(&denials)
+        .unwrap()
+        .compile(&context())
+        .unwrap();
+    let full = compiler(PolicyProfile::XadesConformant)
+        .compile(&context())
+        .unwrap();
+    let verification = denied.verification().unwrap();
+    let transforms = verification.transforms.allowed_algorithms.clone().unwrap();
+    assert!(!transforms.contains(FILTER2));
+    assert!(transforms.contains(XPATH));
+    assert!(
+        verification
+            .check_signature_algorithm(SignatureAlgorithm::RsaSha1)
+            .is_err()
+    );
+    assert_eq!(
+        verification.check_signature_algorithm(SignatureAlgorithm::DsaSha1),
+        Ok(())
+    );
+    assert!(!verification.key_sources.contains(KeySourceKind::KeyValue));
+    assert!(verification.key_sources.contains(KeySourceKind::X509Data));
+    assert!(!verification.uris.references.allows("external.xml"));
+    let signing = denied.signing().unwrap();
+    assert!(
+        !signing
+            .transforms
+            .allowed_algorithms
+            .as_ref()
+            .unwrap()
+            .contains(FILTER2)
+    );
+    // Everything not named is unchanged.
+    let mut expected = full.verification().unwrap().clone();
+    expected.transforms.allowed_algorithms = Some(transforms);
+    expected.denied_signature_algorithms = [SignatureAlgorithm::RsaSha1].into();
+    // Composition keeps only what both layers admit, so the list drops it too.
+    if let Some(methods) = expected.signature_algorithms.as_mut() {
+        methods.remove(&SignatureAlgorithm::RsaSha1);
+    }
+    expected.key_sources.remove(KeySourceKind::KeyValue);
+    expected.uris.references = verification.uris.references;
+    assert_eq!(format!("{verification:?}"), format!("{expected:?}"));
+}
+
+/// An RSA-PSS method over SHA-256 with `salt_len` octets of salt.
+fn pss(salt_len: usize) -> SignatureAlgorithm {
+    SignatureAlgorithm::RsaPss(xml_sec::xmldsig::RsaPssParameters {
+        salt_len,
+        ..xml_sec::xmldsig::RsaPssParameters::DEFAULT
+    })
+}
+
+#[test]
+fn a_denied_signature_method_wins_over_every_grant() {
+    // A denial withdraws the method its URI names (RFC 9231 2.3.10: the
+    // RSA-PSS URI carries its parameters in the element), in every
+    // parameterization and through the profile's RSA-PSS family grant, in
+    // signing and verification alike. Other methods stay admitted.
+    use xml_sec::policy::Denials;
+    let denied = compiler(PolicyProfile::Modern)
+        .deny(&Denials {
+            signature_algorithms: [pss(32)].into(),
+            ..Denials::default()
+        })
+        .unwrap()
+        .compile(&context())
+        .unwrap();
+    let (verification, signing) = (denied.verification().unwrap(), denied.signing().unwrap());
+    for method in [pss(32), pss(20)] {
+        assert!(
+            verification.check_signature_algorithm(method).is_err(),
+            "{method:?}"
+        );
+        assert!(
+            signing.check_signature_algorithm(method).is_err(),
+            "{method:?}"
+        );
+    }
+    assert_eq!(
+        verification.check_signature_algorithm(SignatureAlgorithm::RsaSha256),
+        Ok(())
+    );
+    assert_eq!(
+        signing.check_signature_algorithm(SignatureAlgorithm::RsaSha256),
+        Ok(())
+    );
+}
+
+#[test]
+fn a_denial_keeps_every_method_it_does_not_name() {
+    // Without an explicit list a policy admits RSA-PSS tuples no fixed list
+    // holds, such as a 20-octet salt; denying another method keeps them.
+    use xml_sec::policy::{Denials, RsaPssPermission};
+    let mut open = compiler(PolicyProfile::Modern).policies().clone();
+    if let Some(verification) = open.verification.as_mut() {
+        verification.signature_algorithms = None;
+        verification.parameterized_rsa_pss = RsaPssPermission::ExactOnly;
+    }
+    if let Some(signing) = open.signing.as_mut() {
+        signing.signature_algorithms = None;
+        signing.parameterized_rsa_pss = RsaPssPermission::ExactOnly;
+    }
+    let kept = PolicyCompiler::from_policies(PolicyProfile::Modern, &RustCryptoProvider, open)
+        .deny(&Denials {
+            signature_algorithms: [SignatureAlgorithm::RsaSha1].into(),
+            ..Denials::default()
+        })
+        .unwrap()
+        .compile(&context())
+        .unwrap();
+    assert_eq!(
+        kept.verification()
+            .unwrap()
+            .check_signature_algorithm(pss(20)),
+        Ok(())
+    );
+    assert_eq!(
+        kept.signing().unwrap().check_signature_algorithm(pss(20)),
+        Ok(())
+    );
+}
+
+#[test]
+fn the_conformant_profile_admits_rsa_pss_down_to_sha1_only() {
+    // XadesConformant adds SHA-1 signatures, not MD5 or RIPEMD-160: its
+    // RSA-PSS family grant stops at SHA-1 for the message and MGF1 digests.
+    use xml_sec::xmldsig::{DigestAlgorithm, RsaPssParameters};
+    let compiled = compiler(PolicyProfile::XadesConformant)
+        .compile(&context())
+        .unwrap();
+    let verification = compiled.verification().unwrap();
+    let with = |digest| {
+        SignatureAlgorithm::RsaPss(RsaPssParameters {
+            digest,
+            mgf_digest: digest,
+            salt_len: 20,
+        })
+    };
+    assert_eq!(
+        verification.check_signature_algorithm(with(DigestAlgorithm::Sha256)),
+        Ok(())
+    );
+    assert_eq!(
+        verification.check_signature_algorithm(with(DigestAlgorithm::Sha1)),
+        Ok(())
+    );
+    #[cfg(feature = "legacy-algorithms")]
+    for digest in [DigestAlgorithm::Md5, DigestAlgorithm::Ripemd160] {
+        assert!(
+            verification
+                .check_signature_algorithm(with(digest))
+                .is_err(),
+            "{digest:?}"
+        );
+    }
+}
+
+#[test]
+#[cfg(feature = "dstu4145")]
+fn no_rsa_pss_family_grant_admits_a_digest_that_needs_its_own_permission() {
+    // GOST 34.311 and DSTU 7564 need an explicit digest permission; neither
+    // the secure nor the SHA-1 RSA-PSS family grant may admit them, so the
+    // grants stay ordered SecureSupported < Sha1Supported under composition.
+    use xml_sec::xmldsig::{DigestAlgorithm, RsaPssParameters};
+    for profile in [PolicyProfile::Modern, PolicyProfile::XadesConformant] {
+        let compiled = compiler(profile).compile(&context()).unwrap();
+        let verification = compiled.verification().unwrap();
+        for digest in [DigestAlgorithm::Gost34311, DigestAlgorithm::Dstu7564_256] {
+            let method = SignatureAlgorithm::RsaPss(RsaPssParameters {
+                digest,
+                mgf_digest: digest,
+                salt_len: 32,
+            });
+            assert!(
+                verification.check_signature_algorithm(method).is_err(),
+                "{profile:?} {digest:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_denial_never_grants_and_reaches_absent_allowlists() {
+    // Denying what a profile already refuses changes nothing. A profile that
+    // admits every implemented transform (no allowlist) still loses exactly
+    // the denied one, so signing with it is a typed policy refusal.
+    use xml_sec::policy::Denials;
+    const XPATH: &str = "http://www.w3.org/TR/1999/REC-xpath-19991116";
+    let absent = Denials {
+        transforms: ["http://www.w3.org/TR/1999/REC-xslt-19991116".to_owned()].into(),
+        ..Denials::default()
+    };
+    let unchanged = compiler(PolicyProfile::Xades)
+        .deny(&absent)
+        .unwrap()
+        .compile(&context())
+        .unwrap();
+    let strict = compiler(PolicyProfile::Xades).compile(&context()).unwrap();
+    assert_eq!(
+        format!("{:?}", unchanged.verification()),
+        format!("{:?}", strict.verification())
+    );
+    let compatible = compiler(PolicyProfile::XmlSecCompatible)
+        .deny(&Denials {
+            transforms: [XPATH.to_owned()].into(),
+            ..Denials::default()
+        })
+        .unwrap()
+        .compile(&context())
+        .unwrap();
+    let verification = compatible.verification().unwrap();
+    let transforms = verification.transforms.allowed_algorithms.as_ref().unwrap();
+    assert!(!transforms.contains(XPATH));
+    assert!(transforms.contains("http://www.w3.org/2000/09/xmldsig#base64"));
+    assert!(transforms.contains("http://www.w3.org/2002/06/xmldsig-filter2"));
+    let key = HmacSigningKey::new(vec![0x53; 32]).unwrap();
+    let refused = SignContext::new(&key)
+        .policy(compatible.signing().unwrap().clone())
+        .sign_template(&xades_with_object_reference(XPATH));
+    assert!(
+        matches!(
+            refused,
+            Err(xml_sec::xmldsig::SigningError::Policy(PolicyViolation::Algorithm { ref algorithm, .. }))
+                if algorithm == XPATH
+        ),
+        "{refused:?}"
+    );
+}
+
 #[test]
 fn incompatible_protocols_and_interpretation_models_reject_composition() {
     // Restriction cannot silently change which document bytes an ID names.

@@ -2,6 +2,7 @@
 //! provider selection, key loading or implicit authorization occurs here.
 #![forbid(unsafe_code)]
 
+mod deny;
 mod settings;
 mod store;
 
@@ -86,6 +87,8 @@ struct Profile {
     signing: Option<toml::Table>,
     encryption: Option<toml::Table>,
     decryption: Option<toml::Table>,
+    /// Permissions this profile withdraws from what it inherits.
+    deny: Option<deny::Deny>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -95,6 +98,8 @@ enum Base {
     SecureSaml,
     WsSecurity,
     Xades,
+    XadesExtended,
+    XadesConformant,
     LegacyVerify,
 }
 
@@ -106,6 +111,8 @@ impl Base {
             Self::SecureSaml => PolicyProfile::SecureSaml,
             Self::WsSecurity => PolicyProfile::WsSecurity,
             Self::Xades => PolicyProfile::Xades,
+            Self::XadesExtended => PolicyProfile::XadesExtended,
+            Self::XadesConformant => PolicyProfile::XadesConformant,
             Self::LegacyVerify => PolicyProfile::LegacyVerify,
         }
     }
@@ -145,6 +152,9 @@ impl Configuration {
             }
             for (operation, table) in profile.tables() {
                 settings::validate(operation, table)?;
+            }
+            if let Some(deny) = &profile.deny {
+                deny.denials()?;
             }
             config.chain(name)?;
         }
@@ -268,6 +278,9 @@ impl Configuration {
             let mut layer = compiler.policies().clone();
             settings::apply(profile, &mut layer)?;
             compiler = compiler.restrict(&layer)?;
+            if let Some(deny) = &profile.deny {
+                compiler = compiler.deny(&deny.denials()?)?;
+            }
         }
         Ok(compiler)
     }

@@ -749,7 +749,18 @@ unsafe extern "C" fn simple_find_key(
                 break;
             }
             let key = xmlSecPtrListGetItem(list, pos).cast::<XmlSecKey>();
-            if !key.is_null() && xmlSecKeyMatch(key, name, &raw mut (*ctx).key_req) == 1 {
+            if key.is_null() {
+                continue;
+            }
+            let matched = xmlSecKeyMatch(key, name, &raw mut (*ctx).key_req);
+            if matched < 0 {
+                // A failed comparison ends the search, reported for the
+                // store whose keys were compared.
+                errors::internal(here, (*(*store).id).name.cast(), c"xmlSecKeyMatch");
+                found = std::ptr::null_mut();
+                break;
+            }
+            if matched == 1 {
                 found = xmlSecKeyDuplicate(key);
                 break;
             }

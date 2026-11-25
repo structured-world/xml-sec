@@ -83,6 +83,33 @@ pub const XPATH_TRANSFORM_URI: &str = "http://www.w3.org/TR/1999/REC-xpath-19991
 pub const XPATH_FILTER2_TRANSFORM_URI: &str = "http://www.w3.org/2002/06/xmldsig-filter2";
 /// The algorithm URI for the XSLT transform, executed when the `xslt` feature is built.
 pub const XSLT_TRANSFORM_URI: &str = "http://www.w3.org/TR/1999/REC-xslt-19991116";
+/// Every transform and canonicalization URI this build executes: what an
+/// absent transform allowlist admits, and what a policy denial removes from.
+/// It names each kind a parsed transform reports as its algorithm.
+///
+/// ```
+/// use xml_sec::xmldsig::transforms::implemented_transform_uris;
+/// assert!(implemented_transform_uris().any(|uri| uri == "http://www.w3.org/2000/09/xmldsig#base64"));
+/// ```
+pub fn implemented_transform_uris() -> impl Iterator<Item = &'static str> {
+    [
+        ENVELOPED_SIGNATURE_URI,
+        BASE64_TRANSFORM_URI,
+        XPATH_TRANSFORM_URI,
+        XPATH_FILTER2_TRANSFORM_URI,
+        relationship::RELATIONSHIP_TRANSFORM_URI,
+        #[cfg(feature = "xslt")]
+        XSLT_TRANSFORM_URI,
+        "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+        "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments",
+        "http://www.w3.org/2006/12/xml-c14n11",
+        "http://www.w3.org/2006/12/xml-c14n11#WithComments",
+        "http://www.w3.org/2001/10/xml-exc-c14n#",
+        "http://www.w3.org/2001/10/xml-exc-c14n#WithComments",
+    ]
+    .into_iter()
+}
+
 /// The implicit default canonicalization URI applied when no explicit C14N
 /// transform is present in a `<Reference>`.
 pub const DEFAULT_IMPLICIT_C14N_URI: &str = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315";

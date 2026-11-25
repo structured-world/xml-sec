@@ -333,6 +333,48 @@ fn a_shadowed_prefix_is_not_the_namespace_node_of_the_element() {
     xml_sec_libxml2::document::free(doc);
 }
 
+/// The text of `set` as the dump writes it.
+fn dumped(set: *mut XmlSecNodeSet) -> Vec<u8> {
+    // SAFETY: a live set; the buffers are used while live.
+    unsafe {
+        let buffer = crate::ffi::buffer::xmlSecBufferCreate(0);
+        let out = crate::ffi::transforms::io::xmlSecBufferCreateOutputBuffer(buffer);
+        assert_eq!(super::xmlSecNodeSetDumpTextNodes(set, out), 0);
+        assert!(crate::ffi::transforms::io::xmlOutputBufferClose(out) >= 0);
+        let written = std::slice::from_raw_parts(
+            crate::ffi::buffer::xmlSecBufferGetData(buffer),
+            crate::ffi::buffer::xmlSecBufferGetSize(buffer),
+        )
+        .to_vec();
+        crate::ffi::buffer::xmlSecBufferDestroy(buffer);
+        written
+    }
+}
+
+/// The text dump follows the document, not the order the set lists its
+/// nodes in, for normal and tree sets alike (libxmlsec1 walks the whole
+/// document for it).
+#[test]
+fn text_dump_keeps_document_order() {
+    let doc = parse(b"<r><a>1</a><b>2</b></r>");
+    let a = nodes::first_child(nodes::root_element(doc));
+    let b = nodes::next(a);
+    // SAFETY: the sets are live until destroyed; each owns its node list.
+    unsafe {
+        let normal = xmlSecNodeSetCreate(
+            doc,
+            listing(&[nodes::first_child(b), nodes::first_child(a)]),
+            NORMAL,
+        );
+        assert_eq!(dumped(normal), b"12");
+        xmlSecNodeSetDestroy(normal);
+        let tree = xmlSecNodeSetCreate(doc, listing(&[b, a]), TREE);
+        assert_eq!(dumped(tree), b"12");
+        xmlSecNodeSetDestroy(tree);
+    }
+    xml_sec_libxml2::document::free(doc);
+}
+
 /// CDATA characters are text (`XPath` 1.0 section 5.7), so the text dump
 /// that feeds Base64 writes them like any text node.
 #[test]

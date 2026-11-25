@@ -414,6 +414,12 @@ pub(crate) unsafe extern "C" fn xml_read(
             MODE_READ,
             c"keyInfoCtx->mode == xmlSecKeyInfoModeRead"
         );
+        // An earlier element in the same KeyInfo already gave the key its
+        // value: libxmlsec1 skips this element, as it skips an EncryptedKey.
+        // SAFETY: a key.
+        if unsafe { !(*key).value.is_null() } {
+            return 0;
+        }
         let here = here!("xmlSecKeyDataDerivedKeyXmlRead");
         // SAFETY: a klass, a key, a live node and a context.
         unsafe {

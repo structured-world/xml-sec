@@ -151,7 +151,8 @@ unsafe fn add(
 fn content_set(node: *mut XmlNode, content: &str, here: Here) -> bool {
     let set = nodes::set_content(node, content).is_ok();
     if !set {
-        errors::xml_failed(here, std::ptr::null(), c"xmlNodeSetContent");
+        // SAFETY: the node the caller edits.
+        unsafe { errors::xml_failed_at(here, node, c"xmlNodeSetContent") };
     }
     set
 }

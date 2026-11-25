@@ -320,7 +320,12 @@ pub(crate) unsafe extern "C" fn xmlSecTransformBase64SetLineSize(
             c"xmlSecTransformCheckId(transform, xmlSecTransformBase64Id)"
         );
         let Ok(columns) = c_int::try_from(line_size) else {
-            errors::size_to_int_impossible(here!("xmlSecTransformBase64SetLineSize"), line_size);
+            errors::size_to_int_impossible_for(
+                here!("xmlSecTransformBase64SetLineSize"),
+                // SAFETY: the transform checked above.
+                unsafe { (*(*transform).id).name.cast() },
+                line_size,
+            );
             return;
         };
         check!(
