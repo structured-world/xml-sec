@@ -112,7 +112,8 @@ cargo run -p xml-sec-tools -- xades lifecycle --bench 30 --cold 5 --results targ
 cargo run -p xml-sec-tools -- xades lifecycle --bench 1 --warmups 1 --cold 1 --cases enveloped-rsa --results target/performance/lifecycle-smoke
 ```
 
-The run needs Java 21 and builds the pinned EU DSS 6.5.1 probes, the release
+The run needs Java 21 and builds the EU DSS probes against the current DSS release,
+resolved and recorded at run time (`environment.dss` of the result), the release
 `lifecycle_probe` and `level_probe` examples, and their `allocation-profile`
 builds. It issues a PKI for the run with the oracle's OpenSSL (`OPENSSL_BIN`).
 Each case is a packaging (`enveloped`, `enveloping`, `internally-detached`,

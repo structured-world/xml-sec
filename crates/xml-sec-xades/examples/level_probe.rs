@@ -177,7 +177,10 @@ impl Material {
     /// `ANCHOR_DER`, or with `-` where each carried chain ends.
     fn read(text: &str, anchor: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let carried = tokens::values(text, "X509Certificate");
-        let authorities = tokens::token_authorities(text, &carried)?;
+        let (authorities, unreadable) = tokens::token_authorities(text, &carried);
+        if let Some(failure) = unreadable.into_iter().next() {
+            return Err(failure.into());
+        }
         let mut pool = carried.clone();
         pool.extend(
             authorities

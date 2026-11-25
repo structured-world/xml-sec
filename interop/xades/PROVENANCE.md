@@ -23,8 +23,10 @@ The generation runners encode the signing commands. Only selected signed inputs 
 construction inputs are retained; unrelated output from the broader baseline generator
 is excluded. The `expected-*.bin` files are independently captured libxmlsec1 vectors,
 never Rust outputs. Every retained vector is checked against fresh execution in CI.
-The `*expectations.json` files pin the observed behavior of DSS 6.5.1, including known
-disagreements with the normative profile; they are consumed by the same live check.
+The `*expectations.json` files record the observed behavior of the DSS release current when
+they were reviewed, including known disagreements with the normative profile; every run
+compares the current release with them, so a change in a new release fails the check
+instead of passing unnoticed.
 Actual Rust/replay bytes, computed comparisons, tool/dependency snapshots, full DSS
 reports, stdout/stderr, build logs and command captures remain run artifacts, excluded
 from Git and the distributable bundle.

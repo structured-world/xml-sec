@@ -594,7 +594,11 @@ fn augment(args: &[String], samples: Option<timing::Sampling>) -> Result<(), Str
     let signature = signature_id(&text).ok_or("the document has no signature with an Id")?;
     let carried = tokens::values(&text, "X509Certificate");
     let authorities = if seconds.is_some() {
-        tokens::token_authorities(&text, &carried)?
+        let (authorities, unreadable) = tokens::token_authorities(&text, &carried);
+        if let Some(failure) = unreadable.into_iter().next() {
+            return Err(failure);
+        }
+        authorities
     } else {
         Vec::new()
     };

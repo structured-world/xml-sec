@@ -1,12 +1,58 @@
-//! `xades dss [--results DIR] [--summarize]`: builds a pinned local EU DSS
-//! probe and keeps its independent profile reports. Maven downloads public
-//! build dependencies; validation reads only local corpus inputs.
+//! `xades dss [--results DIR] [--summarize]`: builds a local EU DSS probe
+//! against the current DSS release and keeps its independent profile reports.
+//! Maven downloads public build dependencies; validation reads only local
+//! corpus inputs.
 
 use super::{Corpus, absolute, line, read, write_json, xml};
 use serde_json::{Map, Value, json};
 use std::path::{Path, PathBuf};
 
-const MAVEN: &str = "3.9.12";
+#[cfg(test)]
+mod tests;
+
+/// Maven Central's version list of DSS's `XAdES` module.
+const DSS_METADATA: &str =
+    "https://repo.maven.apache.org/maven2/eu/europa/ec/joinup/sd-dss/dss-xades/maven-metadata.xml";
+/// Maven Central's version list of the Maven distribution.
+const MAVEN_METADATA: &str =
+    "https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/maven-metadata.xml";
+/// Maven Central's version list of the logging binding DSS's reports go through.
+const SLF4J_METADATA: &str =
+    "https://repo.maven.apache.org/maven2/org/slf4j/slf4j-simple/maven-metadata.xml";
+
+/// The DSS, Maven and slf4j releases one run builds against, resolved from
+/// Maven Central when it starts: nothing in the repository fixes any of them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Release {
+    pub(crate) dss: String,
+    pub(crate) maven: String,
+    pub(crate) slf4j: String,
+}
+
+impl Release {
+    /// The versions as the run records them.
+    pub(crate) fn json(&self) -> Value {
+        json!({ "dss": self.dss, "maven": self.maven, "slf4j": self.slf4j })
+    }
+}
+
+/// The highest release a Maven `metadata` document lists: a version whose
+/// every dot-separated part is a number. A pre-release (`6.5.RC1`,
+/// `4.0.0-rc-7`, `3.0-alpha-2`) is not a release.
+pub(crate) fn newest_release(metadata: &str) -> Result<String, String> {
+    let document = xml::parse(metadata, "Maven metadata")?;
+    let parts = |version: &str| -> Option<Vec<u64>> {
+        version.split('.').map(|part| part.parse().ok()).collect()
+    };
+    xml::below(document.root_element(), "version", None)
+        .filter_map(|node| {
+            let version = node.text()?.trim();
+            Some((parts(version)?, version.to_owned()))
+        })
+        .max()
+        .map(|(_, version)| version)
+        .ok_or_else(|| "Maven metadata lists no release".to_owned())
+}
 
 /// The cases DSS validates. The deliberate external-URI fixtures are never
 /// given to another validator.
@@ -22,13 +68,45 @@ pub(crate) const CASES: [&str; 9] = [
     "baseline-certificate-digest-mismatch",
 ];
 
-/// The pinned Maven and its repository, outside the corpus.
+/// The Maven distributions and their repository, outside the corpus.
 pub(crate) fn tools(corpus: &Corpus) -> PathBuf {
     corpus.root.join(".tools/xades-dss")
 }
 
-pub(crate) fn maven(corpus: &Corpus) -> PathBuf {
-    tools(corpus).join(format!("apache-maven-{MAVEN}/bin/mvn"))
+/// The `mvn` of the Maven release `version`.
+pub(crate) fn maven(corpus: &Corpus, version: &str) -> PathBuf {
+    tools(corpus).join(format!("apache-maven-{version}/bin/mvn"))
+}
+
+/// `curl` arguments that fetch `url` into `output`. Maven Central answers
+/// shared CI addresses with 429 under load; curl retries it, honouring
+/// Retry-After. A retry rewrites `output` from its start.
+pub(crate) fn fetch(url: &str, output: &Path) -> Vec<std::ffi::OsString> {
+    line(&[
+        &"curl",
+        &"--fail",
+        &"--silent",
+        &"--show-error",
+        &"--retry",
+        &"5",
+        &"--output",
+        &output,
+        &url,
+    ])
+}
+
+/// The current DSS, Maven and slf4j releases, read from Maven Central into `logs`.
+pub(crate) fn resolve(corpus: &Corpus, logs: &Path) -> Result<Release, String> {
+    let newest = |url: &str, name: &str| -> Result<String, String> {
+        let file = logs.join(format!("{name}-metadata.xml"));
+        corpus.require(&fetch(url, &file), &logs.join(format!("{name}-metadata")))?;
+        newest_release(&xml::read(&file)?)
+    };
+    Ok(Release {
+        dss: newest(DSS_METADATA, "dss")?,
+        maven: newest(MAVEN_METADATA, "maven")?,
+        slf4j: newest(SLF4J_METADATA, "slf4j")?,
+    })
 }
 
 /// The probe classes and their resolved dependency classpath.
@@ -157,37 +235,19 @@ pub(crate) fn summarize(logs: &Path) -> Result<Vec<Value>, String> {
     Ok(summary)
 }
 
-/// Downloads and checks the pinned Maven distribution once.
-fn bootstrap(corpus: &Corpus, logs: &Path) -> Result<(), String> {
+/// Downloads and checks the Maven distribution `version` once.
+fn bootstrap(corpus: &Corpus, version: &str, logs: &Path) -> Result<(), String> {
     use sha2::Digest as _;
     let tools = tools(corpus);
     let archive = tools.join("maven.tar.gz");
     let url = format!(
-        "https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/{MAVEN}/apache-maven-{MAVEN}-bin.tar.gz"
+        "https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/{version}/apache-maven-{version}-bin.tar.gz"
     );
-    // Maven Central answers shared CI addresses with 429 under load; curl
-    // retries it, honouring Retry-After.
-    let curl = |extra: &[&dyn AsRef<std::ffi::OsStr>]| {
-        let mut args = line(&[
-            &"curl",
-            &"--fail",
-            &"--silent",
-            &"--show-error",
-            &"--retry",
-            &"5",
-        ]);
-        args.extend(line(extra));
-        args
-    };
-    corpus.require(
-        &curl(&[&"--output", &archive, &url]),
-        &logs.join("download"),
-    )?;
-    // The checksum goes to a file: a retry rewrites a file from its start,
-    // where it would append to captured stdout.
+    corpus.require(&fetch(&url, &archive), &logs.join("download"))?;
+    // The checksum goes to a file, not captured stdout, so a retry replaces it.
     let checksum = tools.join("maven.tar.gz.sha512");
     corpus.require(
-        &curl(&[&"--output", &checksum, &format!("{url}.sha512")]),
+        &fetch(&format!("{url}.sha512"), &checksum),
         &logs.join("download-sha512"),
     )?;
     let published = read(&checksum)?;
@@ -203,14 +263,16 @@ fn bootstrap(corpus: &Corpus, logs: &Path) -> Result<(), String> {
         .map_err(|error| format!("unpack Maven: {error}"))
 }
 
-/// Builds the probes against DSS, bootstrapping the pinned Maven once.
-pub(crate) fn build(corpus: &Corpus, logs: &Path) -> Result<(), String> {
+/// Builds the probes against the current DSS release with the current Maven,
+/// bootstrapping that Maven once, and records both versions in `logs`.
+pub(crate) fn build(corpus: &Corpus, logs: &Path) -> Result<Release, String> {
     let tools = tools(corpus);
     std::fs::create_dir_all(&tools).map_err(|error| error.to_string())?;
     std::fs::create_dir_all(logs).map_err(|error| error.to_string())?;
-    let mvn = maven(corpus);
+    let release = resolve(corpus, logs)?;
+    let mvn = maven(corpus, &release.maven);
     if !mvn.exists() {
-        bootstrap(corpus, logs)?;
+        bootstrap(corpus, &release.maven, logs)?;
     }
     let package = corpus.package();
     // Build output stays under target, so the repository's cargo clean removes it.
@@ -220,6 +282,8 @@ pub(crate) fn build(corpus: &Corpus, logs: &Path) -> Result<(), String> {
         &"-f",
         &package.join("dss/pom.xml"),
         &format!("-Dmaven.repo.local={}", tools.join("repository").display()),
+        &format!("-Ddss.version={}", release.dss),
+        &format!("-Dslf4j.version={}", release.slf4j),
     ]);
     let mut build = maven.clone();
     build.extend(line(&[
@@ -238,7 +302,8 @@ pub(crate) fn build(corpus: &Corpus, logs: &Path) -> Result<(), String> {
         &format!("-DoutputFile={}", logs.join("dependencies.json").display()),
     ]));
     corpus.require(&maven, &logs.join("dependencies"))?;
-    Ok(())
+    write_json(&logs.join("versions.json"), &release.json())?;
+    Ok(release)
 }
 
 /// Builds the probe and validates every case with DSS.
@@ -246,7 +311,7 @@ pub(crate) fn execute(corpus: &Corpus, logs: &Path) -> Result<(), String> {
     if logs.exists() {
         return Err("results already exist; select a fresh --results directory".into());
     }
-    build(corpus, logs)?;
+    let release = build(corpus, logs)?;
     let package = corpus.package();
     let cases: Value = serde_json::from_str(&xml::read(&package.join("cases.json"))?)
         .map_err(|error| error.to_string())?;
@@ -277,7 +342,8 @@ pub(crate) fn execute(corpus: &Corpus, logs: &Path) -> Result<(), String> {
         return Err("DSS cryptographic control failed; inspect retained reports".into());
     }
     println!(
-        "EU DSS 6.5.1: {} local profile reports saved to {}",
+        "EU DSS {}: {} local profile reports saved to {}",
+        release.dss,
         CASES.len(),
         logs.display()
     );

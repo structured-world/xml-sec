@@ -900,7 +900,7 @@ pub(crate) fn execute(corpus: &Corpus, results: &Path, record: bool) -> Result<(
         return Err("results already exist; select a fresh --results directory".into());
     }
     std::fs::create_dir_all(results).map_err(|error| error.to_string())?;
-    super::dss::build(corpus, &results.join("dss-build"))?;
+    let release = super::dss::build(corpus, &results.join("dss-build"))?;
     let run = Run {
         corpus,
         results: results.to_owned(),
@@ -940,14 +940,15 @@ pub(crate) fn execute(corpus: &Corpus, results: &Path, record: bool) -> Result<(
                 (name, json!({ "steps": row["steps"] }))
             })
             .collect();
-        // The reviewed explanations outlive a new recording.
+        // The reviewed explanations outlive a new recording; `dss` names the
+        // release the outcomes were recorded against.
         let notes = xml::read(&path)
             .ok()
             .and_then(|text| serde_json::from_str::<Value>(&text).ok())
             .map_or(Value::Null, |previous| previous["notes"].clone());
         return write_json(
             &path,
-            &json!({ "dss": "6.5.1", "notes": notes, "cases": cases }),
+            &json!({ "dss": release.dss, "notes": notes, "cases": cases }),
         );
     }
     let expected: Value = serde_json::from_str(&xml::read(&path)?)

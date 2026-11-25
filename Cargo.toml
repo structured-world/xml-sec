@@ -310,7 +310,7 @@ winnow ={ version = "1.0.4", default-features = false, features = ["parser"], op
 snafu = { version = "0.9", default-features = false, features = ["rust_1_81"], optional = true }
 
 # Crypto
-structured-dstu4145 = { version = "0.25", default-features = false, features = ["alloc"], optional = true }
+structured-dstu4145 = { version = "0.28", default-features = false, features = ["alloc"], optional = true }
 # Holds the prepared GOST substitution tables that digest states borrow.
 once_cell = { version = "1", default-features = false, features = ["alloc", "race"], optional = true }
 cryptoki = { version = "0.12.1", optional = true }
@@ -367,10 +367,10 @@ ripemd = { version = "0.2.0", default-features = false, features = ["oid", "zero
 
 # X.509 certificates, the seeded hashing of every table keyed by document
 # content, and the incremental HMAC of the HMAC signature methods.
-structured-asn1 = { version = "0.25", default-features = false, features = ["alloc"] }
-structured-pkix = { version = "0.25", default-features = false, features = ["alloc"], optional = true }
+structured-asn1 = { version = "0.28", default-features = false, features = ["alloc"] }
+structured-pkix = { version = "0.28", default-features = false, features = ["alloc"], optional = true }
 # PKCS#12 containers and their password engine, OpenSSL traditional private keys.
-structured-cms = { version = "0.25", default-features = false, features = ["alloc"], optional = true }
+structured-cms = { version = "0.28", default-features = false, features = ["alloc"], optional = true }
 tinyvec = { version = "1.13", optional = true }
 # `pem` is RFC 7468 decoding of caller key and certificate text.
 der = { version = "0.8", default-features = false, features = ["alloc", "pem"], optional = true }
@@ -385,7 +385,7 @@ time = { version = "0.3.55", features = ["local-offset"], optional = true }
 url = { version = "2", optional = true }
 
 # Base64 of XMLDSig and XMLEnc values and the Base64 transform.
-structured-base64 = { version = "0.25", features = ["alloc"], optional = true }
+structured-base64 = { version = "0.28", features = ["alloc"], optional = true }
 
 # Error handling
 thiserror = { version = "2", default-features = false }

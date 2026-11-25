@@ -20,7 +20,7 @@ xml-sec-config = { path = "../xml-sec-config", features = ["experimental-pq"] }
 # C `fputs` for debug dumps to a caller's `FILE*`.
 libc = "0.2"
 # The resumable Base64 codec behind `xmlSecBase64Ctx`.
-structured-base64 = "0.25"
+structured-base64 = "0.28"
 # Private keys held by key data are wiped when released.
 zeroize = "1"
 

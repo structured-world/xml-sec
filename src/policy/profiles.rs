@@ -12,7 +12,7 @@ use super::{
     KeyDerivationAlgorithm, KeyEstablishmentPolicy, KeySourceKind, KeySourcePolicy,
     PolicyViolation, RelationshipTargetModeSemantics, RequestSelections, RsaPssPermission,
     SameDocumentIdSemantics, SignatureAlgorithm, SigningPolicy, TransformPolicy, TrustAnchorSigner,
-    UnknownX509CertificateSemantics, UriPolicy, UriTypeSet, VerificationPolicy,
+    UnknownX509CertificateSemantics, UriPolicy, UriTypeSet, VerificationPolicy, XadesSyntax,
     XsltStylesheetSemantics,
 };
 use crate::provider::{CryptoProvider, KeyEncapsulationAlgorithm, ProviderCapability};
@@ -554,6 +554,8 @@ fn verification_profile(
         verification.key_trust.dsa_keys.minimum_modulus_bits = 1024;
         // ETSI EN 319 102-1 V1.4.1 5.2.6.4 step 1(b), as EU DSS applies it.
         verification.key_trust.trust_anchor_signer = TrustAnchorSigner::Accepted;
+        // Signatures made before EN 319 132-1 under ETSI TS 101 903 V1.2.2.
+        verification.xades_syntax = XadesSyntax::WithTs101903V122;
     }
     if compatibility {
         verification.key_trust.allowed_legacy_signature_algorithms = verification

@@ -12,6 +12,7 @@ use structured_pkix::signature::SignatureValue;
 use structured_pkix::temporal::Instant;
 use structured_pkix::{AlgorithmIdentifier, Certificate};
 use xml_sec::document::NodeIdentity;
+use xml_sec::policy::TrustAnchorSigner;
 use xml_sec::xmldsig::extension::{self, NodeView};
 use xml_sec::xmldsig::{KeyTrustEvidence, VerifiedSession, X509ChainError, X509TrustEvidence};
 
@@ -26,9 +27,6 @@ pub enum PathFailure {
     /// Verification established no X.509 path for this signer (for example a
     /// caller-trusted key or cryptographic-only verification).
     NotValidated,
-    /// The validated path consists of the trust anchor alone, so it has no
-    /// certification path to check (RFC 5280 §6.1 excludes the anchor).
-    AnchorOnly,
     /// A certificate of the validated path is neither in this Signature's
     /// `KeyInfo` nor in the caller's certificate pool.
     MissingCertificate,
@@ -332,13 +330,42 @@ fn checked<'d, W: Work, Q: Work>(
         return Ok(Err(PathFailure::MissingCertificate));
     };
     if members.is_empty() {
-        return Ok(Err(PathFailure::AnchorOnly));
+        return direct(session, &certificates[*anchor], interval, work);
     }
     let mut chain = work.vector();
     for position in members {
         chain.try_push(&certificates[*position])?;
     }
     check_chain(session, &chain, &certificates[*anchor], interval, work)
+}
+
+/// The signer verification took as a trust anchor itself, bound to that exact
+/// certificate (EN 319 102-1 V1.4.1 §5.2.6.4 step 1). Under
+/// `TrustAnchorSigner::Accepted` the anchor is trusted throughout, its validity
+/// included (step 1(b)); otherwise it is held to its validity over `interval`
+/// as any path certificate is (RFC 5280 §6.1.3(a)(2)).
+fn direct<'d, W: Work, Q: Work>(
+    session: &VerifiedSession<'_, '_, '_, W>,
+    anchor: &'d Certificate<'d>,
+    interval: Interval,
+    work: &Q,
+) -> Result<Result<CheckedPath<'d>, PathFailure>, Error> {
+    let validity = anchor.tbs().validity();
+    if session.trust_anchor_signer() == TrustAnchorSigner::Validated
+        && !(validity.not_before().instant() <= interval.from_instant()
+            && interval.to_instant() <= validity.not_after().instant())
+    {
+        return Ok(Err(PathFailure::Rejected));
+    }
+    let checked = structured_ltv::pki::check_direct_anchor(
+        anchor,
+        Anchor::from_certificate(anchor),
+        interval,
+        work,
+    )
+    .map_err(X509ChainError::Processing)?;
+    // The target is the anchor's own certificate, so the bytes always agree.
+    Ok(checked.ok_or(PathFailure::Rejected))
 }
 
 /// One leaf-first chain through the shared processor over `interval`, with the
@@ -360,7 +387,12 @@ pub(crate) fn check_chain<'d, W: Work, Q: Work>(
         watch: &(),
         recognizer: &(),
     };
-    match structured_ltv::pki::check_path(chain, Anchor::from_certificate(anchor), &context) {
+    match structured_ltv::pki::check_path_with_validity(
+        chain,
+        Anchor::from_certificate(anchor),
+        &context,
+        session.certificate_path_validity(),
+    ) {
         Ok(PathOutcome::Accepted(path)) => Ok(Ok(path)),
         Ok(PathOutcome::Rejected(_)) => Ok(Err(PathFailure::Rejected)),
         Ok(PathOutcome::Incomplete(reason)) => Ok(Err(PathFailure::Incomplete(reason))),
@@ -426,7 +458,12 @@ pub(crate) fn discover<'d, W: Work>(
         watch: &(),
         recognizer: &(),
     };
-    let found = match structured_pkix::path::build(target, authorities.pool, &context) {
+    let found = match structured_pkix::path::build_with_validity(
+        target,
+        authorities.pool,
+        &context,
+        session.certificate_path_validity(),
+    ) {
         Ok(found) => found,
         Err(BuildError::Processing(error)) => return Err(X509ChainError::Processing(error).into()),
         Err(BuildError::Verification(never) | BuildError::Recognition(never)) => match never {},

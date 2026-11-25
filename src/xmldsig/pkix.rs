@@ -306,12 +306,21 @@ pub(crate) fn verify_crls<'a>(
         let target = path[position];
         let mut reasons = structured_pkix::crl::Reasons::NONE;
         let lists = authenticated_crls(&crls, issuer, issuer_key, position, &verifier, session)?;
+        // An issuing certificate under the chain model answers for the
+        // issuance of the certificate below it.
+        let issuance = match (options.validity_model, position.checked_sub(1)) {
+            (crate::policy::CertificateValidityModel::Chain, Some(below)) => {
+                Some(issuer_time(path[below], options, session)?)
+            }
+            _ => None,
+        };
         for list in lists.iter().filter(|list| !list.delta) {
             let evaluation = CrlEvaluation {
                 utc: options.utc_facts.as_ref(),
                 now,
                 index: list.index,
                 position,
+                issued: issuance,
             };
             let covered = match newest_delta(list, &lists, session)? {
                 Some((delta, pair)) => delta_reasons(pair, target, delta, evaluation, session)?,
@@ -525,6 +534,9 @@ struct CrlEvaluation<'u> {
     now: structured_pkix::temporal::Reading,
     index: usize,
     position: usize,
+    /// Under the chain model, when the issuer this list speaks for issued its
+    /// subordinate in the path.
+    issued: Option<crate::policy::Instant>,
 }
 
 /// The caller's UTC history, a fact and no implicit clock/table default: `None`
@@ -579,14 +591,7 @@ fn crl_reasons<'a>(
             return Err(X509ChainError::InvalidCrl(evaluation.index));
         }
     };
-    validate_complete_crl(
-        facts,
-        evaluation.now,
-        utc,
-        session,
-        evaluation.index,
-        evaluation.position,
-    )?;
+    validate_complete_crl(facts, evaluation, utc, session)?;
     execution.charge_work(1).map_err(|reason| {
         session.error(structured_pkix::Error::resource(
             reason,
@@ -696,6 +701,7 @@ fn validate_delta_entry(
                 now: evaluation.now,
                 utc,
                 position: evaluation.position,
+                issued: evaluation.issued,
             },
             session,
         ),
@@ -711,6 +717,8 @@ struct RevocationCheck<'u> {
     now: structured_pkix::temporal::Reading,
     utc: &'u structured_pkix::temporal::LeapTable<'u>,
     position: usize,
+    /// Under the chain model, when this issuer issued its subordinate.
+    issued: Option<crate::policy::Instant>,
 }
 
 /// An entry revokes from its date on; a later date is not yet in effect.
@@ -720,13 +728,46 @@ fn revocation_in_effect(
     check: RevocationCheck<'_>,
     session: &CertificateSession,
 ) -> Result<(), X509ChainError> {
+    use structured_pkix::crl::Reason;
     use structured_pkix::time::Relation;
-    match entry
-        .time_relation(check.now, check.utc, session.memory())
-        .map_err(|error| session.error(error))?
-    {
-        Relation::Before | Relation::At => Err(X509ChainError::Revoked(check.position)),
+    let relation = |at| {
+        entry
+            .time_relation(at, check.utc, session.memory())
+            .map_err(|error| session.error(error))
+    };
+    match relation(check.now)? {
+        Relation::Before | Relation::At => {}
+        Relation::After => return Ok(()),
+        Relation::Uncertain(reason) => {
+            return Err(X509ChainError::CrlTimeUncertain { index, reason });
+        }
+    }
+    // Under the chain model an issuer revoked after it issued its subordinate
+    // still issued it validly, unless the stated reason puts its key in doubt:
+    // an unknown reason, a compromise or a hold reach back (EN 319 102-1
+    // V1.4.1 5.2.6.4 step 4, Common PKI v2.0 Part 9 section 6), as the shared
+    // status assessment decides.
+    // https://www.etsi.org/deliver/etsi_en/319100_319199/31910201/01.04.01_60/en_31910201v010401p.pdf
+    let Some(issued) = check.issued else {
+        return Err(X509ChainError::Revoked(check.position));
+    };
+    let reason = entry
+        .reason(session.memory())
+        .map_err(|error| session.error(error))?;
+    if !matches!(
+        reason,
+        Some(
+            Reason::AffiliationChanged
+                | Reason::Superseded
+                | Reason::CessationOfOperation
+                | Reason::PrivilegeWithdrawn
+        )
+    ) {
+        return Err(X509ChainError::Revoked(check.position));
+    }
+    match relation(issued.into())? {
         Relation::After => Ok(()),
+        Relation::Before | Relation::At => Err(X509ChainError::Revoked(check.position)),
         Relation::Uncertain(reason) => Err(X509ChainError::CrlTimeUncertain { index, reason }),
     }
 }
@@ -758,13 +799,12 @@ fn read_crl_pool<'a>(
 
 fn validate_complete_crl(
     facts: structured_pkix::crl::CompleteFacts<'_, '_, '_>,
-    now: structured_pkix::temporal::Reading,
+    evaluation: CrlEvaluation<'_>,
     utc: &structured_pkix::temporal::LeapTable<'_>,
     session: &CertificateSession,
-    index: usize,
-    position: usize,
 ) -> Result<(), X509ChainError> {
     use structured_pkix::crl::{EntryLookup, Freshness};
+    let index = evaluation.index;
     match facts.freshness() {
         Freshness::Current | Freshness::AtNextUpdate => (),
         Freshness::Uncertain(reason) => {
@@ -778,7 +818,12 @@ fn validate_complete_crl(
             revocation_in_effect(
                 entry,
                 index,
-                RevocationCheck { now, utc, position },
+                RevocationCheck {
+                    now: evaluation.now,
+                    utc,
+                    position: evaluation.position,
+                    issued: evaluation.issued,
+                },
                 session,
             )?;
         }
@@ -824,6 +869,41 @@ pub(crate) fn path_bounds(max_chain_depth: usize) -> structured_pkix::path::Vali
     }
 }
 
+/// The shared path processor's rules for `model`; the signing certificate is
+/// always held to the validation time.
+pub(crate) fn path_validity(
+    model: crate::policy::CertificateValidityModel,
+) -> structured_pkix::path::ValidityPolicy {
+    use crate::policy::CertificateValidityModel;
+    use structured_pkix::path::{TargetValidity, ValidityModel, ValidityPolicy};
+    ValidityPolicy {
+        model: match model {
+            CertificateValidityModel::Shell => ValidityModel::Shell,
+            CertificateValidityModel::Chain => ValidityModel::Chain,
+        },
+        target: TargetValidity::Required,
+    }
+}
+
+/// When the issuer of `subordinate` must have been valid and unrevoked: the
+/// validation time under the shell model, the subordinate's issuance under the
+/// chain model (Common PKI v2.0 Part 9 section 6, as ETSI EN 319 102-1 V1.4.1
+/// 5.2.6.4 step 4 invokes it).
+pub(crate) fn issuer_time(
+    subordinate: &Certificate<'_>,
+    options: &super::x509::X509ChainOptions<'_>,
+    session: &CertificateSession,
+) -> Result<crate::policy::Instant, X509ChainError> {
+    match options.validity_model {
+        crate::policy::CertificateValidityModel::Shell => Ok(options.verification_time),
+        crate::policy::CertificateValidityModel::Chain => {
+            structured_pkix::path::issuance_time(subordinate, session.memory())
+                .map(structured_pkix::Time::instant)
+                .map_err(|error| session.error(error))
+        }
+    }
+}
+
 pub(crate) fn validate_supplied_path<'a>(
     chain: &[&'a Certificate<'a>],
     anchor: &'a Certificate<'a>,
@@ -857,13 +937,18 @@ pub(crate) fn validate_supplied_path<'a>(
         watch: &(),
         recognizer: &(),
     };
-    let result = structured_pkix::path::validate(chain, Anchor::from_certificate(anchor), &context)
-        .map_err(|error| match error {
-            BuildError::Processing(error)
-            | BuildError::Verification(X509ChainError::Processing(error)) => session.error(error),
-            BuildError::Verification(error) => error,
-            BuildError::Recognition(never) => match never {},
-        })?;
+    let result = structured_pkix::path::validate_with_validity(
+        chain,
+        Anchor::from_certificate(anchor),
+        &context,
+        path_validity(options.validity_model),
+    )
+    .map_err(|error| match error {
+        BuildError::Processing(error)
+        | BuildError::Verification(X509ChainError::Processing(error)) => session.error(error),
+        BuildError::Verification(error) => error,
+        BuildError::Recognition(never) => match never {},
+    })?;
     match result {
         Validation::Accepted(facts) => Ok(facts),
         Validation::Incomplete(reason) => Err(X509ChainError::PathIncomplete(reason)),
@@ -1660,6 +1745,17 @@ pub(crate) enum SpkiAlgorithm {
     Other,
 }
 
+/// What a standalone EC SPKI names for ECDSA verification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EcNamedPoint {
+    /// A curve this build verifies with, and the range of the SEC1 point.
+    Supported(super::signature::EcCurve, core::ops::Range<usize>),
+    /// A well-formed named curve this build does not verify with.
+    UnsupportedCurve,
+    /// Another key, explicit curve parameters or a malformed encoding.
+    Malformed,
+}
+
 /// Structure of an RSA or EC public key, borrowed from its SPKI encoding.
 pub(crate) enum PublicKey<'a> {
     Rsa(structured_pkix::key::rsa::PublicKey<'a>),
@@ -1895,31 +1991,34 @@ impl CertificateSession {
     }
 
     /// Supported named curve and range of the SEC1 point inside a standalone
-    /// EC SPKI; `None` for another key, curve choice or malformed encoding.
+    /// EC SPKI.
     ///
     /// # Errors
     /// The reader's resource refusal under this session's account.
     pub(crate) fn ec_named_point(
         &self,
         spki: &[u8],
-    ) -> Result<Option<(super::signature::EcCurve, core::ops::Range<usize>)>, structured_pkix::Error>
-    {
+    ) -> Result<EcNamedPoint, structured_pkix::Error> {
         let Some(PublicKey::Ec(key)) = refused_as_none(self.read_public_key(spki))? else {
-            return Ok(None);
+            return Ok(EcNamedPoint::Malformed);
         };
         let structured_pkix::key::ec::Curve::Named(curve) = key.curve() else {
-            return Ok(None);
+            // Explicit parameters are a curve choice RFC 5480 §2.1.1 forbids
+            // in PKIX, not one of the named curves this build lacks.
+            return Ok(EcNamedPoint::Malformed);
         };
         let Some(curve) = super::signature::EcCurve::from_oid_bytes(curve.as_bytes()) else {
-            return Ok(None);
+            return Ok(EcNamedPoint::UnsupportedCurve);
         };
         // The SPKI is read at document offset zero, so source offsets index it.
         let Ok(start) = usize::try_from(key.offset()) else {
-            return Ok(None);
+            return Ok(EcNamedPoint::Malformed);
         };
         Ok(start
             .checked_add(key.as_bytes().len())
-            .map(|end| (curve, start..end)))
+            .map_or(EcNamedPoint::Malformed, |end| {
+                EcNamedPoint::Supported(curve, start..end)
+            }))
     }
 
     /// RSA key of a standalone SPKI whose algorithm identifier `admit` accepts.
@@ -2977,6 +3076,7 @@ mod tests {
             rsa_keys: crate::policy::RsaKeyPolicy::default(),
             dsa_keys: crate::policy::DsaKeyPolicy::default(),
             certificate_signature_algorithms: None,
+            validity_model: crate::policy::CertificateValidityModel::Shell,
         };
         let validation = validate_supplied_path(
             &[&parsed],

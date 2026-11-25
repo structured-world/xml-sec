@@ -7,6 +7,9 @@
 //! no signature is verified again. [`validate_basic`] runs the B-B checks of
 //! ETSI EN 319 132-1 for one selected signature, and [`validate`] any level up
 //! to B-LTA over the document's own timestamps and validation material.
+//! Under a policy that admits ETSI TS 101 903 V1.2.2, [`validate_ts101903`]
+//! validates the BES form of a signature in that syntax, to which the
+//! EN 319 132-1 levels do not apply.
 //!
 //! Signer paths are the paths xml-sec already validated: the adapter selects
 //! the exact certificates recorded in each signature's X.509 trust evidence and
@@ -69,6 +72,7 @@ mod path;
 mod placement;
 mod signature;
 mod status;
+mod ts101903;
 mod xml;
 
 pub use accuracy::AuthorityAccuracy;
@@ -79,8 +83,8 @@ pub use augment::{
     request_archive_timestamp_with_renewal, request_timestamp,
 };
 pub use basic::{
-    CounterError, Outcome, PathFailure, Report, TimestampCheckError, ValidationError,
-    validate_basic,
+    CounterError, EnclosingError, Outcome, PathFailure, Report, TimestampCheckError,
+    ValidationError, validate_basic,
 };
 pub use binary::DigestIdentity;
 #[cfg(feature = "produce")]
@@ -95,7 +99,9 @@ pub use level::{
 };
 pub use path::CounterPathError;
 pub use status::{StatusError, StatusFailure};
+pub use structured_xades::container::Syntax;
 pub use structured_xades::unsigned::Requirements;
+pub use ts101903::{Ts101903Error, Ts101903Report, validate_ts101903};
 
 /// Original document identity and generation, as seen by the shared core.
 pub type Snapshot = structured_xades::xml::Snapshot<DocumentIdentity, u64>;

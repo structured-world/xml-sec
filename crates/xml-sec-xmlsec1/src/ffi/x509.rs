@@ -323,6 +323,7 @@ fn check(
             .key_trust
             .certificate_signature_algorithms
             .as_ref(),
+        validity_model: policy.key_trust.validity_model,
     };
     let target = &certs[index];
     let parsed = parse_x509_certificate_with_resources(target, resources).map_err(|error| {

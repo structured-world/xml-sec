@@ -97,11 +97,22 @@ final class Lifecycle {
      * document's own material is.
      */
     static CommonCertificateVerifier verifier(byte[] anchor, Path evidence) throws Exception {
+        return verifier(List.of(anchor), evidence);
+    }
+
+    /** As {@link #verifier(byte[], Path)}, trusting every one of {@code anchors}. */
+    static CommonCertificateVerifier verifier(List<byte[]> anchors, Path evidence) throws Exception {
         var verifier = new CommonCertificateVerifier();
         verifier.setAIASource(null);
-        var anchors = new CommonTrustedCertificateSource();
-        anchors.addCertificate(DSSUtils.loadCertificate(anchor));
-        verifier.setTrustedCertSources(anchors);
+        var trusted = new CommonTrustedCertificateSource();
+        for (var index = 0; index < anchors.size(); index++) {
+            try {
+                trusted.addCertificate(DSSUtils.loadCertificate(anchors.get(index)));
+            } catch (RuntimeException error) {
+                throw new IllegalArgumentException("anchor " + index + " cannot be loaded", error);
+            }
+        }
+        verifier.setTrustedCertSources(trusted);
         var certificates = new CommonCertificateSource();
         List<DSSDocument> crls = new ArrayList<>();
         List<DSSDocument> responses = new ArrayList<>();
