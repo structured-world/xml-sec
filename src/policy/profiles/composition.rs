@@ -504,6 +504,10 @@ fn key_trust(a: &KeyTrustPolicy, b: &KeyTrustPolicy) -> Result<KeyTrustPolicy, P
         } else {
             TrustAnchorSigner::Validated
         },
+        // Neither model is narrower: chain accepts a path through an issuer
+        // that expired after issuing, shell one that issued before its own
+        // validity began. Layers must agree.
+        validity_model: equal(a.validity_model, b.validity_model)?,
     })
 }
 

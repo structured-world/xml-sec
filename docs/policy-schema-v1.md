@@ -122,6 +122,18 @@ does not itself establish trust or supply a key.
 | `verification_time` | `"system"` or explicit timestamp below |
 | `unknown_x509_certificate` | `References`, `Libxmlsec1` |
 | `trust_anchor_signer` | `Validated`, `Accepted` |
+| `validity_model` | `Shell`, `Chain` |
+
+`validity_model` is the validity model ETSI EN 319 102-1 V1.4.1 5.2.6.4 step 4
+lets the X.509 validation constraints select. `Shell` (RFC 5280 6.1.3(a)(2))
+holds every certificate of the path, the configured anchor included, to the
+validation time. `Chain` (Common PKI v2.0 Part 9 section 6) holds each issuer,
+the anchor included, to the issuance of its subordinate: the subordinate's
+`DateOfCertGen` or, without it, its `notBefore`; a revocation of an issuer
+after that issuance counts only when its reason is unstated, a compromise or a
+hold. The signing certificate is held to the validation time under both. The
+models are incomparable, so layers must select the same one, and a change of
+either kind is reported as relaxing. Every profile selects `Shell`.
 
 `trust_anchor_signer` decides a signing certificate that is itself a
 configured trust anchor (ETSI EN 319 102-1 V1.4.1 5.2.6.4 step 1):

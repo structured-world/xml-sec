@@ -9,16 +9,17 @@ use xml_sec::xmlenc::{
 };
 use xml_sec::{
     policy::{
-        CertificateSignatureAlgorithms, CompiledPolicies, DetachedDigestAttestation, DsaKeyPolicy,
-        EcdsaSignatureValueEncoding, EmptyDigestInput, ExtendedKeyPurpose,
-        GeneratedCanonicalization, HmacPolicy, Instant, KemContentAuthentication,
-        KemSignatureTrust, KeyAgreementAlgorithm, KeyDerivationAlgorithm, KeyEstablishmentPolicy,
-        KeyNameSemantics, KeySourceKind, KeySourcePolicy, KeyTrustPolicy, ManifestProcessing,
-        OpcRelationshipEdition, PolicySet, PolicyValidity, RelationshipTargetModeSemantics,
-        RequestSelections, ResourcePolicy, RsaKeyPolicy, RsaPssPermission, SameDocumentIdSemantics,
-        SignatureConstraints, SigningPolicy, TimestampTokenEncoding, TransformPolicy,
-        TrustAnchorSigner, UnknownX509CertificateSemantics, UriPolicy, VerificationPolicy,
-        VerificationTrustMode, XadesSyntax, XmlInputPolicy, XsltStylesheetSemantics,
+        CertificateSignatureAlgorithms, CertificateValidityModel, CompiledPolicies,
+        DetachedDigestAttestation, DsaKeyPolicy, EcdsaSignatureValueEncoding, EmptyDigestInput,
+        ExtendedKeyPurpose, GeneratedCanonicalization, HmacPolicy, Instant,
+        KemContentAuthentication, KemSignatureTrust, KeyAgreementAlgorithm, KeyDerivationAlgorithm,
+        KeyEstablishmentPolicy, KeyNameSemantics, KeySourceKind, KeySourcePolicy, KeyTrustPolicy,
+        ManifestProcessing, OpcRelationshipEdition, PolicySet, PolicyValidity,
+        RelationshipTargetModeSemantics, RequestSelections, ResourcePolicy, RsaKeyPolicy,
+        RsaPssPermission, SameDocumentIdSemantics, SignatureConstraints, SigningPolicy,
+        TimestampTokenEncoding, TransformPolicy, TrustAnchorSigner,
+        UnknownX509CertificateSemantics, UriPolicy, VerificationPolicy, VerificationTrustMode,
+        XadesSyntax, XmlInputPolicy, XsltStylesheetSemantics,
     },
     provider::{KeyEncapsulationAlgorithm, X509SignatureAlgorithm},
     xmldsig::{
@@ -530,6 +531,14 @@ fn key_trust(p: &mut KeyTrustPolicy, v: &Value) -> Result<(), Error> {
                     key,
                     TrustAnchorSigner::Validated,
                     TrustAnchorSigner::Accepted
+                );
+            }
+            "validity_model" => {
+                p.validity_model = choice!(
+                    value,
+                    key,
+                    CertificateValidityModel::Shell,
+                    CertificateValidityModel::Chain
                 );
             }
             _ => return Err(invalid(key)),
@@ -1065,6 +1074,7 @@ fn trust_snapshot(p: &KeyTrustPolicy) -> Result<Value, Error> {
         verification_time: _,
         unknown_x509_certificate: _,
         trust_anchor_signer: _,
+        validity_model: _,
     } = p;
     let purpose = |v: &ExtendedKeyPurpose| match v {
         ExtendedKeyPurpose::Other(arcs) => {
@@ -1128,6 +1138,7 @@ fn trust_snapshot(p: &KeyTrustPolicy) -> Result<Value, Error> {
             named(p.unknown_x509_certificate),
         ),
         ("trust_anchor_signer".into(), named(p.trust_anchor_signer)),
+        ("validity_model".into(), named(p.validity_model)),
     ])))
 }
 fn source_snapshot(p: KeySourcePolicy) -> Value {
@@ -1894,5 +1905,22 @@ mod tests {
                 "{field}: {narrow:?} -> {wide:?}"
             );
         }
+    }
+
+    #[test]
+    fn changing_the_certificate_validity_model_relaxes_either_way() {
+        // Each model accepts paths the other refuses, so neither change is a
+        // narrowing a rollout report may call restrictive.
+        let field = "verification.key_trust.validity_model";
+        let shell = Value::String("Shell".into());
+        let chain = Value::String("Chain".into());
+        assert_eq!(
+            direction(field, Some(&shell), Some(&chain)),
+            Direction::Relaxing
+        );
+        assert_eq!(
+            direction(field, Some(&chain), Some(&shell)),
+            Direction::Relaxing
+        );
     }
 }

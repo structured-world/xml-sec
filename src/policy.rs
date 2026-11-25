@@ -1440,6 +1440,24 @@ pub enum TrustAnchorSigner {
     Accepted,
 }
 
+/// When X.509 validation holds each issuing certificate of a path to its
+/// validity period, the validation constraint ETSI EN 319 102-1 V1.4.1
+/// 5.2.6.4 step 4 selects. The signing certificate is always held to the
+/// validation time.
+/// <https://www.etsi.org/deliver/etsi_en/319100_319199/31910201/01.04.01_60/en_31910201v010401p.pdf>
+#[cfg(feature = "xmldsig")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CertificateValidityModel {
+    /// Every certificate, the configured anchor included, is valid at the
+    /// validation time (RFC 5280 6.1.3(a)(2)).
+    #[default]
+    Shell,
+    /// Each issuer, the configured anchor included, was valid when it issued
+    /// its subordinate: at the subordinate's `DateOfCertGen` or, without it,
+    /// its `notBefore` (Common PKI v2.0 Part 9 section 6).
+    Chain,
+}
+
 /// X.509 and key-resolution decisions for verification.
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1482,6 +1500,8 @@ pub struct KeyTrustPolicy {
     pub unknown_x509_certificate: UnknownX509CertificateSemantics,
     /// How a signing certificate that is itself a trust anchor validates.
     pub trust_anchor_signer: TrustAnchorSigner,
+    /// When the issuing certificates of a path must be valid.
+    pub validity_model: CertificateValidityModel,
 }
 
 #[cfg(feature = "xmldsig")]
@@ -1502,6 +1522,7 @@ impl Default for KeyTrustPolicy {
             verification_time: None,
             unknown_x509_certificate: UnknownX509CertificateSemantics::References,
             trust_anchor_signer: TrustAnchorSigner::Validated,
+            validity_model: CertificateValidityModel::Shell,
         }
     }
 }

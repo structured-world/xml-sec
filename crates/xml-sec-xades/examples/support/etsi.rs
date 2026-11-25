@@ -516,7 +516,13 @@ fn checked_over<'a, W: structured_asn1::memory::Work>(
         watch: &(),
         recognizer: &(),
     };
-    match structured_ltv::pki::check_path(chain, Anchor::from_certificate(anchor), &context) {
+    // Step 4's validity model is the X.509 validation constraint of the policy.
+    match structured_ltv::pki::check_path_with_validity(
+        chain,
+        Anchor::from_certificate(anchor),
+        &context,
+        session.certificate_path_validity(),
+    ) {
         Ok(PathOutcome::Accepted(path)) => Ok(path),
         Ok(PathOutcome::Rejected(reason)) => Err(format!("{reason:?}")),
         Ok(PathOutcome::Incomplete(reason)) => Err(format!("{reason:?}")),

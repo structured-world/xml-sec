@@ -249,6 +249,18 @@ impl<W: Work> VerifiedSession<'_, '_, '_, W> {
         self.context.policy.key_trust.trust_anchor_signer
     }
 
+    /// The shared path processor's validity rules under this operation's
+    /// key-trust policy (EN 319 102-1 V1.4.1 §5.2.6.4 step 4), the rules
+    /// verification applied to its own paths.
+    pub fn certificate_path_validity(&self) -> structured_pkix::path::ValidityPolicy {
+        super::super::super::pkix::path_validity(self.context.policy.key_trust.validity_model)
+    }
+
+    /// The `XAdES` syntaxes this operation's policy reads.
+    pub fn xades_syntax(&self) -> crate::policy::XadesSyntax {
+        self.context.policy.xades_syntax
+    }
+
     /// How this operation's compiled policy reads timestamp tokens.
     pub fn timestamp_token_encoding(&self) -> crate::policy::TimestampTokenEncoding {
         self.context.policy.timestamp_token_encoding

@@ -1815,6 +1815,147 @@ fn a_conformant_profile_accepts_a_signing_certificate_that_is_its_trust_anchor()
     );
 }
 
+/// A root valid 2020-2040, an intermediate valid 2020 to 2025 and a leaf it
+/// issued valid from `leaf_from` to 2028, as leaf, intermediate, root DER.
+fn chain_with_expired_intermediate(leaf_from: (i32, u8, u8)) -> [Vec<u8>; 3] {
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertifiedIssuer, DnType, IsCa, KeyPair,
+        KeyUsagePurpose, date_time_ymd,
+    };
+    let authority = |name: &str, from: i32, to: i32| {
+        let mut params = CertificateParams::new(Vec::new()).unwrap();
+        params.distinguished_name.push(DnType::CommonName, name);
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        params.not_before = date_time_ymd(from, 1, 1);
+        params.not_after = date_time_ymd(to, 1, 1);
+        params
+    };
+    let root =
+        CertifiedIssuer::self_signed(authority("root", 2020, 2040), KeyPair::generate().unwrap())
+            .unwrap();
+    let intermediate = CertifiedIssuer::signed_by(
+        authority("intermediate", 2020, 2025),
+        KeyPair::generate().unwrap(),
+        &root,
+    )
+    .unwrap();
+    let mut leaf = CertificateParams::new(Vec::new()).unwrap();
+    leaf.distinguished_name.push(DnType::CommonName, "leaf");
+    leaf.not_before = date_time_ymd(leaf_from.0, leaf_from.1, leaf_from.2);
+    leaf.not_after = date_time_ymd(2028, 1, 1);
+    let leaf = leaf
+        .signed_by(&KeyPair::generate().unwrap(), &intermediate)
+        .unwrap();
+    [
+        leaf.der().to_vec(),
+        intermediate.der().to_vec(),
+        root.der().to_vec(),
+    ]
+}
+
+/// How the leaf of `chain` resolves from `KeyInfo` in 2026, after its
+/// intermediate expired, under `model` with X.509 chains checked against the
+/// root: `validated`, or the refusal.
+fn resolve_under_validity_model(
+    chain: &[Vec<u8>; 3],
+    model: xml_sec::policy::CertificateValidityModel,
+) -> String {
+    use xml_sec::xmldsig::{
+        DefaultKeyResolver, InspectedKeyCandidateBudget, KeyResolverConfig,
+        ResolvedVerificationKey, parse_key_info,
+    };
+    const IN_2026: i64 = 1_773_964_800; // 2026-03-20
+    let [leaf, intermediate, root] = chain;
+    let xml = format!(
+        r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"><X509Data><X509Certificate>{}</X509Certificate><X509Certificate>{}</X509Certificate></X509Data></KeyInfo>"#,
+        structured_base64::STANDARD
+            .encode(leaf)
+            .expect("test encoding"),
+        structured_base64::STANDARD
+            .encode(intermediate)
+            .expect("test encoding"),
+    );
+    let document = xml_sec::XmlDomDocument::parse(&xml).unwrap();
+    let key_info = parse_key_info(document.root_element()).unwrap();
+    let mut policy = compiler(PolicyProfile::Xades)
+        .compile(&context())
+        .unwrap()
+        .verification()
+        .unwrap()
+        .clone();
+    policy.key_trust.verify_x509_chains = true;
+    policy.key_trust.verification_time = Some(Instant::new(IN_2026, 0).unwrap());
+    policy.key_trust.validity_model = model;
+    let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+        trusted_certs: vec![root.clone()],
+        ..KeyResolverConfig::default()
+    });
+    let mut budget = InspectedKeyCandidateBudget::new(&policy);
+    match resolver.resolve_with_candidate_budget(
+        Some(&key_info),
+        SignatureAlgorithm::EcdsaSha256,
+        &policy,
+        &RustCryptoProvider,
+        &mut budget,
+    ) {
+        Ok(Some(ResolvedVerificationKey::Validated(_))) => "validated".into(),
+        Ok(Some(_)) => "unvalidated key".into(),
+        Ok(None) => "no key".into(),
+        Err(error) => format!("{error:?}"),
+    }
+}
+
+#[test]
+fn the_validity_model_decides_a_path_through_an_expired_intermediate() {
+    // ETSI EN 319 102-1 V1.4.1 5.2.6.4 step 4: the X.509 validation
+    // constraints select the shell model (RFC 5280 6.1.3(a)(2): every path
+    // certificate valid at the validation time) or the chain model (Common
+    // PKI v2.0 Part 9 6: each issuer valid when it issued its subordinate).
+    // An intermediate that expired after issuing a still valid leaf breaks the
+    // path only under shell; under chain only an issuance after its expiry
+    // does.
+    use xml_sec::policy::CertificateValidityModel;
+    let issued_in_validity = chain_with_expired_intermediate((2024, 1, 1));
+    let refused =
+        resolve_under_validity_model(&issued_in_validity, CertificateValidityModel::Shell);
+    assert!(refused.contains("CertificateNotValid(1)"), "{refused}");
+    assert_eq!(
+        resolve_under_validity_model(&issued_in_validity, CertificateValidityModel::Chain),
+        "validated"
+    );
+    let issued_after_expiry = chain_with_expired_intermediate((2025, 6, 1));
+    let refused =
+        resolve_under_validity_model(&issued_after_expiry, CertificateValidityModel::Chain);
+    assert!(refused.contains("CertificateNotValid(1)"), "{refused}");
+    // Every profile keeps the shell model; layers must agree on the model, as
+    // neither is narrower than the other.
+    for profile in [PolicyProfile::Xades, PolicyProfile::XadesConformant] {
+        assert_eq!(
+            compiler(profile)
+                .compile(&context())
+                .unwrap()
+                .verification()
+                .unwrap()
+                .key_trust
+                .validity_model,
+            CertificateValidityModel::Shell
+        );
+    }
+    let shell = compiler(PolicyProfile::XadesConformant);
+    let mut layer = shell.policies().clone();
+    if let Some(verification) = layer.verification.as_mut() {
+        verification.key_trust.validity_model = CertificateValidityModel::Chain;
+    }
+    let composed = shell
+        .restrict(&layer)
+        .and_then(|layered| layered.compile(&context()).map(drop));
+    assert!(
+        matches!(composed, Err(PolicyViolation::Configuration { .. })),
+        "{composed:?}"
+    );
+}
+
 #[test]
 fn a_denial_withdraws_exactly_the_named_permissions() {
     // A deployment narrows any profile without restating it: each denied

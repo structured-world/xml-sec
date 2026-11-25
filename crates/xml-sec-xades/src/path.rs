@@ -387,7 +387,12 @@ pub(crate) fn check_chain<'d, W: Work, Q: Work>(
         watch: &(),
         recognizer: &(),
     };
-    match structured_ltv::pki::check_path(chain, Anchor::from_certificate(anchor), &context) {
+    match structured_ltv::pki::check_path_with_validity(
+        chain,
+        Anchor::from_certificate(anchor),
+        &context,
+        session.certificate_path_validity(),
+    ) {
         Ok(PathOutcome::Accepted(path)) => Ok(Ok(path)),
         Ok(PathOutcome::Rejected(_)) => Ok(Err(PathFailure::Rejected)),
         Ok(PathOutcome::Incomplete(reason)) => Ok(Err(PathFailure::Incomplete(reason))),
@@ -453,7 +458,12 @@ pub(crate) fn discover<'d, W: Work>(
         watch: &(),
         recognizer: &(),
     };
-    let found = match structured_pkix::path::build(target, authorities.pool, &context) {
+    let found = match structured_pkix::path::build_with_validity(
+        target,
+        authorities.pool,
+        &context,
+        session.certificate_path_validity(),
+    ) {
         Ok(found) => found,
         Err(BuildError::Processing(error)) => return Err(X509ChainError::Processing(error).into()),
         Err(BuildError::Verification(never) | BuildError::Recognition(never)) => match never {},
