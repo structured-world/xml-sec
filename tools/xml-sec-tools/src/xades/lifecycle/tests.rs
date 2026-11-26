@@ -6,13 +6,52 @@ use serde_json::json;
 use std::collections::BTreeSet;
 
 #[test]
+fn every_signature_after_the_first_is_reported_and_one_signature_keeps_its_shape() {
+    // A form with several signatures must not hide a refused countersignature
+    // behind a valid first signature; a single signature's outcome keeps the
+    // fields the existing expectations record, with no `others`.
+    let one = "signature: Ok(Valid)\nlevel: Ok(Assessed(true))\n";
+    let single = xml_sec_outcome(one);
+    assert!(single.get("others").is_none());
+    assert_eq!(single["crypto"], "Valid");
+    let several = format!("{one}signature: Ok(Valid)\nlevel: Ok(Assessed(false))\n");
+    assert_eq!(
+        xml_sec_outcome(&several)["others"],
+        json!([{ "crypto": "Valid", "structure": "unmet" }])
+    );
+}
+
+#[test]
 fn every_case_has_its_own_name_and_alternates_the_implementations() {
     // Both directions cover every packaging and signer with CRL and OCSP
     // evidence, and every further algorithm over an enveloping signature;
     // the step after creation and the renewal swap implementations, so each
     // step is validated by the side that did not make it.
     let cases = cases();
-    assert_eq!(cases.len(), 2 * (4 * 2 * 2 + 1 + Algorithm::MORE.len()));
+    // Each form runs in both directions, except DSS's indented serialization,
+    // which only DSS makes.
+    let forms = 2 * Packaging::FORMS.len() - 1;
+    assert_eq!(
+        cases.len(),
+        2 * (4 * 2 * 2 + 1 + Algorithm::MORE.len()) + forms
+    );
+    for packaging in Packaging::FORMS {
+        let dss_first = super::Case {
+            first: Actor::Dss,
+            packaging,
+            algorithm: Algorithm::Rsa,
+            evidence: Evidence::Crl,
+        };
+        assert!(cases.contains(&dss_first));
+        let xml_sec_first = super::Case {
+            first: Actor::XmlSec,
+            ..dss_first
+        };
+        assert_eq!(
+            cases.contains(&xml_sec_first),
+            packaging != Packaging::PrettyPrint
+        );
+    }
     for first in [Actor::XmlSec, Actor::Dss] {
         for algorithm in Algorithm::MORE {
             assert!(cases.contains(&super::Case {

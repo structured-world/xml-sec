@@ -178,10 +178,15 @@ final class Lifecycle {
      * reference names.
      */
     static DSSDocument extend(XAdESService service, DSSDocument input, String level, DSSDocument detached) {
+        return extend(service, input, level, detached == null ? List.of() : List.of(detached));
+    }
+
+    /** As the single-content form, with every content the references name. */
+    static DSSDocument extend(XAdESService service, DSSDocument input, String level, List<DSSDocument> detached) {
         var parameters = new XAdESSignatureParameters();
         parameters.setSignatureLevel(SignatureLevel.valueOf("XAdES_BASELINE_" + level));
-        if (detached != null) {
-            parameters.setDetachedContents(List.of(detached));
+        if (!detached.isEmpty()) {
+            parameters.setDetachedContents(detached);
         }
         return service.extendDocument(input, parameters);
     }

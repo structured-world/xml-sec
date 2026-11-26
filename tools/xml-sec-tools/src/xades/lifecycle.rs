@@ -53,39 +53,84 @@ impl Actor {
     }
 }
 
+/// The shape of the B-B document: one signature in one of the four
+/// packagings, or one of the signature forms DSS's signature tests make
+/// (parallel signatures, a countersignature and a nested one, a detached
+/// signature over two files, inclusive canonicalization, DSS's indented
+/// serialization).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Packaging {
     Enveloped,
     Enveloping,
     InternallyDetached,
     Detached,
+    Parallel,
+    Countersigned,
+    CountersignedNested,
+    DetachedMultiple,
+    Inclusive,
+    PrettyPrint,
 }
 
 impl Packaging {
-    const ALL: [Self; 4] = [
+    pub(crate) const ALL: [Self; 4] = [
         Self::Enveloped,
         Self::Enveloping,
         Self::InternallyDetached,
         Self::Detached,
     ];
 
-    fn name(self) -> &'static str {
+    /// The signature forms, each run with an RSA signer and CRL evidence.
+    pub(crate) const FORMS: [Self; 6] = [
+        Self::Parallel,
+        Self::Countersigned,
+        Self::CountersignedNested,
+        Self::DetachedMultiple,
+        Self::Inclusive,
+        Self::PrettyPrint,
+    ];
+
+    /// The case name part; for a form also the name both probes take.
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Enveloped => "enveloped",
             Self::Enveloping => "enveloping",
             Self::InternallyDetached => "internally-detached",
             Self::Detached => "detached",
+            Self::Parallel => "parallel",
+            Self::Countersigned => "countersigned",
+            Self::CountersignedNested => "countersigned-nested",
+            Self::DetachedMultiple => "detached-multiple",
+            Self::Inclusive => "inclusive",
+            Self::PrettyPrint => "pretty-print",
         }
     }
 
-    /// DSS's `SignaturePackaging` constant.
-    fn dss(self) -> &'static str {
+    /// DSS's `SignaturePackaging` constant; none for a form, which DSS's
+    /// `FormProbe` makes by name.
+    fn dss(self) -> Option<&'static str> {
         match self {
-            Self::Enveloped => "ENVELOPED",
-            Self::Enveloping => "ENVELOPING",
-            Self::InternallyDetached => "INTERNALLY_DETACHED",
-            Self::Detached => "DETACHED",
+            Self::Enveloped => Some("ENVELOPED"),
+            Self::Enveloping => Some("ENVELOPING"),
+            Self::InternallyDetached => Some("INTERNALLY_DETACHED"),
+            Self::Detached => Some("DETACHED"),
+            _ => None,
         }
+    }
+
+    /// The detached files the references of this shape name.
+    fn detached(self) -> &'static [&'static str] {
+        match self {
+            Self::Detached => &["detached.txt"],
+            Self::DetachedMultiple => &["detached.txt", "detached-2.txt"],
+            _ => &[],
+        }
+    }
+
+    /// Whether xml-sec makes this shape: DSS's indented serialization is
+    /// DSS's own choice, which xml-sec only reads and augments.
+    fn made_by(self, actor: Actor) -> bool {
+        self != Self::PrettyPrint || actor == Actor::Dss
     }
 }
 
@@ -237,8 +282,9 @@ impl Case {
 }
 
 /// Every lifecycle: each packaging and signer with CRL and with OCSP
-/// evidence, one revoked signer, and each further algorithm over an
-/// enveloping signature as DSS's algorithm tests sign it, in both directions.
+/// evidence, one revoked signer, each further algorithm over an enveloping
+/// signature as DSS's algorithm tests sign it, and each signature form, in
+/// both directions where both implementations make the form.
 pub(crate) fn cases() -> Vec<Case> {
     let mut cases = Vec::new();
     for first in [Actor::XmlSec, Actor::Dss] {
@@ -267,6 +313,16 @@ pub(crate) fn cases() -> Vec<Case> {
                 algorithm,
                 evidence: Evidence::Crl,
             });
+        }
+        for packaging in Packaging::FORMS {
+            if packaging.made_by(first) {
+                cases.push(Case {
+                    first,
+                    packaging,
+                    algorithm: Algorithm::Rsa,
+                    evidence: Evidence::Crl,
+                });
+            }
         }
     }
     cases
@@ -378,13 +434,27 @@ pub(crate) fn xml_sec_outcome(output: &str) -> Value {
                 .to_owned()
         }
     });
-    json!({
+    let mut outcome = json!({
         "crypto": signature,
         "structure": structure,
         // xml-sec reports statuses; whether they are usable is the caller's
         // reading, so there is no trust verdict to compare.
         "trust": "not assessed",
-    })
+    });
+    // A document with several signatures (parallel ones, countersignatures)
+    // reports each after the first, in the order the probe lists them.
+    let others: Vec<Value> = output
+        .split("signature: ")
+        .skip(2)
+        .map(|chunk| {
+            let reading = xml_sec_outcome(&format!("signature: {chunk}"));
+            json!({ "crypto": reading["crypto"], "structure": reading["structure"] })
+        })
+        .collect();
+    if !others.is_empty() {
+        outcome["others"] = others.into();
+    }
+    outcome
 }
 
 /// What DSS's `LevelProbe` reports, reduced to the compared fields.
@@ -418,7 +488,26 @@ pub(crate) fn dss_outcome(output: &str, reports: &Path) -> Result<Value, String>
     let revocations = xml::below(root, "Revocation", None)
         .filter(|node| xml::child(*node, "BasicSignature").is_some())
         .count();
-    Ok(json!({
+    // Every signature after the first, parallel ones and countersignatures,
+    // as the simple report lists them.
+    let others: Vec<Value> = output
+        .lines()
+        .filter(|line| line.contains(" format="))
+        .skip(1)
+        .map(|line| {
+            let field = |name: &str| {
+                line.split(' ')
+                    .find_map(|word| word.strip_prefix(&format!("{name}=")))
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            json!({
+                "structure": field("format"),
+                "trust": format!("{}/{}", field("indication"), field("subindication")),
+            })
+        })
+        .collect();
+    let mut outcome = json!({
         "crypto": if intact(signature) { "intact" } else { "broken" },
         "structure": field("format"),
         "evidence": {
@@ -431,7 +520,11 @@ pub(crate) fn dss_outcome(output: &str, reports: &Path) -> Result<Value, String>
             field("indication").unwrap_or_default(),
             field("subindication").unwrap_or_default()
         ),
-    }))
+    });
+    if !others.is_empty() {
+        outcome["others"] = others.into();
+    }
+    Ok(outcome)
 }
 
 /// The fields of `expected` that `observed` does not repeat.
@@ -548,6 +641,7 @@ const TSA_CONFIG: &str = "[tsa]\ndefault_tsa=lifecycle\n[lifecycle]\nserial=PKI/
 const DATA: &str =
     "<Document Id=\"document\"><Data Id=\"payload\">Lifecycle payload</Data></Document>";
 const DETACHED: &str = "Lifecycle detached payload\n";
+const SECOND_DETACHED: &str = "Lifecycle second detached payload\n";
 
 impl Run<'_> {
     fn levels(&self) -> Generator {
@@ -698,6 +792,9 @@ impl Run<'_> {
         let pki = self.pki.display().to_string();
         write(&self.pki.join("tsa.cnf"), TSA_CONFIG.replace("PKI", &pki))?;
         write(&self.pki.join("data.xml"), DATA)?;
+        // DSS's FormProbe reads the forms' document under this name.
+        write(&self.pki.join("document.xml"), DATA)?;
+        write(&self.pki.join("detached-2.txt"), SECOND_DETACHED)?;
         write(&self.pki.join("detached.txt"), DETACHED)
     }
 
@@ -728,16 +825,25 @@ impl Run<'_> {
         }
     }
 
+    /// What the B-B signature signs: the first detached file, or the XML data
+    /// (a detached signature over two files finds the second beside it).
     fn data(&self, case: Case) -> PathBuf {
-        self.pki.join(match case.packaging {
-            Packaging::Detached => "detached.txt",
-            _ => "data.xml",
-        })
+        self.pki.join(
+            case.packaging
+                .detached()
+                .first()
+                .copied()
+                .unwrap_or("data.xml"),
+        )
     }
 
-    /// The detached object a validator or augmenter needs, if any.
-    fn detached(&self, case: Case) -> Option<PathBuf> {
-        (case.packaging == Packaging::Detached).then(|| self.pki.join("detached.txt"))
+    /// The detached objects a validator or augmenter needs.
+    fn detached(&self, case: Case) -> Vec<PathBuf> {
+        case.packaging
+            .detached()
+            .iter()
+            .map(|file| self.pki.join(file))
+            .collect()
     }
 
     fn java(&self, class: &str) -> Vec<OsString> {
@@ -755,6 +861,34 @@ impl Run<'_> {
         Ok(
             json!({ "refused": refusal(&String::from_utf8_lossy(&run.stdout), &String::from_utf8_lossy(&run.stderr)) }),
         )
+    }
+
+    /// DSS's B-B signature of `case` at Unix time `time` into `output`: a
+    /// packaging through `SignProbe`, a form through `FormProbe`.
+    fn dss_create(&self, case: Case, time: u64, output: &Path) -> Vec<OsString> {
+        let store = self.pki.join(format!("{}.p12", case.algorithm.signer()));
+        if let Some(packaging) = case.packaging.dss() {
+            let mut args = self.java("SignProbe");
+            args.extend(line(&[
+                &store,
+                &packaging,
+                &self.data(case),
+                &time.to_string(),
+                &output,
+                &case.algorithm.dss(),
+            ]));
+            return args;
+        }
+        // The PKI directory holds document.xml and both detached files.
+        let mut args = self.java("FormProbe");
+        args.extend(line(&[
+            &store,
+            &case.packaging.name(),
+            &self.pki,
+            &time.to_string(),
+            &output,
+        ]));
+        args
     }
 
     /// The command that makes `step` at Unix time `time`.
@@ -787,18 +921,7 @@ impl Run<'_> {
                 args.push(output.clone().into_os_string());
                 args
             }
-            (Actor::Dss, "b") => {
-                let mut args = self.java("SignProbe");
-                args.extend(line(&[
-                    &self.pki.join(format!("{}.p12", case.algorithm.signer())),
-                    &case.packaging.dss(),
-                    &self.data(case),
-                    &time.to_string(),
-                    &output,
-                    &case.algorithm.dss(),
-                ]));
-                args
-            }
+            (Actor::Dss, "b") => self.dss_create(case, time, &output),
             (Actor::XmlSec, step) => {
                 let input = input.ok_or("no input to augment")?;
                 let mut args = line(&[
@@ -813,7 +936,7 @@ impl Run<'_> {
                     &"--accuracy",
                     &"1",
                 ]);
-                if let Some(detached) = self.detached(case) {
+                for detached in self.detached(case) {
                     args.extend(line(&[&"--detached", &detached]));
                 }
                 // xml-sec renews only over DSS's tokens, whose unsorted
@@ -852,7 +975,7 @@ impl Run<'_> {
                     &time.to_string(),
                     &evidence,
                 ]));
-                args.extend(self.detached(case).map(Into::into));
+                args.extend(self.detached(case).into_iter().map(Into::into));
                 args
             }
         })
@@ -873,7 +996,7 @@ impl Run<'_> {
                     &self.at.to_string(),
                     &reports,
                 ]));
-                args.extend(self.detached(case).map(Into::into));
+                args.extend(self.detached(case).into_iter().map(Into::into));
                 let run = self.corpus.require(&args, &log)?;
                 dss_outcome(&String::from_utf8_lossy(&run.stdout), &reports)
             }
@@ -902,7 +1025,7 @@ impl Run<'_> {
         if ber {
             args.push("cms".into());
         }
-        if let Some(detached) = self.detached(step.case) {
+        for detached in self.detached(step.case) {
             args.extend(line(&[&"--detached", &detached]));
         }
         let run = self.corpus.command(&args, log)?;

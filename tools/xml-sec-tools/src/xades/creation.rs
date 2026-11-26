@@ -44,7 +44,7 @@ const fn created(name: &'static str, signatures: usize) -> Case {
     }
 }
 
-pub(crate) const CASES: [Case; 14] = [
+pub(crate) const CASES: [Case; 25] = [
     created("enveloped", 1),
     created("enveloping", 1),
     created("internally-detached", 1),
@@ -54,6 +54,18 @@ pub(crate) const CASES: [Case; 14] = [
     created("countersigned-nested", 3),
     created("detached-multiple", 1),
     created("inclusive", 1),
+    created("prefixes", 1),
+    created("empty-prefix", 1),
+    created("placement-first-child", 1),
+    created("placement-before", 1),
+    created("signed-key-info", 1),
+    // References the caller composes (`DataObject::Reference`).
+    created("reference-filter2", 1),
+    created("reference-xpath", 1),
+    created("reference-by-id", 1),
+    created("reference-comments", 1),
+    created("object-base64", 1),
+    created("reference-xslt", 1),
     Case {
         name: "b-t",
         signatures: 1,
@@ -325,7 +337,7 @@ pub(crate) fn execute(corpus: &Corpus, results: &Path) -> Result<(), String> {
             &"-p",
             &"xml-sec-xades",
             &"--features",
-            &"produce",
+            &"produce,xslt",
             &"--example",
             &example,
             &"--",

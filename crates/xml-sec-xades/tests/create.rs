@@ -18,12 +18,13 @@ use xml_sec::policy::{Instant, SigningPolicy, VerificationPolicy};
 use xml_sec::xmldsig::extension;
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DigestAlgorithm, KeyInfoWriteError, KeyResolverConfig, ObjectContent,
-    ObjectElement, RsaSigningKey, SignatureAlgorithm, SigningError, UriTypeSet,
-    VerificationRequest, VerifyContext, with_verified_request,
+    ObjectElement, RsaSigningKey, SignatureAlgorithm, SigningError, Transform, UriTypeSet,
+    VerificationRequest, VerifyContext, XPathExpression, XPathFilter, XPathFilterOperation,
+    with_verified_request,
 };
 use xml_sec_xades::{
-    Assessment, Countersignature, CreateError, DataObject, DraftError, Envelope, Outcome, Request,
-    Signer, countersign, create, validate_basic,
+    Assessment, Countersignature, CreateError, DataObject, DraftError, Envelope, Outcome,
+    Placement, Prefixes, Request, Signer, countersign, create, validate_basic,
 };
 
 const ROOT: &[u8] = include_bytes!("fixtures/creation/root.der");
@@ -101,6 +102,7 @@ impl Fixture {
             method: SignatureAlgorithm::RsaSha256,
             digest: DigestAlgorithm::Sha256,
             canonicalization: c14n(),
+            prefixes: Prefixes::default(),
         }
     }
 
@@ -220,7 +222,7 @@ fn request<'a>(id: &'a str, objects: &[DataObject<'a>]) -> Request<'a> {
         id,
         signing_time: TIME,
         objects: objects.to_vec(),
-        parent: None,
+        placement: Placement::DocumentEnd,
         resources: None,
         id_attributes: &[],
     }
@@ -298,6 +300,378 @@ fn every_packaging_mode_meets_basic() {
         assert_eq!(formats, objects.len(), "{id}: one format per object");
     }
 }
+
+#[test]
+fn references_the_caller_composes_meet_basic() {
+    // XMLDSig 1.1 §4.4.3.1/§6.6: a reference keeps the URI and transforms the
+    // caller gives, in order; each document is assessed independently, and the
+    // written Transforms are the ones requested.
+    let fixture = Fixture::new();
+    let exclusive = || Transform::C14n(c14n());
+    let filter = |operation, expression: &str| {
+        XPathFilter::new(
+            operation,
+            XPathExpression::new(expression).with_namespace("ds", DS),
+        )
+    };
+    let cases: Vec<(&str, Vec<Transform>, &str, Vec<&str>)> = vec![
+        (
+            "filter2",
+            vec![
+                Transform::XPathFilter2(vec![filter(
+                    XPathFilterOperation::Subtract,
+                    "/descendant::ds:Signature",
+                )]),
+                exclusive(),
+            ],
+            "",
+            vec![XPATH_FILTER2_URI, EXCLUSIVE],
+        ),
+        (
+            "xpath",
+            vec![
+                Transform::XPath(
+                    XPathExpression::new("not(ancestor-or-self::ds:Signature)")
+                        .with_namespace("ds", DS),
+                ),
+                exclusive(),
+            ],
+            "",
+            vec![XPATH_URI, EXCLUSIVE],
+        ),
+        (
+            // A chain ending in a node set gains the explicit Exclusive C14N
+            // the default signing policy generates (XMLDSig 1.1 §4.4.3.2).
+            "enveloped-only",
+            vec![Transform::Enveloped],
+            "",
+            vec![ENVELOPED, EXCLUSIVE],
+        ),
+        ("by-id", Vec::new(), "#payload", vec![EXCLUSIVE]),
+        (
+            "with-comments",
+            vec![Transform::C14n(C14nAlgorithm::new(
+                C14nMode::Exclusive1_0,
+                true,
+            ))],
+            "#xpointer(id('payload'))",
+            vec![EXCLUSIVE_WITH_COMMENTS],
+        ),
+    ];
+    for (id, transforms, uri, written) in cases {
+        let mut document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
+        let objects = [DataObject::Reference {
+            uri,
+            transforms,
+            mime_type: "text/xml",
+        }];
+        fixture
+            .create(&mut document, request(id, &objects))
+            .unwrap_or_else(|error| panic!("{id}: {error}"));
+        assert!(fixture.meets_basic(document.as_xml(), id), "{id}: B-B");
+        let created = parse(document.as_xml());
+        let reference = created
+            .descendants()
+            .find(|node| node.has_tag_name((DS, "Reference")))
+            .expect("the data reference comes first");
+        assert_eq!(reference.attribute("URI"), Some(uri), "{id}: URI");
+        let algorithms: Vec<&str> = reference
+            .descendants()
+            .filter(|node| node.has_tag_name((DS, "Transform")))
+            .filter_map(|node| node.attribute("Algorithm"))
+            .collect();
+        assert_eq!(algorithms, written, "{id}: transforms");
+    }
+}
+
+#[test]
+fn objects_the_caller_names_meet_basic_and_their_ids_must_be_free() {
+    // XMLDSig 1.1 §4.5/§6.6.2: an Object with the caller's Id, MimeType and
+    // Encoding, signed through a reference to that Id with the caller's
+    // transforms: base64 content decoded before the digest, and XML content
+    // canonicalized. An Id the document already declares is refused before
+    // anything is published.
+    let fixture = Fixture::new();
+    let element = ObjectElement::parse("<Data>Named object</Data>", &fixture.policy)
+        .expect("valid object element");
+    let objects = [
+        DataObject::Object {
+            id: "image",
+            content: ObjectContent::Text("SGVsbG8gYmFzZTY0".to_owned()),
+            encoding: Some("http://www.w3.org/2000/09/xmldsig#base64"),
+            transforms: vec![Transform::Base64Decode],
+            mime_type: "image/png",
+        },
+        DataObject::Object {
+            id: "xml",
+            content: ObjectContent::Element(element),
+            encoding: None,
+            transforms: vec![Transform::C14n(c14n())],
+            mime_type: "text/xml",
+        },
+    ];
+    let mut document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
+    fixture
+        .create(&mut document, request("sig", &objects))
+        .expect("creation with named objects");
+    assert!(fixture.meets_basic(document.as_xml(), "sig"), "B-B");
+    let created = parse(document.as_xml());
+    let image = created
+        .descendants()
+        .find(|node| node.has_tag_name((DS, "Object")) && node.attribute("Id") == Some("image"))
+        .expect("the named object");
+    assert_eq!(image.attribute("MimeType"), Some("image/png"));
+    assert_eq!(
+        image.attribute("Encoding"),
+        Some("http://www.w3.org/2000/09/xmldsig#base64")
+    );
+    let taken = [DataObject::Object {
+        id: "payload",
+        content: ObjectContent::Text("text".to_owned()),
+        encoding: None,
+        transforms: Vec::new(),
+        mime_type: "text/plain",
+    }];
+    let mut document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
+    let error = fixture
+        .create(&mut document, request("sig", &taken))
+        .expect_err("the document already declares payload");
+    assert!(
+        matches!(error, CreateError::IdInUse(ref id) if id == "payload"),
+        "{error}"
+    );
+    assert_eq!(document.as_xml(), DOCUMENT, "nothing published");
+}
+
+#[test]
+fn a_reference_to_key_info_signs_the_written_certificates() {
+    // XMLDSig 1.1 §4.5: KeyInfo may be signed. The reference to
+    // `{id}-key-info` covers the certificates the operation writes into
+    // KeyInfo, so the signature meets B-B as created and breaks when a
+    // carried certificate is removed afterwards.
+    let fixture = Fixture::new();
+    let objects = [
+        enveloped(Envelope::ExcludingSignatures)[0].clone(),
+        DataObject::KeyInfo {
+            mime_type: "text/xml",
+        },
+    ];
+    let mut document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
+    fixture
+        .create(&mut document, request("sig", &objects))
+        .expect("creation with a signed KeyInfo");
+    assert!(fixture.meets_basic(document.as_xml(), "sig"), "B-B");
+    let created = parse(document.as_xml());
+    let key_info = created
+        .descendants()
+        .find(|node| node.has_tag_name((DS, "KeyInfo")))
+        .expect("KeyInfo");
+    assert_eq!(key_info.attribute("Id"), Some("sig-key-info"));
+    let intermediate = structured_base64::STANDARD
+        .encode(INTERMEDIATE)
+        .expect("test encoding");
+    // The KeyInfo writer declares the default namespace on X509Data.
+    let tampered = document.as_xml().replacen(
+        &format!("<X509Certificate>{intermediate}</X509Certificate>"),
+        "",
+        1,
+    );
+    assert_ne!(tampered, document.as_xml(), "the intermediate was carried");
+    let account = account(1 << 30);
+    let parsed = XmlDocument::parse(tampered.as_str()).expect("tampered XML parses");
+    let context = VerifyContext::new()
+        .policy(fixture.context_policy.clone())
+        .key_resolver(&fixture.resolver);
+    let request = VerificationRequest {
+        external_resources: Some(&fixture.resources),
+        ..VerificationRequest::default()
+    };
+    let accepted = with_verified_request(&parsed, &context, &request, &account, |session| {
+        session.evidence().accepted(&parsed)
+    })
+    .expect("the tampered document is read");
+    assert!(!accepted, "a changed KeyInfo breaks its reference");
+}
+
+#[test]
+fn every_placement_puts_the_signature_where_requested_and_meets_basic() {
+    // A signature excluding every signature from its document reference
+    // signs the same data wherever it stands; it goes before, after, as the
+    // first or the last child of the element the placement names.
+    const PLACED: &str = "<Document><Head Id=\"head\"><Title>T</Title></Head><Data Id=\"payload\">Created payload</Data></Document>";
+    let fixture = Fixture::new();
+    let cases = [
+        (Placement::FirstChildOf("head"), "Head", true),
+        (Placement::LastChildOf("head"), "Head", false),
+        (Placement::Before("payload"), "Document", false),
+        (Placement::After("head"), "Document", false),
+    ];
+    for (placement, parent, first) in cases {
+        let mut document = XmlDocument::parse(PLACED).expect("fixture parses");
+        let objects = enveloped(Envelope::ExcludingSignatures);
+        fixture
+            .create(
+                &mut document,
+                Request {
+                    placement,
+                    ..request("sig", &objects)
+                },
+            )
+            .unwrap_or_else(|error| panic!("{placement:?}: {error}"));
+        assert!(
+            fixture.meets_basic(document.as_xml(), "sig"),
+            "{placement:?}: B-B"
+        );
+        let created = parse(document.as_xml());
+        let signature = created
+            .descendants()
+            .find(|node| node.has_tag_name((DS, "Signature")))
+            .expect("the signature");
+        let holder = signature.parent_element().expect("a parent");
+        assert_eq!(holder.tag_name().name(), parent, "{placement:?}: parent");
+        let position = holder
+            .children()
+            .filter(roxmltree::Node::is_element)
+            .position(|node| node == signature);
+        match placement {
+            Placement::Before(_) => assert_eq!(
+                signature
+                    .next_sibling_element()
+                    .and_then(|node| node.attribute("Id")),
+                Some("payload")
+            ),
+            Placement::After(_) => assert_eq!(
+                signature
+                    .prev_sibling_element()
+                    .and_then(|node| node.attribute("Id")),
+                Some("head")
+            ),
+            _ if first => assert_eq!(position, Some(0), "{placement:?}: first"),
+            _ => assert!(
+                signature.next_sibling_element().is_none(),
+                "{placement:?}: last"
+            ),
+        }
+    }
+    let mut document = XmlDocument::parse(PLACED).expect("fixture parses");
+    let objects = enveloped(Envelope::ExcludingSignatures);
+    let error = fixture
+        .create(
+            &mut document,
+            Request {
+                placement: Placement::After("missing"),
+                ..request("sig", &objects)
+            },
+        )
+        .expect_err("no element has the ID");
+    assert!(
+        matches!(error, CreateError::UnknownPlacement(ref id) if id == "missing"),
+        "{error}"
+    );
+    assert_eq!(document.as_xml(), PLACED, "nothing published");
+}
+
+#[test]
+fn chosen_and_default_namespace_prefixes_meet_basic() {
+    // A prefix is a serialization choice: a signature and its countersignature
+    // written with other prefixes, or with both namespaces as default ones
+    // (each redeclared where the other one takes over), meet B-B, and the
+    // elements carry the chosen names.
+    let fixture = Fixture::new();
+    for (ds, xades) in [("dsig", "xa"), ("", "")] {
+        let chain: [&[u8]; 2] = [SIGNER, INTERMEDIATE];
+        let signer = Signer {
+            prefixes: Prefixes { ds, xades },
+            ..fixture.signer(&chain)
+        };
+        let mut document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
+        fixture.with_assessment(&fixture.resolver, |assessment| {
+            create(
+                &mut document,
+                &signer,
+                request("sig", &enveloped(Envelope::ExcludingSignatures)),
+                assessment,
+                &account(1 << 30),
+            )
+            .expect("creation with chosen prefixes");
+            countersign(
+                &mut document,
+                &signer,
+                &Countersignature {
+                    parent: "sig",
+                    id: "counter",
+                    signing_time: TIME,
+                    id_attributes: &[],
+                },
+                assessment,
+                &account(1 << 30),
+            )
+            .expect("countersignature with chosen prefixes");
+        });
+        let label = format!("{ds:?}/{xades:?}");
+        assert!(
+            fixture.meets_basic(document.as_xml(), "sig"),
+            "{label}: sig"
+        );
+        assert!(
+            fixture.meets_basic(document.as_xml(), "counter"),
+            "{label}: counter"
+        );
+        let qualified = |prefix: &str, local: &str| {
+            if prefix.is_empty() {
+                format!("<{local}")
+            } else {
+                format!("<{prefix}:{local}")
+            }
+        };
+        let xml = document.as_xml();
+        assert!(xml.contains(&qualified(ds, "SignedInfo")), "{label}");
+        assert!(
+            xml.contains(&qualified(xades, "SignedProperties")),
+            "{label}"
+        );
+        assert!(
+            xml.contains(&qualified(xades, "CounterSignature")),
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn an_unusable_prefix_is_refused_before_anything_is_published() {
+    // A prefix must be an XML name without a colon, or empty.
+    let fixture = Fixture::new();
+    let chain: [&[u8]; 2] = [SIGNER, INTERMEDIATE];
+    let signer = Signer {
+        prefixes: Prefixes {
+            ds: "ds",
+            xades: "x:y",
+        },
+        ..fixture.signer(&chain)
+    };
+    let mut document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
+    let error = fixture.with_assessment(&fixture.resolver, |assessment| {
+        create(
+            &mut document,
+            &signer,
+            request("sig", &enveloped(Envelope::Enveloped)),
+            assessment,
+            &account(1 << 30),
+        )
+        .expect_err("x:y is no prefix")
+    });
+    assert!(
+        matches!(error, CreateError::Draft(DraftError::Name(_))),
+        "{error}"
+    );
+    assert_eq!(document.as_xml(), DOCUMENT);
+}
+
+const XPATH_FILTER2_URI: &str = "http://www.w3.org/2002/06/xmldsig-filter2";
+const XPATH_URI: &str = "http://www.w3.org/TR/1999/REC-xpath-19991116";
+const ENVELOPED: &str = "http://www.w3.org/2000/09/xmldsig#enveloped-signature";
+const EXCLUSIVE: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
+const EXCLUSIVE_WITH_COMMENTS: &str = "http://www.w3.org/2001/10/xml-exc-c14n#WithComments";
 
 #[test]
 fn the_signing_certificate_is_bound_and_carried() {

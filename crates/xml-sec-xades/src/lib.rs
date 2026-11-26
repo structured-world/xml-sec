@@ -92,8 +92,8 @@ pub use basic::{
 pub use binary::DigestIdentity;
 #[cfg(feature = "produce")]
 pub use create::{
-    Assessment, Countersignature, CreateError, DataObject, Envelope, Request, Signer, countersign,
-    create,
+    Assessment, Countersignature, CreateError, DataObject, Envelope, Placement, Prefixes, Request,
+    Signer, countersign, create,
 };
 #[cfg(feature = "produce")]
 pub use draft::{Draft, DraftError};

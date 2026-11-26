@@ -83,6 +83,9 @@ pub struct Draft {
     ids: Vec<String>,
     generated: usize,
     complete: bool,
+    /// Prefixes the caller chose, as (namespace, prefix), ahead of the known
+    /// ones; an empty prefix writes the namespace as the default one.
+    chosen: Vec<(&'static str, String)>,
 }
 
 impl Draft {
@@ -90,6 +93,39 @@ impl Draft {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An empty draft writing each namespace of `chosen` with its prefix, an
+    /// empty one as the default namespace.
+    ///
+    /// # Errors
+    /// Returns [`DraftError::Name`] for a prefix that is neither empty nor an
+    /// XML name without a colon, or for one chosen for two namespaces.
+    pub fn with_prefixes(chosen: &[(&'static str, &str)]) -> Result<Self, DraftError> {
+        let mut draft = Self::default();
+        for (index, (namespace, prefix)) in chosen.iter().enumerate() {
+            // The default namespace is declared again wherever it changes, so
+            // several namespaces may take it; a prefix stays with one.
+            let reused = !prefix.is_empty()
+                && chosen[..index]
+                    .iter()
+                    .any(|(other, earlier)| earlier == prefix && other != namespace);
+            if (!prefix.is_empty() && !is_ncname(prefix)) || reused {
+                return Err(DraftError::Name("a chosen namespace prefix"));
+            }
+            draft.chosen.push((namespace, (*prefix).into()));
+        }
+        Ok(draft)
+    }
+
+    /// The default namespace in scope, if one is declared.
+    fn default_namespace(&self) -> Option<&'static str> {
+        self.frames.iter().rev().find_map(|frame| {
+            frame
+                .bindings
+                .iter()
+                .find_map(|(bound, prefix)| prefix.is_empty().then_some(*bound))
+        })
     }
 
     /// The finished element and every ID it declares.
@@ -137,17 +173,35 @@ impl Draft {
         work: &impl Work,
     ) -> Result<(String, bool), DraftError> {
         work.charge_work(self.frames.len() as u64 + 1)?;
+        let chosen = self
+            .chosen
+            .iter()
+            .find_map(|(bound, prefix)| (*bound == namespace).then(|| prefix.clone()));
+        // The default namespace is in scope only until an inner element
+        // declares another, so it is declared again whenever it changes.
+        if chosen.as_deref() == Some("") {
+            if self.default_namespace() == Some(namespace) {
+                return Ok((String::new(), false));
+            }
+            let frame = self
+                .frames
+                .last_mut()
+                .ok_or(DraftError::Order("namespace outside a start tag"))?;
+            frame.bindings.push((namespace, String::new()));
+            return Ok((String::new(), true));
+        }
         if let Some(prefix) = self.frames.iter().rev().find_map(|frame| {
-            frame
-                .bindings
-                .iter()
-                .find_map(|(bound, prefix)| (*bound == namespace).then(|| prefix.clone()))
+            frame.bindings.iter().find_map(|(bound, prefix)| {
+                (*bound == namespace && !prefix.is_empty()).then(|| prefix.clone())
+            })
         }) {
             return Ok((prefix, false));
         }
-        // Each chosen prefix is bound only to its own namespace in this draft,
-        // so a new declaration never rebinds an enclosing scope.
-        let prefix: String = if let Some((_, prefix)) =
+        // Each prefix is bound only to its own namespace in this draft, so a
+        // new declaration never rebinds an enclosing scope.
+        let prefix: String = if let Some(prefix) = chosen {
+            prefix
+        } else if let Some((_, prefix)) =
             KNOWN_PREFIXES.iter().find(|(known, _)| *known == namespace)
         {
             (*prefix).into()
@@ -172,8 +226,12 @@ impl Draft {
     ) -> Result<(), DraftError> {
         work.charge_work(namespace.len() as u64)?;
         let escaped = escape_attribute(namespace);
-        self.push(b" xmlns:", work)?;
-        self.push(prefix.as_bytes(), work)?;
+        if prefix.is_empty() {
+            self.push(b" xmlns", work)?;
+        } else {
+            self.push(b" xmlns:", work)?;
+            self.push(prefix.as_bytes(), work)?;
+        }
         self.push(b"=\"", work)?;
         self.push(escaped.as_bytes(), work)?;
         self.push(b"\"", work)
@@ -197,12 +255,21 @@ impl Draft {
             open: true,
         });
         // An element in no namespace stays unprefixed; the Object content
-        // check undeclares any default namespace around it.
+        // check undeclares any default namespace around it. Under a default
+        // namespace of this draft it would change namespace, so it is refused.
         let (qualified, declaration) = if name.namespace.is_empty() {
+            if self.default_namespace().is_some() {
+                return Err(DraftError::Name(name.local));
+            }
             (String::from(name.local), None)
         } else {
             let (prefix, new) = self.bind(name.namespace, work)?;
-            (format!("{prefix}:{}", name.local), new.then_some(prefix))
+            let qualified = if prefix.is_empty() {
+                String::from(name.local)
+            } else {
+                format!("{prefix}:{}", name.local)
+            };
+            (qualified, new.then_some(prefix))
         };
         self.push(b"<", work)?;
         self.push(qualified.as_bytes(), work)?;
@@ -251,6 +318,15 @@ impl Draft {
         let qualified = if name.namespace.is_empty() {
             String::from(name.local)
         } else {
+            // Namespaces in XML 1.0 §6.2: a default namespace never applies to
+            // an attribute, so a namespaced one needs a prefix.
+            if self
+                .chosen
+                .iter()
+                .any(|(bound, prefix)| *bound == name.namespace && prefix.is_empty())
+            {
+                return Err(DraftError::Name(name.local));
+            }
             let (prefix, new) = self.bind(name.namespace, work)?;
             if new {
                 self.declare(&prefix, name.namespace, work)?;

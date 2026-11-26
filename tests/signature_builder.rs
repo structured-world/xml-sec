@@ -82,6 +82,34 @@ fn builds_parseable_prefixed_template_in_required_order() {
 }
 
 #[test]
+fn a_key_info_id_names_the_placeholder_a_reference_can_sign() {
+    // XMLDSig 1.1 §4.5: KeyInfo may carry an Id so a Reference signs it; the
+    // placeholder carries it only when asked.
+    let build = |builder: SignatureBuilder| {
+        builder
+            .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("#key"))
+            .key_info(true)
+            .build_template()
+            .expect("valid template")
+    };
+    let skeleton = || SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256);
+    let named = build(skeleton().key_info_id("key"));
+    let document = roxmltree::Document::parse(&named).expect("valid XML");
+    let key_info = document
+        .descendants()
+        .find(|node| node.has_tag_name((DSIG_NS, "KeyInfo")))
+        .expect("KeyInfo placeholder");
+    assert_eq!(key_info.attribute("Id"), Some("key"));
+    let plain = build(skeleton());
+    let document = roxmltree::Document::parse(&plain).expect("valid XML");
+    let key_info = document
+        .descendants()
+        .find(|node| node.has_tag_name((DSIG_NS, "KeyInfo")))
+        .expect("KeyInfo placeholder");
+    assert_eq!(key_info.attribute("Id"), None);
+}
+
+#[test]
 fn preserves_reference_order_and_default_namespace() {
     // Reference order is signed data and must never be normalized or sorted.
     let xml = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::EcdsaSha256)

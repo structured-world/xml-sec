@@ -31,6 +31,9 @@ rustcrypto = ["xml-sec/rustcrypto"]
 # Signature creation over the XMLDSig signer. Verification-only builds,
 # including alloc and WASM ones, do not take the signing dependencies.
 produce = ["std", "xml-sec/xmldsig-sign", "dep:structured-base64"]
+# XSLT reference transforms, at creation through `DataObject::Reference` and
+# at validation, from the core's XSLT engine.
+xslt = ["xml-sec/xslt"]
 std = [
     "xml-sec/std",
     "structured-xades/std",
@@ -53,7 +56,7 @@ test = true
 
 [[example]]
 name = "create_probe"
-required-features = ["produce"]
+required-features = ["produce", "xslt"]
 
 [[example]]
 name = "augment_probe"

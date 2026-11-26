@@ -20,7 +20,7 @@ use xml_sec::c14n::C14nAlgorithm;
 use xml_sec::document::{DocumentView, NodeIdentity, XmlDocument, XmlDocumentError};
 use xml_sec::policy::SigningPolicy;
 use xml_sec::provider::{CryptoProvider, ProviderError};
-use xml_sec::xmldsig::extension::{ScalarError, TreeError};
+use xml_sec::xmldsig::extension::{ScalarError, TreeError, first_child, next_sibling, parent};
 use xml_sec::xmldsig::parse::{KeyInfoParsingSession, ParseError};
 use xml_sec::xmldsig::{
     CallerTrustedSignatureKey, DigestAlgorithm, DsigError, KeyInfoWriteError, ObjectBuilder,
@@ -46,6 +46,29 @@ pub struct Signer<'a> {
     pub digest: DigestAlgorithm,
     /// `CanonicalizationMethod` and the canonicalization of XML references.
     pub canonicalization: C14nAlgorithm,
+    /// Namespace prefixes the new signatures are written with.
+    pub prefixes: Prefixes<'a>,
+}
+
+/// The prefixes of the `XMLDSig` and `XAdES` namespaces in a new signature:
+/// `ds` and `xades` by default. An empty prefix writes the namespace as the
+/// default one. Prefixes change no canonical form a digest covers beyond the
+/// prefix itself; they are a serialization choice, not policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Prefixes<'a> {
+    /// Prefix of `http://www.w3.org/2000/09/xmldsig#`.
+    pub ds: &'a str,
+    /// Prefix of `http://uri.etsi.org/01903/v1.3.2#`.
+    pub xades: &'a str,
+}
+
+impl Default for Prefixes<'_> {
+    fn default() -> Self {
+        Self {
+            ds: "ds",
+            xades: "xades",
+        }
+    }
 }
 
 /// How a document-wide reference leaves signatures out of what it signs.
@@ -92,13 +115,103 @@ pub enum DataObject<'a> {
         /// MIME type of the content.
         mime_type: &'a str,
     },
+    /// Content in a new `Object` of the signature with the caller's `Id`,
+    /// signed through a reference to it with the caller's transforms
+    /// (`XMLDSig` 1.1 §4.5, §6.6.2): base64 content with its `Encoding`,
+    /// decoded by [`Transform::Base64Decode`], say.
+    Object {
+        /// ID of the new `Object`.
+        id: &'a str,
+        /// The object content.
+        content: ObjectContent,
+        /// `Encoding` attribute of the object, if any.
+        encoding: Option<&'a str>,
+        /// The transforms of the reference, in order.
+        transforms: Vec<Transform>,
+        /// MIME type of the content, also the object's `MimeType`.
+        mime_type: &'a str,
+    },
+    /// The signature's own `KeyInfo`, with the signer's certificates the
+    /// operation writes into it (`XMLDSig` 1.1 §4.5), canonicalized as the
+    /// other XML references are.
+    KeyInfo {
+        /// MIME type of the key information.
+        mime_type: &'a str,
+    },
+    /// A reference the caller composes: any URI and the transforms applied to
+    /// what it dereferences, in order (`XMLDSig` 1.1 §4.4.3.1, §6.6). The
+    /// signing policy decides which URIs and transforms are admitted.
+    Reference {
+        /// URI of the reference: empty for the whole document, `#id` for an
+        /// element, `#xpointer(...)` or an external URI.
+        uri: &'a str,
+        /// The transforms, in order; none signs the dereferenced data as is.
+        transforms: Vec<Transform>,
+        /// MIME type of the signed data.
+        mime_type: &'a str,
+    },
+}
+
+/// Where a new signature goes, relative to an element named by its ID. An
+/// enveloped reference signs the document whatever the placement; only
+/// which nodes the signature's own transforms leave out depends on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Placement<'a> {
+    /// The last child of the document element.
+    #[default]
+    DocumentEnd,
+    /// The last child of the element.
+    LastChildOf(&'a str),
+    /// Before every existing child of the element.
+    FirstChildOf(&'a str),
+    /// Immediately before the element.
+    Before(&'a str),
+    /// Immediately after the element.
+    After(&'a str),
+}
+
+/// Where a signature template is inserted: before a node, or appended to one.
+#[derive(Debug, Clone, Copy)]
+enum Anchor {
+    Before(NodeIdentity),
+    Append(NodeIdentity),
+}
+
+/// The anchor of a placement that the signer's append path cannot reach.
+fn anchor<W: Work>(
+    view: DocumentView<'_>,
+    placement: Placement<'_>,
+    registrations: &[IdAttributeRegistration],
+    work: &W,
+) -> Result<Anchor, CreateError> {
+    let (Placement::FirstChildOf(id) | Placement::Before(id) | Placement::After(id)) = placement
+    else {
+        return Err(CreateError::UnknownPlacement(String::new()));
+    };
+    let unknown = || CreateError::UnknownPlacement(id.into());
+    let element = view.node_for_id(id, registrations).ok_or_else(unknown)?;
+    Ok(match placement {
+        Placement::FirstChildOf(_) => match first_child(view, element, work)? {
+            Some(child) => Anchor::Before(child),
+            None => Anchor::Append(element),
+        },
+        Placement::Before(_) => Anchor::Before(element),
+        _ => {
+            let parent = parent(view, element, work)?.ok_or_else(unknown)?;
+            match next_sibling(view, parent, element, work)? {
+                Some(next) => Anchor::Before(next),
+                None => Anchor::Append(parent),
+            }
+        }
+    })
 }
 
 /// What one new signature signs and where it goes.
 pub struct Request<'a> {
     /// ID of the new `Signature`. The IDs of its parts derive from it, as
-    /// `{id}-signed-properties`, `{id}-value`, `{id}-reference-{n}` and
-    /// `{id}-object-{n}`; none of them may already be declared.
+    /// `{id}-signed-properties`, `{id}-value`, `{id}-reference-{n}`,
+    /// `{id}-object-{n}` and, when [`DataObject::KeyInfo`] signs it,
+    /// `{id}-key-info`; none of them may already be declared.
     pub id: &'a str,
     /// Claimed signing time, an XML Schema dateTime with an explicit timezone.
     /// This is the signer's claim, not a clock reading or temporal evidence.
@@ -106,9 +219,8 @@ pub struct Request<'a> {
     /// The data objects, in reference order. Enveloping content moves into
     /// the signature.
     pub objects: Vec<DataObject<'a>>,
-    /// ID of the element the signature is appended to; the document element
-    /// when absent.
-    pub parent: Option<&'a str>,
+    /// Where the signature goes in the document.
+    pub placement: Placement<'a>,
     /// Detached data, keyed as the signing operation resolves its URIs.
     pub resources: Option<&'a BTreeMap<String, Vec<u8>>>,
     /// ID attributes beyond the standard spellings.
@@ -161,6 +273,10 @@ pub enum CreateError {
     /// No `Signature` element has the parent ID.
     #[error("no Signature has the ID {0:?}")]
     UnknownSignature(String),
+    /// No element has the ID the placement names, or it has no parent to
+    /// place a sibling in.
+    #[error("no element to place the signature at: {0:?}")]
+    UnknownPlacement(String),
     /// The parent has no `QualifyingProperties` targeting it.
     #[error("signature {0:?} has no XAdES qualifying properties")]
     NotXades(String),
@@ -240,6 +356,7 @@ struct Ids {
     signature: String,
     properties: String,
     value: String,
+    key_info: String,
 }
 
 impl Ids {
@@ -248,6 +365,7 @@ impl Ids {
             signature: signature.into(),
             properties: format!("{signature}-signed-properties"),
             value: format!("{signature}-value"),
+            key_info: format!("{signature}-key-info"),
         }
     }
 }
@@ -286,10 +404,22 @@ pub fn create<W: Work>(
         .zip(&objects)
         .filter(|(object, _)| matches!(object, DataObject::Enveloping { .. }))
         .map(|(_, uri)| &uri[1..]);
+    let named_objects = request.objects.iter().filter_map(|object| match object {
+        DataObject::Object { id, .. } => Some(*id),
+        _ => None,
+    });
+    // KeyInfo gets an ID only when a reference signs it, so every other
+    // signature keeps its exact form.
+    let signs_key_info = request
+        .objects
+        .iter()
+        .any(|object| matches!(object, DataObject::KeyInfo { .. }));
     let new_ids: Vec<&str> = [ids.signature.as_str(), &ids.properties, &ids.value]
         .into_iter()
+        .chain(signs_key_info.then_some(ids.key_info.as_str()))
         .chain(references.iter().map(|uri| &uri[1..]))
         .chain(enveloping)
+        .chain(named_objects)
         .collect();
     require_free(document, &new_ids, request.id_attributes)?;
 
@@ -315,31 +445,50 @@ pub fn create<W: Work>(
 
     let Request {
         objects: data,
-        parent,
+        placement,
         resources,
         id_attributes,
         ..
     } = request;
-    let template = data_template(
-        signer,
-        data,
-        &references,
-        &objects,
-        signature_template(signer, &ids),
-    )
-    .add_reference(properties_reference(signer, &ids))
-    .add_object(ObjectBuilder::new(ObjectContent::Element(properties)));
+    let mut skeleton = signature_template(signer, &ids);
+    if signs_key_info {
+        skeleton = skeleton.key_info_id(ids.key_info.as_str());
+    }
+    let template = data_template(signer, data, &references, &objects, &ids.key_info, skeleton)
+        .add_reference(properties_reference(signer, &ids))
+        .add_object(ObjectBuilder::new(ObjectContent::Element(properties)));
 
     let key_info = key_info(signer)?;
     let mut context = context(signer, &key_info, id_attributes);
     if let Some(resources) = resources {
         context = context.external_resources(resources);
     }
-    if let Some(parent) = parent {
-        context = context.start_node_id(parent);
-    }
+    // The signer appends a new signature; any other placement inserts the
+    // template first and signs it where it stands, as a countersignature is.
+    let at = match placement {
+        Placement::DocumentEnd => None,
+        Placement::LastChildOf(parent) => {
+            context = context.start_node_id(parent);
+            None
+        }
+        other => Some(document.with_view(|view| anchor(view, other, id_attributes, work))?),
+    };
+    let Some(at) = at else {
+        return document.transaction(|document| {
+            context.sign_document_with_builder(document, &template)?;
+            assess(document, &ids.signature, id_attributes, assessment, work)
+        });
+    };
+    let markup = template.build_template_with_policy(signer.policy)?;
+    let context = context
+        .start_node_id(&ids.signature)
+        .signature_template_selection(SignatureTemplateSelection::FirstDescendant);
     document.transaction(|document| {
-        context.sign_document_with_builder(document, &template)?;
+        match at {
+            Anchor::Before(node) => document.insert_before(node, &markup)?,
+            Anchor::Append(node) => document.append_child(node, &markup)?,
+        }
+        context.sign_document(document)?;
         assess(document, &ids.signature, id_attributes, assessment, work)
     })
 }
@@ -351,6 +500,7 @@ fn data_template(
     data: Vec<DataObject<'_>>,
     references: &[String],
     objects: &[String],
+    key_info: &str,
     mut template: SignatureBuilder,
 ) -> SignatureBuilder {
     let mut enveloping = Vec::new();
@@ -374,6 +524,24 @@ fn data_template(
                 enveloping.push(ObjectBuilder::new(content).id(&object_uri[1..]));
                 (object_uri.clone(), Vec::from([c14n()]))
             }
+            DataObject::Object {
+                id,
+                content,
+                encoding,
+                transforms,
+                mime_type,
+            } => {
+                let mut object = ObjectBuilder::new(content).id(id).mime_type(mime_type);
+                if let Some(encoding) = encoding {
+                    object = object.encoding(encoding);
+                }
+                enveloping.push(object);
+                (format!("#{id}"), transforms)
+            }
+            DataObject::KeyInfo { .. } => (format!("#{key_info}"), Vec::from([c14n()])),
+            DataObject::Reference {
+                uri, transforms, ..
+            } => (String::from(uri), transforms),
         };
         let mut built = ReferenceBuilder::new(signer.digest)
             .uri(uri)
@@ -452,9 +620,12 @@ pub fn countersign<W: Work>(
         .start_node_id(&ids.signature)
         .signature_template_selection(SignatureTemplateSelection::FirstDescendant);
 
-    let counter = format!(
-        "<xades:CounterSignature xmlns:xades=\"{XADES}\">{template}</xades:CounterSignature>"
-    );
+    let counter = match signer.prefixes.xades {
+        "" => format!("<CounterSignature xmlns=\"{XADES}\">{template}</CounterSignature>"),
+        prefix => format!(
+            "<{prefix}:CounterSignature xmlns:{prefix}=\"{XADES}\">{template}</{prefix}:CounterSignature>"
+        ),
+    };
     document.transaction(|document| {
         located.unsigned.insert(document, &counter)?;
         context.sign_document(document)?;
@@ -485,7 +656,10 @@ fn mime_type<'a>(object: &DataObject<'a>) -> &'a str {
         DataObject::Document { mime_type, .. }
         | DataObject::Element { mime_type, .. }
         | DataObject::Detached { mime_type, .. }
-        | DataObject::Enveloping { mime_type, .. } => mime_type,
+        | DataObject::Enveloping { mime_type, .. }
+        | DataObject::Object { mime_type, .. }
+        | DataObject::KeyInfo { mime_type }
+        | DataObject::Reference { mime_type, .. } => mime_type,
     }
 }
 
@@ -531,7 +705,8 @@ fn signed_properties<W: Work>(
         objects,
         counter_signature,
     };
-    let mut draft = Draft::new();
+    let mut draft =
+        Draft::with_prefixes(&[(DS, signer.prefixes.ds), (XADES, signer.prefixes.xades)])?;
     basic
         .write(&mut draft, work)
         .map_err(CreateError::Properties)?;
@@ -541,11 +716,15 @@ fn signed_properties<W: Work>(
 
 /// The signature skeleton every new signature shares.
 fn signature_template(signer: &Signer<'_>, ids: &Ids) -> SignatureBuilder {
-    SignatureBuilder::new(signer.canonicalization.clone(), signer.method)
-        .ns_prefix("ds")
+    let template = SignatureBuilder::new(signer.canonicalization.clone(), signer.method)
         .signature_id(ids.signature.as_str())
         .signature_value_id(ids.value.as_str())
-        .key_info(true)
+        .key_info(true);
+    // The builder writes the default namespace when no prefix is set.
+    match signer.prefixes.ds {
+        "" => template,
+        prefix => template.ns_prefix(prefix),
+    }
 }
 
 /// EN 319 132-1 §4.4.2: a typed reference covers the complete `SignedProperties`.
