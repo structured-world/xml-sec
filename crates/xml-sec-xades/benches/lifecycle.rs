@@ -112,6 +112,7 @@ fn enveloped(id: &str) -> Request<'_> {
         placement: xml_sec_xades::Placement::DocumentEnd,
         resources: None,
         id_attributes: &[],
+        properties: xml_sec_xades::properties::Properties::default(),
     }
 }
 
@@ -127,6 +128,7 @@ fn countersigned(setup: &Setup, document: &mut XmlDocument, work: &Memory) {
         id: "counter",
         signing_time: TIME,
         id_attributes: &[],
+        properties: xml_sec_xades::properties::Properties::default(),
     };
     setup
         .with(|signer, assessment| {

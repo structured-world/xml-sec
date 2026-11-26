@@ -19,6 +19,7 @@ use xml_sec::xmldsig::{
     RsaSigningKey, SignatureAlgorithm, Transform, UriTypeSet, VerificationRequest, VerifyContext,
     XPathExpression, XPathFilter, XPathFilterOperation, XsltStylesheet,
 };
+use xml_sec_xades::properties::Properties;
 use xml_sec_xades::{
     Assessment, Countersignature, DataObject, Envelope, ManifestEntry, Placement, Prefixes,
     Request, Signer, countersign, create,
@@ -387,6 +388,7 @@ fn sign(
             },
             resources: Some(resources),
             id_attributes: &[],
+            properties: Properties::default(),
         };
         create(&mut document, signer, request, assessment, &work)
             .map_err(|error| format!("{name} {id}: {error}"))?;
@@ -403,6 +405,7 @@ fn sign(
             id,
             signing_time: TIME,
             id_attributes: &[],
+            properties: Properties::default(),
         };
         countersign(&mut document, signer, &countersignature, assessment, &work)
             .map_err(|error| format!("{name} {id}: {error}"))?;

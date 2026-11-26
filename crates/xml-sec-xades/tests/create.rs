@@ -22,6 +22,12 @@ use xml_sec::xmldsig::{
     VerificationRequest, VerifyContext, XPathExpression, XPathFilter, XPathFilterOperation,
     with_verified_request,
 };
+use xml_sec_xades::properties::{
+    Commitment, CommitmentScope, ExplicitPolicy, FormatDetails, Fragment, Identifier,
+    NoticeReference, PolicyDocument, PolicyQualifier, PolicyStore, PolicyTransform,
+    PolicyTransforms, ProductionPlace, Properties, PropertyError, Qualifier, SignaturePolicy,
+    SignerRole, UserNotice,
+};
 use xml_sec_xades::{
     Assessment, Countersignature, CreateError, DataObject, DraftError, Envelope, ManifestEntry,
     Outcome, Placement, Prefixes, Request, Signer, countersign, create, validate_basic,
@@ -225,6 +231,7 @@ fn request<'a>(id: &'a str, objects: &[DataObject<'a>]) -> Request<'a> {
         placement: Placement::DocumentEnd,
         resources: None,
         id_attributes: &[],
+        properties: Properties::default(),
     }
 }
 
@@ -237,6 +244,470 @@ fn enveloped(envelope: Envelope) -> [DataObject<'static>; 1] {
 
 fn parse(xml: &str) -> roxmltree::Document<'_> {
     roxmltree::Document::parse(xml).expect("XML parses")
+}
+
+/// The local names of the element children of `parent` in `document`.
+fn children<'a>(document: &'a roxmltree::Document<'_>, parent: &str) -> Vec<&'a str> {
+    document
+        .descendants()
+        .find(|node| node.has_tag_name((XADES, parent)))
+        .unwrap_or_else(|| panic!("{parent} is written"))
+        .children()
+        .filter(roxmltree::Node::is_element)
+        .map(|node| node.tag_name().name())
+        .collect()
+}
+
+/// The decoded `DigestValue` under `parent`.
+fn digest_under(document: &roxmltree::Document<'_>, parent: &str) -> Vec<u8> {
+    let value = document
+        .descendants()
+        .find(|node| node.has_tag_name((XADES, parent)))
+        .and_then(|node| {
+            node.descendants()
+                .find(|node| node.has_tag_name((DS, "DigestValue")))
+        })
+        .and_then(|node| node.text())
+        .unwrap_or_else(|| panic!("{parent} has a digest"));
+    structured_base64::STANDARD
+        .decode(value.as_bytes())
+        .expect("base64 digest")
+}
+
+const POLICY_DOCUMENT: &[u8] =
+    b"<Policy xmlns=\"urn:policy\">  <Rule  b=\"2\" a=\"1\">Sign</Rule></Policy>";
+const POLICY_ID: &str = "urn:oid:1.2.3.4.5";
+
+fn policy_identifier() -> Identifier<'static> {
+    Identifier {
+        uri: POLICY_ID,
+        qualifier: None,
+        description: Some("Test policy"),
+        documentation: &[],
+    }
+}
+
+fn sha256(bytes: &[u8]) -> Vec<u8> {
+    xml_sec::xmldsig::compute_digest_with_provider(
+        xml_sec::provider::default_provider(),
+        DigestAlgorithm::Sha256,
+        bytes,
+        &account(1 << 24),
+    )
+    .expect("digest")
+    .as_ref()
+    .to_vec()
+}
+
+/// An explicit policy over [`POLICY_DOCUMENT`] with SHA-256.
+fn explicit<'a>(
+    transform: PolicyTransform<'a, Fragment>,
+    qualifiers: &'a [PolicyQualifier<'a, Fragment>],
+) -> SignaturePolicy<'a, Fragment> {
+    SignaturePolicy::Explicit(ExplicitPolicy {
+        identifier: policy_identifier(),
+        document: POLICY_DOCUMENT,
+        digest_method: DigestAlgorithm::Sha256.uri(),
+        transform,
+        qualifiers,
+    })
+}
+
+/// A policy store of the given form, an ISO 19115 document specification.
+fn policy_store(document: PolicyDocument<'_>) -> PolicyStore<'_> {
+    PolicyStore {
+        specification: Identifier {
+            uri: "urn:oid:1.0.19115.1.1.1",
+            qualifier: None,
+            description: None,
+            documentation: &[],
+        },
+        document,
+    }
+}
+
+impl Fixture {
+    /// The creation of `sig` over `objects` with `properties`, which must be
+    /// refused without publishing anything.
+    fn refused(&self, properties: Properties<'_>, objects: &[DataObject<'_>]) -> CreateError {
+        let mut document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
+        let error = self
+            .create(
+                &mut document,
+                Request {
+                    properties,
+                    ..request("sig", objects)
+                },
+            )
+            .expect_err("refused");
+        assert_eq!(document.as_xml(), DOCUMENT, "nothing is published");
+        error
+    }
+}
+
+#[test]
+fn signature_properties_are_signed_in_schema_order_and_meet_basic() {
+    // EN 319 132-1 §5.2.5, §5.2.6, §5.2.9, §5.2.10: an explicit policy with
+    // the digest of its document as given, a production place and a claimed
+    // role among the signed signature properties, and the policy store as an
+    // unsigned property; the signature still meets B-B.
+    let fixture = Fixture::new();
+    let mut document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
+    let objects = enveloped(Envelope::ExcludingSignatures);
+    let role = ObjectElement::parse("<Role xmlns=\"urn:role\">Approver</Role>", &fixture.policy)
+        .expect("role element");
+    let claimed = [
+        Fragment::Text("Manager".to_owned()),
+        Fragment::Element(role),
+    ];
+    let properties = Properties {
+        policy: Some(explicit(
+            PolicyTransform::None,
+            &[PolicyQualifier::Uri("https://example.org/policy.xml")],
+        )),
+        policy_store: Some(policy_store(PolicyDocument::Embedded)),
+        production_place: Some(ProductionPlace {
+            city: Some("Prague"),
+            country: Some("CZ"),
+            ..ProductionPlace::default()
+        }),
+        signer_role: Some(SignerRole {
+            claimed: &claimed,
+            certified: &[],
+            assertions: &[],
+        }),
+        ..Properties::default()
+    };
+    fixture
+        .create(
+            &mut document,
+            Request {
+                properties,
+                ..request("sig", &objects)
+            },
+        )
+        .expect("creation with signature properties");
+    assert!(fixture.meets_basic(document.as_xml(), "sig"), "B-B");
+    let created = parse(document.as_xml());
+    assert_eq!(
+        children(&created, "SignedSignatureProperties"),
+        [
+            "SigningTime",
+            "SigningCertificateV2",
+            "SignaturePolicyIdentifier",
+            "SignatureProductionPlaceV2",
+            "SignerRoleV2"
+        ]
+    );
+    assert_eq!(
+        children(&created, "ClaimedRoles"),
+        ["ClaimedRole", "ClaimedRole"]
+    );
+    assert_eq!(
+        digest_under(&created, "SigPolicyHash"),
+        sha256(POLICY_DOCUMENT),
+        "the policy digest covers the document as given"
+    );
+    let stored = created
+        .descendants()
+        .find(|node| node.tag_name().name() == "SignaturePolicyDocument")
+        .and_then(|node| node.text())
+        .expect("the store embeds the policy");
+    assert_eq!(
+        structured_base64::STANDARD
+            .decode(stored.as_bytes())
+            .expect("base64"),
+        POLICY_DOCUMENT
+    );
+    let store = created
+        .descendants()
+        .find(|node| node.tag_name().name() == "SignaturePolicyStore")
+        .expect("policy store");
+    assert_eq!(
+        store.tag_name().namespace(),
+        Some("http://uri.etsi.org/01903/v1.4.1#")
+    );
+    assert_eq!(
+        store.parent().map(|node| node.tag_name().name()),
+        Some("UnsignedSignatureProperties")
+    );
+}
+
+#[test]
+fn data_object_properties_are_signed_in_schema_order_and_meet_basic() {
+    // EN 319 132-1 §5.2.3, §5.2.4: format details join the baseline MIME
+    // type of their object, and a commitment over every object follows the
+    // formats; the signature still meets B-B.
+    let fixture = Fixture::new();
+    let mut document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
+    let objects = enveloped(Envelope::ExcludingSignatures);
+    let commitment = Commitment {
+        identifier: Identifier {
+            uri: "http://uri.etsi.org/01903/v1.2.2#ProofOfOrigin",
+            qualifier: None,
+            description: None,
+            documentation: &[],
+        },
+        scope: CommitmentScope::All,
+        qualifiers: &[],
+    };
+    let formats = [FormatDetails {
+        reference: "#sig-reference-0",
+        description: Some("The document"),
+        identifier: Some(Identifier {
+            uri: "urn:oid:1.2.840.113549.1.7.1",
+            qualifier: Some(Qualifier::Urn),
+            description: None,
+            documentation: &[],
+        }),
+        encoding: None,
+    }];
+    let properties = Properties {
+        commitments: std::slice::from_ref(&commitment),
+        formats: &formats,
+        ..Properties::default()
+    };
+    fixture
+        .create(
+            &mut document,
+            Request {
+                properties,
+                ..request("sig", &objects)
+            },
+        )
+        .expect("creation with data object properties");
+    assert!(fixture.meets_basic(document.as_xml(), "sig"), "B-B");
+    let created = parse(document.as_xml());
+    assert_eq!(
+        children(&created, "SignedDataObjectProperties"),
+        ["DataObjectFormat", "CommitmentTypeIndication"]
+    );
+    assert_eq!(
+        children(&created, "DataObjectFormat"),
+        ["Description", "ObjectIdentifier", "MimeType"]
+    );
+    assert_eq!(
+        children(&created, "CommitmentTypeIndication"),
+        ["CommitmentTypeId", "AllSignedDataObjects"]
+    );
+}
+
+#[test]
+fn a_policy_digest_covers_the_document_after_its_transforms() {
+    // EN 319 132-1 §5.2.9.2: with ds:Transforms the digest covers the policy
+    // document after them, and the same Transforms are written beside it.
+    let fixture = Fixture::new();
+    let transforms = PolicyTransforms::parse(
+        format!(
+            "<ds:Transforms xmlns:ds=\"{DS}\"><ds:Transform Algorithm=\"http://www.w3.org/TR/2001/REC-xml-c14n-20010315\"/></ds:Transforms>"
+        ),
+        &fixture.policy,
+    )
+    .expect("policy transforms");
+    let transforms = Fragment::Transforms(transforms);
+    let mut document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
+    let objects = enveloped(Envelope::ExcludingSignatures);
+    fixture
+        .create(
+            &mut document,
+            Request {
+                properties: Properties {
+                    policy: Some(explicit(PolicyTransform::Xml(&transforms), &[])),
+                    ..Properties::default()
+                },
+                ..request("sig", &objects)
+            },
+        )
+        .expect("creation with a transformed policy digest");
+    assert!(fixture.meets_basic(document.as_xml(), "sig"), "B-B");
+    let created = parse(document.as_xml());
+    assert_eq!(
+        children(&created, "SignaturePolicyId"),
+        ["SigPolicyId", "Transforms", "SigPolicyHash"]
+    );
+    let canonical = xml_sec::c14n::canonicalize_xml(
+        POLICY_DOCUMENT,
+        &C14nAlgorithm::new(C14nMode::Inclusive1_0, false),
+    )
+    .expect("canonical policy");
+    assert_ne!(
+        canonical, POLICY_DOCUMENT,
+        "the transform changes the bytes"
+    );
+    assert_eq!(digest_under(&created, "SigPolicyHash"), sha256(&canonical));
+}
+
+#[test]
+fn inconsistent_properties_are_refused_before_publication() {
+    // EN 319 132-1 §5.2.10 and §5.2.4: a store without an explicit policy,
+    // details for no data object, and an encoding the ds:Object does not
+    // declare are refused, and the document is left as it was.
+    let fixture = Fixture::new();
+    let objects = enveloped(Envelope::ExcludingSignatures);
+    assert!(matches!(
+        fixture.refused(
+            Properties {
+                policy: Some(SignaturePolicy::Implied),
+                policy_store: Some(policy_store(PolicyDocument::LocalUri("policy.xml"))),
+                ..Properties::default()
+            },
+            &objects
+        ),
+        CreateError::PolicyStoreWithoutPolicy
+    ));
+    let unknown = [FormatDetails {
+        reference: "#sig-reference-7",
+        description: Some("none"),
+        identifier: None,
+        encoding: None,
+    }];
+    assert!(matches!(
+        fixture.refused(Properties { formats: &unknown, ..Properties::default() }, &objects),
+        CreateError::FormatReference(reference) if reference == "#sig-reference-7"
+    ));
+    let base64 = [DataObject::Object {
+        id: "data",
+        content: ObjectContent::Text("SGVsbG8=".to_owned()),
+        encoding: Some("http://www.w3.org/2000/09/xmldsig#base64"),
+        transforms: vec![Transform::Base64Decode],
+        mime_type: "text/plain",
+    }];
+    let wrong_encoding = [FormatDetails {
+        reference: "#sig-reference-0",
+        description: None,
+        identifier: None,
+        encoding: Some("urn:other-encoding"),
+    }];
+    assert!(matches!(
+        fixture.refused(
+            Properties {
+                formats: &wrong_encoding,
+                ..Properties::default()
+            },
+            &base64
+        ),
+        CreateError::Properties(structured_xades::produce::Error::Value(
+            "dataObjectFormat.encoding"
+        ))
+    ));
+}
+
+#[test]
+fn policy_values_xml_sec_cannot_draft_are_refused_before_publication() {
+    // A digest as some specification computes it is not implemented, a
+    // notice number must be an xsd:integer, and a ds:Transforms cannot stand
+    // where a role is due; none of them publishes anything.
+    let fixture = Fixture::new();
+    let objects = enveloped(Envelope::ExcludingSignatures);
+    let specified = fixture.refused(
+        Properties {
+            policy: Some(explicit(
+                PolicyTransform::InSpecification(Identifier {
+                    uri: "urn:example:spec",
+                    qualifier: None,
+                    description: None,
+                    documentation: &[],
+                }),
+                &[],
+            )),
+            ..Properties::default()
+        },
+        &objects,
+    );
+    assert!(
+        matches!(
+            specified,
+            CreateError::Properties(structured_xades::produce::Error::Writer(
+                PropertyError::Specification(_)
+            ))
+        ),
+        "{specified:?}"
+    );
+    let notice = [PolicyQualifier::Notice(UserNotice {
+        reference: Some(NoticeReference {
+            organization: "Example",
+            numbers: &["1", "two"],
+        }),
+        text: None,
+    })];
+    let integer = fixture.refused(
+        Properties {
+            policy: Some(explicit(PolicyTransform::None, &notice)),
+            ..Properties::default()
+        },
+        &objects,
+    );
+    assert!(
+        matches!(
+            &integer,
+            CreateError::Properties(structured_xades::produce::Error::Writer(
+                PropertyError::Integer(value)
+            )) if value == "two"
+        ),
+        "{integer:?}"
+    );
+    let transforms = Fragment::Transforms(
+        PolicyTransforms::parse(
+            format!("<ds:Transforms xmlns:ds=\"{DS}\"/>"),
+            &fixture.policy,
+        )
+        .expect("empty transforms"),
+    );
+    let misplaced = fixture.refused(
+        Properties {
+            signer_role: Some(SignerRole {
+                claimed: std::slice::from_ref(&transforms),
+                certified: &[],
+                assertions: &[],
+            }),
+            ..Properties::default()
+        },
+        &objects,
+    );
+    assert!(
+        matches!(
+            misplaced,
+            CreateError::Properties(structured_xades::produce::Error::Writer(
+                PropertyError::Slot(_)
+            ))
+        ),
+        "{misplaced:?}"
+    );
+}
+
+#[test]
+fn a_countersignature_takes_no_data_object_property() {
+    // A countersignature signs no data object (EN 319 132-1 §5.2.7.2), so a
+    // commitment on it would qualify nothing; the parent stays as it was.
+    let fixture = Fixture::new();
+    let objects = enveloped(Envelope::ExcludingSignatures);
+    let mut document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
+    fixture
+        .create(&mut document, request("sig", &objects))
+        .expect("parent");
+    let commitment = Commitment {
+        identifier: policy_identifier(),
+        scope: CommitmentScope::All,
+        qualifiers: &[],
+    };
+    let parent = document.as_xml().to_owned();
+    let error = fixture
+        .countersign(
+            &mut document,
+            &Countersignature {
+                parent: "sig",
+                id: "counter",
+                signing_time: TIME,
+                id_attributes: &[],
+                properties: Properties {
+                    commitments: std::slice::from_ref(&commitment),
+                    ..Properties::default()
+                },
+            },
+        )
+        .expect_err("a countersignature qualifies no data object");
+    assert!(matches!(error, CreateError::NoQualifiedObject));
+    assert_eq!(document.as_xml(), parent);
 }
 
 #[test]
@@ -711,6 +1182,7 @@ fn chosen_and_default_namespace_prefixes_meet_basic() {
                     id: "counter",
                     signing_time: TIME,
                     id_attributes: &[],
+                    properties: Properties::default(),
                 },
                 assessment,
                 &account(1 << 30),
@@ -884,6 +1356,7 @@ fn a_countersignature_meets_basic_with_its_parent() {
                 id: "counter",
                 signing_time: TIME,
                 id_attributes: &[],
+                properties: Properties::default(),
             },
         )
         .expect("countersignature");
@@ -932,6 +1405,7 @@ fn a_second_countersignature_follows_the_first() {
                     id,
                     signing_time: TIME,
                     id_attributes: &[],
+                    properties: Properties::default(),
                 },
             )
             .unwrap_or_else(|error| panic!("{id}: {error}"));
@@ -987,6 +1461,7 @@ fn expected_targets_hold_for_the_published_generation() {
                     id: "counter",
                     signing_time: TIME,
                     id_attributes: &[],
+                    properties: Properties::default(),
                 },
                 assessment,
                 &account(1 << 30),
@@ -1086,6 +1561,7 @@ fn signature_properties_precede_existing_data_object_properties() {
                 id: "counter",
                 signing_time: TIME,
                 id_attributes: &[],
+                properties: Properties::default(),
             },
         )
         .expect("countersignature");
@@ -1191,7 +1667,7 @@ fn malformed_inputs_are_refused_without_a_partial_signature() {
             matches!(
                 error,
                 CreateError::Properties(structured_xades::produce::Error::Writer(
-                    DraftError::Value { .. }
+                    PropertyError::Draft(DraftError::Value { .. })
                 ))
             )
         },
@@ -1336,8 +1812,8 @@ fn a_refused_draft_reports_its_resource_cause() {
                     | CreateError::Resource(MemoryError::WorkExceeded)
                     | CreateError::Properties(
                         structured_xades::produce::Error::Resource(MemoryError::WorkExceeded)
-                            | structured_xades::produce::Error::Writer(DraftError::Resource(
-                                MemoryError::WorkExceeded
+                            | structured_xades::produce::Error::Writer(PropertyError::Draft(
+                                DraftError::Resource(MemoryError::WorkExceeded)
                             ))
                     )
             )
@@ -1360,6 +1836,7 @@ fn a_parent_that_cannot_be_countersigned_is_refused() {
         id: "counter",
         signing_time: TIME,
         id_attributes: &[],
+        properties: Properties::default(),
     };
     refused(
         &mut document,

@@ -33,6 +33,14 @@
 //! that generation satisfies the caller's verification request and meets
 //! every B-B requirement of [`validate_basic`]; otherwise the document is
 //! unchanged. Verification-only builds do not take the signing dependencies.
+//! The optional qualifying properties of `properties` (a signature policy and
+//! its store, a production place, signer roles, commitments and format
+//! details) are built by the same shared rules. Content timestamps are two
+//! steps around the caller's TSA exchange: `request_content_timestamps`
+//! encodes each request over the data references' output, computed by the
+//! signing operation stopped before any signature value, and `create` checks
+//! each response against its request before it signs. `add_policy_store`
+//! stores the explicit policy an existing signature signed.
 //!
 //! B-T augmentation is two steps around the caller's own TSA exchange:
 //! `request_timestamp` encodes the RFC 3161 request over a B-B signature's
@@ -65,6 +73,8 @@ mod augment;
 mod basic;
 mod binary;
 #[cfg(feature = "produce")]
+mod content;
+#[cfg(feature = "produce")]
 mod create;
 #[cfg(feature = "produce")]
 mod draft;
@@ -72,6 +82,8 @@ mod level;
 mod path;
 #[cfg(feature = "produce")]
 mod placement;
+#[cfg(feature = "produce")]
+pub mod properties;
 mod signature;
 mod status;
 mod tokens;
@@ -81,9 +93,10 @@ mod xml;
 pub use accuracy::AuthorityAccuracy;
 #[cfg(feature = "produce")]
 pub use augment::{
-    AugmentError, Completion, DataAdded, DigestRenewal, PendingTimestamp, TimestampRequest,
-    TokenFacts, ValidationData, add_validation_data, complete_timestamp, request_archive_timestamp,
-    request_archive_timestamp_with_renewal, request_timestamp,
+    AugmentError, Completion, DataAdded, DigestRenewal, PendingTimestamp, PolicyStoreRequest,
+    TimestampRequest, TokenFacts, ValidationData, add_policy_store, add_validation_data,
+    complete_timestamp, request_archive_timestamp, request_archive_timestamp_with_renewal,
+    request_timestamp,
 };
 pub use basic::{
     CounterError, EnclosingError, Outcome, PathFailure, Report, TimestampCheckError,
@@ -91,9 +104,13 @@ pub use basic::{
 };
 pub use binary::DigestIdentity;
 #[cfg(feature = "produce")]
+pub use content::{
+    ContentError, ContentEvidence, ContentRequests, ContentScope, ContentTimestamp, StagedError,
+};
+#[cfg(feature = "produce")]
 pub use create::{
     Assessment, Countersignature, CreateError, DataObject, Envelope, ManifestEntry, Placement,
-    Prefixes, Request, Signer, countersign, create,
+    Prefixes, Request, Signer, countersign, create, request_content_timestamps,
 };
 #[cfg(feature = "produce")]
 pub use draft::{Draft, DraftError};

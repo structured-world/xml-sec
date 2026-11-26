@@ -4,7 +4,8 @@
 //! writes the timestamp requests of a B-B signature xml-sec creates, then,
 //! from the responses so far, those of its first archive timestamp and of
 //! that archive's renewal; the OpenSSL TSA answers every one, so no response
-//! is produced by xml-sec.
+//! is produced by xml-sec. `xades fixtures --content` issues the same PKI for
+//! the content timestamps of a new signature.
 
 use super::fixtures::Generator;
 use super::levels::{Levels, TSA_CONFIG};
@@ -69,8 +70,9 @@ fn probe(corpus: &Corpus, generator: &Generator, action: &str) -> Result<(), Str
     Ok(())
 }
 
-/// Issues the chain and the TSA, then writes the requests and every response.
-pub(crate) fn generate(corpus: &Corpus, generator: &Generator) -> Result<(), String> {
+/// Issues the signer chain and a TSA under the same intermediate, and writes
+/// the certificates and the signer's key.
+fn issue_with_tsa(generator: &Generator) -> Result<(), String> {
     for directory in [&generator.output, &generator.work] {
         std::fs::create_dir_all(directory)
             .map_err(|error| format!("create {}: {error}", directory.display()))?;
@@ -92,6 +94,32 @@ pub(crate) fn generate(corpus: &Corpus, generator: &Generator) -> Result<(), Str
         &generator.output.join("signer.key"),
         read(&generator.work.join("signer.key"))?,
     )?;
+    write(&generator.work.join("tsa.serial"), "01\n")
+}
+
+/// `xades fixtures --content`: the content timestamp fixtures. The probe
+/// writes the requests of a new signature's content timestamps, computed
+/// before it is signed, and the OpenSSL TSA answers each one.
+pub(crate) fn content(corpus: &Corpus, generator: &Generator) -> Result<(), String> {
+    issue_with_tsa(generator)?;
+    probe(corpus, generator, "content-request")?;
+    for (query, response) in [
+        ("content-all.tsq", "content-all.tsr"),
+        ("content-individual.tsq", "content-individual.tsr"),
+        ("content-changing.tsq", "content-changing.tsr"),
+    ] {
+        write(
+            &generator.output.join(query),
+            read(&generator.work.join(query))?,
+        )?;
+        reply(generator, query, response, true)?;
+    }
+    Ok(())
+}
+
+/// Issues the chain and the TSA, then writes the requests and every response.
+pub(crate) fn generate(corpus: &Corpus, generator: &Generator) -> Result<(), String> {
+    issue_with_tsa(generator)?;
     let levels = Levels { generator };
     for issuer in ["root", "intermediate"] {
         write(
@@ -99,7 +127,6 @@ pub(crate) fn generate(corpus: &Corpus, generator: &Generator) -> Result<(), Str
             levels.crl(issuer)?,
         )?;
     }
-    write(&generator.work.join("tsa.serial"), "01\n")?;
     probe(corpus, generator, "request")?;
     for name in ["request.tsq", "request-policy.tsq", "request-no-nonce.tsq"] {
         write(

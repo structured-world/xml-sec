@@ -1,6 +1,8 @@
 //! `xades creation [--results DIR]`: EU DSS's independent reading of the
 //! signatures xml-sec creates and augments. The `create_probe` example signs
-//! every packaging mode with the creation fixtures, and `augment_probe` adds a
+//! every packaging mode with the creation fixtures, `properties_probe` signs
+//! with every optional qualifying property, `augment_probe` creates a
+//! signature with content timestamps from the content fixtures and adds a
 //! TSA token to a B-B signature with the augmentation fixtures, the CRLs and
 //! OCSP response of the level fixtures to their B-T signature, from its own
 //! B-T signature and CRLs, an archive timestamp and its renewal, and to the
@@ -44,7 +46,7 @@ const fn created(name: &'static str, signatures: usize) -> Case {
     }
 }
 
-pub(crate) const CASES: [Case; 29] = [
+pub(crate) const CASES: [Case; 41] = [
     created("enveloped", 1),
     created("enveloping", 1),
     created("internally-detached", 1),
@@ -70,6 +72,31 @@ pub(crate) const CASES: [Case; 29] = [
     created("reference-comments", 1),
     created("object-base64", 1),
     created("reference-xslt", 1),
+    // The optional qualifying properties (`properties_probe`).
+    created("policy-explicit", 1),
+    created("policy-transforms", 1),
+    created("policy-implied", 1),
+    created("policy-local-uri", 1),
+    created("commitment", 1),
+    created("signer-role", 1),
+    created("production-place", 1),
+    created("data-object-format", 1),
+    created("countersigned-properties", 2),
+    created("policy-store-added", 2),
+    Case {
+        name: "content-timestamps",
+        signatures: 1,
+        format: "XAdES-BASELINE-B",
+        timestamps: 2,
+        fixtures: "content",
+    },
+    Case {
+        name: "content-repeated",
+        signatures: 1,
+        format: "XAdES-BASELINE-B",
+        timestamps: 2,
+        fixtures: "content",
+    },
     Case {
         name: "b-t",
         signatures: 1,
@@ -154,7 +181,7 @@ const FORM_DETACHED: [(&str, &str); 2] = [
 /// The detached files a case's references name.
 fn detached_files(name: &str) -> &'static [&'static str] {
     match name {
-        "detached" => &["detached.txt"],
+        "detached" | "commitment" => &["detached.txt"],
         "detached-multiple" | "manifest" => &["detached.txt", "detached-2.txt"],
         "reference-detached-xml" => &["detached-data.xml"],
         _ => &[],
@@ -214,6 +241,87 @@ fn tokens(diagnostic: xml::Node<'_, '_>, expected: usize, problems: &mut Vec<Str
     }
 }
 
+/// The optional properties DSS must read in a case's diagnostic report, as
+/// (element, expected text): some element of that local name holds the text,
+/// or, for `element@attribute`, has the attribute with that value.
+fn expected_properties(name: &str) -> &'static [(&'static str, &'static str)] {
+    const POLICY: &str = "1.3.6.1.4.1.13762.3.1";
+    match name {
+        // The stored document's digest, after the transforms of the second,
+        // matches the signed one.
+        "policy-explicit" => &[
+            ("Id", POLICY),
+            ("Identified", "true"),
+            ("DigestAlgoAndValue@match", "true"),
+            ("Organization", "Example Organization"),
+            ("ExplicitText", "Signed under the example policy"),
+        ],
+        "policy-transforms" => &[
+            ("Id", POLICY),
+            ("Transformation", "Canonical XML 1.0 (omits comments)"),
+            ("DigestAlgoAndValue@match", "true"),
+        ],
+        "policy-implied" => &[("Id", "IMPLICIT_POLICY")],
+        // The store added to the first signature authenticates its policy;
+        // the second signature has none to compare with.
+        "policy-store-added" => &[
+            ("Id", POLICY),
+            ("Identified", "true"),
+            ("DigestAlgoAndValue@match", "true"),
+            ("Identified", "false"),
+        ],
+        // DSS has no local copy to compare; it reads the identifier.
+        "policy-local-uri" => &[("Id", POLICY)],
+        "commitment" => &[
+            (
+                "Identifier",
+                "http://uri.etsi.org/01903/v1.2.2#ProofOfOrigin",
+            ),
+            ("AllDataSignedObjects", "true"),
+            (
+                "Identifier",
+                "http://uri.etsi.org/01903/v1.2.2#ProofOfApproval",
+            ),
+            ("ObjectReference", "sig-reference-1"),
+        ],
+        "signer-role" => &[
+            ("Role", "Manager"),
+            ("Role", "Approver"),
+            ("SignerRole@Category", "signed"),
+        ],
+        "production-place" | "countersigned-properties" => &[
+            ("City", "Prague"),
+            ("StreetAddress", "Main Street 1"),
+            ("PostalCode", "11000"),
+            ("CountryName", "CZ"),
+        ],
+        "content-timestamps" => &[
+            ("Timestamp@Type", "ALL_DATA_OBJECTS_TIMESTAMP"),
+            ("Timestamp@Type", "INDIVIDUAL_DATA_OBJECTS_TIMESTAMP"),
+        ],
+        "content-repeated" => &[("Timestamp@Type", "ALL_DATA_OBJECTS_TIMESTAMP")],
+        _ => &[],
+    }
+}
+
+/// Each expected property of `name` the diagnostic report does not hold.
+fn property_problems(name: &str, diagnostic: xml::Node<'_, '_>, problems: &mut Vec<String>) {
+    for (element, expected) in expected_properties(name) {
+        let (local, attribute) = element
+            .split_once('@')
+            .map_or((*element, None), |(local, attribute)| {
+                (local, Some(attribute))
+            });
+        let found = xml::below(diagnostic, local, None).any(|node| match attribute {
+            Some(attribute) => node.attribute(attribute) == Some(*expected),
+            None => xml::text_at(node, &[]).as_deref() == Some(*expected),
+        });
+        if !found {
+            problems.push(format!("DSS did not read {element} {expected:?}"));
+        }
+    }
+}
+
 /// What DSS concluded on one created document, and why it does not qualify.
 pub(crate) fn assess(case: &Case, output: &str, reports: &Path) -> Result<Value, String> {
     let Case {
@@ -243,6 +351,7 @@ pub(crate) fn assess(case: &Case, output: &str, reports: &Path) -> Result<Value,
     let diagnostic_text = xml::read(&reports.join("diagnostic.xml"))?;
     let diagnostic = xml::parse(&diagnostic_text, "diagnostic report")?;
     tokens(diagnostic.root_element(), timestamps, &mut problems);
+    property_problems(name, diagnostic.root_element(), &mut problems);
     let mut intact = Vec::new();
     for signature in xml::below(diagnostic.root_element(), "Signature", None)
         .filter(|node| xml::child(*node, "BasicSignature").is_some())
@@ -330,6 +439,8 @@ pub(crate) fn execute(corpus: &Corpus, results: &Path) -> Result<(), String> {
     let signed = results.join("signed");
     for (example, action, directory) in [
         ("create_probe", None, "creation"),
+        ("properties_probe", None, "creation"),
+        ("augment_probe", Some("content"), "content"),
         ("augment_probe", Some("complete"), "augmentation"),
         ("augment_probe", Some("extend"), "levels"),
         ("augment_probe", Some("archive"), "augmentation"),

@@ -150,6 +150,7 @@ impl Fixture {
                     placement: xml_sec_xades::Placement::DocumentEnd,
                     resources: None,
                     id_attributes: &[],
+                    properties: xml_sec_xades::properties::Properties::default(),
                 },
                 assessment,
                 &account(),

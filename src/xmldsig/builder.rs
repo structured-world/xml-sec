@@ -171,6 +171,13 @@ pub struct ObjectElement {
     markup: String,
 }
 
+impl AsRef<str> for ObjectElement {
+    /// The checked markup exactly as it is copied into a document.
+    fn as_ref(&self) -> &str {
+        &self.markup
+    }
+}
+
 impl ObjectElement {
     /// Check that `markup` is exactly one well-formed element under `policy`.
     ///

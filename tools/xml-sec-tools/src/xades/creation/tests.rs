@@ -166,6 +166,40 @@ fn every_independent_finding_is_reported() {
 }
 
 #[test]
+fn a_property_dss_did_not_read_is_reported() {
+    // A case with optional properties qualifies only when DSS reads each of
+    // them back: a policy whose stored document's digest does not match, or
+    // a commitment DSS does not see, is named.
+    let diagnostic = |policy: &str| {
+        format!(
+            "<DiagnosticData><Signature><Policy><Id>1.3.6.1.4.1.13762.3.1</Id><Identified>true</Identified><Organization>Example Organization</Organization><ExplicitText>Signed under the example policy</ExplicitText>{policy}</Policy></Signature></DiagnosticData>"
+        )
+    };
+    let problems_of = |name: &str, text: &str| {
+        let document = super::xml::parse(text, "diagnostic").expect("parses");
+        let mut problems = Vec::new();
+        super::property_problems(name, document.root_element(), &mut problems);
+        problems
+    };
+    let matched = diagnostic("<DigestAlgoAndValue match=\"true\"/>");
+    assert_eq!(
+        problems_of("policy-explicit", &matched),
+        Vec::<String>::new()
+    );
+    let mismatched = diagnostic("<DigestAlgoAndValue match=\"false\"/>");
+    assert_eq!(
+        problems_of("policy-explicit", &mismatched),
+        ["DSS did not read DigestAlgoAndValue@match \"true\""]
+    );
+    assert_eq!(
+        problems_of("commitment", &matched).len(),
+        4,
+        "no commitment was read"
+    );
+    assert_eq!(problems_of("enveloped", &matched), Vec::<String>::new());
+}
+
+#[test]
 fn a_timestamped_signature_needs_an_intact_token() {
     // B-T needs the token's own signature and its imprint over the signature
     // value confirmed, not only the signature's classification.
