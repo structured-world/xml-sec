@@ -8,10 +8,21 @@ use std::collections::BTreeSet;
 #[test]
 fn every_case_has_its_own_name_and_alternates_the_implementations() {
     // Both directions cover every packaging and signer with CRL and OCSP
-    // evidence; the step after creation and the renewal swap implementations,
-    // so each step is validated by the side that did not make it.
+    // evidence, and every further algorithm over an enveloping signature;
+    // the step after creation and the renewal swap implementations, so each
+    // step is validated by the side that did not make it.
     let cases = cases();
-    assert_eq!(cases.len(), 2 * (4 * 2 * 2 + 1));
+    assert_eq!(cases.len(), 2 * (4 * 2 * 2 + 1 + Algorithm::MORE.len()));
+    for first in [Actor::XmlSec, Actor::Dss] {
+        for algorithm in Algorithm::MORE {
+            assert!(cases.contains(&super::Case {
+                first,
+                packaging: Packaging::Enveloping,
+                algorithm,
+                evidence: Evidence::Crl,
+            }));
+        }
+    }
     let names: BTreeSet<String> = cases.iter().map(|case| case.name()).collect();
     assert_eq!(names.len(), cases.len());
     for first in [Actor::XmlSec, Actor::Dss] {

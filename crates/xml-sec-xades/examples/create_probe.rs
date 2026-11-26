@@ -24,6 +24,7 @@ use xml_sec_xades::{
 
 const DOCUMENT: &str = "<Document><Data Id=\"payload\">Created payload</Data></Document>";
 const DETACHED: &[u8] = b"Detached payload\n";
+const SECOND_DETACHED: &[u8] = b"Second detached payload\n";
 const TIME: &str = "2026-10-18T12:00:00Z";
 
 fn read(directory: &Path, name: &str) -> Result<Vec<u8>, String> {
@@ -64,7 +65,10 @@ fn main() -> Result<(), String> {
     let context = VerifyContext::new()
         .policy(verification)
         .key_resolver(&resolver);
-    let resources = BTreeMap::from([("detached.txt".to_owned(), DETACHED.to_vec())]);
+    let resources = BTreeMap::from([
+        ("detached.txt".to_owned(), DETACHED.to_vec()),
+        ("detached-2.txt".to_owned(), SECOND_DETACHED.to_vec()),
+    ]);
     let request = VerificationRequest {
         external_resources: Some(&resources),
         ..VerificationRequest::default()
@@ -76,10 +80,22 @@ fn main() -> Result<(), String> {
     };
     let element = ObjectElement::parse("<Data>Enveloped object</Data>", &signing)
         .map_err(|error| error.to_string())?;
+    // The same signer with inclusive canonicalization of SignedInfo.
+    let inclusive = Signer {
+        canonicalization: C14nAlgorithm::new(C14nMode::Inclusive1_0, false),
+        ..signer
+    };
     std::fs::create_dir_all(&output).map_err(|error| error.to_string())?;
-    std::fs::write(output.join("detached.txt"), DETACHED).map_err(|error| error.to_string())?;
+    for (name, content) in &resources {
+        std::fs::write(output.join(name), content).map_err(|error| error.to_string())?;
+    }
     for (name, signatures) in cases(element) {
-        let document = sign(&signer, &assessment, &resources, name, signatures)?;
+        let signer = if name == "inclusive" {
+            &inclusive
+        } else {
+            &signer
+        };
+        let document = sign(signer, &assessment, &resources, name, signatures)?;
         std::fs::write(output.join(format!("{name}.xml")), document.as_xml())
             .map_err(|error| error.to_string())?;
         println!("{name}");
@@ -145,6 +161,24 @@ fn cases(element: ObjectElement) -> Vec<(&'static str, Signatures)> {
             "countersigned",
             one(vec![document_object(Envelope::ExcludingSignatures)]),
         ),
+        (
+            "countersigned-nested",
+            one(vec![document_object(Envelope::ExcludingSignatures)]),
+        ),
+        (
+            "detached-multiple",
+            one(vec![
+                DataObject::Detached {
+                    uri: "detached.txt",
+                    mime_type: "text/plain",
+                },
+                DataObject::Detached {
+                    uri: "detached-2.txt",
+                    mime_type: "text/plain",
+                },
+            ]),
+        ),
+        ("inclusive", one(vec![document_object(Envelope::Enveloped)])),
     ]
 }
 
@@ -171,15 +205,21 @@ fn sign(
         create(&mut document, signer, request, assessment, &work)
             .map_err(|error| format!("{name} {id}: {error}"))?;
     }
-    if name == "countersigned" {
+    // A countersignature of `sig`, and in the nested case one of it in turn.
+    let chain: &[(&str, &str)] = match name {
+        "countersigned" => &[("sig", "counter")],
+        "countersigned-nested" => &[("sig", "counter"), ("counter", "counter-nested")],
+        _ => &[],
+    };
+    for (parent, id) in chain {
         let countersignature = Countersignature {
-            parent: "sig",
-            id: "counter",
+            parent,
+            id,
             signing_time: TIME,
             id_attributes: &[],
         };
         countersign(&mut document, signer, &countersignature, assessment, &work)
-            .map_err(|error| format!("{name}: {error}"))?;
+            .map_err(|error| format!("{name} {id}: {error}"))?;
     }
     Ok(document)
 }

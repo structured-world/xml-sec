@@ -9,6 +9,9 @@
 //! classify each signature at its expected level, find it cryptographically
 //! intact with every reference found and intact, identify the signing
 //! certificate and find every timestamp intact over its message imprint.
+//! In the other direction DSS (`FormProbe`) makes the signature forms its own
+//! tests make with the creation fixtures' signer, and `level_probe` must find
+//! every signature of each valid at XAdES-BASELINE-B.
 
 use super::{Corpus, absolute, line, xml};
 use serde_json::{Map, Value, json};
@@ -41,13 +44,16 @@ const fn created(name: &'static str, signatures: usize) -> Case {
     }
 }
 
-pub(crate) const CASES: [Case; 11] = [
+pub(crate) const CASES: [Case; 14] = [
     created("enveloped", 1),
     created("enveloping", 1),
     created("internally-detached", 1),
     created("detached", 1),
     created("parallel", 2),
     created("countersigned", 2),
+    created("countersigned-nested", 3),
+    created("detached-multiple", 1),
+    created("inclusive", 1),
     Case {
         name: "b-t",
         signatures: 1,
@@ -85,6 +91,82 @@ pub(crate) const CASES: [Case; 11] = [
         fixtures: "levels",
     },
 ];
+
+/// One signature form EU DSS makes as its signature tests make it, and the
+/// signatures xml-sec must find in it, a countersignature counting as one of
+/// its own.
+#[derive(Clone, Copy)]
+pub(crate) struct Form {
+    pub(crate) name: &'static str,
+    pub(crate) signatures: usize,
+}
+
+pub(crate) const FORMS: [Form; 6] = [
+    Form {
+        name: "parallel",
+        signatures: 2,
+    },
+    Form {
+        name: "countersigned",
+        signatures: 2,
+    },
+    Form {
+        name: "countersigned-nested",
+        signatures: 3,
+    },
+    Form {
+        name: "detached-multiple",
+        signatures: 1,
+    },
+    Form {
+        name: "inclusive",
+        signatures: 1,
+    },
+    Form {
+        name: "pretty-print",
+        signatures: 1,
+    },
+];
+
+/// The document every enveloped DSS form signs, and the detached files.
+const FORM_DOCUMENT: &str = "<Document><Data Id=\"payload\">Form payload</Data></Document>";
+const FORM_DETACHED: [(&str, &str); 2] = [
+    ("detached.txt", "Detached payload\n"),
+    ("detached-2.txt", "Second detached payload\n"),
+];
+
+/// The detached files a case's references name.
+fn detached_files(name: &str) -> &'static [&'static str] {
+    match name {
+        "detached" => &["detached.txt"],
+        "detached-multiple" => &["detached.txt", "detached-2.txt"],
+        _ => &[],
+    }
+}
+
+/// Why xml-sec's reading of a DSS form does not qualify: every signature
+/// `level_probe` reports must be valid and meet XAdES-BASELINE-B.
+pub(crate) fn assess_form(form: &Form, output: &str) -> Value {
+    let reports: Vec<Value> = output
+        .split("signature: ")
+        .skip(1)
+        .map(|chunk| super::lifecycle::xml_sec_outcome(&format!("signature: {chunk}")))
+        .collect();
+    let mut problems = Vec::new();
+    if reports.len() != form.signatures {
+        problems.push(format!(
+            "{} signatures reported, {} expected",
+            reports.len(),
+            form.signatures
+        ));
+    }
+    for (index, report) in reports.iter().enumerate() {
+        if report["crypto"] != "Valid" || report["structure"] != "met" {
+            problems.push(format!("signature {index}: {report}"));
+        }
+    }
+    json!({ "name": form.name, "signatures": reports, "problems": problems })
+}
 
 /// The instant the probe assesses at, inside every creation certificate.
 const TIME: &str = "1800000000";
@@ -266,17 +348,24 @@ pub(crate) fn execute(corpus: &Corpus, results: &Path) -> Result<(), String> {
                 &reports,
             ],
         );
-        match case.name {
-            "detached" => probe.push(signed.join("detached.txt").into()),
-            // The object its signed Manifest names.
-            "b-lta-manifest" => probe.push(fixtures.join("levels/detached.txt").into()),
-            _ => {}
+        for file in detached_files(case.name) {
+            probe.push(signed.join(file).into());
+        }
+        // The object its signed Manifest names.
+        if case.name == "b-lta-manifest" {
+            probe.push(fixtures.join("levels/detached.txt").into());
         }
         let run = corpus.require(&probe, &results.join(format!("{}-run", case.name)))?;
         let output = String::from_utf8_lossy(&run.stdout).into_owned();
         print!("{output}");
         summary.push(assess(case, &output, &reports)?);
     }
+    summary.extend(forms(
+        corpus,
+        results,
+        &classpath,
+        &fixtures.join("creation"),
+    )?);
     super::write_json(
         &results.join("summary.json"),
         &Value::Array(summary.clone()),
@@ -291,16 +380,105 @@ pub(crate) fn execute(corpus: &Corpus, results: &Path) -> Result<(), String> {
         .collect();
     if !failed.is_empty() {
         return Err(format!(
-            "DSS does not accept the created signatures: {}",
+            "the other implementation does not accept a created document (DSS for xml-sec's, xml-sec for DSS's forms under dss-forms): {}",
             Value::Array(failed.into_iter().cloned().collect())
         ));
     }
     println!(
-        "EU DSS: {} created documents validated, reports saved to {}",
+        "EU DSS: {} created documents validated, xml-sec: {} DSS forms validated, reports saved to {}",
         CASES.len(),
+        FORMS.len(),
         results.display()
     );
     Ok(())
+}
+
+/// DSS makes every form with the creation fixtures' signer, and xml-sec
+/// validates each signature at B-B against the fixtures' root.
+fn forms(
+    corpus: &Corpus,
+    results: &Path,
+    classpath: &str,
+    fixtures: &Path,
+) -> Result<Vec<Value>, String> {
+    let work = results.join("dss-forms");
+    std::fs::create_dir_all(&work).map_err(|error| error.to_string())?;
+    let write = |name: &str, content: &[u8]| {
+        std::fs::write(work.join(name), content).map_err(|error| format!("write {name}: {error}"))
+    };
+    write("document.xml", FORM_DOCUMENT.as_bytes())?;
+    for (name, content) in FORM_DETACHED {
+        write(name, content.as_bytes())?;
+    }
+    // DSS takes the signer as a PKCS#12 store with its chain.
+    for certificate in ["signer", "intermediate"] {
+        corpus.require(
+            &line(&[
+                &corpus.openssl,
+                &"x509",
+                &"-inform",
+                &"DER",
+                &"-in",
+                &fixtures.join(format!("{certificate}.der")),
+                &"-out",
+                &work.join(format!("{certificate}.pem")),
+            ]),
+            &work.join(format!("{certificate}-pem")),
+        )?;
+    }
+    let store = work.join("signer.p12");
+    corpus.require(
+        &line(&[
+            &corpus.openssl,
+            &"pkcs12",
+            &"-export",
+            &"-inkey",
+            &fixtures.join("signer.key"),
+            &"-in",
+            &work.join("signer.pem"),
+            &"-certfile",
+            &work.join("intermediate.pem"),
+            &"-name",
+            &"signer",
+            &"-passout",
+            &"pass:dss",
+            &"-out",
+            &store,
+        ]),
+        &work.join("signer-p12"),
+    )?;
+    let level_probe = line(&[
+        &"cargo",
+        &"run",
+        &"-q",
+        &"-p",
+        &"xml-sec-xades",
+        &"--features",
+        &"produce",
+        &"--example",
+        &"level_probe",
+        &"--",
+    ]);
+    let mut rows = Vec::new();
+    for form in &FORMS {
+        let document = work.join(format!("{}.xml", form.name));
+        let probe = super::dss::java(
+            classpath,
+            "FormProbe",
+            &[&store, &form.name, &work, &TIME, &document],
+        );
+        corpus.require(&probe, &work.join(format!("{}-dss", form.name)))?;
+        let mut validate = level_probe.clone();
+        validate.extend(line(&[&document, &fixtures.join("root.der"), &TIME, &"b"]));
+        for file in detached_files(form.name) {
+            validate.extend(line(&[&"--detached", &work.join(file)]));
+        }
+        let run = corpus.require(&validate, &work.join(format!("{}-xml-sec", form.name)))?;
+        let output = String::from_utf8_lossy(&run.stdout).into_owned();
+        print!("{output}");
+        rows.push(assess_form(form, &output));
+    }
+    Ok(rows)
 }
 
 pub(crate) fn run(corpus: &Corpus, args: &[String]) -> Result<(), crate::repo::Failure> {

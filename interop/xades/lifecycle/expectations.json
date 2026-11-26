@@ -8,7 +8,8 @@
     "Tokens": "xml-sec under TimestampTokenEncoding::Declared refuses a token DSS made: BouncyCastle writes its certificate SET OF unsorted, which is not DER, and an unmarked token is DER (EN 319 132-1 §5.1.3). Normative difference, intended.",
     "unmet": "Under TimestampTokenEncoding::Ber xml-sec reads DSS's tokens and finds DSS's B-T met, but not the B-LT and B-LTA DSS makes: DSS places the CRL that covers the TSA certificate only in RevocationValues, while EN 319 132-1 §6.3(x) requires the validation data of a time-stamp in TimeStampValidationData, AnyValidationData or the token itself. Normative difference, intended. xml-sec therefore refuses to renew such an archive (§6.3(aa)).",
     "revoked": "The CRL lists the signer as revoked before signing. DSS refuses to augment to B-LT or to renew; xml-sec adds the evidence, because a level states what the document carries, and DSS then reads it as INDETERMINATE/REVOKED_NO_POE.",
-    "crl": "Every certificate of the run carries a CRL distribution point that is never fetched: DSS looks a CRL up only through one (RFC 5280 §4.2.1.13), while the run supplies the CRLs offline."
+    "crl": "Every certificate of the run carries a CRL distribution point that is never fetched: DSS looks a CRL up only through one (RFC 5280 §4.2.1.13), while the run supplies the CRLs offline.",
+    "algorithms": "Each further signature algorithm DSS's signature tests use (RSA with SHA-512, RSASSA-PSS with SHA-256 and MGF1, ECDSA on P-384 and P-521, ECDSA P-256 with SHA3-512, Ed25519, Ed448, DSA with (L, N) = (2048, 256)) runs one enveloping lifecycle in each direction, references digested with SHA-256. Every step is made and validated by the other side. Once revocation data exists, DSS's default validation policy reads Ed25519 and Ed448 signatures as INDETERMINATE/CRYPTO_CONSTRAINTS_FAILURE_NO_POE: 'The algorithm EdDSA with SHA512 is not authorised for signature creation'. That is DSS's policy verdict on the algorithm, not a fault of the signature."
   },
   "cases": {
     "xml-sec-first-enveloped-rsa-crl": {
@@ -1054,6 +1055,510 @@
           "by": "dss",
           "made": {
             "refused": "Revoked/Suspended certificate(s) detected."
+          }
+        }
+      ]
+    },
+    "xml-sec-first-enveloping-rsa-sha512-crl": {
+      "steps": [
+        {
+          "step": "b",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-B",
+            "evidence": {
+              "timestamps": 0,
+              "timestamps_intact": true,
+              "revocations": 0
+            },
+            "trust": "INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE"
+          }
+        },
+        {
+          "step": "t",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "met"
+          }
+        },
+        {
+          "step": "lt",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "unmet"
+          }
+        },
+        {
+          "step": "lta",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "unmet"
+          }
+        },
+        {
+          "step": "renew",
+          "by": "xml-sec",
+          "made": {
+            "refused": "completion: the required level is not met: Assessed"
+          }
+        }
+      ]
+    },
+    "xml-sec-first-enveloping-rsa-pss-crl": {
+      "steps": [
+        {
+          "step": "b",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-B",
+            "evidence": {
+              "timestamps": 0,
+              "timestamps_intact": true,
+              "revocations": 0
+            },
+            "trust": "INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE"
+          }
+        },
+        {
+          "step": "t",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "met"
+          }
+        },
+        {
+          "step": "lt",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "unmet"
+          }
+        },
+        {
+          "step": "lta",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "unmet"
+          }
+        },
+        {
+          "step": "renew",
+          "by": "xml-sec",
+          "made": {
+            "refused": "completion: the required level is not met: Assessed"
+          }
+        }
+      ]
+    },
+    "xml-sec-first-enveloping-ec-p384-crl": {
+      "steps": [
+        {
+          "step": "b",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-B",
+            "evidence": {
+              "timestamps": 0,
+              "timestamps_intact": true,
+              "revocations": 0
+            },
+            "trust": "INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE"
+          }
+        },
+        {
+          "step": "t",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "met"
+          }
+        },
+        {
+          "step": "lt",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "unmet"
+          }
+        },
+        {
+          "step": "lta",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "unmet"
+          }
+        },
+        {
+          "step": "renew",
+          "by": "xml-sec",
+          "made": {
+            "refused": "completion: the required level is not met: Assessed"
+          }
+        }
+      ]
+    },
+    "xml-sec-first-enveloping-ec-p521-crl": {
+      "steps": [
+        {
+          "step": "b",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-B",
+            "evidence": {
+              "timestamps": 0,
+              "timestamps_intact": true,
+              "revocations": 0
+            },
+            "trust": "INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE"
+          }
+        },
+        {
+          "step": "t",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "met"
+          }
+        },
+        {
+          "step": "lt",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "unmet"
+          }
+        },
+        {
+          "step": "lta",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "unmet"
+          }
+        },
+        {
+          "step": "renew",
+          "by": "xml-sec",
+          "made": {
+            "refused": "completion: the required level is not met: Assessed"
+          }
+        }
+      ]
+    },
+    "xml-sec-first-enveloping-ec-sha3-512-crl": {
+      "steps": [
+        {
+          "step": "b",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-B",
+            "evidence": {
+              "timestamps": 0,
+              "timestamps_intact": true,
+              "revocations": 0
+            },
+            "trust": "INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE"
+          }
+        },
+        {
+          "step": "t",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "met"
+          }
+        },
+        {
+          "step": "lt",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "unmet"
+          }
+        },
+        {
+          "step": "lta",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "unmet"
+          }
+        },
+        {
+          "step": "renew",
+          "by": "xml-sec",
+          "made": {
+            "refused": "completion: the required level is not met: Assessed"
+          }
+        }
+      ]
+    },
+    "xml-sec-first-enveloping-ed25519-crl": {
+      "steps": [
+        {
+          "step": "b",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-B",
+            "evidence": {
+              "timestamps": 0,
+              "timestamps_intact": true,
+              "revocations": 0
+            },
+            "trust": "INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE"
+          }
+        },
+        {
+          "step": "t",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "met"
+          }
+        },
+        {
+          "step": "lt",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "unmet"
+          }
+        },
+        {
+          "step": "lta",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "unmet"
+          }
+        },
+        {
+          "step": "renew",
+          "by": "xml-sec",
+          "made": {
+            "refused": "completion: the required level is not met: Assessed"
+          }
+        }
+      ]
+    },
+    "xml-sec-first-enveloping-ed448-crl": {
+      "steps": [
+        {
+          "step": "b",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-B",
+            "evidence": {
+              "timestamps": 0,
+              "timestamps_intact": true,
+              "revocations": 0
+            },
+            "trust": "INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE"
+          }
+        },
+        {
+          "step": "t",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "met"
+          }
+        },
+        {
+          "step": "lt",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "unmet"
+          }
+        },
+        {
+          "step": "lta",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "unmet"
+          }
+        },
+        {
+          "step": "renew",
+          "by": "xml-sec",
+          "made": {
+            "refused": "completion: the required level is not met: Assessed"
+          }
+        }
+      ]
+    },
+    "xml-sec-first-enveloping-dsa-crl": {
+      "steps": [
+        {
+          "step": "b",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-B",
+            "evidence": {
+              "timestamps": 0,
+              "timestamps_intact": true,
+              "revocations": 0
+            },
+            "trust": "INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE"
+          }
+        },
+        {
+          "step": "t",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "met"
+          }
+        },
+        {
+          "step": "lt",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "unmet"
+          }
+        },
+        {
+          "step": "lta",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "unmet"
+          }
+        },
+        {
+          "step": "renew",
+          "by": "xml-sec",
+          "made": {
+            "refused": "completion: the required level is not met: Assessed"
           }
         }
       ]
@@ -2341,6 +2846,614 @@
           "by": "dss",
           "made": {
             "refused": "Revoked/Suspended certificate(s) detected."
+          }
+        }
+      ]
+    },
+    "dss-first-enveloping-rsa-sha512-crl": {
+      "steps": [
+        {
+          "step": "b",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "met",
+            "trust": "not assessed",
+            "structure_ber": "met"
+          }
+        },
+        {
+          "step": "t",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-T",
+            "evidence": {
+              "timestamps": 1,
+              "timestamps_intact": true,
+              "revocations": 0
+            },
+            "trust": "INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE"
+          }
+        },
+        {
+          "step": "lt",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-LT",
+            "evidence": {
+              "timestamps": 1,
+              "timestamps_intact": true,
+              "revocations": 2
+            },
+            "trust": "TOTAL_PASSED/null"
+          }
+        },
+        {
+          "step": "lta",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-LTA",
+            "evidence": {
+              "timestamps": 2,
+              "timestamps_intact": true,
+              "revocations": 2
+            },
+            "trust": "TOTAL_PASSED/null"
+          }
+        },
+        {
+          "step": "renew",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "met"
+          }
+        }
+      ]
+    },
+    "dss-first-enveloping-rsa-pss-crl": {
+      "steps": [
+        {
+          "step": "b",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "met",
+            "trust": "not assessed",
+            "structure_ber": "met"
+          }
+        },
+        {
+          "step": "t",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-T",
+            "evidence": {
+              "timestamps": 1,
+              "timestamps_intact": true,
+              "revocations": 0
+            },
+            "trust": "INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE"
+          }
+        },
+        {
+          "step": "lt",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-LT",
+            "evidence": {
+              "timestamps": 1,
+              "timestamps_intact": true,
+              "revocations": 2
+            },
+            "trust": "TOTAL_PASSED/null"
+          }
+        },
+        {
+          "step": "lta",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-LTA",
+            "evidence": {
+              "timestamps": 2,
+              "timestamps_intact": true,
+              "revocations": 2
+            },
+            "trust": "TOTAL_PASSED/null"
+          }
+        },
+        {
+          "step": "renew",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "met"
+          }
+        }
+      ]
+    },
+    "dss-first-enveloping-ec-p384-crl": {
+      "steps": [
+        {
+          "step": "b",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "met",
+            "trust": "not assessed",
+            "structure_ber": "met"
+          }
+        },
+        {
+          "step": "t",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-T",
+            "evidence": {
+              "timestamps": 1,
+              "timestamps_intact": true,
+              "revocations": 0
+            },
+            "trust": "INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE"
+          }
+        },
+        {
+          "step": "lt",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-LT",
+            "evidence": {
+              "timestamps": 1,
+              "timestamps_intact": true,
+              "revocations": 2
+            },
+            "trust": "TOTAL_PASSED/null"
+          }
+        },
+        {
+          "step": "lta",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-LTA",
+            "evidence": {
+              "timestamps": 2,
+              "timestamps_intact": true,
+              "revocations": 2
+            },
+            "trust": "TOTAL_PASSED/null"
+          }
+        },
+        {
+          "step": "renew",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "met"
+          }
+        }
+      ]
+    },
+    "dss-first-enveloping-ec-p521-crl": {
+      "steps": [
+        {
+          "step": "b",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "met",
+            "trust": "not assessed",
+            "structure_ber": "met"
+          }
+        },
+        {
+          "step": "t",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-T",
+            "evidence": {
+              "timestamps": 1,
+              "timestamps_intact": true,
+              "revocations": 0
+            },
+            "trust": "INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE"
+          }
+        },
+        {
+          "step": "lt",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-LT",
+            "evidence": {
+              "timestamps": 1,
+              "timestamps_intact": true,
+              "revocations": 2
+            },
+            "trust": "TOTAL_PASSED/null"
+          }
+        },
+        {
+          "step": "lta",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-LTA",
+            "evidence": {
+              "timestamps": 2,
+              "timestamps_intact": true,
+              "revocations": 2
+            },
+            "trust": "TOTAL_PASSED/null"
+          }
+        },
+        {
+          "step": "renew",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "met"
+          }
+        }
+      ]
+    },
+    "dss-first-enveloping-ec-sha3-512-crl": {
+      "steps": [
+        {
+          "step": "b",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "met",
+            "trust": "not assessed",
+            "structure_ber": "met"
+          }
+        },
+        {
+          "step": "t",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-T",
+            "evidence": {
+              "timestamps": 1,
+              "timestamps_intact": true,
+              "revocations": 0
+            },
+            "trust": "INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE"
+          }
+        },
+        {
+          "step": "lt",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-LT",
+            "evidence": {
+              "timestamps": 1,
+              "timestamps_intact": true,
+              "revocations": 2
+            },
+            "trust": "TOTAL_PASSED/null"
+          }
+        },
+        {
+          "step": "lta",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-LTA",
+            "evidence": {
+              "timestamps": 2,
+              "timestamps_intact": true,
+              "revocations": 2
+            },
+            "trust": "TOTAL_PASSED/null"
+          }
+        },
+        {
+          "step": "renew",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "met"
+          }
+        }
+      ]
+    },
+    "dss-first-enveloping-ed25519-crl": {
+      "steps": [
+        {
+          "step": "b",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "met",
+            "trust": "not assessed",
+            "structure_ber": "met"
+          }
+        },
+        {
+          "step": "t",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-T",
+            "evidence": {
+              "timestamps": 1,
+              "timestamps_intact": true,
+              "revocations": 0
+            },
+            "trust": "INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE"
+          }
+        },
+        {
+          "step": "lt",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-LT",
+            "evidence": {
+              "timestamps": 1,
+              "timestamps_intact": true,
+              "revocations": 2
+            },
+            "trust": "INDETERMINATE/CRYPTO_CONSTRAINTS_FAILURE_NO_POE"
+          }
+        },
+        {
+          "step": "lta",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-LTA",
+            "evidence": {
+              "timestamps": 2,
+              "timestamps_intact": true,
+              "revocations": 2
+            },
+            "trust": "INDETERMINATE/CRYPTO_CONSTRAINTS_FAILURE_NO_POE"
+          }
+        },
+        {
+          "step": "renew",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "met"
+          }
+        }
+      ]
+    },
+    "dss-first-enveloping-ed448-crl": {
+      "steps": [
+        {
+          "step": "b",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "met",
+            "trust": "not assessed",
+            "structure_ber": "met"
+          }
+        },
+        {
+          "step": "t",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-T",
+            "evidence": {
+              "timestamps": 1,
+              "timestamps_intact": true,
+              "revocations": 0
+            },
+            "trust": "INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE"
+          }
+        },
+        {
+          "step": "lt",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-LT",
+            "evidence": {
+              "timestamps": 1,
+              "timestamps_intact": true,
+              "revocations": 2
+            },
+            "trust": "INDETERMINATE/CRYPTO_CONSTRAINTS_FAILURE_NO_POE"
+          }
+        },
+        {
+          "step": "lta",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-LTA",
+            "evidence": {
+              "timestamps": 2,
+              "timestamps_intact": true,
+              "revocations": 2
+            },
+            "trust": "INDETERMINATE/CRYPTO_CONSTRAINTS_FAILURE_NO_POE"
+          }
+        },
+        {
+          "step": "renew",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "met"
+          }
+        }
+      ]
+    },
+    "dss-first-enveloping-dsa-crl": {
+      "steps": [
+        {
+          "step": "b",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "met",
+            "trust": "not assessed",
+            "structure_ber": "met"
+          }
+        },
+        {
+          "step": "t",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-T",
+            "evidence": {
+              "timestamps": 1,
+              "timestamps_intact": true,
+              "revocations": 0
+            },
+            "trust": "INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE"
+          }
+        },
+        {
+          "step": "lt",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-LT",
+            "evidence": {
+              "timestamps": 1,
+              "timestamps_intact": true,
+              "revocations": 2
+            },
+            "trust": "TOTAL_PASSED/null"
+          }
+        },
+        {
+          "step": "lta",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-LTA",
+            "evidence": {
+              "timestamps": 2,
+              "timestamps_intact": true,
+              "revocations": 2
+            },
+            "trust": "TOTAL_PASSED/null"
+          }
+        },
+        {
+          "step": "renew",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "met"
           }
         }
       ]

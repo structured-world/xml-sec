@@ -1,5 +1,41 @@
-use super::{Case, assess};
+use super::{Case, FORMS, Form, assess, assess_form, detached_files};
 use std::path::Path;
+
+#[test]
+fn a_dss_form_qualifies_only_with_every_signature_valid_at_b_b() {
+    // `level_probe` prints one `signature:`/`level:` pair per signature; each
+    // must be a valid signature that meets B-B, and the count must match the
+    // form, so a countersignature xml-sec did not read is a problem too.
+    let form = Form {
+        name: "countersigned",
+        signatures: 2,
+    };
+    let valid = "signature: Ok(Valid)\nlevel: Ok(Assessed(true))\n";
+    let accepted = assess_form(&form, &valid.repeat(2));
+    assert_eq!(accepted["problems"], serde_json::json!([]));
+    let refused = format!(
+        "{valid}signature: Ok(Invalid(ReferenceProcessingFailure {{ ref_index: 1 }}))\nlevel: Err(Prepare(Binding(Target)))\n"
+    );
+    let problems = assess_form(&form, &refused)["problems"].clone();
+    assert_eq!(problems.as_array().map(Vec::len), Some(1));
+    assert!(problems[0].as_str().unwrap().starts_with("signature 1: "));
+    let missing = assess_form(&form, valid)["problems"].clone();
+    assert_eq!(missing[0], "1 signatures reported, 2 expected");
+}
+
+#[test]
+fn every_form_with_detached_references_names_its_files() {
+    // The detached forms are validated with the files their references name;
+    // the others need none.
+    for form in FORMS {
+        let files = detached_files(form.name);
+        assert_eq!(files.is_empty(), !form.name.starts_with("detached"));
+    }
+    assert_eq!(
+        detached_files("detached-multiple"),
+        ["detached.txt", "detached-2.txt"]
+    );
+}
 
 /// Writes a diagnostic and a detailed report with one signature `S-1` whose
 /// signature value is `intact`, whose one reference is `reference_intact`, and

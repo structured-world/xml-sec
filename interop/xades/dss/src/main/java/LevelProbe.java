@@ -1,4 +1,6 @@
 import java.nio.file.*;
+import java.util.ArrayList;
+import java.util.List;
 import eu.europa.esig.dss.enumerations.ValidationLevel;
 import eu.europa.esig.dss.model.DSSDocument;
 import eu.europa.esig.dss.model.FileDocument;
@@ -7,11 +9,14 @@ import eu.europa.esig.dss.model.FileDocument;
  * Independent long-term validation of one signature. Only the supplied anchor
  * is trusted, nothing is fetched: every status comes from the document itself.
  * Arguments: document, anchor DER, validation time in Unix seconds, output,
- * and the detached content its reference names, if any.
+ * and the detached contents its references name, if any.
  */
 public class LevelProbe {
     public static void main(String[] args) throws Exception {
-        DSSDocument detached = args.length > 4 ? Lifecycle.named(Path.of(args[4])) : null;
+        List<DSSDocument> detached = new ArrayList<>();
+        for (int index = 4; index < args.length; index++) {
+            detached.add(Lifecycle.named(Path.of(args[index])));
+        }
         var reports = Lifecycle.validate(
             new FileDocument(args[0]),
             Lifecycle.verifier(Files.readAllBytes(Path.of(args[1])), null),

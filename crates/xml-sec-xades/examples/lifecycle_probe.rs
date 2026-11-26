@@ -2,8 +2,11 @@
 //! another implementation, one step per run so the other side can validate
 //! each result, and the harness that times the same steps.
 //!
-//! `lifecycle_probe create rsa|ec PACKAGING PKI DATA SIGNING_TIME AT OUTPUT`
-//! creates the B-B signature `sig` with `PKI/signer.key` (PKCS#8) and the
+//! `lifecycle_probe create ALGORITHM PACKAGING PKI DATA SIGNING_TIME AT OUTPUT`
+//! creates the B-B signature `sig` with `ALGORITHM` (`rsa`, `ec`,
+//! `rsa-sha512`, `rsa-pss`, `ec-p384`, `ec-p521`, `ec-sha3-512`, `ed25519`,
+//! `ed448` or `dsa`,
+//! references digested with SHA-256), `PKI/signer.key` (PKCS#8) and the
 //! `signer.der`/`issuer.der` chain over `DATA`, laid out as EU DSS lays out
 //! the same packaging. `PACKAGING` is `enveloped`, `enveloping` or
 //! `internally-detached` over an XML `DATA` with the root `Id` `document`, or
@@ -46,9 +49,8 @@ use xml_sec::XmlDocument;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::policy::{Instant, SigningPolicy, TimestampTokenEncoding, VerificationPolicy};
 use xml_sec::xmldsig::{
-    DefaultKeyResolver, DigestAlgorithm, EcdsaP256SigningKey, KeyResolverConfig, ObjectContent,
-    ObjectElement, RsaSigningKey, SignatureAlgorithm, SigningKey, UriTypeSet, VerificationRequest,
-    VerifyContext,
+    DefaultKeyResolver, DigestAlgorithm, KeyResolverConfig, ObjectContent, ObjectElement,
+    SignatureAlgorithm, SigningKey, UriTypeSet, VerificationRequest, VerifyContext,
 };
 use xml_sec_xades::{
     Assessment, Completion, DataObject, Envelope, Inputs, Request, Requirements, Signer,
@@ -145,22 +147,40 @@ fn run(
     Ok(())
 }
 
-/// The signer's key of `algorithm` from its PKCS#8 `pem`, and its method.
+/// The signer's key of `algorithm` from its PKCS#8 `pem`, and its method:
+/// the methods DSS signs with under the names the lifecycle harness gives
+/// them, each key imported through the provider for that method.
 fn signing_key(
     algorithm: &str,
     pem: &str,
 ) -> Result<(Box<dyn SigningKey>, SignatureAlgorithm), String> {
-    Ok(match algorithm {
-        "rsa" => (
-            Box::new(RsaSigningKey::from_pkcs8_pem(pem).map_err(|error| error.to_string())?),
-            SignatureAlgorithm::RsaSha256,
-        ),
-        "ec" => (
-            Box::new(EcdsaP256SigningKey::from_pkcs8_pem(pem).map_err(|error| error.to_string())?),
-            SignatureAlgorithm::EcdsaSha256,
-        ),
-        _ => return Err("the algorithm is rsa or ec".into()),
-    })
+    use SignatureAlgorithm as A;
+    let method = match algorithm {
+        "rsa" => A::RsaSha256,
+        "ec" => A::EcdsaSha256,
+        "rsa-sha512" => A::RsaSha512,
+        "rsa-pss" => A::RsaPssSha256,
+        "ec-p384" => A::EcdsaSha384,
+        "ec-p521" => A::EcdsaSha512,
+        "ec-sha3-512" => A::EcdsaSha3_512,
+        "ed25519" => A::Ed25519,
+        "ed448" => A::Ed448,
+        "dsa" => A::DsaSha256,
+        _ => return Err(format!("unknown signature algorithm {algorithm}")),
+    };
+    let body: Vec<u8> = pem
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .flat_map(str::bytes)
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    let der = structured_base64::STANDARD
+        .decode(&body)
+        .map_err(|error| format!("signer.key: {error}"))?;
+    let key = xml_sec::provider::default_provider()
+        .import_signing_key(method, &der)
+        .map_err(|error| error.to_string())?;
+    Ok((key, method))
 }
 
 /// The document a signature of `packaging` is made in and its signed data
@@ -213,7 +233,8 @@ fn signed<'a>(
 fn created(args: &[String], samples: Option<timing::Sampling>) -> Result<(), String> {
     let [algorithm, packaging, pki, data, signing_time, at, output] = args else {
         return Err(
-            "usage: lifecycle_probe create rsa|ec PACKAGING PKI DATA SIGNING_TIME AT OUTPUT".into(),
+            "usage: lifecycle_probe create ALGORITHM PACKAGING PKI DATA SIGNING_TIME AT OUTPUT"
+                .into(),
         );
     };
     let pki = PathBuf::from(pki);

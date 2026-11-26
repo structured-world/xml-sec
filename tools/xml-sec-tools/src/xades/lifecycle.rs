@@ -89,25 +89,96 @@ impl Packaging {
     }
 }
 
+/// The signature algorithm of the B-B signature and the signer key it needs.
+/// The forms beyond RSA and ECDSA P-256 with SHA-256 are the algorithms DSS's
+/// signature tests sign with (RSASSA-PSS, ECDSA on P-384/P-521, Ed25519,
+/// Ed448, DSA, RSA with SHA-512).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Algorithm {
     Rsa,
     Ec,
+    RsaSha512,
+    RsaPss,
+    EcP384,
+    EcP521,
+    EcSha3,
+    Ed25519,
+    Ed448,
+    Dsa,
 }
 
 impl Algorithm {
-    fn name(self) -> &'static str {
+    /// Every algorithm beyond the two the full packaging matrix runs.
+    pub(crate) const MORE: [Self; 8] = [
+        Self::RsaSha512,
+        Self::RsaPss,
+        Self::EcP384,
+        Self::EcP521,
+        Self::EcSha3,
+        Self::Ed25519,
+        Self::Ed448,
+        Self::Dsa,
+    ];
+
+    /// The case name part, and the name `lifecycle_probe create` takes.
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Rsa => "rsa",
             Self::Ec => "ec",
+            Self::RsaSha512 => "rsa-sha512",
+            Self::RsaPss => "rsa-pss",
+            Self::EcP384 => "ec-p384",
+            Self::EcP521 => "ec-p521",
+            Self::EcSha3 => "ec-sha3-512",
+            Self::Ed25519 => "ed25519",
+            Self::Ed448 => "ed448",
+            Self::Dsa => "dsa",
         }
     }
 
-    /// The certificate and key names of the signer in the run's PKI.
+    /// The certificate and key names of the signer in the run's PKI: the
+    /// RSA methods share one RSA key, the P-256 methods one EC key.
     fn signer(self) -> &'static str {
         match self {
-            Self::Rsa => "signer",
-            Self::Ec => "signer-ec",
+            Self::Rsa | Self::RsaSha512 | Self::RsaPss => "signer",
+            Self::Ec | Self::EcSha3 => "signer-ec",
+            Self::EcP384 => "signer-ec384",
+            Self::EcP521 => "signer-ec521",
+            Self::Ed25519 => "signer-ed25519",
+            Self::Ed448 => "signer-ed448",
+            Self::Dsa => "signer-dsa",
+        }
+    }
+
+    /// DSS's `SignatureAlgorithm` constant of the same method.
+    fn dss(self) -> &'static str {
+        match self {
+            Self::Rsa => "RSA_SHA256",
+            Self::Ec => "ECDSA_SHA256",
+            Self::RsaSha512 => "RSA_SHA512",
+            Self::RsaPss => "RSA_SSA_PSS_SHA256_MGF1",
+            Self::EcP384 => "ECDSA_SHA384",
+            Self::EcP521 => "ECDSA_SHA512",
+            Self::EcSha3 => "ECDSA_SHA3_512",
+            Self::Ed25519 => "ED25519",
+            Self::Ed448 => "ED448",
+            Self::Dsa => "DSA_SHA256",
+        }
+    }
+
+    /// The `openssl req -newkey` arguments of a signer key this algorithm
+    /// needs beyond the levels PKI's RSA keys, with the subject's name; none
+    /// for a method that shares another's key. DSA keys come from the run's
+    /// `dsa.param`.
+    fn key(self) -> Option<(&'static [&'static str], &'static str)> {
+        match self {
+            Self::Rsa | Self::RsaSha512 | Self::RsaPss | Self::EcSha3 => None,
+            Self::Ec => Some((&["ec", "-pkeyopt", "ec_paramgen_curve:P-256"], "EC")),
+            Self::EcP384 => Some((&["ec", "-pkeyopt", "ec_paramgen_curve:P-384"], "EC P-384")),
+            Self::EcP521 => Some((&["ec", "-pkeyopt", "ec_paramgen_curve:P-521"], "EC P-521")),
+            Self::Ed25519 => Some((&["ed25519"], "Ed25519")),
+            Self::Ed448 => Some((&["ed448"], "Ed448")),
+            Self::Dsa => Some((&["dsa:dsa.param"], "DSA")),
         }
     }
 }
@@ -166,7 +237,8 @@ impl Case {
 }
 
 /// Every lifecycle: each packaging and signer with CRL and with OCSP
-/// evidence, and one revoked signer, in both directions.
+/// evidence, one revoked signer, and each further algorithm over an
+/// enveloping signature as DSS's algorithm tests sign it, in both directions.
 pub(crate) fn cases() -> Vec<Case> {
     let mut cases = Vec::new();
     for first in [Actor::XmlSec, Actor::Dss] {
@@ -188,6 +260,14 @@ pub(crate) fn cases() -> Vec<Case> {
             algorithm: Algorithm::Rsa,
             evidence: Evidence::Revoked,
         });
+        for algorithm in Algorithm::MORE {
+            cases.push(Case {
+                first,
+                packaging: Packaging::Enveloping,
+                algorithm,
+                evidence: Evidence::Crl,
+            });
+        }
     }
     cases
 }
@@ -526,19 +606,38 @@ impl Run<'_> {
         };
         levels.issue()?;
         generator.openssl(&[
-            "req",
-            "-newkey",
-            "ec",
+            "genpkey",
+            "-genparam",
+            "-algorithm",
+            "DSA",
             "-pkeyopt",
-            "ec_paramgen_curve:P-256",
-            "-nodes",
-            "-keyout",
-            "signer-ec.key",
+            "dsa_paramgen_bits:2048",
+            // XMLDSig 1.1 §6.4.1 requires DSA-SHA256 with (L, N) = (2048, 256);
+            // OpenSSL's default N for 2048 is 224.
+            "-pkeyopt",
+            "dsa_paramgen_q_bits:256",
             "-out",
-            "signer-ec.csr",
-            "-subj",
-            "/CN=xml-sec XAdES Lifecycle EC Signer",
+            "dsa.param",
         ])?;
+        // Every signer key beyond the levels PKI's RSA keys.
+        let keyed: Vec<_> = Algorithm::MORE
+            .into_iter()
+            .chain([Algorithm::Ec])
+            .filter_map(|algorithm| algorithm.key().map(|key| (algorithm.signer(), key)))
+            .collect();
+        for (signer, (newkey, label)) in &keyed {
+            let (key, request, subject) = (
+                format!("{signer}.key"),
+                format!("{signer}.csr"),
+                format!("/CN=xml-sec XAdES Lifecycle {label} Signer"),
+            );
+            let mut args = vec!["req", "-newkey"];
+            args.extend_from_slice(newkey);
+            args.extend([
+                "-nodes", "-keyout", &key, "-out", &request, "-subj", &subject,
+            ]);
+            generator.openssl(&args)?;
+        }
         // The CAs first: a certificate is signed by its issuer's final key.
         for (name, issuer, _, extensions) in CERTIFICATES {
             if name != "outsider" {
@@ -546,15 +645,18 @@ impl Run<'_> {
             }
         }
         let (_, issuer, _, extensions) = CERTIFICATES[1];
-        self.certify(&generator, "signer-ec", issuer, extensions)?;
+        for (signer, _) in &keyed {
+            self.certify(&generator, signer, issuer, extensions)?;
+        }
         let mut chain = read(&self.pki.join("issuer.pem"))?;
         chain.extend(read(&self.pki.join("root.pem"))?);
         write(&self.pki.join("chain.pem"), chain)?;
-        for (name, alias) in [
-            ("signer", "signer"),
-            ("signer-ec", "signer"),
-            ("tsa", "tsa"),
-        ] {
+        let stores = ["signer"]
+            .into_iter()
+            .chain(keyed.iter().map(|(signer, _)| *signer))
+            .map(|signer| (signer, "signer"))
+            .chain([("tsa", "tsa")]);
+        for (name, alias) in stores {
             generator.openssl(&[
                 "pkcs12",
                 "-export",
@@ -572,7 +674,10 @@ impl Run<'_> {
                 &format!("{name}.p12"),
             ])?;
         }
-        for algorithm in [Algorithm::Rsa, Algorithm::Ec] {
+        for algorithm in [Algorithm::Rsa, Algorithm::Ec]
+            .into_iter()
+            .chain(Algorithm::MORE)
+        {
             let directory = self.pki.join(algorithm.name());
             std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
             let signer = algorithm.signer();
@@ -690,6 +795,7 @@ impl Run<'_> {
                     &self.data(case),
                     &time.to_string(),
                     &output,
+                    &case.algorithm.dss(),
                 ]));
                 args
             }

@@ -131,8 +131,9 @@ public class LifecycleBench {
                 String name = data.getFileName().toString();
                 long time = Long.parseLong(args.get(4));
                 var service = Lifecycle.signing();
+                var algorithm = signer.sha256();
                 measure("create", bytes.length, count, Path.of(args.get(5)), () -> DSSUtils.toByteArray(
-                    Lifecycle.sign(service, signer, args.get(2), new InMemoryDocument(bytes, name), time)));
+                    Lifecycle.sign(service, signer, args.get(2), new InMemoryDocument(bytes, name), time, algorithm)));
             }
             case "augment" -> {
                 String tsaStore = take(args, "--tsa");

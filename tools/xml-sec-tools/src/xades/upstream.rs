@@ -127,7 +127,11 @@ fn applied(pass: &Value, review: Option<&Value>) -> Value {
 
 /// The sparse checkout of the corpus at the DSS tag `release`, under the
 /// repository's tool directory, and the commit that tag names.
-fn fetch(corpus: &Corpus, release: &str, logs: &Path) -> Result<(PathBuf, String), String> {
+pub(crate) fn fetch(
+    corpus: &Corpus,
+    release: &str,
+    logs: &Path,
+) -> Result<(PathBuf, String), String> {
     let checkout = super::dss::tools(corpus).join(format!("corpus-{release}"));
     if !checkout.join(".git").exists() {
         corpus.require(
