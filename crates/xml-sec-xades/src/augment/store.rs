@@ -8,7 +8,7 @@ use crate::draft::Draft;
 use crate::level::Inputs;
 use crate::placement::{self, PlacementError, XADES};
 use crate::properties::{
-    Bound, ExplicitPolicy, Fragment, PolicyStore, PropertyDraft, SignedPolicy,
+    Bound, ExplicitPolicy, Fragment, PolicyStore, PropertyDraft, SignedPolicy, SpecifiedDigest,
 };
 use alloc::{boxed::Box, string::String, vec::Vec};
 use structured_asn1::memory::Work;
@@ -31,6 +31,9 @@ pub struct PolicyStoreRequest<'a, 'inputs> {
     pub policy: &'a ExplicitPolicy<'a, Fragment>,
     /// The document's specification and how the store carries it.
     pub store: PolicyStore<'a>,
+    /// The digest rule of the specification the policy names with
+    /// `PolicyTransform::InSpecification`.
+    pub specified: Option<SpecifiedDigest<'a>>,
     /// Provider of the policy digest.
     pub provider: &'a dyn CryptoProvider,
     /// Policy of the digest's transforms and of the written property.
@@ -79,6 +82,7 @@ pub struct PolicyStoreRequest<'a, 'inputs> {
 ///         signature: "sig",
 ///         policy,
 ///         store: PolicyStore { specification, document: PolicyDocument::Embedded },
+///         specified: None,
 ///         provider: xml_sec::provider::default_provider(),
 ///         signing,
 ///         assessment,
@@ -111,6 +115,7 @@ pub fn add_policy_store<W: Work>(
         provider: request.provider,
         policy: request.signing,
         bound: Bound::Signed(signed),
+        specified: request.specified,
         content: None,
     };
     request

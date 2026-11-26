@@ -13,7 +13,13 @@
 //! object (`data-object-format`), a countersignature with a production
 //! place and a role (`countersigned-properties`) and two signatures under one
 //! policy, the first with a store added after signing (`policy-store-added`),
-//! with the detached data as `OUTPUT/detached.txt`.
+//! a policy whose digest the signer supplies without the document
+//! (`policy-supplied`) and an ETSI TR 102 272 ASN.1 policy digested as that
+//! specification defines, stored after signing (`policy-asn1`), with the
+//! detached data as `OUTPUT/detached.txt`.
+
+#[path = "support/asn1_policy.rs"]
+mod asn1_policy;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -29,10 +35,10 @@ use xml_sec::xmldsig::{
     RsaSigningKey, SignatureAlgorithm, Transform, UriTypeSet, VerificationRequest, VerifyContext,
 };
 use xml_sec_xades::properties::{
-    Commitment, CommitmentScope, ExplicitPolicy, FormatDetails, Fragment, Identifier,
-    NoticeReference, PolicyDocument, PolicyQualifier, PolicyStore, PolicyTransform,
+    Commitment, CommitmentScope, DigestRule, ExplicitPolicy, FormatDetails, Fragment, Identifier,
+    NoticeReference, Policy, PolicyDocument, PolicyQualifier, PolicyStore, PolicyTransform,
     PolicyTransforms, ProductionPlace, Properties, Qualifier, SignaturePolicy, SignerRole,
-    UserNotice,
+    SpecifiedDigest, SuppliedPolicy, UserNotice,
 };
 use xml_sec_xades::{
     Assessment, Countersignature, DataObject, Envelope, Inputs, Placement, PolicyStoreRequest,
@@ -66,8 +72,17 @@ const fn identifier(uri: &'static str) -> Identifier<'static> {
 fn explicit<'a>(
     transform: PolicyTransform<'a, Fragment>,
     qualifiers: &'a [PolicyQualifier<'a, Fragment>],
-) -> SignaturePolicy<'a, Fragment> {
-    SignaturePolicy::Explicit(ExplicitPolicy {
+) -> Policy<'a> {
+    Policy::Document(SignaturePolicy::Explicit(explicit_policy(
+        transform, qualifiers,
+    )))
+}
+
+fn explicit_policy<'a>(
+    transform: PolicyTransform<'a, Fragment>,
+    qualifiers: &'a [PolicyQualifier<'a, Fragment>],
+) -> ExplicitPolicy<'a, Fragment> {
+    ExplicitPolicy {
         identifier: Identifier {
             description: Some("Example signature policy"),
             ..identifier(POLICY_ID)
@@ -76,8 +91,57 @@ fn explicit<'a>(
         digest_method: DigestAlgorithm::Sha256.uri(),
         transform,
         qualifiers,
-    })
+    }
 }
+
+/// The SPURI of the supplied and ASN.1 policies.
+const SPURI: [PolicyQualifier<'static, Fragment>; 1] = [PolicyQualifier::Uri("http://spuri.test")];
+
+/// Every kind of qualifier of the supplied policy: its SPURI, a notice and
+/// the specification of its document.
+const SUPPLIED_QUALIFIERS: [PolicyQualifier<'static, Fragment>; 3] = [
+    PolicyQualifier::Uri("http://spuri.test"),
+    PolicyQualifier::Notice(UserNotice {
+        reference: Some(NoticeReference {
+            organization: "Nowina Solutions",
+            numbers: &["1", "4", "10"],
+        }),
+        text: Some("This is a test policy"),
+    }),
+    PolicyQualifier::DocumentSpecification(Identifier {
+        uri: "urn:oid:1.2.3.4.5.6",
+        qualifier: Some(Qualifier::Urn),
+        description: Some("Test description"),
+        documentation: &DOCUMENTATION,
+    }),
+];
+
+/// Where the supplied policy is documented; an empty URI is a valid
+/// relative reference.
+const DOCUMENTATION: [&str; 2] = ["http://nowina.lu/signature-policy.pdf", ""];
+
+/// A SHA-256 digest of a policy document the signer does not hold.
+const SUPPLIED_DIGEST: [u8; 32] = [0x5a; 32];
+
+/// The DER ASN.1 policy, its rule and the explicit policy over it.
+fn asn1_policy(document: &[u8]) -> ExplicitPolicy<'_, Fragment> {
+    ExplicitPolicy {
+        identifier: Identifier {
+            qualifier: Some(Qualifier::Urn),
+            description: Some("ASN.1 signature policy"),
+            ..identifier(asn1_policy::POLICY_OID)
+        },
+        document,
+        digest_method: DigestAlgorithm::Sha256.uri(),
+        transform: PolicyTransform::InSpecification(identifier(asn1_policy::SPECIFICATION)),
+        qualifiers: &SPURI,
+    }
+}
+
+const ASN1_RULE: SpecifiedDigest<'static> = SpecifiedDigest {
+    specification: asn1_policy::SPECIFICATION,
+    rule: DigestRule::Asn1Policy,
+};
 
 /// A policy store of `document` with its syntax specification.
 fn store(document: PolicyDocument<'_>) -> PolicyStore<'_> {
@@ -168,7 +232,29 @@ impl<'f> Values<'f> {
                 ..Properties::default()
             },
             "policy-implied" => Properties {
-                policy: Some(SignaturePolicy::Implied),
+                policy: Some(Policy::Document(SignaturePolicy::Implied)),
+                ..Properties::default()
+            },
+            "policy-supplied" => Properties {
+                policy: Some(Policy::Supplied(SuppliedPolicy {
+                    identifier: Identifier {
+                        qualifier: Some(Qualifier::Urn),
+                        description: Some("Test description"),
+                        documentation: &DOCUMENTATION,
+                        ..identifier(asn1_policy::POLICY_OID)
+                    },
+                    digest_method: DigestAlgorithm::Sha256.uri(),
+                    digest: &SUPPLIED_DIGEST,
+                    transform: PolicyTransform::None,
+                    qualifiers: &SUPPLIED_QUALIFIERS,
+                })),
+                ..Properties::default()
+            },
+            "policy-asn1" => Properties {
+                policy: Some(Policy::Document(SignaturePolicy::Explicit(asn1_policy(
+                    &self.fragments.asn1,
+                )))),
+                specified: Some(ASN1_RULE),
                 ..Properties::default()
             },
             "policy-store-added" => Properties {
@@ -225,6 +311,8 @@ struct Fragments {
     roles: [Fragment; 2],
     assertion: [Fragment; 1],
     qualifiers: [Fragment; 1],
+    /// The DER document of the ASN.1 policy.
+    asn1: Vec<u8>,
 }
 
 impl Fragments {
@@ -247,8 +335,25 @@ impl Fragments {
                 "<Assertion xmlns=\"urn:example:assertion\">Signer is authorized</Assertion>",
             )?],
             qualifiers: [Fragment::Text("Reviewed".to_owned())],
+            asn1: asn1_policy::document(Some(&stored_hash()?)),
         })
     }
+}
+
+/// The `signPolicyHash` of the ASN.1 policy, which DSS reads as a required
+/// field although TR 102 272 makes it optional.
+fn stored_hash() -> Result<Vec<u8>, String> {
+    let bare = asn1_policy::document(None);
+    // Under 128 bytes, the SEQUENCE header is two bytes; the rest is the
+    // signPolicyHashAlg and signPolicyInfo the hash covers.
+    let digest = xml_sec::xmldsig::compute_digest_with_provider(
+        xml_sec::provider::default_provider(),
+        DigestAlgorithm::Sha256,
+        &bare[2..],
+        &Memory::new(Arc::new(MemoryAccount::new(1 << 20, 1 << 20))),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(digest.to_vec())
 }
 
 fn main() -> Result<(), String> {
@@ -382,46 +487,65 @@ impl Then<'_> {
                 };
                 create(document, self.signer, request, self.assessment, self.work)
                     .map_err(|error| format!("{case} second: {error}"))?;
-                let utc = LeapTable::new(-2_208_988_800, 4_102_444_800, &[])
-                    .map_err(|error| format!("UTC coverage: {error:?}"))?;
-                let [root, intermediate] = self.pki;
-                let (anchors, certificates) = ([root], [intermediate]);
-                let policy = explicit(PolicyTransform::None, &[]);
-                let SignaturePolicy::Explicit(policy) = &policy else {
-                    return Err("an explicit policy".into());
+                let policy = explicit_policy(PolicyTransform::None, &[]);
+                self.store(document, &policy, store(PolicyDocument::Embedded), None)
+                    .map_err(|error| format!("{case} store: {error}"))
+            }
+            "policy-asn1" => {
+                let policy = asn1_policy(&self.values.fragments.asn1);
+                let store = PolicyStore {
+                    specification: identifier(asn1_policy::SPECIFICATION),
+                    document: PolicyDocument::Embedded,
                 };
-                add_policy_store(
-                    document,
-                    &PolicyStoreRequest {
-                        signature: "sig",
-                        policy,
-                        store: store(PolicyDocument::Embedded),
-                        provider: self.signer.provider,
-                        signing: self.signer.policy,
-                        assessment: self.assessment,
-                        inputs: &Inputs {
-                            requirements: Requirements::Basic,
-                            anchors: &anchors,
-                            certificates: &certificates,
-                            utc: &utc,
-                            accuracies: &[],
-                            responders: &[],
-                            crls: &[],
-                            responses: &[],
-                        },
-                        id_attributes: &[],
-                    },
-                    self.work,
-                )
-                .map_err(|error| format!("{case} store: {error}"))
+                self.store(document, &policy, store, Some(ASN1_RULE))
+                    .map_err(|error| format!("{case} store: {error}"))
             }
             _ => Ok(()),
         }
     }
+
+    /// Store `policy`, which signature `sig` signed, in `document`.
+    fn store(
+        &self,
+        document: &mut XmlDocument,
+        policy: &ExplicitPolicy<'_, Fragment>,
+        store: PolicyStore<'_>,
+        specified: Option<SpecifiedDigest<'_>>,
+    ) -> Result<(), String> {
+        let utc = LeapTable::new(-2_208_988_800, 4_102_444_800, &[])
+            .map_err(|error| format!("UTC coverage: {error:?}"))?;
+        let [root, intermediate] = self.pki;
+        let (anchors, certificates) = ([root], [intermediate]);
+        add_policy_store(
+            document,
+            &PolicyStoreRequest {
+                signature: "sig",
+                policy,
+                store,
+                specified,
+                provider: self.signer.provider,
+                signing: self.signer.policy,
+                assessment: self.assessment,
+                inputs: &Inputs {
+                    requirements: Requirements::Basic,
+                    anchors: &anchors,
+                    certificates: &certificates,
+                    utc: &utc,
+                    accuracies: &[],
+                    responders: &[],
+                    crls: &[],
+                    responses: &[],
+                },
+                id_attributes: &[],
+            },
+            self.work,
+        )
+        .map_err(|error| error.to_string())
+    }
 }
 
 /// Every case, in the order they are written.
-const CASES: [&str; 10] = [
+const CASES: [&str; 12] = [
     "policy-explicit",
     "policy-transforms",
     "policy-implied",
@@ -432,6 +556,8 @@ const CASES: [&str; 10] = [
     "data-object-format",
     "countersigned-properties",
     "policy-store-added",
+    "policy-supplied",
+    "policy-asn1",
 ];
 
 fn document_object() -> DataObject<'static> {

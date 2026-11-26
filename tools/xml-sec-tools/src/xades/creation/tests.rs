@@ -169,10 +169,11 @@ fn every_independent_finding_is_reported() {
 fn a_property_dss_did_not_read_is_reported() {
     // A case with optional properties qualifies only when DSS reads each of
     // them back: a policy whose stored document's digest does not match, or
-    // a commitment DSS does not see, is named.
+    // a commitment DSS does not see, is named. A matching certificate digest
+    // elsewhere in the report does not stand in for the policy's.
     let diagnostic = |policy: &str| {
         format!(
-            "<DiagnosticData><Signature><Policy><Id>1.3.6.1.4.1.13762.3.1</Id><Identified>true</Identified><Organization>Example Organization</Organization><ExplicitText>Signed under the example policy</ExplicitText>{policy}</Policy></Signature></DiagnosticData>"
+            "<DiagnosticData><Signature><Policy><Id>1.3.6.1.4.1.13762.3.1</Id><Identified>true</Identified><Organization>Example Organization</Organization><ExplicitText>Signed under the example policy</ExplicitText>{policy}</Policy><CertificateRef><DigestAlgoAndValue match=\"true\"/></CertificateRef></Signature></DiagnosticData>"
         )
     };
     let problems_of = |name: &str, text: &str| {
@@ -189,7 +190,7 @@ fn a_property_dss_did_not_read_is_reported() {
     let mismatched = diagnostic("<DigestAlgoAndValue match=\"false\"/>");
     assert_eq!(
         problems_of("policy-explicit", &mismatched),
-        ["DSS did not read DigestAlgoAndValue@match \"true\""]
+        ["DSS did not read Policy/DigestAlgoAndValue@match \"true\""]
     );
     assert_eq!(
         problems_of("commitment", &matched).len(),

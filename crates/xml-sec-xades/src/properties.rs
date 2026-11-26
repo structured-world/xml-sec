@@ -9,8 +9,9 @@
 
 use crate::content::{ContentEvidence, ContentTimestamp, Replayed};
 use crate::draft::{Draft, DraftError};
-use alloc::{string::String, vec::Vec};
+use alloc::{boxed::Box, string::String, vec::Vec};
 use structured_asn1::memory::Work;
+use structured_cms::signature_policy::PolicyDigestError;
 pub use structured_xades::identifier::Qualifier;
 use structured_xades::produce::{
     self, Event, FragmentSlot, ObjectMetadata, PolicyWriter, PropertyWriter, Writer,
@@ -18,8 +19,12 @@ use structured_xades::produce::{
 pub use structured_xades::produce::{
     CertifiedRole, Commitment, CommitmentScope, ExplicitPolicy, Identifier, NoticeReference,
     PolicyDocument, PolicyQualifier, PolicyStore, PolicyTransform, ProductionPlace,
-    RoleCertificate, SignaturePolicy, SignerRole, UserNotice,
+    RoleCertificate, SignaturePolicy, SignerRole, SuppliedPolicy, UserNotice,
 };
+
+mod specified;
+
+pub use specified::{DigestRule, PolicyHash, SpecifiedDigest};
 use xml_sec::policy::{PolicyViolation, SigningPolicy};
 use xml_sec::provider::{CryptoProvider, ProviderError};
 use xml_sec::xmldsig::extension::{
@@ -127,11 +132,25 @@ pub struct FormatDetails<'a> {
     pub encoding: Option<&'a str>,
 }
 
+/// The `SignaturePolicyIdentifier` of a new signature (§5.2.9).
+pub enum Policy<'a> {
+    /// An implied policy, or an explicit one whose digest xml-sec computes
+    /// from the policy document.
+    Document(SignaturePolicy<'a, Fragment>),
+    /// An explicit policy whose digest the signer obtained without the
+    /// document, which therefore cannot be stored at creation; its method
+    /// and the digest's width are checked under the signing policy.
+    Supplied(SuppliedPolicy<'a, Fragment>),
+}
+
 /// The optional properties of one new signature. The default has none.
 #[derive(Default)]
 pub struct Properties<'a> {
     /// `SignaturePolicyIdentifier` (§5.2.9).
-    pub policy: Option<SignaturePolicy<'a, Fragment>>,
+    pub policy: Option<Policy<'a>>,
+    /// The digest rule of the specification an explicit policy names with
+    /// `PolicyTransform::InSpecification`.
+    pub specified: Option<SpecifiedDigest<'a>>,
     /// `SignaturePolicyStore` of the explicit policy, an unsigned property
     /// (§5.2.10).
     pub policy_store: Option<PolicyStore<'a>>,
@@ -179,10 +198,23 @@ pub enum PropertyError {
     /// The signing policy does not admit the policy digest method.
     #[error(transparent)]
     Policy(#[from] PolicyViolation),
-    /// The digest as specified by a technical specification is not
-    /// implemented; the policy needs another digest plan.
-    #[error("policy digest as in specification {0:?} is not supported")]
+    /// The policy names a technical specification for its digest whose rule
+    /// the caller did not state in a [`SpecifiedDigest`].
+    #[error("policy digest as in specification {0:?} has no stated rule")]
     Specification(String),
+    /// The policy document is not one DER encoding.
+    #[error("the policy document is not DER: {0}")]
+    Der(structured_asn1::Error),
+    /// The policy document is not an ETSI TR 102 272 `SignaturePolicy`.
+    #[error("the policy document is not an ASN.1 signature policy: {0}")]
+    Asn1(structured_cms::Error),
+    /// The policy digest method has no ASN.1 identity.
+    #[error("the policy digest method has no ASN.1 identity")]
+    Asn1Method,
+    /// The ASN.1 policy digest failed: the document names another hash, its
+    /// stored digest differs, or the provider refused.
+    #[error("the ASN.1 policy digest failed: {0:?}")]
+    Asn1Digest(Box<PolicyDigestError<PropertyError>>),
     /// The policy transforms could not be applied.
     #[error(transparent)]
     Transforms(#[from] TransformsError),
@@ -244,6 +276,8 @@ pub(crate) struct PropertyDraft<'a> {
     pub(crate) provider: &'a dyn CryptoProvider,
     pub(crate) policy: &'a SigningPolicy,
     pub(crate) bound: Bound<'a>,
+    /// The caller's rule for a policy digest as in a specification.
+    pub(crate) specified: Option<SpecifiedDigest<'a>>,
     /// The reference plan the content timestamps were checked over.
     pub(crate) content: Option<&'a Replayed<'a>>,
 }
@@ -331,8 +365,19 @@ impl PropertyWriter for PropertyDraft<'_> {
     }
 }
 
+/// The policy digest method `method` names, admitted by the signing `policy`.
+pub(crate) fn policy_digest_method(
+    policy: &SigningPolicy,
+    method: &str,
+) -> Result<DigestAlgorithm, PropertyError> {
+    let algorithm = DigestAlgorithm::from_uri(method)
+        .ok_or_else(|| PropertyError::DigestMethod(method.into()))?;
+    policy.check_digest_algorithm(algorithm)?;
+    Ok(algorithm)
+}
+
 impl PolicyWriter for PropertyDraft<'_> {
-    type Digest = DigestOutput;
+    type Digest = PolicyHash;
 
     fn policy_digest<W: Work>(
         &self,
@@ -340,22 +385,17 @@ impl PolicyWriter for PropertyDraft<'_> {
         method: &str,
         transform: &PolicyTransform<'_, Fragment>,
         work: &W,
-    ) -> Result<DigestOutput, PropertyError> {
-        let algorithm = DigestAlgorithm::from_uri(method)
-            .ok_or_else(|| PropertyError::DigestMethod(method.into()))?;
-        self.policy.check_digest_algorithm(algorithm)?;
+    ) -> Result<PolicyHash, PropertyError> {
+        let algorithm = policy_digest_method(self.policy, method)?;
         work.charge_work(document.len() as u64)
             .map_err(DraftError::from)?;
         let memory = work.memory();
-        match transform {
+        let digest: DigestOutput = match transform {
             // EN 319 132-1 §5.2.9.2: without transforms the digest covers the
             // policy document's bytes as they are.
-            PolicyTransform::None => Ok(compute_digest_with_provider(
-                self.provider,
-                algorithm,
-                document,
-                memory,
-            )?),
+            PolicyTransform::None => {
+                compute_digest_with_provider(self.provider, algorithm, document, memory)?
+            }
             PolicyTransform::Xml(Fragment::Transforms(transforms)) => {
                 let transformed = with_transforms(&transforms.element, |node| {
                     // The policy document is the input; `here()` in an XPath
@@ -369,18 +409,28 @@ impl PolicyWriter for PropertyDraft<'_> {
                 })?;
                 work.charge_work(transformed.len() as u64)
                     .map_err(DraftError::from)?;
-                Ok(compute_digest_with_provider(
-                    self.provider,
-                    algorithm,
-                    &transformed,
-                    memory,
-                )?)
+                compute_digest_with_provider(self.provider, algorithm, &transformed, memory)?
             }
-            PolicyTransform::Xml(_) => Err(PropertyError::Slot(FragmentSlot::PolicyTransforms)),
+            PolicyTransform::Xml(_) => {
+                return Err(PropertyError::Slot(FragmentSlot::PolicyTransforms));
+            }
             PolicyTransform::InSpecification(specification) => {
-                Err(PropertyError::Specification(specification.uri.into()))
+                return match self.specified {
+                    Some(SpecifiedDigest {
+                        specification: named,
+                        rule: DigestRule::Asn1Policy,
+                    }) if named == specification.uri => specified::asn1_policy(
+                        document,
+                        algorithm,
+                        self.provider,
+                        self.policy,
+                        work,
+                    ),
+                    _ => Err(PropertyError::Specification(specification.uri.into())),
+                };
             }
-        }
+        };
+        Ok(digest.into())
     }
 
     fn matches_policy<W: Work>(

@@ -46,7 +46,7 @@ const fn created(name: &'static str, signatures: usize) -> Case {
     }
 }
 
-pub(crate) const CASES: [Case; 42] = [
+pub(crate) const CASES: [Case; 44] = [
     created("enveloped", 1),
     created("enveloping", 1),
     created("internally-detached", 1),
@@ -83,6 +83,8 @@ pub(crate) const CASES: [Case; 42] = [
     created("data-object-format", 1),
     created("countersigned-properties", 2),
     created("policy-store-added", 2),
+    created("policy-supplied", 1),
+    created("policy-asn1", 1),
     Case {
         name: "content-timestamps",
         signatures: 1,
@@ -251,8 +253,9 @@ fn tokens(diagnostic: xml::Node<'_, '_>, expected: usize, problems: &mut Vec<Str
 
 /// The optional properties DSS must read in a case's diagnostic report, as
 /// (element, expected text): some element of that local name holds the text,
-/// for `element@attribute` has the attribute with that value, and for
-/// `element#` that many elements of the name carry a `BasicSignature`.
+/// for `element@attribute` has the attribute with that value, `scope/` first
+/// limits the search to elements below one named `scope`, and for `element#`
+/// that many elements of the name carry a `BasicSignature`.
 fn expected_properties(name: &str) -> &'static [(&'static str, &'static str)] {
     const POLICY: &str = "1.3.6.1.4.1.13762.3.1";
     match name {
@@ -261,22 +264,49 @@ fn expected_properties(name: &str) -> &'static [(&'static str, &'static str)] {
         "policy-explicit" => &[
             ("Id", POLICY),
             ("Identified", "true"),
-            ("DigestAlgoAndValue@match", "true"),
+            ("Policy/DigestAlgoAndValue@match", "true"),
             ("Organization", "Example Organization"),
             ("ExplicitText", "Signed under the example policy"),
         ],
         "policy-transforms" => &[
             ("Id", POLICY),
             ("Transformation", "Canonical XML 1.0 (omits comments)"),
-            ("DigestAlgoAndValue@match", "true"),
+            ("Policy/DigestAlgoAndValue@match", "true"),
         ],
         "policy-implied" => &[("Id", "IMPLICIT_POLICY")],
+        // DSS reads the identifier and its qualifiers; without the document
+        // it cannot check the supplied digest.
+        "policy-supplied" => &[
+            ("Policy/Id", "1.2.3.4.5.6"),
+            ("Policy/Url", "http://spuri.test"),
+            ("Policy/Description", "Test description"),
+            (
+                "Policy/DocumentationReference",
+                "http://nowina.lu/signature-policy.pdf",
+            ),
+            ("Policy/Organization", "Nowina Solutions"),
+            ("Policy/ExplicitText", "This is a test policy"),
+            ("DocSpecification/Id", "1.2.3.4.5.6"),
+        ],
+        // The stored DER policy digests, as TR 102 272 says, to the signed
+        // value.
+        "policy-asn1" => &[
+            ("Policy/Id", "1.2.3.4.5.6"),
+            ("Policy/Identified", "true"),
+            ("Policy/Asn1Processable", "true"),
+            (
+                "Policy/Transformation",
+                "http://uri.etsi.org/01903/v1.3.2/SignaturePolicy/SPDocDigestAsInSpecification",
+            ),
+            ("Policy/DigestAlgoAndValue@match", "true"),
+        ],
         // The store added to the first signature authenticates its policy;
         // the second signature has none to compare with.
         "policy-store-added" => &[
             ("Id", POLICY),
             ("Identified", "true"),
-            ("DigestAlgoAndValue@match", "true"),
+            ("Policy/DigestAlgoAndValue@match", "true"),
+            ("Policy/DigestAlgoAndValue@match", "false"),
             ("Identified", "false"),
         ],
         // DSS has no local copy to compare; it reads the identifier.
@@ -327,15 +357,21 @@ fn property_problems(name: &str, diagnostic: xml::Node<'_, '_>, problems: &mut V
             }
             continue;
         }
-        let (local, attribute) = element
+        let (scope, named) = element
+            .split_once('/')
+            .map_or((None, *element), |(scope, named)| (Some(scope), named));
+        let (local, attribute) = named
             .split_once('@')
-            .map_or((*element, None), |(local, attribute)| {
-                (local, Some(attribute))
-            });
-        let found = xml::below(diagnostic, local, None).any(|node| match attribute {
+            .map_or((named, None), |(local, attribute)| (local, Some(attribute)));
+        let holds = |node: xml::Node<'_, '_>| match attribute {
             Some(attribute) => node.attribute(attribute) == Some(*expected),
             None => xml::text_at(node, &[]).as_deref() == Some(*expected),
-        });
+        };
+        let found = match scope {
+            Some(scope) => xml::below(diagnostic, scope, None)
+                .any(|parent| xml::below(parent, local, None).any(holds)),
+            None => xml::below(diagnostic, local, None).any(holds),
+        };
         if !found {
             problems.push(format!("DSS did not read {element} {expected:?}"));
         }

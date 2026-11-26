@@ -12,7 +12,8 @@ use crate::content::{self, ContentError, ContentRequests, Replayed};
 use crate::draft::{Draft, DraftError};
 use crate::placement::{self, DS, PlacementError, XADES};
 use crate::properties::{
-    Bound, Planned, Properties, PropertyDraft, PropertyError, SignaturePolicy,
+    Bound, Planned, Policy, Properties, PropertyDraft, PropertyError, SignaturePolicy,
+    policy_digest_method,
 };
 use alloc::{collections::BTreeMap, format, string::String, vec::Vec};
 use structured_asn1::Parser;
@@ -1220,8 +1221,9 @@ fn checked_optional<'p>(
     Option<&'p crate::properties::ExplicitPolicy<'p, crate::properties::Fragment>>,
     CreateError,
 > {
+    // A supplied digest comes without the document a store would carry.
     let staged = match &properties.policy {
-        Some(SignaturePolicy::Explicit(policy)) => Some(policy),
+        Some(Policy::Document(SignaturePolicy::Explicit(policy))) => Some(policy),
         _ => None,
     };
     if properties.policy_store.is_some() && staged.is_none() {
@@ -1239,6 +1241,22 @@ fn checked_optional<'p>(
         }
     }
     Ok(staged)
+}
+
+/// Write `policy`'s `SignaturePolicyIdentifier`; a supplied digest must have
+/// the width of its method, which the signing policy admits.
+fn write_policy<W: Work>(
+    policy: &Policy<'_>,
+    signing: &SigningPolicy,
+    writer: &mut PropertyDraft<'_>,
+    work: &W,
+) -> Result<(), produce::Error<PropertyError>> {
+    match policy {
+        Policy::Document(policy) => policy.write(writer, work),
+        Policy::Supplied(policy) => policy.write(writer, work, |method, _| {
+            Ok(policy_digest_method(signing, method)?.output_len())
+        }),
+    }
 }
 
 /// The `QualifyingProperties` of a new signature, drafted from the shared
@@ -1289,6 +1307,7 @@ fn signed_properties<W: Work>(
         provider: signer.provider,
         policy: signer.policy,
         bound: staged.map_or(Bound::None, Bound::Staged),
+        specified: properties.specified,
         content: content.map(|(replayed, _)| replayed),
     };
     // EN 319 132-1 Annex A orders SignedSignatureProperties as policy,
@@ -1301,7 +1320,7 @@ fn signed_properties<W: Work>(
             work,
             |writer, work| {
                 if let Some(policy) = &properties.policy {
-                    policy.write(writer, work)?;
+                    write_policy(policy, signer.policy, writer, work)?;
                 }
                 if let Some(place) = properties.production_place {
                     place.write(writer, work)?;

@@ -24,7 +24,7 @@ use xml_sec::xmldsig::{
 };
 use xml_sec_xades::properties::{
     Commitment, CommitmentScope, ExplicitPolicy, FormatDetails, Fragment, Identifier,
-    NoticeReference, PolicyDocument, PolicyQualifier, PolicyStore, PolicyTransform,
+    NoticeReference, Policy, PolicyDocument, PolicyQualifier, PolicyStore, PolicyTransform,
     PolicyTransforms, ProductionPlace, Properties, PropertyError, Qualifier, SignaturePolicy,
     SignerRole, UserNotice,
 };
@@ -303,14 +303,14 @@ fn sha256(bytes: &[u8]) -> Vec<u8> {
 fn explicit<'a>(
     transform: PolicyTransform<'a, Fragment>,
     qualifiers: &'a [PolicyQualifier<'a, Fragment>],
-) -> SignaturePolicy<'a, Fragment> {
-    SignaturePolicy::Explicit(ExplicitPolicy {
+) -> Policy<'a> {
+    Policy::Document(SignaturePolicy::Explicit(ExplicitPolicy {
         identifier: policy_identifier(),
         document: POLICY_DOCUMENT,
         digest_method: DigestAlgorithm::Sha256.uri(),
         transform,
         qualifiers,
-    })
+    }))
 }
 
 /// A policy store of the given form, an ISO 19115 document specification.
@@ -547,7 +547,7 @@ fn inconsistent_properties_are_refused_before_publication() {
     assert!(matches!(
         fixture.refused(
             Properties {
-                policy: Some(SignaturePolicy::Implied),
+                policy: Some(Policy::Document(SignaturePolicy::Implied)),
                 policy_store: Some(policy_store(PolicyDocument::LocalUri("policy.xml"))),
                 ..Properties::default()
             },
@@ -594,8 +594,8 @@ fn inconsistent_properties_are_refused_before_publication() {
 
 #[test]
 fn policy_values_xml_sec_cannot_draft_are_refused_before_publication() {
-    // A digest as some specification computes it is not implemented, a
-    // notice number must be an xsd:integer, and a ds:Transforms cannot stand
+    // A digest as a specification computes it needs the caller's rule for
+    // that specification, a notice number must be an xsd:integer, and a ds:Transforms cannot stand
     // where a role is due; none of them publishes anything.
     let fixture = Fixture::new();
     let objects = enveloped(Envelope::ExcludingSignatures);

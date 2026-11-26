@@ -35,7 +35,10 @@
 //! unchanged. Verification-only builds do not take the signing dependencies.
 //! The optional qualifying properties of `properties` (a signature policy and
 //! its store, a production place, signer roles, commitments and format
-//! details) are built by the same shared rules. Content timestamps are two
+//! details) are built by the same shared rules. A policy digest is computed
+//! from the policy document under its declared plan, as ETSI TR 102 272 says
+//! for an ASN.1 policy when the caller names that specification's rule, or
+//! taken as the signer supplies it. Content timestamps are two
 //! steps around the caller's TSA exchange: `request_content_timestamps`
 //! encodes each request over the data references' output, computed by the
 //! signing operation stopped before any signature value, and `create` checks

@@ -6,8 +6,6 @@
     "not-applicable": "The class tests DSS's own behaviour, not a signature form xml-sec should make: its API, its validation policy over a PKI scenario, its handling of an input, or a form both implementations refuse or that meets no baseline level."
   },
   "capabilities": {
-    "policy-digest-supplied": "an explicit signature policy whose digest the signer supplies without the policy document; xml-sec computes the digest from the document the policy names",
-    "policy-digest-as-in-specification": "a signature policy digest computed as the policy's technical specification defines (SPDocDigestAsInSpecification, as ETSI TR 102 272 does for ASN.1 policies)",
     "ts101903-format": "ETSI TS 101 903 V1.1.1 and V1.2.2 namespaces and the signing certificate properties before EN 319 132",
     "ts101903-level": "the TS 101 903 levels C, X, XL and A",
     "evidence-record": "an evidence record as an unsigned property"
@@ -20,7 +18,8 @@
     "invalidating-form": "a second signature whose enveloped transform would cover the first, which then no longer verifies; DSS refuses it with an exception and xml-sec refuses to publish a signature that breaks an earlier one, the same outcome",
     "stored-document": "DSS augments a document of its own test resources; the corpus comparison validates those resources",
     "deprecated-algorithm": "RIPEMD-160, which xml-sec verifies only behind its legacy-algorithms feature and does not create in the harness",
-    "forbidden-property": "DSS writes a property in a form EN 319 132-1 forbids: a commitment identifier with an OID Qualifier (§5.2.3), a DataObjectFormat whose MimeType or Encoding differs from its ds:Object's (§5.2.4); xml-sec refuses to write it"
+    "forbidden-property": "DSS writes a property in a form EN 319 132-1 forbids: a commitment identifier with an OID Qualifier (§5.2.3), a DataObjectFormat whose MimeType or Encoding differs from its ds:Object's (§5.2.4); xml-sec refuses to write it",
+    "policy-validator-configuration": "DSS signs a supplied policy digest and checks how its configured policy validator judges it: the TR 102 272 digest inferred from the document without SPDocDigestAsInSpecification, or a digest that differs from the one under the declared plan. xml-sec writes the digest of the document under the declared plan, the TR 102 272 one only for a specification the caller names, or the signer's supplied digest as given"
   },
   "classes": {
     "extension/DSS2058Test": { "not-applicable": "stored-document" },
@@ -299,12 +298,12 @@
     "signature/XAdESLevelBWithEd448Test": { "covered": ["lifecycle/xml-sec-first-enveloping-ed448-crl", "lifecycle/dss-first-enveloping-ed448-crl"] },
     "signature/XAdESLevelBWithEnvelopedTransformOnlyTest": { "covered": ["creation/enveloped", "lifecycle/xml-sec-first-enveloped-rsa-crl", "lifecycle/dss-first-enveloped-rsa-crl"] },
     "signature/XAdESLevelBWithMultipleTrustedCertificateSourcesTest": { "not-applicable": "pki-scenario" },
-    "signature/XAdESLevelBWithNotTrimmedPolicyIdTest": { "unsupported": "policy-digest-supplied" },
+    "signature/XAdESLevelBWithNotTrimmedPolicyIdTest": { "not-applicable": "dss-input-handling" },
     "signature/XAdESLevelBWithPlainECDSATest": { "covered": ["lifecycle/xml-sec-first-enveloping-ec-crl", "lifecycle/dss-first-enveloping-ec-crl", "lifecycle/xml-sec-first-enveloping-ec-p384-crl", "lifecycle/dss-first-enveloping-ec-p384-crl"] },
     "signature/XAdESLevelBWithPlainECDSATokenTest": { "covered": ["lifecycle/xml-sec-first-enveloping-ec-crl", "lifecycle/dss-first-enveloping-ec-crl"] },
-    "signature/XAdESLevelBWithPolicyTest": { "unsupported": "policy-digest-supplied" },
+    "signature/XAdESLevelBWithPolicyTest": { "covered": ["creation/policy-supplied"] },
     "signature/XAdESLevelBWithPolicyWithTransformsAndPolicyStoreTest": { "covered": ["creation/policy-transforms", "creation/policy-store-added"] },
-    "signature/XAdESLevelBWithSPQualifiersTest": { "unsupported": "policy-digest-supplied" },
+    "signature/XAdESLevelBWithSPQualifiersTest": { "covered": ["creation/policy-supplied"] },
     "signature/XAdESLevelBWithSignaturePolicyImpliedTest": { "covered": ["creation/policy-implied"] },
     "signature/XAdESLevelBWithTrustAnchorTest": { "not-applicable": "pki-scenario" },
     "signature/XAdESLevelBWithTrustServicesTest": { "not-applicable": "pki-scenario" },
@@ -417,14 +416,14 @@
     "signature/XAdESSignedPropertiesCanonicalizationTest": { "covered": ["creation/commitment", "creation/inclusive"] },
     "signature/XAdESTimestampCanonicalizationTest": { "covered": ["creation/content-timestamps", "creation/inclusive", "lifecycle/xml-sec-first-inclusive-rsa-crl"] },
     "signature/XAdESTripleSignatureWithUserFriendlyIdentifierTest": { "not-applicable": "dss-api" },
-    "signature/XAdESWithASN1SignaturePolicyFailureTest": { "unsupported": "policy-digest-as-in-specification" },
-    "signature/XAdESWithASN1SignaturePolicySPDocAndPolicyStoreTest": { "unsupported": "policy-digest-as-in-specification" },
+    "signature/XAdESWithASN1SignaturePolicyFailureTest": { "not-applicable": "policy-validator-configuration" },
+    "signature/XAdESWithASN1SignaturePolicySPDocAndPolicyStoreTest": { "covered": ["creation/policy-asn1"] },
     "signature/XAdESWithASN1SignaturePolicyTest": { "covered": ["creation/policy-explicit"] },
-    "signature/XAdESWithASN1SignaturePolicyWithDefaultPolicyOnlyValidatorInvalidTest": { "unsupported": "policy-digest-as-in-specification" },
-    "signature/XAdESWithASN1SignaturePolicyWithDefaultPolicyOnlyValidatorTest": { "unsupported": "policy-digest-as-in-specification" },
-    "signature/XAdESWithASN1SignaturePolicyWithPolicyDependentValidatorTest": { "unsupported": "policy-digest-as-in-specification" },
-    "signature/XAdESWithASN1SignaturePolicyWithSPDocTransformFailureTest": { "unsupported": "policy-digest-as-in-specification" },
-    "signature/XAdESWithASN1SignaturePolicyWithSPDocTransformTest": { "unsupported": "policy-digest-as-in-specification" },
+    "signature/XAdESWithASN1SignaturePolicyWithDefaultPolicyOnlyValidatorInvalidTest": { "not-applicable": "policy-validator-configuration" },
+    "signature/XAdESWithASN1SignaturePolicyWithDefaultPolicyOnlyValidatorTest": { "not-applicable": "policy-validator-configuration" },
+    "signature/XAdESWithASN1SignaturePolicyWithPolicyDependentValidatorTest": { "not-applicable": "policy-validator-configuration" },
+    "signature/XAdESWithASN1SignaturePolicyWithSPDocTransformFailureTest": { "not-applicable": "policy-validator-configuration" },
+    "signature/XAdESWithASN1SignaturePolicyWithSPDocTransformTest": { "covered": ["creation/policy-asn1"] },
     "signature/XAdESWithMGF1Test": { "covered": ["lifecycle/xml-sec-first-enveloping-rsa-pss-crl", "lifecycle/dss-first-enveloping-rsa-pss-crl"] },
     "signature/XAdESWithNotAcceptableOCSPTest": { "not-applicable": "pki-scenario" },
     "signature/XAdESWithOCSPResponderWithOCSPTest": { "not-applicable": "pki-scenario" },
@@ -461,6 +460,6 @@
     "signature/prettyprint/XAdESLevelXLPrettyPrintTest": { "unsupported": "ts101903-level" },
     "signature/prettyprint/XAdESLevelXPrettyPrintTest": { "unsupported": "ts101903-level" },
     "signature/prettyprint/XAdESWithCommitmentTypePrettyPrintTest": { "covered": ["creation/commitment", "lifecycle/dss-first-pretty-print-rsa-crl"] },
-    "signature/prettyprint/XAdESWithPolicyPrettyPrintTest": { "unsupported": "policy-digest-supplied" }
+    "signature/prettyprint/XAdESWithPolicyPrettyPrintTest": { "covered": ["dss-form/pretty-print", "creation/policy-supplied"] }
   }
 }

@@ -1,12 +1,19 @@
-//! A `SignaturePolicyStore` added to an existing signature, through the
-//! public entry points, over the creation fixtures.
+//! Signature policy digests (computed from the document, supplied by the
+//! signer, or as a technical specification defines) and a
+//! `SignaturePolicyStore` added to an existing signature, through the public
+//! entry points, over the creation fixtures.
 
 #![cfg(feature = "produce")]
+
+#[path = "../examples/support/asn1_policy.rs"]
+mod asn1_policy;
 
 use std::sync::Arc;
 
 use structured_asn1::memory::{Memory, MemoryAccount};
+use structured_cms::signature_policy::PolicyDigestError;
 use structured_pkix::temporal::LeapTable;
+use structured_xades::produce::Error as ProduceError;
 use xml_sec::XmlDocument;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::policy::{Instant, SigningPolicy, VerificationPolicy};
@@ -15,12 +22,13 @@ use xml_sec::xmldsig::{
     UriTypeSet, VerificationRequest, VerifyContext,
 };
 use xml_sec_xades::properties::{
-    ExplicitPolicy, Fragment, Identifier, PolicyDocument, PolicyStore, PolicyTransform,
-    PolicyTransforms, Properties, SignaturePolicy,
+    DigestRule, ExplicitPolicy, Fragment, Identifier, Policy, PolicyDocument, PolicyStore,
+    PolicyTransform, PolicyTransforms, Properties, PropertyError, Qualifier, SignaturePolicy,
+    SpecifiedDigest, SuppliedPolicy,
 };
 use xml_sec_xades::{
-    Assessment, AugmentError, DataObject, Envelope, Inputs, PolicyStoreRequest, Request,
-    Requirements, Signer, add_policy_store, create,
+    Assessment, AugmentError, CreateError, DataObject, Envelope, Inputs, PolicyStoreRequest,
+    Request, Requirements, Signer, add_policy_store, create,
 };
 
 const ROOT: &[u8] = include_bytes!("fixtures/creation/root.der");
@@ -106,6 +114,15 @@ impl Fixture {
 
     /// A document with the B-B signature `sig` under `policy`.
     fn signed(&self, policy: Option<SignaturePolicy<'_, Fragment>>) -> XmlDocument {
+        self.created(Properties {
+            policy: policy.map(Policy::Document),
+            ..Properties::default()
+        })
+        .expect("signed")
+    }
+
+    /// A document with the B-B signature `sig` carrying `properties`.
+    fn created(&self, properties: Properties<'_>) -> Result<XmlDocument, CreateError> {
         let chain: [&[u8]; 2] = [SIGNER, INTERMEDIATE];
         let signer = Signer {
             key: &self.key,
@@ -132,17 +149,13 @@ impl Fixture {
                     placement: xml_sec_xades::Placement::DocumentEnd,
                     resources: None,
                     id_attributes: &[],
-                    properties: Properties {
-                        policy,
-                        ..Properties::default()
-                    },
+                    properties,
                 },
                 assessment,
                 &account(),
             )
-        })
-        .expect("signed");
-        document
+        })?;
+        Ok(document)
     }
 
     /// Add the store of `policy` to `sig`, assessed at B-B.
@@ -150,6 +163,16 @@ impl Fixture {
         &self,
         document: &mut XmlDocument,
         policy: &ExplicitPolicy<'_, Fragment>,
+    ) -> Result<(), AugmentError> {
+        self.store_specified(document, policy, None)
+    }
+
+    /// Add the store of `policy`, digested under `specified`, to `sig`.
+    fn store_specified(
+        &self,
+        document: &mut XmlDocument,
+        policy: &ExplicitPolicy<'_, Fragment>,
+        specified: Option<SpecifiedDigest<'_>>,
     ) -> Result<(), AugmentError> {
         let inputs = Inputs {
             requirements: Requirements::Basic,
@@ -168,6 +191,7 @@ impl Fixture {
                     signature: "sig",
                     policy,
                     store: store(),
+                    specified,
                     provider: xml_sec::provider::default_provider(),
                     signing: &self.signing,
                     assessment,
@@ -265,4 +289,204 @@ fn a_policy_digested_after_transforms_is_stored_with_the_same_plan() {
         )
         .expect("the same plan");
     assert_eq!(stores(document.as_xml()), 1);
+}
+
+/// The refusal of a creation that must not succeed.
+fn refusal(result: Result<XmlDocument, CreateError>, what: &str) -> CreateError {
+    match result {
+        Ok(_) => panic!("{what} is refused"),
+        Err(error) => error,
+    }
+}
+
+fn sha256(bytes: &[u8]) -> Vec<u8> {
+    xml_sec::xmldsig::compute_digest_with_provider(
+        xml_sec::provider::default_provider(),
+        DigestAlgorithm::Sha256,
+        bytes,
+        &account(),
+    )
+    .expect("digest")
+    .as_ref()
+    .to_vec()
+}
+
+/// The decoded `SigPolicyHash/DigestValue` of `xml`.
+fn signed_digest(xml: &str) -> Vec<u8> {
+    let document = roxmltree::Document::parse(xml).expect("XML parses");
+    let value = document
+        .descendants()
+        .find(|node| node.tag_name().name() == "SigPolicyHash")
+        .and_then(|hash| {
+            hash.children()
+                .find(|node| node.tag_name().name() == "DigestValue")
+        })
+        .and_then(|node| node.text())
+        .expect("SigPolicyHash/DigestValue");
+    structured_base64::STANDARD
+        .decode(value.as_bytes())
+        .expect("base64")
+}
+
+fn supplied(digest: &[u8]) -> Policy<'_> {
+    Policy::Supplied(SuppliedPolicy {
+        identifier: identifier("urn:oid:1.2.3.4.5"),
+        digest_method: DigestAlgorithm::Sha256.uri(),
+        digest,
+        transform: PolicyTransform::None,
+        qualifiers: &[],
+    })
+}
+
+#[test]
+fn a_supplied_policy_digest_is_signed_without_the_document() {
+    // EN 319 132-1 §5.2.9: the signer may hold only the digest of the policy
+    // version; it is signed as given when its width is the method's, a
+    // digest of another width is refused (an 11-byte value under SHA-256),
+    // and no store can be written for a document the signer does not hold.
+    let fixture = Fixture::new();
+    let digest = sha256(POLICY);
+    let document = fixture
+        .created(Properties {
+            policy: Some(supplied(&digest)),
+            ..Properties::default()
+        })
+        .expect("a supplied digest");
+    assert_eq!(signed_digest(document.as_xml()), digest);
+
+    let short = refusal(
+        fixture.created(Properties {
+            policy: Some(supplied(b"digestvalue")),
+            ..Properties::default()
+        }),
+        "a digest of another width",
+    );
+    assert!(
+        matches!(
+            short,
+            CreateError::Properties(ProduceError::Value("signaturePolicyId.digestWidth"))
+        ),
+        "{short:?}"
+    );
+    let stored = refusal(
+        fixture.created(Properties {
+            policy: Some(supplied(&digest)),
+            policy_store: Some(store()),
+            ..Properties::default()
+        }),
+        "a store without the document",
+    );
+    assert!(
+        matches!(stored, CreateError::PolicyStoreWithoutPolicy),
+        "{stored:?}"
+    );
+}
+
+const ASN1_RULE: SpecifiedDigest<'static> = SpecifiedDigest {
+    specification: asn1_policy::SPECIFICATION,
+    rule: DigestRule::Asn1Policy,
+};
+
+fn asn1_explicit<'a>(document: &'a [u8], method: &'a str) -> ExplicitPolicy<'a, Fragment> {
+    ExplicitPolicy {
+        identifier: Identifier {
+            qualifier: Some(Qualifier::Urn),
+            ..identifier(asn1_policy::POLICY_OID)
+        },
+        document,
+        digest_method: method,
+        transform: PolicyTransform::InSpecification(identifier(asn1_policy::SPECIFICATION)),
+        qualifiers: &[],
+    }
+}
+
+#[test]
+fn an_asn1_policy_is_digested_as_its_specification_defines() {
+    // ETSI TR 102 272 §6.1: the digest covers the DER signPolicyHashAlg and
+    // signPolicyInfo, not the whole document, when the caller states that
+    // rule for the specification the policy names; the store recomputes it.
+    let fixture = Fixture::new();
+    let der = asn1_policy::document(None);
+    // The document is under 128 bytes: a two-byte SEQUENCE header.
+    assert!(der.len() < 130);
+    let covered = sha256(&der[2..]);
+    let policy = asn1_explicit(&der, DigestAlgorithm::Sha256.uri());
+    let mut document = fixture
+        .created(Properties {
+            policy: Some(Policy::Document(SignaturePolicy::Explicit(asn1_explicit(
+                &der,
+                DigestAlgorithm::Sha256.uri(),
+            )))),
+            specified: Some(ASN1_RULE),
+            ..Properties::default()
+        })
+        .expect("an ASN.1 policy");
+    assert_eq!(signed_digest(document.as_xml()), covered);
+    assert_ne!(covered, sha256(&der), "not the whole document");
+
+    let unstated = fixture
+        .store(&mut document, &policy)
+        .expect_err("a store without the rule");
+    assert!(
+        matches!(&unstated, AugmentError::Store(error)
+            if matches!(**error, ProduceError::Writer(PropertyError::Specification(_)))),
+        "{unstated:?}"
+    );
+    fixture
+        .store_specified(&mut document, &policy, Some(ASN1_RULE))
+        .expect("the store under the rule");
+    assert_eq!(stores(document.as_xml()), 1);
+}
+
+#[test]
+fn an_asn1_policy_that_contradicts_its_digest_is_refused() {
+    // TR 102 272 §6.1: the document names its own hash, which must be the
+    // policy digest method, and a stored signPolicyHash must be the digest;
+    // a policy breaking either is refused, while a correct stored hash is
+    // accepted.
+    let fixture = Fixture::new();
+    let create = |document: &[u8], method: &str| {
+        fixture.created(Properties {
+            policy: Some(Policy::Document(SignaturePolicy::Explicit(asn1_explicit(
+                document, method,
+            )))),
+            specified: Some(ASN1_RULE),
+            ..Properties::default()
+        })
+    };
+    let der = asn1_policy::document(None);
+    let mismatch = refusal(
+        create(&der, DigestAlgorithm::Sha384.uri()),
+        "another method",
+    );
+    assert!(
+        matches!(&mismatch, CreateError::Properties(ProduceError::Writer(PropertyError::Asn1Digest(error)))
+            if matches!(**error, PolicyDigestError::AlgorithmMismatch { .. })),
+        "{mismatch:?}"
+    );
+    let wrong = asn1_policy::document(Some(&[0; 32]));
+    let differs = refusal(
+        create(&wrong, DigestAlgorithm::Sha256.uri()),
+        "a wrong stored hash",
+    );
+    assert!(
+        matches!(&differs, CreateError::Properties(ProduceError::Writer(PropertyError::Asn1Digest(error)))
+            if matches!(**error, PolicyDigestError::StoredDigestMismatch(_))),
+        "{differs:?}"
+    );
+    let correct = asn1_policy::document(Some(&sha256(&der[2..])));
+    create(&correct, DigestAlgorithm::Sha256.uri()).expect("a correct stored hash");
+    let malformed = refusal(
+        create(b"<Policy/>", DigestAlgorithm::Sha256.uri()),
+        "not DER",
+    );
+    assert!(
+        matches!(
+            malformed,
+            CreateError::Properties(ProduceError::Writer(
+                PropertyError::Der(_) | PropertyError::Asn1(_)
+            ))
+        ),
+        "{malformed:?}"
+    );
 }
