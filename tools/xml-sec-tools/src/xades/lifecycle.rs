@@ -1097,20 +1097,42 @@ pub(crate) fn compare(expected: &Value, observed: &[Value]) -> Vec<String> {
     let mut found = Vec::new();
     for row in observed {
         let name = row["case"].as_str().unwrap_or_default();
-        let Some(steps) = expected["cases"][name]["steps"].as_array() else {
+        let case = &expected["cases"][name];
+        let Some(steps) = case["steps"].as_array() else {
             found.push(format!("{name}: no expectation"));
             continue;
         };
         let actual = row["steps"].as_array().map_or(&[][..], Vec::as_slice);
-        if steps.len() != actual.len() {
-            found.push(format!(
-                "{name}: {} steps expected, {} observed",
-                steps.len(),
-                actual.len()
-            ));
-        }
-        for (index, (step, observed)) in steps.iter().zip(actual).enumerate() {
-            deviations(step, observed, &format!("{name}[{index}]"), &mut found);
+        let differences = |steps: &[Value]| {
+            let mut differences = Vec::new();
+            if steps.len() != actual.len() {
+                differences.push(format!(
+                    "{name}: {} steps expected, {} observed",
+                    steps.len(),
+                    actual.len()
+                ));
+            }
+            for (index, (step, observed)) in steps.iter().zip(actual).enumerate() {
+                deviations(
+                    step,
+                    observed,
+                    &format!("{name}[{index}]"),
+                    &mut differences,
+                );
+            }
+            differences
+        };
+        // A reviewed alternative outcome, such as one the other side's
+        // randomized encoding produces now and then, matches as well.
+        let primary = differences(steps);
+        let alternative = case["alternatives"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|alternative| alternative["steps"].as_array())
+            .any(|steps| differences(steps).is_empty());
+        if !alternative {
+            found.extend(primary);
         }
     }
     if let Some(cases) = expected["cases"].as_object() {
@@ -1163,19 +1185,25 @@ pub(crate) fn execute(corpus: &Corpus, results: &Path, record: bool) -> Result<(
     )?;
     let path = expectations_path(corpus);
     if record {
+        // The reviewed explanations and alternatives outlive a new recording;
+        // `dss` names the release the outcomes were recorded against.
+        let previous = xml::read(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .unwrap_or(Value::Null);
         let cases: Map<String, Value> = observed
             .iter()
             .map(|row| {
                 let name = row["case"].as_str().unwrap_or_default().to_owned();
-                (name, json!({ "steps": row["steps"] }))
+                let mut case = json!({ "steps": row["steps"] });
+                let alternatives = &previous["cases"][&name]["alternatives"];
+                if !alternatives.is_null() {
+                    case["alternatives"] = alternatives.clone();
+                }
+                (name, case)
             })
             .collect();
-        // The reviewed explanations outlive a new recording; `dss` names the
-        // release the outcomes were recorded against.
-        let notes = xml::read(&path)
-            .ok()
-            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-            .map_or(Value::Null, |previous| previous["notes"].clone());
+        let notes = previous["notes"].clone();
         return write_json(
             &path,
             &json!({ "dss": release.dss, "notes": notes, "cases": cases }),

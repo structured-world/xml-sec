@@ -6,6 +6,31 @@ use serde_json::json;
 use std::collections::BTreeSet;
 
 #[test]
+fn a_reviewed_alternative_outcome_matches_and_an_unknown_one_does_not() {
+    // DSS's randomized r || s width makes one P-521 lifecycle end either way;
+    // both reviewed outcomes match, anything else is a deviation of the
+    // expected one.
+    let expected = json!({ "cases": { "c": {
+        "steps": [{ "step": "b", "made": "made" }],
+        "alternatives": [{ "note": "p521", "steps": [{ "step": "b", "made": { "refused": "r" } }] }]
+    } } });
+    let row =
+        |made: serde_json::Value| json!({ "case": "c", "steps": [{ "step": "b", "made": made }] });
+    assert_eq!(
+        compare(&expected, &[row(json!("made"))]),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        compare(&expected, &[row(json!({ "refused": "r" }))]),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        compare(&expected, &[row(json!({ "refused": "other" }))]),
+        ["c[0].made: expected \"made\", got {\"refused\":\"other\"}"]
+    );
+}
+
+#[test]
 fn every_signature_after_the_first_is_reported_and_one_signature_keeps_its_shape() {
     // A form with several signatures must not hide a refused countersignature
     // behind a valid first signature; a single signature's outcome keeps the
