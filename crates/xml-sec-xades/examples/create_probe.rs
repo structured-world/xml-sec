@@ -27,6 +27,8 @@ use xml_sec_xades::{
 const DOCUMENT: &str = "<Document><Data Id=\"payload\">Created payload</Data></Document>";
 const DETACHED: &[u8] = b"Detached payload\n";
 const SECOND_DETACHED: &[u8] = b"Second detached payload\n";
+/// Detached XML a reference canonicalizes, as DSS's detached transform tests do.
+const DETACHED_XML: &[u8] = b"<Detached xmlns=\"urn:detached\"><Item>Payload</Item></Detached>";
 const TIME: &str = "2026-10-18T12:00:00Z";
 
 fn read(directory: &Path, name: &str) -> Result<Vec<u8>, String> {
@@ -74,6 +76,8 @@ fn main() -> Result<(), String> {
     let resources = BTreeMap::from([
         ("detached.txt".to_owned(), DETACHED.to_vec()),
         ("detached-2.txt".to_owned(), SECOND_DETACHED.to_vec()),
+        // Not detached.xml: that is the signed document of the detached case.
+        ("detached-data.xml".to_owned(), DETACHED_XML.to_vec()),
     ]);
     let request = VerificationRequest {
         external_resources: Some(&resources),
@@ -229,6 +233,22 @@ fn shaped() -> Vec<(&'static str, Signatures)> {
             one(vec![document_object(Envelope::ExcludingSignatures)]),
         ),
         (
+            "placement-after",
+            one(vec![document_object(Envelope::ExcludingSignatures)]),
+        ),
+        (
+            "placement-last-child",
+            one(vec![document_object(Envelope::ExcludingSignatures)]),
+        ),
+        (
+            "reference-detached-xml",
+            one(vec![DataObject::Reference {
+                uri: "detached-data.xml",
+                transforms: vec![exclusive()],
+                mime_type: "text/xml",
+            }]),
+        ),
+        (
             "manifest",
             one(vec![DataObject::Manifest {
                 id: "manifest",
@@ -359,6 +379,8 @@ fn sign(
             placement: match name {
                 "placement-first-child" => Placement::FirstChildOf("payload"),
                 "placement-before" => Placement::Before("payload"),
+                "placement-after" => Placement::After("payload"),
+                "placement-last-child" => Placement::LastChildOf("payload"),
                 _ => Placement::DocumentEnd,
             },
             resources: Some(resources),

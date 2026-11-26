@@ -44,7 +44,7 @@ const fn created(name: &'static str, signatures: usize) -> Case {
     }
 }
 
-pub(crate) const CASES: [Case; 26] = [
+pub(crate) const CASES: [Case; 29] = [
     created("enveloped", 1),
     created("enveloping", 1),
     created("internally-detached", 1),
@@ -58,6 +58,9 @@ pub(crate) const CASES: [Case; 26] = [
     created("empty-prefix", 1),
     created("placement-first-child", 1),
     created("placement-before", 1),
+    created("placement-after", 1),
+    created("placement-last-child", 1),
+    created("reference-detached-xml", 1),
     created("signed-key-info", 1),
     created("manifest", 1),
     // References the caller composes (`DataObject::Reference`).
@@ -153,6 +156,7 @@ fn detached_files(name: &str) -> &'static [&'static str] {
     match name {
         "detached" => &["detached.txt"],
         "detached-multiple" | "manifest" => &["detached.txt", "detached-2.txt"],
+        "reference-detached-xml" => &["detached-data.xml"],
         _ => &[],
     }
 }
