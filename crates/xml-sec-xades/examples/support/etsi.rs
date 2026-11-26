@@ -42,7 +42,9 @@ use xml_sec_xades::{TimestampRole, TokenIntegrity};
 /// held.
 pub(crate) fn token_finding(integrity: TokenIntegrity) -> Option<SubIndication> {
     match integrity {
-        TokenIntegrity::ImprintMismatch => Some(SubIndication::HashFailure),
+        TokenIntegrity::ImprintMismatch | TokenIntegrity::ContentMismatch => {
+            Some(SubIndication::HashFailure)
+        }
         TokenIntegrity::SignatureInvalid => Some(SubIndication::SigCryptoFailure),
         TokenIntegrity::Rejected => Some(SubIndication::FormatFailure),
         TokenIntegrity::Intact | TokenIntegrity::MissingSigner => None,
@@ -190,7 +192,7 @@ const FRESHNESS_IGNORED: u64 = 100 * 366 * 86_400;
 /// 2.3.2), which `structured_pkix::oid` does not name.
 const DSA_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x38, 0x04, 0x01];
 
-fn instant(seconds: i64) -> Instant {
+pub(crate) fn instant(seconds: i64) -> Instant {
     Instant::new(seconds, 0).expect("corpus times are in range")
 }
 
@@ -508,6 +510,41 @@ fn integrity(result: &VerifyResult) -> (Vec<Reference>, Computed) {
         _ => Computed::Verified,
     };
     (references, value)
+}
+
+/// The signed elements a signature claims: its signing time and its signing
+/// certificate references.
+fn declared_elements(declared: &Declared) -> Elements {
+    let mut elements = Elements::NONE;
+    if declared.signing_time.is_some() {
+        elements = elements.with(Element::ClaimedSigningTime);
+    }
+    if !declared.certificate_references.is_empty() {
+        elements = elements.with(Element::SigningCertificate);
+    }
+    elements
+}
+
+/// Clause 5.2.8: a `SignedInfo` reference the selected policy refuses is a
+/// constraint the signature does not meet; its digest was never checked, so
+/// it has no integrity result of its own (never [`Reference::Intact`]).
+fn reference_refused(result: &VerifyResult) -> Option<Value> {
+    result
+        .signed_info_references
+        .iter()
+        .any(|reference| {
+            matches!(
+                reference.status,
+                DsigStatus::Invalid(FailureReason::ReferencePolicyViolation { .. })
+            )
+        })
+        .then(|| {
+            verdict(
+                "INDETERMINATE",
+                Some("SIG_CONSTRAINTS_FAILURE"),
+                "a SignedInfo reference the policy refuses",
+            )
+        })
 }
 
 /// The parsed material one validation reads, all of one account.
@@ -1318,6 +1355,14 @@ fn authority<'a>(token: &[u8], parsed: &'a Parsed<'a>) -> Option<&'a Certificate
     })
 }
 
+/// Whether a token generated at `generated` (Unix seconds) already existed at
+/// `now`: one generated later did not exist at the validation time, so it is
+/// not evaluated at it and proves no existence (EN 319 102-1 V1.4.1 clause
+/// 5.4; the token's own checks leave that comparison to their caller).
+pub(crate) fn existed(generated: i64, now: Instant) -> bool {
+    instant(generated) <= now
+}
+
 /// The authenticated lower bound of the signature's creation a content
 /// timestamp gives (EN 319 102-1 V1.4.1 clause 5.3.4 steps 4 and 6): the
 /// latest generation time of a content token whose own checks held and whose
@@ -1347,6 +1392,9 @@ fn content_bound<W: structured_asn1::memory::Work>(
         ) else {
             continue;
         };
+        if !existed(generated, now) {
+            continue;
+        }
         let Some(tsa) = authority(token, parsed) else {
             continue;
         };
@@ -1381,7 +1429,7 @@ fn signature_timestamps<W: structured_asn1::memory::Work>(
         };
         match declared.intact(TimestampRole::Signature, index, token) {
             Some(TokenIntegrity::Intact) => {
-                let Some(tsa) = authority(token, parsed) else {
+                let Some(tsa) = authority(token, parsed).filter(|_| existed(generated, now)) else {
                     continue;
                 };
                 let outcome = authority_outcome(session, tsa, parsed, inputs, now, memory)?;
@@ -1424,6 +1472,17 @@ fn authority_outcome<W: structured_asn1::memory::Work>(
     memory: &Memory,
 ) -> Result<structured_ltv::validation::Outcome, String> {
     let paths = path_facts(session, tsa, parsed, inputs, now, memory)?;
+    authority_decision(&paths, tsa, inputs, now, memory)
+}
+
+/// [`authority_outcome`] over the TSA's path facts already assessed at `now`.
+fn authority_decision(
+    paths: &PathFacts,
+    tsa: &Certificate<'_>,
+    inputs: &Inputs<'_>,
+    now: Instant,
+    memory: &Memory,
+) -> Result<structured_ltv::validation::Outcome, String> {
     let etsi_paths = paths.lend();
     let (not_before, not_after) = validity(tsa);
     // The token's own signature is held to the compared profile's key sizes
@@ -1536,6 +1595,9 @@ pub fn indication<W: structured_asn1::memory::Work>(
             return refusal(kind(&debug), &detail);
         }
     };
+    if let Some(refused) = reference_refused(result) {
+        return refused;
+    }
     let parser = session.certificate_parser();
     let memory = parser.memory().clone();
     let parsed = parse(&parser, inputs);
@@ -1566,13 +1628,7 @@ pub fn indication<W: structured_asn1::memory::Work>(
     let etsi_paths = paths.lend();
     let (references, value) = integrity(result);
     let materials = own_materials(declared, signer, inputs.reference_digests, &memory);
-    let mut elements = Elements::NONE;
-    if declared.signing_time.is_some() {
-        elements = elements.with(Element::ClaimedSigningTime);
-    }
-    if !declared.certificate_references.is_empty() {
-        elements = elements.with(Element::SigningCertificate);
-    }
+    let elements = declared_elements(declared);
     let mut references = references;
     if uncountersigned {
         references.push(Reference::Mismatch);
@@ -1649,18 +1705,26 @@ fn catalogue<'a>(
             .map(|(_, at)| at.clone())
             .unwrap_or_default()
     };
-    let mut certificates: Vec<&Certificate<'a>> =
-        parsed.pool.iter().chain(&parsed.anchors).collect();
-    let mut positions: Vec<Vec<usize>> = certificates
-        .iter()
-        .map(|certificate| position(certificate.as_bytes()))
-        .collect();
-    // A certificate inside a response is where that response is.
+    let mut certificates: Vec<&Certificate<'a>> = Vec::new();
+    let mut positions: Vec<Vec<usize>> = Vec::new();
+    let same =
+        |one: &&Certificate<'a>, other: &&Certificate<'a>| one.as_bytes() == other.as_bytes();
+    for certificate in parsed.pool.iter().chain(&parsed.anchors) {
+        let places = position(certificate.as_bytes());
+        catalogue_entry(&mut certificates, &mut positions, certificate, places, same);
+    }
+    // A certificate inside a response is where that response is, and also
+    // wherever the document carries it otherwise: one object, every place.
     let responses = &parsed.sources[parsed.crls.len()..];
     for (response, der) in parsed.responses.iter().zip(responses) {
         for certificate in response.certificates() {
-            certificates.push(certificate);
-            positions.push(position(der));
+            catalogue_entry(
+                &mut certificates,
+                &mut positions,
+                certificate,
+                position(der),
+                same,
+            );
         }
     }
     positions.extend(parsed.sources.iter().map(|der| position(der)));
@@ -1670,6 +1734,31 @@ fn catalogue<'a>(
         sources: parsed.sources.len(),
         positions,
     }
+}
+
+/// Adds `item`, carried at `places`, to the catalogued `entries` once: an
+/// entry `same` as one already there takes no object of its own, its places
+/// join that one's. Two objects for one certificate would let a record cite
+/// the copy no archive timestamp covers.
+pub(crate) fn catalogue_entry<T>(
+    entries: &mut Vec<T>,
+    positions: &mut Vec<Vec<usize>>,
+    item: T,
+    places: Vec<usize>,
+    same: impl Fn(&T, &T) -> bool,
+) {
+    let Some(index) = entries.iter().position(|known| same(known, &item)) else {
+        entries.push(item);
+        positions.push(places);
+        return;
+    };
+    let known = &mut positions[index];
+    for place in places {
+        if !known.contains(&place) {
+            known.push(place);
+        }
+    }
+    known.sort_unstable();
 }
 
 /// A completed ETSI decision in DSS's spelling.
@@ -1823,7 +1912,8 @@ impl<W: structured_asn1::memory::Work> TokenContext<'_, '_, '_, '_, '_, W> {
                     | TimestampRole::AllDataObjects
                     | TimestampRole::IndividualDataObjects
             ) {
-                let (current, past) = match self.token_outcomes(der, integrity, object, pasts) {
+                let checks = (integrity, facts.generated);
+                let (current, past) = match self.token_outcomes(der, checks, object, pasts) {
                     Ok(found) => found,
                     Err(error) => {
                         stopped.get_or_insert(error);
@@ -1879,7 +1969,8 @@ impl<W: structured_asn1::memory::Work> TokenContext<'_, '_, '_, '_, '_, W> {
                         .map(long_term::Covered::Direct),
                 );
             }
-            let (current, past) = match self.token_outcomes(der, integrity, object, pasts) {
+            let checks = (integrity, facts.generated);
+            let (current, past) = match self.token_outcomes(der, checks, object, pasts) {
                 Ok(found) => found,
                 Err(error) => {
                     stopped.get_or_insert(error);
@@ -1910,7 +2001,7 @@ impl<W: structured_asn1::memory::Work> TokenContext<'_, '_, '_, '_, '_, W> {
     fn token_outcomes(
         &self,
         der: &[u8],
-        integrity: TokenIntegrity,
+        (integrity, generated): (TokenIntegrity, i64),
         object: long_term::Object,
         pasts: &mut Vec<long_term::Past>,
     ) -> Result<(Option<long_term::Decision>, Option<usize>), String> {
@@ -1921,34 +2012,30 @@ impl<W: structured_asn1::memory::Work> TokenContext<'_, '_, '_, '_, '_, W> {
         if let Some(sub) = token_finding(integrity) {
             return Ok((Some(long_term::Decision::Finding(sub)), None));
         }
-        let current = if let Some(tsa) = tsa {
-            Some(long_term::Decision::from(authority_outcome(
-                self.session,
-                tsa,
-                self.parsed,
-                self.inputs,
-                self.now,
-                self.memory,
-            )?))
-        } else {
-            None
+        if !existed(generated, self.now) {
+            return Ok((None, None));
+        }
+        let Some(tsa) = tsa else {
+            return Ok((None, None));
         };
-        let past = match tsa {
-            Some(tsa) if current.is_some() => {
-                let history = path_facts(
-                    self.session,
-                    tsa,
-                    self.parsed,
-                    self.inputs,
-                    self.now,
-                    self.memory,
-                )?
-                .history;
-                pasts.push(long_term::past(object, tsa, &history, self.catalogue));
-                Some(pasts.len() - 1)
-            }
-            _ => None,
-        };
-        Ok((current, past))
+        // One assessment of the TSA's paths gives both the current decision
+        // and the historical chains.
+        let paths = path_facts(
+            self.session,
+            tsa,
+            self.parsed,
+            self.inputs,
+            self.now,
+            self.memory,
+        )?;
+        let current = long_term::Decision::from(authority_decision(
+            &paths,
+            tsa,
+            self.inputs,
+            self.now,
+            self.memory,
+        )?);
+        pasts.push(long_term::past(object, tsa, &paths.history, self.catalogue));
+        Ok((Some(current), Some(pasts.len() - 1)))
     }
 }

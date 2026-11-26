@@ -44,6 +44,7 @@ fn a_rejected_token_keeps_its_cause_in_the_etsi_finding() {
     use xml_sec_xades::TokenIntegrity;
     for (integrity, sub) in [
         (TokenIntegrity::ImprintMismatch, SubIndication::HashFailure),
+        (TokenIntegrity::ContentMismatch, SubIndication::HashFailure),
         (
             TokenIntegrity::SignatureInvalid,
             SubIndication::SigCryptoFailure,
@@ -57,6 +58,55 @@ fn a_rejected_token_keeps_its_cause_in_the_etsi_finding() {
         );
     }
     assert_eq!(super::etsi::token_finding(TokenIntegrity::Intact), None);
+}
+
+#[test]
+fn the_probe_reports_each_cause_of_a_corrupted_token() {
+    // The probe's own token rows carry the cause check_tokens established:
+    // TSA signature bytes altered are a cryptographic failure, a TSTInfo
+    // altered under its messageDigest a hash failure (EN 319 102-1 V1.4.1
+    // clause 5.2.7), not a dropped or merged result.
+    use structured_base64::STANDARD;
+    let open = "<xades:EncapsulatedTimeStamp>";
+    let start = B_T.find(open).expect("a token") + open.len();
+    let value = &B_T[start..start + B_T[start..].find('<').expect("token end")];
+    let signature = B_T.replacen("ADozW5ea", "ADozX5ea", 1);
+    assert_ne!(signature, B_T, "the TSA signature changed");
+    let mut der = STANDARD.decode(value.as_bytes()).expect("base64");
+    let time = der
+        .windows(2)
+        .position(|pair| pair == [0x18, 0x0f])
+        .expect("the TSTInfo genTime");
+    der[time + 15] = if der[time + 15] == b'0' { b'1' } else { b'0' };
+    let content = B_T.replace(value, &STANDARD.encode(&der).expect("test encoding"));
+    let directory =
+        std::env::temp_dir().join(format!("xml-sec-probe-tokens-{}", std::process::id()));
+    let anchors = directory.join("anchors");
+    std::fs::create_dir_all(&anchors).unwrap();
+    std::fs::write(
+        anchors.join("0.der"),
+        include_bytes!("../../tests/fixtures/levels/root.der"),
+    )
+    .unwrap();
+    for (name, xml, sub) in [
+        ("signature.xml", signature, "SIG_CRYPTO_FAILURE"),
+        ("content.xml", content, "HASH_FAILURE"),
+    ] {
+        let path = directory.join(name);
+        std::fs::write(&path, xml).unwrap();
+        let facts = super::facts(
+            path.to_str().unwrap(),
+            &anchors,
+            1_800_000_000,
+            xml_sec::policy::PolicyProfile::Xades,
+        )
+        .unwrap();
+        assert_eq!(
+            facts["signatures"][0]["timestamps"][0]["current"]["sub"], sub,
+            "{name}: {facts}"
+        );
+    }
+    std::fs::remove_dir_all(&directory).unwrap();
 }
 
 #[test]
@@ -622,6 +672,77 @@ fn a_signing_time_counts_only_when_the_signature_signs_it() {
     // Whitespace between the pointer's tokens, as the verifier admits it.
     let spaced = CLAIMS.replace("URI=\"#props\"", "URI=\"#xpointer( id ( 'props' ) )\"");
     assert_eq!(declarations(&spaced)[0].signing_time, Some(1_577_836_800));
+}
+
+#[test]
+fn a_reference_whose_transform_may_cut_the_claims_signs_none_of_them() {
+    // A reference signs its output after the transforms (XMLDSig 1.1
+    // section 4.4.3.2): an XPath transform may leave SigningTime and the
+    // signing certificate references out, so naming SignedProperties
+    // through it claims neither; canonicalization keeps them.
+    let reference =
+        "<ds:Reference URI=\"#props\" Type=\"http://uri.etsi.org/01903#SignedProperties\"/>";
+    let transformed = |algorithm: &str| {
+        CLAIMS.replace(
+            reference,
+            &format!(
+                "<ds:Reference URI=\"#props\" Type=\"http://uri.etsi.org/01903#SignedProperties\"><ds:Transforms><ds:Transform Algorithm=\"{algorithm}\"/></ds:Transforms></ds:Reference>"
+            ),
+        )
+    };
+    let filtered = transformed("http://www.w3.org/TR/1999/REC-xpath-19991116");
+    assert_ne!(filtered, CLAIMS);
+    let found = declarations(&filtered);
+    assert_eq!(found[0].signing_time, None);
+    assert_eq!(found[0].certificate_references.len(), 0);
+    let canonical = transformed("http://www.w3.org/2001/10/xml-exc-c14n#");
+    assert_eq!(
+        declarations(&canonical)[0].signing_time,
+        Some(1_577_836_800)
+    );
+}
+
+#[test]
+fn a_certificate_carried_twice_is_one_catalogued_object_at_both_places() {
+    // A responder certificate after an archive timestamp and again inside an
+    // OCSP response before it is one object: the record it signs cites that
+    // object, which the copy inside the imprint covers.
+    let mut entries: Vec<&[u8]> = Vec::new();
+    let mut positions = Vec::new();
+    let same = |one: &&[u8], other: &&[u8]| one == other;
+    super::etsi::catalogue_entry(&mut entries, &mut positions, b"responder", vec![40], same);
+    super::etsi::catalogue_entry(&mut entries, &mut positions, b"anchor", Vec::new(), same);
+    super::etsi::catalogue_entry(&mut entries, &mut positions, b"responder", vec![12], same);
+    assert_eq!(entries, [&b"responder"[..], &b"anchor"[..]]);
+    assert_eq!(positions, [vec![12, 40], Vec::new()]);
+    let covered: Vec<usize> =
+        super::etsi::long_term::archived_within(&positions, entries.len(), &[(0, 20)]).collect();
+    assert_eq!(covered, [0]);
+}
+
+#[test]
+fn a_token_generated_after_the_validation_time_did_not_exist_then() {
+    // A token's own checks leave its generation time to the caller: one
+    // generated after the validation time is not evaluated at it and proves
+    // no existence, while one generated at or before it is.
+    let now = super::etsi::instant(1_000);
+    assert!(super::etsi::existed(1_000, now));
+    assert!(super::etsi::existed(999, now));
+    assert!(!super::etsi::existed(1_001, now));
+}
+
+#[test]
+fn a_whitespace_spelled_root_pointer_names_the_whole_document() {
+    // The verifier resolves `xpointer( / )` as the whole document, so the
+    // probe reads it as the root, not as an id() pointer that names nothing.
+    assert!(matches!(
+        super::uri_target("#xpointer( / )"),
+        Some(super::Target::Root)
+    ));
+    assert!(matches!(
+        super::uri_target("#xpointer(/)"),
+        Some(super::Target::Root)
+    ));
 }
 
 #[test]

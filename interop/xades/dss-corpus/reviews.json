@@ -810,7 +810,7 @@
             "CV": "PASSED/pass",
             "XCV": "PASSED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "SAV": "PASSED/pass",
-            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND",
+            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/not-reached",
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           },
           {
@@ -1007,7 +1007,7 @@
             "CV": "PASSED/pass",
             "XCV": "PASSED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "SAV": "PASSED/pass",
-            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/not-reached",
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ]
@@ -1144,7 +1144,7 @@
             "CV": "PASSED/pass",
             "XCV": "PASSED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "SAV": "PASSED/pass",
-            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND",
+            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/not-reached",
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           },
           {
@@ -1206,7 +1206,7 @@
             "CV": "PASSED/pass",
             "XCV": "PASSED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "SAV": "PASSED/pass",
-            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND",
+            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/not-reached",
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           },
           {
@@ -1363,7 +1363,7 @@
             "CV": "PASSED/pass",
             "XCV": "PASSED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND",
+            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/not-reached",
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           },
           {
@@ -1529,7 +1529,7 @@
             "CV": "PASSED/pass",
             "XCV": "PASSED/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "SAV": "PASSED/pass",
-            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
+            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/not-reached",
             "OVERALL": "TOTAL_PASSED:-/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ]
@@ -4015,7 +4015,7 @@
             "CV": "PASSED/not-reached",
             "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND",
+            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/not-reached",
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
@@ -4035,7 +4035,7 @@
             "CV": "PASSED/not-reached",
             "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND",
+            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/not-reached",
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ]
@@ -4097,7 +4097,7 @@
             "CV": "PASSED/not-reached",
             "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND",
+            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/not-reached",
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
@@ -4117,7 +4117,7 @@
             "CV": "PASSED/not-reached",
             "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND",
+            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/not-reached",
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ]
@@ -4179,7 +4179,7 @@
             "CV": "PASSED/not-reached",
             "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND",
+            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/not-reached",
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
@@ -4199,7 +4199,7 @@
             "CV": "PASSED/not-reached",
             "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND",
+            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/not-reached",
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ]
@@ -4343,7 +4343,7 @@
             "CV": "PASSED/not-reached",
             "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND",
+            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/not-reached",
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ],
@@ -4363,7 +4363,7 @@
             "CV": "PASSED/not-reached",
             "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "SAV": "PASSED/not-reached",
-            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND",
+            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/not-reached",
             "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
           }
         ]
@@ -4512,26 +4512,6 @@
       ],
       "class": "normative-difference",
       "reason": "Both validators conclude INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE and their X.509 blocks agree. The signature timestamp's TSA certificate is expired at the fixed instant, and its only revocation status the document carries was issued before that expiry. EN 319 102-1 V1.4.1 section 5.2.6.4 step 7 returns OUT_OF_BOUNDS_NOT_REVOKED only on a status issued after the expiry (NOTE 8), so xml-sec concludes that token OUT_OF_BOUNDS_NO_POE where DSS takes the earlier status and reports OUT_OF_BOUNDS_NOT_REVOKED."
-    },
-    {
-      "overall": [
-        "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
-      ],
-      "observed": [
-        [
-          {
-            "FC": "PASSED/not-reached",
-            "ISC": "PASSED/not-reached",
-            "CV": "PASSED/not-reached",
-            "XCV": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
-            "SAV": "INDETERMINATE:SIG_CONSTRAINTS_FAILURE/not-reached",
-            "TIMESTAMPS": "INDETERMINATE:NO_CERTIFICATE_CHAIN_FOUND/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE",
-            "OVERALL": "INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE/INDETERMINATE:CERTIFICATE_CHAIN_GENERAL_FAILURE"
-          }
-        ]
-      ],
-      "class": "normative-difference",
-      "reason": "Both validators conclude INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE at the claimed signing time and their X.509 blocks agree. Every revocation status the document carries for the signature timestamp's TSA was issued after that time; xml-sec's validation takes the statuses issued by the validation time (RFC 5280 section 6.3, EN 319 102-1 V1.4.1 section 5.2.6.4 step 4) and concludes that token CERTIFICATE_CHAIN_GENERAL_FAILURE (step 4 e)). DSS takes the later status and passes it, and reports the archive timestamp, whose authority's chain ends at no anchor of the comparison, NO_CERTIFICATE_CHAIN_FOUND, which xml-sec also finds for it."
     }
   ],
   "dss-xades/src/test/resources/validation/xades-extended-xl.xml": [
@@ -4680,6 +4660,28 @@
       ],
       "class": "policy-refusal",
       "reason": "At the claimed signing time the signing certificate, the comparison's only trust anchor, is within its validity, but this profile does not trust it directly (EN 319 102-1 V1.4.1 section 5.2.6.4 step 1 b) is the policy's to accept), and the signature's other key source, its KeyValue, is one the profile disables as untrusted key material. The profile refuses the signature, which is signature acceptance (section 5.2.8). DSS trusts the anchor directly and passes, as the xades-conformant profile does."
+    }
+  ],
+  "dss-xades/src/test/resources/sample-saml-assertion.xml": [
+    {
+      "overall": [
+        "absent:-/INDETERMINATE:NO_SIGNING_CERTIFICATE_FOUND"
+      ],
+      "observed": [
+        [
+          {
+            "FC": "absent/not-reached",
+            "ISC": "absent/INDETERMINATE:NO_SIGNING_CERTIFICATE_FOUND",
+            "CV": "absent/not-reached",
+            "XCV": "absent/not-reached",
+            "SAV": "absent/not-reached",
+            "TIMESTAMPS": "absent/none",
+            "OVERALL": "absent:-/INDETERMINATE:NO_SIGNING_CERTIFICATE_FOUND"
+          }
+        ]
+      ],
+      "class": "normative-difference",
+      "reason": "The input is a SAML assertion signed with plain XMLDSig: its ds:Signature carries no XAdES QualifyingProperties (EN 319 132-1 V1.3.1 clause 4.3), so DSS's XAdES validator reports no signature. xml-sec reads the ds:Signature and, with no anchor the document carries for its certificate, finds no signing certificate (EN 319 102-1 V1.4.1 clause 5.2.3). Neither validates an AdES signature."
     }
   ]
 }

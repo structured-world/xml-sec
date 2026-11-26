@@ -16,6 +16,7 @@ use structured_cms::timestamp::{
     CheckContext, CheckedTimestamp, ImprintAgreement, IntervalError, PolicyAccuracy,
     TokenExtension, TokenSignature, interval_in,
 };
+use structured_cms::verify::ContentAgreement;
 use structured_ltv::baseline::{self as composed, LongTerm, Timed};
 use structured_ltv::credential::Authentication;
 use structured_ltv::material::Coverage;
@@ -478,6 +479,8 @@ pub(crate) enum Refusal {
     Imprint,
     /// The imprint binds and the signer's key does not verify the token.
     Signature,
+    /// The token's content does not match its signed `messageDigest`.
+    Content,
     /// Another profile fact of the token did not hold.
     Profile,
 }
@@ -488,7 +491,15 @@ fn refusal(checked: &CheckedTimestamp<'_>) -> Refusal {
     if matches!(checked.imprint, ImprintAgreement::Differs) {
         return Refusal::Imprint;
     }
+    // A content that does not match its messageDigest leaves no signature
+    // answer (RFC 5652 5.4): a hash failure of the token, not of its
+    // signature.
     match &checked.signature {
+        TokenSignature::Checked(signer)
+            if matches!(signer.content(), ContentAgreement::Differs) =>
+        {
+            Refusal::Content
+        }
         TokenSignature::Checked(signer) if signer.signature() != Some(SignatureAnswer::Valid) => {
             Refusal::Signature
         }
@@ -509,7 +520,7 @@ impl<'p, 't, W: Work> OwnCheck<'p, 't, '_, '_, '_, '_, W> {
             .checked(cms, ordinal)?
             .map_err(|refusal| match refusal {
                 Refusal::MissingSigner => TimestampFailure::MissingSigner,
-                Refusal::Imprint | Refusal::Signature | Refusal::Profile => {
+                Refusal::Imprint | Refusal::Signature | Refusal::Content | Refusal::Profile => {
                     TimestampFailure::Rejected
                 }
             }))

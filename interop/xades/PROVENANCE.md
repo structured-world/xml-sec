@@ -24,9 +24,10 @@ construction inputs are retained; unrelated output from the broader baseline gen
 is excluded. The `expected-*.bin` files are independently captured libxmlsec1 vectors,
 never Rust outputs. Every retained vector is checked against fresh execution in CI.
 The `*expectations.json` files record the observed behavior of the DSS release current when
-they were reviewed, including known disagreements with the normative profile; every run
-compares the current release with them, so a change in a new release fails the check
-instead of passing unnoticed.
+they were reviewed, including known disagreements with the normative profile; every check
+run compares the current release with them, so a change in a new release fails the check
+instead of passing unnoticed. A `--record` run writes new expectations instead and
+compares nothing, so it does not detect such a change.
 Actual Rust/replay bytes, computed comparisons, tool/dependency snapshots, full DSS
 reports, stdout/stderr, build logs and command captures remain run artifacts, excluded
 from Git and the distributable bundle.

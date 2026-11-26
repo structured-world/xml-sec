@@ -41,6 +41,10 @@ pub enum TokenIntegrity {
     /// The imprint binds, and the named signer's key does not verify the
     /// token's signature (clause 5.2.7: a signature failure).
     SignatureInvalid,
+    /// The imprint binds, and the token's own content does not match the
+    /// `messageDigest` its signer signed (RFC 5652 5.4; clause 5.2.7: a hash
+    /// failure of the token itself, before any signature arithmetic).
+    ContentMismatch,
     /// Another of the token's profile facts did not hold.
     Rejected,
     /// No available certificate is the one the token names as its signer.
@@ -175,6 +179,7 @@ pub fn check_tokens<W: structured_asn1::memory::Work, R>(
                                 Err(Refusal::MissingSigner) => TokenIntegrity::MissingSigner,
                                 Err(Refusal::Imprint) => TokenIntegrity::ImprintMismatch,
                                 Err(Refusal::Signature) => TokenIntegrity::SignatureInvalid,
+                                Err(Refusal::Content) => TokenIntegrity::ContentMismatch,
                                 Err(Refusal::Profile) => TokenIntegrity::Rejected,
                             };
                             results

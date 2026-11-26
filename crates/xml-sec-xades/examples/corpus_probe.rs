@@ -584,15 +584,14 @@ fn span(node: roxmltree::Node<'_, '_>) -> (usize, usize) {
 /// `ds:Object`s other than the one holding its `QualifyingProperties`; and
 /// each unsigned signature property before `property`. Another signature's
 /// validation data is covered only as part of a referenced data object.
-fn archive_coverage(
-    signature: roxmltree::Node<'_, '_>,
-    property: roxmltree::Node<'_, '_>,
-) -> Vec<(usize, usize)> {
-    // The reference output after its transforms is what the imprint reads
-    // (EN 319 132-1 section 5.5.2.3). Canonicalization keeps every element
-    // of its input and the enveloped-signature transform drops only this
-    // signature; any other transform (XPath, Base64, XSLT, ...) may drop
-    // values, so its reference establishes no coverage at all.
+/// Whether the transforms of `reference` keep every element of the subtree
+/// its URI names, but for the signature that holds it. A reference signs its
+/// output after the transforms (`XMLDSig` 1.1 section 4.4.3.2, EN 319 132-1
+/// section 5.5.2.3 for an archive imprint): canonicalization keeps every
+/// element of its input and the enveloped-signature transform drops only the
+/// enclosing signature; any other transform (`XPath`, Base64, XSLT, ...) may
+/// drop nodes, so its reference establishes no coverage of a named node.
+fn preserves_target(reference: roxmltree::Node<'_, '_>) -> bool {
     const PRESERVING: [&str; 7] = [
         "http://www.w3.org/2000/09/xmldsig#enveloped-signature",
         "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
@@ -602,6 +601,22 @@ fn archive_coverage(
         "http://www.w3.org/2001/10/xml-exc-c14n#",
         "http://www.w3.org/2001/10/xml-exc-c14n#WithComments",
     ];
+    reference
+        .children()
+        .filter(|transforms| is_ds_element(transforms, "Transforms"))
+        .flat_map(|transforms| transforms.children())
+        .filter(|transform| is_ds_element(transform, "Transform"))
+        .all(|transform| {
+            transform
+                .attribute("Algorithm")
+                .is_some_and(|algorithm| PRESERVING.contains(&algorithm))
+        })
+}
+
+fn archive_coverage(
+    signature: roxmltree::Node<'_, '_>,
+    property: roxmltree::Node<'_, '_>,
+) -> Vec<(usize, usize)> {
     let document = signature.document();
     let (signature_first, signature_last) = span(signature);
     let qualifying = qualifying_properties(signature);
@@ -612,22 +627,12 @@ fn archive_coverage(
         .flat_map(|info| info.children())
         .filter(|reference| is_ds_element(reference, "Reference"));
     for reference in references {
-        let preserving = reference
-            .children()
-            .filter(|transforms| is_ds_element(transforms, "Transforms"))
-            .flat_map(|transforms| transforms.children())
-            .filter(|transform| is_ds_element(transform, "Transform"))
-            .all(|transform| {
-                transform
-                    .attribute("Algorithm")
-                    .is_some_and(|algorithm| PRESERVING.contains(&algorithm))
-            });
+        if !preserves_target(reference) {
+            continue;
+        }
         let Some(target) = reference.attribute("URI").and_then(uri_target) else {
             continue;
         };
-        if !preserving {
-            continue;
-        }
         let named = match target {
             Target::Root => Some(document.root_element()),
             Target::Id(id) => document.descendants().find(|node| {
@@ -712,14 +717,15 @@ fn signed_claims(signature: roxmltree::Node<'_, '_>, declared: &mut etsi::Declar
         return;
     };
     // The properties are signed only when a reference of the signature's own
-    // SignedInfo names them (EN 319 132-1 section 4.3.2); an unreferenced
-    // SignedProperties claims nothing the signature protects.
+    // SignedInfo names them (EN 319 132-1 section 4.3.2) and its transforms
+    // keep them whole: an unreferenced SignedProperties, or one a transform
+    // may cut the claims out of, claims nothing the signature protects.
     let covered = properties.attribute("Id").is_some_and(|id| {
         signature
             .children()
             .filter(|info| ds(info, "SignedInfo"))
             .flat_map(|info| info.children())
-            .filter(|reference| ds(reference, "Reference"))
+            .filter(|reference| ds(reference, "Reference") && preserves_target(*reference))
             .filter_map(|reference| reference.attribute("URI"))
             .filter_map(uri_target)
             .any(|target| target == Target::Id(id.to_owned()))
@@ -952,16 +958,14 @@ fn targets(text: &str) -> Vec<Target> {
 /// element of an ID in either the bare-name or the `XPointer` `id()` form;
 /// none for any other URI or a malformed escape.
 fn uri_target(uri: &str) -> Option<Target> {
-    if matches!(uri, "" | "#xpointer(/)") {
+    if uri.is_empty() {
         return Some(Target::Root);
     }
     let fragment = uri.strip_prefix('#').and_then(unescaped)?;
-    if fragment == "xpointer(/)" {
-        return Some(Target::Root);
-    }
     // The verifier reverses the scheme data's `^` escapes (XPointer Framework
-    // section 3.1) before it reads the id() pointer with its own grammar,
-    // whitespace between the tokens included; the probe reads it alike.
+    // section 3.1) before it reads the root or id() pointer with its own
+    // grammar, whitespace between the tokens included; the probe reads it
+    // alike.
     if fragment.starts_with("xpointer(") {
         let mut literal = String::with_capacity(fragment.len());
         let mut characters = fragment.chars();
@@ -971,6 +975,9 @@ fn uri_target(uri: &str) -> Option<Target> {
             } else {
                 Some(character)
             });
+        }
+        if xml_sec::xmldsig::uri::is_xpointer_root(&literal) {
+            return Some(Target::Root);
         }
         let id = xml_sec::xmldsig::uri::parse_xpointer_id_fragment(&literal)?;
         return Some(Target::Id(id.to_owned()));

@@ -1472,7 +1472,22 @@ fn has_encoded_xpointer_prefix(fragment: &str) -> bool {
     true
 }
 
-fn is_xpointer_root(fragment: &str) -> bool {
+/// Whether a same-document fragment is the `xpointer(/)` whole-document
+/// pointer as verification resolves it, whitespace around the `/` included.
+/// Callers that classify `Reference` URIs outside verification use it to read
+/// them the same way.
+///
+/// # Examples
+///
+/// ```
+/// use xml_sec::xmldsig::uri::is_xpointer_root;
+///
+/// assert!(is_xpointer_root("xpointer(/)"));
+/// assert!(is_xpointer_root("xpointer( / )"));
+/// assert!(!is_xpointer_root("xpointer(id('props'))"));
+/// ```
+#[must_use]
+pub fn is_xpointer_root(fragment: &str) -> bool {
     fragment
         .strip_prefix("xpointer(")
         .and_then(|value| value.strip_suffix(')'))

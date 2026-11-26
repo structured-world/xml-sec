@@ -326,7 +326,9 @@ fn the_timestamps_block_reads_every_token_of_the_signature() {
     // validation-data ones included; a B-T result alone would pass a
     // signature whose archive token failed.
     let mut facts = verified();
-    facts["timestamps"] = json!([token(Some("PASSED")), token(Some("INDETERMINATE"))]);
+    let mut archive = token(Some("INDETERMINATE"));
+    archive["role"] = "Archive".into();
+    facts["timestamps"] = json!([token(Some("PASSED")), archive]);
     assert_eq!(our_blocks(&facts)["TIMESTAMPS"]["verdict"], "INDETERMINATE");
     // FAILED is the worse conclusion, wherever its token is.
     facts["timestamps"] = json!([token(Some("INDETERMINATE")), token(Some("FAILED"))]);
@@ -420,8 +422,57 @@ fn an_unmatched_or_missing_signature_never_counts_as_agreement() {
     // reported none: the input is not one.
     assert_eq!(automatic_class(&compare(&[], &[]), 0), "not-a-signature");
     // A document without a chain to anchor is classified as such.
-    let agreeing = compare(&signatures, &[verified()]);
+    let mut facts = verified();
+    facts["verification"]["trust"] = "Unknown".into();
+    facts["etsi"] = json!({ "indication": "INDETERMINATE", "sub": "TRY_LATER" });
+    let agreeing = compare(&signatures[..1], &[facts]);
+    assert_eq!(automatic_class(&agreeing, 1), "agreement");
     assert_eq!(automatic_class(&agreeing, 0), "no-usable-anchor");
+}
+
+#[test]
+fn a_missing_anchor_does_not_exempt_a_difference_from_review() {
+    // No anchor explains a shared refusal of the signer's path, not one
+    // validator reading a signature the other does not: that difference
+    // still needs a review.
+    let signatures = dss_signatures(DIAGNOSTIC, DETAILED, SIMPLE).unwrap();
+    let mut other = verified();
+    other["id"] = json!("elsewhere");
+    let rows = compare(&signatures[..1], &[other]);
+    assert_eq!(automatic_class(&rows, 0), "unreviewed");
+}
+
+#[test]
+fn reviews_are_read_only_when_present_and_an_object() {
+    // A missing file is an empty review set; an unreadable one is an error,
+    // never an empty set that would record expectations without the
+    // committed approvals; a top-level value other than an object is refused
+    // before a review indexes into it.
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("reviews.json");
+    assert_eq!(super::read_reviews(&path).unwrap(), json!({}));
+    std::fs::write(&path, "[]").unwrap();
+    let refused = super::read_reviews(&path).unwrap_err();
+    assert!(refused.contains("reviews.json"), "{refused}");
+    std::fs::write(&path, "{}").unwrap();
+    assert_eq!(super::read_reviews(&path).unwrap(), json!({}));
+    // A path whose parent is a file cannot be read: an error, not absence.
+    let below_file = path.join("reviews.json");
+    assert!(super::read_reviews(&below_file).is_err());
+}
+
+#[test]
+fn a_result_directory_name_stays_within_one_path_component() {
+    // ext4 and APFS limit one component to 255 bytes; a long corpus path
+    // still maps to a bounded name, distinct for distinct paths, and a
+    // short one keeps its reversible spelling.
+    let long = format!("dss-xades/src/test/resources/{}.xml", "a".repeat(240));
+    let other = format!("dss-xades/src/test/resources/{}b.xml", "a".repeat(239));
+    let (first, second) = (super::slug(&long), super::slug(&other));
+    assert!(first.len() <= 255, "{}", first.len());
+    assert!(second.len() <= 255, "{}", second.len());
+    assert_ne!(first, second);
+    assert_eq!(super::slug("dir/a_b.xml"), "dir_sa_ub.xml");
 }
 
 #[test]
@@ -746,6 +797,30 @@ fn each_signature_is_compared_at_its_own_claimed_time() {
     assert_eq!(facts["signatures"][1]["etsi"]["indication"], "TOTAL_PASSED");
     assert_eq!(super::time_run(0), "signing-time");
     assert_eq!(super::time_run(1), "signing-time-2");
+}
+
+#[test]
+fn a_signature_without_a_claimed_time_is_left_out_of_the_signing_time_pass() {
+    // The pass validates each signature at its own claimed time; one that
+    // claims none has no such time, so its result at another signature's
+    // claim is not compared or counted.
+    let facts = json!({ "signatures": [
+        { "id": "A", "etsi": { "indication": "TOTAL_PASSED" } },
+        { "id": "B", "etsi": { "indication": "TOTAL_PASSED" } },
+    ] });
+    let ours = facts["signatures"].as_array().unwrap().clone();
+    let rows = compare(
+        &[
+            theirs(Some("A"), "TOTAL_PASSED"),
+            theirs(Some("B"), "TOTAL_PASSED"),
+        ],
+        &ours,
+    );
+    let claimed = super::claimed_times(&json!({ "signing_times": [2019, null] }));
+    let times = super::distinct_times(&claimed);
+    let (rows, _) = super::per_signature(vec![(rows, facts)], &times, &claimed);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["position"], 0);
 }
 
 #[test]

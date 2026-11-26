@@ -67,12 +67,24 @@ fn reviews_path(corpus: &Corpus) -> PathBuf {
     corpus.package().join("dss-corpus/reviews.json")
 }
 
-/// The reviews of differences, by input; none when the file is absent.
+/// The reviews of differences, by input; none when the file is absent. Any
+/// other read failure is an error: an empty set in its place would record
+/// expectations without the committed approvals.
 fn read_reviews(path: &Path) -> Result<Value, String> {
-    if !path.exists() {
-        return Ok(json!({}));
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(json!({})),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    let reviews: Value =
+        serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
+    if !reviews.is_object() {
+        return Err(format!(
+            "{}: the reviews are not an object of inputs",
+            path.display()
+        ));
     }
-    serde_json::from_str(&xml::read(path)?).map_err(|error| format!("{}: {error}", path.display()))
+    Ok(reviews)
 }
 
 /// The overall comparison of each signature of one pass's observation.
@@ -254,9 +266,13 @@ pub(crate) fn not_xml(files: &[String]) -> Value {
     )
 }
 
-/// A directory name for an input path, distinct for distinct paths: `_` is
-/// escaped before the separators take its place, so the encoding reverses.
+/// A directory name for an input path, distinct for distinct paths and one
+/// path component long: `_` is escaped before the separators take its place,
+/// so the encoding reverses; a name over the 255 bytes a component may hold
+/// (ext4, APFS) keeps a prefix and ends in `_h` and the SHA-256 of the whole
+/// path, a suffix the escaping never produces, so the two forms never meet.
 pub(crate) fn slug(input: &str) -> String {
+    const COMPONENT: usize = 255;
     let mut name = String::with_capacity(input.len());
     for character in input.chars() {
         match character {
@@ -266,6 +282,17 @@ pub(crate) fn slug(input: &str) -> String {
             other => name.push(other),
         }
     }
+    if name.len() <= COMPONENT {
+        return name;
+    }
+    let digest = crate::security_corpus::sha256(input.as_bytes());
+    let mut cut = COMPONENT - 2 - digest.len();
+    while !name.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    name.truncate(cut);
+    name.push_str("_h");
+    name.push_str(&digest);
     name
 }
 
@@ -783,16 +810,13 @@ pub(crate) fn observed(rows: &[Value]) -> Value {
 
 /// The class a comparison takes without review: every signature reaches
 /// DSS's overall indication and sub-indication and agrees on every building
-/// block both validators reached, neither side found a signature, or the
-/// document carries no anchor. A block one side did not reach stays in the
+/// block both validators reached (`no-usable-anchor` when the document
+/// carries no anchor), or neither side found a signature. A block one side did not reach stays in the
 /// observation, which the check compares, but needs no review: xml-sec's
 /// facts stop at the first refusal where DSS goes on.
 pub(crate) fn automatic_class(rows: &[Value], anchors: u64) -> &'static str {
     if rows.is_empty() {
         return "not-a-signature";
-    }
-    if anchors == 0 {
-        return "no-usable-anchor";
     }
     let blocks_agree = rows.iter().all(|row| {
         BLOCKS.iter().all(|name| {
@@ -800,10 +824,12 @@ pub(crate) fn automatic_class(rows: &[Value], anchors: u64) -> &'static str {
             block["reached"] != true || block["agrees"] == true
         })
     });
-    if every_overall(rows, "agrees") && blocks_agree {
-        "agreement"
-    } else {
-        "unreviewed"
+    // A missing anchor explains a path both validators refuse, not a
+    // difference between them: one still needs a review.
+    match (every_overall(rows, "agrees") && blocks_agree, anchors) {
+        (false, _) => "unreviewed",
+        (true, 0) => "no-usable-anchor",
+        (true, _) => "agreement",
     }
 }
 
@@ -1212,8 +1238,8 @@ pub(crate) fn time_run(index: usize) -> String {
 
 /// The signing-time comparison of one input from its `runs`, one per
 /// [`distinct_times`] entry: each signature's row and facts come from the run
-/// at its own claimed time. A signature that claims none, or one only DSS
-/// reads, keeps the first run's. The first run's failures stand, and a later
+/// at its own claimed time. A signature that claims none is left out; one
+/// only DSS reads keeps the first run's. The first run's failures stand, and a later
 /// run's failure is added where the first has none.
 pub(crate) fn per_signature(
     mut runs: Vec<(Vec<Value>, Value)>,
@@ -1248,6 +1274,12 @@ pub(crate) fn per_signature(
             *row = own.clone();
         }
     }
+    // A signature xml-sec reads that claims no time has no run of its own:
+    // its result at another signature's claim is neither compared nor
+    // counted.
+    rows.retain(|row| {
+        position(row).is_none_or(|position| claimed.get(position).copied().flatten().is_some())
+    });
     if let Some(signatures) = facts["signatures"].as_array_mut() {
         for (position, signature) in signatures.iter_mut().enumerate() {
             if let Some((_, later_facts)) = run_of(position) {

@@ -48,7 +48,7 @@ pub(crate) fn manifests(metadata: &Value) -> Result<Vec<String>, String> {
     names.sort();
     let versions: std::collections::BTreeSet<Option<String>> = shared
         .iter()
-        .map(|package| field(package, "version"))
+        .map(|package| field(package, "version").map(|version| generation(&version)))
         .collect();
     let registry = shared.iter().all(|package| {
         field(package, "source").is_some_and(|source| source.starts_with("registry+"))
@@ -69,6 +69,18 @@ pub(crate) fn manifests(metadata: &Value) -> Result<Vec<String>, String> {
         }
     }
     Ok(manifests)
+}
+
+/// The compatibility generation of a version: its major, or major and minor
+/// below 1.0, which Cargo treats as compatible across patch releases (Cargo
+/// book, "`SemVer` Compatibility"); a pre-release stays part of its patch.
+fn generation(version: &str) -> String {
+    let mut parts = version.split('.');
+    match (parts.next(), parts.next()) {
+        (Some("0"), Some(minor)) => format!("0.{minor}"),
+        (Some(major), _) => major.to_owned(),
+        (None, _) => String::new(),
+    }
 }
 
 /// Whether `manifest` is `.../registry/src/<index>/<entry point>-<version>/Cargo.toml`.

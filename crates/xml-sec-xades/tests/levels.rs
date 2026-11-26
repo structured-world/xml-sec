@@ -262,6 +262,38 @@ fn a_token_over_other_input_is_an_imprint_mismatch() {
 }
 
 #[test]
+fn a_token_whose_content_differs_from_its_message_digest_is_a_content_mismatch() {
+    // A changed TSTInfo no longer matches the messageDigest signed attribute
+    // (RFC 5652 5.4): the token's own content fails its hash (EN 319 102-1
+    // V1.4.1 clause 5.2.7), and no signature arithmetic ran, so it is no
+    // signature failure. The first GeneralizedTime of the token is the
+    // TSTInfo genTime: the encapsulated content precedes the certificates
+    // and signer infos, whose times are UTCTime.
+    let value = token_value(B_T, 0);
+    let mut der = structured_base64::STANDARD
+        .decode(value.as_bytes())
+        .expect("base64");
+    let time = der
+        .windows(2)
+        .position(|pair| pair == [0x18, 0x0f])
+        .expect("the TSTInfo genTime");
+    let digit = time + 2 + 13;
+    der[digit] = if der[digit] == b'0' { b'1' } else { b'0' };
+    let xml = B_T.replace(
+        value,
+        &structured_base64::STANDARD
+            .encode(&der)
+            .expect("test encoding"),
+    );
+    assert_ne!(xml, B_T, "the token content changed");
+    let checked = integrities(&xml);
+    assert!(
+        matches!(&checked, Ok(Outcome::Assessed(found)) if found == &[TokenIntegrity::ContentMismatch]),
+        "{checked:?}"
+    );
+}
+
+#[test]
 fn a_token_stays_checkable_after_the_signers_certificate_expired() {
     // A token's own checks are its imprint over the verified signature and
     // its TSA's signature; long after every certificate of the signer's
