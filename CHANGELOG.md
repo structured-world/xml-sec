@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/structured-world/xml-sec/compare/v0.6.0...v0.7.0) - 2026-11-26
+
+### Added
+
+- *(policy)* [**breaking**] XAdES profile chain and policy denials ([#510](https://github.com/structured-world/xml-sec/pull/510))
+- *(policy)* [**breaking**] follow libxmlsec1 to f7e823e2 ([#503](https://github.com/structured-world/xml-sec/pull/503))
+- *(xmlsec1)* [**breaking**] xsPolicyRestrict and ChaCha20 ciphers in the C library ([#497](https://github.com/structured-world/xml-sec/pull/497))
+- *(xmlsec1)* [**breaking**] ML-KEM key transport and HMAC signatures in the C library ([#496](https://github.com/structured-world/xml-sec/pull/496))
+- *(xmlsec1)* [**breaking**] agree on keys in AgreementMethod ([#495](https://github.com/structured-world/xml-sec/pull/495))
+- *(xmlsec1)* derive DerivedKey keys in the encryption context ([#494](https://github.com/structured-world/xml-sec/pull/494))
+- *(xmldsig)* generate exclusive canonicalization, honour implicit one and declined recipients ([#488](https://github.com/structured-world/xml-sec/pull/488))
+- *(xmlsec1)* add the signature and encryption contexts ([#491](https://github.com/structured-world/xml-sec/pull/491))
+- *(xmlsec1)* classify the backend tier and C exclusions ([#483](https://github.com/structured-world/xml-sec/pull/483))
+- *(xmlsec1)* add the X.509 store and certificate key data ([#482](https://github.com/structured-world/xml-sec/pull/482))
+- *(xmldsig)* verify PTB digital calibration certificates by their rings ([#481](https://github.com/structured-world/xml-sec/pull/481))
+- *(xmldsig)* [**breaking**] follow upstream libxmlsec1 master's PQ, context and ML-KEM forms ([#478](https://github.com/structured-world/xml-sec/pull/478))
+- *(xmlsec1)* [**breaking**] follow upstream master on the libxmlsec1 C surface ([#468](https://github.com/structured-world/xml-sec/pull/468))
+- *(policy)* let a policy refuse to digest a Reference with no data ([#469](https://github.com/structured-world/xml-sec/pull/469))
+- *(tools)* build the libxmlsec1 oracle from upstream master by default ([#467](https://github.com/structured-world/xml-sec/pull/467))
+- *(xmlsec1)* add keys, KeyInfo, templates and signature transforms on the owned tree ([#466](https://github.com/structured-world/xml-sec/pull/466))
+- *(key-manager)* [**breaking**] import keys and edit trees on the shared primitives ([#463](https://github.com/structured-world/xml-sec/pull/463))
+- *(xmlsec1)* [**breaking**] own document tree for the libxmlsec1 surface, no libxml2 ([#454](https://github.com/structured-world/xml-sec/pull/454))
+- *(xmlsec1)* add error, I/O, library state and crypto table compatibility ([#450](https://github.com/structured-world/xml-sec/pull/450))
+- *(xmlsec1)* add the libxmlsec1 transform, key-data and extension ABI ([#448](https://github.com/structured-world/xml-sec/pull/448))
+- *(xmldsig)* [**breaking**] verify through the caller's provider alone ([#445](https://github.com/structured-world/xml-sec/pull/445))
+- *(libxml2)* operate on a caller's libxml2 document in place ([#444](https://github.com/structured-world/xml-sec/pull/444))
+- *(capi)* [**breaking**] add key lookup callbacks to verify and decrypt ([#438](https://github.com/structured-world/xml-sec/pull/438))
+- *(capi)* [**breaking**] add a clean C ABI over the policy-bound API ([#433](https://github.com/structured-world/xml-sec/pull/433))
+- *(policy)* [**breaking**] share policy snapshots and audit every operation ([#431](https://github.com/structured-world/xml-sec/pull/431))
+
+### Fixed
+
+- *(xmlsec1)* refuse content replacement between related nodes ([#476](https://github.com/structured-world/xml-sec/pull/476))
+- *(capi)* resolve lookup-supplied wrap and preset keys ([#442](https://github.com/structured-world/xml-sec/pull/442))
+- *(policy)* audit the OAEP digest and mask a key transport admits ([#436](https://github.com/structured-world/xml-sec/pull/436))
+
+### Performance
+
+- *(xmldsig)* verify each certificate signature once per operation ([#499](https://github.com/structured-world/xml-sec/pull/499))
+
 ## [0.6.0](https://github.com/structured-world/xml-sec/compare/v0.5.1...v0.6.0) - 2026-11-07
 
 ### Added
