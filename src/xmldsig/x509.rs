@@ -46,6 +46,9 @@ pub struct X509ChainOptions<'a> {
     /// `None` rejects PQ signatures; explicit permissions can select an exact
     /// allowlist or all provider-supported algorithms for compatibility.
     pub certificate_signature_algorithms: Option<&'a crate::policy::CertificateSignatureAlgorithms>,
+    /// When the issuing certificates of the path, the anchor included, must
+    /// be valid.
+    pub validity_model: crate::policy::CertificateValidityModel,
 }
 
 /// Certificate-chain validation failure.
@@ -895,7 +898,11 @@ fn validate_path_profile(
         }
     }
     let mut anchor_limit = None;
-    let at = options.verification_time;
+    // The anchor issued the certificate before it, unless it is the target.
+    let at = match decoded {
+        [.., subordinate, _] => super::pkix::issuer_time(subordinate, options, session)?,
+        _ => options.verification_time,
+    };
     for (position, cert) in decoded.iter().enumerate() {
         validate_positive_serial_bytes(
             cert.tbs().serial().as_bytes(),
@@ -2034,6 +2041,7 @@ mod tests {
             rsa_keys: RsaKeyPolicy::default(),
             dsa_keys: DsaKeyPolicy::default(),
             certificate_signature_algorithms: None,
+            validity_model: crate::policy::CertificateValidityModel::Shell,
         };
         let session = super::super::pkix::CertificateSession::new(&crate::policy::ResourcePolicy {
             max_x509_work: 0,
@@ -2190,6 +2198,7 @@ mod tests {
                 rsa_keys: RsaKeyPolicy::default(),
                 dsa_keys: DsaKeyPolicy::default(),
                 certificate_signature_algorithms: None,
+                validity_model: crate::policy::CertificateValidityModel::Shell,
             },
         )
     }
@@ -2238,6 +2247,7 @@ mod tests {
             rsa_keys: RsaKeyPolicy::default(),
             dsa_keys: DsaKeyPolicy::default(),
             certificate_signature_algorithms: None,
+            validity_model: crate::policy::CertificateValidityModel::Shell,
         };
         super::super::pkix::validate_supplied_path(
             &[&leaf],
@@ -2917,6 +2927,7 @@ mod tests {
             },
             utc_facts: None,
             certificate_signature_algorithms: None,
+            validity_model: crate::policy::CertificateValidityModel::Shell,
         };
 
         verify_x509_certificate_chain(&info, &options)
@@ -2948,6 +2959,7 @@ mod tests {
             dsa_keys: DsaKeyPolicy::default(),
             utc_facts: None,
             certificate_signature_algorithms: None,
+            validity_model: crate::policy::CertificateValidityModel::Shell,
         };
 
         assert!(matches!(

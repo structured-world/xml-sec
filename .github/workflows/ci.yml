@@ -687,6 +687,27 @@ jobs:
           path: ${{ runner.temp }}/xades-lifecycle-bench/lifecycle-bench.json
           if-no-files-found: error
           retention-days: 7
+      - name: Compare the EU DSS XAdES corpus with its reviewed classification
+        id: dss-corpus
+        run: cargo run --quiet -p xml-sec-tools -- xades dss-corpus --results "$RUNNER_TEMP/xades-dss-corpus"
+      # The summary exists once the comparison ran, a classification mismatch
+      # included; a run that stopped earlier, in setup, has only its logs.
+      - uses: actions/upload-artifact@v7
+        if: always() && steps.dss-corpus.outcome == 'success'
+        with:
+          name: xades-dss-corpus
+          path: ${{ runner.temp }}/xades-dss-corpus/summary.json
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@v7
+        if: always() && steps.dss-corpus.outcome == 'failure'
+        with:
+          name: xades-dss-corpus-failure
+          path: |
+            ${{ runner.temp }}/xades-dss-corpus
+            !${{ runner.temp }}/xades-dss-corpus/corpus-probe-build
+          if-no-files-found: error
+          retention-days: 7
       - name: Qualify XSLT engine, signature chains and failure contracts
         env:
           LIBXSLT_SOURCE_DIR: ${{ github.workspace }}/donors/libxslt

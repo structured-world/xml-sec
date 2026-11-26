@@ -330,6 +330,7 @@ fn options(trusted_certs: &[Vec<u8>], check_crls: bool) -> X509ChainOptions<'_> 
         rsa_keys: xml_sec::policy::RsaKeyPolicy::default(),
         dsa_keys: xml_sec::policy::DsaKeyPolicy::default(),
         certificate_signature_algorithms: None,
+        validity_model: xml_sec::policy::CertificateValidityModel::Shell,
     }
 }
 
@@ -1430,5 +1431,138 @@ fn same_name_ca_rollover_skips_crl_from_the_previous_key() {
     assert_eq!(
         verify_x509_certificate_chain(&info, &options(&anchors, true)),
         Err(X509ChainError::Revoked(0))
+    );
+}
+
+/// How a leaf issued in 2024 validates in 2026 when its intermediate was
+/// revoked for `reason` after issuing it, under `model`.
+fn validate_after_issuer_revocation(
+    reason: rcgen::RevocationReason,
+    model: xml_sec::policy::CertificateValidityModel,
+) -> Result<(), X509ChainError> {
+    let mut root_params = CertificateParams::new(Vec::new()).unwrap();
+    root_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "root");
+    root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    root_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let root =
+        rcgen::CertifiedIssuer::self_signed(root_params, KeyPair::generate().unwrap()).unwrap();
+    let mut intermediate_params = CertificateParams::new(Vec::new()).unwrap();
+    intermediate_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "intermediate");
+    intermediate_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    intermediate_params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+    intermediate_params.serial_number = Some(SerialNumber::from(42_u64));
+    let intermediate =
+        rcgen::CertifiedIssuer::signed_by(intermediate_params, KeyPair::generate().unwrap(), &root)
+            .unwrap();
+    let mut leaf_params = CertificateParams::new(Vec::new()).unwrap();
+    leaf_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "leaf");
+    leaf_params.not_before = date_time_ymd(2024, 1, 1);
+    let leaf = leaf_params
+        .signed_by(&KeyPair::generate().unwrap(), &intermediate)
+        .unwrap();
+    let crl = CertificateRevocationListParams {
+        this_update: date_time_ymd(2026, 3, 15),
+        next_update: date_time_ymd(2026, 4, 15),
+        crl_number: SerialNumber::from(1_u64),
+        issuing_distribution_point: None,
+        revoked_certs: vec![RevokedCertParams {
+            serial_number: SerialNumber::from(42_u64),
+            revocation_time: date_time_ymd(2026, 3, 16),
+            reason_code: Some(reason),
+            invalidity_date: None,
+        }],
+        key_identifier_method: KeyIdMethod::Sha256,
+    }
+    .signed_by(&root)
+    .unwrap();
+    let mut info = generated_info(vec![
+        leaf.der().to_vec(),
+        intermediate.der().to_vec(),
+        root.der().to_vec(),
+    ]);
+    info.crls.push(crl.der().to_vec());
+    let anchors = [root.der().to_vec()];
+    verify_x509_certificate_chain(
+        &info,
+        &X509ChainOptions {
+            validity_model: model,
+            ..options(&anchors, true)
+        },
+    )
+}
+
+#[test]
+fn the_chain_model_holds_the_anchor_to_its_issuance() {
+    // A root valid 2020 to 2025 issued an intermediate in 2020 that issued a
+    // leaf in 2024. In 2026 the shell model refuses the expired anchor; the
+    // chain model holds the anchor, as every issuer, to the time it issued.
+    use xml_sec::policy::CertificateValidityModel::{Chain, Shell};
+    let authority = |name: &str, to: i32| {
+        let mut params = CertificateParams::new(Vec::new()).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, name);
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+        params.not_before = date_time_ymd(2020, 1, 1);
+        params.not_after = date_time_ymd(to, 1, 1);
+        params
+    };
+    let root =
+        rcgen::CertifiedIssuer::self_signed(authority("root", 2025), KeyPair::generate().unwrap())
+            .unwrap();
+    let intermediate = rcgen::CertifiedIssuer::signed_by(
+        authority("intermediate", 2030),
+        KeyPair::generate().unwrap(),
+        &root,
+    )
+    .unwrap();
+    let mut leaf_params = CertificateParams::new(Vec::new()).unwrap();
+    leaf_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "leaf");
+    leaf_params.not_before = date_time_ymd(2024, 1, 1);
+    leaf_params.not_after = date_time_ymd(2028, 1, 1);
+    let leaf = leaf_params
+        .signed_by(&KeyPair::generate().unwrap(), &intermediate)
+        .unwrap();
+    let info = generated_info(vec![leaf.der().to_vec(), intermediate.der().to_vec()]);
+    let anchors = [root.der().to_vec()];
+    let under = |validity_model| {
+        verify_x509_certificate_chain(
+            &info,
+            &X509ChainOptions {
+                validity_model,
+                ..options(&anchors, false)
+            },
+        )
+    };
+    assert_eq!(under(Shell), Err(X509ChainError::CertificateNotValid(2)));
+    assert_eq!(under(Chain), Ok(()));
+}
+
+#[test]
+fn the_chain_model_keeps_an_issuance_before_a_non_compromise_revocation() {
+    // Common PKI v2.0 Part 9 6, as ETSI EN 319 102-1 V1.4.1 5.2.6.4 step 4
+    // invokes it: under the chain model an intermediate revoked after it
+    // issued the leaf still issued it validly, unless the reason (here a key
+    // compromise) puts that issuance in doubt. The shell model holds the
+    // intermediate to the validation time whatever the reason.
+    use rcgen::RevocationReason::{KeyCompromise, Superseded};
+    use xml_sec::policy::CertificateValidityModel::{Chain, Shell};
+    assert_eq!(validate_after_issuer_revocation(Superseded, Chain), Ok(()));
+    assert_eq!(
+        validate_after_issuer_revocation(KeyCompromise, Chain),
+        Err(X509ChainError::Revoked(1))
+    );
+    assert_eq!(
+        validate_after_issuer_revocation(Superseded, Shell),
+        Err(X509ChainError::Revoked(1))
     );
 }

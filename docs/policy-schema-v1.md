@@ -47,6 +47,7 @@ a disabled operation. Encryption tables require an encryption-enabled build.
 | `request_selections` | verify, sign | Table of arrays a request may select in place of the policy's value: `same_document_id_semantics` (`Specification`, `XmlSecBarename`, `XmlSecVisa3d`), `ecdsa_signature_value_encodings` (`XmlDsig`, `XmlSecAsn1Der`), `manifest_processing` (`Ignore`, `Process`). Layers intersect; fewer values is restrictive |
 | `detached_digest_attestation` | verify | `Forbidden`, `Accepted` |
 | `timestamp_token_encoding` | verify | `Declared`, `Ber` |
+| `xades_syntax` | verify | `En319132` (ETSI EN 319 132-1 only), `WithTs101903V122` (also ETSI TS 101 903 V1.2.2 qualifying properties and their `SignedProperties` reference type). `XadesConformant` reads both; the others, and every signature this library writes, use EN 319 132-1. V1.2.2 is read only where every layer reads it |
 | `hmac` | verify, sign | `minimum_key_bits`, `minimum_output_bits` (nonnegative integers) |
 | `uris` | all | Nested table below |
 | `transforms` | verify, sign, decrypt | Nested table below |
@@ -121,6 +122,18 @@ does not itself establish trust or supply a key.
 | `verification_time` | `"system"` or explicit timestamp below |
 | `unknown_x509_certificate` | `References`, `Libxmlsec1` |
 | `trust_anchor_signer` | `Validated`, `Accepted` |
+| `validity_model` | `Shell`, `Chain` |
+
+`validity_model` is the validity model ETSI EN 319 102-1 V1.4.1 5.2.6.4 step 4
+lets the X.509 validation constraints select. `Shell` (RFC 5280 6.1.3(a)(2))
+holds every certificate of the path, the configured anchor included, to the
+validation time. `Chain` (Common PKI v2.0 Part 9 section 6) holds each issuer,
+the anchor included, to the issuance of its subordinate: the subordinate's
+`DateOfCertGen` or, without it, its `notBefore`; a revocation of an issuer
+after that issuance counts only when its reason is unstated, a compromise or a
+hold. The signing certificate is held to the validation time under both. The
+models are incomparable, so layers must select the same one, and a change of
+either kind is reported as relaxing. Every profile selects `Shell`.
 
 `trust_anchor_signer` decides a signing certificate that is itself a
 configured trust anchor (ETSI EN 319 102-1 V1.4.1 5.2.6.4 step 1):

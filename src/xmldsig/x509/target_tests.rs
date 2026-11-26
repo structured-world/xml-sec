@@ -25,6 +25,7 @@ fn options(anchors: &[Vec<u8>], at: SystemTime) -> X509ChainOptions<'_> {
         rsa_keys: RsaKeyPolicy::default(),
         dsa_keys: DsaKeyPolicy::default(),
         certificate_signature_algorithms: None,
+        validity_model: crate::policy::CertificateValidityModel::Shell,
     }
 }
 

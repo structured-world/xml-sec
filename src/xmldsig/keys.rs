@@ -1455,6 +1455,7 @@ impl DefaultKeyResolver {
             rsa_keys: trust.rsa_keys,
             dsa_keys: trust.dsa_keys,
             certificate_signature_algorithms: trust.certificate_signature_algorithms.as_ref(),
+            validity_model: trust.validity_model,
         })
     }
 

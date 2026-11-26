@@ -252,21 +252,20 @@ pub(crate) fn execute(corpus: &Corpus, results: &Path) -> Result<(), String> {
         probe.extend(line(&[&fixtures.join(directory), &signed]));
         corpus.require(&probe, &results.join(example))?;
     }
-    super::dss::build(corpus, results)?;
-    let classpath = super::dss::classpath(corpus)?;
+    let classpath = super::dss::build(corpus, results)?.classpath;
     let mut summary = Vec::new();
     for case in &CASES {
         let reports = results.join(case.name);
-        let mut probe = line(&[
-            &"java",
-            &"-cp",
+        let mut probe = super::dss::java(
             &classpath,
-            &"LevelProbe",
-            &signed.join(format!("{}.xml", case.name)),
-            &fixtures.join(case.fixtures).join("root.der"),
-            &TIME,
-            &reports,
-        ]);
+            "LevelProbe",
+            &[
+                &signed.join(format!("{}.xml", case.name)),
+                &fixtures.join(case.fixtures).join("root.der"),
+                &TIME,
+                &reports,
+            ],
+        );
         match case.name {
             "detached" => probe.push(signed.join("detached.txt").into()),
             // The object its signed Manifest names.

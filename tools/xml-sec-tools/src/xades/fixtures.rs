@@ -397,6 +397,11 @@ impl Generator {
             .args(["--id-attr:Id", &format!("{DS}:Object")])
             .args(["--id-attr:Id", &format!("{DS}:SignatureValue")])
             .args(["--id-attr:Id", &format!("{SP}:SignedProperties")])
+            .args([
+                "--id-attr:Id",
+                "http://uri.etsi.org/01903/v1.2.2#:SignedProperties",
+            ])
+            .args(["--id-attr:Id", &format!("{DS}:KeyInfo")])
             .args(["--id-attr:Id", "Data", "--node-id", node, "--output"])
             .arg(result)
             .arg(input)
@@ -701,10 +706,11 @@ enum Set {
     Levels,
     Creation,
     Augmentation,
+    Ts101903,
 }
 
 pub(crate) fn run(corpus: &super::Corpus, args: &[String]) -> Result<(), crate::repo::Failure> {
-    let usage = "usage: xades fixtures [--levels | --creation | --augmentation] [--units N] [--output DIR] [--work DIR]";
+    let usage = "usage: xades fixtures [--levels | --creation | --augmentation | --ts101903] [--units N] [--output DIR] [--work DIR]";
     let mut output = None;
     let mut work = None;
     let mut set = Set::Baseline;
@@ -715,6 +721,7 @@ pub(crate) fn run(corpus: &super::Corpus, args: &[String]) -> Result<(), crate::
             "--levels" => Some(Set::Levels),
             "--creation" => Some(Set::Creation),
             "--augmentation" => Some(Set::Augmentation),
+            "--ts101903" => Some(Set::Ts101903),
             _ => None,
         };
         if let Some(selected) = selected {
@@ -742,6 +749,7 @@ pub(crate) fn run(corpus: &super::Corpus, args: &[String]) -> Result<(), crate::
     let output = output.unwrap_or_else(|| match set {
         Set::Creation => fixtures.join("creation"),
         Set::Augmentation => fixtures.join("augmentation"),
+        Set::Ts101903 => fixtures.join("ts101903"),
         Set::Baseline | Set::Levels => fixtures,
     });
     // Without --work the keys and templates are removed with the scratch directory.
@@ -759,6 +767,7 @@ pub(crate) fn run(corpus: &super::Corpus, args: &[String]) -> Result<(), crate::
         Set::Levels => super::levels::generate(corpus, &generator),
         Set::Creation => creation(&generator),
         Set::Augmentation => super::augmentation::generate(corpus, &generator),
+        Set::Ts101903 => super::ts101903::generate(&generator),
     }
     .map_err(Into::into)
 }
