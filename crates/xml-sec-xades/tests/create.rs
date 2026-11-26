@@ -14,7 +14,7 @@ use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
 use xml_sec::XmlDocument;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::document::{NodeIdentity, XmlDocumentError};
-use xml_sec::policy::{Instant, SigningPolicy, VerificationPolicy};
+use xml_sec::policy::{Instant, ManifestProcessing, SigningPolicy, VerificationPolicy};
 use xml_sec::xmldsig::extension;
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DigestAlgorithm, KeyInfoWriteError, KeyResolverConfig, ObjectContent,
@@ -23,8 +23,8 @@ use xml_sec::xmldsig::{
     with_verified_request,
 };
 use xml_sec_xades::{
-    Assessment, Countersignature, CreateError, DataObject, DraftError, Envelope, Outcome,
-    Placement, Prefixes, Request, Signer, countersign, create, validate_basic,
+    Assessment, Countersignature, CreateError, DataObject, DraftError, Envelope, ManifestEntry,
+    Outcome, Placement, Prefixes, Request, Signer, countersign, create, validate_basic,
 };
 
 const ROOT: &[u8] = include_bytes!("fixtures/creation/root.der");
@@ -441,6 +441,63 @@ fn objects_the_caller_names_meet_basic_and_their_ids_must_be_free() {
         "{error}"
     );
     assert_eq!(document.as_xml(), DOCUMENT, "nothing published");
+}
+
+#[test]
+fn a_manifest_of_detached_data_is_signed_with_its_digests_filled() {
+    // XMLDSig 1.1 §5.1: the signature signs a Manifest, typed as one, whose
+    // own references name detached data; the signing operation fills their
+    // digests before it digests the Manifest, and B-B holds.
+    let mut fixture = Fixture::new();
+    fixture
+        .resources
+        .insert("second.txt".to_owned(), b"Second payload\n".to_vec());
+    // Both operations process Manifests by their policies: signing fills the
+    // Manifest's digests, verification checks them before B-B is assessed.
+    fixture.policy.manifest_processing = ManifestProcessing::Process;
+    fixture.context_policy.manifest_processing = ManifestProcessing::Process;
+    let entry = |uri| ManifestEntry {
+        uri,
+        mime_type: "text/plain",
+    };
+    let objects = [DataObject::Manifest {
+        id: "manifest",
+        entries: vec![entry("detached.txt"), entry("second.txt")],
+        mime_type: "text/xml",
+    }];
+    let mut document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
+    let request = Request {
+        resources: Some(&fixture.resources),
+        ..request("sig", &objects)
+    };
+    fixture
+        .create(&mut document, request)
+        .expect("creation over a Manifest");
+    assert!(fixture.meets_basic(document.as_xml(), "sig"), "B-B");
+    let created = parse(document.as_xml());
+    let signed = created
+        .descendants()
+        .find(|node| node.has_tag_name((DS, "Reference")))
+        .expect("the Manifest reference comes first");
+    assert_eq!(signed.attribute("URI"), Some("#manifest"));
+    assert_eq!(
+        signed.attribute("Type"),
+        Some("http://www.w3.org/2000/09/xmldsig#Manifest")
+    );
+    let manifest = created
+        .descendants()
+        .find(|node| node.has_tag_name((DS, "Manifest")))
+        .expect("the Manifest");
+    let digests: Vec<&str> = manifest
+        .descendants()
+        .filter(|node| node.has_tag_name((DS, "DigestValue")))
+        .map(|node| node.text().unwrap_or_default())
+        .collect();
+    assert_eq!(digests.len(), 2);
+    assert!(
+        digests.iter().all(|digest| !digest.is_empty()),
+        "{digests:?}"
+    );
 }
 
 #[test]

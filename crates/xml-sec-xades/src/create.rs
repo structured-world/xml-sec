@@ -131,6 +131,19 @@ pub enum DataObject<'a> {
         /// MIME type of the content, also the object's `MimeType`.
         mime_type: &'a str,
     },
+    /// A `Manifest` in a new `Object` with the caller's `Id`, listing the
+    /// data its references name; the signature signs the `Manifest`, whose
+    /// reference digests the signing operation computes first (`XMLDSig` 1.1
+    /// §5.1, the signing policy processing Manifests).
+    Manifest {
+        /// ID of the `Manifest`; its references take `{id}-reference-{n}`.
+        id: &'a str,
+        /// The data the `Manifest` lists, each digested as dereferenced,
+        /// detached data from [`Request::resources`] included.
+        entries: Vec<ManifestEntry<'a>>,
+        /// MIME type of the `Manifest`.
+        mime_type: &'a str,
+    },
     /// The signature's own `KeyInfo`, with the signer's certificates the
     /// operation writes into it (`XMLDSig` 1.1 §4.5), canonicalized as the
     /// other XML references are.
@@ -204,6 +217,16 @@ fn anchor<W: Work>(
             }
         }
     })
+}
+
+/// One datum a signed `Manifest` lists, with its MIME type: each one gets a
+/// `DataObjectFormat` as a signed data object (EN 319 132-1 §6.3(k)).
+#[derive(Debug, Clone, Copy)]
+pub struct ManifestEntry<'a> {
+    /// URI of the datum.
+    pub uri: &'a str,
+    /// MIME type of the datum.
+    pub mime_type: &'a str,
 }
 
 /// What one new signature signs and where it goes.
@@ -398,29 +421,22 @@ pub fn create<W: Work>(
     let objects: Vec<String> = (0..request.objects.len())
         .map(|index| format!("#{}-object-{index}", ids.signature))
         .collect();
-    let enveloping = request
-        .objects
-        .iter()
-        .zip(&objects)
-        .filter(|(object, _)| matches!(object, DataObject::Enveloping { .. }))
-        .map(|(_, uri)| &uri[1..]);
-    let named_objects = request.objects.iter().filter_map(|object| match object {
-        DataObject::Object { id, .. } => Some(*id),
-        _ => None,
-    });
+    let manifest_references = manifest_references(&request.objects);
     // KeyInfo gets an ID only when a reference signs it, so every other
     // signature keeps its exact form.
     let signs_key_info = request
         .objects
         .iter()
         .any(|object| matches!(object, DataObject::KeyInfo { .. }));
-    let new_ids: Vec<&str> = [ids.signature.as_str(), &ids.properties, &ids.value]
-        .into_iter()
-        .chain(signs_key_info.then_some(ids.key_info.as_str()))
-        .chain(references.iter().map(|uri| &uri[1..]))
-        .chain(enveloping)
-        .chain(named_objects)
-        .collect();
+    let key_info_id = signs_key_info.then_some(ids.key_info.as_str());
+    let new_ids = new_ids(
+        &request.objects,
+        &ids,
+        key_info_id,
+        &references,
+        &objects,
+        &manifest_references,
+    );
     require_free(document, &new_ids, request.id_attributes)?;
 
     let described: Vec<produce::DataObject<'_>> = request
@@ -431,6 +447,14 @@ pub fn create<W: Work>(
             reference,
             mime_type: mime_type(object),
         })
+        .chain(
+            manifest_references
+                .iter()
+                .map(|(reference, mime_type)| produce::DataObject {
+                    reference,
+                    mime_type,
+                }),
+        )
         .collect();
     let target = format!("#{}", ids.signature);
     let properties = signed_properties(
@@ -454,7 +478,7 @@ pub fn create<W: Work>(
     if signs_key_info {
         skeleton = skeleton.key_info_id(ids.key_info.as_str());
     }
-    let template = data_template(signer, data, &references, &objects, &ids.key_info, skeleton)
+    let template = data_template(signer, data, &references, &objects, &ids.key_info, skeleton)?
         .add_reference(properties_reference(signer, &ids))
         .add_object(ObjectBuilder::new(ObjectContent::Element(properties)));
 
@@ -502,10 +526,12 @@ fn data_template(
     objects: &[String],
     key_info: &str,
     mut template: SignatureBuilder,
-) -> SignatureBuilder {
+) -> Result<SignatureBuilder, CreateError> {
     let mut enveloping = Vec::new();
     for ((object, reference), object_uri) in data.into_iter().zip(references).zip(objects) {
         let c14n = || Transform::C14n(signer.canonicalization.clone());
+        // XMLDSig 1.1 §5.1: a reference to a Manifest says so in its Type.
+        let manifest = matches!(object, DataObject::Manifest { .. });
         let (uri, transforms) = match object {
             DataObject::Document { envelope, .. } => (
                 String::new(),
@@ -538,6 +564,12 @@ fn data_template(
                 enveloping.push(object);
                 (format!("#{id}"), transforms)
             }
+            DataObject::Manifest { id, entries, .. } => {
+                let element =
+                    ObjectElement::parse(manifest_markup(signer, id, &entries), signer.policy)?;
+                enveloping.push(ObjectBuilder::new(ObjectContent::Element(element)));
+                (format!("#{id}"), Vec::from([c14n()]))
+            }
             DataObject::KeyInfo { .. } => (format!("#{key_info}"), Vec::from([c14n()])),
             DataObject::Reference {
                 uri, transforms, ..
@@ -546,6 +578,9 @@ fn data_template(
         let mut built = ReferenceBuilder::new(signer.digest)
             .uri(uri)
             .id(&reference[1..]);
+        if manifest {
+            built = built.ref_type(MANIFEST_TYPE);
+        }
         for transform in transforms {
             built = built.transform(transform);
         }
@@ -554,7 +589,109 @@ fn data_template(
     for object in enveloping {
         template = template.add_object(object);
     }
-    template
+    Ok(template)
+}
+
+/// Every ID a new signature declares: its parts, its references, the
+/// enveloping and named objects and the references of its `Manifest`s.
+fn new_ids<'a>(
+    data: &'a [DataObject<'a>],
+    ids: &'a Ids,
+    key_info: Option<&'a str>,
+    references: &'a [String],
+    objects: &'a [String],
+    manifest_references: &'a [(String, &str)],
+) -> Vec<&'a str> {
+    let enveloping = data
+        .iter()
+        .zip(objects)
+        .filter(|(object, _)| matches!(object, DataObject::Enveloping { .. }))
+        .map(|(_, uri)| &uri[1..]);
+    let named = data.iter().filter_map(|object| match object {
+        DataObject::Object { id, .. } | DataObject::Manifest { id, .. } => Some(*id),
+        _ => None,
+    });
+    [ids.signature.as_str(), &ids.properties, &ids.value]
+        .into_iter()
+        .chain(key_info)
+        .chain(references.iter().map(|uri| &uri[1..]))
+        .chain(enveloping)
+        .chain(named)
+        .chain(manifest_references.iter().map(|(uri, _)| &uri[1..]))
+        .collect()
+}
+
+/// Each reference of a signed `Manifest` among `objects`, as `#ID` with the
+/// MIME type of the datum it names.
+fn manifest_references<'a>(objects: &[DataObject<'a>]) -> Vec<(String, &'a str)> {
+    objects
+        .iter()
+        .filter_map(|object| match object {
+            DataObject::Manifest { id, entries, .. } => Some((*id, entries)),
+            _ => None,
+        })
+        .flat_map(|(id, entries)| {
+            entries.iter().enumerate().map(move |(index, entry)| {
+                (
+                    format!("#{}", manifest_reference_id(id, index)),
+                    entry.mime_type,
+                )
+            })
+        })
+        .collect()
+}
+
+/// The ID of the `index`th reference of `Manifest` `id`.
+fn manifest_reference_id(id: &str, index: usize) -> String {
+    format!("{id}-reference-{index}")
+}
+
+/// `XMLDSig` 1.1 §5.1: the `Type` of a reference to a `Manifest`.
+const MANIFEST_TYPE: &str = "http://www.w3.org/2000/09/xmldsig#Manifest";
+
+/// A `Manifest` whose references name `entries`, with empty digest values
+/// the signing operation fills before it digests the `Manifest` itself.
+/// Each entry is digested as dereferenced, as a detached reference is.
+fn manifest_markup(signer: &Signer<'_>, id: &str, entries: &[ManifestEntry<'_>]) -> String {
+    let (prefix, declaration) = match signer.prefixes.ds {
+        "" => (String::new(), format!(" xmlns=\"{DS}\"")),
+        prefix => (format!("{prefix}:"), format!(" xmlns:{prefix}=\"{DS}\"")),
+    };
+    let escape = |value: &str| {
+        value
+            .replace('&', "&amp;")
+            .replace('"', "&quot;")
+            .replace('<', "&lt;")
+    };
+    let mut markup = format!("<{prefix}Manifest{declaration} Id=\"{}\">", escape(id));
+    let digest_method = signer.digest.uri();
+    for (index, entry) in entries.iter().enumerate() {
+        for piece in [
+            "<",
+            &prefix,
+            "Reference Id=\"",
+            &escape(&manifest_reference_id(id, index)),
+            "\" URI=\"",
+            &escape(entry.uri),
+            "\"><",
+            &prefix,
+            "DigestMethod Algorithm=\"",
+            digest_method,
+            "\"/><",
+            &prefix,
+            "DigestValue></",
+            &prefix,
+            "DigestValue></",
+            &prefix,
+            "Reference>",
+        ] {
+            markup.push_str(piece);
+        }
+    }
+    for piece in ["</", &prefix, "Manifest>"] {
+        markup.push_str(piece);
+    }
+    markup
 }
 
 /// Countersign one existing `XAdES` signature and publish the result as one
@@ -658,6 +795,7 @@ fn mime_type<'a>(object: &DataObject<'a>) -> &'a str {
         | DataObject::Detached { mime_type, .. }
         | DataObject::Enveloping { mime_type, .. }
         | DataObject::Object { mime_type, .. }
+        | DataObject::Manifest { mime_type, .. }
         | DataObject::KeyInfo { mime_type }
         | DataObject::Reference { mime_type, .. } => mime_type,
     }

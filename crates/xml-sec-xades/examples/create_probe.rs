@@ -13,15 +13,15 @@ use std::sync::Arc;
 use structured_asn1::memory::{Memory, MemoryAccount};
 use xml_sec::XmlDocument;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
-use xml_sec::policy::{Instant, SigningPolicy, VerificationPolicy};
+use xml_sec::policy::{Instant, ManifestProcessing, SigningPolicy, VerificationPolicy};
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DigestAlgorithm, KeyResolverConfig, ObjectContent, ObjectElement,
     RsaSigningKey, SignatureAlgorithm, Transform, UriTypeSet, VerificationRequest, VerifyContext,
     XPathExpression, XPathFilter, XPathFilterOperation, XsltStylesheet,
 };
 use xml_sec_xades::{
-    Assessment, Countersignature, DataObject, Envelope, Placement, Prefixes, Request, Signer,
-    countersign, create,
+    Assessment, Countersignature, DataObject, Envelope, ManifestEntry, Placement, Prefixes,
+    Request, Signer, countersign, create,
 };
 
 const DOCUMENT: &str = "<Document><Data Id=\"payload\">Created payload</Data></Document>";
@@ -46,6 +46,8 @@ fn main() -> Result<(), String> {
     let key = RsaSigningKey::from_pkcs8_pem(&key_pem).map_err(|error| error.to_string())?;
     let mut signing = SigningPolicy::default();
     signing.uris.references = UriTypeSet::ALL;
+    // A signed Manifest's digests are computed and checked by both operations.
+    signing.manifest_processing = ManifestProcessing::Process;
     let chain: [&[u8]; 2] = [&signer_der, &intermediate];
     let signer = Signer {
         key: &key,
@@ -61,6 +63,7 @@ fn main() -> Result<(), String> {
     verification.key_trust.verify_x509_chains = true;
     verification.key_trust.verification_time = Instant::new(1_800_000_000, 0);
     verification.uris.references = UriTypeSet::ALL;
+    verification.manifest_processing = ManifestProcessing::Process;
     let resolver = DefaultKeyResolver::new(KeyResolverConfig {
         trusted_certs: vec![root.clone()],
         ..KeyResolverConfig::default()
@@ -197,6 +200,18 @@ fn cases(element: ObjectElement) -> Vec<(&'static str, Signatures)> {
             ]),
         ),
         ("inclusive", one(vec![document_object(Envelope::Enveloped)])),
+    ]
+    .into_iter()
+    .chain(composed_references())
+    .chain(shaped())
+    .collect()
+}
+
+/// One signature per serialization or structure choice: prefixes,
+/// placement, a signed Manifest, a signed `KeyInfo`.
+fn shaped() -> Vec<(&'static str, Signatures)> {
+    let one = |objects| vec![("sig", objects)];
+    vec![
         (
             "prefixes",
             one(vec![document_object(Envelope::ExcludingSignatures)]),
@@ -214,6 +229,23 @@ fn cases(element: ObjectElement) -> Vec<(&'static str, Signatures)> {
             one(vec![document_object(Envelope::ExcludingSignatures)]),
         ),
         (
+            "manifest",
+            one(vec![DataObject::Manifest {
+                id: "manifest",
+                entries: vec![
+                    ManifestEntry {
+                        uri: "detached.txt",
+                        mime_type: "text/plain",
+                    },
+                    ManifestEntry {
+                        uri: "detached-2.txt",
+                        mime_type: "text/plain",
+                    },
+                ],
+                mime_type: "text/xml",
+            }]),
+        ),
+        (
             "signed-key-info",
             one(vec![
                 document_object(Envelope::ExcludingSignatures),
@@ -223,9 +255,6 @@ fn cases(element: ObjectElement) -> Vec<(&'static str, Signatures)> {
             ]),
         ),
     ]
-    .into_iter()
-    .chain(composed_references())
-    .collect()
 }
 
 /// One signature per reference the caller composes.
