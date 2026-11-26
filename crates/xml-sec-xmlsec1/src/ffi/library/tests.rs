@@ -161,8 +161,9 @@ fn default_crypto_loads_the_builtin_table() {
 }
 
 /// Before the library list is initialized, looking a library up or unloading
-/// one fails with libxmlsec1's single "not initialized" report rather than
-/// a failed list check followed by a library created into no list.
+/// one fails with libxmlsec1's single internal-error report, with no error
+/// object, rather than a failed list check followed by a library created
+/// into no list.
 #[test]
 fn crypto_library_calls_before_init_report_not_initialized() {
     own_process();

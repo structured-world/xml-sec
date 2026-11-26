@@ -264,9 +264,17 @@ fn namespaces_at(node: *mut XmlNode) -> Vec<(String, String)> {
 fn read_data(kind: Kind, node: *mut XmlNode, op: c_int, node_set_type: c_int) -> Option<Data> {
     let here = here!("xmlSecXPathDataNodeRead");
     let namespaces = namespaces_at(node);
+    // An element without content reads as the empty expression; no content
+    // at all means the read itself failed, which libxmlsec1 reports as the
+    // allocation failure of xmlNodeGetContent.
     let Some(expression) = nodes::content(node) else {
-        // SAFETY: a report about the caller's node.
-        unsafe { errors::invalid_node_content(here, node, std::ptr::null(), "empty") };
+        errors::report(
+            here,
+            std::ptr::null(),
+            c"xmlNodeGetContent".as_ptr(),
+            errors::R_MALLOC_FAILED,
+            "",
+        );
         return None;
     };
     Some(Data {

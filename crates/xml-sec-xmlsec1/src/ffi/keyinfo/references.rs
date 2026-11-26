@@ -463,6 +463,13 @@ unsafe fn retrieve(
         };
         let context = &raw mut (*ctx).retrieval_method_ctx;
         let uri = xsGetProp(node, xmlSecAttrURI.as_ptr());
+        // RetrievalMethod requires its URI (XMLDSig 1.1 section 4.5.3), and
+        // libxmlsec1 reports its absence as such before any dereference.
+        if uri.is_null() {
+            xmlSecTransformCtxReset(context);
+            errors::invalid_node_attribute(here, node, c"URI", object, "missing");
+            return -1;
+        }
         let side = read_side(ctx);
         let dereferenced = dereference(
             here,

@@ -499,6 +499,16 @@ int main(void) {
     printf("  verify: %d", xmlSecDSigCtxVerify(ctx, xsDocGetRootElement(doc)));
     printf(" status=%s\n", xmlSecDSigCtxGetStatusString(ctx->status));
     xmlSecDSigCtxDestroy(ctx);
+
+    /* A context that signed holds the signature as its result and is
+     * refused for a verification. */
+    ctx = xmlSecDSigCtxCreate(NULL);
+    ctx->signKey = hmac_key();
+    printf("verify after sign\n");
+    printf("  sign: %d", xmlSecDSigCtxSign(ctx, signature_of(doc)));
+    printf(" result=%d\n", ctx->result != NULL);
+    printf("  verify: %d\n", xmlSecDSigCtxVerify(ctx, signature_of(doc)));
+    xmlSecDSigCtxDestroy(ctx);
     xmlSecKeysMngrDestroy(mngr);
     xsFreeDoc(doc);
 

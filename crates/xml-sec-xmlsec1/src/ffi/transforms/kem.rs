@@ -802,6 +802,18 @@ unsafe extern "C" fn kem_initialize(data: *mut XmlSecKeyData) -> c_int {
 unsafe extern "C" fn kem_duplicate(dst: *mut XmlSecKeyData, src: *mut XmlSecKeyData) -> c_int {
     contain(-1, || {
         let here = here!("xmlSecKeyDataKEMDuplicate");
+        // A self-duplicate would empty the destination before copying from
+        // it, and the two views of one object below would alias: refused as
+        // libxmlsec1 refuses it.
+        if std::ptr::eq(dst, src) && !dst.is_null() {
+            errors::other(
+                here,
+                errors::R_INVALID_OPERATION,
+                c"kem-cipher-value".as_ptr(),
+                Some("self-duplicate is not supported"),
+            );
+            return -1;
+        }
         // SAFETY: the registry passes key data of this klass.
         let (Some(target), Some(source)) = (unsafe { kem_data(dst) }, unsafe { kem_data(src) })
         else {

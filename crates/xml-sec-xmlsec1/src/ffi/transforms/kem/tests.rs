@@ -420,6 +420,30 @@ fn a_kept_ciphertext_is_written_whole_whatever_the_expected_width() {
 }
 
 #[test]
+fn a_self_duplicate_of_kem_data_is_refused_and_keeps_the_ciphertext() {
+    // Duplicating KEM data into itself would empty the ciphertext before
+    // copying from it (and alias the object): refused as libxmlsec1 refuses
+    // it, with the ciphertext left in place.
+    use super::super::super::buffer::xmlSecBufferSetData;
+    use super::super::super::keysdata::{xmlSecKeyDataCreate, xmlSecKeyDataDestroy};
+    with_library(|| {
+        // SAFETY: a key-data object created and released here.
+        unsafe {
+            let data = xmlSecKeyDataCreate(&raw const KEM_DATA);
+            let object = kem_data(data).expect("KEM data");
+            assert_eq!(
+                xmlSecBufferSetData(&raw mut object.ciphertext, [7u8; 4].as_ptr(), 4),
+                0
+            );
+            assert_eq!(kem_duplicate(data, data), -1);
+            let object = kem_data(data).expect("KEM data");
+            assert_eq!(xmlSecBufferGetSize(&raw mut object.ciphertext), 4);
+            xmlSecKeyDataDestroy(data);
+        }
+    });
+}
+
+#[test]
 fn a_kept_ciphertext_is_written_for_its_own_recipient_only() {
     // An ML-KEM secret keys the content for the one recipient it was
     // encapsulated to; writing its ciphertext into another recipient's
