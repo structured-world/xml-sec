@@ -385,6 +385,53 @@ fn references_the_caller_composes_meet_basic() {
 }
 
 #[test]
+fn a_reference_with_comments_signs_the_comments_of_its_data() {
+    // XML-C14N 1.0 §1.1 / Exc-C14N §3: a URI naming the element by XPointer
+    // keeps its comments, and #WithComments canonicalization signs them, so a
+    // changed comment breaks the reference.
+    const COMMENTED: &str =
+        "<Document><Data Id=\"payload\">Created <!--signed note--> payload</Data></Document>";
+    let fixture = Fixture::new();
+    let mut document = XmlDocument::parse(COMMENTED).expect("fixture parses");
+    let objects = [DataObject::Reference {
+        uri: "#xpointer(id('payload'))",
+        transforms: vec![Transform::C14n(C14nAlgorithm::new(
+            C14nMode::Exclusive1_0,
+            true,
+        ))],
+        mime_type: "text/xml",
+    }];
+    fixture
+        .create(&mut document, request("sig", &objects))
+        .expect("creation with a commented reference");
+    assert!(fixture.meets_basic(document.as_xml(), "sig"), "B-B");
+    let accepted = |xml: &str| {
+        let account = account(1 << 30);
+        let parsed = XmlDocument::parse(xml).expect("XML parses");
+        let context = VerifyContext::new()
+            .policy(fixture.context_policy.clone())
+            .key_resolver(&fixture.resolver);
+        let request = VerificationRequest {
+            external_resources: Some(&fixture.resources),
+            ..VerificationRequest::default()
+        };
+        with_verified_request(&parsed, &context, &request, &account, |session| {
+            session.evidence().accepted(&parsed)
+        })
+        .expect("the document is read")
+    };
+    assert!(accepted(document.as_xml()), "the created document verifies");
+    let tampered = document
+        .as_xml()
+        .replacen("<!--signed note-->", "<!--changed note-->", 1);
+    assert_ne!(tampered, document.as_xml(), "the comment was kept");
+    assert!(
+        !accepted(&tampered),
+        "a changed comment breaks the reference"
+    );
+}
+
+#[test]
 fn objects_the_caller_names_meet_basic_and_their_ids_must_be_free() {
     // XMLDSig 1.1 §4.5/§6.6.2: an Object with the caller's Id, MimeType and
     // Encoding, signed through a reference to that Id with the caller's
@@ -524,16 +571,15 @@ fn a_reference_to_key_info_signs_the_written_certificates() {
         .find(|node| node.has_tag_name((DS, "KeyInfo")))
         .expect("KeyInfo");
     assert_eq!(key_info.attribute("Id"), Some("sig-key-info"));
-    let intermediate = structured_base64::STANDARD
-        .encode(INTERMEDIATE)
-        .expect("test encoding");
-    // The KeyInfo writer declares the default namespace on X509Data.
+    // Whitespace between the carried certificates changes the canonical
+    // KeyInfo but neither certificate, so the path still validates and only
+    // the KeyInfo reference (the second) can fail.
     let tampered = document.as_xml().replacen(
-        &format!("<X509Certificate>{intermediate}</X509Certificate>"),
-        "",
+        "</X509Certificate><X509Certificate>",
+        "</X509Certificate> <X509Certificate>",
         1,
     );
-    assert_ne!(tampered, document.as_xml(), "the intermediate was carried");
+    assert_ne!(tampered, document.as_xml(), "two certificates were carried");
     let account = account(1 << 30);
     let parsed = XmlDocument::parse(tampered.as_str()).expect("tampered XML parses");
     let context = VerifyContext::new()
@@ -543,11 +589,17 @@ fn a_reference_to_key_info_signs_the_written_certificates() {
         external_resources: Some(&fixture.resources),
         ..VerificationRequest::default()
     };
-    let accepted = with_verified_request(&parsed, &context, &request, &account, |session| {
-        session.evidence().accepted(&parsed)
+    let status = with_verified_request(&parsed, &context, &request, &account, |session| {
+        Ok(session
+            .evidence()
+            .signatures()
+            .iter()
+            .map(|entry| format!("{:?}", entry.result().as_ref().map(|result| result.status)))
+            .collect::<Vec<_>>())
     })
     .expect("the tampered document is read");
-    assert!(!accepted, "a changed KeyInfo breaks its reference");
+    assert_eq!(status.len(), 1);
+    assert!(status[0].contains("ref_index: 1"), "{status:?}");
 }
 
 #[test]

@@ -24,7 +24,9 @@ use xml_sec_xades::{
     Request, Signer, countersign, create,
 };
 
-const DOCUMENT: &str = "<Document><Data Id=\"payload\">Created payload</Data></Document>";
+/// The payload carries a comment, which only the `reference-comments` case signs.
+const DOCUMENT: &str =
+    "<Document><Data Id=\"payload\">Created <!--signed note--> payload</Data></Document>";
 const DETACHED: &[u8] = b"Detached payload\n";
 const SECOND_DETACHED: &[u8] = b"Second detached payload\n";
 /// Detached XML a reference canonicalizes, as DSS's detached transform tests do.

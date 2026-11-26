@@ -18,8 +18,9 @@ import eu.europa.esig.dss.xades.signature.XAdESService;
  * {@code countersigned-nested} (an enveloping signature countersigned, and its
  * countersignature countersigned in turn), {@code detached-multiple} (one
  * detached signature over two files), {@code inclusive} (inclusive
- * canonicalization of SignedInfo and SignedProperties) and
- * {@code pretty-print} (DSS's indented serialization).
+ * canonicalization of SignedInfo and SignedProperties),
+ * {@code pretty-print} (DSS's indented serialization) and
+ * {@code signed-key-info} (a reference signing the KeyInfo).
  */
 public class FormProbe {
     public static void main(String[] args) throws Exception {
@@ -55,6 +56,8 @@ public class FormProbe {
             });
             case "pretty-print" -> sign(
                 service, signer, time, "ENVELOPED", List.of(document), parameters -> parameters.setPrettyPrint(true));
+            case "signed-key-info" -> sign(
+                service, signer, time, "ENVELOPED", List.of(document), parameters -> parameters.setSignKeyInfo(true));
             default -> throw new IllegalArgumentException("unknown form " + args[1]);
         };
         signed.save(args[4]);

@@ -21,6 +21,7 @@ use super::fixtures::Generator;
 use super::levels::{CERTIFICATES, Levels};
 use super::{Build, Corpus, absolute, line, read, write, write_json, xml};
 use serde_json::{Map, Value, json};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -57,7 +58,7 @@ impl Actor {
 /// packagings, or one of the signature forms DSS's signature tests make
 /// (parallel signatures, a countersignature and a nested one, a detached
 /// signature over two files, inclusive canonicalization, DSS's indented
-/// serialization).
+/// serialization, a signed `KeyInfo`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Packaging {
     Enveloped,
@@ -70,6 +71,7 @@ pub(crate) enum Packaging {
     DetachedMultiple,
     Inclusive,
     PrettyPrint,
+    SignedKeyInfo,
 }
 
 impl Packaging {
@@ -81,13 +83,14 @@ impl Packaging {
     ];
 
     /// The signature forms, each run with an RSA signer and CRL evidence.
-    pub(crate) const FORMS: [Self; 6] = [
+    pub(crate) const FORMS: [Self; 7] = [
         Self::Parallel,
         Self::Countersigned,
         Self::CountersignedNested,
         Self::DetachedMultiple,
         Self::Inclusive,
         Self::PrettyPrint,
+        Self::SignedKeyInfo,
     ];
 
     /// The case name part; for a form also the name both probes take.
@@ -103,6 +106,7 @@ impl Packaging {
             Self::DetachedMultiple => "detached-multiple",
             Self::Inclusive => "inclusive",
             Self::PrettyPrint => "pretty-print",
+            Self::SignedKeyInfo => "signed-key-info",
         }
     }
 
@@ -338,69 +342,95 @@ fn level(step: &str) -> &'static str {
     }
 }
 
-/// The text of the first element whose local name is `local`, start tag to
-/// end tag, as the document holds it.
-pub(crate) fn element<'a>(text: &'a str, local: &str) -> Option<&'a str> {
-    let mut offset = 0;
-    while let Some(found) = text[offset..].find('<') {
-        let start = offset + found;
-        let tag = &text[start + 1..];
-        let name_end = tag.find(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/')?;
-        let name = &tag[..name_end];
-        if name.rsplit(':').next() == Some(local) && !name.starts_with('/') {
-            let close = format!("</{name}>");
-            let end = text[start..].find(&close)? + start + close.len();
-            return Some(&text[start..end]);
-        }
-        offset = start + 1;
-    }
-    None
-}
+/// The key of one part of a signature: the `Id` of the `Signature` that owns
+/// it (empty for none) and its ordinal among that signature's parts of the
+/// same name, so a step that adds a signature or a countersignature never
+/// shifts the parts of another.
+type PartKey = (String, usize);
 
-/// The exclusive canonical form of every property of the first
-/// `UnsignedSignatureProperties` of `text`, in document order. An archive
-/// timestamp covers this form (EN 319 132-1 §5.5.2), so a serializer may drop
-/// a redundant namespace declaration without changing what it covers.
-fn unsigned_properties(text: &str) -> Result<Vec<Vec<u8>>, String> {
-    let document = xml::parse(text, "lifecycle document")?;
-    let Some(properties) = document
+/// Every `local` element of `document`, keyed by its owning signature.
+fn parts<'a, 'input>(
+    document: &'a xml_sec::XmlDomDocument<'input>,
+    local: &str,
+) -> Vec<(PartKey, xml::Node<'a, 'input>)> {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    document
         .root_element()
         .descendants()
-        .find(|node| node.is_element() && node.tag_name().name() == "UnsignedSignatureProperties")
-    else {
-        return Ok(Vec::new());
-    };
-    let algorithm = C14nAlgorithm::new(C14nMode::Exclusive1_0, false);
-    properties
-        .children()
-        .filter(xml::Node::is_element)
-        .map(|property| {
-            let within = |node: xml::Node<'_, '_>| {
-                node.id() == property.id()
-                    || node
-                        .ancestors()
-                        .any(|ancestor| ancestor.id() == property.id())
-            };
-            let mut canonical = Vec::new();
-            canonicalize(&document, Some(&within), &algorithm, &mut canonical)
-                .map_err(|error| format!("canonicalize an unsigned property: {error}"))?;
-            Ok(canonical)
+        .filter(|node| node.is_element() && node.tag_name().name() == local)
+        .map(|node| {
+            let owner = node
+                .ancestors()
+                .skip(1)
+                .find(|ancestor| ancestor.is_element() && ancestor.tag_name().name() == "Signature")
+                .and_then(|signature| signature.attribute("Id"))
+                .unwrap_or_default()
+                .to_owned();
+            let ordinal = counts.entry(owner.clone()).or_default();
+            let key = (owner, *ordinal);
+            *ordinal += 1;
+            (key, node)
         })
         .collect()
 }
 
-/// Whether `later` keeps the signature of `created` byte for byte and every
-/// unsigned property of `previous` canonically unchanged and in place: a step
-/// only appends properties.
-pub(crate) fn preserved(created: &str, previous: &str, later: &str) -> Result<bool, String> {
-    let signature = ["SignedInfo", "SignatureValue"].iter().all(|local| {
-        element(created, local).is_some_and(|bytes| element(later, local) == Some(bytes))
-    });
-    if !signature {
-        return Ok(false);
+/// The exclusive canonical form of every property of each
+/// `UnsignedSignatureProperties` of `text`, keyed by its owning signature. An
+/// archive timestamp covers this form (EN 319 132-1 §5.5.2), so a serializer
+/// may drop a redundant namespace declaration without changing what it covers.
+fn unsigned_properties(text: &str) -> Result<BTreeMap<PartKey, Vec<Vec<u8>>>, String> {
+    let document = xml::parse(text, "lifecycle document")?;
+    let algorithm = C14nAlgorithm::new(C14nMode::Exclusive1_0, false);
+    let mut found = BTreeMap::new();
+    for (key, properties) in parts(&document, "UnsignedSignatureProperties") {
+        let canonical = properties
+            .children()
+            .filter(xml::Node::is_element)
+            .map(|property| {
+                let within = |node: xml::Node<'_, '_>| {
+                    node.id() == property.id()
+                        || node
+                            .ancestors()
+                            .any(|ancestor| ancestor.id() == property.id())
+                };
+                let mut canonical = Vec::new();
+                canonicalize(&document, Some(&within), &algorithm, &mut canonical)
+                    .map_err(|error| format!("canonicalize an unsigned property: {error}"))?;
+                Ok(canonical)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        found.insert(key, canonical);
     }
-    let earlier = unsigned_properties(previous)?;
-    Ok(unsigned_properties(later)?.starts_with(&earlier))
+    Ok(found)
+}
+
+/// Whether `later` keeps every signature of `created` byte for byte and every
+/// unsigned property of `previous` canonically unchanged and in place, for
+/// each signature matched by its `Id`: a step only appends properties.
+pub(crate) fn preserved(created: &str, previous: &str, later: &str) -> Result<bool, String> {
+    let (created_document, later_document) = (
+        xml::parse(created, "created document")?,
+        xml::parse(later, "lifecycle document")?,
+    );
+    for local in ["SignedInfo", "SignatureValue"] {
+        let earlier = parts(&created_document, local);
+        if earlier.is_empty() {
+            return Ok(false);
+        }
+        let now: BTreeMap<PartKey, &str> = parts(&later_document, local)
+            .into_iter()
+            .map(|(key, node)| (key, &later[node.range()]))
+            .collect();
+        for (key, node) in earlier {
+            if now.get(&key) != Some(&&created[node.range()]) {
+                return Ok(false);
+            }
+        }
+    }
+    let now = unsigned_properties(later)?;
+    Ok(unsigned_properties(previous)?
+        .iter()
+        .all(|(key, earlier)| now.get(key).is_some_and(|later| later.starts_with(earlier))))
 }
 
 /// What xml-sec's `level_probe` reports, reduced to the compared fields: the
@@ -457,6 +487,19 @@ pub(crate) fn xml_sec_outcome(output: &str) -> Value {
     outcome
 }
 
+/// `outcome` with the structure of the BER reading `ber` of the same
+/// document beside each signature's structure, the later signatures' too.
+pub(crate) fn with_ber(mut outcome: Value, ber: &Value) -> Value {
+    outcome["structure_ber"] = ber["structure"].clone();
+    // `get_mut`, not indexing: indexing would insert a null `others`.
+    if let Some(others) = outcome.get_mut("others").and_then(Value::as_array_mut) {
+        for (index, other) in others.iter_mut().enumerate() {
+            other["structure_ber"] = ber["others"][index]["structure"].clone();
+        }
+    }
+    outcome
+}
+
 /// What DSS's `LevelProbe` reports, reduced to the compared fields.
 pub(crate) fn dss_outcome(output: &str, reports: &Path) -> Result<Value, String> {
     let line = output
@@ -489,7 +532,8 @@ pub(crate) fn dss_outcome(output: &str, reports: &Path) -> Result<Value, String>
         .filter(|node| xml::child(*node, "BasicSignature").is_some())
         .count();
     // Every signature after the first, parallel ones and countersignatures,
-    // as the simple report lists them.
+    // as the simple report lists them, each with the cryptographic result of
+    // the diagnostic signature of the same token.
     let others: Vec<Value> = output
         .lines()
         .filter(|line| line.contains(" format="))
@@ -501,7 +545,20 @@ pub(crate) fn dss_outcome(output: &str, reports: &Path) -> Result<Value, String>
                     .unwrap_or_default()
                     .to_owned()
             };
+            let token = line.split(' ').next().unwrap_or_default();
+            let crypto = xml::below(root, "Signature", None)
+                .find(|node| {
+                    node.attribute("Id") == Some(token)
+                        && xml::child(*node, "BasicSignature").is_some()
+                })
+                .map_or(
+                    "absent",
+                    |node| {
+                        if intact(node) { "intact" } else { "broken" }
+                    },
+                );
             json!({
+                "crypto": crypto,
                 "structure": field("format"),
                 "trust": format!("{}/{}", field("indication"), field("subindication")),
             })
@@ -1001,12 +1058,11 @@ impl Run<'_> {
                 dss_outcome(&String::from_utf8_lossy(&run.stdout), &reports)
             }
             Actor::XmlSec => {
-                let mut outcome = self.xml_sec_reading(step, false, &log)?;
+                let outcome = self.xml_sec_reading(step, false, &log)?;
                 // The same document with unmarked tokens read as BER: the
                 // two readings differ only for a token that is not DER.
                 let ber = self.xml_sec_reading(step, true, &reports.with_extension("ber"))?;
-                outcome["structure_ber"] = ber["structure"].clone();
-                Ok(outcome)
+                Ok(with_ber(outcome, &ber))
             }
         }
     }
@@ -1145,6 +1201,36 @@ pub(crate) fn compare(expected: &Value, observed: &[Value]) -> Vec<String> {
     found
 }
 
+/// The recorded expectation of one case from its `previous` expectation and
+/// the `observed` steps: an observation one of the reviewed alternatives
+/// already describes keeps the expectation as it was, so a run that met the
+/// alternative never replaces the expected outcome; any other observation
+/// becomes the expected outcome for review, keeping the alternatives.
+pub(crate) fn recorded_case(previous: &Value, observed: &Value) -> Value {
+    let alternatives = &previous["alternatives"];
+    let reviewed = alternatives
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|alternative| alternative["steps"].as_array())
+        .any(|steps| {
+            let actual = observed.as_array().map_or(&[][..], Vec::as_slice);
+            let mut found = Vec::new();
+            for (index, (step, observed)) in steps.iter().zip(actual).enumerate() {
+                deviations(step, observed, &index.to_string(), &mut found);
+            }
+            steps.len() == actual.len() && found.is_empty()
+        });
+    if reviewed {
+        return previous.clone();
+    }
+    let mut case = json!({ "steps": observed });
+    if !alternatives.is_null() {
+        case["alternatives"] = alternatives.clone();
+    }
+    case
+}
+
 /// Runs every lifecycle and compares it with the expectations.
 pub(crate) fn execute(corpus: &Corpus, results: &Path, record: bool) -> Result<(), String> {
     if results.exists() {
@@ -1195,11 +1281,7 @@ pub(crate) fn execute(corpus: &Corpus, results: &Path, record: bool) -> Result<(
             .iter()
             .map(|row| {
                 let name = row["case"].as_str().unwrap_or_default().to_owned();
-                let mut case = json!({ "steps": row["steps"] });
-                let alternatives = &previous["cases"][&name]["alternatives"];
-                if !alternatives.is_null() {
-                    case["alternatives"] = alternatives.clone();
-                }
+                let case = recorded_case(&previous["cases"][&name], &row["steps"]);
                 (name, case)
             })
             .collect();

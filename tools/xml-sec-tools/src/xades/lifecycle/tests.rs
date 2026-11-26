@@ -1,9 +1,67 @@
 use super::{
-    Actor, Algorithm, Evidence, Packaging, cases, compare, deviations, element, preserved, refusal,
+    Actor, Algorithm, Evidence, Packaging, cases, compare, deviations, preserved, refusal,
     xml_sec_outcome,
 };
 use serde_json::json;
 use std::collections::BTreeSet;
+
+#[test]
+fn every_signature_keeps_its_ber_reading_and_dss_crypto_result() {
+    // A later signature whose BER reading or whose signature value DSS finds
+    // broken must show in its own entry, not be hidden by the first one.
+    let der = json!({ "crypto": "Valid", "structure": "Tokens",
+        "others": [{ "crypto": "Valid", "structure": "Tokens" }] });
+    let ber = json!({ "structure": "met", "others": [{ "structure": "unmet" }] });
+    let merged = super::with_ber(der, &ber);
+    assert_eq!(merged["structure_ber"], "met");
+    assert_eq!(merged["others"][0]["structure_ber"], "unmet");
+    // One signature keeps the shape its recorded expectations have.
+    let single = super::with_ber(
+        json!({ "structure": "Tokens" }),
+        &json!({ "structure": "met" }),
+    );
+    assert_eq!(
+        single,
+        json!({ "structure": "Tokens", "structure_ber": "met" })
+    );
+
+    let reports = tempfile::tempdir().expect("temporary directory");
+    std::fs::write(
+        reports.path().join("diagnostic.xml"),
+        "<DiagnosticData><Signatures>\
+         <Signature Id=\"S-1\"><BasicSignature><SignatureIntact>true</SignatureIntact></BasicSignature></Signature>\
+         <Signature Id=\"S-2\"><BasicSignature><SignatureIntact>false</SignatureIntact></BasicSignature></Signature>\
+         </Signatures></DiagnosticData>",
+    )
+    .expect("write diagnostic report");
+    let output = "S-1 format=XAdES-BASELINE-B indication=TOTAL_PASSED subindication=null errors=[]\n\
+                  S-2 format=XAdES-BASELINE-B indication=TOTAL_FAILED subindication=SIG_CRYPTO_FAILURE errors=[]\n";
+    let outcome = super::dss_outcome(output, reports.path()).expect("reports read");
+    assert_eq!(outcome["crypto"], "intact");
+    assert_eq!(outcome["others"][0]["crypto"], "broken");
+}
+
+#[test]
+fn recording_a_reviewed_alternative_keeps_the_expected_outcome() {
+    // A run that happens to observe the reviewed refusal must not replace the
+    // conformant expectation with it; a new outcome is recorded for review
+    // and keeps the reviewed alternatives.
+    let previous = json!({
+        "steps": [{ "step": "b", "made": "made" }],
+        "alternatives": [{ "note": "p521", "steps": [{ "step": "b", "made": { "refused": "r" } }] }]
+    });
+    let refused = json!([{ "step": "b", "made": { "refused": "r" } }]);
+    assert_eq!(super::recorded_case(&previous, &refused), previous);
+    let new = json!([{ "step": "b", "made": { "refused": "other" } }]);
+    assert_eq!(
+        super::recorded_case(&previous, &new),
+        json!({ "steps": new, "alternatives": previous["alternatives"] })
+    );
+    assert_eq!(
+        super::recorded_case(&serde_json::Value::Null, &refused),
+        json!({ "steps": refused })
+    );
+}
 
 #[test]
 fn a_reviewed_alternative_outcome_matches_and_an_unknown_one_does_not() {
@@ -67,38 +125,42 @@ fn every_case_has_its_own_name_and_alternates_the_implementations() {
             algorithm: Algorithm::Rsa,
             evidence: Evidence::Crl,
         };
-        assert!(cases.contains(&dss_first));
+        assert!(cases.contains(&dss_first), "missing {}", dss_first.name());
         let xml_sec_first = super::Case {
             first: Actor::XmlSec,
             ..dss_first
         };
         assert_eq!(
             cases.contains(&xml_sec_first),
-            packaging != Packaging::PrettyPrint
+            packaging != Packaging::PrettyPrint,
+            "{}: only DSS makes the indented form",
+            xml_sec_first.name()
         );
     }
     for first in [Actor::XmlSec, Actor::Dss] {
         for algorithm in Algorithm::MORE {
-            assert!(cases.contains(&super::Case {
+            let case = super::Case {
                 first,
                 packaging: Packaging::Enveloping,
                 algorithm,
                 evidence: Evidence::Crl,
-            }));
+            };
+            assert!(cases.contains(&case), "missing {}", case.name());
         }
     }
     let names: BTreeSet<String> = cases.iter().map(|case| case.name()).collect();
-    assert_eq!(names.len(), cases.len());
+    assert_eq!(names.len(), cases.len(), "two cases share a name");
     for first in [Actor::XmlSec, Actor::Dss] {
         for packaging in Packaging::ALL {
             for algorithm in [Algorithm::Rsa, Algorithm::Ec] {
                 for evidence in [Evidence::Crl, Evidence::Ocsp] {
-                    assert!(cases.contains(&super::Case {
+                    let case = super::Case {
                         first,
                         packaging,
                         algorithm,
-                        evidence
-                    }));
+                        evidence,
+                    };
+                    assert!(cases.contains(&case), "missing {}", case.name());
                 }
             }
         }
@@ -107,7 +169,7 @@ fn every_case_has_its_own_name_and_alternates_the_implementations() {
         .iter()
         .filter(|case| case.evidence == Evidence::Revoked)
         .collect();
-    assert_eq!(revoked.len(), 2);
+    assert_eq!(revoked.len(), 2, "one revoked case per direction");
     let case = cases[0];
     assert_eq!(case.name(), "xml-sec-first-enveloped-rsa-crl");
     let actors: Vec<Actor> = case.steps().iter().map(|(_, actor)| *actor).collect();
@@ -124,20 +186,14 @@ fn every_case_has_its_own_name_and_alternates_the_implementations() {
 }
 
 #[test]
-fn an_element_is_cut_at_its_own_end_tag_under_any_prefix() {
-    // DSS writes `ds:` prefixes and xml-sec may not; an end tag of another
-    // element or a closing tag must never be taken as the start.
-    let text = r#"<a><ds:SignedInfo Id="x"><ds:Reference/></ds:SignedInfo><SignatureValue>AA==</SignatureValue></a>"#;
-    assert_eq!(
-        element(text, "SignedInfo"),
-        Some(r#"<ds:SignedInfo Id="x"><ds:Reference/></ds:SignedInfo>"#)
-    );
-    assert_eq!(
-        element(text, "SignatureValue"),
-        Some("<SignatureValue>AA==</SignatureValue>")
-    );
-    assert_eq!(element(text, "Missing"), None);
-    assert_eq!(element("<SignedInfo>unterminated", "SignedInfo"), None);
+fn signature_parts_match_under_any_prefix() {
+    // DSS writes `ds:` prefixes and xml-sec may not: parts match by local
+    // name, and their bytes are compared exactly as the documents hold them.
+    let created = r#"<a xmlns:ds="urn:ds"><ds:SignedInfo Id="x"><ds:Reference/></ds:SignedInfo><SignatureValue>AA==</SignatureValue></a>"#;
+    let appended = r#"<a xmlns:ds="urn:ds"><ds:SignedInfo Id="x"><ds:Reference/></ds:SignedInfo><SignatureValue>AA==</SignatureValue><Q/></a>"#;
+    assert!(preserved(created, created, appended).unwrap());
+    let rewritten = r#"<a xmlns:ds="urn:ds"><ds:SignedInfo Id="x"><ds:Reference /></ds:SignedInfo><SignatureValue>AA==</SignatureValue></a>"#;
+    assert!(!preserved(created, created, rewritten).unwrap());
 }
 
 #[test]
@@ -155,6 +211,34 @@ fn preservation_requires_both_signature_parts_unchanged() {
         "<S><SignedInfo>a</SignedInfo><SignatureValue>w</SignatureValue></S>"
     ));
     assert!(!preserved("<S/>", "<S/>", created).unwrap());
+}
+
+#[test]
+fn preservation_holds_for_every_signature_of_the_document() {
+    // A later parallel signature or a countersignature keeps its signed parts
+    // and earlier unsigned properties too, matched by the signature's Id: a
+    // step that rewrites only the second signature is no preservation.
+    let signature = |id: &str, value: &str, unsigned: &str| {
+        format!(
+            "<Signature Id=\"{id}\"><SignedInfo>{id}</SignedInfo><SignatureValue>{value}</SignatureValue><UnsignedSignatureProperties>{unsigned}</UnsignedSignatureProperties></Signature>"
+        )
+    };
+    let document = |second_value: &str, second_unsigned: &str| {
+        format!(
+            "<D>{}{}</D>",
+            signature("one", "v1", "<T>1</T>"),
+            signature("two", second_value, second_unsigned)
+        )
+    };
+    let earlier = document("v2", "<T>2</T>");
+    let kept = |later: &str| preserved(&earlier, &earlier, later).unwrap();
+    assert!(kept(&document("v2", "<T>2</T><V>3</V>")));
+    assert!(!kept(&document("w2", "<T>2</T>")));
+    assert!(!kept(&document("v2", "<T>9</T>")));
+    assert!(!kept(&format!(
+        "<D>{}</D>",
+        signature("one", "v1", "<T>1</T>")
+    )));
 }
 
 #[test]

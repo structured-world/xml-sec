@@ -100,6 +100,20 @@ fn a_key_info_id_names_the_placeholder_a_reference_can_sign() {
         .find(|node| node.has_tag_name((DSIG_NS, "KeyInfo")))
         .expect("KeyInfo placeholder");
     assert_eq!(key_info.attribute("Id"), Some("key"));
+    // XMLDSig 1.1 §4.5 types KeyInfo/@Id as xs:ID: a value that is no NCName
+    // is refused like every other structural ID.
+    let refused = skeleton()
+        .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("#key"))
+        .key_info(true)
+        .key_info_id("two words")
+        .build_template();
+    assert!(
+        matches!(
+            refused,
+            Err(SignatureBuilderError::InvalidId { element: "KeyInfo", ref value }) if value == "two words"
+        ),
+        "{refused:?}"
+    );
     let plain = build(skeleton());
     let document = roxmltree::Document::parse(&plain).expect("valid XML");
     let key_info = document

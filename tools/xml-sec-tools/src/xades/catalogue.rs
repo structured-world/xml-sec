@@ -112,9 +112,14 @@ pub(crate) fn problems(
             .find_map(|(name, section)| (*name == status).then_some(*section))
             .flatten();
         for name in named {
+            // A definition is known only with a description that says why.
             let known = section.map_or_else(
                 || cases.contains(name),
-                |section| !catalogue[section][name].is_null(),
+                |section| {
+                    catalogue[section][name]
+                        .as_str()
+                        .is_some_and(|description| !description.trim().is_empty())
+                },
             );
             if !known {
                 found.push(format!("{class}: {status} names unknown {name:?}"));

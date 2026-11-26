@@ -97,35 +97,23 @@ fn verification(at: i64, detached: bool, encoding: TimestampTokenEncoding) -> Ve
 /// The `Id` of every top-level element of `text` named `Signature`, prefixed
 /// or not, in document order: a countersignature, nested in the signature it
 /// countersigns, is augmented with that signature's archive, not on its own.
-fn signature_ids(text: &str) -> Result<Vec<&str>, String> {
-    let mut found = Vec::new();
-    let mut depth = 0_usize;
-    let mut rest = text;
-    while let Some(start) = rest.find('<') {
-        let tag = &rest[start + 1..];
-        let end = tag.find('>').ok_or("unterminated tag")?;
-        let closing = tag.starts_with('/');
-        let body = tag[..end].trim_start_matches('/');
-        let name_end = body
-            .find(|c: char| c.is_ascii_whitespace() || c == '/')
-            .unwrap_or(body.len());
-        if body[..name_end].rsplit(':').next() == Some("Signature") {
-            if closing {
-                depth = depth.checked_sub(1).ok_or("unbalanced Signature")?;
-            } else if !body.ends_with('/') {
-                if depth == 0 {
-                    let id = body[name_end..]
-                        .split_once(" Id=\"")
-                        .and_then(|(_, value)| value.split_once('"'))
-                        .map(|(id, _)| id)
-                        .ok_or("a signature without an Id")?;
-                    found.push(id);
-                }
-                depth += 1;
-            }
-        }
-        rest = &tag[end..];
-    }
+fn signature_ids(text: &str) -> Result<Vec<String>, String> {
+    const DS: (&str, &str) = ("http://www.w3.org/2000/09/xmldsig#", "Signature");
+    let document = roxmltree::Document::parse(text).map_err(|error| error.to_string())?;
+    let found = document
+        .descendants()
+        .filter(|node| node.has_tag_name(DS))
+        .filter(|node| {
+            node.ancestors()
+                .skip(1)
+                .all(|ancestor| !ancestor.has_tag_name(DS))
+        })
+        .map(|node| {
+            node.attribute("Id")
+                .map(str::to_owned)
+                .ok_or_else(|| String::from("a signature without an Id"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     if found.is_empty() {
         return Err("the document has no signature".into());
     }
@@ -186,6 +174,8 @@ fn signing_key(
         "dsa" => A::DsaSha256,
         _ => return Err(format!("unknown signature algorithm {algorithm}")),
     };
+    // The key is a test key the harness issues for this run only: no other
+    // party can reach the process memory it would protect.
     let body: Vec<u8> = pem
         .lines()
         .filter(|line| !line.starts_with("-----"))
@@ -303,6 +293,20 @@ fn plan<'a>(
                     .collect(),
             )],
             ..one(HOST.to_owned(), excluding())
+        },
+        // XAdES's LT augmentation adds validation data beside the KeyInfo the
+        // signature signed, which must keep verifying.
+        "signed-key-info" => Plan {
+            signatures: vec![(
+                "sig",
+                vec![
+                    excluding(),
+                    DataObject::KeyInfo {
+                        mime_type: "text/xml",
+                    },
+                ],
+            )],
+            ..one(xml()?, excluding())
         },
         "inclusive" => {
             let (host, object) = signed("enveloped", data, &uris[0], policy)?;

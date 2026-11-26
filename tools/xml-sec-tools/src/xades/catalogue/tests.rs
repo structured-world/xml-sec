@@ -107,6 +107,23 @@ fn unknown_names_and_ambiguous_entries_are_reported() {
 }
 
 #[test]
+fn a_capability_or_reason_without_a_description_is_reported() {
+    // A classification must say why: an empty or non-string definition
+    // explains nothing, even when classes name it.
+    let mut catalogue = catalogue();
+    catalogue["capabilities"]["signature-policy"] = json!("");
+    catalogue["reasons"]["dss-api"] = json!(7);
+    let found = problems(&catalogue, &classes(), &cases());
+    assert_eq!(
+        found,
+        [
+            "signature/BetaTest: unsupported names unknown \"signature-policy\"",
+            "extension/GammaTest: not-applicable names unknown \"dss-api\"",
+        ]
+    );
+}
+
+#[test]
 fn an_entry_naming_nothing_is_reported() {
     // An empty list classifies nothing, whatever its status.
     let mut catalogue = catalogue();

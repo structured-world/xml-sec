@@ -377,7 +377,7 @@
     "signature/XAdESLevelLTTstRevocationFreshnessTest": { "not-applicable": "pki-scenario" },
     "signature/XAdESLevelLTWithCANoCrlSignTest": { "not-applicable": "pki-scenario" },
     "signature/XAdESLevelLTWithExpiredOCSPResponderTest": { "not-applicable": "pki-scenario" },
-    "signature/XAdESLevelLTWithKeyInfoReferenceTest": { "covered": ["creation/signed-key-info", "lifecycle/xml-sec-first-enveloping-rsa-crl"] },
+    "signature/XAdESLevelLTWithKeyInfoReferenceTest": { "covered": ["lifecycle/xml-sec-first-signed-key-info-rsa-crl", "lifecycle/dss-first-signed-key-info-rsa-crl"] },
     "signature/XAdESLevelLTWithNotYetValidCATest": { "not-applicable": "pki-scenario" },
     "signature/XAdESLevelLTWithSHA1OcspResponseTest": { "not-applicable": "pki-scenario" },
     "signature/XAdESLevelLTWrongAIATest": { "not-applicable": "pki-scenario" },

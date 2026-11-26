@@ -729,21 +729,21 @@ impl SignatureBuilder {
                 prefix.clone(),
             ));
         }
-        if let Some(id) = &self.signature_id
-            && !is_xml_ncname(id)
-        {
-            return Err(SignatureBuilderError::InvalidId {
-                element: "Signature",
-                value: id.clone(),
-            });
-        }
-        if let Some(id) = &self.signature_value_id
-            && !is_xml_ncname(id)
-        {
-            return Err(SignatureBuilderError::InvalidId {
-                element: "SignatureValue",
-                value: id.clone(),
-            });
+        // XMLDSig 1.1 types the Signature, SignatureValue and KeyInfo (§4.5)
+        // Id attributes as xs:ID.
+        for (element, id) in [
+            ("Signature", &self.signature_id),
+            ("SignatureValue", &self.signature_value_id),
+            ("KeyInfo", &self.key_info_id),
+        ] {
+            if let Some(id) = id
+                && !is_xml_ncname(id)
+            {
+                return Err(SignatureBuilderError::InvalidId {
+                    element,
+                    value: id.clone(),
+                });
+            }
         }
         // The template sink stops at the document limit, but escaping builds
         // each value's escaped copy before it reaches the sink: Object content

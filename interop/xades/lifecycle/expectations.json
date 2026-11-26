@@ -1583,6 +1583,7 @@
             "trust": "INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "others": [
               {
+                "crypto": "intact",
                 "structure": "XAdES-BASELINE-B",
                 "trust": "INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE"
               }
@@ -1601,7 +1602,8 @@
             "others": [
               {
                 "crypto": "Valid",
-                "structure": "Tokens"
+                "structure": "Tokens",
+                "structure_ber": "met"
               }
             ],
             "structure_ber": "met"
@@ -1619,7 +1621,8 @@
             "others": [
               {
                 "crypto": "Valid",
-                "structure": "Tokens"
+                "structure": "Tokens",
+                "structure_ber": "unmet"
               }
             ],
             "structure_ber": "unmet"
@@ -1637,7 +1640,8 @@
             "others": [
               {
                 "crypto": "Valid",
-                "structure": "Tokens"
+                "structure": "Tokens",
+                "structure_ber": "unmet"
               }
             ],
             "structure_ber": "unmet"
@@ -1670,6 +1674,7 @@
             "trust": "INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "others": [
               {
+                "crypto": "intact",
                 "structure": "XAdES-BASELINE-B",
                 "trust": "INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE"
               }
@@ -1688,7 +1693,8 @@
             "others": [
               {
                 "crypto": "Valid",
-                "structure": "Prepare"
+                "structure": "Prepare",
+                "structure_ber": "Prepare"
               }
             ],
             "structure_ber": "met"
@@ -1706,7 +1712,8 @@
             "others": [
               {
                 "crypto": "Valid",
-                "structure": "Prepare"
+                "structure": "Prepare",
+                "structure_ber": "Prepare"
               }
             ],
             "structure_ber": "unmet"
@@ -1724,7 +1731,8 @@
             "others": [
               {
                 "crypto": "Valid",
-                "structure": "Prepare"
+                "structure": "Prepare",
+                "structure_ber": "Prepare"
               }
             ],
             "structure_ber": "unmet"
@@ -1757,10 +1765,12 @@
             "trust": "INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "others": [
               {
+                "crypto": "intact",
                 "structure": "XAdES-BASELINE-B",
                 "trust": "INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE"
               },
               {
+                "crypto": "intact",
                 "structure": "XAdES-BASELINE-B",
                 "trust": "INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE"
               }
@@ -1779,11 +1789,13 @@
             "others": [
               {
                 "crypto": "Valid",
-                "structure": "Prepare"
+                "structure": "Prepare",
+                "structure_ber": "Prepare"
               },
               {
                 "crypto": "Valid",
-                "structure": "Prepare"
+                "structure": "Prepare",
+                "structure_ber": "Prepare"
               }
             ],
             "structure_ber": "met"
@@ -1801,11 +1813,13 @@
             "others": [
               {
                 "crypto": "Valid",
-                "structure": "Prepare"
+                "structure": "Prepare",
+                "structure_ber": "Prepare"
               },
               {
                 "crypto": "Valid",
-                "structure": "Prepare"
+                "structure": "Prepare",
+                "structure_ber": "Prepare"
               }
             ],
             "structure_ber": "unmet"
@@ -1823,11 +1837,13 @@
             "others": [
               {
                 "crypto": "Valid",
-                "structure": "Prepare"
+                "structure": "Prepare",
+                "structure_ber": "Prepare"
               },
               {
                 "crypto": "Valid",
-                "structure": "Prepare"
+                "structure": "Prepare",
+                "structure_ber": "Prepare"
               }
             ],
             "structure_ber": "unmet"
@@ -1906,6 +1922,69 @@
       ]
     },
     "xml-sec-first-inclusive-rsa-crl": {
+      "steps": [
+        {
+          "step": "b",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-B",
+            "evidence": {
+              "timestamps": 0,
+              "timestamps_intact": true,
+              "revocations": 0
+            },
+            "trust": "INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE"
+          }
+        },
+        {
+          "step": "t",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "met"
+          }
+        },
+        {
+          "step": "lt",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "unmet"
+          }
+        },
+        {
+          "step": "lta",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "unmet"
+          }
+        },
+        {
+          "step": "renew",
+          "by": "xml-sec",
+          "made": {
+            "refused": "completion: the required level is not met: Assessed"
+          }
+        }
+      ]
+    },
+    "xml-sec-first-signed-key-info-rsa-crl": {
       "steps": [
         {
           "step": "b",
@@ -3903,7 +3982,8 @@
             "others": [
               {
                 "crypto": "Valid",
-                "structure": "met"
+                "structure": "met",
+                "structure_ber": "met"
               }
             ],
             "structure_ber": "met"
@@ -3925,6 +4005,7 @@
             "trust": "INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "others": [
               {
+                "crypto": "intact",
                 "structure": "XAdES-BASELINE-T",
                 "trust": "INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE"
               }
@@ -3947,6 +4028,7 @@
             "trust": "TOTAL_PASSED/null",
             "others": [
               {
+                "crypto": "intact",
                 "structure": "XAdES-BASELINE-LT",
                 "trust": "TOTAL_PASSED/null"
               }
@@ -3969,6 +4051,7 @@
             "trust": "TOTAL_PASSED/null",
             "others": [
               {
+                "crypto": "intact",
                 "structure": "XAdES-BASELINE-LTA",
                 "trust": "TOTAL_PASSED/null"
               }
@@ -3987,7 +4070,8 @@
             "others": [
               {
                 "crypto": "Valid",
-                "structure": "Tokens"
+                "structure": "Tokens",
+                "structure_ber": "met"
               }
             ],
             "structure_ber": "met"
@@ -4009,7 +4093,8 @@
             "others": [
               {
                 "crypto": "Valid",
-                "structure": "met"
+                "structure": "met",
+                "structure_ber": "met"
               }
             ],
             "structure_ber": "met"
@@ -4031,6 +4116,7 @@
             "trust": "INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "others": [
               {
+                "crypto": "intact",
                 "structure": "XAdES-BASELINE-B",
                 "trust": "INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE"
               }
@@ -4053,6 +4139,7 @@
             "trust": "TOTAL_PASSED/null",
             "others": [
               {
+                "crypto": "intact",
                 "structure": "XAdES-BASELINE-B",
                 "trust": "TOTAL_PASSED/null"
               }
@@ -4075,6 +4162,7 @@
             "trust": "TOTAL_PASSED/null",
             "others": [
               {
+                "crypto": "intact",
                 "structure": "XAdES-BASELINE-B",
                 "trust": "TOTAL_PASSED/null"
               }
@@ -4093,7 +4181,8 @@
             "others": [
               {
                 "crypto": "Valid",
-                "structure": "Prepare"
+                "structure": "Prepare",
+                "structure_ber": "Prepare"
               }
             ],
             "structure_ber": "met"
@@ -4115,11 +4204,13 @@
             "others": [
               {
                 "crypto": "Valid",
-                "structure": "met"
+                "structure": "met",
+                "structure_ber": "met"
               },
               {
                 "crypto": "Valid",
-                "structure": "met"
+                "structure": "met",
+                "structure_ber": "met"
               }
             ],
             "structure_ber": "met"
@@ -4141,10 +4232,12 @@
             "trust": "INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE",
             "others": [
               {
+                "crypto": "intact",
                 "structure": "XAdES-BASELINE-B",
                 "trust": "INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE"
               },
               {
+                "crypto": "intact",
                 "structure": "XAdES-BASELINE-B",
                 "trust": "INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE"
               }
@@ -4167,10 +4260,12 @@
             "trust": "TOTAL_PASSED/null",
             "others": [
               {
+                "crypto": "intact",
                 "structure": "XAdES-BASELINE-B",
                 "trust": "TOTAL_PASSED/null"
               },
               {
+                "crypto": "intact",
                 "structure": "XAdES-BASELINE-B",
                 "trust": "TOTAL_PASSED/null"
               }
@@ -4193,10 +4288,12 @@
             "trust": "TOTAL_PASSED/null",
             "others": [
               {
+                "crypto": "intact",
                 "structure": "XAdES-BASELINE-B",
                 "trust": "TOTAL_PASSED/null"
               },
               {
+                "crypto": "intact",
                 "structure": "XAdES-BASELINE-B",
                 "trust": "TOTAL_PASSED/null"
               }
@@ -4215,11 +4312,13 @@
             "others": [
               {
                 "crypto": "Valid",
-                "structure": "Prepare"
+                "structure": "Prepare",
+                "structure_ber": "Prepare"
               },
               {
                 "crypto": "Valid",
-                "structure": "Prepare"
+                "structure": "Prepare",
+                "structure_ber": "Prepare"
               }
             ],
             "structure_ber": "met"
@@ -4380,6 +4479,82 @@
       ]
     },
     "dss-first-pretty-print-rsa-crl": {
+      "steps": [
+        {
+          "step": "b",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "met",
+            "trust": "not assessed",
+            "structure_ber": "met"
+          }
+        },
+        {
+          "step": "t",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-T",
+            "evidence": {
+              "timestamps": 1,
+              "timestamps_intact": true,
+              "revocations": 0
+            },
+            "trust": "INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE"
+          }
+        },
+        {
+          "step": "lt",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-LT",
+            "evidence": {
+              "timestamps": 1,
+              "timestamps_intact": true,
+              "revocations": 2
+            },
+            "trust": "TOTAL_PASSED/null"
+          }
+        },
+        {
+          "step": "lta",
+          "by": "xml-sec",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "intact",
+            "structure": "XAdES-BASELINE-LTA",
+            "evidence": {
+              "timestamps": 2,
+              "timestamps_intact": true,
+              "revocations": 2
+            },
+            "trust": "TOTAL_PASSED/null"
+          }
+        },
+        {
+          "step": "renew",
+          "by": "dss",
+          "made": "made",
+          "preserved": true,
+          "validated": {
+            "crypto": "Valid",
+            "structure": "Tokens",
+            "trust": "not assessed",
+            "structure_ber": "met"
+          }
+        }
+      ]
+    },
+    "dss-first-signed-key-info-rsa-crl": {
       "steps": [
         {
           "step": "b",

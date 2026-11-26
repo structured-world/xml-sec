@@ -56,6 +56,44 @@ fn names_get_one_declaration_per_namespace_scope() {
 }
 
 #[test]
+fn a_fallback_prefix_never_shadows_a_chosen_one() {
+    // Namespaces in XML 1.0 §6.1: an inner declaration of a prefix rebinds it
+    // for the whole subtree. With `ds` chosen for another namespace, the XMLDSig
+    // child must take a different prefix, so the innermost element keeps the
+    // chosen namespace; the result is read back with its expanded names.
+    const OUTER: &str = "urn:outer";
+    let mut draft = Draft::with_prefixes(&[(OUTER, "ds")]).expect("ds is a prefix");
+    write(
+        &mut draft,
+        &[
+            Event::Begin(name(OUTER, "Root")),
+            Event::Begin(name(DS, "Child")),
+            Event::Begin(name(OUTER, "Leaf")),
+            Event::End,
+            Event::End,
+            Event::End,
+        ],
+    )
+    .expect("events are accepted");
+    let markup = draft.finish().expect("one complete element").0;
+    let document = roxmltree::Document::parse(&markup).expect("well-formed");
+    let names: Vec<(Option<&str>, &str)> = document
+        .descendants()
+        .filter(roxmltree::Node::is_element)
+        .map(|node| (node.tag_name().namespace(), node.tag_name().name()))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            (Some(OUTER), "Root"),
+            (Some(DS), "Child"),
+            (Some(OUTER), "Leaf")
+        ],
+        "{markup}"
+    );
+}
+
+#[test]
 fn an_unknown_namespace_gets_a_generated_prefix() {
     let markup = finished(&[
         Event::Begin(name("urn:other", "a")),

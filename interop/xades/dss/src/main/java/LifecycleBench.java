@@ -116,6 +116,10 @@ public class LifecycleBench {
     }
 
     public static void main(String[] arguments) throws Exception {
+        // DSS logs INFO for every signature its token makes; writing those lines
+        // inside the timed loop would measure stderr, so the benchmark keeps
+        // only warnings. Set before the first logger exists.
+        System.setProperty("org.slf4j.simpleLogger.log.eu.europa.esig.dss", "warn");
         List<String> args = new ArrayList<>(List.of(arguments));
         String samples = take(args, "--samples");
         String warmupCount = take(args, "--warmups");

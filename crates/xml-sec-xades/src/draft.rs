@@ -118,6 +118,30 @@ impl Draft {
         Ok(draft)
     }
 
+    /// The prefix bound to `namespace` in scope: the innermost declaration of
+    /// it whose prefix no inner element rebinds to another namespace.
+    fn in_scope(&self, namespace: &str) -> Option<String> {
+        let mut rebound: Vec<&str> = Vec::new();
+        for frame in self.frames.iter().rev() {
+            for (bound, prefix) in &frame.bindings {
+                if prefix.is_empty() || rebound.contains(&prefix.as_str()) {
+                    continue;
+                }
+                if *bound == namespace {
+                    return Some(prefix.clone());
+                }
+            }
+            rebound.extend(
+                frame
+                    .bindings
+                    .iter()
+                    .filter(|(bound, _)| *bound != namespace)
+                    .map(|(_, prefix)| prefix.as_str()),
+            );
+        }
+        None
+    }
+
     /// The default namespace in scope, if one is declared.
     fn default_namespace(&self) -> Option<&'static str> {
         self.frames.iter().rev().find_map(|frame| {
@@ -190,24 +214,38 @@ impl Draft {
             frame.bindings.push((namespace, String::new()));
             return Ok((String::new(), true));
         }
-        if let Some(prefix) = self.frames.iter().rev().find_map(|frame| {
-            frame.bindings.iter().find_map(|(bound, prefix)| {
-                (*bound == namespace && !prefix.is_empty()).then(|| prefix.clone())
-            })
-        }) {
+        if let Some(prefix) = self.in_scope(namespace) {
             return Ok((prefix, false));
         }
-        // Each prefix is bound only to its own namespace in this draft, so a
-        // new declaration never rebinds an enclosing scope.
-        let prefix: String = if let Some(prefix) = chosen {
-            prefix
-        } else if let Some((_, prefix)) =
-            KNOWN_PREFIXES.iter().find(|(known, _)| *known == namespace)
-        {
-            (*prefix).into()
-        } else {
-            self.generated += 1;
-            format!("ns{}", self.generated)
+        // A fallback prefix the caller chose for another namespace, or one in
+        // scope for another namespace, would rebind it for this subtree
+        // (Namespaces in XML 1.0 §6.1): such a prefix is skipped.
+        let taken = |draft: &Self, prefix: &str| {
+            draft
+                .chosen
+                .iter()
+                .any(|(bound, chosen)| chosen == prefix && *bound != namespace)
+                || draft
+                    .frames
+                    .iter()
+                    .flat_map(|frame| frame.bindings.iter())
+                    .any(|(bound, bound_prefix)| bound_prefix == prefix && *bound != namespace)
+        };
+        let known = KNOWN_PREFIXES
+            .iter()
+            .find(|(known, _)| *known == namespace)
+            .map(|(_, prefix)| String::from(*prefix));
+        let prefix: String = match (chosen, known) {
+            (Some(prefix), _) => prefix,
+            (None, Some(prefix)) if !taken(self, &prefix) => prefix,
+            _ => loop {
+                work.charge_work(1)?;
+                self.generated += 1;
+                let prefix = format!("ns{}", self.generated);
+                if !taken(self, &prefix) {
+                    break prefix;
+                }
+            },
         };
         let frame = self
             .frames
