@@ -111,6 +111,12 @@ pub(crate) unsafe extern "C" fn value_duplicate(
     contain(-1, || {
         binary_klass_or!(dst, "xmlSecKeyDataBinaryValueDuplicate", -1);
         let buffer = binary_buffer_or!(src, "xmlSecKeyDataBinaryValueDuplicate", -1);
+        // Setting a buffer from itself would empty it first: libxmlsec1
+        // asserts the two differ.
+        if std::ptr::eq(dst, src) {
+            errors::assertion(here!("xmlSecKeyDataBinaryValueDuplicate"), c"src != dst");
+            return -1;
+        }
         // SAFETY: both are binary key data.
         unsafe {
             if xmlSecKeyDataBinaryValueSetBuffer(

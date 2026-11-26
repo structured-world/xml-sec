@@ -109,6 +109,24 @@ fn mixed_generations_duplicate_packages_and_non_registry_substitutes_fail_before
 }
 
 #[test]
+fn patch_releases_within_one_generation_qualify() {
+    // A patch release of one shared crate (structured-pkix 0.30.1 beside the
+    // others at 0.30.0) is the same coordinated generation: Cargo treats
+    // 0.x.y and 0.x.z as compatible, so the graph still qualifies.
+    let mut patched = packages();
+    patched[1]["version"] = json!("0.13.1");
+    patched[1]["manifest_path"] =
+        json!("/store/registry/src/index/structured-pkix-0.13.1/Cargo.toml");
+    let mut cargo = Cargo::new(patched);
+    execute(&mut cargo).unwrap();
+    assert_eq!(cargo.checks.len(), 4);
+    // Another minor of a 0.x crate is another generation.
+    let mut minor = packages();
+    minor[1]["version"] = json!("0.14.0");
+    assert!(manifests(&json!({ "packages": minor })).is_err());
+}
+
+#[test]
 fn a_target_failure_terminates_qualification_with_its_original_status() {
     // Later successful targets must not conceal an alloc-only compile failure.
     let mut cargo = Cargo {

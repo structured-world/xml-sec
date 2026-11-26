@@ -1472,7 +1472,22 @@ fn has_encoded_xpointer_prefix(fragment: &str) -> bool {
     true
 }
 
-fn is_xpointer_root(fragment: &str) -> bool {
+/// Whether a same-document fragment is the `xpointer(/)` whole-document
+/// pointer as verification resolves it, whitespace around the `/` included.
+/// Callers that classify `Reference` URIs outside verification use it to read
+/// them the same way.
+///
+/// # Examples
+///
+/// ```
+/// use xml_sec::xmldsig::uri::is_xpointer_root;
+///
+/// assert!(is_xpointer_root("xpointer(/)"));
+/// assert!(is_xpointer_root("xpointer( / )"));
+/// assert!(!is_xpointer_root("xpointer(id('props'))"));
+/// ```
+#[must_use]
+pub fn is_xpointer_root(fragment: &str) -> bool {
     fragment
         .strip_prefix("xpointer(")
         .and_then(|value| value.strip_suffix(')'))
@@ -1512,9 +1527,22 @@ pub(crate) fn map_xml_base_resolution_error(error: XmlBaseResolutionError) -> Tr
     }
 }
 
-/// Parse `xpointer(id('value'))` or `xpointer(id("value"))` and return the ID value.
-/// Returns `None` if the fragment doesn't match this pattern.
-pub(crate) fn parse_xpointer_id_fragment(fragment: &str) -> Option<&str> {
+/// The ID a same-document `xpointer(id('value'))` or `xpointer(id("value"))`
+/// fragment names, as verification resolves it, whitespace between the
+/// tokens included; `None` for any other fragment. Callers that classify
+/// `Reference` URIs outside verification use it to read them the same way.
+///
+/// # Examples
+///
+/// ```
+/// use xml_sec::xmldsig::uri::parse_xpointer_id_fragment;
+///
+/// assert_eq!(parse_xpointer_id_fragment("xpointer(id('props'))"), Some("props"));
+/// assert_eq!(parse_xpointer_id_fragment("xpointer( id ( \"props\" ) )"), Some("props"));
+/// assert_eq!(parse_xpointer_id_fragment("props"), None);
+/// ```
+#[must_use]
+pub fn parse_xpointer_id_fragment(fragment: &str) -> Option<&str> {
     // XPath 1.0 section 3.7 [29]: a Literal cannot contain its delimiter.
     // Whitespace may separate tokens, but must not split the function name.
     // https://www.w3.org/TR/1999/REC-xpath-19991116/#exprlex

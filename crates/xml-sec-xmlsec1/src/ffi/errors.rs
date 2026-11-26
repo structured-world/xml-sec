@@ -154,8 +154,8 @@ static TABLE: [(c_int, &CStr); 56] = [
     (77, c"CRL verification failed"),
     (78, c"CRL is not yet valid"),
     (79, c"CRL has expired"),
-    (81, c"Reference nodes are not found"),
-    (82, c"Reference verification failed"),
+    (81, c"reference nodes are not found"),
+    (82, c"reference verification failed"),
     (100, c"assertion"),
     (101, c"cast from one type to another is impossible"),
 ];
@@ -513,6 +513,28 @@ pub(crate) unsafe fn invalid_node_content(
         std::ptr::null(),
         R_INVALID_NODE_CONTENT,
         &format!("node={name}; reason={reason}"),
+    );
+}
+
+/// libxmlsec1's `xmlSecInvalidNodeContentError3`: a formatted `message`
+/// about `node`'s content, the node named after it.
+///
+/// # Safety
+/// `node` is null or a live node.
+pub(crate) unsafe fn invalid_node_content_with(
+    here: Here,
+    node: *const XmlNode,
+    object: *const c_char,
+    message: &str,
+) {
+    // SAFETY: by the caller's contract.
+    let name = unsafe { node_name(node) };
+    report(
+        here,
+        object,
+        std::ptr::null(),
+        R_INVALID_NODE_CONTENT,
+        &format!("{message}; node={name}"),
     );
 }
 

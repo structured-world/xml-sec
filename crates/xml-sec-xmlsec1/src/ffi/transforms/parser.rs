@@ -226,7 +226,15 @@ unsafe fn push_working(
         }
         if !object.next.is_null() && xmlSecTransformPushXml(object.next, object.out_nodes, ctx) < 0
         {
-            errors::internal(here, name(), c"xmlSecTransformPushXml");
+            // The report names the transform the nodes were pushed to, the
+            // one that failed, as libxmlsec1 does.
+            let next = (*object.next).id;
+            let failed = if next.is_null() {
+                std::ptr::null()
+            } else {
+                (*next).name.cast()
+            };
+            errors::internal(here, failed, c"xmlSecTransformPushXml");
             return -1;
         }
         object.status = STATUS_FINISHED;

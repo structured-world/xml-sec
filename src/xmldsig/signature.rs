@@ -318,6 +318,10 @@ pub enum SignatureVerificationError {
     #[error("invalid SubjectPublicKeyInfo DER")]
     InvalidKeyDer,
 
+    /// The key names an elliptic curve this build does not verify with.
+    #[error("unsupported elliptic curve")]
+    UnsupportedCurve,
+
     /// A structurally valid key violates the active key-strength policy.
     #[error("verification key rejected by policy: {0}")]
     KeyPolicy(#[from] crate::policy::PolicyViolation),
@@ -975,10 +979,18 @@ fn ecdsa_public_key<'a>(
     session: &CertificateSession,
     spki: &'a [u8],
 ) -> Result<(EcCurve, &'a [u8]), SignatureVerificationError> {
-    let (curve, range) = session
+    let (curve, range) = match session
         .ec_named_point(spki)
         .map_err(|error| key_read_error(session, &error))?
-        .ok_or(SignatureVerificationError::InvalidKeyDer)?;
+    {
+        super::pkix::EcNamedPoint::Supported(curve, range) => (curve, range),
+        super::pkix::EcNamedPoint::UnsupportedCurve => {
+            return Err(SignatureVerificationError::UnsupportedCurve);
+        }
+        super::pkix::EcNamedPoint::Malformed => {
+            return Err(SignatureVerificationError::InvalidKeyDer);
+        }
+    };
     let point = spki
         .get(range)
         .ok_or(SignatureVerificationError::InvalidKeyDer)?;
@@ -1313,6 +1325,22 @@ mod tests {
                 SignatureVerificationError::UnsupportedAlgorithm { .. }
             ));
         }
+    }
+
+    #[test]
+    fn ecdsa_on_an_unsupported_named_curve_is_not_reported_as_malformed() {
+        // A well-formed SPKI naming brainpoolP256r1 (RFC 5639 §4.1, OID
+        // 1.3.36.3.3.2.8.1.1.7) is a curve this build does not verify with,
+        // not an invalid encoding; callers report the two differently.
+        let mut spki = vec![
+            0x30, 0x5a, 0x30, 0x14, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06,
+            0x09, 0x2b, 0x24, 0x03, 0x03, 0x02, 0x08, 0x01, 0x01, 0x07, 0x03, 0x42, 0x00, 0x04,
+        ];
+        spki.extend([0x01; 64]);
+        assert!(matches!(
+            verify_ecdsa_signature_spki(SignatureAlgorithm::EcdsaSha256, &spki, b"data", &[0; 64]),
+            Err(SignatureVerificationError::UnsupportedCurve)
+        ));
     }
 
     #[test]

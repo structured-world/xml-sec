@@ -842,13 +842,14 @@ pub(crate) fn execute(corpus: &Corpus, results: &Path, options: &Options) -> Res
         return Err("results already exist; select a fresh --results directory".into());
     }
     std::fs::create_dir_all(results).map_err(|error| error.to_string())?;
-    crate::xades::dss::build(corpus, &results.join("dss-build"))?;
+    let crate::xades::dss::Built { release, classpath } =
+        crate::xades::dss::build(corpus, &results.join("dss-build"))?;
     let binaries = Binaries::build(corpus, &results.join("bin"))?;
     let run = Run {
         corpus,
         results: results.join("chain"),
         pki: results.join("pki"),
-        classpath: crate::xades::dss::classpath(corpus)?,
+        classpath,
         lifecycle_probe: binaries.lifecycle.clone(),
         level_probe: binaries.level.clone(),
         at: now()? + 86_400,
@@ -919,7 +920,8 @@ pub(crate) fn execute(corpus: &Corpus, results: &Path, options: &Options) -> Res
                 "repetitions": REPETITIONS,
                 "rustc": version("rustc", &["-V"]),
                 "java": version("java", &["-version"]),
-                "dss": "6.5.1",
+                "dss": release.dss,
+                "maven": release.maven,
                 "timing": "monotonic clock around each run inside the process (warm) or around each process (cold)",
                 "memory": "native allocations come from a separate instrumented build and are never timed; JVM thread allocation, GC and heap counters cover the warm samples and are a different metric",
             },

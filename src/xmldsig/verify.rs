@@ -3459,9 +3459,11 @@ fn prepare_verification_signature<'a, C: VerificationCapture>(
         .into());
     }
     let signature_children = parse_signature_children(signature_node)?;
-    ctx.policy
-        .signature_constraints
-        .check(signature_node, &operation.budgets().transforms)?;
+    ctx.policy.signature_constraints.check(
+        ctx.policy.xades_syntax,
+        signature_node,
+        &operation.budgets().transforms,
+    )?;
     if ctx.encapsulated() {
         // Public-key encapsulation establishes a recipient secret, not sender
         // identity. Reject an impossible trust requirement before key work.

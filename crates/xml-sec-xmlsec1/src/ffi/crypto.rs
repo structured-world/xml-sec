@@ -406,7 +406,7 @@ fn libraries_ready(here: errors::Here, failed: &CStr) -> bool {
     // SAFETY: the list has a fixed address.
     let ready = std::ptr::eq(unsafe { (*LIBRARIES.get()).id }, &raw const LIBRARY_LIST);
     if !ready {
-        errors::internal(here, c"not initialized".as_ptr(), failed);
+        errors::internal(here, std::ptr::null(), failed);
     }
     ready
 }

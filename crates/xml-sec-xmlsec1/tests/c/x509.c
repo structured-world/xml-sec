@@ -359,6 +359,18 @@ int main(void) {
                   "CN=Test Key rsa-2048,O=XML Security Library (http://www.aleksey.com/xmlsec),"
                   "ST=California,C=US</X509SubjectName></X509Data></KeyInfo>",
                   0, 0);
+    /* An X509IssuerSerial whose X509SerialNumber is missing: the node is not
+     * found, unlike another element in its place. */
+    read_key_info("issuer serial without its serial number", mngr,
+                  "<KeyInfo xmlns='" DSIG "'><X509Data><X509IssuerSerial>"
+                  "<X509IssuerName>CN=Test</X509IssuerName></X509IssuerSerial>"
+                  "</X509Data></KeyInfo>",
+                  0, 0);
+    read_key_info("issuer serial with another element in place", mngr,
+                  "<KeyInfo xmlns='" DSIG "'><X509Data><X509IssuerSerial>"
+                  "<X509IssuerName>CN=Test</X509IssuerName><X509SKI>AA==</X509SKI>"
+                  "</X509IssuerSerial></X509Data></KeyInfo>",
+                  0, 0);
     xmlSecKeysMngrDestroy(mngr);
 
     /* A key the request cannot use does not hide a usable one with the same

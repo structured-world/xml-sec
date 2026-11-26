@@ -235,6 +235,7 @@ fn phaos_certificate_chain_is_expired_at_a_modern_verification_time() {
         rsa_keys: xml_sec::policy::RsaKeyPolicy::default(),
         dsa_keys: xml_sec::policy::DsaKeyPolicy::default(),
         certificate_signature_algorithms: None,
+        validity_model: xml_sec::policy::CertificateValidityModel::Shell,
     };
 
     assert_eq!(
@@ -289,6 +290,7 @@ fn x509_path_enforces_configured_issuer_rsa_minimum() {
         rsa_keys: xml_sec::policy::RsaKeyPolicy::default(),
         dsa_keys: xml_sec::policy::DsaKeyPolicy::default(),
         certificate_signature_algorithms: None,
+        validity_model: xml_sec::policy::CertificateValidityModel::Shell,
     };
 
     verify_x509_certificate_chain(&info, &options).expect("canonical chain meets default minimum");
@@ -328,6 +330,7 @@ fn phaos_non_der_key_usage_cannot_establish_certificate_trust() {
         },
         dsa_keys: xml_sec::policy::DsaKeyPolicy::default(),
         certificate_signature_algorithms: None,
+        validity_model: xml_sec::policy::CertificateValidityModel::Shell,
     };
     assert_eq!(
         verify_x509_certificate_chain(&info, &options),

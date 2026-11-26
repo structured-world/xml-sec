@@ -579,7 +579,22 @@ fn read_issuer_serial(
     }
     // SAFETY: a live element.
     let second = unsafe { xmlSecGetNextElementNode(nodes::next(first)) };
-    if second.is_null() || !is(second, &xmlSecNodeX509SerialNumber, &xmlSecDSigNs) {
+    // A missing X509SerialNumber is a node not found, another element in its
+    // place an invalid node, as libxmlsec1 reports them.
+    if second.is_null() {
+        // SAFETY: `node` is the live X509IssuerSerial element.
+        unsafe {
+            errors::node_not_found(
+                here,
+                c"xmlSecGetNextElementNode",
+                node,
+                c"X509SerialNumber",
+                std::ptr::null(),
+            );
+        }
+        return false;
+    }
+    if !is(second, &xmlSecNodeX509SerialNumber, &xmlSecDSigNs) {
         return missing("X509SerialNumber");
     }
     if !read_string(here, &mut value.issuer_serial, second, flags) {

@@ -177,6 +177,10 @@ int main(void) {
     printf("dump:\n");
     xmlSecKeyDataDebugDump(xmlSecKeyGetValue(key), stdout);
     xmlSecKeyDataDebugXmlDump(xmlSecKeyGetValue(key), stdout);
+    /* a self-duplicate through the klass is refused and keeps the value */
+    printf("self duplicate: %d", xmlSecKeyGetValue(key)->id->duplicate(xmlSecKeyGetValue(key),
+                                                                       xmlSecKeyGetValue(key)));
+    printf(" size=%d\n", (int)xmlSecKeyDataGetSize(xmlSecKeyGetValue(key)));
     printf("same again: %d\n", read_value(xmlSecKeyDataAesId, key, ctx, "AAECAwQFBgcICQoLDA0ODw=="));
     printf("other bytes: %d\n", read_value(xmlSecKeyDataAesId, key, ctx, "DwECAwQFBgcICQoLDA0ODw=="));
     printf("other size: %d\n", read_value(xmlSecKeyDataAesId, key, ctx, "AAECAw=="));

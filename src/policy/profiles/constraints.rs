@@ -3,7 +3,7 @@ use super::OAEP_MGF_DIGESTS;
 use super::{PolicyCompileContext, PolicyView, SignatureConstraints, configuration};
 use crate::policy::{
     CertificateSignatureAlgorithms, HmacPolicy, KeyTrustPolicy, PolicyViolation, TransformPolicy,
-    UriPolicy,
+    UriPolicy, XadesSyntax,
 };
 #[cfg(feature = "xmlenc")]
 use crate::policy::{
@@ -287,8 +287,11 @@ impl SignatureConstraints {
 
     /// Borrowed direct-child inspection, before resolver or provider callbacks.
     /// Protocol validators still own replay, audience, time and application semantics.
+    /// `syntax` is the `XAdES` syntaxes the operation reads; signing writes
+    /// [`XadesSyntax::En319132`] only.
     pub(crate) fn check(
         self,
+        syntax: XadesSyntax,
         signature: Node<'_, '_>,
         budget: &crate::xmldsig::transforms::TransformExecutionBudget,
     ) -> Result<(), PolicyViolation> {
@@ -307,7 +310,7 @@ impl SignatureConstraints {
             Self::General => Ok(()),
             Self::Saml => saml(signature),
             Self::WsSecurity => ws_security(signature),
-            Self::Xades => xades(signature, budget),
+            Self::Xades => xades(signature, syntax, budget),
         }
         .map_err(|error| match error {
             PolicyViolation::Configuration { reason } => PolicyViolation::SignatureProfile {
@@ -537,28 +540,66 @@ fn ws_security(signature: Node<'_, '_>) -> Result<(), PolicyViolation> {
     Ok(())
 }
 
+/// One `XAdES` syntax: the namespace of its properties and the type of the
+/// `Reference` that protects its `SignedProperties`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Syntax {
+    namespace: &'static str,
+    signed_properties: &'static str,
+}
+
+/// ETSI EN 319 132-1 V1.3.1 §4.4.2: `SignedProperties` is protected by a
+/// `Reference` with this `Type`.
+/// <https://www.etsi.org/deliver/etsi_en/319100_319199/31913201/01.03.01_60/en_31913201v010301p.pdf>
+const EN_319_132: Syntax = Syntax {
+    namespace: "http://uri.etsi.org/01903/v1.3.2#",
+    signed_properties: "http://uri.etsi.org/01903#SignedProperties",
+};
+
+/// ETSI TS 101 903 V1.2.2 §5 and §6.3.1 mandate its own namespace and Type.
+/// <https://www.etsi.org/deliver/etsi_ts/101900_101999/101903/01.02.02_60/ts_101903v010202p.pdf>
+const TS_101_903_V122: Syntax = Syntax {
+    namespace: "http://uri.etsi.org/01903/v1.2.2#",
+    signed_properties: "http://uri.etsi.org/01903/v1.2.2#SignedProperties",
+};
+
 fn xades(
     signature: Node<'_, '_>,
+    accepted: XadesSyntax,
     budget: &crate::xmldsig::transforms::TransformExecutionBudget,
 ) -> Result<(), PolicyViolation> {
-    // ETSI EN 319 132-1 V1.3.1 §4.4.2: SignedProperties is protected by
-    // a Reference with the assigned Type. This checks XML-security binding,
-    // not the complete signature profile or its timestamp/certificate claims.
-    // https://www.etsi.org/deliver/etsi_en/319100_319199/31913201/01.03.01_60/en_31913201v010301p.pdf
-    const XADES: &str = "http://uri.etsi.org/01903/v1.3.2#";
+    // This checks XML-security binding, not the complete signature profile or
+    // its timestamp/certificate claims. The policy, never the document,
+    // decides which syntaxes are read; the QualifyingProperties found select
+    // one of them for the whole signature.
+    let syntaxes: &[Syntax] = match accepted {
+        XadesSyntax::En319132 => &[EN_319_132],
+        XadesSyntax::WithTs101903V122 => &[EN_319_132, TS_101_903_V122],
+    };
     let signature_id = signature
         .attribute("Id")
         .filter(|id| !id.is_empty())
         .ok_or(configuration("XAdES Signature requires Id"))?;
     let mut properties = None;
+    let mut selected: Option<Syntax> = None;
     for object in signature
         .children()
         .filter(|node| named(*node, DS, "Object"))
     {
-        for qualifying in object
-            .children()
-            .filter(|node| named(*node, XADES, "QualifyingProperties"))
-        {
+        for (qualifying, syntax) in object.children().filter_map(|node| {
+            syntaxes
+                .iter()
+                .find(|syntax| named(node, syntax.namespace, "QualifyingProperties"))
+                .map(|syntax| (node, *syntax))
+        }) {
+            if selected
+                .replace(syntax)
+                .is_some_and(|other| other != syntax)
+            {
+                return Err(configuration(
+                    "XAdES properties mix the namespaces of two syntaxes",
+                ));
+            }
             if qualifying
                 .attribute("Target")
                 .and_then(|uri| uri.strip_prefix('#'))
@@ -570,7 +611,7 @@ fn xades(
             }
             for node in qualifying
                 .children()
-                .filter(|node| named(*node, XADES, "SignedProperties"))
+                .filter(|node| named(*node, syntax.namespace, "SignedProperties"))
             {
                 if properties.replace(node).is_some() {
                     return Err(configuration("XAdES requires unique SignedProperties"));
@@ -578,19 +619,18 @@ fn xades(
             }
         }
     }
-    let properties = properties.ok_or(configuration("XAdES requires SignedProperties"))?;
+    let (Some(properties), Some(syntax)) = (properties, selected) else {
+        return Err(configuration("XAdES requires SignedProperties"));
+    };
     let id = properties
         .attribute("Id")
         .filter(|id| !id.is_empty())
         .ok_or(configuration("SignedProperties requires Id"))?;
-    // ETSI EN 319 132-1 V1.3.1 §4.3.2 forbids empty SignedProperties and
-    // defines this sequence of optional containers, not arbitrary children.
-    // https://www.etsi.org/deliver/etsi_en/319100_319199/31913201/01.03.01_60/en_31913201v010301p.pdf
-    xades_containers(properties, budget)?;
+    xades_containers(properties, syntax, budget)?;
     let info = child(signature, DS, "SignedInfo").ok_or(configuration("missing SignedInfo"))?;
     let mut count = 0;
     for reference in info.children().filter(|node| named(*node, DS, "Reference")) {
-        if reference.attribute("Type") == Some("http://uri.etsi.org/01903#SignedProperties") {
+        if reference.attribute("Type") == Some(syntax.signed_properties) {
             if reference
                 .attribute("URI")
                 .and_then(|uri| uri.strip_prefix('#'))
@@ -630,17 +670,22 @@ fn xades(
 
 fn xades_containers(
     properties: Node<'_, '_>,
+    syntax: Syntax,
     budget: &crate::xmldsig::transforms::TransformExecutionBudget,
 ) -> Result<(), PolicyViolation> {
-    // ETSI EN 319 132-1 V1.3.1 §4.3.2 requires nonempty, ordered containers.
+    // ETSI EN 319 132-1 V1.3.1 §4.3.2 forbids empty SignedProperties and
+    // defines this sequence of optional containers, not arbitrary children.
     // https://www.etsi.org/deliver/etsi_en/319100_319199/31913201/01.03.01_60/en_31913201v010301p.pdf
-    const XADES: &str = "http://uri.etsi.org/01903/v1.3.2#";
+    // ETSI TS 101 903 V1.2.2 §6.2.1 has the same sequence and makes
+    // SignedSignatureProperties mandatory.
     let mut last = 0;
+    let mut signature_properties = false;
     for node in properties.children() {
         if node.is_element() {
-            let position = if named(node, XADES, "SignedSignatureProperties") {
+            let position = if named(node, syntax.namespace, "SignedSignatureProperties") {
+                signature_properties = true;
                 1
-            } else if named(node, XADES, "SignedDataObjectProperties") {
+            } else if named(node, syntax.namespace, "SignedDataObjectProperties") {
                 2
             } else {
                 return Err(configuration("invalid SignedProperties child"));
@@ -670,6 +715,11 @@ fn xades_containers(
     if last == 0 {
         return Err(configuration(
             "SignedProperties requires a qualifying-property container",
+        ));
+    }
+    if syntax == TS_101_903_V122 && !signature_properties {
+        return Err(configuration(
+            "SignedProperties requires SignedSignatureProperties",
         ));
     }
     Ok(())
