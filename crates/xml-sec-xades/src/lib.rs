@@ -50,7 +50,9 @@
 //! `add_validation_data` takes a B-T signature to B-LT: the level's own census
 //! decides which certificates, CRLs and OCSP responses the document lacks, or
 //! holds only where a timestamp may not use them, and they are appended from
-//! the caller's inputs or the document as one `AnyValidationData`.
+//! the caller's inputs or the document as one `AnyValidationData`;
+//! `refresh_validation_data` adds the caller's fresher statuses to a
+//! signature that already meets B-LT.
 //! `request_archive_timestamp` then takes a B-LT signature to B-LTA through the
 //! same completion, and a B-LTA one to its next renewal: each new
 //! `ArchiveTimeStamp` covers every earlier archive.
@@ -95,8 +97,8 @@ pub use accuracy::AuthorityAccuracy;
 pub use augment::{
     AugmentError, Completion, DataAdded, DigestRenewal, PendingTimestamp, PolicyStoreRequest,
     TimestampRequest, TokenFacts, ValidationData, add_policy_store, add_validation_data,
-    complete_timestamp, request_archive_timestamp, request_archive_timestamp_with_renewal,
-    request_timestamp,
+    complete_timestamp, refresh_validation_data, request_archive_timestamp,
+    request_archive_timestamp_with_renewal, request_timestamp,
 };
 pub use basic::{
     CounterError, EnclosingError, Outcome, PathFailure, Report, TimestampCheckError,

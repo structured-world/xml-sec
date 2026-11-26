@@ -184,6 +184,12 @@ impl Levels<'_> {
         self.crl_listing(issuer, "")
     }
 
+    /// The next empty complete CRL of `issuer`, number 02, issued after the
+    /// one [`Self::crl`] issues.
+    pub(super) fn next_crl(&self, issuer: &str) -> Result<Vec<u8>, String> {
+        self.crl_numbered(issuer, "", "02\n", &[])
+    }
+
     /// A complete CRL of `issuer` listing `subject` as revoked before the
     /// fixtures' test instant, as DER.
     pub(super) fn crl_revoking(&self, issuer: &str, subject: &str) -> Result<Vec<u8>, String> {

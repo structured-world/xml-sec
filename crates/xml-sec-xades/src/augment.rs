@@ -18,7 +18,9 @@ mod store;
 mod validation_data;
 
 pub use store::{PolicyStoreRequest, add_policy_store};
-pub use validation_data::{DataAdded, ValidationData, add_validation_data};
+pub use validation_data::{
+    DataAdded, ValidationData, add_validation_data, refresh_validation_data,
+};
 
 use crate::accuracy;
 use crate::basic::{Outcome, Stage, ValidationError, with_stage};

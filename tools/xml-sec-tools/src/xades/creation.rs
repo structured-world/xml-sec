@@ -46,7 +46,7 @@ const fn created(name: &'static str, signatures: usize) -> Case {
     }
 }
 
-pub(crate) const CASES: [Case; 41] = [
+pub(crate) const CASES: [Case; 42] = [
     created("enveloped", 1),
     created("enveloping", 1),
     created("internally-detached", 1),
@@ -88,6 +88,14 @@ pub(crate) const CASES: [Case; 41] = [
         signatures: 1,
         format: "XAdES-BASELINE-B",
         timestamps: 2,
+        fixtures: "content",
+    },
+    // A B-LT signature that took the next generation of CRLs by a refresh.
+    Case {
+        name: "b-lt-refreshed",
+        signatures: 1,
+        format: "XAdES-BASELINE-LT",
+        timestamps: 1,
         fixtures: "content",
     },
     Case {
@@ -243,7 +251,8 @@ fn tokens(diagnostic: xml::Node<'_, '_>, expected: usize, problems: &mut Vec<Str
 
 /// The optional properties DSS must read in a case's diagnostic report, as
 /// (element, expected text): some element of that local name holds the text,
-/// or, for `element@attribute`, has the attribute with that value.
+/// for `element@attribute` has the attribute with that value, and for
+/// `element#` that many elements of the name carry a `BasicSignature`.
 fn expected_properties(name: &str) -> &'static [(&'static str, &'static str)] {
     const POLICY: &str = "1.3.6.1.4.1.13762.3.1";
     match name {
@@ -300,6 +309,8 @@ fn expected_properties(name: &str) -> &'static [(&'static str, &'static str)] {
             ("Timestamp@Type", "INDIVIDUAL_DATA_OBJECTS_TIMESTAMP"),
         ],
         "content-repeated" => &[("Timestamp@Type", "ALL_DATA_OBJECTS_TIMESTAMP")],
+        // Both generations of both CAs' CRLs are incorporated.
+        "b-lt-refreshed" => &[("Revocation#", "4")],
         _ => &[],
     }
 }
@@ -307,6 +318,15 @@ fn expected_properties(name: &str) -> &'static [(&'static str, &'static str)] {
 /// Each expected property of `name` the diagnostic report does not hold.
 fn property_problems(name: &str, diagnostic: xml::Node<'_, '_>, problems: &mut Vec<String>) {
     for (element, expected) in expected_properties(name) {
+        if let Some(local) = element.strip_suffix('#') {
+            let count = xml::below(diagnostic, local, None)
+                .filter(|node| xml::child(*node, "BasicSignature").is_some())
+                .count();
+            if count.to_string() != *expected {
+                problems.push(format!("DSS read {count} {local}, {expected} expected"));
+            }
+            continue;
+        }
         let (local, attribute) = element
             .split_once('@')
             .map_or((*element, None), |(local, attribute)| {
@@ -441,6 +461,7 @@ pub(crate) fn execute(corpus: &Corpus, results: &Path) -> Result<(), String> {
         ("create_probe", None, "creation"),
         ("properties_probe", None, "creation"),
         ("augment_probe", Some("content"), "content"),
+        ("augment_probe", Some("refresh"), "content"),
         ("augment_probe", Some("complete"), "augmentation"),
         ("augment_probe", Some("extend"), "levels"),
         ("augment_probe", Some("archive"), "augmentation"),

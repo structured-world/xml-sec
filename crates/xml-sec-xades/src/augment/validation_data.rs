@@ -107,6 +107,61 @@ pub fn add_validation_data<W: Work>(
     data: &ValidationData<'_, '_>,
     work: &W,
 ) -> Result<DataAdded, AugmentError> {
+    added(document, data, false, work)
+}
+
+/// Add to `data.signature` the caller's statuses for its paths that the
+/// document does not yet carry, even where the document's own statuses
+/// already meet B-LT: before a new archive, fresher CRLs and OCSP responses
+/// join the validation data an archive timestamp will protect
+/// (EN 319 132-1 §5.5.2 lets an augmentation add validation data).
+///
+/// Each path member takes its status from `data.inputs` first and from the
+/// document only when the caller supplies none for it; the values the
+/// document already holds byte for byte are not added again. The result is
+/// published as one `AnyValidationData`, under the same assessment as
+/// [`add_validation_data`].
+///
+/// # Errors
+/// As for [`add_validation_data`].
+///
+/// # Examples
+///
+/// ```no_run
+/// use xml_sec_xades::{
+///     Assessment, DataAdded, Inputs, Requirements, ValidationData, refresh_validation_data,
+/// };
+/// # fn refresh(
+/// #     document: &mut xml_sec::XmlDocument,
+/// #     assessment: &Assessment<'_, '_>,
+/// #     inputs: &Inputs<'_>,
+/// #     work: &structured_asn1::memory::Memory,
+/// # ) -> Result<(), xml_sec_xades::AugmentError> {
+/// let added = refresh_validation_data(
+///     document,
+///     &ValidationData { signature: "sig", assessment, inputs, id_attributes: &[] },
+///     work,
+/// )?;
+/// assert!(matches!(added, DataAdded::Published | DataAdded::AlreadyPresent));
+/// # Ok(())
+/// # }
+/// ```
+pub fn refresh_validation_data<W: Work>(
+    document: &mut XmlDocument,
+    data: &ValidationData<'_, '_>,
+    work: &W,
+) -> Result<DataAdded, AugmentError> {
+    added(document, data, true, work)
+}
+
+/// The census of `data` with the caller's statuses first when
+/// `supplied_first`, its missing values published.
+fn added<W: Work>(
+    document: &mut XmlDocument,
+    data: &ValidationData<'_, '_>,
+    supplied_first: bool,
+    work: &W,
+) -> Result<DataAdded, AugmentError> {
     let requirements = data.inputs.requirements;
     if matches!(
         requirements,
@@ -138,7 +193,11 @@ pub fn add_validation_data<W: Work>(
         |session| {
             Ok(
                 selected(document, &session, data.signature, data.id_attributes).and_then(|node| {
-                    match validate_with(&session, node, &census, Missing { unsigned })? {
+                    let visitor = Missing {
+                        unsigned,
+                        supplied_first,
+                    };
+                    match validate_with(&session, node, &census, visitor)? {
                         Outcome::Assessed(property) => property,
                         outcome => Err(AugmentError::Unmet(outcome.map(|_| ()))),
                     }
@@ -169,10 +228,16 @@ pub fn add_validation_data<W: Work>(
 /// The census visitor: the missing values as one property, if any.
 struct Missing {
     unsigned: Unsigned,
+    /// Whether the caller's statuses come before the document's.
+    supplied_first: bool,
 }
 
 impl<W: Work> Visit<W> for Missing {
     type Output = Result<Option<String>, AugmentError>;
+
+    fn supplied_first(&self) -> bool {
+        self.supplied_first
+    }
 
     // Only a validation that ended before its B-LT census reaches this.
     fn level(self, _stage: &Stage<'_, '_, '_, '_, W>, level: &Level<'_>) -> Self::Output {

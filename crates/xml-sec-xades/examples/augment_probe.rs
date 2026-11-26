@@ -12,10 +12,16 @@
 //! `augment_probe content-request FIXTURES OUTPUT` writes the content
 //! timestamp requests of a new signature: `content-all.tsq` and
 //! `content-individual.tsq`, and `content-changing.tsq` of a signature whose
-//! reference covers its own qualifying properties. `augment_probe content
+//! reference covers its own qualifying properties, and `signature.tsq`, the
+//! signature timestamp request of the B-B signature `sig`. `augment_probe content
 //! FIXTURES OUTPUT` completes the first two with `FIXTURES/content-all.tsr`
 //! and `FIXTURES/content-individual.tsr` and writes the signature as
 //! `OUTPUT/content-timestamps.xml`.
+//!
+//! `augment_probe refresh FIXTURES OUTPUT`, over the content fixtures,
+//! completes `signature.tsq` with `FIXTURES/signature.tsr`, adds the first
+//! generation of CRLs and refreshes the B-LT signature with the next, written
+//! as `OUTPUT/b-lt-refreshed.xml`.
 //!
 //! `augment_probe complete FIXTURES OUTPUT` completes `request.tsq` with
 //! `FIXTURES/response.tsr` and writes the B-T document `OUTPUT/b-t.xml`.
@@ -55,11 +61,11 @@ use xml_sec::xmldsig::{
     Transform, UriTypeSet, VerificationRequest, VerifyContext, XPathExpression,
 };
 use xml_sec_xades::{
-    Assessment, Completion, ContentEvidence, ContentScope, ContentTimestamp, DataObject,
+    Assessment, Completion, ContentEvidence, ContentScope, ContentTimestamp, DataAdded, DataObject,
     DigestRenewal, Envelope, Inputs, PendingTimestamp, Request, Requirements, Signer,
     TimestampRequest, ValidationData, add_validation_data, complete_timestamp, create,
-    request_archive_timestamp, request_archive_timestamp_with_renewal, request_content_timestamps,
-    request_timestamp,
+    refresh_validation_data, request_archive_timestamp, request_archive_timestamp_with_renewal,
+    request_content_timestamps, request_timestamp,
 };
 
 const DOCUMENT: &str = "<Document><Data Id=\"payload\">Augmented payload</Data></Document>";
@@ -88,7 +94,7 @@ fn utc() -> Result<LeapTable<'static>, String> {
 
 fn main() -> Result<(), String> {
     let mut args = std::env::args_os().skip(1);
-    let usage = "usage: augment_probe request|content-request|content|complete|archive-request|renewal-request|archive|extend|renew-request|renew FIXTURES OUTPUT";
+    let usage = "usage: augment_probe request|content-request|content|refresh|complete|archive-request|renewal-request|archive|extend|renew-request|renew FIXTURES OUTPUT";
     let (Some(action), Some(fixtures), Some(output), None) =
         (args.next(), args.next(), args.next(), args.next())
     else {
@@ -148,42 +154,70 @@ fn main() -> Result<(), String> {
         }
         _ => {}
     }
-    let mut document = created(&signer, &assessment, &work)?;
+    let action = action.to_str().ok_or(usage)?;
+    augmented(
+        action,
+        (&signer, &assessment),
+        (&fixtures, &output),
+        [&root, &intermediate],
+        &work,
+    )
+    .map_err(|error| {
+        if error.is_empty() {
+            usage.into()
+        } else {
+            error
+        }
+    })
+}
+
+/// The B-B signature `sig`, its timestamp requests, or its augmentation the
+/// `action` names; an unknown action is an empty error.
+fn augmented(
+    action: &str,
+    (signer, assessment): (&Signer<'_>, &Assessment<'_, '_>),
+    (fixtures, output): (&Path, &Path),
+    pki: [&[u8]; 2],
+    work: &Memory,
+) -> Result<(), String> {
+    let mut document = created(signer, assessment, work)?;
     let write = |name: &str, bytes: &[u8]| {
         std::fs::write(output.join(name), bytes).map_err(|error| format!("{name}: {error}"))
     };
-    let pending = request_timestamp(&document, &timestamp(None, Some(NONCE)), &assessment, &work)
+    let pending = request_timestamp(&document, &timestamp(None, Some(NONCE)), assessment, work)
         .map_err(|error| format!("request: {error}"))?;
-    match action.to_str() {
-        Some("request") => {
+    match action {
+        "request" => {
             write("request.tsq", pending.request())?;
-            requests(&document, &assessment, &write, &work)?;
+            requests(&document, assessment, &write, work)?;
         }
-        Some(action @ ("complete" | "archive-request" | "renewal-request" | "archive")) => {
-            let response = read(&fixtures, "response.tsr")?;
-            complete(
-                &mut document,
-                &pending,
-                &response,
-                &assessment,
-                [&root, &intermediate],
-                &work,
-            )?;
-            if action == "complete" {
-                write("b-t.xml", document.as_xml().as_bytes())?;
+        "complete" | "archive-request" | "renewal-request" | "archive" | "refresh" => {
+            // The content fixtures answer the same request as `signature.tsr`.
+            let answer = if action == "refresh" {
+                "signature.tsr"
             } else {
-                archived(
+                "response.tsr"
+            };
+            let response = read(fixtures, answer)?;
+            complete(&mut document, &pending, &response, assessment, pki, work)?;
+            match action {
+                "complete" => write("b-t.xml", document.as_xml().as_bytes())?,
+                "refresh" => {
+                    refreshed(&mut document, assessment, fixtures, pki, work)?;
+                    write("b-lt-refreshed.xml", document.as_xml().as_bytes())?;
+                }
+                _ => archived(
                     &mut document,
-                    &assessment,
-                    &fixtures,
-                    [&root, &intermediate],
+                    assessment,
+                    fixtures,
+                    pki,
                     action,
                     &write,
-                    &work,
-                )?;
+                    work,
+                )?,
             }
         }
-        _ => return Err(usage.into()),
+        _ => return Err(String::new()),
     }
     Ok(())
 }
@@ -394,7 +428,12 @@ fn content_requests(
             std::fs::write(output.join(name), bytes).map_err(|error| format!("{name}: {error}"))?;
         }
     }
-    Ok(())
+    // The B-B signature the refresh tests take to B-T and B-LT.
+    let document = created(signer, assessment, work)?;
+    let pending = request_timestamp(&document, &timestamp(None, Some(NONCE)), assessment, work)
+        .map_err(|error| format!("signature request: {error}"))?;
+    std::fs::write(output.join("signature.tsq"), pending.request())
+        .map_err(|error| format!("signature.tsq: {error}"))
 }
 
 const DS: &str = "http://www.w3.org/2000/09/xmldsig#";
@@ -463,6 +502,53 @@ fn content(
             .map_err(|error| format!("{name}: {error}"))?;
         std::fs::write(output.join(format!("{name}.xml")), document.as_xml())
             .map_err(|error| format!("{name}.xml: {error}"))?;
+    }
+    Ok(())
+}
+
+/// The CRLs `FIXTURES/root.crl` and `FIXTURES/intermediate.crl` added to the
+/// B-T document, then the next generation `root-next.crl` and
+/// `intermediate-next.crl` added by a refresh of the B-LT signature.
+fn refreshed(
+    document: &mut XmlDocument,
+    assessment: &Assessment<'_, '_>,
+    fixtures: &Path,
+    [root, intermediate]: [&[u8]; 2],
+    work: &Memory,
+) -> Result<(), String> {
+    let utc = utc()?;
+    let (anchors, certificates) = ([root], [intermediate]);
+    for (names, refresh) in [
+        (["root.crl", "intermediate.crl"], false),
+        (["root-next.crl", "intermediate-next.crl"], true),
+    ] {
+        let lists = [read(fixtures, names[0])?, read(fixtures, names[1])?];
+        let crls: [&[u8]; 2] = [&lists[0], &lists[1]];
+        let inputs = Inputs {
+            requirements: Requirements::LongTerm,
+            anchors: &anchors,
+            certificates: &certificates,
+            utc: &utc,
+            accuracies: &[],
+            responders: &[],
+            crls: &crls,
+            responses: &[],
+        };
+        let data = ValidationData {
+            signature: "sig",
+            assessment,
+            inputs: &inputs,
+            id_attributes: &[],
+        };
+        let added = if refresh {
+            refresh_validation_data(document, &data, work)
+        } else {
+            add_validation_data(document, &data, work)
+        }
+        .map_err(|error| format!("{}: {error}", names[0]))?;
+        if added != DataAdded::Published {
+            return Err(format!("{}: nothing was added", names[0]));
+        }
     }
     Ok(())
 }

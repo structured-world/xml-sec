@@ -10,8 +10,7 @@
     "policy-digest-as-in-specification": "a signature policy digest computed as the policy's technical specification defines (SPDocDigestAsInSpecification, as ETSI TR 102 272 does for ASN.1 policies)",
     "ts101903-format": "ETSI TS 101 903 V1.1.1 and V1.2.2 namespaces and the signing certificate properties before EN 319 132",
     "ts101903-level": "the TS 101 903 levels C, X, XL and A",
-    "evidence-record": "an evidence record as an unsigned property",
-    "validation-data-refresh": "adding fresher validation data to a signature that already meets B-LT; xml-sec adds only the data a signature lacks"
+    "evidence-record": "an evidence record as an unsigned property"
   },
   "reasons": {
     "dss-api": "behaviour of the DSS service API: parameter validation and its exceptions, re-initialised or atomic calls, identifier providers, the document extender class, external signature values, digest documents in place of content, TSA failures",
@@ -56,13 +55,13 @@
     "extension/XAdESExtensionDetachedWithContentTimestampTest": { "covered": ["creation/content-timestamps", "lifecycle/xml-sec-first-detached-rsa-crl"] },
     "extension/XAdESExtensionInvalidLevelsTest": { "not-applicable": "dss-api" },
     "extension/XAdESExtensionLTAToLTATest": { "covered": ["lifecycle/xml-sec-first-enveloping-rsa-crl", "lifecycle/dss-first-enveloping-rsa-crl", "creation/b-lta-renewed"] },
-    "extension/XAdESExtensionLTOldToLTNewRevocationTest": { "unsupported": "validation-data-refresh" },
+    "extension/XAdESExtensionLTOldToLTNewRevocationTest": { "covered": ["creation/b-lt-refreshed"] },
     "extension/XAdESExtensionLTToLTASelfSignedTSATest": { "not-applicable": "pki-scenario" },
     "extension/XAdESExtensionLTToLTATest": { "covered": ["lifecycle/xml-sec-first-enveloping-rsa-crl", "lifecycle/dss-first-enveloping-rsa-crl", "creation/b-lta"] },
     "extension/XAdESExtensionLTToLTAWithError500TimestampTest": { "not-applicable": "dss-api" },
     "extension/XAdESExtensionLTToLTAWithFailTimestampTest": { "not-applicable": "dss-api" },
     "extension/XAdESExtensionLTToLTAWithSelfSignedTest": { "not-applicable": "pki-scenario" },
-    "extension/XAdESExtensionLTToLTTest": { "unsupported": "validation-data-refresh" },
+    "extension/XAdESExtensionLTToLTTest": { "covered": ["creation/b-lt-refreshed"] },
     "extension/XAdESExtensionLTWithTSVDToLTATest": { "covered": ["lifecycle/xml-sec-first-enveloping-rsa-crl", "lifecycle/dss-first-enveloping-rsa-crl"] },
     "extension/XAdESExtensionNoDetachedFileBToATest": { "unsupported": "ts101903-level" },
     "extension/XAdESExtensionNoDetachedFileBToLTATest": { "not-applicable": "dss-api" },

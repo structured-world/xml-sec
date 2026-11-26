@@ -97,16 +97,32 @@ fn issue_with_tsa(generator: &Generator) -> Result<(), String> {
     write(&generator.work.join("tsa.serial"), "01\n")
 }
 
-/// `xades fixtures --content`: the content timestamp fixtures. The probe
-/// writes the requests of a new signature's content timestamps, computed
-/// before it is signed, and the OpenSSL TSA answers each one.
+/// `xades fixtures --content`: the content timestamp and refresh fixtures.
+/// The probe writes the requests of a new signature's content timestamps,
+/// computed before it is signed, and the signature timestamp request of a
+/// B-B signature; the OpenSSL TSA answers each one. Two generations of each
+/// CA's CRL let a B-LT signature take fresher statuses.
 pub(crate) fn content(corpus: &Corpus, generator: &Generator) -> Result<(), String> {
     issue_with_tsa(generator)?;
+    // Two generations of each CA's CRL: a signature takes B-LT with the first
+    // and has the second added by a refresh.
+    let levels = Levels { generator };
+    for issuer in ["root", "intermediate"] {
+        write(
+            &generator.output.join(format!("{issuer}.crl")),
+            levels.crl(issuer)?,
+        )?;
+        write(
+            &generator.output.join(format!("{issuer}-next.crl")),
+            levels.next_crl(issuer)?,
+        )?;
+    }
     probe(corpus, generator, "content-request")?;
     for (query, response) in [
         ("content-all.tsq", "content-all.tsr"),
         ("content-individual.tsq", "content-individual.tsr"),
         ("content-changing.tsq", "content-changing.tsr"),
+        ("signature.tsq", "signature.tsr"),
     ] {
         write(
             &generator.output.join(query),
