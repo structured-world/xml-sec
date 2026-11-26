@@ -264,6 +264,7 @@ static const char referencesText[] =
     "<KeyInfo><dsig11:KeyInfoReference URI='#shared'/></KeyInfo>"
     "<KeyInfo><dsig11:KeyInfoReference/></KeyInfo>"
     "<KeyInfo><dsig11:KeyInfoReference URI='#secret'/></KeyInfo>"
+    "<KeyInfo><RetrievalMethod Type='urn:test:secret'/></KeyInfo>"
     "</Root>";
 
 /* Reads the index-th KeyInfo child of the references document. */
@@ -291,6 +292,7 @@ static void references(void) {
     read_reference("unknown type stops", doc, 4, ctx);
     ctx->flags = 0;
     read_reference("unexpected child", doc, 5, ctx);
+    read_reference("retrieval without uri", doc, 9, ctx);
     ctx->maxRetrievalMethodLevel = 0;
     read_reference("retrieval level", doc, 2, ctx);
     ctx->maxRetrievalMethodLevel = 1;

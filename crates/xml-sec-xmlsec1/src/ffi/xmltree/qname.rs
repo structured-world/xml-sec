@@ -285,13 +285,12 @@ pub(crate) unsafe extern "C" fn xmlSecQName2IntegerGetIntegerFromString(
                 return -1;
             };
             if xmlSecQName2IntegerGetInteger(info, href, local, int_value) < 0 {
-                errors::internal_with(
+                errors::invalid_node_content_with(
                     here,
+                    node,
                     std::ptr::null(),
-                    c"xmlSecQName2IntegerGetInteger",
                     &format!(
-                        "node={},qnameLocalPart={},qnameHref={}",
-                        node_name(node),
+                        "unknown value: qnameLocalPart={},qnameHref={}",
                         text(local),
                         text(href)
                     ),
@@ -915,13 +914,12 @@ pub(crate) unsafe extern "C" fn xmlSecQName2BitMaskGetBitMaskFromString(
                 return -1;
             };
             if xmlSecQName2BitMaskGetBitMask(info, local, href, mask) < 0 {
-                errors::internal_with(
+                errors::invalid_node_content_with(
                     here,
+                    node,
                     std::ptr::null(),
-                    c"xmlSecQName2BitMaskGetBitMask",
                     &format!(
-                        "node={},qnameLocalPart={},qnameHref={}",
-                        node_name(node),
+                        "unknown value: qnameLocalPart={},qnameHref={}",
                         text(local),
                         text(href)
                     ),

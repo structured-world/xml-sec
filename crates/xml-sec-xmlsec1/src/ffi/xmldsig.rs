@@ -473,6 +473,15 @@ pub(crate) unsafe extern "C" fn xmlSecDSigCtxVerify(
             c"dsigCtx != NULL",
             -1
         );
+        // A context that already holds a result was used before: libxmlsec1
+        // asserts a fresh one.
+        check!(
+            // SAFETY: a live context, checked above.
+            unsafe { (*ctx).result.is_null() },
+            "xmlSecDSigCtxVerify",
+            c"dsigCtx->result == NULL",
+            -1
+        );
         check!(!node.is_null(), "xmlSecDSigCtxVerify", c"node != NULL", -1);
         check!(
             !super::tree::nodes::doc(node).is_null(),
