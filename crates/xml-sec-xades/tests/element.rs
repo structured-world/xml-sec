@@ -130,6 +130,40 @@ fn a_method_outside_the_transform_policy_is_refused() {
 }
 
 #[test]
+fn a_replayed_enveloped_transform_removes_only_its_own_signature() {
+    // XMLDSig 1.1 §6.6.4: the enveloped-signature transform removes the
+    // Signature that contains it, not every input node. Replaying the
+    // fixture's document reference from its own Transforms yields the
+    // document without that Signature, payload included.
+    verified(
+        |_| {},
+        |session| {
+            let (reference, transforms) = (
+                element(session, "Reference"),
+                element(session, "Transforms"),
+            );
+            let mut output = Vec::new();
+            session
+                .select_signature(element(session, "Signature"))
+                .expect("the signature verified")
+                .replay_transforms(
+                    reference,
+                    "",
+                    Some((transforms, "http://www.w3.org/2000/09/xmldsig#")),
+                    &mut |bytes: &[u8]| {
+                        output.extend_from_slice(bytes);
+                        Ok::<_, ()>(())
+                    },
+                )
+                .expect("the reference replays");
+            let text = String::from_utf8(output).expect("canonical XML is UTF-8");
+            assert!(text.contains("Levels payload"), "{text:?}");
+            assert!(!text.contains("Signature"), "{text:?}");
+        },
+    );
+}
+
+#[test]
 fn a_receiver_refusal_keeps_its_own_cause() {
     verified(
         |_| {},

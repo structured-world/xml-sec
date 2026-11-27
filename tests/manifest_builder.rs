@@ -135,6 +135,42 @@ fn a_manifest_needs_an_id_and_a_reference() {
 }
 
 #[test]
+fn a_manifest_declares_each_id_once() {
+    // XMLDSig 1.1 types Manifest/@Id and Reference/@Id as xs:ID, unique in
+    // the document: two references with one Id, or one sharing the
+    // Manifest's own, are refused; references without an Id stay valid.
+    let policy = processing();
+    let reference = |id: Option<&str>| {
+        let built = ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("#payload");
+        match id {
+            Some(id) => built.id(id),
+            None => built,
+        }
+    };
+    for (first, second) in [(Some("entry"), Some("entry")), (Some("manifest"), None)] {
+        let result = ManifestBuilder::new("manifest")
+            .add_reference(reference(first))
+            .add_reference(reference(second))
+            .build_with_policy(&policy);
+        assert!(
+            matches!(
+                result,
+                Err(SignatureBuilderError::InvalidId {
+                    element: "Reference",
+                    ..
+                })
+            ),
+            "{first:?} {second:?}: {result:?}"
+        );
+    }
+    ManifestBuilder::new("manifest")
+        .add_reference(reference(None))
+        .add_reference(reference(None))
+        .build_with_policy(&policy)
+        .expect("references without an Id");
+}
+
+#[test]
 fn a_manifest_reference_meets_the_signing_policy() {
     // The same policy that admits a SignedInfo reference admits a Manifest
     // one: an external URI the policy refuses is refused when building.

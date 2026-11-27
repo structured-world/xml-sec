@@ -403,7 +403,7 @@ impl ManifestBuilder {
             )?;
         }
         validate_namespace_bindings(&self.references)?;
-        validate_reference_ids_and_digests(&self.references, policy)?;
+        validate_reference_ids_and_digests(&self.references, Some(&self.id), policy)?;
 
         let mut writer = Writer::new(BoundedOutput {
             bytes: Vec::new(),
@@ -943,7 +943,7 @@ impl SignatureBuilder {
             }
             .into());
         }
-        validate_reference_ids_and_digests(&self.references, policy)
+        validate_reference_ids_and_digests(&self.references, None, policy)
     }
 
     /// `XMLDSig` 1.1 §4.5 types `Object/@Id` as ID, `MimeType` as string and
@@ -1002,20 +1002,26 @@ impl SignatureBuilder {
     }
 }
 
-/// `XMLDSig` 1.1 §4.4.3 types `Reference/@Id` as ID; each digest method must
-/// be one `policy` admits.
+/// `XMLDSig` 1.1 §4.4.3 types `Reference/@Id` as ID, so each is an `NCName`
+/// declared once, and none is `reserved`; each digest method must be one
+/// `policy` admits.
 fn validate_reference_ids_and_digests(
     references: &[ReferenceBuilder],
+    reserved: Option<&str>,
     policy: &SigningPolicy,
 ) -> Result<(), SignatureBuilderError> {
-    for reference in references {
-        if let Some(id) = &reference.id
-            && !is_xml_ncname(id)
-        {
-            return Err(SignatureBuilderError::InvalidId {
-                element: "Reference",
-                value: id.clone(),
-            });
+    for (index, reference) in references.iter().enumerate() {
+        if let Some(id) = &reference.id {
+            let repeated = reserved == Some(id.as_str())
+                || references[..index]
+                    .iter()
+                    .any(|earlier| earlier.id.as_ref() == Some(id));
+            if repeated || !is_xml_ncname(id) {
+                return Err(SignatureBuilderError::InvalidId {
+                    element: "Reference",
+                    value: id.clone(),
+                });
+            }
         }
         policy.check_digest_algorithm(reference.digest_method)?;
     }
