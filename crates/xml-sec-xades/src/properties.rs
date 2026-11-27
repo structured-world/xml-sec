@@ -358,6 +358,8 @@ impl PropertyWriter for PropertyDraft<'_> {
                 )?;
             }
             (FragmentSlot::AnyContent, Fragment::Element(element)) => {
+                // The copy keeps its own namespaces: under a default namespace
+                // the draft undeclares it on the copy's root.
                 self.draft.copied(element.as_ref().as_bytes(), work)?;
             }
             (FragmentSlot::PolicyTransforms, Fragment::Transforms(transforms)) => {
