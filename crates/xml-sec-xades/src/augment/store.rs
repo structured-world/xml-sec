@@ -8,18 +8,26 @@ use crate::draft::Draft;
 use crate::level::Inputs;
 use crate::placement::{self, PlacementError, XADES};
 use crate::properties::{
-    Bound, ExplicitPolicy, Fragment, PolicyStore, PropertyDraft, SignedPolicy, SpecifiedDigest,
+    Bound, ExplicitPolicy, Fragment, PolicyStore, PolicyTransforms, PropertyDraft, PropertyError,
+    SignedPlan, SignedPolicy, SpecifiedDigest,
 };
 use alloc::{boxed::Box, string::String, vec::Vec};
 use structured_asn1::memory::Work;
 use xml_sec::IdAttributeRegistration;
+use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize};
 use xml_sec::document::{DocumentView, NodeIdentity, XmlDocument};
 use xml_sec::policy::SigningPolicy;
 use xml_sec::provider::CryptoProvider;
 use xml_sec::xmldsig::extension::{self, NodeView};
+use xml_sec::{XmlDomDocument, XmlDomNode};
 
 /// `http://uri.etsi.org/01903/v1.4.1#`, the namespace of the store.
 const XADES_141: &str = "http://uri.etsi.org/01903/v1.4.1#";
+
+/// The transform naming a digest a technical specification defines
+/// (EN 319 132-1 §5.2.9.2).
+const SPECIFICATION_TRANSFORM: &str =
+    "http://uri.etsi.org/01903/v1.3.2/SignaturePolicy/SPDocDigestAsInSpecification";
 
 /// The policy store to add to one signature.
 pub struct PolicyStoreRequest<'a, 'inputs> {
@@ -109,6 +117,10 @@ pub fn add_policy_store<W: Work>(
         }
         Ok::<_, AugmentError>((located, signed))
     })?;
+    let signed = SignedPolicy {
+        plan: signed_plan(document.as_xml(), request.signature, request.signing)?,
+        ..signed
+    };
     let mut writer = PropertyDraft {
         draft: Draft::new(),
         plan: &[],
@@ -165,14 +177,84 @@ fn signed_policy<W: Work>(
     let value =
         placement::child(view, hash, placement::DS, "DigestValue", work)?.ok_or_else(missing)?;
     Ok(SignedPolicy {
-        // XML Schema 1.0 §3.2.17: anyURI collapses whitespace.
-        identifier: text(view, identifier, work)?.trim().into(),
+        identifier: crate::properties::collapse(&text(view, identifier, work)?),
         method: placement::attribute(view, method, "Algorithm", work)?
             .ok_or_else(missing)?
             .trim()
             .into(),
         digest: Vec::from(&extension::base64_owned(view, value, work)?[..]),
+        plan: SignedPlan::None,
     })
+}
+
+/// The policy digest plan signature `id` signed: none, the one
+/// `SPDocDigestAsInSpecification` transform (EN 319 132-1 §5.2.9.2), or its
+/// `ds:Transforms` as self-contained markup, the subtree in inclusive
+/// Canonical XML 1.0, which carries every namespace in scope so an `XPath`
+/// expression keeps its prefixes.
+fn signed_plan(xml: &str, id: &str, signing: &SigningPolicy) -> Result<SignedPlan, AugmentError> {
+    fn is(node: XmlDomNode<'_, '_>, namespace: &str, local: &str) -> bool {
+        node.is_element()
+            && node.tag_name().namespace() == Some(namespace)
+            && node.tag_name().name() == local
+    }
+    fn owner<'a, 'i>(node: XmlDomNode<'a, 'i>) -> Option<XmlDomNode<'a, 'i>> {
+        node.ancestors()
+            .skip(1)
+            .find(|ancestor| is(*ancestor, placement::DS, "Signature"))
+    }
+    let parsed =
+        XmlDomDocument::parse(xml).map_err(|_| AugmentError::NoExplicitPolicy(id.into()))?;
+    let Some(signature) = parsed.root_element().descendants().find(|node| {
+        is(*node, placement::DS, "Signature")
+            && ["Id", "ID", "id"]
+                .iter()
+                .any(|name| node.attribute(*name) == Some(id))
+    }) else {
+        return Err(AugmentError::NoExplicitPolicy(id.into()));
+    };
+    let Some(policy) = signature.descendants().find(|node| {
+        is(*node, XADES, "SignaturePolicyId")
+            && owner(*node).is_some_and(|found| found.id() == signature.id())
+    }) else {
+        return Err(AugmentError::NoExplicitPolicy(id.into()));
+    };
+    let Some(transforms) = policy
+        .children()
+        .find(|node| is(*node, placement::DS, "Transforms"))
+    else {
+        return Ok(SignedPlan::None);
+    };
+    let mut steps = transforms.children().filter(XmlDomNode::is_element);
+    if let (Some(step), None) = (steps.next(), steps.next())
+        && is(step, placement::DS, "Transform")
+        && step.attribute("Algorithm") == Some(SPECIFICATION_TRANSFORM)
+    {
+        return Ok(SignedPlan::InSpecification);
+    }
+    let within = |node: XmlDomNode<'_, '_>| {
+        node.id() == transforms.id()
+            || node
+                .ancestors()
+                .any(|ancestor| ancestor.id() == transforms.id())
+    };
+    let mut markup = Vec::new();
+    canonicalize(
+        &parsed,
+        Some(&within),
+        &C14nAlgorithm::new(C14nMode::Inclusive1_0, false),
+        &mut markup,
+    )
+    .map_err(|_| AugmentError::NoExplicitPolicy(id.into()))?;
+    let markup =
+        String::from_utf8(markup).map_err(|_| AugmentError::NoExplicitPolicy(id.into()))?;
+    PolicyTransforms::parse(markup, signing)
+        .map(SignedPlan::Transforms)
+        .map_err(|error| {
+            AugmentError::Store(Box::new(structured_xades::produce::Error::Writer(
+                PropertyError::from(error),
+            )))
+        })
 }
 
 /// The character data of `node`'s children, in order.

@@ -818,7 +818,13 @@ impl<'s> External<'s> {
 
 /// The CRLs and OCSP responses of one document, then the caller's, or the
 /// caller's first when `supplied_first`: each member takes the first source
-/// that answers for it.
+/// that answers for it, and with `supplied_first` the caller's of either
+/// kind before the document's, with the number of each that are the
+/// caller's.
+#[expect(
+    clippy::type_complexity,
+    reason = "the two ordered pools and the caller's share of each"
+)]
 fn status_sources<'p, 't: 'p>(
     view: &'p Material<'t>,
     carried: &'p CarriedMaterial<'t, N, D, G>,
@@ -829,6 +835,7 @@ fn status_sources<'p, 't: 'p>(
     (
         OwnedVec<&'p CertificateList<'t>>,
         OwnedVec<&'p BasicResponse<'t>>,
+        (usize, usize),
     ),
     Error,
 > {
@@ -865,7 +872,12 @@ fn status_sources<'p, 't: 'p>(
     if !supplied_first {
         supplied(&mut lists, &mut responses)?;
     }
-    Ok((lists.into_owned(), responses.into_owned()))
+    let leading = if supplied_first {
+        (external.crls.len(), external.responses.len())
+    } else {
+        (0, 0)
+    };
+    Ok((lists.into_owned(), responses.into_owned(), leading))
 }
 
 /// Every participant's status, its incorporation and, for B-LTA, each archive.
@@ -899,7 +911,7 @@ fn long_term<W: Work, V: Visit<W>>(
         .map_err(|error| ValidationError::Carried(Box::new(error)))?;
     let index = material::index_with_tokens(chain.pools.view, &carried, access)
         .map_err(ValidationError::Index)?;
-    let (lists, responses) = status_sources(
+    let (lists, responses, supplied) = status_sources(
         chain.pools.view,
         &carried,
         chain.external,
@@ -917,8 +929,11 @@ fn long_term<W: Work, V: Visit<W>>(
         stage.session,
         chain.cms,
         chain.authorities,
-        &lists,
-        &responses,
+        &status::StatusSources {
+            lists: &lists,
+            responses: &responses,
+            supplied,
+        },
         &distinct,
         chain.inputs.utc,
         stage.signer_time,

@@ -61,7 +61,14 @@ fn reserved_prefixes_are_refused_for_a_foreign_namespace() {
     // only the XML namespace; either chosen for another namespace would
     // write namespace-invalid markup.
     const XML: &str = "http://www.w3.org/XML/1998/namespace";
-    for chosen in [("urn:outer", "xml"), ("urn:outer", "xmlns"), (XML, "xmlns")] {
+    // The XML namespace is never bound to another prefix or as the default.
+    for chosen in [
+        ("urn:outer", "xml"),
+        ("urn:outer", "xmlns"),
+        (XML, "xmlns"),
+        (XML, "p"),
+        (XML, ""),
+    ] {
         assert!(
             matches!(Draft::with_prefixes(&[chosen]), Err(DraftError::Name(_))),
             "{chosen:?}"

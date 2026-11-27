@@ -16,7 +16,8 @@
 //! a policy whose digest the signer supplies without the document
 //! (`policy-supplied`) and an ETSI TR 102 272 ASN.1 policy digested as that
 //! specification defines, stored after signing (`policy-asn1`), with the
-//! detached data as `OUTPUT/detached.txt`.
+//! detached data as `OUTPUT/detached.txt` and the local policy copy as
+//! `OUTPUT/policy.xml`.
 
 #[path = "support/asn1_policy.rs"]
 mod asn1_policy;
@@ -364,6 +365,8 @@ fn main() -> Result<(), String> {
     let root = read(&fixtures, "root.der")?;
     let signer_der = read(&fixtures, "signer.der")?;
     let intermediate = read(&fixtures, "intermediate.der")?;
+    // The committed test fixture key: no secret crosses a boundary here, so
+    // the probe holds it as plain text.
     let key_pem = String::from_utf8(read(&fixtures, "signer.key")?)
         .map_err(|error| format!("signer.key: {error}"))?;
     let key = RsaSigningKey::from_pkcs8_pem(&key_pem).map_err(|error| error.to_string())?;
@@ -404,6 +407,8 @@ fn main() -> Result<(), String> {
     let fragments = Fragments::new(&signing)?;
     std::fs::create_dir_all(&output).map_err(|error| error.to_string())?;
     std::fs::write(output.join("detached.txt"), DETACHED).map_err(|error| error.to_string())?;
+    // The local copy `policy-local-uri` names beside the documents.
+    std::fs::write(output.join("policy.xml"), POLICY).map_err(|error| error.to_string())?;
     let work = Memory::new(Arc::new(MemoryAccount::new(1 << 26, 1 << 30)));
     let write = |name: &str, document: &XmlDocument| {
         std::fs::write(output.join(format!("{name}.xml")), document.as_xml())

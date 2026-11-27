@@ -117,6 +117,21 @@ pub(crate) fn content(corpus: &Corpus, generator: &Generator) -> Result<(), Stri
             levels.next_crl(issuer)?,
         )?;
     }
+    // Responses for the signer and the TSA, signed by their CA's delegated
+    // responder: a B-LT signature that carries them can take a fresher CRL by
+    // a refresh.
+    generator.certify(
+        "responder",
+        "intermediate",
+        "/CN=xml-sec XAdES Test OCSP",
+        "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=critical,OCSPSigning\nnoCheck=ignored\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n",
+    )?;
+    for subject in ["signer", "tsa"] {
+        write(
+            &generator.output.join(format!("{subject}.ocsp")),
+            levels.ocsp_delegated("intermediate", "responder", subject)?,
+        )?;
+    }
     probe(corpus, generator, "content-request")?;
     for (query, response) in [
         ("content-all.tsq", "content-all.tsr"),
@@ -124,6 +139,28 @@ pub(crate) fn content(corpus: &Corpus, generator: &Generator) -> Result<(), Stri
         ("content-changing.tsq", "content-changing.tsr"),
         ("signature.tsq", "signature.tsr"),
     ] {
+        write(
+            &generator.output.join(query),
+            read(&generator.work.join(query))?,
+        )?;
+        reply(generator, query, response, true)?;
+    }
+    // The signature timestamp, then the archive timestamp, of the signature
+    // that carries content timestamps and a policy store, each needing the
+    // response before it.
+    for (action, query, response) in [
+        (
+            "content-lta-request",
+            "content-lta-signature.tsq",
+            "content-lta-signature.tsr",
+        ),
+        (
+            "content-lta-archive-request",
+            "content-lta-archive.tsq",
+            "content-lta-archive.tsr",
+        ),
+    ] {
+        probe(corpus, generator, action)?;
         write(
             &generator.output.join(query),
             read(&generator.work.join(query))?,

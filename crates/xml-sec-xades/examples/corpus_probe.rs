@@ -1954,6 +1954,7 @@ const INSTANT_ANY: i64 = 1_800_000_000;
 /// Every `--detached FILE` object, by its file name, taken out of `args`.
 fn detached(args: &mut Vec<String>) -> Result<BTreeMap<String, Vec<u8>>, Failure> {
     let mut resources = BTreeMap::new();
+    let mut paths = BTreeMap::new();
     while let Some(flag) = args.iter().position(|arg| arg == "--detached") {
         let path = args.get(flag + 1).ok_or("--detached needs a file")?.clone();
         let name = Path::new(&path)
@@ -1961,6 +1962,11 @@ fn detached(args: &mut Vec<String>) -> Result<BTreeMap<String, Vec<u8>>, Failure
             .ok_or("--detached needs a file")?
             .to_string_lossy()
             .into_owned();
+        // A reference names its object by the file name alone, so two files
+        // of one name would leave the bytes to the order of the arguments.
+        if let Some(earlier) = paths.insert(name.clone(), path.clone()) {
+            return Err(format!("--detached {earlier} and {path} share the name {name}").into());
+        }
         resources.insert(name, std::fs::read(&path)?);
         args.drain(flag..flag + 2);
     }
@@ -1969,7 +1975,12 @@ fn detached(args: &mut Vec<String>) -> Result<BTreeMap<String, Vec<u8>>, Failure
 
 fn main() -> Result<(), Failure> {
     let mut args: Vec<String> = std::env::args().collect();
-    let resources = detached(&mut args)?;
+    // Only `facts` verifies, so only it takes detached objects.
+    let resources = if args.get(1).is_some_and(|mode| mode == "facts") {
+        detached(&mut args)?
+    } else {
+        BTreeMap::new()
+    };
     let result = match &args[1..] {
         [mode, profile] if mode == "constraints" => constraints(named_profile(profile)?)?,
         [mode, xml, anchors] if mode == "conditions" => conditions(xml, Path::new(anchors))?,

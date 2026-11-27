@@ -264,8 +264,9 @@ fn the_signed_policy_is_stored_once_after_signing() {
 
 #[test]
 fn a_policy_digested_after_transforms_is_stored_with_the_same_plan() {
-    // The signed hash covers the document after its transforms; the stored
-    // policy matches it under the same plan and not as the raw bytes.
+    // The signed hash covers the document after its transforms, not its raw
+    // bytes; the store checks the document under the signed plan, whatever
+    // plan the caller states.
     let fixture = Fixture::new();
     let transforms = Fragment::Transforms(
         PolicyTransforms::parse(
@@ -278,16 +279,67 @@ fn a_policy_digested_after_transforms_is_stored_with_the_same_plan() {
         POLICY,
         PolicyTransform::Xml(&transforms),
     ))));
-    let raw = fixture
-        .store(&mut document, &explicit(POLICY, PolicyTransform::None))
-        .expect_err("the raw bytes digest otherwise");
-    assert!(matches!(raw, AugmentError::Store(_)), "{raw:?}");
+    assert_ne!(signed_digest(document.as_xml()), sha256(POLICY));
     fixture
+        .store(&mut document, &explicit(POLICY, PolicyTransform::None))
+        .expect("the signed plan");
+    assert_eq!(stores(document.as_xml()), 1);
+}
+
+#[test]
+fn a_store_is_checked_under_the_plan_the_signature_signed() {
+    // EN 319 132-1 §5.2.9.2 and §5.2.10: the stored document must give the
+    // signed hash under the signed plan. A signature over the canonical
+    // bytes without transforms does not take a differently formatted
+    // document whose canonicalization, supplied by the caller, gives them.
+    let fixture = Fixture::new();
+    let canonical: &[u8] =
+        b"<Policy xmlns=\"urn:policy\"><Rule a=\"1\" b=\"2\">Sign</Rule></Policy>";
+    let formatted: &[u8] =
+        b"<Policy xmlns=\"urn:policy\"><Rule b=\"2\"  a=\"1\">Sign</Rule></Policy>";
+    let transforms = Fragment::Transforms(
+        PolicyTransforms::parse(
+            "<ds:Transforms xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><ds:Transform Algorithm=\"http://www.w3.org/TR/2001/REC-xml-c14n-20010315\"/></ds:Transforms>",
+            &fixture.signing,
+        )
+        .expect("policy transforms"),
+    );
+    let mut document = fixture.signed(Some(SignaturePolicy::Explicit(explicit(
+        canonical,
+        PolicyTransform::None,
+    ))));
+    let original = document.as_xml().to_owned();
+    let refused = fixture
         .store(
             &mut document,
-            &explicit(POLICY, PolicyTransform::Xml(&transforms)),
+            &explicit(formatted, PolicyTransform::Xml(&transforms)),
         )
-        .expect("the same plan");
+        .expect_err("a plan the signature did not sign");
+    assert!(matches!(refused, AugmentError::Store(_)), "{refused:?}");
+    assert_eq!(document.as_xml(), original);
+    fixture
+        .store(&mut document, &explicit(canonical, PolicyTransform::None))
+        .expect("the signed plan");
+}
+
+#[test]
+fn policy_identifiers_compare_as_collapsed_any_uris() {
+    // XML Schema 1.0 Part 2 §3.2.17: anyURI collapses whitespace, so an
+    // identifier signed with a run of spaces names the same policy as its
+    // collapsed form.
+    let fixture = Fixture::new();
+    let spaced = ExplicitPolicy {
+        identifier: identifier("urn:example:policy  v1"),
+        ..explicit(POLICY, PolicyTransform::None)
+    };
+    let collapsed = ExplicitPolicy {
+        identifier: identifier("urn:example:policy v1"),
+        ..explicit(POLICY, PolicyTransform::None)
+    };
+    let mut document = fixture.signed(Some(SignaturePolicy::Explicit(spaced)));
+    fixture
+        .store(&mut document, &collapsed)
+        .expect("the same anyURI");
     assert_eq!(stores(document.as_xml()), 1);
 }
 

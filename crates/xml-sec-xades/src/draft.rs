@@ -103,8 +103,9 @@ impl Draft {
     ///
     /// # Errors
     /// Returns [`DraftError::Name`] for a prefix that is neither empty nor an
-    /// XML name without a colon, for one chosen for two namespaces, and for
-    /// `xmlns`, or `xml` for any namespace but the XML namespace.
+    /// XML name without a colon, for one chosen for two namespaces, for
+    /// `xmlns`, for `xml` with any namespace but the XML namespace, and for
+    /// the XML namespace with any prefix but `xml`.
     pub fn with_prefixes(chosen: &[(&'static str, &str)]) -> Result<Self, DraftError> {
         let mut draft = Self::default();
         for (index, (namespace, prefix)) in chosen.iter().enumerate() {
@@ -114,14 +115,15 @@ impl Draft {
                 && chosen[..index]
                     .iter()
                     .any(|(other, earlier)| earlier == prefix && other != namespace);
-            // Namespaces in XML 1.0 §3: `xmlns` is never declared, and `xml`
-            // may only be bound to the XML namespace.
+            // Namespaces in XML 1.0 §3: `xmlns` is never declared, `xml` is
+            // bound to the XML namespace only, and that namespace to no other
+            // prefix and not as the default.
             let reserved = match *prefix {
                 "xmlns" => true,
                 "xml" => *namespace != XML_NAMESPACE,
-                _ => false,
+                _ => *namespace == XML_NAMESPACE,
             };
-            if (!prefix.is_empty() && (!is_ncname(prefix) || reserved)) || reused {
+            if (!prefix.is_empty() && !is_ncname(prefix)) || reserved || reused {
                 return Err(DraftError::Name("a chosen namespace prefix"));
             }
             draft.chosen.push((namespace, (*prefix).into()));

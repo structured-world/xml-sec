@@ -46,7 +46,7 @@ const fn created(name: &'static str, signatures: usize) -> Case {
     }
 }
 
-pub(crate) const CASES: [Case; 45] = [
+pub(crate) const CASES: [Case; 46] = [
     created("enveloped", 1),
     created("enveloping", 1),
     created("internally-detached", 1),
@@ -106,6 +106,15 @@ pub(crate) const CASES: [Case; 45] = [
         signatures: 1,
         format: "XAdES-BASELINE-B",
         timestamps: 2,
+        fixtures: "content",
+    },
+    // Content timestamps, an explicit policy and its store, extended through
+    // B-T and B-LT to B-LTA.
+    Case {
+        name: "content-lta",
+        signatures: 1,
+        format: "XAdES-BASELINE-LTA",
+        timestamps: 4,
         fixtures: "content",
     },
     Case {
@@ -254,135 +263,273 @@ fn tokens(diagnostic: xml::Node<'_, '_>, expected: usize, problems: &mut Vec<Str
     }
 }
 
-/// The optional properties DSS must read in a case's diagnostic report, as
-/// (element, expected text): some element of that local name holds the text,
-/// for `element@attribute` has the attribute with that value, `scope/` first
-/// limits the search to elements below one named `scope`, and for `element#`
-/// that many elements of the name carry a `BasicSignature`.
-fn expected_properties(name: &str) -> &'static [(&'static str, &'static str)] {
-    const POLICY: &str = "1.3.6.1.4.1.13762.3.1";
+/// One fact DSS must report in a case's diagnostic report.
+pub(crate) enum Expect {
+    /// Some element matching the path holds the text: `element` names it by
+    /// local name, `element@attribute` reads an attribute instead, and a
+    /// `scope/` prefix limits the search to elements below one named `scope`.
+    Text(&'static str, &'static str),
+    /// Some `parent` element holds every one of these (element, text) facts
+    /// below itself: values that belong together, such as a commitment's
+    /// identifier and its scope.
+    Together(&'static str, &'static [(&'static str, &'static str)]),
+    /// Exactly `count` elements of local name `local` that carry a
+    /// `BasicSignature` (validated objects such as revocation data).
+    Validated(&'static str, usize),
+    /// Exactly `count` elements of local name `local` whose `attribute` has
+    /// this value.
+    Counted(&'static str, &'static str, &'static str, usize),
+    /// The fact holds within the diagnostic signature of the `ds:Signature`
+    /// with this `Id` (its `DAIdentifier`).
+    In(&'static str, &'static Expect),
+}
+
+const POLICY: &str = "1.3.6.1.4.1.13762.3.1";
+const PROOF_OF_ORIGIN: &str = "http://uri.etsi.org/01903/v1.2.2#ProofOfOrigin";
+const PROOF_OF_APPROVAL: &str = "http://uri.etsi.org/01903/v1.2.2#ProofOfApproval";
+
+/// The facts of the optional properties DSS must report for `name`.
+fn expected_properties(name: &str) -> &'static [Expect] {
+    use Expect::{Counted, In, Text, Together, Validated};
+    if name.starts_with("policy-") {
+        return policy_properties(name);
+    }
+    match name {
+        // Each commitment with its own scope.
+        "commitment" => &[
+            Together(
+                "CommitmentTypeIndication",
+                &[
+                    ("Identifier", PROOF_OF_ORIGIN),
+                    ("AllDataSignedObjects", "true"),
+                ],
+            ),
+            Together(
+                "CommitmentTypeIndication",
+                &[
+                    ("Identifier", PROOF_OF_APPROVAL),
+                    ("ObjectReference", "sig-reference-1"),
+                ],
+            ),
+        ],
+        "signer-role" => &[
+            Text("Role", "Manager"),
+            Text("Role", "Approver"),
+            Text("SignerRole@Category", "signed"),
+        ],
+        "production-place" => &[
+            Text("City", "Prague"),
+            Text("StreetAddress", "Main Street 1"),
+            Text("PostalCode", "11000"),
+            Text("CountryName", "CZ"),
+        ],
+        // The countersignature's own place and claimed roles.
+        "countersigned-properties" => &[
+            In("counter", &Text("City", "Prague")),
+            In("counter", &Text("StreetAddress", "Main Street 1")),
+            In("counter", &Text("PostalCode", "11000")),
+            In("counter", &Text("CountryName", "CZ")),
+            In("counter", &Text("Role", "Manager")),
+            In("counter", &Text("Role", "Approver")),
+        ],
+        "content-timestamps" => &[
+            Counted("Timestamp", "Type", "ALL_DATA_OBJECTS_TIMESTAMP", 1),
+            Counted("Timestamp", "Type", "INDIVIDUAL_DATA_OBJECTS_TIMESTAMP", 1),
+        ],
+        "content-repeated" => &[Counted(
+            "Timestamp",
+            "Type",
+            "ALL_DATA_OBJECTS_TIMESTAMP",
+            2,
+        )],
+        // The content timestamps and the stored policy survive the levels.
+        "content-lta" => &[
+            Counted("Timestamp", "Type", "ALL_DATA_OBJECTS_TIMESTAMP", 1),
+            Counted("Timestamp", "Type", "INDIVIDUAL_DATA_OBJECTS_TIMESTAMP", 1),
+            Counted("Timestamp", "Type", "SIGNATURE_TIMESTAMP", 1),
+            Counted("Timestamp", "Type", "ARCHIVE_TIMESTAMP", 1),
+            Text("Id", POLICY),
+            Text("Policy/DigestAlgoAndValue@match", "true"),
+        ],
+        // Both signed Manifests, each with its own entry.
+        "manifest-multiple" => &[
+            Counted("DigestMatcher", "type", "MANIFEST", 2),
+            Counted("DigestMatcher", "type", "MANIFEST_ENTRY", 2),
+        ],
+        // Both generations of both CAs' CRLs are incorporated.
+        "b-lt-refreshed" => &[Validated("Revocation", 4)],
+        _ => &[],
+    }
+}
+
+/// The facts of the signature policy cases.
+fn policy_properties(name: &str) -> &'static [Expect] {
+    use Expect::{In, Text};
     match name {
         // The stored document's digest, after the transforms of the second,
         // matches the signed one.
         "policy-explicit" => &[
-            ("Id", POLICY),
-            ("Identified", "true"),
-            ("Policy/DigestAlgoAndValue@match", "true"),
-            ("Organization", "Example Organization"),
-            ("ExplicitText", "Signed under the example policy"),
+            Text("Id", POLICY),
+            Text("Identified", "true"),
+            Text("Policy/DigestAlgoAndValue@match", "true"),
+            Text("Organization", "Example Organization"),
+            Text("ExplicitText", "Signed under the example policy"),
         ],
         "policy-transforms" => &[
-            ("Id", POLICY),
-            ("Transformation", "Canonical XML 1.0 (omits comments)"),
-            ("Policy/DigestAlgoAndValue@match", "true"),
+            Text("Id", POLICY),
+            Text("Transformation", "Canonical XML 1.0 (omits comments)"),
+            Text("Policy/DigestAlgoAndValue@match", "true"),
         ],
-        "policy-implied" => &[("Id", "IMPLICIT_POLICY")],
+        "policy-implied" => &[Text("Id", "IMPLICIT_POLICY")],
         // DSS reads the identifier and its qualifiers; without the document
         // it cannot check the supplied digest.
         "policy-supplied" => &[
-            ("Policy/Id", "1.2.3.4.5.6"),
-            ("Policy/Url", "http://spuri.test"),
-            ("Policy/Description", "Test description"),
-            (
+            Text("Policy/Id", "1.2.3.4.5.6"),
+            Text("Policy/Url", "http://spuri.test"),
+            Text("Policy/Description", "Test description"),
+            Text(
                 "Policy/DocumentationReference",
                 "http://nowina.lu/signature-policy.pdf",
             ),
-            ("Policy/Organization", "Nowina Solutions"),
-            ("Policy/ExplicitText", "This is a test policy"),
-            ("DocSpecification/Id", "1.2.3.4.5.6"),
+            Text("Policy/Organization", "Nowina Solutions"),
+            Text("Policy/ExplicitText", "This is a test policy"),
+            Text("DocSpecification/Id", "1.2.3.4.5.6"),
         ],
         // The stored DER policy digests, as TR 102 272 says, to the signed
         // value.
         "policy-asn1" => &[
-            ("Policy/Id", "1.2.3.4.5.6"),
-            ("Policy/Identified", "true"),
-            ("Policy/Asn1Processable", "true"),
-            (
+            Text("Policy/Id", "1.2.3.4.5.6"),
+            Text("Policy/Identified", "true"),
+            Text("Policy/Asn1Processable", "true"),
+            Text(
                 "Policy/Transformation",
                 "http://uri.etsi.org/01903/v1.3.2/SignaturePolicy/SPDocDigestAsInSpecification",
             ),
-            ("Policy/DigestAlgoAndValue@match", "true"),
+            Text("Policy/DigestAlgoAndValue@match", "true"),
         ],
         // The store added to the first signature authenticates its policy;
-        // the second signature has none to compare with.
+        // the second signature, under the same policy, has none.
         "policy-store-added" => &[
-            ("Id", POLICY),
-            ("Identified", "true"),
-            ("Policy/DigestAlgoAndValue@match", "true"),
-            ("Policy/DigestAlgoAndValue@match", "false"),
-            ("Identified", "false"),
+            In("sig", &Text("Id", POLICY)),
+            In("sig", &Text("Identified", "true")),
+            In("sig", &Text("Policy/DigestAlgoAndValue@match", "true")),
+            In("second", &Text("Policy/DigestAlgoAndValue@match", "false")),
+            In("second", &Text("Identified", "false")),
         ],
         // DSS has no local copy to compare; it reads the identifier.
-        "policy-local-uri" => &[("Id", POLICY)],
-        "commitment" => &[
-            (
-                "Identifier",
-                "http://uri.etsi.org/01903/v1.2.2#ProofOfOrigin",
-            ),
-            ("AllDataSignedObjects", "true"),
-            (
-                "Identifier",
-                "http://uri.etsi.org/01903/v1.2.2#ProofOfApproval",
-            ),
-            ("ObjectReference", "sig-reference-1"),
-        ],
-        "signer-role" => &[
-            ("Role", "Manager"),
-            ("Role", "Approver"),
-            ("SignerRole@Category", "signed"),
-        ],
-        "production-place" | "countersigned-properties" => &[
-            ("City", "Prague"),
-            ("StreetAddress", "Main Street 1"),
-            ("PostalCode", "11000"),
-            ("CountryName", "CZ"),
-        ],
-        "content-timestamps" => &[
-            ("Timestamp@Type", "ALL_DATA_OBJECTS_TIMESTAMP"),
-            ("Timestamp@Type", "INDIVIDUAL_DATA_OBJECTS_TIMESTAMP"),
-        ],
-        "content-repeated" => &[("Timestamp@Type", "ALL_DATA_OBJECTS_TIMESTAMP")],
-        // Both generations of both CAs' CRLs are incorporated.
-        "b-lt-refreshed" => &[("Revocation#", "4")],
+        "policy-local-uri" => &[Text("Id", POLICY)],
         _ => &[],
+    }
+}
+
+/// Whether some element at the `Text` path `element` below `root` holds
+/// `expected`.
+fn holds_text(root: xml::Node<'_, '_>, element: &str, expected: &str) -> bool {
+    let (scope, named) = element
+        .split_once('/')
+        .map_or((None, element), |(scope, named)| (Some(scope), named));
+    let (local, attribute) = named
+        .split_once('@')
+        .map_or((named, None), |(local, attribute)| (local, Some(attribute)));
+    let holds = |node: xml::Node<'_, '_>| match attribute {
+        Some(attribute) => node.attribute(attribute) == Some(expected),
+        None => xml::text_at(node, &[]).as_deref() == Some(expected),
+    };
+    match scope {
+        Some(scope) => {
+            xml::below(root, scope, None).any(|parent| xml::below(parent, local, None).any(holds))
+        }
+        None => xml::below(root, local, None).any(holds),
+    }
+}
+
+/// Why `expect` does not hold below `root`, if it does not.
+fn unmet(root: xml::Node<'_, '_>, expect: &Expect) -> Option<String> {
+    match expect {
+        Expect::Text(element, expected) => (!holds_text(root, element, expected))
+            .then(|| format!("DSS did not read {element} {expected:?}")),
+        Expect::Together(parent, facts) => (!xml::below(root, parent, None).any(|node| {
+            facts
+                .iter()
+                .all(|(element, expected)| holds_text(node, element, expected))
+        }))
+        .then(|| format!("DSS did not read one {parent} with {facts:?}")),
+        Expect::Validated(local, count) => {
+            let found = xml::below(root, local, None)
+                .filter(|node| xml::child(*node, "BasicSignature").is_some())
+                .count();
+            (found != *count).then(|| format!("DSS read {found} {local}, {count} expected"))
+        }
+        Expect::Counted(local, attribute, value, count) => {
+            let found = xml::below(root, local, None)
+                .filter(|node| node.attribute(*attribute) == Some(*value))
+                .count();
+            (found != *count).then(|| {
+                format!("DSS read {found} {local} with {attribute}={value}, {count} expected")
+            })
+        }
+        Expect::In(id, inner) => {
+            let signature = xml::below(root, "Signature", None).find(|node| {
+                xml::child(*node, "BasicSignature").is_some()
+                    && xml::text_at(*node, &["DAIdentifier"]).as_deref() == Some(*id)
+            });
+            match signature {
+                Some(signature) => unmet(signature, inner).map(|why| format!("{id}: {why}")),
+                None => Some(format!("DSS reported no signature {id}")),
+            }
+        }
     }
 }
 
 /// Each expected property of `name` the diagnostic report does not hold.
 fn property_problems(name: &str, diagnostic: xml::Node<'_, '_>, problems: &mut Vec<String>) {
-    for (element, expected) in expected_properties(name) {
-        if let Some(local) = element.strip_suffix('#') {
-            let count = xml::below(diagnostic, local, None)
-                .filter(|node| xml::child(*node, "BasicSignature").is_some())
-                .count();
-            if count.to_string() != *expected {
-                problems.push(format!("DSS read {count} {local}, {expected} expected"));
-            }
-            continue;
+    problems.extend(
+        expected_properties(name)
+            .iter()
+            .filter_map(|expect| unmet(diagnostic, expect)),
+    );
+}
+
+/// The format details `data-object-format` writes, read in the created
+/// document: DSS's report keeps only the MIME type of a `DataObjectFormat`.
+fn document_problems(name: &str, document: &str, problems: &mut Vec<String>) {
+    if name != "data-object-format" {
+        return;
+    }
+    let parsed = match xml::parse(document, "created document") {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            problems.push(error);
+            return;
         }
-        let (scope, named) = element
-            .split_once('/')
-            .map_or((None, *element), |(scope, named)| (Some(scope), named));
-        let (local, attribute) = named
-            .split_once('@')
-            .map_or((named, None), |(local, attribute)| (local, Some(attribute)));
-        let holds = |node: xml::Node<'_, '_>| match attribute {
-            Some(attribute) => node.attribute(attribute) == Some(*expected),
-            None => xml::text_at(node, &[]).as_deref() == Some(*expected),
-        };
-        let found = match scope {
-            Some(scope) => xml::below(diagnostic, scope, None)
-                .any(|parent| xml::below(parent, local, None).any(holds)),
-            None => xml::below(diagnostic, local, None).any(holds),
-        };
-        if !found {
-            problems.push(format!("DSS did not read {element} {expected:?}"));
+    };
+    let format = xml::below(parsed.root_element(), "DataObjectFormat", None)
+        .find(|node| node.attribute("ObjectReference") == Some("#sig-reference-0"));
+    for (local, expected) in [
+        ("Description", "Base64 encoded text"),
+        ("Identifier", "urn:oid:1.2.840.113549.1.7.1"),
+        ("Encoding", "http://www.w3.org/2000/09/xmldsig#base64"),
+    ] {
+        let found = format.and_then(|format| {
+            xml::below(format, local, None)
+                .next()
+                .and_then(|node| xml::text_at(node, &[]))
+        });
+        if found.as_deref().map(str::trim) != Some(expected) {
+            problems.push(format!(
+                "DataObjectFormat of #sig-reference-0: {local} {found:?}, {expected:?} expected"
+            ));
         }
     }
 }
 
 /// What DSS concluded on one created document, and why it does not qualify.
-pub(crate) fn assess(case: &Case, output: &str, reports: &Path) -> Result<Value, String> {
+pub(crate) fn assess(
+    case: &Case,
+    output: &str,
+    reports: &Path,
+    document: &str,
+) -> Result<Value, String> {
     let Case {
         name,
         signatures,
@@ -411,6 +558,7 @@ pub(crate) fn assess(case: &Case, output: &str, reports: &Path) -> Result<Value,
     let diagnostic = xml::parse(&diagnostic_text, "diagnostic report")?;
     tokens(diagnostic.root_element(), timestamps, &mut problems);
     property_problems(name, diagnostic.root_element(), &mut problems);
+    document_problems(name, document, &mut problems);
     let mut intact = Vec::new();
     for signature in xml::below(diagnostic.root_element(), "Signature", None)
         .filter(|node| xml::child(*node, "BasicSignature").is_some())
@@ -500,6 +648,7 @@ pub(crate) fn execute(corpus: &Corpus, results: &Path) -> Result<(), String> {
         ("create_probe", None, "creation"),
         ("properties_probe", None, "creation"),
         ("augment_probe", Some("content"), "content"),
+        ("augment_probe", Some("content-lta"), "content"),
         ("augment_probe", Some("refresh"), "content"),
         ("augment_probe", Some("complete"), "augmentation"),
         ("augment_probe", Some("extend"), "levels"),
@@ -546,7 +695,8 @@ pub(crate) fn execute(corpus: &Corpus, results: &Path) -> Result<(), String> {
         let run = corpus.require(&probe, &results.join(format!("{}-run", case.name)))?;
         let output = String::from_utf8_lossy(&run.stdout).into_owned();
         print!("{output}");
-        summary.push(assess(case, &output, &reports)?);
+        let document = xml::read(&signed.join(format!("{}.xml", case.name)))?;
+        summary.push(assess(case, &output, &reports, &document)?);
     }
     summary.extend(forms(
         corpus,

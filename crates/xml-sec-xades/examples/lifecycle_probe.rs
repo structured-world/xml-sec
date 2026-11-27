@@ -379,6 +379,10 @@ fn created(args: &[String], samples: Option<timing::Sampling>) -> Result<(), Str
     let mut resources = BTreeMap::from([(uris[0].clone(), bytes.clone())]);
     if packaging.ends_with("detached-multiple") {
         let second = data.with_file_name("detached-2.txt");
+        // Two references must name two objects.
+        if second == data {
+            return Err("DATA must not be detached-2.txt for a two-file form".into());
+        }
         uris.push(file_name(&second)?);
         resources.insert(uris[1].clone(), read(&second)?);
     }

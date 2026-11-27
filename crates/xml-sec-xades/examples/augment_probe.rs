@@ -152,6 +152,15 @@ fn main() -> Result<(), String> {
                 &work,
             );
         }
+        Some(step @ ("content-lta-request" | "content-lta-archive-request" | "content-lta")) => {
+            return content_lta(
+                step,
+                (&signer, &assessment),
+                (&fixtures, &output),
+                [&root, &intermediate],
+                &work,
+            );
+        }
         _ => {}
     }
     let action = action.to_str().ok_or(usage)?;
@@ -504,6 +513,176 @@ fn content(
             .map_err(|error| format!("{name}.xml: {error}"))?;
     }
     Ok(())
+}
+
+/// The explicit policy `content-lta` signs and stores.
+const LTA_POLICY: &[u8] = b"<Policy xmlns=\"urn:policy\">Sign</Policy>";
+
+/// A signature with both content timestamps, an explicit policy and its
+/// embedded store, taken to B-LTA: its signature timestamp request is
+/// written as `OUTPUT/content-lta-signature.tsq` for `content-lta-request`;
+/// answered by `FIXTURES/content-lta-signature.tsr`, the CRLs of both CAs are
+/// added and the archive timestamp request written as
+/// `OUTPUT/content-lta-archive.tsq` for `content-lta-archive-request`; for
+/// `content-lta`, `FIXTURES/content-lta-archive.tsr` completes it and the
+/// document is written as `OUTPUT/content-lta.xml`.
+fn content_lta(
+    step: &str,
+    (signer, assessment): (&Signer<'_>, &Assessment<'_, '_>),
+    (fixtures, output): (&Path, &Path),
+    [root, intermediate]: [&[u8]; 2],
+    work: &Memory,
+) -> Result<(), String> {
+    let write = |name: &str, bytes: &[u8]| {
+        std::fs::write(output.join(name), bytes).map_err(|error| format!("{name}: {error}"))
+    };
+    let utc = utc()?;
+    let (anchors, certificates) = ([root], [intermediate]);
+    let mut document = content_lta_signed(signer, assessment, fixtures, intermediate, work)?;
+    let pending = request_timestamp(&document, &timestamp(None, Some(NONCE)), assessment, work)
+        .map_err(|error| format!("content-lta signature request: {error}"))?;
+    if step == "content-lta-request" {
+        return write("content-lta-signature.tsq", pending.request());
+    }
+    complete(
+        &mut document,
+        &pending,
+        &read(fixtures, "content-lta-signature.tsr")?,
+        assessment,
+        [root, intermediate],
+        work,
+    )?;
+    let lists = [
+        read(fixtures, "root.crl")?,
+        read(fixtures, "intermediate.crl")?,
+    ];
+    let crls: [&[u8]; 2] = [&lists[0], &lists[1]];
+    let inputs = |requirements| Inputs {
+        requirements,
+        anchors: &anchors,
+        certificates: &certificates,
+        utc: &utc,
+        accuracies: &[],
+        responders: &[],
+        crls: &crls,
+        responses: &[],
+    };
+    add_validation_data(
+        &mut document,
+        &ValidationData {
+            signature: "sig",
+            assessment,
+            inputs: &inputs(Requirements::LongTerm),
+            id_attributes: &[],
+        },
+        work,
+    )
+    .map_err(|error| format!("content-lta validation data: {error}"))?;
+    let archive = request_archive_timestamp(
+        &document,
+        &timestamp(None, Some(NONCE)),
+        assessment,
+        &inputs(Requirements::LongTerm),
+        work,
+    )
+    .map_err(|error| format!("content-lta archive request: {error}"))?;
+    if step == "content-lta-archive-request" {
+        return write("content-lta-archive.tsq", archive.request());
+    }
+    complete_timestamp(
+        &mut document,
+        &archive,
+        &read(fixtures, "content-lta-archive.tsr")?,
+        &Completion {
+            assessment,
+            inputs: &inputs(Requirements::Archival),
+            window: None,
+            id_attributes: &[],
+        },
+        work,
+    )
+    .map_err(|error| format!("content-lta archive completion: {error}"))?;
+    write("content-lta.xml", document.as_xml().as_bytes())
+}
+
+/// The B-B signature of `content-lta`.
+fn content_lta_signed(
+    signer: &Signer<'_>,
+    assessment: &Assessment<'_, '_>,
+    fixtures: &Path,
+    intermediate: &[u8],
+    work: &Memory,
+) -> Result<XmlDocument, String> {
+    use xml_sec_xades::properties::{
+        ExplicitPolicy, Identifier, Policy, PolicyDocument, PolicyStore, PolicyTransform,
+        Properties, SignaturePolicy,
+    };
+    let (all, individual) = (
+        read(fixtures, "content-all.tsr")?,
+        read(fixtures, "content-individual.tsr")?,
+    );
+    let stamps = [
+        ContentTimestamp {
+            response: Some(&all),
+            ..STAMPS[0]
+        },
+        ContentTimestamp {
+            response: Some(&individual),
+            ..STAMPS[1]
+        },
+    ];
+    let utc = utc()?;
+    let certificates = [intermediate];
+    let identifier = |uri| Identifier {
+        uri,
+        qualifier: None,
+        description: None,
+        documentation: &[],
+    };
+    let mut document = XmlDocument::parse(DOCUMENT).map_err(|error| error.to_string())?;
+    let request = Request {
+        id: "sig",
+        signing_time: TIME,
+        objects: vec![
+            DataObject::Document {
+                mime_type: "text/xml",
+                envelope: Envelope::ExcludingSignatures,
+            },
+            DataObject::Element {
+                id: "payload",
+                mime_type: "text/xml",
+            },
+        ],
+        placement: xml_sec_xades::Placement::DocumentEnd,
+        resources: None,
+        id_attributes: &[],
+        properties: Properties {
+            policy: Some(Policy::Document(SignaturePolicy::Explicit(
+                ExplicitPolicy {
+                    identifier: identifier("urn:oid:1.3.6.1.4.1.13762.3.1"),
+                    document: LTA_POLICY,
+                    digest_method: DigestAlgorithm::Sha256.uri(),
+                    transform: PolicyTransform::None,
+                    qualifiers: &[],
+                },
+            ))),
+            policy_store: Some(PolicyStore {
+                specification: identifier("urn:oid:1.3.6.1.4.1.13762.3.2"),
+                document: PolicyDocument::Embedded,
+            }),
+            content_timestamps: &stamps,
+            content_evidence: Some(ContentEvidence {
+                certificates: &certificates,
+                utc: &utc,
+                accuracies: &[],
+                window: None,
+            }),
+            ..Properties::default()
+        },
+    };
+    create(&mut document, signer, request, assessment, work)
+        .map_err(|error| format!("content-lta: {error}"))?;
+    Ok(document)
 }
 
 /// The CRLs `FIXTURES/root.crl` and `FIXTURES/intermediate.crl` added to the

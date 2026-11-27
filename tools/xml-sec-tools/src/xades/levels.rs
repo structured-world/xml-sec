@@ -253,6 +253,18 @@ impl Levels<'_> {
         self.ocsp_response(responder, subject, false, &["-resp_no_certs"])
     }
 
+    /// A response for `subject`, a certificate of the CA `issuer`, signed by
+    /// that CA's delegated `responder` (RFC 6960 §4.2.2.2), as a whole DER
+    /// `OCSPResponse`.
+    pub(super) fn ocsp_delegated(
+        &self,
+        issuer: &str,
+        responder: &str,
+        subject: &str,
+    ) -> Result<Vec<u8>, String> {
+        self.ocsp_under(issuer, responder, subject, false, &[])
+    }
+
     fn ocsp_response(
         &self,
         responder: &str,
@@ -260,6 +272,18 @@ impl Levels<'_> {
         by_key: bool,
         options: &[&str],
     ) -> Result<Vec<u8>, String> {
+        self.ocsp_under("issuer", responder, subject, by_key, options)
+    }
+
+    fn ocsp_under(
+        &self,
+        issuer: &str,
+        responder: &str,
+        subject: &str,
+        by_key: bool,
+        options: &[&str],
+    ) -> Result<Vec<u8>, String> {
+        let issuer = format!("{issuer}.pem");
         let (signer, signer_key) = (format!("{responder}.pem"), format!("{responder}.key"));
         let certificate = format!("{subject}.pem");
         let serial = self.serial(subject)?;
@@ -272,7 +296,7 @@ impl Levels<'_> {
         self.openssl(&[
             "ocsp",
             "-issuer",
-            "issuer.pem",
+            &issuer,
             "-sha256",
             "-cert",
             &certificate,
@@ -285,7 +309,7 @@ impl Levels<'_> {
             "-index",
             "responder.index",
             "-CA",
-            "issuer.pem",
+            &issuer,
             "-rsigner",
             &signer,
             "-rkey",

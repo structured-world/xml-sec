@@ -37,6 +37,11 @@ const NEXT_CRLS: [&[u8]; 2] = [
     include_bytes!("fixtures/content/root-next.crl"),
     include_bytes!("fixtures/content/intermediate-next.crl"),
 ];
+/// Responses for the signer and the TSA their CA signed.
+const OCSP: [&[u8]; 2] = [
+    include_bytes!("fixtures/content/signer.ocsp"),
+    include_bytes!("fixtures/content/tsa.ocsp"),
+];
 /// The document and signing time of the probe's B-B signature.
 const DOCUMENT: &str = "<Document><Data Id=\"payload\">Augmented payload</Data></Document>";
 const TIME: &str = "2026-10-18T12:00:00Z";
@@ -168,7 +173,20 @@ impl Fixture {
         crls: &[&[u8]],
         refresh: bool,
     ) -> Result<DataAdded, xml_sec_xades::AugmentError> {
-        let inputs = self.inputs(Requirements::LongTerm, crls);
+        self.extend_with(document, crls, &[], refresh)
+    }
+
+    fn extend_with(
+        &self,
+        document: &mut XmlDocument,
+        crls: &[&[u8]],
+        responses: &[&[u8]],
+        refresh: bool,
+    ) -> Result<DataAdded, xml_sec_xades::AugmentError> {
+        let inputs = Inputs {
+            responses,
+            ..self.inputs(Requirements::LongTerm, crls)
+        };
         self.with_assessment(|assessment| {
             let data = ValidationData {
                 signature: "sig",
@@ -192,6 +210,35 @@ fn crls(xml: &str) -> usize {
         .descendants()
         .filter(|node| node.tag_name().name() == "EncapsulatedCRLValue")
         .count()
+}
+
+#[test]
+fn a_refresh_takes_the_callers_crl_over_the_documents_ocsp_response() {
+    // A refresh takes each member's status from the caller first, whatever
+    // kind it is: the signer's newer CRL beats the OCSP response the
+    // document already carries, and is added.
+    let fixture = Fixture::new();
+    let mut document = fixture.timestamped();
+    assert_eq!(
+        fixture
+            .extend_with(&mut document, &CRLS[..1], &OCSP, false)
+            .expect("B-LT over the OCSP response"),
+        DataAdded::Published
+    );
+    let ocsp = roxmltree::Document::parse(document.as_xml())
+        .expect("XML parses")
+        .descendants()
+        .filter(|node| node.tag_name().name() == "EncapsulatedOCSPValue")
+        .count();
+    assert_eq!(ocsp, 2, "both members' statuses are the OCSP responses");
+    let before = crls(document.as_xml());
+    assert_eq!(
+        fixture
+            .extend_with(&mut document, &NEXT_CRLS[1..], &[], true)
+            .expect("refresh"),
+        DataAdded::Published
+    );
+    assert_eq!(crls(document.as_xml()), before + 1);
 }
 
 #[test]

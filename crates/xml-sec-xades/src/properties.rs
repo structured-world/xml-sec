@@ -32,7 +32,8 @@ use xml_sec::xmldsig::extension::{
 };
 use xml_sec::xmldsig::{
     DigestAlgorithm, DigestOutput, ObjectElement, SignatureBuilderError, Transform, TransformData,
-    TransformError, compute_digest_with_provider, execute_transforms_with_policy, parse_transforms,
+    TransformError, compute_digest_with_provider, constant_time_eq, execute_transforms_with_policy,
+    parse_transforms,
 };
 use xml_sec::{XmlDomDocument, XmlDomNode};
 
@@ -264,6 +265,35 @@ pub(crate) struct SignedPolicy {
     pub(crate) method: String,
     /// The decoded `SigPolicyHash/DigestValue`.
     pub(crate) digest: Vec<u8>,
+    /// The plan the signed digest was computed under: the one the stored
+    /// document is checked under (EN 319 132-1 §5.2.9.2).
+    pub(crate) plan: SignedPlan,
+}
+
+/// `value` with its whitespace collapsed, as an `xsd:anyURI` is compared
+/// (XML Schema 1.0 Part 2 §3.2.17, §4.3.6): runs become one space, with
+/// none leading or trailing.
+pub(crate) fn collapse(value: &str) -> String {
+    let mut collapsed = String::with_capacity(value.len());
+    for word in value.split_ascii_whitespace() {
+        if !collapsed.is_empty() {
+            collapsed.push(' ');
+        }
+        collapsed.push_str(word);
+    }
+    collapsed
+}
+
+/// The policy digest plan a signature signed.
+#[derive(Debug)]
+pub(crate) enum SignedPlan {
+    /// The document's bytes as they are.
+    None,
+    /// The signed `ds:Transforms`.
+    Transforms(PolicyTransforms),
+    /// The digest a named technical specification defines
+    /// (`SPDocDigestAsInSpecification`).
+    InSpecification,
 }
 
 /// The draft of one new signature's `QualifyingProperties`, or of a policy
@@ -453,18 +483,31 @@ impl PolicyWriter for PropertyDraft<'_> {
             Bound::Signed(signed) => {
                 work.charge_work((policy.identifier.uri.len() + policy.digest_method.len()) as u64)
                     .map_err(DraftError::from)?;
-                if policy.identifier.uri != signed.identifier
+                if collapse(policy.identifier.uri) != signed.identifier
                     || policy.digest_method != signed.method
                 {
                     return Ok(false);
                 }
-                let digest = self.policy_digest(
-                    policy.document,
-                    policy.digest_method,
-                    &policy.transform,
-                    work,
-                )?;
-                Ok(digest.as_ref() == signed.digest.as_slice())
+                // The document is checked under the plan the signature
+                // signed: its own ds:Transforms, or none, never a plan only
+                // the caller states.
+                let digest = match (&signed.plan, &policy.transform) {
+                    (SignedPlan::Transforms(transforms), _) => {
+                        let plan = Fragment::Transforms(transforms.clone());
+                        self.policy_digest(
+                            policy.document,
+                            policy.digest_method,
+                            &PolicyTransform::Xml(&plan),
+                            work,
+                        )?
+                    }
+                    (SignedPlan::None, plan @ PolicyTransform::None)
+                    | (SignedPlan::InSpecification, plan @ PolicyTransform::InSpecification(_)) => {
+                        self.policy_digest(policy.document, policy.digest_method, plan, work)?
+                    }
+                    _ => return Ok(false),
+                };
+                Ok(constant_time_eq(digest.as_ref(), signed.digest.as_slice()))
             }
         }
     }

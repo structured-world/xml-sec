@@ -447,7 +447,7 @@ pub fn create<W: Work>(
     work: &W,
 ) -> Result<(), CreateError> {
     let layout = Layout::new(document, &request)?;
-    let key_info = key_info(signer)?;
+    let key_info = checked_key_info(signer, work)?;
     let stamps = request.properties.content_timestamps;
     if stamps.is_empty() {
         let properties = layout.properties(signer, &request, None, work)?;
@@ -580,7 +580,7 @@ pub fn request_content_timestamps<W: Work>(
     work: &W,
 ) -> Result<ContentRequests, CreateError> {
     let layout = Layout::new(document, request)?;
-    let key_info = key_info(signer)?;
+    let key_info = checked_key_info(signer, work)?;
     let replayed = layout.replayed(document, signer, &key_info, request, work)?;
     let cms = assessment.context.cms_provider();
     Ok(content::requests(
@@ -837,16 +837,14 @@ impl<'a> Placed<'a> {
             )?);
         };
         // Failing the transaction on purpose discards the inserted template;
-        // the dry run's outcome leaves it beside the refusal.
-        let mut outcome = None;
-        let Err(()) = document.transaction(|document| {
-            outcome = Some(
+        // the dry run's outcome leaves it as the rollback value.
+        let Err(outcome) = document.transaction(|document| {
+            Err::<core::convert::Infallible, _>(
                 insert(document, template, policy, at)
                     .and_then(|()| Ok(self.context.reference_inputs(document, CONTENT_INPUTS)?)),
-            );
-            Err::<core::convert::Infallible, ()>(())
+            )
         });
-        outcome.expect("a transaction runs its operation once")
+        outcome
     }
 }
 
@@ -1229,14 +1227,16 @@ fn checked_optional<'p>(
     if properties.policy_store.is_some() && staged.is_none() {
         return Err(CreateError::PolicyStoreWithoutPolicy);
     }
-    for (index, details) in properties.formats.iter().enumerate() {
-        let known = objects
-            .iter()
-            .any(|object| object.reference == details.reference);
-        let repeated = properties.formats[..index]
-            .iter()
-            .any(|earlier| earlier.reference == details.reference);
-        if !known || repeated {
+    if properties.formats.is_empty() {
+        return Ok(staged);
+    }
+    // One pass each way: the objects' references, then each format's
+    // reference checked against them and against those already described.
+    let known: alloc::collections::BTreeSet<&str> =
+        objects.iter().map(|object| object.reference).collect();
+    let mut described = alloc::collections::BTreeSet::new();
+    for details in properties.formats {
+        if !known.contains(details.reference) || !described.insert(details.reference) {
             return Err(CreateError::FormatReference(details.reference.into()));
         }
     }
@@ -1262,6 +1262,29 @@ fn write_policy<W: Work>(
 /// The `QualifyingProperties` of a new signature, drafted from the shared
 /// B-B rules and the optional properties, and checked as `Object` content
 /// under the signing policy.
+/// The signer's certificate `leaf`, exactly one DER certificate.
+fn leaf_certificate<'p>(
+    parser: &'p Parser,
+    leaf: &'p [u8],
+) -> Result<Certificate<'p>, CreateError> {
+    let certificate = Certificate::read(parser, leaf, 0).map_err(CreateError::Certificate)?;
+    if certificate.as_bytes().len() != leaf.len() {
+        return Err(CreateError::TrailingBytes);
+    }
+    Ok(certificate)
+}
+
+/// `key_info(signer)` after the signer's certificate is checked, so a leaf
+/// that is no certificate keeps that cause.
+fn checked_key_info<W: Work>(
+    signer: &Signer<'_>,
+    work: &W,
+) -> Result<X509CertificateKeyInfoWriter, CreateError> {
+    let (&leaf, _) = signer.chain.split_first().ok_or(CreateError::EmptyChain)?;
+    leaf_certificate(&Parser::der(work.memory().clone()), leaf)?;
+    key_info(signer)
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "the B-B inputs of one signature, each a distinct required value"
@@ -1284,10 +1307,7 @@ fn signed_properties<W: Work>(
     let staged = checked_optional(properties, objects)?;
     let (&leaf, _) = signer.chain.split_first().ok_or(CreateError::EmptyChain)?;
     let parser = Parser::der(work.memory().clone());
-    let certificate = Certificate::read(&parser, leaf, 0).map_err(CreateError::Certificate)?;
-    if certificate.as_bytes().len() != leaf.len() {
-        return Err(CreateError::TrailingBytes);
-    }
+    let certificate = leaf_certificate(&parser, leaf)?;
     // EN 319 132-1 §5.2.2: CertDigest is the digest of the complete
     // certificate encoding, computed here by the operation's provider.
     let digest = compute_digest_with_provider(signer.provider, signer.digest, leaf, work.memory())?;

@@ -331,17 +331,19 @@ impl Fixture {
     /// refused without publishing anything.
     fn refused(&self, properties: Properties<'_>, objects: &[DataObject<'_>]) -> CreateError {
         let mut document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
-        let error = self
-            .create(
-                &mut document,
-                Request {
-                    properties,
-                    ..request("sig", objects)
-                },
-            )
-            .expect_err("refused");
-        assert_eq!(document.as_xml(), DOCUMENT, "nothing is published");
-        error
+        refused(
+            &mut document,
+            |document| {
+                self.create(
+                    document,
+                    Request {
+                        properties,
+                        ..request("sig", objects)
+                    },
+                )
+            },
+            |_| true,
+        )
     }
 }
 
@@ -1590,20 +1592,20 @@ fn refused(
     document: &mut XmlDocument,
     operation: impl FnOnce(&mut XmlDocument) -> Result<(), CreateError>,
     matches: impl FnOnce(&CreateError) -> bool,
-) {
+) -> CreateError {
     let before = document.as_xml().to_owned();
     let generation = document.generation();
-    let result = operation(document);
-    match &result {
-        Err(error) if matches(error) => {}
+    let error = match operation(document) {
+        Err(error) if matches(&error) => error,
         other => panic!("unexpected result {other:?}"),
-    }
+    };
     assert_eq!(document.as_xml(), before, "the document is unchanged");
     assert_eq!(
         document.generation(),
         generation,
         "no generation is published"
     );
+    error
 }
 
 #[test]
@@ -1711,6 +1713,21 @@ fn malformed_inputs_are_refused_without_a_partial_signature() {
             )
         },
         |error| matches!(error, CreateError::EmptyChain),
+    );
+    // A leaf that is not a certificate keeps its parse cause, whatever
+    // writes KeyInfo after it.
+    refused(
+        &mut document,
+        |document| {
+            fixture.create_with(
+                document,
+                request("sig", &objects),
+                &[b"\x30\x03\x02\x01\x01", INTERMEDIATE],
+                &fixture.resolver,
+                1 << 30,
+            )
+        },
+        |error| matches!(error, CreateError::Certificate(_)),
     );
 }
 
