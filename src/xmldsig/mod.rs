@@ -101,8 +101,8 @@ mod xpath;
 
 #[cfg(feature = "xmldsig-sign")]
 pub use builder::{
-    ObjectBuilder, ObjectContent, ObjectElement, ReferenceBuilder, SignatureBuilder,
-    SignatureBuilderError,
+    ManifestBuilder, ObjectBuilder, ObjectContent, ObjectElement, ReferenceBuilder,
+    SignatureBuilder, SignatureBuilderError,
 };
 #[cfg(feature = "rustcrypto")]
 pub use digest::compute_digest;
