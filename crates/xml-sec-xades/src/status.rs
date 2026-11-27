@@ -18,7 +18,7 @@ use structured_pkix::Certificate;
 use structured_pkix::crl::{
     Authenticated, Authentication, CertificateList, CombinedEntry, CompleteEvidence, CompleteFacts,
     Coverage, CoverageAdmission, DeltaBinding, DeltaEvidence, DeltaFacts, EntryLookup, Evaluation,
-    SourceOrigin,
+    Reasons, SourceOrigin,
 };
 use structured_pkix::error::CallbackError;
 use structured_pkix::ocsp::{
@@ -144,10 +144,67 @@ struct Engine<'e, 'x, 'v, 's, 'i, W: Work> {
     cms: &'e CmsProvider<'e>,
     authorities: &'e Authorities<'x>,
     lists: &'e [Authenticated<'x, 'x>],
+    /// The lists from this position on are bases only: each decides nothing
+    /// alone, only with one of the leading `base_deltas` deltas bound to it.
+    base_from: usize,
     deltas: &'e [Authenticated<'x, 'x>],
+    base_deltas: usize,
     responses: &'e [SignedResponse<'x, 'x>],
     utc: &'x LeapTable<'x>,
     at: Instant,
+}
+
+/// The CRLs and OCSP responses a status may come from, in order.
+pub(crate) struct StatusSources<'s, 'x> {
+    pub(crate) lists: &'s [&'x CertificateList<'x>],
+    pub(crate) responses: &'s [&'x BasicResponse<'x>],
+    /// How many leading lists and responses are the caller's, each member's
+    /// status taken from them before any other; (0, 0) gives every source
+    /// the same rank, the order alone deciding within a kind.
+    pub(crate) supplied: (usize, usize),
+}
+
+/// The authenticated pools of one status census.
+struct Pools<'x> {
+    complete: OwnedVec<Authenticated<'x, 'x>>,
+    deltas: OwnedVec<Authenticated<'x, 'x>>,
+    signed: OwnedVec<SignedResponse<'x, 'x>>,
+    /// How many leading complete lists, deltas and signed responses are the
+    /// caller's.
+    supplied: (usize, usize, usize),
+}
+
+/// The authenticated lists and signed responses of `sources`, the caller's
+/// first so the leading entries of each pool are theirs whichever of them
+/// authenticate.
+fn pools<'x, W: Work>(
+    session: &VerifiedSession<'_, '_, '_, W>,
+    cms: &CmsProvider<'_>,
+    authorities: &Authorities<'x>,
+    sources: &StatusSources<'_, 'x>,
+) -> Result<Pools<'x>, StatusError> {
+    let (lists_first, lists_rest) = sources.lists.split_at(sources.supplied.0);
+    let (responses_first, responses_rest) = sources.responses.split_at(sources.supplied.1);
+    let (mut complete, mut deltas) = authenticated_lists(session, authorities, lists_first)?;
+    let (supplied_lists, supplied_deltas) = (complete.len(), deltas.len());
+    let (rest_complete, rest_deltas) = authenticated_lists(session, authorities, lists_rest)?;
+    for list in rest_complete {
+        complete.try_push(list).map_err(Error::from)?;
+    }
+    for list in rest_deltas {
+        deltas.try_push(list).map_err(Error::from)?;
+    }
+    let mut signed = signed_responses(session, cms, authorities, responses_first)?;
+    let supplied_responses = signed.len();
+    for response in signed_responses(session, cms, authorities, responses_rest)? {
+        signed.try_push(response).map_err(Error::from)?;
+    }
+    Ok(Pools {
+        complete,
+        deltas,
+        signed,
+        supplied: (supplied_lists, supplied_deltas, supplied_responses),
+    })
 }
 
 /// Every supplied list its issuer's own key authenticates. Lists no available
@@ -243,6 +300,18 @@ fn signed_responses<'x, W: Work>(
 }
 
 impl<'e, 'x, W: Work> Engine<'e, 'x, '_, '_, '_, W> {
+    /// The engine a refresh asks first: the caller's complete lists, the
+    /// caller's deltas over any complete list (RFC 5280 §5.2.4 lets the base
+    /// be one the document holds) and the caller's responses.
+    fn caller_first(&self, pools: &'e Pools<'x>) -> Self {
+        Self {
+            base_from: pools.supplied.0,
+            base_deltas: pools.supplied.1,
+            responses: &pools.signed[..pools.supplied.2],
+            ..*self
+        }
+    }
+
     fn evaluation(&self) -> Evaluation<'_, structured_asn1::memory::Memory> {
         Evaluation {
             now: Reading::from(self.at),
@@ -324,13 +393,15 @@ impl<'e, 'x, W: Work> Engine<'e, 'x, '_, '_, '_, W> {
     }
 
     /// An OCSP response for `target` its issuer, a delegate of that issuer or a
-    /// responder the caller configured for it signed. Configured trust is never
-    /// inferred from a document.
+    /// responder the caller configured for it signed, stating the target
+    /// revoked when `revoked` is set. Configured trust is never inferred from
+    /// a document.
     fn ocsp(
         &self,
         target: &'x Certificate<'x>,
         issuer: &'x Certificate<'x>,
         issuing: EffectiveKey<'x>,
+        revoked: bool,
         roots: usize,
         extra: &mut OwnedVec<CheckedPath<'x>, structured_asn1::memory::Memory>,
     ) -> Result<Selection<'e, 'x>, StatusError> {
@@ -397,6 +468,14 @@ impl<'e, 'x, W: Work> Engine<'e, 'x, '_, '_, '_, W> {
             let Some(evidence) = reading.evidence() else {
                 continue;
             };
+            if revoked
+                && !matches!(
+                    evidence.evidence().status(),
+                    ocsp::Status::Revoked { .. } | ocsp::Status::NotIssued
+                )
+            {
+                continue;
+            }
             let responder = if delegated && !configured {
                 match self.authority_path(signed.signer(), roots, extra)? {
                     Ok(path) => Some(path),
@@ -416,6 +495,97 @@ impl<'e, 'x, W: Work> Engine<'e, 'x, '_, '_, '_, W> {
         Ok(None)
     }
 
+    /// The status of `target`: from the caller's `supplied` sources first when
+    /// there are any, then from every source.
+    #[expect(
+        clippy::type_complexity,
+        reason = "the selection, its no-check mark, or the authority path failure"
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the member, its issuer and the census's growing state"
+    )]
+    fn decide(
+        &self,
+        supplied: Option<&Self>,
+        anchor: Anchor<'x>,
+        target: &'x Certificate<'x>,
+        issuer: Option<(&'x Certificate<'x>, EffectiveKey<'x>)>,
+        roots: usize,
+        extra: &mut OwnedVec<CheckedPath<'x>, structured_asn1::memory::Memory>,
+        signers: &mut OwnedVec<CrlAuthoritySource, structured_asn1::memory::Memory>,
+    ) -> Result<Option<Result<(Selected<'e, 'x>, bool), PathFailure>>, StatusError> {
+        // A listed entry decides whatever another source omits (RFC 5280
+        // §6.3.3(i)), so a good OCSP answer cannot hide it from the report;
+        // the caller's response that states the revocation too is still the
+        // caller's status.
+        let listed = self.listed(target)?;
+        if listed
+            && let (Some(supplied), Some((issuer, issuing))) = (supplied, issuer)
+            && let Some(found) = supplied.ocsp(target, issuer, issuing, true, roots, extra)?
+        {
+            return Ok(Some(found));
+        }
+        // The listing decides over an absence a caller's list reports too:
+        // only the full engine, whose CRL walk returns the first listing and
+        // reads the caller's lists first, answers a listed member.
+        let (issuer, supplied) = if listed {
+            (None, None)
+        } else {
+            (issuer, supplied)
+        };
+        if let Some(supplied) = supplied {
+            let (mark, paths) = (signers.len(), extra.len());
+            match supplied.choose(anchor, target, issuer, roots, extra, signers)? {
+                // RFC 5280 §6.3.3(j): an absence determines the status only
+                // once its reasons reach all reasons; the caller's partial
+                // coverage is completed by the full census instead.
+                Some(Ok((Selected::Absent { coverage, .. }, _)))
+                    if coverage.reasons() != Reasons::ALL =>
+                {
+                    // Drop the partial answer's authority sources and the
+                    // authority paths it reached; the full census records its
+                    // own, and an orphaned path would need a status of its own.
+                    while signers.len() > mark {
+                        signers.pop();
+                    }
+                    while extra.len() > paths {
+                        extra.pop();
+                    }
+                }
+                Some(found) => return Ok(Some(found)),
+                None => {}
+            }
+        }
+        self.choose(anchor, target, issuer, roots, extra, signers)
+    }
+
+    /// The status of `target` from this engine's sources: an OCSP response
+    /// when `issuer` is given (the target is listed by no CRL), else its CRL
+    /// evidence. None when neither answers.
+    #[expect(
+        clippy::type_complexity,
+        reason = "the selection, its no-check mark, or the authority path failure"
+    )]
+    fn choose(
+        &self,
+        anchor: Anchor<'x>,
+        target: &'x Certificate<'x>,
+        issuer: Option<(&'x Certificate<'x>, EffectiveKey<'x>)>,
+        roots: usize,
+        extra: &mut OwnedVec<CheckedPath<'x>, structured_asn1::memory::Memory>,
+        signers: &mut OwnedVec<CrlAuthoritySource, structured_asn1::memory::Memory>,
+    ) -> Result<Option<Result<(Selected<'e, 'x>, bool), PathFailure>>, StatusError> {
+        if let Some((issuer, issuing)) = issuer
+            && let Some(found) = self.ocsp(target, issuer, issuing, false, roots, extra)?
+        {
+            return Ok(Some(found));
+        }
+        Ok(self
+            .crl(anchor, target, roots, extra, signers)?
+            .map(|found| found.map(|selected| (selected, false))))
+    }
+
     /// The CRL evidence for `target`, combining every applicable complete list
     /// with its newest bound delta (RFC 5280 §6.3.3).
     fn crl(
@@ -431,16 +601,18 @@ impl<'e, 'x, W: Work> Engine<'e, 'x, '_, '_, '_, W> {
         let first = signers.len();
         let mut coverage: Option<Coverage<'x, 'x>> = None;
         let mut negative = None;
-        for list in self.lists {
+        for (position, list) in self.lists.iter().enumerate() {
             let CompleteEvidence::Facts(facts) = list.evaluate(target, &time)? else {
                 continue;
             };
-            let signer = match self.signer(anchor, list.issuer(), roots, extra)? {
-                Ok(signer) => signer,
-                Err(failure) => return Ok(Some(Err(failure))),
+            let base = position >= self.base_from;
+            let deltas = if base {
+                &self.deltas[..self.base_deltas]
+            } else {
+                self.deltas
             };
             let mut newest = None;
-            for delta in self.deltas {
+            for delta in deltas {
                 let DeltaBinding::Bound(pair) = list.bind_delta(delta, memory)? else {
                     continue;
                 };
@@ -452,6 +624,13 @@ impl<'e, 'x, W: Work> Engine<'e, 'x, '_, '_, '_, W> {
                     newest = Some(pair);
                 }
             }
+            if base && newest.is_none() {
+                continue;
+            }
+            let signer = match self.signer(anchor, list.issuer(), roots, extra)? {
+                Ok(signer) => signer,
+                Err(failure) => return Ok(Some(Err(failure))),
+            };
             let (absence, source) = if let Some(pair) = newest {
                 let DeltaEvidence::Facts(facts) = pair.evaluate(target, &time)? else {
                     continue;
@@ -533,26 +712,27 @@ pub(crate) fn with_statuses<'x, W: Work, R>(
     session: &VerifiedSession<'_, '_, '_, W>,
     cms: &CmsProvider<'_>,
     authorities: &'x Authorities<'x>,
-    lists: &[&'x CertificateList<'x>],
-    responses: &[&'x BasicResponse<'x>],
+    sources: &StatusSources<'_, 'x>,
     roots: &'x [&'x CheckedPath<'x>],
     utc: &'x LeapTable<'x>,
     at: Instant,
     then: impl for<'v> FnOnce(&'v [&'v PathStatuses<'v, 'x, 'x>], &'v [AuthorityNode<'v, 'x, 'x>]) -> R,
 ) -> Result<Result<R, StatusFailure>, StatusError> {
     let memory = authorities.memory;
-    let (complete, deltas) = authenticated_lists(session, authorities, lists)?;
-    let signed = signed_responses(session, cms, authorities, responses)?;
+    let pools = pools(session, cms, authorities, sources)?;
     let engine = Engine {
         session,
         cms,
         authorities,
-        lists: &complete,
-        deltas: &deltas,
-        responses: &signed,
+        lists: &pools.complete,
+        base_from: pools.complete.len(),
+        deltas: &pools.deltas,
+        base_deltas: 0,
+        responses: &pools.signed,
         utc,
         at,
     };
+    let supplied = (sources.supplied != (0, 0)).then(|| engine.caller_first(&pools));
     let mut extra = memory.vector();
     let mut signers = memory.vector();
     let mut plans: OwnedVec<Plan<'_, 'x>, _> = memory.vector();
@@ -585,15 +765,16 @@ pub(crate) fn with_statuses<'x, W: Work, R>(
             } else {
                 (anchor.certificate(), EffectiveKey::standing(anchor.key()))
             };
-            // A listed entry decides whatever another source omits (RFC 5280
-            // §6.3.3(i)), so a good OCSP answer cannot hide it from the report.
-            let ocsp = match issuer {
-                Some(issuer) if !engine.listed(target)? => {
-                    engine.ocsp(target, issuer, issuing, roots.len(), &mut extra)?
-                }
-                _ => None,
-            };
-            let selected = match ocsp {
+            let chosen = engine.decide(
+                supplied.as_ref(),
+                anchor,
+                target,
+                issuer.map(|issuer| (issuer, issuing)),
+                roots.len(),
+                &mut extra,
+                &mut signers,
+            )?;
+            let selected = match chosen {
                 Some(Ok((selected, no_check))) => {
                     if no_check
                         && let Selected::Ocsp {
@@ -606,11 +787,7 @@ pub(crate) fn with_statuses<'x, W: Work, R>(
                     selected
                 }
                 Some(Err(failure)) => return Ok(Err(StatusFailure::AuthorityPath(failure))),
-                None => match engine.crl(anchor, target, roots.len(), &mut extra, &mut signers)? {
-                    Some(Ok(selected)) => selected,
-                    Some(Err(failure)) => return Ok(Err(StatusFailure::AuthorityPath(failure))),
-                    None => return Ok(Err(StatusFailure::NoSource)),
-                },
+                None => return Ok(Err(StatusFailure::NoSource)),
             };
             plans
                 .try_push(Plan {

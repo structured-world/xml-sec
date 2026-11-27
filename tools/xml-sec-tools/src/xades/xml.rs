@@ -29,6 +29,16 @@ pub(crate) fn child<'a, 'input>(node: Node<'a, 'input>, name: &str) -> Option<No
     node.children().find(|child| named(*child, name, None))
 }
 
+/// Every element child of `node` called `name` in `namespace`.
+pub(crate) fn children_named<'a, 'input>(
+    node: Node<'a, 'input>,
+    name: &'a str,
+    namespace: &'a str,
+) -> impl Iterator<Item = Node<'a, 'input>> {
+    node.children()
+        .filter(move |child| named(*child, name, Some(namespace)))
+}
+
 /// Every element child of `node`.
 pub(crate) fn elements<'a, 'input>(
     node: Node<'a, 'input>,

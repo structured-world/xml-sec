@@ -10,7 +10,7 @@ public class Probe {
             Lifecycle.verifier(Files.readAllBytes(Path.of(args[1])), null),
             1800000000L,
             ValidationLevel.BASIC_SIGNATURES,
-            null);
+            java.util.List.of());
         Path output = Path.of(args[2]);
         Files.createDirectories(output);
         Files.writeString(output.resolve("diagnostic.xml"), reports.getXmlDiagnosticData());

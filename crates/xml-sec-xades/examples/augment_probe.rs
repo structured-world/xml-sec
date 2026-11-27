@@ -9,6 +9,20 @@
 //! `OUTPUT`: `request.tsq` with a nonce, `request-policy.tsq` that also asks
 //! for a policy, and `request-no-nonce.tsq` without a nonce.
 //!
+//! `augment_probe content-request FIXTURES OUTPUT` writes the content
+//! timestamp requests of a new signature: `content-all.tsq` and
+//! `content-individual.tsq`, and `content-changing.tsq` of a signature whose
+//! reference covers its own qualifying properties, and `signature.tsq`, the
+//! signature timestamp request of the B-B signature `sig`. `augment_probe content
+//! FIXTURES OUTPUT` completes the first two with `FIXTURES/content-all.tsr`
+//! and `FIXTURES/content-individual.tsr` and writes the signature as
+//! `OUTPUT/content-timestamps.xml`.
+//!
+//! `augment_probe refresh FIXTURES OUTPUT`, over the content fixtures,
+//! completes `signature.tsq` with `FIXTURES/signature.tsr`, adds the first
+//! generation of CRLs and refreshes the B-LT signature with the next, written
+//! as `OUTPUT/b-lt-refreshed.xml`.
+//!
 //! `augment_probe complete FIXTURES OUTPUT` completes `request.tsq` with
 //! `FIXTURES/response.tsr` and writes the B-T document `OUTPUT/b-t.xml`.
 //!
@@ -44,13 +58,14 @@ use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::policy::{Instant, ManifestProcessing, SigningPolicy, VerificationPolicy};
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DigestAlgorithm, KeyResolverConfig, RsaSigningKey, SignatureAlgorithm,
-    UriTypeSet, VerificationRequest, VerifyContext,
+    Transform, UriTypeSet, VerificationRequest, VerifyContext, XPathExpression,
 };
 use xml_sec_xades::{
-    Assessment, Completion, DataObject, DigestRenewal, Envelope, Inputs, PendingTimestamp, Request,
-    Requirements, Signer, TimestampRequest, ValidationData, add_validation_data,
-    complete_timestamp, create, request_archive_timestamp, request_archive_timestamp_with_renewal,
-    request_timestamp,
+    Assessment, Completion, ContentEvidence, ContentScope, ContentTimestamp, DataAdded, DataObject,
+    DigestRenewal, Envelope, Inputs, PendingTimestamp, Request, Requirements, Signer,
+    TimestampRequest, ValidationData, add_validation_data, complete_timestamp, create,
+    refresh_validation_data, request_archive_timestamp, request_archive_timestamp_with_renewal,
+    request_content_timestamps, request_timestamp,
 };
 
 const DOCUMENT: &str = "<Document><Data Id=\"payload\">Augmented payload</Data></Document>";
@@ -79,7 +94,7 @@ fn utc() -> Result<LeapTable<'static>, String> {
 
 fn main() -> Result<(), String> {
     let mut args = std::env::args_os().skip(1);
-    let usage = "usage: augment_probe request|complete|archive-request|renewal-request|archive|extend|renew-request|renew FIXTURES OUTPUT";
+    let usage = "usage: augment_probe request|content-request|content|content-lta-request|content-lta-archive-request|content-lta|refresh|complete|archive-request|renewal-request|archive|extend|renew-request|renew FIXTURES OUTPUT";
     let (Some(action), Some(fixtures), Some(output), None) =
         (args.next(), args.next(), args.next(), args.next())
     else {
@@ -110,6 +125,7 @@ fn main() -> Result<(), String> {
         method: SignatureAlgorithm::RsaSha256,
         digest: DigestAlgorithm::Sha256,
         canonicalization: C14nAlgorithm::new(C14nMode::Exclusive1_0, false),
+        prefixes: xml_sec_xades::Prefixes::default(),
     };
     let resolver = DefaultKeyResolver::new(KeyResolverConfig {
         trusted_certs: vec![root.clone()],
@@ -125,42 +141,92 @@ fn main() -> Result<(), String> {
         certificates: &[&root],
     };
     let work = Memory::new(Arc::new(MemoryAccount::new(1 << 26, 1 << 30)));
-    let mut document = created(&signer, &assessment, &work)?;
+    match action.to_str() {
+        Some("content-request") => return content_requests(&signer, &assessment, &output, &work),
+        Some("content") => {
+            return content(
+                &signer,
+                &assessment,
+                (&fixtures, &output),
+                &intermediate,
+                &work,
+            );
+        }
+        Some(step @ ("content-lta-request" | "content-lta-archive-request" | "content-lta")) => {
+            return content_lta(
+                step,
+                (&signer, &assessment),
+                (&fixtures, &output),
+                [&root, &intermediate],
+                &work,
+            );
+        }
+        _ => {}
+    }
+    let action = action.to_str().ok_or(usage)?;
+    augmented(
+        action,
+        (&signer, &assessment),
+        (&fixtures, &output),
+        [&root, &intermediate],
+        &work,
+    )
+    .map_err(|error| {
+        if error.is_empty() {
+            usage.into()
+        } else {
+            error
+        }
+    })
+}
+
+/// The B-B signature `sig`, its timestamp requests, or its augmentation the
+/// `action` names; an unknown action is an empty error.
+fn augmented(
+    action: &str,
+    (signer, assessment): (&Signer<'_>, &Assessment<'_, '_>),
+    (fixtures, output): (&Path, &Path),
+    pki: [&[u8]; 2],
+    work: &Memory,
+) -> Result<(), String> {
+    let mut document = created(signer, assessment, work)?;
     let write = |name: &str, bytes: &[u8]| {
         std::fs::write(output.join(name), bytes).map_err(|error| format!("{name}: {error}"))
     };
-    let pending = request_timestamp(&document, &timestamp(None, Some(NONCE)), &assessment, &work)
+    let pending = request_timestamp(&document, &timestamp(None, Some(NONCE)), assessment, work)
         .map_err(|error| format!("request: {error}"))?;
-    match action.to_str() {
-        Some("request") => {
+    match action {
+        "request" => {
             write("request.tsq", pending.request())?;
-            requests(&document, &assessment, &write, &work)?;
+            requests(&document, assessment, &write, work)?;
         }
-        Some(action @ ("complete" | "archive-request" | "renewal-request" | "archive")) => {
-            let response = read(&fixtures, "response.tsr")?;
-            complete(
-                &mut document,
-                &pending,
-                &response,
-                &assessment,
-                [&root, &intermediate],
-                &work,
-            )?;
-            if action == "complete" {
-                write("b-t.xml", document.as_xml().as_bytes())?;
+        "complete" | "archive-request" | "renewal-request" | "archive" | "refresh" => {
+            // The content fixtures answer the same request as `signature.tsr`.
+            let answer = if action == "refresh" {
+                "signature.tsr"
             } else {
-                archived(
+                "response.tsr"
+            };
+            let response = read(fixtures, answer)?;
+            complete(&mut document, &pending, &response, assessment, pki, work)?;
+            match action {
+                "complete" => write("b-t.xml", document.as_xml().as_bytes())?,
+                "refresh" => {
+                    refreshed(&mut document, assessment, fixtures, pki, work)?;
+                    write("b-lt-refreshed.xml", document.as_xml().as_bytes())?;
+                }
+                _ => archived(
                     &mut document,
-                    &assessment,
-                    &fixtures,
-                    [&root, &intermediate],
+                    assessment,
+                    fixtures,
+                    pki,
                     action,
                     &write,
-                    &work,
-                )?;
+                    work,
+                )?,
             }
         }
-        _ => return Err(usage.into()),
+        _ => return Err(String::new()),
     }
     Ok(())
 }
@@ -289,6 +355,386 @@ fn archived(
     Ok(())
 }
 
+/// The content timestamps the creation tests complete: one over every data
+/// object and one over the payload element alone, each with a nonce.
+const STAMPS: [ContentTimestamp<'static>; 2] = [
+    ContentTimestamp {
+        scope: ContentScope::All,
+        digest: Algorithm::Sha256,
+        policy: None,
+        nonce: Some(NONCE),
+        response: None,
+    },
+    ContentTimestamp {
+        // Include order differs from reference order (EN 319 132-1 §5.2.8.3).
+        scope: ContentScope::Individual(&["#sig-reference-1", "#sig-reference-0"]),
+        digest: Algorithm::Sha256,
+        policy: None,
+        nonce: Some(NONCE),
+        response: None,
+    },
+];
+
+/// `XPath` that keeps the signature's qualifying properties in a whole-document
+/// reference while leaving out what signing fills in.
+const CHANGING: &str =
+    "not(ancestor-or-self::ds:SignedInfo or ancestor-or-self::ds:SignatureValue)";
+
+/// The content timestamp requests of a signature `sig` over the document
+/// without signatures and its payload element (`content-all.tsq`,
+/// `content-individual.tsq`), and of one whose reference covers its own
+/// qualifying properties, which the timestamp then changes
+/// (`content-changing.tsq`).
+fn content_requests(
+    signer: &Signer<'_>,
+    assessment: &Assessment<'_, '_>,
+    output: &Path,
+    work: &Memory,
+) -> Result<(), String> {
+    let objects = vec![
+        DataObject::Document {
+            mime_type: "text/xml",
+            envelope: Envelope::ExcludingSignatures,
+        },
+        DataObject::Element {
+            id: "payload",
+            mime_type: "text/xml",
+        },
+    ];
+    let changing = vec![DataObject::Reference {
+        uri: "",
+        transforms: vec![
+            Transform::XPath(XPathExpression::new(CHANGING).with_namespace("ds", DS)),
+            Transform::C14n(C14nAlgorithm::new(C14nMode::Exclusive1_0, false)),
+        ],
+        mime_type: "text/xml",
+    }];
+    for (objects, stamps, names) in [
+        (
+            objects,
+            &STAMPS[..],
+            &["content-all.tsq", "content-individual.tsq"][..],
+        ),
+        (changing, &STAMPS[..1], &["content-changing.tsq"][..]),
+    ] {
+        let mut document = XmlDocument::parse(DOCUMENT).map_err(|error| error.to_string())?;
+        let request = Request {
+            id: "sig",
+            signing_time: TIME,
+            objects,
+            placement: xml_sec_xades::Placement::DocumentEnd,
+            resources: None,
+            id_attributes: &[],
+            properties: xml_sec_xades::properties::Properties {
+                content_timestamps: stamps,
+                ..xml_sec_xades::properties::Properties::default()
+            },
+        };
+        let requests =
+            request_content_timestamps(&mut document, signer, &request, assessment, work)
+                .map_err(|error| format!("content request: {error}"))?;
+        for (name, bytes) in names.iter().zip(requests.iter()) {
+            std::fs::write(output.join(name), bytes).map_err(|error| format!("{name}: {error}"))?;
+        }
+    }
+    // The B-B signature the refresh tests take to B-T and B-LT.
+    let document = created(signer, assessment, work)?;
+    let pending = request_timestamp(&document, &timestamp(None, Some(NONCE)), assessment, work)
+        .map_err(|error| format!("signature request: {error}"))?;
+    std::fs::write(output.join("signature.tsq"), pending.request())
+        .map_err(|error| format!("signature.tsq: {error}"))
+}
+
+const DS: &str = "http://www.w3.org/2000/09/xmldsig#";
+
+/// The signatures of `content-all.tsq` and `content-individual.tsq`,
+/// created with `FIXTURES/content-all.tsr` and `FIXTURES/content-individual.tsr`
+/// and written as `OUTPUT/content-timestamps.xml`, and the one carrying the
+/// first token twice, as `OUTPUT/content-repeated.xml`: equal requests take
+/// the same response.
+fn content(
+    signer: &Signer<'_>,
+    assessment: &Assessment<'_, '_>,
+    (fixtures, output): (&Path, &Path),
+    intermediate: &[u8],
+    work: &Memory,
+) -> Result<(), String> {
+    let (all, individual) = (
+        read(fixtures, "content-all.tsr")?,
+        read(fixtures, "content-individual.tsr")?,
+    );
+    let answered = |stamp: ContentTimestamp<'static>, response| ContentTimestamp {
+        response: Some(response),
+        ..stamp
+    };
+    let utc = utc()?;
+    let certificates = [intermediate];
+    for (name, stamps) in [
+        (
+            "content-timestamps",
+            [answered(STAMPS[0], &all), answered(STAMPS[1], &individual)],
+        ),
+        (
+            "content-repeated",
+            [answered(STAMPS[0], &all), answered(STAMPS[0], &all)],
+        ),
+    ] {
+        let mut document = XmlDocument::parse(DOCUMENT).map_err(|error| error.to_string())?;
+        let request = Request {
+            id: "sig",
+            signing_time: TIME,
+            objects: vec![
+                DataObject::Document {
+                    mime_type: "text/xml",
+                    envelope: Envelope::ExcludingSignatures,
+                },
+                DataObject::Element {
+                    id: "payload",
+                    mime_type: "text/xml",
+                },
+            ],
+            placement: xml_sec_xades::Placement::DocumentEnd,
+            resources: None,
+            id_attributes: &[],
+            properties: xml_sec_xades::properties::Properties {
+                content_timestamps: &stamps,
+                content_evidence: Some(ContentEvidence {
+                    certificates: &certificates,
+                    utc: &utc,
+                    accuracies: &[],
+                    window: None,
+                }),
+                ..xml_sec_xades::properties::Properties::default()
+            },
+        };
+        create(&mut document, signer, request, assessment, work)
+            .map_err(|error| format!("{name}: {error}"))?;
+        std::fs::write(output.join(format!("{name}.xml")), document.as_xml())
+            .map_err(|error| format!("{name}.xml: {error}"))?;
+    }
+    Ok(())
+}
+
+/// The explicit policy `content-lta` signs and stores.
+const LTA_POLICY: &[u8] = b"<Policy xmlns=\"urn:policy\">Sign</Policy>";
+
+/// A signature with both content timestamps, an explicit policy and its
+/// embedded store, taken to B-LTA: its signature timestamp request is
+/// written as `OUTPUT/content-lta-signature.tsq` for `content-lta-request`;
+/// answered by `FIXTURES/content-lta-signature.tsr`, the B-T document is
+/// written as `OUTPUT/content-t.xml`, the CRLs of both CAs are
+/// added and the archive timestamp request written as
+/// `OUTPUT/content-lta-archive.tsq` for `content-lta-archive-request`; for
+/// `content-lta`, `FIXTURES/content-lta-archive.tsr` completes it and the
+/// document is written as `OUTPUT/content-lta.xml`.
+fn content_lta(
+    step: &str,
+    (signer, assessment): (&Signer<'_>, &Assessment<'_, '_>),
+    (fixtures, output): (&Path, &Path),
+    [root, intermediate]: [&[u8]; 2],
+    work: &Memory,
+) -> Result<(), String> {
+    let write = |name: &str, bytes: &[u8]| {
+        std::fs::write(output.join(name), bytes).map_err(|error| format!("{name}: {error}"))
+    };
+    let utc = utc()?;
+    let (anchors, certificates) = ([root], [intermediate]);
+    let mut document = content_lta_signed(signer, assessment, fixtures, intermediate, work)?;
+    let pending = request_timestamp(&document, &timestamp(None, Some(NONCE)), assessment, work)
+        .map_err(|error| format!("content-lta signature request: {error}"))?;
+    if step == "content-lta-request" {
+        return write("content-lta-signature.tsq", pending.request());
+    }
+    complete(
+        &mut document,
+        &pending,
+        &read(fixtures, "content-lta-signature.tsr")?,
+        assessment,
+        [root, intermediate],
+        work,
+    )?;
+    // The same signature at B-T, before its validation data.
+    write("content-t.xml", document.as_xml().as_bytes())?;
+    let lists = [
+        read(fixtures, "root.crl")?,
+        read(fixtures, "intermediate.crl")?,
+    ];
+    let crls: [&[u8]; 2] = [&lists[0], &lists[1]];
+    let inputs = |requirements| Inputs {
+        requirements,
+        anchors: &anchors,
+        certificates: &certificates,
+        utc: &utc,
+        accuracies: &[],
+        responders: &[],
+        crls: &crls,
+        responses: &[],
+    };
+    add_validation_data(
+        &mut document,
+        &ValidationData {
+            signature: "sig",
+            assessment,
+            inputs: &inputs(Requirements::LongTerm),
+            id_attributes: &[],
+        },
+        work,
+    )
+    .map_err(|error| format!("content-lta validation data: {error}"))?;
+    let archive = request_archive_timestamp(
+        &document,
+        &timestamp(None, Some(NONCE)),
+        assessment,
+        &inputs(Requirements::LongTerm),
+        work,
+    )
+    .map_err(|error| format!("content-lta archive request: {error}"))?;
+    if step == "content-lta-archive-request" {
+        return write("content-lta-archive.tsq", archive.request());
+    }
+    complete_timestamp(
+        &mut document,
+        &archive,
+        &read(fixtures, "content-lta-archive.tsr")?,
+        &Completion {
+            assessment,
+            inputs: &inputs(Requirements::Archival),
+            window: None,
+            id_attributes: &[],
+        },
+        work,
+    )
+    .map_err(|error| format!("content-lta archive completion: {error}"))?;
+    write("content-lta.xml", document.as_xml().as_bytes())
+}
+
+/// The B-B signature of `content-lta`.
+fn content_lta_signed(
+    signer: &Signer<'_>,
+    assessment: &Assessment<'_, '_>,
+    fixtures: &Path,
+    intermediate: &[u8],
+    work: &Memory,
+) -> Result<XmlDocument, String> {
+    use xml_sec_xades::properties::{
+        ExplicitPolicy, Identifier, Policy, PolicyDocument, PolicyStore, PolicyTransform,
+        Properties, SignaturePolicy,
+    };
+    let (all, individual) = (
+        read(fixtures, "content-all.tsr")?,
+        read(fixtures, "content-individual.tsr")?,
+    );
+    let stamps = [
+        ContentTimestamp {
+            response: Some(&all),
+            ..STAMPS[0]
+        },
+        ContentTimestamp {
+            response: Some(&individual),
+            ..STAMPS[1]
+        },
+    ];
+    let utc = utc()?;
+    let certificates = [intermediate];
+    let identifier = |uri| Identifier {
+        uri,
+        qualifier: None,
+        description: None,
+        documentation: &[],
+    };
+    let mut document = XmlDocument::parse(DOCUMENT).map_err(|error| error.to_string())?;
+    let request = Request {
+        id: "sig",
+        signing_time: TIME,
+        objects: vec![
+            DataObject::Document {
+                mime_type: "text/xml",
+                envelope: Envelope::ExcludingSignatures,
+            },
+            DataObject::Element {
+                id: "payload",
+                mime_type: "text/xml",
+            },
+        ],
+        placement: xml_sec_xades::Placement::DocumentEnd,
+        resources: None,
+        id_attributes: &[],
+        properties: Properties {
+            policy: Some(Policy::Document(SignaturePolicy::Explicit(
+                ExplicitPolicy {
+                    identifier: identifier("urn:oid:1.3.6.1.4.1.13762.3.1"),
+                    document: LTA_POLICY,
+                    digest_method: DigestAlgorithm::Sha256.uri(),
+                    transform: PolicyTransform::None,
+                    qualifiers: &[],
+                },
+            ))),
+            policy_store: Some(PolicyStore {
+                specification: identifier("urn:oid:1.3.6.1.4.1.13762.3.2"),
+                document: PolicyDocument::Embedded,
+            }),
+            content_timestamps: &stamps,
+            content_evidence: Some(ContentEvidence {
+                certificates: &certificates,
+                utc: &utc,
+                accuracies: &[],
+                window: None,
+            }),
+            ..Properties::default()
+        },
+    };
+    create(&mut document, signer, request, assessment, work)
+        .map_err(|error| format!("content-lta: {error}"))?;
+    Ok(document)
+}
+
+/// The CRLs `FIXTURES/root.crl` and `FIXTURES/intermediate.crl` added to the
+/// B-T document, then the next generation `root-next.crl` and
+/// `intermediate-next.crl` added by a refresh of the B-LT signature.
+fn refreshed(
+    document: &mut XmlDocument,
+    assessment: &Assessment<'_, '_>,
+    fixtures: &Path,
+    [root, intermediate]: [&[u8]; 2],
+    work: &Memory,
+) -> Result<(), String> {
+    let utc = utc()?;
+    let (anchors, certificates) = ([root], [intermediate]);
+    for (names, refresh) in [
+        (["root.crl", "intermediate.crl"], false),
+        (["root-next.crl", "intermediate-next.crl"], true),
+    ] {
+        let lists = [read(fixtures, names[0])?, read(fixtures, names[1])?];
+        let crls: [&[u8]; 2] = [&lists[0], &lists[1]];
+        let inputs = Inputs {
+            requirements: Requirements::LongTerm,
+            anchors: &anchors,
+            certificates: &certificates,
+            utc: &utc,
+            accuracies: &[],
+            responders: &[],
+            crls: &crls,
+            responses: &[],
+        };
+        let data = ValidationData {
+            signature: "sig",
+            assessment,
+            inputs: &inputs,
+            id_attributes: &[],
+        };
+        let added = if refresh {
+            refresh_validation_data(document, &data, work)
+        } else {
+            add_validation_data(document, &data, work)
+        }
+        .map_err(|error| format!("{}: {error}", names[0]))?;
+        if added != DataAdded::Published {
+            return Err(format!("{}: nothing was added", names[0]));
+        }
+    }
+    Ok(())
+}
+
 /// The B-B signature `sig` over the whole document.
 fn created(
     signer: &Signer<'_>,
@@ -306,9 +752,10 @@ fn created(
                 mime_type: "text/xml",
                 envelope: Envelope::Enveloped,
             }],
-            parent: None,
+            placement: xml_sec_xades::Placement::DocumentEnd,
             resources: None,
             id_attributes: &[],
+            properties: xml_sec_xades::properties::Properties::default(),
         },
         assessment,
         work,

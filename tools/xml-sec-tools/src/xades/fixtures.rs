@@ -706,11 +706,12 @@ enum Set {
     Levels,
     Creation,
     Augmentation,
+    Content,
     Ts101903,
 }
 
 pub(crate) fn run(corpus: &super::Corpus, args: &[String]) -> Result<(), crate::repo::Failure> {
-    let usage = "usage: xades fixtures [--levels | --creation | --augmentation | --ts101903] [--units N] [--output DIR] [--work DIR]";
+    let usage = "usage: xades fixtures [--levels | --creation | --augmentation | --content | --ts101903] [--units N] [--output DIR] [--work DIR]";
     let mut output = None;
     let mut work = None;
     let mut set = Set::Baseline;
@@ -721,6 +722,7 @@ pub(crate) fn run(corpus: &super::Corpus, args: &[String]) -> Result<(), crate::
             "--levels" => Some(Set::Levels),
             "--creation" => Some(Set::Creation),
             "--augmentation" => Some(Set::Augmentation),
+            "--content" => Some(Set::Content),
             "--ts101903" => Some(Set::Ts101903),
             _ => None,
         };
@@ -749,6 +751,7 @@ pub(crate) fn run(corpus: &super::Corpus, args: &[String]) -> Result<(), crate::
     let output = output.unwrap_or_else(|| match set {
         Set::Creation => fixtures.join("creation"),
         Set::Augmentation => fixtures.join("augmentation"),
+        Set::Content => fixtures.join("content"),
         Set::Ts101903 => fixtures.join("ts101903"),
         Set::Baseline | Set::Levels => fixtures,
     });
@@ -767,6 +770,7 @@ pub(crate) fn run(corpus: &super::Corpus, args: &[String]) -> Result<(), crate::
         Set::Levels => super::levels::generate(corpus, &generator),
         Set::Creation => creation(&generator),
         Set::Augmentation => super::augmentation::generate(corpus, &generator),
+        Set::Content => super::augmentation::content(corpus, &generator),
         Set::Ts101903 => super::ts101903::generate(&generator),
     }
     .map_err(Into::into)

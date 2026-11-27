@@ -1,7 +1,5 @@
 import java.nio.file.*;
 import java.security.KeyStore;
-import java.security.PrivateKey;
-import java.security.Signature;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Date;
@@ -14,8 +12,9 @@ import eu.europa.esig.dss.enumerations.SignaturePackaging;
 import eu.europa.esig.dss.enumerations.ValidationLevel;
 import eu.europa.esig.dss.model.DSSDocument;
 import eu.europa.esig.dss.model.FileDocument;
-import eu.europa.esig.dss.model.SignatureValue;
 import eu.europa.esig.dss.model.x509.CertificateToken;
+import eu.europa.esig.dss.token.DSSPrivateKeyEntry;
+import eu.europa.esig.dss.token.Pkcs12SignatureToken;
 import eu.europa.esig.dss.spi.DSSUtils;
 import eu.europa.esig.dss.spi.validation.CommonCertificateVerifier;
 import eu.europa.esig.dss.spi.x509.CommonCertificateSource;
@@ -39,18 +38,24 @@ final class Lifecycle {
 
     private Lifecycle() {}
 
-    /** A signer's private key and certificate chain from its PKCS#12 store (alias "signer"). */
-    record Signer(PrivateKey key, List<CertificateToken> chain) {
+    /**
+     * A signer's key entry (alias "signer") in its PKCS#12 store: DSS's own
+     * token signs with it, for every algorithm DSS supports.
+     */
+    record Signer(Pkcs12SignatureToken token, DSSPrivateKeyEntry entry) {
         static Signer load(Path store) throws Exception {
-            var keys = KeyStore.getInstance("PKCS12");
-            try (var input = Files.newInputStream(store)) {
-                keys.load(input, PASSWORD);
-            }
-            var chain = new ArrayList<CertificateToken>();
-            for (var certificate : keys.getCertificateChain("signer")) {
-                chain.add(DSSUtils.loadCertificate(certificate.getEncoded()));
-            }
-            return new Signer((PrivateKey) keys.getKey("signer", PASSWORD), chain);
+            var token = new Pkcs12SignatureToken(store.toFile(), new KeyStore.PasswordProtection(PASSWORD));
+            return new Signer(token, token.getKey("signer"));
+        }
+
+        List<CertificateToken> chain() {
+            return List.of(entry.getCertificateChain());
+        }
+
+        /** The signer's key algorithm with SHA-256. */
+        SignatureAlgorithm sha256() {
+            var encryption = EncryptionAlgorithm.forKey(entry.getCertificate().getPublicKey());
+            return SignatureAlgorithm.getAlgorithm(encryption, DigestAlgorithm.SHA256);
         }
     }
 
@@ -69,25 +74,41 @@ final class Lifecycle {
     /**
      * A XAdES-BASELINE-B signature by {@code service} over {@code data} in
      * {@code packaging} (ENVELOPED, ENVELOPING, DETACHED or
-     * INTERNALLY_DETACHED), signed at Unix time {@code time}.
+     * INTERNALLY_DETACHED), signed with {@code algorithm} at Unix time
+     * {@code time}. References are digested with SHA-256 whatever the
+     * signature's own digest, as DSS's Ed448 tests do for SHAKE256.
      */
-    static DSSDocument sign(XAdESService service, Signer signer, String packaging, DSSDocument data, long time)
+    static DSSDocument sign(
+            XAdESService service,
+            Signer signer,
+            String packaging,
+            DSSDocument data,
+            long time,
+            SignatureAlgorithm algorithm)
             throws Exception {
-        var parameters = new XAdESSignatureParameters();
-        parameters.setSignatureLevel(SignatureLevel.XAdES_BASELINE_B);
+        var parameters = baseline(new XAdESSignatureParameters(), signer, time, algorithm);
         parameters.setSignaturePackaging(SignaturePackaging.valueOf(packaging));
-        parameters.setDigestAlgorithm(DigestAlgorithm.SHA256);
+        var toSign = service.getDataToSign(data, parameters);
+        return service.signDocument(data, parameters, signer.token().sign(toSign, algorithm, signer.entry()));
+    }
+
+    /**
+     * {@code parameters} set for a XAdES-BASELINE-B signature by
+     * {@code signer} with {@code algorithm} at Unix time {@code time}, the
+     * references digested with SHA-256.
+     */
+    static <P extends XAdESSignatureParameters> P baseline(
+            P parameters, Signer signer, long time, SignatureAlgorithm algorithm) {
+        parameters.setSignatureLevel(SignatureLevel.XAdES_BASELINE_B);
+        // The certificate first: setting it resets the encryption algorithm
+        // to its key's, which would turn RSASSA-PSS back into PKCS#1 v1.5.
         parameters.setSigningCertificate(signer.chain().get(0));
         parameters.setCertificateChain(signer.chain());
+        parameters.setDigestAlgorithm(algorithm.getDigestAlgorithm());
+        parameters.setEncryptionAlgorithm(algorithm.getEncryptionAlgorithm());
+        parameters.setReferenceDigestAlgorithm(DigestAlgorithm.SHA256);
         parameters.bLevel().setSigningDate(Date.from(Instant.ofEpochSecond(time)));
-        var toSign = service.getDataToSign(data, parameters);
-        var encryption = EncryptionAlgorithm.forKey(signer.chain().get(0).getPublicKey());
-        var algorithm = SignatureAlgorithm.getAlgorithm(encryption, DigestAlgorithm.SHA256);
-        var jce = Signature.getInstance(algorithm.getJCEId());
-        jce.initSign(signer.key());
-        jce.update(toSign.getBytes());
-        // A JCE ECDSA signature is DER, the form DSS converts to XMLDSig's r || s.
-        return service.signDocument(data, parameters, new SignatureValue(algorithm, jce.sign()));
+        return parameters;
     }
 
     /**
@@ -157,10 +178,15 @@ final class Lifecycle {
      * reference names.
      */
     static DSSDocument extend(XAdESService service, DSSDocument input, String level, DSSDocument detached) {
+        return extend(service, input, level, detached == null ? List.of() : List.of(detached));
+    }
+
+    /** As the single-content form, with every content the references name. */
+    static DSSDocument extend(XAdESService service, DSSDocument input, String level, List<DSSDocument> detached) {
         var parameters = new XAdESSignatureParameters();
         parameters.setSignatureLevel(SignatureLevel.valueOf("XAdES_BASELINE_" + level));
-        if (detached != null) {
-            parameters.setDetachedContents(List.of(detached));
+        if (!detached.isEmpty()) {
+            parameters.setDetachedContents(detached);
         }
         return service.extendDocument(input, parameters);
     }
@@ -176,10 +202,21 @@ final class Lifecycle {
             long time,
             ValidationLevel level,
             DSSDocument detached) {
+        return validate(document, verifier, time, level, detached == null ? List.of() : List.of(detached));
+    }
+
+    /** As {@link #validate(DSSDocument, CommonCertificateVerifier, long, ValidationLevel, DSSDocument)}
+     * with every content the signature's detached references name. */
+    static Reports validate(
+            DSSDocument document,
+            CommonCertificateVerifier verifier,
+            long time,
+            ValidationLevel level,
+            List<DSSDocument> detached) {
         var validator = SignedDocumentValidator.fromDocument(document);
         validator.setCertificateVerifier(verifier);
-        if (detached != null) {
-            validator.setDetachedContents(List.of(detached));
+        if (!detached.isEmpty()) {
+            validator.setDetachedContents(detached);
         }
         validator.setValidationTime(Date.from(Instant.ofEpochSecond(time)));
         validator.setValidationLevel(level);

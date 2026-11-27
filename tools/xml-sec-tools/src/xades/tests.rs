@@ -182,7 +182,6 @@ fn distributed_prose_is_english() {
     for name in [
         "README.md",
         "PROVENANCE.md",
-        "COMMENT-DRAFT.md",
         "dss-investigation/README.md",
         "dss-evidence/expectations.json",
         "dss-investigation/expectations.json",

@@ -82,6 +82,48 @@ fn builds_parseable_prefixed_template_in_required_order() {
 }
 
 #[test]
+fn a_key_info_id_names_the_placeholder_a_reference_can_sign() {
+    // XMLDSig 1.1 §4.5: KeyInfo may carry an Id so a Reference signs it; the
+    // placeholder carries it only when asked.
+    let build = |builder: SignatureBuilder| {
+        builder
+            .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("#key"))
+            .key_info(true)
+            .build_template()
+            .expect("valid template")
+    };
+    let skeleton = || SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256);
+    let named = build(skeleton().key_info_id("key"));
+    let document = roxmltree::Document::parse(&named).expect("valid XML");
+    let key_info = document
+        .descendants()
+        .find(|node| node.has_tag_name((DSIG_NS, "KeyInfo")))
+        .expect("KeyInfo placeholder");
+    assert_eq!(key_info.attribute("Id"), Some("key"));
+    // XMLDSig 1.1 §4.5 types KeyInfo/@Id as xs:ID: a value that is no NCName
+    // is refused like every other structural ID.
+    let refused = skeleton()
+        .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("#key"))
+        .key_info(true)
+        .key_info_id("two words")
+        .build_template();
+    assert!(
+        matches!(
+            refused,
+            Err(SignatureBuilderError::InvalidId { element: "KeyInfo", ref value }) if value == "two words"
+        ),
+        "{refused:?}"
+    );
+    let plain = build(skeleton());
+    let document = roxmltree::Document::parse(&plain).expect("valid XML");
+    let key_info = document
+        .descendants()
+        .find(|node| node.has_tag_name((DSIG_NS, "KeyInfo")))
+        .expect("KeyInfo placeholder");
+    assert_eq!(key_info.attribute("Id"), None);
+}
+
+#[test]
 fn preserves_reference_order_and_default_namespace() {
     // Reference order is signed data and must never be normalized or sorted.
     let xml = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::EcdsaSha256)
@@ -845,10 +887,12 @@ fn rejects_invalid_filter2_expression_counts() {
 }
 
 #[test]
-fn rejects_xpath_binding_that_shadows_signature_prefix() {
-    // Rebinding the prefix used for ds:XPath changes the element namespace and
-    // produces a template that neither the strict parser nor a signer can use.
-    let error = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+fn an_xpath_binding_of_the_signature_prefix_keeps_its_namespace() {
+    // An expression may bind the prefix the signature uses to another
+    // namespace: its XPath element is written unprefixed in a local default
+    // XMLDSig namespace, so the element stays XMLDSig and the expression's
+    // prefix keeps the caller's namespace.
+    let template = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
         .ns_prefix("ds")
         .add_reference(
             ReferenceBuilder::new(DigestAlgorithm::Sha256).transform(Transform::XPath(
@@ -856,9 +900,23 @@ fn rejects_xpath_binding_that_shadows_signature_prefix() {
             )),
         )
         .build_template()
-        .expect_err("XPath namespace bindings must not shadow the signature prefix");
-
-    assert!(error.to_string().contains("ds"));
+        .expect("the binding is kept in a local scope");
+    let document = roxmltree::Document::parse(&template).expect("well-formed template");
+    let xpath = document
+        .descendants()
+        .find(|node| node.tag_name().name() == "XPath")
+        .expect("XPath parameter");
+    assert_eq!(
+        xpath.tag_name().namespace(),
+        Some("http://www.w3.org/2000/09/xmldsig#"),
+        "{template}"
+    );
+    assert_eq!(
+        xpath.lookup_namespace_uri(Some("ds")),
+        Some("urn:payload"),
+        "{template}"
+    );
+    assert_eq!(xpath.text(), Some("//ds:item"));
 }
 
 #[test]

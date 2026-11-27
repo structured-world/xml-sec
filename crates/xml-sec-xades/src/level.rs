@@ -84,6 +84,13 @@ pub(crate) trait Visit<W: Work>: Sized {
     fn census(self, _census: &Census<'_, '_, '_, '_, '_, '_, '_, W>) -> Result<Self::Output, Self> {
         Err(self)
     }
+
+    /// Whether a member's status comes from the caller's CRLs and OCSP
+    /// responses before the document's, as when fresher statuses are to be
+    /// incorporated; otherwise the document's own statuses come first.
+    fn supplied_first(&self) -> bool {
+        false
+    }
 }
 
 impl<W: Work, F, R> Visit<W> for F
@@ -809,20 +816,45 @@ impl<'s> External<'s> {
     }
 }
 
-/// The CRLs and OCSP responses of one document, then the caller's.
+/// The CRLs and OCSP responses of one document, then the caller's, or the
+/// caller's first when `supplied_first`: each member takes the first source
+/// that answers for it, and with `supplied_first` the caller's of either
+/// kind before the document's, with the number of each that are the
+/// caller's.
+#[expect(
+    clippy::type_complexity,
+    reason = "the two ordered pools and the caller's share of each"
+)]
 fn status_sources<'p, 't: 'p>(
     view: &'p Material<'t>,
     carried: &'p CarriedMaterial<'t, N, D, G>,
     external: &'p External<'t>,
+    supplied_first: bool,
     memory: &Memory,
 ) -> Result<
     (
         OwnedVec<&'p CertificateList<'t>>,
         OwnedVec<&'p BasicResponse<'t>>,
+        (usize, usize),
     ),
     Error,
 > {
     let mut lists = memory.vector();
+    let mut responses = memory.vector();
+    let supplied = |lists: &mut OwnedVec<&'p CertificateList<'t>, _>,
+                    responses: &mut OwnedVec<&'p BasicResponse<'t>, _>|
+     -> Result<(), Error> {
+        for list in &*external.crls {
+            lists.try_push(list)?;
+        }
+        for response in &*external.responses {
+            responses.try_push(response)?;
+        }
+        Ok(())
+    };
+    if supplied_first {
+        supplied(&mut lists, &mut responses)?;
+    }
     for value in view.values() {
         if let Value::Crl(list) = &value.value {
             lists.try_push(list)?;
@@ -831,20 +863,21 @@ fn status_sources<'p, 't: 'p>(
     for list in carried.crls() {
         lists.try_push(&list.value)?;
     }
-    for list in &*external.crls {
-        lists.try_push(list)?;
-    }
-    let mut responses = memory.vector();
     for basic in view.basic_responses() {
         responses.try_push(basic.response())?;
     }
     for response in carried.basic_responses() {
         responses.try_push(&response.value)?;
     }
-    for response in &*external.responses {
-        responses.try_push(response)?;
+    if !supplied_first {
+        supplied(&mut lists, &mut responses)?;
     }
-    Ok((lists.into_owned(), responses.into_owned()))
+    let leading = if supplied_first {
+        (external.crls.len(), external.responses.len())
+    } else {
+        (0, 0)
+    };
+    Ok((lists.into_owned(), responses.into_owned(), leading))
 }
 
 /// Every participant's status, its incorporation and, for B-LTA, each archive.
@@ -878,7 +911,13 @@ fn long_term<W: Work, V: Visit<W>>(
         .map_err(|error| ValidationError::Carried(Box::new(error)))?;
     let index = material::index_with_tokens(chain.pools.view, &carried, access)
         .map_err(ValidationError::Index)?;
-    let (lists, responses) = status_sources(chain.pools.view, &carried, chain.external, memory)?;
+    let (lists, responses, supplied) = status_sources(
+        chain.pools.view,
+        &carried,
+        chain.external,
+        visitor.supplied_first(),
+        memory,
+    )?;
     // One census per live path; several actors may share one.
     let mut distinct: OwnedVec<&CheckedPath<'_>, _> = memory.vector();
     for path in participant_paths(&participants) {
@@ -890,8 +929,11 @@ fn long_term<W: Work, V: Visit<W>>(
         stage.session,
         chain.cms,
         chain.authorities,
-        &lists,
-        &responses,
+        &status::StatusSources {
+            lists: &lists,
+            responses: &responses,
+            supplied,
+        },
         &distinct,
         chain.inputs.utc,
         stage.signer_time,

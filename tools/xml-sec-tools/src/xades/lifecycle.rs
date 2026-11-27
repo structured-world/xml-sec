@@ -19,8 +19,9 @@
 
 use super::fixtures::Generator;
 use super::levels::{CERTIFICATES, Levels};
-use super::{Build, Corpus, absolute, line, read, write, write_json, xml};
+use super::{Build, Corpus, DS, SP, absolute, line, read, write, write_json, xml};
 use serde_json::{Map, Value, json};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -53,61 +54,195 @@ impl Actor {
     }
 }
 
+/// The shape of the B-B document: one signature in one of the four
+/// packagings, or one of the signature forms DSS's signature tests make
+/// (parallel signatures, a countersignature and a nested one, a detached
+/// signature over two files, inclusive canonicalization, DSS's indented
+/// serialization, a signed `KeyInfo`, chosen namespace prefixes, and a
+/// detached, internally detached or two-file detached signature countersigned).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Packaging {
     Enveloped,
     Enveloping,
     InternallyDetached,
     Detached,
+    Parallel,
+    Countersigned,
+    CountersignedNested,
+    DetachedMultiple,
+    Inclusive,
+    PrettyPrint,
+    SignedKeyInfo,
+    CustomPrefixes,
+    CountersignedDetached,
+    CountersignedInternallyDetached,
+    CountersignedDetachedMultiple,
 }
 
 impl Packaging {
-    const ALL: [Self; 4] = [
+    pub(crate) const ALL: [Self; 4] = [
         Self::Enveloped,
         Self::Enveloping,
         Self::InternallyDetached,
         Self::Detached,
     ];
 
-    fn name(self) -> &'static str {
+    /// The signature forms, each run with an RSA signer and CRL evidence.
+    pub(crate) const FORMS: [Self; 11] = [
+        Self::Parallel,
+        Self::Countersigned,
+        Self::CountersignedNested,
+        Self::DetachedMultiple,
+        Self::Inclusive,
+        Self::PrettyPrint,
+        Self::SignedKeyInfo,
+        Self::CustomPrefixes,
+        Self::CountersignedDetached,
+        Self::CountersignedInternallyDetached,
+        Self::CountersignedDetachedMultiple,
+    ];
+
+    /// The case name part; for a form also the name both probes take.
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Enveloped => "enveloped",
             Self::Enveloping => "enveloping",
             Self::InternallyDetached => "internally-detached",
             Self::Detached => "detached",
+            Self::Parallel => "parallel",
+            Self::Countersigned => "countersigned",
+            Self::CountersignedNested => "countersigned-nested",
+            Self::DetachedMultiple => "detached-multiple",
+            Self::Inclusive => "inclusive",
+            Self::PrettyPrint => "pretty-print",
+            Self::SignedKeyInfo => "signed-key-info",
+            Self::CustomPrefixes => "custom-prefixes",
+            Self::CountersignedDetached => "countersigned-detached",
+            Self::CountersignedInternallyDetached => "countersigned-internally-detached",
+            Self::CountersignedDetachedMultiple => "countersigned-detached-multiple",
         }
     }
 
-    /// DSS's `SignaturePackaging` constant.
-    fn dss(self) -> &'static str {
+    /// DSS's `SignaturePackaging` constant; none for a form, which DSS's
+    /// `FormProbe` makes by name.
+    fn dss(self) -> Option<&'static str> {
         match self {
-            Self::Enveloped => "ENVELOPED",
-            Self::Enveloping => "ENVELOPING",
-            Self::InternallyDetached => "INTERNALLY_DETACHED",
-            Self::Detached => "DETACHED",
+            Self::Enveloped => Some("ENVELOPED"),
+            Self::Enveloping => Some("ENVELOPING"),
+            Self::InternallyDetached => Some("INTERNALLY_DETACHED"),
+            Self::Detached => Some("DETACHED"),
+            _ => None,
         }
+    }
+
+    /// The detached files the references of this shape name.
+    fn detached(self) -> &'static [&'static str] {
+        match self {
+            Self::Detached | Self::CountersignedDetached => &["detached.txt"],
+            Self::DetachedMultiple | Self::CountersignedDetachedMultiple => {
+                &["detached.txt", "detached-2.txt"]
+            }
+            _ => &[],
+        }
+    }
+
+    /// Whether xml-sec makes this shape: DSS's indented serialization is
+    /// DSS's own choice, which xml-sec only reads and augments.
+    fn made_by(self, actor: Actor) -> bool {
+        self != Self::PrettyPrint || actor == Actor::Dss
     }
 }
 
+/// The signature algorithm of the B-B signature and the signer key it needs.
+/// The forms beyond RSA and ECDSA P-256 with SHA-256 are the algorithms DSS's
+/// signature tests sign with (RSASSA-PSS, ECDSA on P-384/P-521, Ed25519,
+/// Ed448, DSA, RSA with SHA-512).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Algorithm {
     Rsa,
     Ec,
+    RsaSha512,
+    RsaPss,
+    EcP384,
+    EcP521,
+    EcSha3,
+    Ed25519,
+    Ed448,
+    Dsa,
 }
 
 impl Algorithm {
-    fn name(self) -> &'static str {
+    /// Every algorithm beyond the two the full packaging matrix runs.
+    pub(crate) const MORE: [Self; 8] = [
+        Self::RsaSha512,
+        Self::RsaPss,
+        Self::EcP384,
+        Self::EcP521,
+        Self::EcSha3,
+        Self::Ed25519,
+        Self::Ed448,
+        Self::Dsa,
+    ];
+
+    /// The case name part, and the name `lifecycle_probe create` takes.
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Rsa => "rsa",
             Self::Ec => "ec",
+            Self::RsaSha512 => "rsa-sha512",
+            Self::RsaPss => "rsa-pss",
+            Self::EcP384 => "ec-p384",
+            Self::EcP521 => "ec-p521",
+            Self::EcSha3 => "ec-sha3-512",
+            Self::Ed25519 => "ed25519",
+            Self::Ed448 => "ed448",
+            Self::Dsa => "dsa",
         }
     }
 
-    /// The certificate and key names of the signer in the run's PKI.
+    /// The certificate and key names of the signer in the run's PKI: the
+    /// RSA methods share one RSA key, the P-256 methods one EC key.
     fn signer(self) -> &'static str {
         match self {
-            Self::Rsa => "signer",
-            Self::Ec => "signer-ec",
+            Self::Rsa | Self::RsaSha512 | Self::RsaPss => "signer",
+            Self::Ec | Self::EcSha3 => "signer-ec",
+            Self::EcP384 => "signer-ec384",
+            Self::EcP521 => "signer-ec521",
+            Self::Ed25519 => "signer-ed25519",
+            Self::Ed448 => "signer-ed448",
+            Self::Dsa => "signer-dsa",
+        }
+    }
+
+    /// DSS's `SignatureAlgorithm` constant of the same method.
+    fn dss(self) -> &'static str {
+        match self {
+            Self::Rsa => "RSA_SHA256",
+            Self::Ec => "ECDSA_SHA256",
+            Self::RsaSha512 => "RSA_SHA512",
+            Self::RsaPss => "RSA_SSA_PSS_SHA256_MGF1",
+            Self::EcP384 => "ECDSA_SHA384",
+            Self::EcP521 => "ECDSA_SHA512",
+            Self::EcSha3 => "ECDSA_SHA3_512",
+            Self::Ed25519 => "ED25519",
+            Self::Ed448 => "ED448",
+            Self::Dsa => "DSA_SHA256",
+        }
+    }
+
+    /// The `openssl req -newkey` arguments of a signer key this algorithm
+    /// needs beyond the levels PKI's RSA keys, with the subject's name; none
+    /// for a method that shares another's key. DSA keys come from the run's
+    /// `dsa.param`.
+    fn key(self) -> Option<(&'static [&'static str], &'static str)> {
+        match self {
+            Self::Rsa | Self::RsaSha512 | Self::RsaPss | Self::EcSha3 => None,
+            Self::Ec => Some((&["ec", "-pkeyopt", "ec_paramgen_curve:P-256"], "EC")),
+            Self::EcP384 => Some((&["ec", "-pkeyopt", "ec_paramgen_curve:P-384"], "EC P-384")),
+            Self::EcP521 => Some((&["ec", "-pkeyopt", "ec_paramgen_curve:P-521"], "EC P-521")),
+            Self::Ed25519 => Some((&["ed25519"], "Ed25519")),
+            Self::Ed448 => Some((&["ed448"], "Ed448")),
+            Self::Dsa => Some((&["dsa:dsa.param"], "DSA")),
         }
     }
 }
@@ -166,7 +301,9 @@ impl Case {
 }
 
 /// Every lifecycle: each packaging and signer with CRL and with OCSP
-/// evidence, and one revoked signer, in both directions.
+/// evidence, one revoked signer, each further algorithm over an enveloping
+/// signature as DSS's algorithm tests sign it, and each signature form, in
+/// both directions where both implementations make the form.
 pub(crate) fn cases() -> Vec<Case> {
     let mut cases = Vec::new();
     for first in [Actor::XmlSec, Actor::Dss] {
@@ -188,6 +325,24 @@ pub(crate) fn cases() -> Vec<Case> {
             algorithm: Algorithm::Rsa,
             evidence: Evidence::Revoked,
         });
+        for algorithm in Algorithm::MORE {
+            cases.push(Case {
+                first,
+                packaging: Packaging::Enveloping,
+                algorithm,
+                evidence: Evidence::Crl,
+            });
+        }
+        for packaging in Packaging::FORMS {
+            if packaging.made_by(first) {
+                cases.push(Case {
+                    first,
+                    packaging,
+                    algorithm: Algorithm::Rsa,
+                    evidence: Evidence::Crl,
+                });
+            }
+        }
     }
     cases
 }
@@ -202,69 +357,135 @@ fn level(step: &str) -> &'static str {
     }
 }
 
-/// The text of the first element whose local name is `local`, start tag to
-/// end tag, as the document holds it.
-pub(crate) fn element<'a>(text: &'a str, local: &str) -> Option<&'a str> {
-    let mut offset = 0;
-    while let Some(found) = text[offset..].find('<') {
-        let start = offset + found;
-        let tag = &text[start + 1..];
-        let name_end = tag.find(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/')?;
-        let name = &tag[..name_end];
-        if name.rsplit(':').next() == Some(local) && !name.starts_with('/') {
-            let close = format!("</{name}>");
-            let end = text[start..].find(&close)? + start + close.len();
-            return Some(&text[start..end]);
-        }
-        offset = start + 1;
-    }
-    None
-}
+/// The key of one part of a signature: the `Id` of the `Signature` that owns
+/// it (empty for none) and its ordinal among that signature's parts of the
+/// same name, so a step that adds a signature or a countersignature never
+/// shifts the parts of another.
+type PartKey = (String, usize);
 
-/// The exclusive canonical form of every property of the first
-/// `UnsignedSignatureProperties` of `text`, in document order. An archive
-/// timestamp covers this form (EN 319 132-1 §5.5.2), so a serializer may drop
-/// a redundant namespace declaration without changing what it covers.
-fn unsigned_properties(text: &str) -> Result<Vec<Vec<u8>>, String> {
-    let document = xml::parse(text, "lifecycle document")?;
-    let Some(properties) = document
+/// The expanded names from a signature part up to the `ds:Signature` that
+/// owns it, nearest first.
+type PartPath = &'static [(&'static str, &'static str)];
+
+/// `SignedInfo`, a child of its `Signature` (`XMLDSig` 1.1 §4.1).
+const SIGNED_INFO: PartPath = &[(DS, "SignedInfo"), (DS, "Signature")];
+/// `SignatureValue`, a child of its `Signature`.
+const SIGNATURE_VALUE: PartPath = &[(DS, "SignatureValue"), (DS, "Signature")];
+/// `UnsignedSignatureProperties` in the qualifying properties a `ds:Object`
+/// of its signature holds (EN 319 132-1 §4.3).
+const UNSIGNED_SIGNATURE_PROPERTIES: PartPath = &[
+    (SP, "UnsignedSignatureProperties"),
+    (SP, "UnsignedProperties"),
+    (SP, "QualifyingProperties"),
+    (DS, "Object"),
+    (DS, "Signature"),
+];
+
+/// Every element of `document` at `path`, keyed by its owning signature.
+fn parts<'a, 'input>(
+    document: &'a xml_sec::XmlDomDocument<'input>,
+    path: PartPath,
+) -> Vec<(PartKey, xml::Node<'a, 'input>)> {
+    let is = |node: xml::Node<'_, '_>, (namespace, local): (&str, &str)| {
+        node.is_element()
+            && node.tag_name().namespace() == Some(namespace)
+            && node.tag_name().name() == local
+    };
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    document
         .root_element()
         .descendants()
-        .find(|node| node.is_element() && node.tag_name().name() == "UnsignedSignatureProperties")
-    else {
-        return Ok(Vec::new());
-    };
-    let algorithm = C14nAlgorithm::new(C14nMode::Exclusive1_0, false);
-    properties
-        .children()
-        .filter(xml::Node::is_element)
-        .map(|property| {
-            let within = |node: xml::Node<'_, '_>| {
-                node.id() == property.id()
-                    || node
-                        .ancestors()
-                        .any(|ancestor| ancestor.id() == property.id())
-            };
-            let mut canonical = Vec::new();
-            canonicalize(&document, Some(&within), &algorithm, &mut canonical)
-                .map_err(|error| format!("canonicalize an unsigned property: {error}"))?;
-            Ok(canonical)
+        .filter_map(|node| {
+            let mut current = node;
+            for (index, step) in path.iter().enumerate() {
+                if !is(current, *step) {
+                    return None;
+                }
+                if index + 1 < path.len() {
+                    current = current.parent()?;
+                }
+            }
+            Some((node, current))
+        })
+        .map(|(node, signature)| {
+            let owner = signature.attribute("Id").unwrap_or_default().to_owned();
+            let ordinal = counts.entry(owner.clone()).or_default();
+            let key = (owner, *ordinal);
+            *ordinal += 1;
+            (key, node)
         })
         .collect()
 }
 
-/// Whether `later` keeps the signature of `created` byte for byte and every
-/// unsigned property of `previous` canonically unchanged and in place: a step
-/// only appends properties.
-pub(crate) fn preserved(created: &str, previous: &str, later: &str) -> Result<bool, String> {
-    let signature = ["SignedInfo", "SignatureValue"].iter().all(|local| {
-        element(created, local).is_some_and(|bytes| element(later, local) == Some(bytes))
-    });
-    if !signature {
-        return Ok(false);
+/// The exclusive canonical form of every property of each
+/// `UnsignedSignatureProperties` of `text`, keyed by its owning signature. An
+/// archive timestamp covers this form (EN 319 132-1 §5.5.2), so a serializer
+/// may drop a redundant namespace declaration without changing what it covers.
+fn unsigned_properties(text: &str) -> Result<BTreeMap<PartKey, Vec<Vec<u8>>>, String> {
+    let document = xml::parse(text, "lifecycle document")?;
+    let algorithm = C14nAlgorithm::new(C14nMode::Exclusive1_0, false);
+    let mut found = BTreeMap::new();
+    for (key, properties) in parts(&document, UNSIGNED_SIGNATURE_PROPERTIES) {
+        let canonical = properties
+            .children()
+            .filter(xml::Node::is_element)
+            .map(|property| {
+                let within = |node: xml::Node<'_, '_>| {
+                    node.id() == property.id()
+                        || node
+                            .ancestors()
+                            .any(|ancestor| ancestor.id() == property.id())
+                };
+                let mut canonical = Vec::new();
+                canonicalize(&document, Some(&within), &algorithm, &mut canonical)
+                    .map_err(|error| format!("canonicalize an unsigned property: {error}"))?;
+                Ok(canonical)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        found.insert(key, canonical);
     }
-    let earlier = unsigned_properties(previous)?;
-    Ok(unsigned_properties(later)?.starts_with(&earlier))
+    Ok(found)
+}
+
+/// The octets of the first signature value of `text`, which tell DSS's
+/// short P-521 encoding (130 octets) from the `XMLDSig` 1.1 §6.4.3 one (132).
+fn signature_octets(text: &str) -> Result<usize, String> {
+    let document = xml::parse(text, "created document")?;
+    let (_, value) = parts(&document, SIGNATURE_VALUE)
+        .into_iter()
+        .next()
+        .ok_or("the created document has no SignatureValue")?;
+    let encoded: String = value.children().filter_map(xml::Node::text).collect();
+    Ok(super::corpus::base64(&encoded)?.len())
+}
+
+/// Whether `later` keeps every signature of `created` byte for byte and every
+/// unsigned property of `previous` canonically unchanged and in place, for
+/// each signature matched by its `Id`: a step only appends properties.
+pub(crate) fn preserved(created: &str, previous: &str, later: &str) -> Result<bool, String> {
+    let (created_document, later_document) = (
+        xml::parse(created, "created document")?,
+        xml::parse(later, "lifecycle document")?,
+    );
+    for path in [SIGNED_INFO, SIGNATURE_VALUE] {
+        let earlier = parts(&created_document, path);
+        if earlier.is_empty() {
+            return Ok(false);
+        }
+        let now: BTreeMap<PartKey, &str> = parts(&later_document, path)
+            .into_iter()
+            .map(|(key, node)| (key, &later[node.range()]))
+            .collect();
+        for (key, node) in earlier {
+            if now.get(&key) != Some(&&created[node.range()]) {
+                return Ok(false);
+            }
+        }
+    }
+    let now = unsigned_properties(later)?;
+    Ok(unsigned_properties(previous)?
+        .iter()
+        .all(|(key, earlier)| now.get(key).is_some_and(|later| later.starts_with(earlier))))
 }
 
 /// What xml-sec's `level_probe` reports, reduced to the compared fields: the
@@ -298,13 +519,72 @@ pub(crate) fn xml_sec_outcome(output: &str) -> Value {
                 .to_owned()
         }
     });
-    json!({
+    let mut outcome = json!({
         "crypto": signature,
         "structure": structure,
         // xml-sec reports statuses; whether they are usable is the caller's
         // reading, so there is no trust verdict to compare.
         "trust": "not assessed",
-    })
+    });
+    // A document with several signatures (parallel ones, countersignatures)
+    // reports each after the first, in the order the probe lists them.
+    let others: Vec<Value> = output
+        .split("signature: ")
+        .skip(2)
+        .map(|chunk| {
+            let reading = xml_sec_outcome(&format!("signature: {chunk}"));
+            json!({ "crypto": reading["crypto"], "structure": reading["structure"] })
+        })
+        .collect();
+    if !others.is_empty() {
+        outcome["others"] = others.into();
+    }
+    outcome
+}
+
+/// `outcome` with the structure of the BER reading `ber` of the same
+/// document beside each signature's structure, the later signatures' too.
+pub(crate) fn with_ber(mut outcome: Value, ber: &Value) -> Value {
+    outcome["structure_ber"] = ber["structure"].clone();
+    // `get_mut`, not indexing: indexing would insert a null `others`.
+    if let Some(others) = outcome.get_mut("others").and_then(Value::as_array_mut) {
+        for (index, other) in others.iter_mut().enumerate() {
+            other["structure_ber"] = ber["others"][index]["structure"].clone();
+        }
+    }
+    outcome
+}
+
+/// Each signature's building-block verdicts in `facts`, in document order:
+/// the verdict of every compared block, without the fact it reads.
+pub(crate) fn our_verdicts(facts: &Value) -> Vec<Value> {
+    facts["signatures"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|signature| {
+            let blocks = super::upstream::our_blocks(signature);
+            Value::Object(
+                blocks
+                    .into_iter()
+                    .map(|(name, verdict)| (name, verdict["verdict"].clone()))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// `outcome` with the first of `blocks` beside the first signature and each
+/// later one beside the signature it reads.
+pub(crate) fn with_blocks(mut outcome: Value, blocks: Vec<Value>) -> Value {
+    let mut blocks = blocks.into_iter();
+    outcome["blocks"] = blocks.next().unwrap_or(Value::Null);
+    if let Some(others) = outcome.get_mut("others").and_then(Value::as_array_mut) {
+        for other in others {
+            other["blocks"] = blocks.next().unwrap_or(Value::Null);
+        }
+    }
+    outcome
 }
 
 /// What DSS's `LevelProbe` reports, reduced to the compared fields.
@@ -338,7 +618,40 @@ pub(crate) fn dss_outcome(output: &str, reports: &Path) -> Result<Value, String>
     let revocations = xml::below(root, "Revocation", None)
         .filter(|node| xml::child(*node, "BasicSignature").is_some())
         .count();
-    Ok(json!({
+    // Every signature after the first, parallel ones and countersignatures,
+    // as the simple report lists them, each with the cryptographic result of
+    // the diagnostic signature of the same token.
+    let others: Vec<Value> = output
+        .lines()
+        .filter(|line| line.contains(" format="))
+        .skip(1)
+        .map(|line| {
+            let field = |name: &str| {
+                line.split(' ')
+                    .find_map(|word| word.strip_prefix(&format!("{name}=")))
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            let token = line.split(' ').next().unwrap_or_default();
+            let crypto = xml::below(root, "Signature", None)
+                .find(|node| {
+                    node.attribute("Id") == Some(token)
+                        && xml::child(*node, "BasicSignature").is_some()
+                })
+                .map_or(
+                    "absent",
+                    |node| {
+                        if intact(node) { "intact" } else { "broken" }
+                    },
+                );
+            json!({
+                "crypto": crypto,
+                "structure": field("format"),
+                "trust": format!("{}/{}", field("indication"), field("subindication")),
+            })
+        })
+        .collect();
+    let mut outcome = json!({
         "crypto": if intact(signature) { "intact" } else { "broken" },
         "structure": field("format"),
         "evidence": {
@@ -351,11 +664,42 @@ pub(crate) fn dss_outcome(output: &str, reports: &Path) -> Result<Value, String>
             field("indication").unwrap_or_default(),
             field("subindication").unwrap_or_default()
         ),
-    }))
+    });
+    if !others.is_empty() {
+        outcome["others"] = others.into();
+    }
+    // Each signature's building-block conclusions, matched by its token in
+    // the order the simple report lists the signatures.
+    let signatures = super::upstream::dss_signatures_of(
+        &diagnostic_text,
+        &xml::read(&reports.join("detailed.xml"))?,
+        &xml::read(&reports.join("simple.xml"))?,
+        &["SIGNATURE", "COUNTER_SIGNATURE"],
+    )?;
+    let blocks = output
+        .lines()
+        .filter(|line| line.contains(" format="))
+        .map(|line| {
+            let token = line.split(' ').next().unwrap_or_default();
+            signatures
+                .iter()
+                .find(|signature| signature["token"] == token)
+                .map_or(Value::Null, |signature| signature["blocks"].clone())
+        })
+        .collect();
+    Ok(with_blocks(outcome, blocks))
 }
 
 /// The fields of `expected` that `observed` does not repeat.
 pub(crate) fn deviations(expected: &Value, observed: &Value, path: &str, found: &mut Vec<String>) {
+    // `{"less_than": N}` expects any number below N, such as every width an
+    // encoder that drops leading zero octets can give.
+    if let Some(bound) = expected.get("less_than").and_then(Value::as_u64) {
+        if observed.as_u64().is_none_or(|value| value >= bound) {
+            found.push(format!("{path}: expected below {bound}, got {observed}"));
+        }
+        return;
+    }
     match expected {
         Value::Object(fields) => {
             for (name, value) in fields {
@@ -364,6 +708,17 @@ pub(crate) fn deviations(expected: &Value, observed: &Value, path: &str, found: 
                     continue;
                 }
                 deviations(value, &observed[name], &format!("{path}.{name}"), found);
+            }
+            // An outcome that expects no further signatures holds none: an
+            // omitted `others` means zero, not "any".
+            if !fields.contains_key("others")
+                && let Some(others) = observed.get("others").and_then(Value::as_array)
+                && !others.is_empty()
+            {
+                found.push(format!(
+                    "{path}.others: no further signature expected, {} reported",
+                    others.len()
+                ));
             }
         }
         _ if expected != observed => {
@@ -458,6 +813,8 @@ struct Run<'a> {
     classpath: String,
     lifecycle_probe: PathBuf,
     level_probe: PathBuf,
+    /// The probe whose facts give xml-sec's building-block verdicts.
+    corpus_probe: PathBuf,
     /// The validation instant of every step, after every token of the run.
     at: u64,
 }
@@ -468,6 +825,7 @@ const TSA_CONFIG: &str = "[tsa]\ndefault_tsa=lifecycle\n[lifecycle]\nserial=PKI/
 const DATA: &str =
     "<Document Id=\"document\"><Data Id=\"payload\">Lifecycle payload</Data></Document>";
 const DETACHED: &str = "Lifecycle detached payload\n";
+const SECOND_DETACHED: &str = "Lifecycle second detached payload\n";
 
 impl Run<'_> {
     fn levels(&self) -> Generator {
@@ -526,19 +884,38 @@ impl Run<'_> {
         };
         levels.issue()?;
         generator.openssl(&[
-            "req",
-            "-newkey",
-            "ec",
+            "genpkey",
+            "-genparam",
+            "-algorithm",
+            "DSA",
             "-pkeyopt",
-            "ec_paramgen_curve:P-256",
-            "-nodes",
-            "-keyout",
-            "signer-ec.key",
+            "dsa_paramgen_bits:2048",
+            // XMLDSig 1.1 §6.4.1 requires DSA-SHA256 with (L, N) = (2048, 256);
+            // OpenSSL's default N for 2048 is 224.
+            "-pkeyopt",
+            "dsa_paramgen_q_bits:256",
             "-out",
-            "signer-ec.csr",
-            "-subj",
-            "/CN=xml-sec XAdES Lifecycle EC Signer",
+            "dsa.param",
         ])?;
+        // Every signer key beyond the levels PKI's RSA keys.
+        let keyed: Vec<_> = Algorithm::MORE
+            .into_iter()
+            .chain([Algorithm::Ec])
+            .filter_map(|algorithm| algorithm.key().map(|key| (algorithm.signer(), key)))
+            .collect();
+        for (signer, (newkey, label)) in &keyed {
+            let (key, request, subject) = (
+                format!("{signer}.key"),
+                format!("{signer}.csr"),
+                format!("/CN=xml-sec XAdES Lifecycle {label} Signer"),
+            );
+            let mut args = vec!["req", "-newkey"];
+            args.extend_from_slice(newkey);
+            args.extend([
+                "-nodes", "-keyout", &key, "-out", &request, "-subj", &subject,
+            ]);
+            generator.openssl(&args)?;
+        }
         // The CAs first: a certificate is signed by its issuer's final key.
         for (name, issuer, _, extensions) in CERTIFICATES {
             if name != "outsider" {
@@ -546,15 +923,18 @@ impl Run<'_> {
             }
         }
         let (_, issuer, _, extensions) = CERTIFICATES[1];
-        self.certify(&generator, "signer-ec", issuer, extensions)?;
+        for (signer, _) in &keyed {
+            self.certify(&generator, signer, issuer, extensions)?;
+        }
         let mut chain = read(&self.pki.join("issuer.pem"))?;
         chain.extend(read(&self.pki.join("root.pem"))?);
         write(&self.pki.join("chain.pem"), chain)?;
-        for (name, alias) in [
-            ("signer", "signer"),
-            ("signer-ec", "signer"),
-            ("tsa", "tsa"),
-        ] {
+        let stores = ["signer"]
+            .into_iter()
+            .chain(keyed.iter().map(|(signer, _)| *signer))
+            .map(|signer| (signer, "signer"))
+            .chain([("tsa", "tsa")]);
+        for (name, alias) in stores {
             generator.openssl(&[
                 "pkcs12",
                 "-export",
@@ -572,7 +952,10 @@ impl Run<'_> {
                 &format!("{name}.p12"),
             ])?;
         }
-        for algorithm in [Algorithm::Rsa, Algorithm::Ec] {
+        for algorithm in [Algorithm::Rsa, Algorithm::Ec]
+            .into_iter()
+            .chain(Algorithm::MORE)
+        {
             let directory = self.pki.join(algorithm.name());
             std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
             let signer = algorithm.signer();
@@ -588,11 +971,25 @@ impl Run<'_> {
                 )?;
             }
         }
-        write(&self.pki.join("root.der"), generator.der("root")?)?;
+        self.inputs(&generator.der("root")?)
+    }
+
+    /// The trust anchor, the TSA's configuration and the signed data every
+    /// lifecycle reads.
+    fn inputs(&self, root: &[u8]) -> Result<(), String> {
+        // The corpus probe reads its trust anchors from a directory: the root
+        // alone, the anchor every other validation takes.
+        let anchors = self.results.join("anchors");
+        std::fs::create_dir_all(&anchors).map_err(|error| error.to_string())?;
+        write(&anchors.join("0.der"), root)?;
+        write(&self.pki.join("root.der"), root)?;
         write(&self.pki.join("tsa.serial"), "01\n")?;
         let pki = self.pki.display().to_string();
         write(&self.pki.join("tsa.cnf"), TSA_CONFIG.replace("PKI", &pki))?;
         write(&self.pki.join("data.xml"), DATA)?;
+        // DSS's FormProbe reads the forms' document under this name.
+        write(&self.pki.join("document.xml"), DATA)?;
+        write(&self.pki.join("detached-2.txt"), SECOND_DETACHED)?;
         write(&self.pki.join("detached.txt"), DETACHED)
     }
 
@@ -623,16 +1020,25 @@ impl Run<'_> {
         }
     }
 
+    /// What the B-B signature signs: the first detached file, or the XML data
+    /// (a detached signature over two files finds the second beside it).
     fn data(&self, case: Case) -> PathBuf {
-        self.pki.join(match case.packaging {
-            Packaging::Detached => "detached.txt",
-            _ => "data.xml",
-        })
+        self.pki.join(
+            case.packaging
+                .detached()
+                .first()
+                .copied()
+                .unwrap_or("data.xml"),
+        )
     }
 
-    /// The detached object a validator or augmenter needs, if any.
-    fn detached(&self, case: Case) -> Option<PathBuf> {
-        (case.packaging == Packaging::Detached).then(|| self.pki.join("detached.txt"))
+    /// The detached objects a validator or augmenter needs.
+    fn detached(&self, case: Case) -> Vec<PathBuf> {
+        case.packaging
+            .detached()
+            .iter()
+            .map(|file| self.pki.join(file))
+            .collect()
     }
 
     fn java(&self, class: &str) -> Vec<OsString> {
@@ -650,6 +1056,34 @@ impl Run<'_> {
         Ok(
             json!({ "refused": refusal(&String::from_utf8_lossy(&run.stdout), &String::from_utf8_lossy(&run.stderr)) }),
         )
+    }
+
+    /// DSS's B-B signature of `case` at Unix time `time` into `output`: a
+    /// packaging through `SignProbe`, a form through `FormProbe`.
+    fn dss_create(&self, case: Case, time: u64, output: &Path) -> Vec<OsString> {
+        let store = self.pki.join(format!("{}.p12", case.algorithm.signer()));
+        if let Some(packaging) = case.packaging.dss() {
+            let mut args = self.java("SignProbe");
+            args.extend(line(&[
+                &store,
+                &packaging,
+                &self.data(case),
+                &time.to_string(),
+                &output,
+                &case.algorithm.dss(),
+            ]));
+            return args;
+        }
+        // The PKI directory holds document.xml and both detached files.
+        let mut args = self.java("FormProbe");
+        args.extend(line(&[
+            &store,
+            &case.packaging.name(),
+            &self.pki,
+            &time.to_string(),
+            &output,
+        ]));
+        args
     }
 
     /// The command that makes `step` at Unix time `time`.
@@ -682,17 +1116,7 @@ impl Run<'_> {
                 args.push(output.clone().into_os_string());
                 args
             }
-            (Actor::Dss, "b") => {
-                let mut args = self.java("SignProbe");
-                args.extend(line(&[
-                    &self.pki.join(format!("{}.p12", case.algorithm.signer())),
-                    &case.packaging.dss(),
-                    &self.data(case),
-                    &time.to_string(),
-                    &output,
-                ]));
-                args
-            }
+            (Actor::Dss, "b") => self.dss_create(case, time, &output),
             (Actor::XmlSec, step) => {
                 let input = input.ok_or("no input to augment")?;
                 let mut args = line(&[
@@ -707,7 +1131,7 @@ impl Run<'_> {
                     &"--accuracy",
                     &"1",
                 ]);
-                if let Some(detached) = self.detached(case) {
+                for detached in self.detached(case) {
                     args.extend(line(&[&"--detached", &detached]));
                 }
                 // xml-sec renews only over DSS's tokens, whose unsorted
@@ -746,7 +1170,7 @@ impl Run<'_> {
                     &time.to_string(),
                     &evidence,
                 ]));
-                args.extend(self.detached(case).map(Into::into));
+                args.extend(self.detached(case).into_iter().map(Into::into));
                 args
             }
         })
@@ -767,19 +1191,43 @@ impl Run<'_> {
                     &self.at.to_string(),
                     &reports,
                 ]));
-                args.extend(self.detached(case).map(Into::into));
+                args.extend(self.detached(case).into_iter().map(Into::into));
                 let run = self.corpus.require(&args, &log)?;
                 dss_outcome(&String::from_utf8_lossy(&run.stdout), &reports)
             }
             Actor::XmlSec => {
-                let mut outcome = self.xml_sec_reading(step, false, &log)?;
+                let outcome = self.xml_sec_reading(step, false, &log)?;
                 // The same document with unmarked tokens read as BER: the
                 // two readings differ only for a token that is not DER.
                 let ber = self.xml_sec_reading(step, true, &reports.with_extension("ber"))?;
-                outcome["structure_ber"] = ber["structure"].clone();
-                Ok(outcome)
+                let blocks = self.xml_sec_blocks(step, &reports.with_extension("facts"))?;
+                Ok(with_blocks(with_ber(outcome, &ber), blocks))
             }
         }
+    }
+
+    /// xml-sec's EN 319 102-1 building-block verdicts for each signature of
+    /// the output of `step`, in document order, from the corpus probe's facts
+    /// under the conformant `XAdES` profile, which admits the transforms and
+    /// URIs the lifecycle's own verification admits (DSS signs an enveloped
+    /// document through an `XPath` Filter 2.0 transform).
+    fn xml_sec_blocks(&self, step: &Step<'_>, log: &Path) -> Result<Vec<Value>, String> {
+        let anchors = self.results.join("anchors");
+        let mut args = line(&[
+            &self.corpus_probe,
+            &"facts",
+            &step.output(),
+            &anchors,
+            &self.at.to_string(),
+            &super::upstream::PROFILES[2].1,
+        ]);
+        for detached in self.detached(step.case) {
+            args.extend(line(&[&"--detached", &detached]));
+        }
+        let run = self.corpus.require(&args, log)?;
+        let facts: Value = serde_json::from_slice(&run.stdout)
+            .map_err(|error| format!("corpus probe facts: {error}"))?;
+        Ok(our_verdicts(&facts))
     }
 
     /// xml-sec's reading of the output of `step`, with unmarked tokens read
@@ -796,7 +1244,7 @@ impl Run<'_> {
         if ber {
             args.push("cms".into());
         }
-        if let Some(detached) = self.detached(step.case) {
+        for detached in self.detached(step.case) {
             args.extend(line(&[&"--detached", &detached]));
         }
         let run = self.corpus.command(&args, log)?;
@@ -844,6 +1292,10 @@ impl Run<'_> {
             let output = step.output();
             let text = xml::read(&output)?;
             let created = created.get_or_insert_with(|| text.clone());
+            if name == "b" {
+                // A reviewed alternative may hold only for one encoding width.
+                row.insert("signature_octets".into(), signature_octets(created)?.into());
+            }
             let earlier = previous_text.as_deref().unwrap_or(created);
             row.insert(
                 "preserved".into(),
@@ -863,25 +1315,57 @@ fn expectations_path(corpus: &Corpus) -> PathBuf {
     corpus.package().join("lifecycle/expectations.json")
 }
 
+/// The recorded expectations a new recording keeps the reviewed notes and
+/// alternatives of; none before the first recording. A file that exists but
+/// does not read or parse is an error and stays untouched.
+fn previous_expectations(path: &Path) -> Result<Value, String> {
+    if !path.exists() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_str(&xml::read(path)?).map_err(|error| format!("{}: {error}", path.display()))
+}
+
 /// Every deviation of `observed` from `expected`, keyed by case.
 pub(crate) fn compare(expected: &Value, observed: &[Value]) -> Vec<String> {
     let mut found = Vec::new();
     for row in observed {
         let name = row["case"].as_str().unwrap_or_default();
-        let Some(steps) = expected["cases"][name]["steps"].as_array() else {
+        let case = &expected["cases"][name];
+        let Some(steps) = case["steps"].as_array() else {
             found.push(format!("{name}: no expectation"));
             continue;
         };
         let actual = row["steps"].as_array().map_or(&[][..], Vec::as_slice);
-        if steps.len() != actual.len() {
-            found.push(format!(
-                "{name}: {} steps expected, {} observed",
-                steps.len(),
-                actual.len()
-            ));
-        }
-        for (index, (step, observed)) in steps.iter().zip(actual).enumerate() {
-            deviations(step, observed, &format!("{name}[{index}]"), &mut found);
+        let differences = |steps: &[Value]| {
+            let mut differences = Vec::new();
+            if steps.len() != actual.len() {
+                differences.push(format!(
+                    "{name}: {} steps expected, {} observed",
+                    steps.len(),
+                    actual.len()
+                ));
+            }
+            for (index, (step, observed)) in steps.iter().zip(actual).enumerate() {
+                deviations(
+                    step,
+                    observed,
+                    &format!("{name}[{index}]"),
+                    &mut differences,
+                );
+            }
+            differences
+        };
+        // A reviewed alternative outcome, such as one the other side's
+        // randomized encoding produces now and then, matches as well.
+        let primary = differences(steps);
+        let alternative = case["alternatives"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|alternative| alternative["steps"].as_array())
+            .any(|steps| differences(steps).is_empty());
+        if !alternative {
+            found.extend(primary);
         }
     }
     if let Some(cases) = expected["cases"].as_object() {
@@ -892,6 +1376,42 @@ pub(crate) fn compare(expected: &Value, observed: &[Value]) -> Vec<String> {
         }
     }
     found
+}
+
+/// The recorded expectation of one case from its `previous` expectation and
+/// the `observed` steps: an observation one of the reviewed alternatives
+/// already describes keeps the expectation as it was, so a run that met the
+/// alternative never replaces the expected outcome; any other observation
+/// becomes the expected outcome for review, keeping the alternatives. Under a
+/// new DSS release (`same_release` false) the kept steps would be credited to
+/// a release that never produced them, so such a case gives `None`.
+pub(crate) fn recorded_case(
+    previous: &Value,
+    observed: &Value,
+    same_release: bool,
+) -> Option<Value> {
+    let alternatives = &previous["alternatives"];
+    let reviewed = alternatives
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|alternative| alternative["steps"].as_array())
+        .any(|steps| {
+            let actual = observed.as_array().map_or(&[][..], Vec::as_slice);
+            let mut found = Vec::new();
+            for (index, (step, observed)) in steps.iter().zip(actual).enumerate() {
+                deviations(step, observed, &index.to_string(), &mut found);
+            }
+            steps.len() == actual.len() && found.is_empty()
+        });
+    if reviewed {
+        return same_release.then(|| previous.clone());
+    }
+    let mut case = json!({ "steps": observed });
+    if !alternatives.is_null() {
+        case["alternatives"] = alternatives.clone();
+    }
+    Some(case)
 }
 
 /// Runs every lifecycle and compares it with the expectations.
@@ -919,6 +1439,12 @@ pub(crate) fn execute(corpus: &Corpus, results: &Path, record: bool) -> Result<(
             Build::Dev,
             &results.join("level-probe-build"),
         )?,
+        corpus_probe: corpus.build_example(
+            "corpus_probe",
+            &[],
+            Build::Dev,
+            &results.join("corpus-probe-build"),
+        )?,
         at: now()? + 86_400,
     };
     run.issue()?;
@@ -934,19 +1460,29 @@ pub(crate) fn execute(corpus: &Corpus, results: &Path, record: bool) -> Result<(
     )?;
     let path = expectations_path(corpus);
     if record {
-        let cases: Map<String, Value> = observed
-            .iter()
-            .map(|row| {
-                let name = row["case"].as_str().unwrap_or_default().to_owned();
-                (name, json!({ "steps": row["steps"] }))
-            })
-            .collect();
-        // The reviewed explanations outlive a new recording; `dss` names the
-        // release the outcomes were recorded against.
-        let notes = xml::read(&path)
-            .ok()
-            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-            .map_or(Value::Null, |previous| previous["notes"].clone());
+        // The reviewed explanations and alternatives outlive a new recording;
+        // `dss` names the release the outcomes were recorded against.
+        let previous = previous_expectations(&path)?;
+        let same_release = previous["dss"] == release.dss.as_str();
+        let mut cases = Map::new();
+        let mut unobserved = Vec::new();
+        for row in &observed {
+            let name = row["case"].as_str().unwrap_or_default().to_owned();
+            match recorded_case(&previous["cases"][&name], &row["steps"], same_release) {
+                Some(case) => {
+                    cases.insert(name, case);
+                }
+                None => unobserved.push(name),
+            }
+        }
+        if !unobserved.is_empty() {
+            return Err(format!(
+                "under DSS {} these cases met only a reviewed alternative; record again for their expected outcome: {}",
+                release.dss,
+                unobserved.join(", ")
+            ));
+        }
+        let notes = previous["notes"].clone();
         return write_json(
             &path,
             &json!({ "dss": release.dss, "notes": notes, "cases": cases }),

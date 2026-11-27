@@ -172,6 +172,7 @@ impl Fixture {
             method: SignatureAlgorithm::RsaSha256,
             digest: DigestAlgorithm::Sha256,
             canonicalization: C14nAlgorithm::new(C14nMode::Exclusive1_0, false),
+            prefixes: xml_sec_xades::Prefixes::default(),
         }
     }
 
@@ -189,9 +190,10 @@ impl Fixture {
                         mime_type: "text/xml",
                         envelope: Envelope::Enveloped,
                     }],
-                    parent: None,
+                    placement: xml_sec_xades::Placement::DocumentEnd,
                     resources: None,
                     id_attributes: &[],
+                    properties: xml_sec_xades::properties::Properties::default(),
                 },
                 assessment,
                 &account(),
@@ -680,6 +682,7 @@ fn a_changed_document_makes_the_request_stale() {
                     id: "counter",
                     signing_time: TIME,
                     id_attributes: &[],
+                    properties: xml_sec_xades::properties::Properties::default(),
                 },
                 assessment,
                 &account(),

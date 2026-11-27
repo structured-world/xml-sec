@@ -110,6 +110,7 @@ impl Setup {
             method: SignatureAlgorithm::RsaSha256,
             digest: DigestAlgorithm::Sha256,
             canonicalization: C14nAlgorithm::new(C14nMode::Exclusive1_0, false),
+            prefixes: xml_sec_xades::Prefixes::default(),
         };
         let mut document = XmlDocument::parse(DOCUMENT).expect("fixture document");
         self.with(|assessment| {
@@ -123,9 +124,10 @@ impl Setup {
                         mime_type: "text/xml",
                         envelope: Envelope::Enveloped,
                     }],
-                    parent: None,
+                    placement: xml_sec_xades::Placement::DocumentEnd,
                     resources: None,
                     id_attributes: &[],
+                    properties: xml_sec_xades::properties::Properties::default(),
                 },
                 assessment,
                 &account(),

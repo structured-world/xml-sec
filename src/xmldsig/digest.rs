@@ -123,6 +123,22 @@ impl DigestAlgorithm {
         }
     }
 
+    /// The `XMLDSig` digest of an ASN.1 digest identity, as CMS and X.509
+    /// structures name it, or `None` when no `XMLDSig` digest corresponds.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use structured_pkix::algorithm::digest::Algorithm;
+    /// use xml_sec::xmldsig::DigestAlgorithm;
+    ///
+    /// assert_eq!(DigestAlgorithm::from_pkix(Algorithm::Sha256), Some(DigestAlgorithm::Sha256));
+    /// ```
+    #[must_use]
+    pub fn from_pkix(algorithm: structured_pkix::algorithm::digest::Algorithm) -> Option<Self> {
+        super::pkix::digest_algorithm(algorithm)
+    }
+
     /// Return the XML namespace URI for this digest algorithm.
     #[must_use]
     pub fn uri(self) -> &'static str {

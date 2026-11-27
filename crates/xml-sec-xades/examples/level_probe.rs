@@ -1,10 +1,10 @@
 //! One baseline level of every signature of a document, through the public API.
 //!
 //! `level_probe XML ANCHOR_DER UNIX_TIME b|t|lt|lta [ACCURACY_SECONDS [cms]]
-//! [--detached FILE]`, where `ANCHOR_DER` may be `-` to anchor where each
+//! [--detached FILE]...`, where `ANCHOR_DER` may be `-` to anchor where each
 //! chain the document carries ends, `ACCURACY_SECONDS` states that accuracy
-//! for the policy of every token the document carries, and `FILE` supplies the
-//! detached object a reference names by the file's name. The anchor and the
+//! for the policy of every token the document carries, and each `FILE`
+//! supplies the detached object a reference names by the file's name. The anchor and the
 //! accuracy are interoperability settings for test corpora, never a trust
 //! decision. `--samples N` times `N` runs from the serialized document to the
 //! levels (see `timing`).
@@ -53,18 +53,23 @@ fn terminal(certificate: &[u8], pool: &[Vec<u8>]) -> bool {
             .any(|other| names(&other))
 }
 
-/// The `--detached FILE` object, by its file name, taken out of `args`.
+/// Every `--detached FILE` object, by its file name, taken out of `args`;
+/// two files of one name would make the reference ambiguous and are refused.
 fn detached(
     args: &mut Vec<String>,
 ) -> Result<BTreeMap<String, Vec<u8>>, Box<dyn std::error::Error>> {
     let mut resources = BTreeMap::new();
-    if let Some(flag) = args.iter().position(|arg| arg == "--detached") {
+    let mut paths = BTreeMap::new();
+    while let Some(flag) = args.iter().position(|arg| arg == "--detached") {
         let path = args.get(flag + 1).ok_or("--detached needs a file")?.clone();
         let name = std::path::Path::new(&path)
             .file_name()
             .ok_or("--detached needs a file")?
             .to_string_lossy()
             .into_owned();
+        if let Some(earlier) = paths.insert(name.clone(), path.clone()) {
+            return Err(format!("--detached {earlier} and {path} have one file name").into());
+        }
         resources.insert(name, std::fs::read(&path)?);
         args.drain(flag..flag + 2);
     }

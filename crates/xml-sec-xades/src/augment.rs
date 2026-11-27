@@ -14,9 +14,13 @@
 //! a `RenewedDigestsV2` before that archive. Nothing is fetched and no clock
 //! is read here.
 
+mod store;
 mod validation_data;
 
-pub use validation_data::{DataAdded, ValidationData, add_validation_data};
+pub use store::{PolicyStoreRequest, add_policy_store};
+pub use validation_data::{
+    DataAdded, ValidationData, add_validation_data, refresh_validation_data,
+};
 
 use crate::accuracy;
 use crate::basic::{Outcome, Stage, ValidationError, with_stage};
@@ -251,6 +255,17 @@ pub enum AugmentError {
     /// A supplied certificate could not be read.
     #[error(transparent)]
     Adapter(#[from] Error),
+    /// The signature signed no explicit signature policy a store could hold
+    /// (EN 319 132-1 §5.2.10).
+    #[error("signature {0:?} signed no explicit signature policy")]
+    NoExplicitPolicy(String),
+    /// The signature already has a `SignaturePolicyStore`.
+    #[error("signature {0:?} already stores its policy")]
+    PolicyStored(String),
+    /// The policy store was refused: the policy is not the signed one, or a
+    /// value or its digest could not be drafted.
+    #[error("policy store refused: {0:?}")]
+    Store(Box<produce::Error<crate::properties::PropertyError>>),
     /// The current execution refused work or storage.
     #[error("augmentation resource refusal: {0}")]
     Resource(MemoryError),
@@ -1101,7 +1116,7 @@ fn timestamped<W: Work>(
 }
 
 /// The certificate `token` names as its signer, carried or supplied.
-fn authority<'p, 't>(
+pub(crate) fn authority<'p, 't>(
     token: &'p Token<'t>,
     carrier: &'p Reader<'t>,
     [supplied, anchors]: [&'p [Certificate<'t>]; 2],

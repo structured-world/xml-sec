@@ -237,6 +237,80 @@ fn kept_signing_inputs_are_the_bytes_the_operation_digested_and_signed() {
 }
 
 #[test]
+fn reference_inputs_are_the_signing_inputs_without_a_signature() {
+    // The inputs a signing would digest, Manifest levels included, come from
+    // the same operation stopped before the signature value: the key signs
+    // nothing and the document keeps its text and generation.
+    for (name, xml, policy) in cases() {
+        let key = RecordingSigningKey::default();
+        let context = SignContext::new(&key).policy(policy);
+        let mut document = XmlDocument::parse(xml.as_str()).expect("fixture must parse");
+        let generation = document.generation();
+        let inputs = context
+            .reference_inputs(&mut document, crate::xmldsig::KeptInputs::ALL)
+            .unwrap_or_else(|error| panic!("{name}: reference inputs failed: {error:?}"));
+        assert!(key.recorded().is_empty(), "{name}: nothing was signed");
+        assert_eq!(document.as_xml(), xml, "{name}");
+        assert_eq!(document.generation(), generation, "{name}");
+        assert_eq!(inputs.signed_info, None, "{name}");
+        let (_, signed) = context
+            .sign_document_keeping_inputs(&mut document)
+            .unwrap_or_else(|error| panic!("{name}: signing failed: {error:?}"));
+        assert_eq!(
+            inputs.signed_info_references, signed.signed_info_references,
+            "{name}"
+        );
+        assert_eq!(
+            inputs.manifest_references, signed.manifest_references,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn builder_reference_inputs_are_the_inputs_of_the_appended_signature() {
+    // The signature a builder appends digests, before any signature value,
+    // the bytes it digests when signed; the dry run appends nothing.
+    let xml = r#"<root><payload Id="payload">text</payload></root>"#;
+    let builder = crate::xmldsig::SignatureBuilder::new(
+        crate::c14n::C14nAlgorithm::new(crate::c14n::C14nMode::Exclusive1_0, false),
+        SignatureAlgorithm::RsaSha256,
+    )
+    .add_reference(
+        crate::xmldsig::ReferenceBuilder::new(crate::xmldsig::DigestAlgorithm::Sha256)
+            .uri("#payload"),
+    )
+    .add_reference(
+        crate::xmldsig::ReferenceBuilder::new(crate::xmldsig::DigestAlgorithm::Sha256)
+            .uri("")
+            .transform(crate::xmldsig::Transform::Enveloped),
+    );
+    let key = RecordingSigningKey::default();
+    let context = SignContext::new(&key);
+    let mut document = XmlDocument::parse(xml).expect("fixture must parse");
+    let generation = document.generation();
+    let inputs = context
+        .reference_inputs_with_builder(&mut document, &builder, crate::xmldsig::KeptInputs::ALL)
+        .expect("reference inputs");
+    assert!(key.recorded().is_empty(), "nothing was signed");
+    assert_eq!(document.as_xml(), xml);
+    assert_eq!(document.generation(), generation);
+    let (_, signed) = context
+        .sign_document_with_builder_keeping(
+            &mut document,
+            &builder,
+            crate::xmldsig::KeptInputs::ALL,
+        )
+        .expect("signing");
+    assert_eq!(inputs.signed_info_references.len(), 2);
+    assert_eq!(inputs.signed_info_references, signed.signed_info_references);
+    assert_eq!(
+        signed.signed_info.as_deref(),
+        Some(key.recorded().as_slice())
+    );
+}
+
+#[test]
 fn kept_binary_digest_inputs_are_charged_to_the_retention_limit() {
     // Bytes a Reference digests without canonicalizing them are copied only
     // for a caller keeping the signing inputs, so they count against the

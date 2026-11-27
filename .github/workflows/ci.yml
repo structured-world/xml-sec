@@ -708,6 +708,12 @@ jobs:
             !${{ runner.temp }}/xades-dss-corpus/corpus-probe-build
           if-no-files-found: error
           retention-days: 7
+      # Every signature and extension test class of the current DSS release
+      # must be classified: covered by a named case, unsupported or not
+      # applicable. A test class is a `*Test.java` file of those directories
+      # not named `Abstract*`, as DSS names its concrete tests.
+      - name: Check the EU DSS signature tests against the reviewed catalogue
+        run: cargo run --quiet -p xml-sec-tools -- xades dss-catalogue --results "$RUNNER_TEMP/xades-dss-catalogue"
       - name: Qualify XSLT engine, signature chains and failure contracts
         env:
           LIBXSLT_SOURCE_DIR: ${{ github.workspace }}/donors/libxslt

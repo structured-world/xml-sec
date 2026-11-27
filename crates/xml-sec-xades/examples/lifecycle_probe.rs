@@ -2,8 +2,11 @@
 //! another implementation, one step per run so the other side can validate
 //! each result, and the harness that times the same steps.
 //!
-//! `lifecycle_probe create rsa|ec PACKAGING PKI DATA SIGNING_TIME AT OUTPUT`
-//! creates the B-B signature `sig` with `PKI/signer.key` (PKCS#8) and the
+//! `lifecycle_probe create ALGORITHM PACKAGING PKI DATA SIGNING_TIME AT OUTPUT`
+//! creates the B-B signature `sig` with `ALGORITHM` (`rsa`, `ec`,
+//! `rsa-sha512`, `rsa-pss`, `ec-p384`, `ec-p521`, `ec-sha3-512`, `ed25519`,
+//! `ed448` or `dsa`,
+//! references digested with SHA-256), `PKI/signer.key` (PKCS#8) and the
 //! `signer.der`/`issuer.der` chain over `DATA`, laid out as EU DSS lays out
 //! the same packaging. `PACKAGING` is `enveloped`, `enveloping` or
 //! `internally-detached` over an XML `DATA` with the root `Id` `document`, or
@@ -46,14 +49,13 @@ use xml_sec::XmlDocument;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::policy::{Instant, SigningPolicy, TimestampTokenEncoding, VerificationPolicy};
 use xml_sec::xmldsig::{
-    DefaultKeyResolver, DigestAlgorithm, EcdsaP256SigningKey, KeyResolverConfig, ObjectContent,
-    ObjectElement, RsaSigningKey, SignatureAlgorithm, SigningKey, UriTypeSet, VerificationRequest,
-    VerifyContext,
+    DefaultKeyResolver, DigestAlgorithm, KeyResolverConfig, ObjectContent, ObjectElement,
+    SignatureAlgorithm, SigningKey, UriTypeSet, VerificationRequest, VerifyContext,
 };
 use xml_sec_xades::{
-    Assessment, Completion, DataObject, Envelope, Inputs, Request, Requirements, Signer,
-    TimestampRequest, ValidationData, add_validation_data, complete_timestamp, create,
-    request_archive_timestamp, request_timestamp,
+    Assessment, Completion, Countersignature, DataObject, Envelope, Inputs, Request, Requirements,
+    Signer, TimestampRequest, ValidationData, add_validation_data, complete_timestamp, countersign,
+    create, request_archive_timestamp, request_timestamp,
 };
 
 /// The document an enveloping or detached signature is appended to: DSS makes
@@ -92,24 +94,30 @@ fn verification(at: i64, detached: bool, encoding: TimestampTokenEncoding) -> Ve
     policy
 }
 
-/// The `Id` of the first element of `text` named `Signature`, prefixed or not.
-fn signature_id(text: &str) -> Option<&str> {
-    let mut rest = text;
-    while let Some(start) = rest.find('<') {
-        let tag = &rest[start + 1..];
-        let end = tag.find('>')?;
-        let name_end = tag
-            .find(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/')
-            .unwrap_or(end);
-        let name = &tag[..name_end];
-        if name.rsplit(':').next() == Some("Signature") {
-            let attributes = &tag[name_end..end];
-            let value = attributes.split_once(" Id=\"")?.1;
-            return value.split_once('"').map(|(id, _)| id);
-        }
-        rest = &tag[end..];
+/// The `Id` of every top-level element of `text` named `Signature`, prefixed
+/// or not, in document order: a countersignature, nested in the signature it
+/// countersigns, is augmented with that signature's archive, not on its own.
+fn signature_ids(text: &str) -> Result<Vec<String>, String> {
+    const DS: (&str, &str) = ("http://www.w3.org/2000/09/xmldsig#", "Signature");
+    let document = roxmltree::Document::parse(text).map_err(|error| error.to_string())?;
+    let found = document
+        .descendants()
+        .filter(|node| node.has_tag_name(DS))
+        .filter(|node| {
+            node.ancestors()
+                .skip(1)
+                .all(|ancestor| !ancestor.has_tag_name(DS))
+        })
+        .map(|node| {
+            node.attribute("Id")
+                .map(str::to_owned)
+                .ok_or_else(|| String::from("a signature without an Id"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if found.is_empty() {
+        return Err("the document has no signature".into());
     }
-    None
+    Ok(found)
 }
 
 fn main() -> Result<(), String> {
@@ -145,22 +153,44 @@ fn run(
     Ok(())
 }
 
-/// The signer's key of `algorithm` from its PKCS#8 `pem`, and its method.
+/// The signer's key of `algorithm` from its PKCS#8 `pem`, and its method:
+/// the methods DSS signs with under the names the lifecycle harness gives
+/// them, each key imported through the provider for that method.
 fn signing_key(
     algorithm: &str,
     pem: &str,
 ) -> Result<(Box<dyn SigningKey>, SignatureAlgorithm), String> {
-    Ok(match algorithm {
-        "rsa" => (
-            Box::new(RsaSigningKey::from_pkcs8_pem(pem).map_err(|error| error.to_string())?),
-            SignatureAlgorithm::RsaSha256,
-        ),
-        "ec" => (
-            Box::new(EcdsaP256SigningKey::from_pkcs8_pem(pem).map_err(|error| error.to_string())?),
-            SignatureAlgorithm::EcdsaSha256,
-        ),
-        _ => return Err("the algorithm is rsa or ec".into()),
-    })
+    use SignatureAlgorithm as A;
+    let method = match algorithm {
+        "rsa" => A::RsaSha256,
+        "ec" => A::EcdsaSha256,
+        "rsa-sha512" => A::RsaSha512,
+        "rsa-pss" => A::RsaPssSha256,
+        "ec-p384" => A::EcdsaSha384,
+        "ec-p521" => A::EcdsaSha512,
+        "ec-sha3-512" => A::EcdsaSha3_512,
+        "ed25519" => A::Ed25519,
+        "ed448" => A::Ed448,
+        "dsa" => A::DsaSha256,
+        _ => return Err(format!("unknown signature algorithm {algorithm}")),
+    };
+    // The key is a test key the harness issues for this run, or one the
+    // caller reads from its own directory into its own process: no other
+    // account or party can reach the memory wiping would protect, so the
+    // buffers are not zeroized.
+    let body: Vec<u8> = pem
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .flat_map(str::bytes)
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    let der = structured_base64::STANDARD
+        .decode(&body)
+        .map_err(|error| format!("signer.key: {error}"))?;
+    let key = xml_sec::provider::default_provider()
+        .import_signing_key(method, &der)
+        .map_err(|error| error.to_string())?;
+    Ok((key, method))
 }
 
 /// The document a signature of `packaging` is made in and its signed data
@@ -210,10 +240,130 @@ fn signed<'a>(
     })
 }
 
+/// One detached data object per file of `uris`.
+fn detached_files(uris: &[String]) -> Vec<DataObject<'_>> {
+    uris.iter()
+        .map(|uri| DataObject::Detached {
+            uri,
+            mime_type: "text/plain",
+        })
+        .collect()
+}
+
+/// The signatures of one B-B document: each new signature's `Id` and data
+/// objects, then each countersignature as `(parent, id)`.
+struct Plan<'a> {
+    host: String,
+    signatures: Vec<(&'static str, Vec<DataObject<'a>>)>,
+    countersignatures: &'static [(&'static str, &'static str)],
+    /// Inclusive canonicalization of `SignedInfo` and the references.
+    inclusive: bool,
+    /// The `XMLDSig` and `XAdES` prefixes the signer chooses.
+    prefixes: xml_sec_xades::Prefixes<'static>,
+}
+
+/// The B-B document of `shape`: one of the four packagings as [`signed`]
+/// lays it out, or one of the signature forms DSS's signature tests make,
+/// over the same data; `uris` names the detached files, the second beside the
+/// first.
+fn plan<'a>(
+    shape: &str,
+    data: &[u8],
+    uris: &'a [String],
+    policy: &SigningPolicy,
+) -> Result<Plan<'a>, String> {
+    let xml = || String::from_utf8(data.to_vec()).map_err(|error| format!("DATA: {error}"));
+    let excluding = || DataObject::Document {
+        mime_type: "text/xml",
+        envelope: Envelope::ExcludingSignatures,
+    };
+    let one = |host, object| Plan {
+        host,
+        signatures: vec![("sig", vec![object])],
+        countersignatures: &[],
+        inclusive: false,
+        prefixes: xml_sec_xades::Prefixes::default(),
+    };
+    Ok(match shape {
+        // DSS's custom-prefix tests: the signature and its properties under
+        // prefixes of the signer's choice, kept by every later level.
+        "custom-prefixes" => {
+            let (host, object) = signed("enveloped", data, &uris[0], policy)?;
+            Plan {
+                prefixes: xml_sec_xades::Prefixes {
+                    ds: "dsig",
+                    xades: "xa",
+                },
+                ..one(host, object)
+            }
+        }
+        // A countersignature over a signature of detached data.
+        "countersigned-detached" => Plan {
+            signatures: vec![("sig", detached_files(&uris[..1]))],
+            countersignatures: &[("sig", "counter")],
+            ..one(HOST.to_owned(), excluding())
+        },
+        "countersigned-internally-detached" => {
+            let (host, object) = signed("internally-detached", data, &uris[0], policy)?;
+            Plan {
+                countersignatures: &[("sig", "counter")],
+                ..one(host, object)
+            }
+        }
+        "countersigned-detached-multiple" => Plan {
+            signatures: vec![("sig", detached_files(uris))],
+            countersignatures: &[("sig", "counter")],
+            ..one(HOST.to_owned(), excluding())
+        },
+        "parallel" => Plan {
+            signatures: vec![("sig", vec![excluding()]), ("sig-2", vec![excluding()])],
+            ..one(xml()?, excluding())
+        },
+        "countersigned" => Plan {
+            countersignatures: &[("sig", "counter")],
+            ..one(xml()?, excluding())
+        },
+        "countersigned-nested" => Plan {
+            countersignatures: &[("sig", "counter"), ("counter", "counter-nested")],
+            ..one(xml()?, excluding())
+        },
+        "detached-multiple" => Plan {
+            signatures: vec![("sig", detached_files(uris))],
+            ..one(HOST.to_owned(), excluding())
+        },
+        // XAdES's LT augmentation adds validation data beside the KeyInfo the
+        // signature signed, which must keep verifying.
+        "signed-key-info" => Plan {
+            signatures: vec![(
+                "sig",
+                vec![
+                    excluding(),
+                    DataObject::KeyInfo {
+                        mime_type: "text/xml",
+                    },
+                ],
+            )],
+            ..one(xml()?, excluding())
+        },
+        "inclusive" => {
+            let (host, object) = signed("enveloped", data, &uris[0], policy)?;
+            Plan {
+                inclusive: true,
+                ..one(host, object)
+            }
+        }
+        packaging => {
+            let (host, object) = signed(packaging, data, &uris[0], policy)?;
+            one(host, object)
+        }
+    })
+}
+
 fn created(args: &[String], samples: Option<timing::Sampling>) -> Result<(), String> {
     let [algorithm, packaging, pki, data, signing_time, at, output] = args else {
         return Err(
-            "usage: lifecycle_probe create rsa|ec PACKAGING PKI DATA SIGNING_TIME AT OUTPUT".into(),
+            "usage: lifecycle_probe create ALGORITHM PACKAGING PKI DATA SIGNING_TIME AT OUTPUT"
+                .into(),
         );
     };
     let pki = PathBuf::from(pki);
@@ -225,12 +375,28 @@ fn created(args: &[String], samples: Option<timing::Sampling>) -> Result<(), Str
     let key_pem = String::from_utf8(read(&pki.join("signer.key"))?)
         .map_err(|error| format!("signer.key: {error}"))?;
     let (key, method) = signing_key(algorithm, &key_pem)?;
-    let uri = file_name(&data)?;
     let bytes = read(&data)?;
+    // A detached signature over two files signs the second beside the first.
+    let mut uris = vec![file_name(&data)?];
+    let mut resources = BTreeMap::from([(uris[0].clone(), bytes.clone())]);
+    if packaging.ends_with("detached-multiple") {
+        let second = data.with_file_name("detached-2.txt");
+        // Two references must name two objects.
+        if second == data {
+            return Err("DATA must not be detached-2.txt for a two-file form".into());
+        }
+        uris.push(file_name(&second)?);
+        resources.insert(uris[1].clone(), read(&second)?);
+    }
     let mut signing = SigningPolicy::default();
     signing.uris.references = UriTypeSet::ALL;
-    let (host, object) = signed(packaging, &bytes, &uri, &signing)?;
+    let plan = plan(packaging, &bytes, &uris, &signing)?;
     let chain: [&[u8]; 2] = [&signer_der, &issuer];
+    let mode = if plan.inclusive {
+        C14nMode::Inclusive1_0
+    } else {
+        C14nMode::Exclusive1_0
+    };
     let signer = Signer {
         key: key.as_ref(),
         provider: xml_sec::provider::default_provider(),
@@ -238,7 +404,8 @@ fn created(args: &[String], samples: Option<timing::Sampling>) -> Result<(), Str
         chain: &chain,
         method,
         digest: DigestAlgorithm::Sha256,
-        canonicalization: C14nAlgorithm::new(C14nMode::Exclusive1_0, false),
+        canonicalization: C14nAlgorithm::new(mode, false),
+        prefixes: plan.prefixes,
     };
     let resolver = DefaultKeyResolver::new(KeyResolverConfig {
         trusted_certs: vec![root.clone()],
@@ -248,7 +415,6 @@ fn created(args: &[String], samples: Option<timing::Sampling>) -> Result<(), Str
         .policy(verification(at, true, TimestampTokenEncoding::Declared))
         .key_resolver(&resolver);
     let input_bytes = bytes.len();
-    let resources = BTreeMap::from([(uri.clone(), bytes)]);
     let request = VerificationRequest {
         external_resources: Some(&resources),
         ..VerificationRequest::default()
@@ -259,23 +425,42 @@ fn created(args: &[String], samples: Option<timing::Sampling>) -> Result<(), Str
         certificates: &[&root],
     };
     run("create", input_bytes, samples, Path::new(output), |work| {
-        let mut document = XmlDocument::parse(&host).map_err(|error| error.to_string())?;
-        create(
-            &mut document,
-            &signer,
-            Request {
-                id: "sig",
-                signing_time,
-                // `create` takes its objects; the prepared one is copied per run.
-                objects: vec![object.clone()],
-                parent: None,
-                resources: Some(&resources),
-                id_attributes: &[],
-            },
-            &assessment,
-            work,
-        )
-        .map_err(|error| format!("create: {error}"))?;
+        let mut document = XmlDocument::parse(&plan.host).map_err(|error| error.to_string())?;
+        for (id, objects) in &plan.signatures {
+            create(
+                &mut document,
+                &signer,
+                Request {
+                    id,
+                    signing_time,
+                    // `create` takes its objects; the prepared ones are copied per run.
+                    objects: objects.clone(),
+                    placement: xml_sec_xades::Placement::DocumentEnd,
+                    resources: Some(&resources),
+                    id_attributes: &[],
+                    properties: xml_sec_xades::properties::Properties::default(),
+                },
+                &assessment,
+                work,
+            )
+            .map_err(|error| format!("create {id}: {error}"))?;
+        }
+        for (parent, id) in plan.countersignatures {
+            countersign(
+                &mut document,
+                &signer,
+                &Countersignature {
+                    parent,
+                    id,
+                    signing_time,
+                    id_attributes: &[],
+                    properties: xml_sec_xades::properties::Properties::default(),
+                },
+                &assessment,
+                work,
+            )
+            .map_err(|error| format!("countersign {id}: {error}"))?;
+        }
         Ok(document.into_xml())
     })
 }
@@ -368,7 +553,7 @@ impl<'a> Tsa<'a> {
             }
             return Ok(Cow::Borrowed(reply));
         }
-        let response = self.acquire(request)?;
+        let response = self.acquire(ordinal, request)?;
         if let Some(tokens) = self.tokens {
             write(&tokens.join(format!("{ordinal}.tsq")), request)?;
             write(&tokens.join(format!("{ordinal}.tsr")), &response)?;
@@ -376,17 +561,24 @@ impl<'a> Tsa<'a> {
         Ok(Cow::Owned(response))
     }
 
-    /// The TSA's response to `request`, through the caller's command.
-    fn acquire(&self, request: &[u8]) -> Result<Vec<u8>, String> {
+    /// The TSA's response to exchange `ordinal`'s `request`, through the
+    /// caller's command. Each exchange has its own files, so a command that
+    /// writes no response fails here instead of returning an earlier one.
+    fn acquire(&self, ordinal: usize, request: &[u8]) -> Result<Vec<u8>, String> {
         let [program, args @ ..] = self.command else {
             return Err(
                 "no recorded response and no TSA command: this run acquires nothing".into(),
             );
         };
         let (query, reply) = (
-            self.scratch.with_extension("tsq"),
-            self.scratch.with_extension("tsr"),
+            self.scratch.with_extension(format!("{ordinal}.tsq")),
+            self.scratch.with_extension(format!("{ordinal}.tsr")),
         );
+        // A response left by an earlier run is not this exchange's.
+        if reply.exists() {
+            std::fs::remove_file(&reply)
+                .map_err(|error| format!("{}: {error}", reply.display()))?;
+        }
         write(&query, request)?;
         let substitute = |arg: &String| match arg.as_str() {
             "{request}" => query.display().to_string(),
@@ -486,8 +678,6 @@ impl Stepper<'_> {
     }
 
     fn advance(&self, document: &mut XmlDocument, step: &str, work: &Memory) -> Result<(), String> {
-        // Every run makes the same exchanges in the same order.
-        self.tsa.next.set(0);
         match step {
             "t" => {
                 let pending = request_timestamp(document, &self.timestamp(), self.assessment, work)
@@ -546,14 +736,24 @@ impl Options {
             tokens: None,
             positional: Vec::new(),
         };
-        for flag in ["--detached", "--accuracy", "--tokens"] {
+        // `--detached` may repeat, one file each, of distinct file names since
+        // a reference names the file; the others are taken once.
+        while let Some(index) = options.iter().position(|arg| arg == "--detached") {
+            let path = PathBuf::from(options.get(index + 1).ok_or(AUGMENT)?);
+            let name = file_name(&path)?;
+            if taken.resources.contains_key(&name) {
+                return Err(format!(
+                    "--detached {}: another file has the name {name}",
+                    path.display()
+                ));
+            }
+            taken.resources.insert(name, read(&path)?);
+            options.drain(index..index + 2);
+        }
+        for flag in ["--accuracy", "--tokens"] {
             if let Some(index) = options.iter().position(|arg| arg == flag) {
                 let value = options.get(index + 1).ok_or(AUGMENT)?.clone();
                 match flag {
-                    "--detached" => {
-                        let path = PathBuf::from(&value);
-                        taken.resources.insert(file_name(&path)?, read(&path)?);
-                    }
                     "--accuracy" => {
                         taken.seconds =
                             Some(value.parse::<u64>().map_err(|error| error.to_string())?);
@@ -591,7 +791,7 @@ fn augment(args: &[String], samples: Option<timing::Sampling>) -> Result<(), Str
     let root = read(&Path::new(pki).join("root.der"))?;
     let evidence = Evidence::read(Path::new(evidence))?;
     let text = String::from_utf8(read(Path::new(input))?).map_err(|error| error.to_string())?;
-    let signature = signature_id(&text).ok_or("the document has no signature with an Id")?;
+    let signatures = signature_ids(&text)?;
     let carried = tokens::values(&text, tokens::Field::Certificate);
     let authorities = if seconds.is_some() {
         let (authorities, unreadable) = tokens::token_authorities(&text, &carried);
@@ -626,7 +826,7 @@ fn augment(args: &[String], samples: Option<timing::Sampling>) -> Result<(), Str
     let crls: Vec<&[u8]> = evidence.crls.iter().map(Vec::as_slice).collect();
     let responses: Vec<&[u8]> = evidence.responses.iter().map(Vec::as_slice).collect();
     let tsa = Tsa::new(command, tokens.as_deref(), &output)?;
-    let stepper = Stepper {
+    let stepper = |signature| Stepper {
         signature,
         assessment: &assessment,
         anchors: &anchors,
@@ -644,7 +844,11 @@ fn augment(args: &[String], samples: Option<timing::Sampling>) -> Result<(), Str
         &output,
         |work| {
             let mut document = XmlDocument::parse(&text).map_err(|error| error.to_string())?;
-            stepper.advance(&mut document, step, work)?;
+            // Every run makes the same exchanges in the same order.
+            tsa.next.set(0);
+            for signature in &signatures {
+                stepper(signature).advance(&mut document, step, work)?;
+            }
             Ok(document.into_xml())
         },
     )?;

@@ -1959,6 +1959,63 @@ impl<'a> SignContext<'a> {
             .map(|(audit, inputs)| (audit, inputs.unwrap_or_default()))
     }
 
+    /// The bytes each `Reference` of the template in `document` digests, as
+    /// [`Self::sign_document_keeping`] computes them under the same policy,
+    /// without producing a signature value: the key is never used to sign,
+    /// and `document` keeps its generation.
+    ///
+    /// The inputs of a later signing equal these only while nothing they
+    /// depend on changes; a reference that covers the signature itself
+    /// depends on everything added to it.
+    ///
+    /// # Errors
+    /// As for [`Self::sign_document`], short of the signature value.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use xml_sec::XmlDocument;
+    /// use xml_sec::xmldsig::{KeptInputs, SignContext};
+    /// # fn inputs(key: &dyn xml_sec::xmldsig::SigningKey, template: &str)
+    /// # -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut document = XmlDocument::parse(template)?;
+    /// let inputs = SignContext::new(key).reference_inputs(
+    ///     &mut document,
+    ///     KeptInputs::NONE.with_signed_info_references(),
+    /// )?;
+    /// // The bytes each SignedInfo Reference would digest, nothing signed.
+    /// assert_eq!(document.as_xml(), template);
+    /// let _first = inputs.signed_info_references.first();
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn reference_inputs(
+        &self,
+        document: &mut XmlDocument,
+        kept: super::KeptInputs,
+    ) -> Result<SigningInputs, SigningError> {
+        self.validate_owned_document_input(document)?;
+        let mut budgets = SigningOperationBudgets::from_resources_with_backend(
+            &self.policy.resources,
+            self.xml_backend,
+        );
+        budgets.stored = Some(SigningInputs::default());
+        budgets.kept = kept;
+        budgets
+            .transforms
+            .xml_parse_work()
+            .admit(document.content_len())?;
+        // Failing the transaction on purpose discards the staged digests.
+        let Err(outcome) = document.transaction(|document| {
+            Err::<core::convert::Infallible, _>(
+                self.sign_document_in_place::<ReferencesOnly>(document, &mut budgets)
+                    .map(|_| ()),
+            )
+        });
+        outcome?;
+        Ok(budgets.stored.unwrap_or_default())
+    }
+
     /// Signs `document`, keeping the signing inputs `kept` names.
     fn sign_document_storing(
         &self,
@@ -1998,6 +2055,20 @@ impl<'a> SignContext<'a> {
         })?;
         self.policy.resources.validate_key_candidates(1)?;
         self.sign_template_at_index_with_budgets::<O>(document, target_signature, budgets)
+    }
+
+    /// The transform options of every reference this operation digests.
+    fn signing_transform_options(&self) -> TransformOptions<'a> {
+        TransformOptions::default()
+            .id_attributes(self.id_attributes)
+            .allow_internal_dtd(self.policy.xml.allow_internal_dtd)
+            .xpath_here_semantics(self.policy.transforms.xpath_here_semantics)
+            .opc_relationship_edition(self.policy.transforms.opc_relationship_edition)
+            .relationship_target_mode_semantics(
+                self.policy.transforms.relationship_target_mode_semantics,
+            )
+            .xslt_stylesheet_semantics(self.policy.transforms.xslt_stylesheet_semantics)
+            .empty_digest_input(self.policy.transforms.empty_digest_input)
     }
 
     fn validate_owned_document_input(&self, document: &XmlDocument) -> Result<(), SigningError> {
@@ -2917,16 +2988,7 @@ impl<'a> SignContext<'a> {
     ) -> Result<(O::Output, crate::policy::PolicyAudit), SigningError> {
         let (signing_algorithm, canonicalization) =
             self.signing_template_algorithm(document, target_signature, &budgets.transforms)?;
-        let transform_options = TransformOptions::default()
-            .id_attributes(self.id_attributes)
-            .allow_internal_dtd(self.policy.xml.allow_internal_dtd)
-            .xpath_here_semantics(self.policy.transforms.xpath_here_semantics)
-            .opc_relationship_edition(self.policy.transforms.opc_relationship_edition)
-            .relationship_target_mode_semantics(
-                self.policy.transforms.relationship_target_mode_semantics,
-            )
-            .xslt_stylesheet_semantics(self.policy.transforms.xslt_stylesheet_semantics)
-            .empty_digest_input(self.policy.transforms.empty_digest_input);
+        let transform_options = self.signing_transform_options();
         let external_resources = ExternalResourceContext::new(
             self.external_resources,
             self.policy.resources.max_external_resource_bytes,
@@ -3005,6 +3067,9 @@ impl<'a> SignContext<'a> {
             self.base64_line_size,
             analyzed,
         )?;
+        if let Some(output) = O::before_signature() {
+            return Ok((output, operation.audit(self.identity.as_ref())));
+        }
         let output = self.finish_signing_template::<O>(
             document,
             target_signature,
@@ -3064,23 +3129,80 @@ impl<'a> SignContext<'a> {
         document: &mut XmlDocument,
         builder: &SignatureBuilder,
     ) -> Result<crate::policy::PolicyAudit, SigningError> {
+        self.sign_document_with_builder_keeping(document, builder, super::KeptInputs::NONE)
+            .map(|(audit, _)| audit)
+    }
+
+    /// [`Self::reference_inputs`] of the signature `builder` would append, as
+    /// [`Self::sign_document_with_builder`] appends it: nothing is signed and
+    /// `document` keeps its generation.
+    ///
+    /// # Errors
+    /// As for [`Self::sign_document_with_builder`], short of the signature
+    /// value.
+    pub fn reference_inputs_with_builder(
+        &self,
+        document: &mut XmlDocument,
+        builder: &SignatureBuilder,
+        kept: super::KeptInputs,
+    ) -> Result<SigningInputs, SigningError> {
         self.validate_owned_document_input(document)?;
         let mut budgets = SigningOperationBudgets::from_resources_with_backend(
             &self.policy.resources,
             self.xml_backend,
         );
+        budgets.stored = Some(SigningInputs::default());
+        budgets.kept = kept;
         budgets
             .transforms
             .xml_parse_work()
             .admit(document.content_len())?;
-        document.transaction(|document| {
+        // Failing the transaction on purpose discards the appended template.
+        let Err(outcome) = document.transaction(|document| {
+            Err::<core::convert::Infallible, _>(
+                self.sign_document_with_builder_in_place::<ReferencesOnly>(
+                    document,
+                    builder,
+                    &mut budgets,
+                )
+                .map(|_| ()),
+            )
+        });
+        outcome?;
+        Ok(budgets.stored.unwrap_or_default())
+    }
+
+    /// [`Self::sign_document_with_builder`], also returning the signing
+    /// inputs `kept` names, as [`Self::sign_document_keeping`] does.
+    ///
+    /// # Errors
+    /// As for [`Self::sign_document_with_builder`].
+    pub fn sign_document_with_builder_keeping(
+        &self,
+        document: &mut XmlDocument,
+        builder: &SignatureBuilder,
+        kept: super::KeptInputs,
+    ) -> Result<(crate::policy::PolicyAudit, SigningInputs), SigningError> {
+        self.validate_owned_document_input(document)?;
+        let mut budgets = SigningOperationBudgets::from_resources_with_backend(
+            &self.policy.resources,
+            self.xml_backend,
+        );
+        budgets.stored = kept.any().then(SigningInputs::default);
+        budgets.kept = kept;
+        budgets
+            .transforms
+            .xml_parse_work()
+            .admit(document.content_len())?;
+        let audit = document.transaction(|document| {
             self.sign_document_with_builder_in_place::<CommitDocument>(
                 document,
                 builder,
                 &mut budgets,
             )
             .map(|((), audit)| audit)
-        })
+        })?;
+        Ok((audit, budgets.stored.unwrap_or_default()))
     }
 
     fn sign_document_with_builder_in_place<O: SignedOutput>(
@@ -3163,6 +3285,12 @@ impl<'a> SignContext<'a> {
 trait SignedOutput {
     type Output;
 
+    /// The output of an operation that stops once the reference digests are
+    /// computed, before any signature value; `None` for one that signs.
+    fn before_signature() -> Option<Self::Output> {
+        None
+    }
+
     /// Apply the final base64 values to `document` under the mutation node.
     fn finish(
         context: &SignContext<'_>,
@@ -3172,6 +3300,30 @@ trait SignedOutput {
         replacement: &[(crate::NodeIdentity, String)],
         key_info: Option<&SplicedElement>,
     ) -> Result<Self::Output, SigningError>;
+}
+
+/// Stop once every reference digest is computed: nothing is signed, and the
+/// caller rolls the staged generation back.
+struct ReferencesOnly;
+
+impl SignedOutput for ReferencesOnly {
+    type Output = ();
+
+    fn before_signature() -> Option<()> {
+        Some(())
+    }
+
+    fn finish(
+        _: &SignContext<'_>,
+        _: &mut SigningExecution<'_>,
+        _: OperationNodeId,
+        _: &mut XmlDocument,
+        _: &[(crate::NodeIdentity, String)],
+        _: Option<&SplicedElement>,
+    ) -> Result<(), SigningError> {
+        // `before_signature` ends the operation first; nothing is applied.
+        Ok(())
+    }
 }
 
 /// Commit a validated generation to the caller's retained document.

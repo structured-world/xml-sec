@@ -1,4 +1,41 @@
-use super::newest_release_of;
+use super::{fetch, newest_release_of};
+
+#[test]
+fn a_fetch_waits_out_a_burst_of_maven_central_rate_limits() {
+    // CI met six 429 answers within 31 seconds: curl's backoff of 1, 2, 4, 8
+    // and 16 seconds without Retry-After. The retries must keep trying for
+    // minutes, bounded by an overall ceiling, before the run fails.
+    let args: Vec<String> = fetch("https://example.invalid/metadata.xml", "out.xml".as_ref())
+        .into_iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let value = |flag: &str| {
+        args.iter()
+            .position(|arg| arg == flag)
+            .and_then(|index| args.get(index + 1))
+            .and_then(|value| value.parse::<u64>().ok())
+    };
+    let retries = value("--retry").expect("a retry count");
+    // Exponential backoff from one second waits 2^n - 1 seconds over n
+    // retries; at least 240 of them.
+    assert!(
+        (1_u64 << retries) > 240,
+        "{retries} retries wait too briefly"
+    );
+    assert!(value("--retry-max-time").is_some_and(|ceiling| ceiling >= 300));
+    // CI also met a 404 for metadata the CDN served a moment later; curl
+    // retries such an answer only with every error retried.
+    assert!(
+        args.iter().any(|arg| arg == "--retry-all-errors"),
+        "{args:?}"
+    );
+    // A stalled attempt is cut off, so the retry ceiling plus one attempt
+    // bounds the whole call.
+    let attempt = value("--max-time").expect("a per-attempt limit");
+    let ceiling = value("--retry-max-time").expect("a retry ceiling");
+    assert!(ceiling + attempt <= 900, "{ceiling} + {attempt} seconds");
+    assert!(value("--connect-timeout").is_some_and(|connect| connect <= attempt));
+}
 
 /// The newest release of any major version.
 fn newest_release(metadata: &str) -> Result<String, String> {
