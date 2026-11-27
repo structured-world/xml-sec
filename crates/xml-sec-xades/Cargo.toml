@@ -9,16 +9,16 @@ description = "XAdES baseline validation of signatures verified by xml-sec"
 
 [dependencies]
 xml-sec = { path = "../..", default-features = false, features = ["xmldsig", "c14n", "cms"] }
-structured-xades = { version = "0.30.3", default-features = false, features = ["alloc"] }
-structured-asn1 = { version = "0.30", default-features = false, features = ["alloc"] }
-structured-pkix = { version = "0.30", default-features = false, features = ["alloc"] }
-structured-cms = { version = "0.30.3", default-features = false, features = ["alloc"] }
-structured-ltv = { version = "0.30", default-features = false, features = ["alloc"] }
+structured-xades = { version = "0.31", default-features = false, features = ["alloc"] }
+structured-asn1 = { version = "0.31", default-features = false, features = ["alloc"] }
+structured-pkix = { version = "0.31", default-features = false, features = ["alloc"] }
+structured-cms = { version = "0.31", default-features = false, features = ["alloc"] }
+structured-ltv = { version = "0.31", default-features = false, features = ["alloc"] }
 thiserror = { version = "2", default-features = false }
-structured-base64 = { version = "0.30", features = ["alloc"], optional = true }
+structured-base64 = { version = "0.31", features = ["alloc"], optional = true }
 
 [dev-dependencies]
-structured-base64 = { version = "0.30", features = ["alloc"] }
+structured-base64 = { version = "0.31", features = ["alloc"] }
 divan = "0.1.21"
 roxmltree = "0.21"
 serde_json = "1"
