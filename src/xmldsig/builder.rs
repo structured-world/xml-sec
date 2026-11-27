@@ -508,7 +508,10 @@ impl SignatureBuilder {
         )?;
         if let Some(algorithm) = encapsulation {
             policy.key_establishment.check_encapsulation(algorithm)?;
-            write_start(writer, prefix, "KeyInfo")?;
+            writer.start(
+                &qualified_name(prefix, "KeyInfo"),
+                self.key_info_id.as_deref().map(|id| ("Id", id)),
+            )?;
             // The HMAC key is an ML-KEM shared secret transported in an
             // EncryptedKey (draft-eastlake-rfc9231bis-xmlsec-uris-09 3.6.9).
             writer.start(
@@ -1369,3 +1372,6 @@ fn is_namespace_prefix(value: &str) -> bool {
     // Namespaces in XML reserves these names regardless of the URI being bound.
     !matches!(value, "xml" | "xmlns") && is_xml_ncname(value)
 }
+
+#[cfg(test)]
+mod tests;

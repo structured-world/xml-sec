@@ -124,6 +124,21 @@ fn a_capability_or_reason_without_a_description_is_reported() {
 }
 
 #[test]
+fn a_non_string_name_in_a_list_is_reported() {
+    // Every element of a list names something: an object beside a valid
+    // name is reported, not dropped, so the entry does not pass on the
+    // name that resolves.
+    let mut catalogue = catalogue();
+    catalogue["classes"]["signature/BetaTest"] =
+        json!({ "unsupported": ["signature-policy", { "capability": "missing" }] });
+    let found = problems(&catalogue, &classes(), &cases());
+    assert_eq!(
+        found,
+        ["signature/BetaTest: unsupported element 2 is not a name"]
+    );
+}
+
+#[test]
 fn an_entry_naming_nothing_is_reported() {
     // An empty list classifies nothing, whatever its status.
     let mut catalogue = catalogue();

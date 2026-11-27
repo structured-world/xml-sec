@@ -19,7 +19,7 @@
 
 use super::fixtures::Generator;
 use super::levels::{CERTIFICATES, Levels};
-use super::{Build, Corpus, absolute, line, read, write, write_json, xml};
+use super::{Build, Corpus, DS, SP, absolute, line, read, write, write_json, xml};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -348,24 +348,52 @@ fn level(step: &str) -> &'static str {
 /// shifts the parts of another.
 type PartKey = (String, usize);
 
-/// Every `local` element of `document`, keyed by its owning signature.
+/// The expanded names from a signature part up to the `ds:Signature` that
+/// owns it, nearest first.
+type PartPath = &'static [(&'static str, &'static str)];
+
+/// `SignedInfo`, a child of its `Signature` (XMLDSig 1.1 §4.1).
+const SIGNED_INFO: PartPath = &[(DS, "SignedInfo"), (DS, "Signature")];
+/// `SignatureValue`, a child of its `Signature`.
+const SIGNATURE_VALUE: PartPath = &[(DS, "SignatureValue"), (DS, "Signature")];
+/// `UnsignedSignatureProperties` in the qualifying properties a `ds:Object`
+/// of its signature holds (EN 319 132-1 §4.3).
+const UNSIGNED_SIGNATURE_PROPERTIES: PartPath = &[
+    (SP, "UnsignedSignatureProperties"),
+    (SP, "UnsignedProperties"),
+    (SP, "QualifyingProperties"),
+    (DS, "Object"),
+    (DS, "Signature"),
+];
+
+/// Every element of `document` at `path`, keyed by its owning signature.
 fn parts<'a, 'input>(
     document: &'a xml_sec::XmlDomDocument<'input>,
-    local: &str,
+    path: PartPath,
 ) -> Vec<(PartKey, xml::Node<'a, 'input>)> {
+    let is = |node: xml::Node<'_, '_>, (namespace, local): (&str, &str)| {
+        node.is_element()
+            && node.tag_name().namespace() == Some(namespace)
+            && node.tag_name().name() == local
+    };
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     document
         .root_element()
         .descendants()
-        .filter(|node| node.is_element() && node.tag_name().name() == local)
-        .map(|node| {
-            let owner = node
-                .ancestors()
-                .skip(1)
-                .find(|ancestor| ancestor.is_element() && ancestor.tag_name().name() == "Signature")
-                .and_then(|signature| signature.attribute("Id"))
-                .unwrap_or_default()
-                .to_owned();
+        .filter_map(|node| {
+            let mut current = node;
+            for (index, step) in path.iter().enumerate() {
+                if !is(current, *step) {
+                    return None;
+                }
+                if index + 1 < path.len() {
+                    current = current.parent()?;
+                }
+            }
+            Some((node, current))
+        })
+        .map(|(node, signature)| {
+            let owner = signature.attribute("Id").unwrap_or_default().to_owned();
             let ordinal = counts.entry(owner.clone()).or_default();
             let key = (owner, *ordinal);
             *ordinal += 1;
@@ -382,7 +410,7 @@ fn unsigned_properties(text: &str) -> Result<BTreeMap<PartKey, Vec<Vec<u8>>>, St
     let document = xml::parse(text, "lifecycle document")?;
     let algorithm = C14nAlgorithm::new(C14nMode::Exclusive1_0, false);
     let mut found = BTreeMap::new();
-    for (key, properties) in parts(&document, "UnsignedSignatureProperties") {
+    for (key, properties) in parts(&document, UNSIGNED_SIGNATURE_PROPERTIES) {
         let canonical = properties
             .children()
             .filter(xml::Node::is_element)
@@ -412,12 +440,12 @@ pub(crate) fn preserved(created: &str, previous: &str, later: &str) -> Result<bo
         xml::parse(created, "created document")?,
         xml::parse(later, "lifecycle document")?,
     );
-    for local in ["SignedInfo", "SignatureValue"] {
-        let earlier = parts(&created_document, local);
+    for path in [SIGNED_INFO, SIGNATURE_VALUE] {
+        let earlier = parts(&created_document, path);
         if earlier.is_empty() {
             return Ok(false);
         }
-        let now: BTreeMap<PartKey, &str> = parts(&later_document, local)
+        let now: BTreeMap<PartKey, &str> = parts(&later_document, path)
             .into_iter()
             .map(|(key, node)| (key, &later[node.range()]))
             .collect();
@@ -1148,6 +1176,16 @@ fn expectations_path(corpus: &Corpus) -> PathBuf {
     corpus.package().join("lifecycle/expectations.json")
 }
 
+/// The recorded expectations a new recording keeps the reviewed notes and
+/// alternatives of; none before the first recording. A file that exists but
+/// does not read or parse is an error and stays untouched.
+fn previous_expectations(path: &Path) -> Result<Value, String> {
+    if !path.exists() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_str(&xml::read(path)?).map_err(|error| format!("{}: {error}", path.display()))
+}
+
 /// Every deviation of `observed` from `expected`, keyed by case.
 pub(crate) fn compare(expected: &Value, observed: &[Value]) -> Vec<String> {
     let mut found = Vec::new();
@@ -1273,10 +1311,7 @@ pub(crate) fn execute(corpus: &Corpus, results: &Path, record: bool) -> Result<(
     if record {
         // The reviewed explanations and alternatives outlive a new recording;
         // `dss` names the release the outcomes were recorded against.
-        let previous = xml::read(&path)
-            .ok()
-            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-            .unwrap_or(Value::Null);
+        let previous = previous_expectations(&path)?;
         let cases: Map<String, Value> = observed
             .iter()
             .map(|row| {

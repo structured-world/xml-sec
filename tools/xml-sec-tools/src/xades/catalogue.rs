@@ -99,11 +99,29 @@ pub(crate) fn problems(
             found.push(format!("{class}: fields beside its status"));
         }
         // One name, or several: a class may lack more than one capability.
-        let named: Vec<&str> = match &entry[status] {
-            Value::String(name) => vec![name.as_str()],
-            Value::Array(names) => names.iter().filter_map(Value::as_str).collect(),
-            _ => Vec::new(),
-        };
+        let mut named: Vec<&str> = Vec::new();
+        match &entry[status] {
+            Value::String(name) => named.push(name.as_str()),
+            Value::Array(names) => {
+                for (index, name) in names.iter().enumerate() {
+                    match name.as_str() {
+                        Some(name) => named.push(name),
+                        None => found.push(format!(
+                            "{class}: {status} element {} is not a name",
+                            index + 1
+                        )),
+                    }
+                }
+            }
+            _ => {}
+        }
+        if named.is_empty()
+            && entry[status]
+                .as_array()
+                .is_some_and(|names| !names.is_empty())
+        {
+            continue;
+        }
         if named.is_empty() {
             found.push(format!("{class}: {status} names nothing"));
         }

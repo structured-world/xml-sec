@@ -56,6 +56,21 @@ fn names_get_one_declaration_per_namespace_scope() {
 }
 
 #[test]
+fn reserved_prefixes_are_refused_for_a_foreign_namespace() {
+    // Namespaces in XML 1.0 §3: `xmlns` is never declared, and `xml` binds
+    // only the XML namespace; either chosen for another namespace would
+    // write namespace-invalid markup.
+    const XML: &str = "http://www.w3.org/XML/1998/namespace";
+    for chosen in [("urn:outer", "xml"), ("urn:outer", "xmlns"), (XML, "xmlns")] {
+        assert!(
+            matches!(Draft::with_prefixes(&[chosen]), Err(DraftError::Name(_))),
+            "{chosen:?}"
+        );
+    }
+    assert!(Draft::with_prefixes(&[(XML, "xml")]).is_ok());
+}
+
+#[test]
 fn a_fallback_prefix_never_shadows_a_chosen_one() {
     // Namespaces in XML 1.0 §6.1: an inner declaration of a prefix rebinds it
     // for the whole subtree. With `ds` chosen for another namespace, the XMLDSig

@@ -2,8 +2,25 @@ use super::{
     Actor, Algorithm, Evidence, Packaging, cases, compare, deviations, preserved, refusal,
     xml_sec_outcome,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::BTreeSet;
+
+#[test]
+fn unreadable_expectations_are_never_recorded_over() {
+    // A first recording starts from nothing; an existing file that does not
+    // parse is an error, so its reviewed alternatives and notes are not
+    // replaced by this run's outcomes.
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("expectations.json");
+    assert_eq!(super::previous_expectations(&path), Ok(Value::Null));
+    std::fs::write(&path, "{ \"cases\": ").expect("write");
+    assert!(super::previous_expectations(&path).is_err());
+    std::fs::write(&path, "{ \"cases\": {} }").expect("write");
+    assert_eq!(
+        super::previous_expectations(&path),
+        Ok(json!({ "cases": {} }))
+    );
+}
 
 #[test]
 fn every_signature_keeps_its_ber_reading_and_dss_crypto_result() {
@@ -186,31 +203,79 @@ fn every_case_has_its_own_name_and_alternates_the_implementations() {
 }
 
 #[test]
+fn parts_are_matched_by_expanded_name_and_owner() {
+    // An application element that shares a local name with a XAdES container
+    // is not one: changing it keeps the signature, changing the real
+    // property does not.
+    let document = |application: &str, property: &str| {
+        format!(
+            concat!(
+                r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#" "#,
+                r#"xmlns:xades="http://uri.etsi.org/01903/v1.3.2#" Id="s">"#,
+                "<ds:SignedInfo>a</ds:SignedInfo><ds:SignatureValue>v</ds:SignatureValue>",
+                "<ds:Object><xades:QualifyingProperties><xades:UnsignedProperties>",
+                "<xades:UnsignedSignatureProperties>{}</xades:UnsignedSignatureProperties>",
+                "</xades:UnsignedProperties></xades:QualifyingProperties></ds:Object>",
+                r#"<ds:Object><app:UnsignedSignatureProperties xmlns:app="urn:app">"#,
+                "{}</app:UnsignedSignatureProperties></ds:Object></ds:Signature>"
+            ),
+            property, application
+        )
+    };
+    let earlier = document("<A>1</A>", "<xades:T>1</xades:T>");
+    let kept = |later: &str| preserved(&earlier, &earlier, later).unwrap();
+    assert!(kept(&document("<A>2</A>", "<xades:T>1</xades:T>")));
+    assert!(!kept(&document("<A>1</A>", "<xades:T>9</xades:T>")));
+}
+
+#[test]
 fn signature_parts_match_under_any_prefix() {
-    // DSS writes `ds:` prefixes and xml-sec may not: parts match by local
+    // DSS writes `ds:` prefixes and xml-sec may not: parts match by expanded
     // name, and their bytes are compared exactly as the documents hold them.
-    let created = r#"<a xmlns:ds="urn:ds"><ds:SignedInfo Id="x"><ds:Reference/></ds:SignedInfo><SignatureValue>AA==</SignatureValue></a>"#;
-    let appended = r#"<a xmlns:ds="urn:ds"><ds:SignedInfo Id="x"><ds:Reference/></ds:SignedInfo><SignatureValue>AA==</SignatureValue><Q/></a>"#;
+    let created = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo Id="x"><ds:Reference/></ds:SignedInfo><SignatureValue xmlns="http://www.w3.org/2000/09/xmldsig#">AA==</SignatureValue></ds:Signature>"#;
+    let appended = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo Id="x"><ds:Reference/></ds:SignedInfo><SignatureValue xmlns="http://www.w3.org/2000/09/xmldsig#">AA==</SignatureValue><ds:Object/></ds:Signature>"#;
     assert!(preserved(created, created, appended).unwrap());
-    let rewritten = r#"<a xmlns:ds="urn:ds"><ds:SignedInfo Id="x"><ds:Reference /></ds:SignedInfo><SignatureValue>AA==</SignatureValue></a>"#;
+    let rewritten = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo Id="x"><ds:Reference /></ds:SignedInfo><SignatureValue xmlns="http://www.w3.org/2000/09/xmldsig#">AA==</SignatureValue></ds:Signature>"#;
     assert!(!preserved(created, created, rewritten).unwrap());
+}
+
+/// `body` inside an XMLDSig `Signature` with the given `Id`.
+fn signature(id: &str, body: &str) -> String {
+    format!(
+        r#"<Signature xmlns="http://www.w3.org/2000/09/xmldsig#" xmlns:x="http://uri.etsi.org/01903/v1.3.2#" Id="{id}">{body}</Signature>"#
+    )
+}
+
+/// `properties` as the unsigned signature properties of a signature.
+fn unsigned(properties: &str) -> String {
+    format!(
+        "<Object><x:QualifyingProperties><x:UnsignedProperties><x:UnsignedSignatureProperties>{properties}</x:UnsignedSignatureProperties></x:UnsignedProperties></x:QualifyingProperties></Object>"
+    )
 }
 
 #[test]
 fn preservation_requires_both_signature_parts_unchanged() {
     // An augmentation that re-serializes the signed part, or changes the
     // value, no longer carries the created signature.
-    let created = "<S><SignedInfo>a</SignedInfo><SignatureValue>v</SignatureValue></S>";
-    let augmented = "<S><SignedInfo>a</SignedInfo><SignatureValue>v</SignatureValue><Q/></S>";
-    let kept = |later: &str| preserved(created, created, later).unwrap();
-    assert!(kept(augmented));
-    assert!(!kept(
-        "<S><SignedInfo >a</SignedInfo><SignatureValue>v</SignatureValue></S>"
-    ));
-    assert!(!kept(
-        "<S><SignedInfo>a</SignedInfo><SignatureValue>w</SignatureValue></S>"
-    ));
-    assert!(!preserved("<S/>", "<S/>", created).unwrap());
+    let created = signature(
+        "s",
+        "<SignedInfo>a</SignedInfo><SignatureValue>v</SignatureValue>",
+    );
+    let augmented = signature(
+        "s",
+        "<SignedInfo>a</SignedInfo><SignatureValue>v</SignatureValue><Object/>",
+    );
+    let kept = |later: &str| preserved(&created, &created, later).unwrap();
+    assert!(kept(&augmented));
+    assert!(!kept(&signature(
+        "s",
+        "<SignedInfo >a</SignedInfo><SignatureValue>v</SignatureValue>"
+    )));
+    assert!(!kept(&signature(
+        "s",
+        "<SignedInfo>a</SignedInfo><SignatureValue>w</SignatureValue>"
+    )));
+    assert!(!preserved("<S/>", "<S/>", &created).unwrap());
 }
 
 #[test]
@@ -218,16 +283,20 @@ fn preservation_holds_for_every_signature_of_the_document() {
     // A later parallel signature or a countersignature keeps its signed parts
     // and earlier unsigned properties too, matched by the signature's Id: a
     // step that rewrites only the second signature is no preservation.
-    let signature = |id: &str, value: &str, unsigned: &str| {
-        format!(
-            "<Signature Id=\"{id}\"><SignedInfo>{id}</SignedInfo><SignatureValue>{value}</SignatureValue><UnsignedSignatureProperties>{unsigned}</UnsignedSignatureProperties></Signature>"
+    let signed = |id: &str, value: &str, properties: &str| {
+        signature(
+            id,
+            &format!(
+                "<SignedInfo>{id}</SignedInfo><SignatureValue>{value}</SignatureValue>{}",
+                unsigned(properties)
+            ),
         )
     };
     let document = |second_value: &str, second_unsigned: &str| {
         format!(
             "<D>{}{}</D>",
-            signature("one", "v1", "<T>1</T>"),
-            signature("two", second_value, second_unsigned)
+            signed("one", "v1", "<T>1</T>"),
+            signed("two", second_value, second_unsigned)
         )
     };
     let earlier = document("v2", "<T>2</T>");
@@ -237,7 +306,7 @@ fn preservation_holds_for_every_signature_of_the_document() {
     assert!(!kept(&document("v2", "<T>9</T>")));
     assert!(!kept(&format!(
         "<D>{}</D>",
-        signature("one", "v1", "<T>1</T>")
+        signed("one", "v1", "<T>1</T>")
     )));
 }
 
@@ -246,11 +315,7 @@ fn preservation_requires_earlier_unsigned_properties_unchanged() {
     // A later step only appends: rewriting or dropping a property an earlier
     // step made, such as its timestamp or evidence, is not preservation.
     let signed = "<SignedInfo>a</SignedInfo><SignatureValue>v</SignatureValue>";
-    let document = |unsigned: &str| {
-        format!(
-            "<S>{signed}<UnsignedSignatureProperties>{unsigned}</UnsignedSignatureProperties></S>"
-        )
-    };
+    let document = |properties: &str| signature("s", &format!("{signed}{}", unsigned(properties)));
     let timestamped = document(r#"<T xmlns:a="urn:a">1</T>"#);
     let kept = |later: &str| preserved(&timestamped, &timestamped, later).unwrap();
     assert!(kept(&document(r#"<T xmlns:a="urn:a">1</T><V>2</V>"#)));
@@ -260,7 +325,7 @@ fn preservation_requires_earlier_unsigned_properties_unchanged() {
     assert!(kept(&document("<T>1</T><V>2</V>")));
     assert!(!kept(&document("<T>9</T><V>2</V>")));
     assert!(!kept(&document("<V>2</V><T>1</T>")));
-    assert!(!kept(&format!("<S>{signed}</S>")));
+    assert!(!kept(&signature("s", signed)));
 }
 
 #[test]
