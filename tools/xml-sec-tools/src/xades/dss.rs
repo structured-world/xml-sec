@@ -105,14 +105,19 @@ pub(crate) fn maven(corpus: &Corpus, version: &str) -> PathBuf {
 /// shared CI addresses with 429 under load, often without Retry-After, and
 /// its CDN at times answers 404 for a file it serves a moment later, which
 /// curl's transient-error retries skip: every error is retried, eight times
-/// with backoff for 255 seconds in all, within a ten-minute ceiling. A retry
-/// rewrites `output` from its start.
+/// with backoff for 255 seconds in all. No retry starts after ten minutes and
+/// each attempt, connection included, ends within two, so a call ends within
+/// twelve minutes. A retry rewrites `output` from its start.
 pub(crate) fn fetch(url: &str, output: &Path) -> Vec<std::ffi::OsString> {
     line(&[
         &"curl",
         &"--fail",
         &"--silent",
         &"--show-error",
+        &"--connect-timeout",
+        &"30",
+        &"--max-time",
+        &"120",
         &"--retry",
         &"8",
         &"--retry-all-errors",

@@ -29,6 +29,12 @@ fn a_fetch_waits_out_a_burst_of_maven_central_rate_limits() {
         args.iter().any(|arg| arg == "--retry-all-errors"),
         "{args:?}"
     );
+    // A stalled attempt is cut off, so the retry ceiling plus one attempt
+    // bounds the whole call.
+    let attempt = value("--max-time").expect("a per-attempt limit");
+    let ceiling = value("--retry-max-time").expect("a retry ceiling");
+    assert!(ceiling + attempt <= 900, "{ceiling} + {attempt} seconds");
+    assert!(value("--connect-timeout").is_some_and(|connect| connect <= attempt));
 }
 
 /// The newest release of any major version.

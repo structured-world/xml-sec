@@ -535,7 +535,7 @@ impl<'e, 'x, W: Work> Engine<'e, 'x, '_, '_, '_, W> {
             (issuer, supplied)
         };
         if let Some(supplied) = supplied {
-            let mark = signers.len();
+            let (mark, paths) = (signers.len(), extra.len());
             match supplied.choose(anchor, target, issuer, roots, extra, signers)? {
                 // RFC 5280 §6.3.3(j): an absence determines the status only
                 // once its reasons reach all reasons; the caller's partial
@@ -543,10 +543,14 @@ impl<'e, 'x, W: Work> Engine<'e, 'x, '_, '_, '_, W> {
                 Some(Ok((Selected::Absent { coverage, .. }, _)))
                     if coverage.reasons() != Reasons::ALL =>
                 {
-                    // Drop the partial answer's authority sources; the full
-                    // census records its own.
+                    // Drop the partial answer's authority sources and the
+                    // authority paths it reached; the full census records its
+                    // own, and an orphaned path would need a status of its own.
                     while signers.len() > mark {
                         signers.pop();
+                    }
+                    while extra.len() > paths {
+                        extra.pop();
                     }
                 }
                 Some(found) => return Ok(Some(found)),
