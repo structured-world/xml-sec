@@ -93,7 +93,9 @@ use structured_pkix::algorithm::digest::Algorithm;
 use structured_pkix::temporal::LeapTable;
 use xml_sec::XmlDocument;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
-use xml_sec::policy::{Instant, ManifestProcessing, SigningPolicy, VerificationPolicy};
+use xml_sec::policy::{
+    Instant, ManifestProcessing, SigningPolicy, VerificationPolicy, XadesSyntax,
+};
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DigestAlgorithm, KeyResolverConfig, RsaSigningKey, SignatureAlgorithm,
     Transform, UriTypeSet, VerificationRequest, VerifyContext, XPathExpression,
@@ -123,6 +125,8 @@ fn verification() -> VerificationPolicy {
     let mut verification = VerificationPolicy::default();
     verification.key_trust.verify_x509_chains = true;
     verification.key_trust.verification_time = Instant::new(1_800_000_000, 0);
+    // The historical actions name their vocabulary; the policy reads it.
+    verification.xades_syntax = XadesSyntax::WithHistoricalVocabularies;
     verification
 }
 

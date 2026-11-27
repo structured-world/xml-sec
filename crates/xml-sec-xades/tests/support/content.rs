@@ -74,6 +74,21 @@ impl Fixture {
         }
     }
 
+    /// The fixture under a verification policy that reads the historical
+    /// vocabularies an operation names.
+    #[allow(dead_code, reason = "only the historical tests read them")]
+    pub(crate) fn historical() -> Self {
+        Self::with_syntax(xml_sec::policy::XadesSyntax::WithHistoricalVocabularies)
+    }
+
+    /// The fixture under a verification policy that reads `syntax`.
+    #[allow(dead_code, reason = "only the historical tests read them")]
+    pub(crate) fn with_syntax(syntax: xml_sec::policy::XadesSyntax) -> Self {
+        let mut fixture = Self::new();
+        fixture.verification.xades_syntax = syntax;
+        fixture
+    }
+
     pub(crate) fn with_assessment<R>(&self, operation: impl FnOnce(&Assessment<'_, '_>) -> R) -> R {
         let context = VerifyContext::new()
             .policy(self.verification.clone())

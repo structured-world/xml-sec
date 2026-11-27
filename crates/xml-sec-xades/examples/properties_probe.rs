@@ -32,7 +32,7 @@ use structured_asn1::memory::{Memory, MemoryAccount};
 use structured_pkix::temporal::LeapTable;
 use xml_sec::XmlDocument;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
-use xml_sec::policy::{Instant, SigningPolicy, VerificationPolicy};
+use xml_sec::policy::{Instant, SigningPolicy, VerificationPolicy, XadesSyntax};
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DigestAlgorithm, KeyResolverConfig, ObjectContent, ObjectElement,
     RsaSigningKey, SignatureAlgorithm, Transform, UriTypeSet, VerificationRequest, VerifyContext,
@@ -407,6 +407,8 @@ fn main() -> Result<(), String> {
     verification.key_trust.verify_x509_chains = true;
     verification.key_trust.verification_time = Instant::new(1_800_000_000, 0);
     verification.uris.references = UriTypeSet::ALL;
+    // The historical cases name their vocabulary; the policy reads it.
+    verification.xades_syntax = XadesSyntax::WithHistoricalVocabularies;
     let resolver = DefaultKeyResolver::new(KeyResolverConfig {
         trusted_certs: vec![root.clone()],
         ..KeyResolverConfig::default()

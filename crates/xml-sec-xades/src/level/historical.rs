@@ -157,6 +157,7 @@ pub(crate) fn with_historical_census<W: Work, R>(
     visitor: impl for<'r, 'c> FnOnce(&HistoricalCensus<'r, 'c, '_, '_, '_, W>) -> R,
 ) -> Result<Outcome<R>, ValidationError> {
     let fail = |error| ValidationError::Ts101903(Box::new(error));
+    crate::ts101903::require_admitted(session, profile)?;
     let work = session.execution();
     path::require_member(session, signature, work)?;
     let document = Document::new(session);

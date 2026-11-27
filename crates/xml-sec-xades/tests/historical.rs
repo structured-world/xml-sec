@@ -50,7 +50,7 @@ fn a_timestamped_historical_signature_takes_its_validation_values() {
 }
 
 fn timestamped_values(profile: Profile, response: &[u8]) {
-    let fixture = Fixture::new();
+    let fixture = Fixture::historical();
     let mut document = timestamped(&fixture, profile, response);
     let inputs = fixture.inputs(Requirements::LongTerm, &CRLS);
     let add = |document: &mut xml_sec::XmlDocument| {
@@ -215,7 +215,7 @@ fn a_pre_en_signature_goes_through_the_ts101903_levels() {
     // timestamp over the signature, its timestamp and the references, the
     // values of XAdES-XL, then the archive timestamp of XAdES-A, each
     // published only while the signature meets BES.
-    let fixture = Fixture::new();
+    let fixture = Fixture::historical();
     let (_, response) = RESPONSES[0];
     let mut document = timestamped(&fixture, Profile::PreEn, response);
     let inputs = fixture.inputs(Requirements::LongTerm, &CRLS);
@@ -261,7 +261,7 @@ fn a_pre_en_signature_goes_through_the_ts101903_levels() {
 fn a_pre_en_signature_with_its_values_takes_an_archive_timestamp() {
     // TS 103 171 V2.1.1 §8.2: the LTA level of the profile is the archive
     // timestamp of TS 101 903 over the signature with its values.
-    let fixture = Fixture::new();
+    let fixture = Fixture::historical();
     let (_, response) = RESPONSES[0];
     let mut document = timestamped(&fixture, Profile::PreEn, response);
     values(&fixture, &mut document);
@@ -283,10 +283,45 @@ fn a_pre_en_signature_with_its_values_takes_an_archive_timestamp() {
 }
 
 #[test]
+fn a_historical_vocabulary_needs_a_policy_that_reads_it() {
+    // The operation's XadesSyntax, not the caller's argument alone, decides
+    // which vocabularies are read: under EN 319 132-1 only, creating a
+    // pre-EN signature is refused before anything is published, and under
+    // V1.2.2 a V1.1.1 one is.
+    let syntaxes = [
+        (xml_sec::policy::XadesSyntax::En319132, Profile::PreEn),
+        (
+            xml_sec::policy::XadesSyntax::WithTs101903V122,
+            Profile::V111,
+        ),
+    ];
+    for (syntax, profile) in syntaxes {
+        let fixture = Fixture::with_syntax(syntax);
+        let refused = fixture
+            .signed(Properties {
+                historical: Some(profile),
+                policy: (profile == Profile::V111)
+                    .then_some(Policy::Document(SignaturePolicy::Implied)),
+                ..Properties::default()
+            })
+            .err()
+            .expect("the policy does not read the vocabulary");
+        assert!(
+            matches!(
+                &refused,
+                CreateError::Validation(xml_sec_xades::ValidationError::Ts101903(error))
+                    if matches!(**error, xml_sec_xades::Ts101903Error::NotAdmitted(named) if named == profile)
+            ),
+            "{syntax:?} {profile:?}: {refused:?}"
+        );
+    }
+}
+
+#[test]
 fn the_levels_beyond_t_are_refused_in_the_earlier_vocabularies() {
     // V1.1.1 and V1.2.2 name these properties in their own namespaces, which
     // the shared writers do not produce; nothing is requested for them.
-    let fixture = Fixture::new();
+    let fixture = Fixture::historical();
     let (profile, response) = RESPONSES[2];
     let document = timestamped(&fixture, profile, response);
     let request = TimestampRequest {
@@ -372,7 +407,7 @@ fn each_profile_writes_its_own_vocabulary_and_meets_bes() {
     // place of SigningCertificateV2, and the SignedProperties reference the
     // profile's Type; each signature meets the profile's BES requirements,
     // which creation checks before it publishes.
-    let fixture = Fixture::new();
+    let fixture = Fixture::historical();
     for (profile, namespace, kind) in [
         (
             Profile::V111,
@@ -417,7 +452,7 @@ fn a_historical_signature_carries_only_what_its_profile_allows() {
     // TS 101 903 V1.1.1 §7.2.3 requires a signature policy; and a historical
     // signature here carries a policy beside the signing certificate and no
     // other optional property.
-    let fixture = Fixture::new();
+    let fixture = Fixture::historical();
     let missing = fixture
         .signed(Properties {
             historical: Some(Profile::V111),
