@@ -7,7 +7,7 @@ use crate::basic::Vocabulary;
 use crate::create::Assessment;
 use crate::draft::Draft;
 use crate::level::Inputs;
-use crate::placement::{self, PlacementError, XADES};
+use crate::placement::{self, PlacementError, XADES, XADES_141};
 use crate::properties::{
     Bound, ExplicitPolicy, Fragment, PolicyStore, PolicyTransforms, PropertyDraft, PropertyError,
     SignedPlan, SignedPolicy, SpecifiedDigest,
@@ -21,9 +21,6 @@ use xml_sec::policy::SigningPolicy;
 use xml_sec::provider::CryptoProvider;
 use xml_sec::xmldsig::extension::{self, NodeView};
 use xml_sec::{XmlDomDocument, XmlDomNode};
-
-/// `http://uri.etsi.org/01903/v1.4.1#`, the namespace of the store.
-const XADES_141: &str = "http://uri.etsi.org/01903/v1.4.1#";
 
 /// The transform naming a digest a technical specification defines
 /// (EN 319 132-1 §5.2.9.2).

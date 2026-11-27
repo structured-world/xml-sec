@@ -53,6 +53,7 @@ pub(crate) struct HistoricalCensus<'r, 'c, 'v, 's, 'i, W: Work> {
     closure: &'r ParticipantClosure<'r, 'r, 'r, 'r, N, D, G, Xades>,
     signer: Option<&'r CheckedPath<'r>>,
     incorporation: &'r HistoricalIncorporation<'r, 'r, Document<'c, 'v, 's, 'i, W>>,
+    index: &'r material::Index<'r, N, D, G, W>,
 }
 
 impl<'r, 'c, 'v, 's, 'i, W: Work> HistoricalCensus<'r, 'c, 'v, 's, 'i, W> {
@@ -92,6 +93,21 @@ impl<'r, 'c, 'v, 's, 'i, W: Work> HistoricalCensus<'r, 'c, 'v, 's, 'i, W> {
         &self,
     ) -> &'r HistoricalIncorporation<'r, 'r, Document<'c, 'v, 's, 'i, W>> {
         self.incorporation
+    }
+
+    /// Each timestamp's TSA material and where the document holds a copy of
+    /// it: in the token, in a `TimeStampValidationData` right after its
+    /// property, or elsewhere (ETSI TS 101 903 V1.4.2 §§8.1–8.1.1).
+    ///
+    /// # Errors
+    /// The original cause when the material cannot be looked up.
+    pub(crate) fn timestamp_material(
+        &self,
+    ) -> Result<
+        material::HistoricalTimestampMaterial<'r, 'r, 'r, N, D, G>,
+        material::HistoricalTimestampError<N>,
+    > {
+        material::historical_timestamp_material(self.closure, self.index, self.access)
     }
 
     /// The whole `OCSPResponse` that carries `basic`: the caller's, one the
@@ -421,7 +437,6 @@ impl<'v, 's, 'i, W: Work> Scope<'_, '_, 'v, 's, 'i, '_, W> {
             .map_err(ValidationError::Index)?;
         let (lists, responses, supplied) =
             status_sources(view, &carried, &external, false, memory)?;
-        let distinct = distinct_paths(&participants, memory)?;
         let closed = status::with_statuses(
             session,
             &session.cms_provider(),
@@ -431,7 +446,7 @@ impl<'v, 's, 'i, W: Work> Scope<'_, '_, 'v, 's, 'i, '_, W> {
                 responses: &responses,
                 supplied,
             },
-            &distinct,
+            &distinct_paths(&participants, memory)?,
             inputs.utc,
             self.signer_time,
             |statuses, nodes| {
@@ -456,6 +471,7 @@ impl<'v, 's, 'i, W: Work> Scope<'_, '_, 'v, 's, 'i, '_, W> {
                     closure: &closure,
                     signer: self.signer.path(),
                     incorporation: &incorporation,
+                    index: &index,
                 }))))
             },
         )

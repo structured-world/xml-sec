@@ -47,10 +47,25 @@ const ANSWERED: [(&str, &str, bool); 3] = [
 /// advances `tsa.serial`, so every token of one run has its own serial number
 /// (RFC 3161 §2.4.2).
 fn reply(generator: &Generator, query: &str, response: &str, accuracy: bool) -> Result<(), String> {
+    reply_by(generator, "tsa", query, response, accuracy)
+}
+
+/// [`reply`] by the TSA `tsa`, whose key and certificate are `{tsa}.key`
+/// and `{tsa}.pem`.
+fn reply_by(
+    generator: &Generator,
+    tsa: &str,
+    query: &str,
+    response: &str,
+    accuracy: bool,
+) -> Result<(), String> {
+    let config = TSA_CONFIG
+        .replace("signer_cert=tsa.pem", &format!("signer_cert={tsa}.pem"))
+        .replace("signer_key=tsa.key", &format!("signer_key={tsa}.key"));
     let config = if accuracy {
-        TSA_CONFIG.to_owned()
+        config
     } else {
-        TSA_CONFIG.replace("accuracy=secs:1\n", "")
+        config.replace("accuracy=secs:1\n", "")
     };
     write(&generator.work.join("tsa.cnf"), config)?;
     generator.openssl(&[
@@ -161,6 +176,7 @@ pub(crate) fn content(corpus: &Corpus, generator: &Generator) -> Result<(), Stri
             levels.ocsp_delegated("intermediate", "responder", subject)?,
         )?;
     }
+    issue_archive_tsa(generator, &levels)?;
     // The signer revoked after its signature timestamp and before the tests'
     // assessment time, stated by a CRL and by a newer OCSP response.
     write(
@@ -229,6 +245,63 @@ pub(crate) fn content(corpus: &Corpus, generator: &Generator) -> Result<(), Stri
         ),
         ("seal-request", "seal.tsq", "seal.tsr"),
         ("parallel-request", "parallel.tsq", "parallel.tsr"),
+    ] {
+        probe(corpus, generator, action)?;
+        write(
+            &generator.output.join(query),
+            read(&generator.work.join(query))?,
+        )?;
+        reply(generator, query, response, true)?;
+    }
+    renewal_and_prefixed(corpus, generator)
+}
+
+/// A second TSA under its own CA below the root, and that CA's CRL: the
+/// archive timestamp it issues needs validation data the signature does not
+/// hold yet.
+fn issue_archive_tsa(generator: &Generator, levels: &Levels<'_>) -> Result<(), String> {
+    generator.certify(
+        "archive-ca",
+        "root",
+        "/CN=xml-sec XAdES Test Archive CA",
+        "basicConstraints=critical,CA:TRUE,pathlen:0\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n",
+    )?;
+    generator.certify(
+        "archive-tsa",
+        "archive-ca",
+        "/CN=xml-sec XAdES Test Archive TSA",
+        TSA_EXTENSIONS,
+    )?;
+    write(
+        &generator.output.join("archive-ca.der"),
+        generator.der("archive-ca")?,
+    )?;
+    write(
+        &generator.output.join("archive-ca.crl"),
+        levels.crl("archive-ca")?,
+    )
+}
+
+/// The pre-EN XAdES-A again, its archive timestamp now from a TSA under a CA
+/// the signature holds nothing of, as DSS's `XAdESDoubleATest` changes the TSA
+/// between XL and A; then the second archive timestamp after that TSA's
+/// validation data. And the signature timestamp of a V1.1.1 signature whose
+/// canonicalization names an `InclusiveNamespaces` `PrefixList`.
+fn renewal_and_prefixed(corpus: &Corpus, generator: &Generator) -> Result<(), String> {
+    reply_by(
+        generator,
+        "archive-tsa",
+        "a-pre-en.tsq",
+        "a-pre-en-other.tsr",
+        true,
+    )?;
+    for (action, query, response) in [
+        ("pre-en-a2-request", "a2-pre-en.tsq", "a2-pre-en.tsr"),
+        (
+            "prefixed-request-v111",
+            "prefixed-v111.tsq",
+            "prefixed-v111.tsr",
+        ),
     ] {
         probe(corpus, generator, action)?;
         write(

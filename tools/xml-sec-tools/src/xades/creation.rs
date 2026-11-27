@@ -47,7 +47,7 @@ const fn created(name: &'static str, signatures: usize) -> Case {
     }
 }
 
-pub(crate) const CASES: [Case; 69] = [
+pub(crate) const CASES: [Case; 70] = [
     created("enveloped", 1),
     created("enveloping", 1),
     created("internally-detached", 1),
@@ -231,6 +231,16 @@ pub(crate) const CASES: [Case; 69] = [
         signatures: 1,
         format: "XAdES-A",
         timestamps: 3,
+        fixtures: "content",
+    },
+    // As DSS's XAdESDoubleATest: the archive timestamp from a TSA under
+    // another CA, that TSA's validation data after it, then a second archive
+    // timestamp.
+    Case {
+        name: "a-renewed-pre-en",
+        signatures: 1,
+        format: "XAdES-A",
+        timestamps: 4,
         fixtures: "content",
     },
     // A B-LT signature that took the next generation of CRLs by a refresh.
@@ -568,6 +578,13 @@ fn timestamp_properties(name: &str) -> &'static [Expect] {
             Counted("Timestamp", "Type", "ARCHIVE_TIMESTAMP", 1),
         ],
         "lta-pre-en" => &[Counted("Timestamp", "Type", "ARCHIVE_TIMESTAMP", 1)],
+        // One signature timestamp, one SigAndRefsTimeStamp and two archive
+        // timestamps.
+        "a-renewed-pre-en" => &[
+            Counted("Timestamp", "Type", "SIGNATURE_TIMESTAMP", 1),
+            Counted("Timestamp", "Type", "VALIDATION_DATA_TIMESTAMP", 1),
+            Counted("Timestamp", "Type", "ARCHIVE_TIMESTAMP", 2),
+        ],
         _ => &[],
     }
 }

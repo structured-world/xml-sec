@@ -81,6 +81,8 @@ pub enum Ts101903Error {
     Credentials(v122::CredentialError<Error, core::convert::Infallible, NodeIdentity>),
     /// The validation data the participants need could not be looked up.
     Incorporation(structured_xades::material::HistoricalError<NodeIdentity>),
+    /// Each timestamp's TSA material could not be looked up.
+    TimestampMaterial(structured_xades::material::HistoricalTimestampError<NodeIdentity>),
     /// The operation's `XadesSyntax` does not admit the vocabulary the
     /// caller named.
     NotAdmitted(Profile),

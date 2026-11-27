@@ -7,14 +7,15 @@ use super::{
     Stamp, TimestampRequest, ValidationData, checked_response, construction, pooled, selected,
     unproven, with_algorithm,
 };
+use crate::basic::ValidationError;
 use crate::create::{Assessment, Carried};
 use crate::draft::Draft;
 use crate::level::historical::{HistoricalCensus, historical_tsa_paths, with_historical_census};
 use crate::level::{Inputs, unrecognized};
 use crate::path;
-use crate::placement::{self, DS, PlacementError, Unsigned};
+use crate::placement::{self, DS, PlacementError, Unsigned, XADES_141};
 use crate::signature::hash_class;
-use crate::ts101903::{Ts101903Report, validate_historical};
+use crate::ts101903::{Ts101903Error, Ts101903Report, validate_historical};
 use crate::{Document, Outcome};
 use alloc::{boxed::Box, string::String, vec::Vec};
 use core::convert::Infallible;
@@ -25,7 +26,7 @@ use structured_xades::legacy::{self, Profile};
 use structured_xades::produce::References;
 use structured_xades::produce::{
     ContentRequest, Event, ExtendedAugmentation, HistoricalTimestampWriter, Material,
-    ReferenceRole, Writer, write_historical_values,
+    ReferenceRole, Writer, write_historical_timestamp_values, write_historical_values,
 };
 use structured_xades::unsigned::Requirements;
 use structured_xades::xml::{Access, Name, Xml as _};
@@ -233,36 +234,53 @@ pub fn add_historical_values<W: Work>(
 ) -> Result<DataAdded, AugmentError> {
     let assessment = data.assessment;
     let namespace = profile.namespace();
-    let unsigned = document.with_view(|view| {
-        placement::locate_in(view, data.signature, data.id_attributes, namespace, work)
-            .map(|located| located.unsigned)
-    })?;
     let certificates = pooled(data.inputs, assessment, work)?;
     let inputs = Inputs {
         certificates: &certificates,
         ..*data.inputs
     };
-    let census = |document: &XmlDocument, request: &VerificationRequest<'_>| {
+    // What the generation lacks, read in that generation: a node identity
+    // names one generation only.
+    let plan = |document: &XmlDocument, request: &VerificationRequest<'_>| {
+        let (unsigned, archived) = document.with_view(|view| {
+            let unsigned =
+                placement::locate_in(view, data.signature, data.id_attributes, namespace, work)?
+                    .unsigned;
+            Ok::<_, AugmentError>((unsigned, archived(view, unsigned, namespace, work)?))
+        })?;
         with_verified_request(document, assessment.context, request, work, |session| {
             Ok(
                 selected(document, &session, data.signature, data.id_attributes).and_then(|node| {
                     match with_historical_census(&session, node, profile, &inputs, |census| {
-                        missing_values(census, unsigned, profile)
+                        missing_values(census, unsigned, profile, archived)
                     })? {
-                        Outcome::Assessed(values) => values,
+                        Outcome::Assessed(plan) => plan,
                         outcome => Err(AugmentError::Unmet(outcome.map(|_| ()))),
                     }
                 }),
             )
         })?
     };
-    let values = census(document, assessment.request)?;
-    if values.is_empty() {
+    let mut step = plan(document, assessment.request)?;
+    if step.is_empty() {
         return Ok(DataAdded::AlreadyPresent);
     }
     document.transaction(|document| {
-        unsigned.insert_in(document, &values.concat(), namespace)?;
-        let carried = Carried::new::<_, AugmentError>(document, assessment.request, work)?;
+        loop {
+            step.apply(document, namespace, work)?;
+            let carried = Carried::new::<_, AugmentError>(document, assessment.request, work)?;
+            let next = plan(document, &carried.request(assessment.request))?;
+            if next.is_empty() {
+                break;
+            }
+            // Each step adds what the census lacked; the same lack again
+            // means the census does not count the added copy.
+            if next == step {
+                return Err(AugmentError::Unmet(Outcome::Assessed(())));
+            }
+            work.charge_work(1)?;
+            step = next;
+        }
         let completion = Completion {
             assessment,
             inputs: &inputs,
@@ -270,12 +288,74 @@ pub fn add_historical_values<W: Work>(
             id_attributes: data.id_attributes,
         };
         require_bes(document, data.signature, profile, &completion, work)?;
-        if census(document, &carried.request(assessment.request))?.is_empty() {
-            Ok(DataAdded::Published)
-        } else {
-            Err(AugmentError::Unmet(Outcome::Assessed(())))
-        }
+        Ok(DataAdded::Published)
     })
+}
+
+/// Whether the signature's unsigned properties already hold an archive
+/// timestamp, which then covers its values: TSA material found missing later
+/// goes after its own timestamp (ETSI TS 101 903 V1.4.2 §8.1.1).
+fn archived<W: Work>(
+    view: xml_sec::document::DocumentView<'_>,
+    unsigned: Unsigned,
+    namespace: &str,
+    work: &W,
+) -> Result<bool, PlacementError> {
+    let Some(properties) = unsigned.signature_properties() else {
+        return Ok(false);
+    };
+    for node in placement::children(view, properties, work)? {
+        if placement::is_element(view, node, XADES_141, "ArchiveTimeStamp", work)?
+            || placement::is_element(view, node, namespace, "ArchiveTimeStamp", work)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// One step of [`add_historical_values`]: the values properties the census
+/// found missing, else the first timestamp whose TSA material is missing and
+/// the `TimeStampValidationData` that follows it.
+#[derive(PartialEq, Eq)]
+struct ValuesStep {
+    unsigned: Unsigned,
+    values: Vec<String>,
+    timestamp: Option<(NodeIdentity, String)>,
+}
+
+impl ValuesStep {
+    fn is_empty(&self) -> bool {
+        self.values.is_empty() && self.timestamp.is_none()
+    }
+
+    /// Insert the values, or else the timestamp's validation data right
+    /// after its property: one insertion, one new generation.
+    fn apply<W: Work>(
+        &self,
+        document: &mut XmlDocument,
+        namespace: &str,
+        work: &W,
+    ) -> Result<(), AugmentError> {
+        if !self.values.is_empty() {
+            return Ok(self
+                .unsigned
+                .insert_in(document, &self.values.concat(), namespace)?);
+        }
+        let (Some((property, data)), Some(parent)) =
+            (&self.timestamp, self.unsigned.signature_properties())
+        else {
+            return Ok(());
+        };
+        let next = document.with_view(|view| {
+            xml_sec::xmldsig::extension::next_sibling(view, parent, *property, work)
+        })?;
+        match next {
+            Some(next) => document.insert_before(next, data)?,
+            None => document.append_child(parent, data)?,
+        }
+        Ok(())
+    }
 }
 
 /// Add to `request.signature`, a signature in the TS 103 171 profile of
@@ -423,15 +503,65 @@ fn references<W: Work>(
     Ok(staging.draft.finish_siblings()?)
 }
 
-/// The values properties of every item of validation data the census finds
-/// missing, none when the document holds them all.
+/// The value of `artifact` to incorporate; an OCSP response takes its whole
+/// `OCSPResponse` from wherever the census found it.
+fn census_material<'r, W: Work>(
+    census: &HistoricalCensus<'r, '_, '_, '_, '_, W>,
+    artifact: ArtifactRef<'r, 'r>,
+) -> Result<Material<'r, 'r>, AugmentError> {
+    Ok(match artifact {
+        ArtifactRef::Certificate(value) => Material::certificate(value),
+        ArtifactRef::Crl(value) => Material::crl(value),
+        ArtifactRef::Ocsp(value) => {
+            let envelope = census
+                .envelope(value)
+                .ok_or(AugmentError::MissingEnvelope)?;
+            Material::ocsp::<Infallible, _>(envelope, value, census.session().execution())
+                .map_err(AugmentError::Construction)?
+        }
+    })
+}
+
+/// What the census finds missing, as the next [`ValuesStep`]. Before an
+/// archive timestamp everything goes into the signature's values; once one
+/// covers them, each timestamp's missing TSA material goes into the
+/// `TimeStampValidationData` right after it (ETSI TS 101 903 V1.4.2 §8.1.1,
+/// TS 103 171 V2.1.1 §8.1.5) and only what no timestamp needs into new
+/// values.
 fn missing_values<W: Work>(
     census: &HistoricalCensus<'_, '_, '_, '_, '_, W>,
     unsigned: Unsigned,
     profile: Profile,
-) -> Result<Vec<String>, AugmentError> {
+    archived: bool,
+) -> Result<ValuesStep, AugmentError> {
     let session = census.session();
     let work = session.execution();
+    let material = |artifact| census_material(census, artifact);
+    // Each timestamp's missing material, gathered for the first such timestamp.
+    let mut stamped = work.map();
+    let mut timestamp = None;
+    let mut timestamp_entries = work.vector();
+    if archived {
+        let rows = census.timestamp_material().map_err(|cause| {
+            AugmentError::Validation(ValidationError::Ts101903(Box::new(
+                Ts101903Error::TimestampMaterial(cause),
+            )))
+        })?;
+        for row in rows.artifacts() {
+            work.charge_work(1)?;
+            if !row.is_missing() {
+                continue;
+            }
+            let identity = row.artifact.identity();
+            if stamped.try_insert(identity, ())?.is_some() {
+                continue;
+            }
+            let property = *timestamp.get_or_insert(row.property);
+            if property == row.property {
+                timestamp_entries.try_push(material(row.artifact)?)?;
+            }
+        }
+    }
     let mut seen = work.map();
     let mut entries = work.vector();
     for entry in census.incorporation().entries() {
@@ -439,42 +569,46 @@ fn missing_values<W: Work>(
         if entry.occurrence().is_some() {
             continue;
         }
-        let artifact = entry.artifact();
-        if seen.try_insert(artifact.identity(), ())?.is_some() {
+        let identity = entry.artifact().identity();
+        if stamped.get(&identity, work)?.is_some() || seen.try_insert(identity, ())?.is_some() {
             continue;
         }
-        let material = match artifact {
-            ArtifactRef::Certificate(value) => Material::certificate(value),
-            ArtifactRef::Crl(value) => Material::crl(value),
-            ArtifactRef::Ocsp(value) => {
-                let envelope = census
-                    .envelope(value)
-                    .ok_or(AugmentError::MissingEnvelope)?;
-                Material::ocsp::<Infallible, _>(envelope, value, work)
-                    .map_err(AugmentError::Construction)?
-            }
-        };
-        entries.try_push(material)?;
+        entries.try_push(material(entry.artifact())?)?;
     }
-    if entries.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut staging = Staging {
+    let staging = || Staging {
         session,
         base: census.snapshot(),
         signature: census.prepared().binding().containers().signature(),
         unsigned: unsigned.signature_properties(),
         draft: Draft::siblings(),
     };
-    write_historical_values(
-        &entries,
-        profile,
-        ReferenceRole::Signature,
-        &mut staging,
-        work,
-    )
-    .map_err(construction)?;
-    Ok(staging.draft.finish_siblings()?)
+    let mut values = Vec::new();
+    if !entries.is_empty() {
+        let mut staging = staging();
+        write_historical_values(
+            &entries,
+            profile,
+            ReferenceRole::Signature,
+            &mut staging,
+            work,
+        )
+        .map_err(construction)?;
+        values = staging.draft.finish_siblings()?;
+    }
+    let timestamp = match timestamp {
+        Some(property) if !timestamp_entries.is_empty() => {
+            let mut staging = staging();
+            write_historical_timestamp_values(&timestamp_entries, &mut staging, work)
+                .map_err(construction)?;
+            Some((property, staging.draft.finish_siblings()?.concat()))
+        }
+        _ => None,
+    };
+    Ok(ValuesStep {
+        unsigned,
+        values,
+        timestamp,
+    })
 }
 
 /// Check `response` against `pending` and publish its token as the
@@ -837,14 +971,15 @@ impl<W: Work> HistoricalTimestampWriter for Staging<'_, '_, '_, '_, W> {
             )
             .map_err(StagingError::Draft)?;
         // The method's parameters, such as an InclusiveNamespaces PrefixList,
-        // each canonicalized by itself as a complete element.
+        // each a complete element canonicalized under the method itself, whose
+        // Algorithm and parameters it carries (exclusive C14N §3).
         for child in placement::children(view, method, work)? {
             if !placement::is_element_node(view, child, work)? {
                 continue;
             }
             let draft = &mut self.draft;
             self.session
-                .canonicalize_element(child, child, work, &mut |bytes: &[u8]| {
+                .canonicalize_element(child, method, work, &mut |bytes: &[u8]| {
                     draft.copied(bytes, work)
                 })
                 .map_err(|error| match error {
