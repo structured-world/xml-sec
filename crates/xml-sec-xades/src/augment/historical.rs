@@ -193,7 +193,11 @@ fn request_stamp<W: Work>(
 /// certificates, CRLs and OCSP responses its participants' paths and
 /// statuses need and the document lacks, as `CertificateValues` and
 /// `RevocationValues` in that vocabulary: the values of ETSI TS 101 903
-/// XAdES-X-L (V1.2.2 §7.6) and of the TS 103 171 profile of V1.3.2.
+/// XAdES-X-L (V1.2.2 §7.6) and of the TS 103 171 profile of V1.3.2. Once an
+/// archive timestamp covers the values, each timestamp's missing TSA material
+/// goes into a `TimeStampValidationData` right after that timestamp instead
+/// (V1.4.2 §8.1.1), outside every earlier archive input, ready for the next
+/// archive timestamp; a usable copy anywhere in the signature is not repeated.
 ///
 /// The census reads the signer's path, every timestamp's TSA path and their
 /// statuses from `data.inputs` and the document, as for a baseline level; no

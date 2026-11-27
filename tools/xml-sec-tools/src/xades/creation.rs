@@ -579,11 +579,14 @@ fn timestamp_properties(name: &str) -> &'static [Expect] {
         ],
         "lta-pre-en" => &[Counted("Timestamp", "Type", "ARCHIVE_TIMESTAMP", 1)],
         // One signature timestamp, one SigAndRefsTimeStamp and two archive
-        // timestamps.
+        // timestamps; the first archive TSA's CA and its CRL come from the
+        // TimeStampValidationData after it.
         "a-renewed-pre-en" => &[
             Counted("Timestamp", "Type", "SIGNATURE_TIMESTAMP", 1),
             Counted("Timestamp", "Type", "VALIDATION_DATA_TIMESTAMP", 1),
             Counted("Timestamp", "Type", "ARCHIVE_TIMESTAMP", 2),
+            Text("RelatedCertificate/Origin", "TIMESTAMP_VALIDATION_DATA"),
+            Text("RelatedRevocation/Origin", "TIMESTAMP_VALIDATION_DATA"),
         ],
         _ => &[],
     }
