@@ -310,6 +310,49 @@ fn appended_child_refuses_an_entity_of_two_elements() {
     );
 }
 
+/// `entity`'s replacement text appended to `parent` by a reference, then
+/// checked as one appended child.
+fn appended_entity(entity: &str) -> (XmlDocument, Result<NodeIdentity, XmlDocumentError>) {
+    let mut policy = crate::policy::SigningPolicy::default();
+    policy.xml.allow_internal_dtd = true;
+    let mut document = XmlDocument::parse_with_policy(
+        format!(
+            "<!DOCTYPE root [<!ENTITY e \"{entity}\">]><root><parent Id=\"parent\"><x/></parent></root>"
+        ),
+        &policy,
+    )
+    .expect("fixture parses");
+    let parent = element(&document, "parent");
+    let checked = document.transaction(|document| {
+        document.append_child(parent, "&e;")?;
+        document.appended_child(parent)
+    });
+    (document, checked)
+}
+
+#[test]
+fn appended_child_refuses_an_entity_of_an_element_and_text() {
+    // The text after the element is a second child the append added, though
+    // it is no element.
+    let (_, checked) = appended_entity("<one/>tail");
+    assert!(
+        matches!(checked, Err(XmlDocumentError::InvalidReplacement(_))),
+        "{checked:?}"
+    );
+}
+
+#[test]
+fn appended_child_takes_an_entity_of_one_element_with_content() {
+    // One element whose own child shares the reference's range is still one
+    // appended child: only the parent's direct children count.
+    let (document, checked) = appended_entity("<one><two/></one>");
+    let appended = checked.expect("one appended child");
+    document.with_view(|view| {
+        let node = view.resolve_node(appended).expect("the appended element");
+        assert_eq!(node.tag_name().name(), "one");
+    });
+}
+
 #[test]
 fn appended_child_needs_an_open_transaction() {
     // Outside a transaction there is no starting generation to compare with.
