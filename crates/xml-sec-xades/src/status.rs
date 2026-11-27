@@ -18,7 +18,7 @@ use structured_pkix::Certificate;
 use structured_pkix::crl::{
     Authenticated, Authentication, CertificateList, CombinedEntry, CompleteEvidence, CompleteFacts,
     Coverage, CoverageAdmission, DeltaBinding, DeltaEvidence, DeltaFacts, EntryLookup, Evaluation,
-    SourceOrigin,
+    Reasons, SourceOrigin,
 };
 use structured_pkix::error::CallbackError;
 use structured_pkix::ocsp::{
@@ -534,12 +534,26 @@ impl<'e, 'x, W: Work> Engine<'e, 'x, '_, '_, '_, W> {
         } else {
             (issuer, supplied)
         };
-        for engine in supplied.into_iter().chain(core::iter::once(self)) {
-            if let Some(found) = engine.choose(anchor, target, issuer, roots, extra, signers)? {
-                return Ok(Some(found));
+        if let Some(supplied) = supplied {
+            let mark = signers.len();
+            match supplied.choose(anchor, target, issuer, roots, extra, signers)? {
+                // RFC 5280 §6.3.3(j): an absence determines the status only
+                // once its reasons reach all reasons; the caller's partial
+                // coverage is completed by the full census instead.
+                Some(Ok((Selected::Absent { coverage, .. }, _)))
+                    if coverage.reasons() != Reasons::ALL =>
+                {
+                    // Drop the partial answer's authority sources; the full
+                    // census records its own.
+                    while signers.len() > mark {
+                        signers.pop();
+                    }
+                }
+                Some(found) => return Ok(Some(found)),
+                None => {}
             }
         }
-        Ok(None)
+        self.choose(anchor, target, issuer, roots, extra, signers)
     }
 
     /// The status of `target` from this engine's sources: an OCSP response
