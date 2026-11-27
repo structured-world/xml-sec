@@ -1613,27 +1613,36 @@ impl XmlDocument {
                     return Err(other());
                 }
                 let inserted = at..at + added;
-                // Every element an entity reference expands to takes the
-                // reference's range, so a second match is a second child.
-                let mut matches = view
+                // Only the inserted bytes changed, so `parent` still starts
+                // where it did and keeps its name; no other element starts
+                // there.
+                let name = element.tag_name();
+                let enclosing = view
                     .parsed
                     .document
                     .descendants()
-                    .filter(|node| node.is_element() && node.range() == inserted);
-                let node = matches.next().ok_or_else(other)?;
-                if matches.next().is_some() {
-                    return Err(other());
-                }
-                // Only the inserted bytes changed, so the enclosing element
-                // starts where `parent` did and keeps its name.
-                let enclosing = node.parent().filter(|enclosing| {
-                    let (name, found) = (element.tag_name(), enclosing.tag_name());
-                    enclosing.is_element()
-                        && enclosing.range().start == range.start
-                        && found.namespace() == name.namespace()
-                        && found.name() == name.name()
+                    .find(|node| {
+                        let found = node.tag_name();
+                        node.is_element()
+                            && node.range().start == range.start
+                            && found.namespace() == name.namespace()
+                            && found.name() == name.name()
+                    })
+                    .ok_or_else(other)?;
+                // Every direct child the inserted bytes produced overlaps
+                // them; every node an entity reference expands to takes the
+                // reference's range. Exactly one, an element spanning all of
+                // them, is one appended child: text beside it is a second
+                // child, its own descendants are not the parent's.
+                let mut added_children = enclosing.children().filter(|child| {
+                    let span = child.range();
+                    span.start < inserted.end && inserted.start < span.end
                 });
-                if enclosing.is_none() {
+                let node = added_children
+                    .next()
+                    .filter(|node| node.is_element() && node.range() == inserted)
+                    .ok_or_else(other)?;
+                if added_children.next().is_some() {
                     return Err(other());
                 }
                 Ok(view.node_identity(node))
