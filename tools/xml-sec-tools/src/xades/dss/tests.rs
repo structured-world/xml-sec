@@ -23,6 +23,12 @@ fn a_fetch_waits_out_a_burst_of_maven_central_rate_limits() {
         "{retries} retries wait too briefly"
     );
     assert!(value("--retry-max-time").is_some_and(|ceiling| ceiling >= 300));
+    // CI also met a 404 for metadata the CDN served a moment later; curl
+    // retries such an answer only with every error retried.
+    assert!(
+        args.iter().any(|arg| arg == "--retry-all-errors"),
+        "{args:?}"
+    );
 }
 
 /// The newest release of any major version.

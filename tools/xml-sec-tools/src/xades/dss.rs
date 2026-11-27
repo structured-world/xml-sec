@@ -102,10 +102,11 @@ pub(crate) fn maven(corpus: &Corpus, version: &str) -> PathBuf {
 }
 
 /// `curl` arguments that fetch `url` into `output`. Maven Central answers
-/// shared CI addresses with 429 under load, often without Retry-After, for
-/// longer than curl's default retries last: eight retries back off for 255
-/// seconds in all, within a ten-minute ceiling. A retry rewrites `output` from
-/// its start.
+/// shared CI addresses with 429 under load, often without Retry-After, and
+/// its CDN at times answers 404 for a file it serves a moment later, which
+/// curl's transient-error retries skip: every error is retried, eight times
+/// with backoff for 255 seconds in all, within a ten-minute ceiling. A retry
+/// rewrites `output` from its start.
 pub(crate) fn fetch(url: &str, output: &Path) -> Vec<std::ffi::OsString> {
     line(&[
         &"curl",
@@ -114,6 +115,7 @@ pub(crate) fn fetch(url: &str, output: &Path) -> Vec<std::ffi::OsString> {
         &"--show-error",
         &"--retry",
         &"8",
+        &"--retry-all-errors",
         &"--retry-max-time",
         &"600",
         &"--output",
