@@ -10,7 +10,8 @@
 //! document at that time with those certificates as the only trust anchors
 //! and prints, for each Signature in document order, its verification outcome
 //! and the `XAdES` facts of every baseline level. `PROFILE` is `xades`,
-//! `xades-extended` or `xades-conformant`.
+//! `xades-extended` or `xades-conformant`. Each `--detached FILE` supplies the
+//! detached object a reference names by the file's name.
 //!
 //! The anchors, the time and the stated accuracy of tokens that omit theirs
 //! (zero, the generation time read as exact) are conditions of the
@@ -26,6 +27,7 @@ mod tests;
 #[path = "support/tokens.rs"]
 mod tokens;
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -1107,12 +1109,38 @@ fn signature_row(
     row
 }
 
-fn facts(xml: &str, anchors: &Path, at: i64, profile: PolicyProfile) -> Result<Value, Failure> {
+/// UTC from 1900 to 2100 without leap seconds, as both validators read it.
+fn utc() -> Result<LeapTable<'static>, Failure> {
+    Ok(LeapTable::new(-2_208_988_800, 4_102_444_800, &[])
+        .map_err(|error| format!("UTC coverage: {error:?}"))?)
+}
+
+/// The compared profile's policy at `at`, with chains checked; detached
+/// objects the caller supplies are dereferenced by name.
+fn facts_policy(
+    profile: PolicyProfile,
+    at: i64,
+    resources: &BTreeMap<String, Vec<u8>>,
+) -> Result<VerificationPolicy, Failure> {
+    let mut policy = profile_policy(profile, at, true)?;
+    if !resources.is_empty() {
+        policy.uris.references = UriTypeSet::ALL;
+    }
+    Ok(policy)
+}
+
+fn facts(
+    xml: &str,
+    anchors: &Path,
+    at: i64,
+    profile: PolicyProfile,
+    resources: &BTreeMap<String, Vec<u8>>,
+) -> Result<Value, Failure> {
     let bytes = std::fs::read(xml)?;
     let text = ascii_view(&bytes);
     let trusted = read_anchors(anchors)?;
     let carried = pool(&text);
-    let policy = profile_policy(profile, at, true)?;
+    let policy = facts_policy(profile, at, resources)?;
     let direct_trust = policy.key_trust.trust_anchor_signer == TrustAnchorSigner::Accepted;
     let resolver = DefaultKeyResolver::new(KeyResolverConfig {
         trusted_certs: trusted.clone(),
@@ -1123,8 +1151,7 @@ fn facts(xml: &str, anchors: &Path, at: i64, profile: PolicyProfile) -> Result<V
         Ok(document) => document,
         Err(error) => return Ok(json!({ "parse": error.to_string() })),
     };
-    let utc = LeapTable::new(-2_208_988_800, 4_102_444_800, &[])
-        .map_err(|error| format!("UTC coverage: {error:?}"))?;
+    let utc = utc()?;
     // An unreadable token carries no authority; why it could not be read
     // stays in the facts, since no later step reports it.
     let (authorities, unreadable) = tokens::token_authorities(&text, &carried);
@@ -1148,6 +1175,7 @@ fn facts(xml: &str, anchors: &Path, at: i64, profile: PolicyProfile) -> Result<V
     let expected = expected_targets(&document, &text);
     let request = VerificationRequest {
         expected_targets: &expected,
+        external_resources: (!resources.is_empty()).then_some(resources),
         ..VerificationRequest::default()
     };
     let mut declared = settled_declarations(&text, &document, &expected, [&carried, &trusted], at)?;
@@ -1239,9 +1267,11 @@ fn establish_timestamps(
     // certificate expired stays checkable, and one signature's newer token
     // never decides another's.
     let direct = SigningKeys::new(declared);
-    let context = VerifyContext::new()
-        .policy(profile_policy(PolicyProfile::XadesConformant, at, false)?)
-        .key_resolver(&direct);
+    let mut policy = profile_policy(PolicyProfile::XadesConformant, at, false)?;
+    if request.external_resources.is_some() {
+        policy.uris.references = UriTypeSet::ALL;
+    }
+    let context = VerifyContext::new().policy(policy).key_resolver(&direct);
     // A document the discovery of signatures refuses leaves every token
     // unjudged, for that reason.
     let identities = match context.signature_identities(document) {
@@ -1263,6 +1293,7 @@ fn establish_timestamps(
         .collect();
     let request = VerificationRequest {
         expected_targets: request.expected_targets,
+        external_resources: request.external_resources,
         trusted_keys: &trusted,
         ..VerificationRequest::default()
     };
@@ -1686,8 +1717,9 @@ fn integrity(
     // Format checking covers the base format only; conformance to a signature
     // profile such as XAdES is signature acceptance (EN 319 102-1 5.2.2 NOTE,
     // 5.2.8), so integrity is established over plain XMLDSig. External
-    // references are admitted: their bytes are supplied to neither validator,
-    // so they are signed data that cannot be obtained (5.2.7.4 step 1).
+    // references are admitted: unless the caller supplies their bytes to both
+    // validators, they are signed data that cannot be obtained (5.2.7.4
+    // step 1).
     let mut policy = profile_policy(PolicyProfile::XadesConformant, at, false)?;
     policy.signature_constraints = SignatureConstraints::General;
     policy.uris.references = UriTypeSet::new(true, true, true);
@@ -1708,6 +1740,7 @@ fn integrity(
         .collect();
     let request = VerificationRequest {
         expected_targets: request.expected_targets,
+        external_resources: request.external_resources,
         trusted_keys: &trusted,
         ..VerificationRequest::default()
     };
@@ -1918,8 +1951,36 @@ fn constraints(profile: PolicyProfile) -> Result<Value, Failure> {
 /// accepts do not depend on it.
 const INSTANT_ANY: i64 = 1_800_000_000;
 
+/// Every `--detached FILE` object, by its file name, taken out of `args`.
+fn detached(args: &mut Vec<String>) -> Result<BTreeMap<String, Vec<u8>>, Failure> {
+    let mut resources = BTreeMap::new();
+    let mut paths = BTreeMap::new();
+    while let Some(flag) = args.iter().position(|arg| arg == "--detached") {
+        let path = args.get(flag + 1).ok_or("--detached needs a file")?.clone();
+        let name = Path::new(&path)
+            .file_name()
+            .ok_or("--detached needs a file")?
+            .to_string_lossy()
+            .into_owned();
+        // A reference names its object by the file name alone, so two files
+        // of one name would leave the bytes to the order of the arguments.
+        if let Some(earlier) = paths.insert(name.clone(), path.clone()) {
+            return Err(format!("--detached {earlier} and {path} share the name {name}").into());
+        }
+        resources.insert(name, std::fs::read(&path)?);
+        args.drain(flag..flag + 2);
+    }
+    Ok(resources)
+}
+
 fn main() -> Result<(), Failure> {
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().collect();
+    // Only `facts` verifies, so only it takes detached objects.
+    let resources = if args.get(1).is_some_and(|mode| mode == "facts") {
+        detached(&mut args)?
+    } else {
+        BTreeMap::new()
+    };
     let result = match &args[1..] {
         [mode, profile] if mode == "constraints" => constraints(named_profile(profile)?)?,
         [mode, xml, anchors] if mode == "conditions" => conditions(xml, Path::new(anchors))?,
@@ -1928,9 +1989,10 @@ fn main() -> Result<(), Failure> {
             Path::new(anchors),
             at.parse()?,
             named_profile(profile)?,
+            &resources,
         )?,
         _ => {
-            return Err("usage: corpus_probe constraints PROFILE | conditions XML ANCHORS_DIR | facts XML ANCHORS_DIR UNIX_TIME PROFILE, PROFILE xades|xades-extended|xades-conformant".into());
+            return Err("usage: corpus_probe constraints PROFILE | conditions XML ANCHORS_DIR | facts XML ANCHORS_DIR UNIX_TIME PROFILE [--detached FILE]..., PROFILE xades|xades-extended|xades-conformant".into());
         }
     };
     println!("{result}");

@@ -75,6 +75,7 @@ impl Setup {
             method: SignatureAlgorithm::RsaSha256,
             digest: DigestAlgorithm::Sha256,
             canonicalization: C14nAlgorithm::new(C14nMode::Exclusive1_0, false),
+            prefixes: xml_sec_xades::Prefixes::default(),
         };
         let context = self.context();
         let request = self.request();
@@ -108,9 +109,10 @@ fn enveloped(id: &str) -> Request<'_> {
             mime_type: "text/xml",
             envelope: Envelope::ExcludingSignatures,
         }],
-        parent: None,
+        placement: xml_sec_xades::Placement::DocumentEnd,
         resources: None,
         id_attributes: &[],
+        properties: xml_sec_xades::properties::Properties::default(),
     }
 }
 
@@ -126,6 +128,7 @@ fn countersigned(setup: &Setup, document: &mut XmlDocument, work: &Memory) {
         id: "counter",
         signing_time: TIME,
         id_attributes: &[],
+        properties: xml_sec_xades::properties::Properties::default(),
     };
     setup
         .with(|signer, assessment| {

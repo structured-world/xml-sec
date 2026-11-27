@@ -799,6 +799,15 @@ impl<'a> VerifyContext<'a> {
         self
     }
 
+    /// CMS processing under this context's provider and verification policy,
+    /// as a session it verifies uses: a token checked before any signature
+    /// is verified obeys the same digest, signature and key policy.
+    #[cfg(feature = "cms")]
+    #[must_use]
+    pub fn cms_provider(&self) -> crate::xmldsig::cms::CmsProvider<'_> {
+        crate::xmldsig::cms::CmsProvider::new(self.provider, &self.policy)
+    }
+
     fn allowed_transform_uris(&self) -> Option<&BTreeSet<String>> {
         self.policy.transforms.allowed_algorithms.as_ref()
     }

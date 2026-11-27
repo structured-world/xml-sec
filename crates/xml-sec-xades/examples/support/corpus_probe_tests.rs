@@ -61,6 +61,66 @@ fn a_rejected_token_keeps_its_cause_in_the_etsi_finding() {
 }
 
 #[test]
+fn supplied_detached_objects_are_signed_data_the_probe_obtains() {
+    // EN 319 102-1 V1.4.1 clause 5.2.7.4 step 1: a detached object neither
+    // validator receives is signed data that cannot be obtained; the same
+    // object supplied by name verifies.
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/levels");
+    let directory = tempfile::tempdir().unwrap();
+    let anchors = directory.path().join("anchors");
+    std::fs::create_dir_all(&anchors).unwrap();
+    std::fs::copy(fixtures.join("root.der"), anchors.join("0.der")).unwrap();
+    let xml = fixtures.join("b-lt-detached.xml");
+    let signature = |resources: &std::collections::BTreeMap<String, Vec<u8>>| {
+        let facts = super::facts(
+            xml.to_str().unwrap(),
+            &anchors,
+            1_800_000_000,
+            xml_sec::policy::PolicyProfile::Xades,
+            resources,
+        )
+        .unwrap();
+        facts["signatures"][0].clone()
+    };
+    let missing = signature(&std::collections::BTreeMap::new());
+    assert_eq!(
+        missing["integrity"]["references"][0], "Invalid(ReferenceUnavailable { ref_index: 0 })",
+        "{missing}"
+    );
+    assert_eq!(missing["etsi"]["sub"], "SIGNED_DATA_NOT_FOUND", "{missing}");
+    let supplied = signature(&std::collections::BTreeMap::from([(
+        "detached.txt".to_owned(),
+        std::fs::read(fixtures.join("detached.txt")).unwrap(),
+    )]));
+    assert_eq!(supplied["verification"]["status"], "Valid", "{supplied}");
+}
+
+#[test]
+fn two_detached_files_of_one_name_are_refused() {
+    // A reference names its object by the file name alone: two files of one
+    // name would leave the bytes to the order of the arguments.
+    let directory = tempfile::tempdir().unwrap();
+    let paths = ["a", "b"].map(|sub| {
+        let path = directory.path().join(sub).join("payload.txt");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, sub).unwrap();
+        path.to_string_lossy().into_owned()
+    });
+    let mut args: Vec<String> = [
+        "probe",
+        "facts",
+        "--detached",
+        &paths[0],
+        "--detached",
+        &paths[1],
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let error = super::detached(&mut args).expect_err("the same name twice");
+    assert!(error.to_string().contains("payload.txt"), "{error}");
+}
+
+#[test]
 fn the_probe_reports_each_cause_of_a_corrupted_token() {
     // The probe's own token rows carry the cause check_tokens established:
     // TSA signature bytes altered are a cryptographic failure, a TSTInfo
@@ -99,6 +159,7 @@ fn the_probe_reports_each_cause_of_a_corrupted_token() {
             &anchors,
             1_800_000_000,
             xml_sec::policy::PolicyProfile::Xades,
+            &std::collections::BTreeMap::new(),
         )
         .unwrap();
         assert_eq!(

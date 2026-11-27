@@ -8,19 +8,27 @@
 //! meet every B-B requirement is never left in the document.
 
 use crate::basic::{Outcome, ValidationError, validate_basic};
+use crate::content::{self, ContentError, ContentRequests, Replayed};
 use crate::draft::{Draft, DraftError};
 use crate::placement::{self, DS, PlacementError, XADES};
+use crate::properties::{
+    Bound, Planned, Policy, Properties, PropertyDraft, PropertyError, SignaturePolicy,
+    policy_digest_method,
+};
 use alloc::{collections::BTreeMap, format, string::String, vec::Vec};
 use structured_asn1::Parser;
 use structured_asn1::memory::{MemoryError, OwnedVec, Work};
 use structured_pkix::Certificate;
 use structured_xades::produce::{self, ReferenceKind};
+use structured_xades::produce::{CheckedContent, ContentInput};
+use structured_xades::produce::{Event, Writer as _};
+use structured_xades::xml::Name;
 use xml_sec::IdAttributeRegistration;
 use xml_sec::c14n::C14nAlgorithm;
 use xml_sec::document::{DocumentView, NodeIdentity, XmlDocument, XmlDocumentError};
 use xml_sec::policy::SigningPolicy;
 use xml_sec::provider::{CryptoProvider, ProviderError};
-use xml_sec::xmldsig::extension::{ScalarError, TreeError};
+use xml_sec::xmldsig::extension::{ScalarError, TreeError, first_child, next_sibling, parent};
 use xml_sec::xmldsig::parse::{KeyInfoParsingSession, ParseError};
 use xml_sec::xmldsig::{
     CallerTrustedSignatureKey, DigestAlgorithm, DsigError, KeyInfoWriteError, ObjectBuilder,
@@ -29,6 +37,7 @@ use xml_sec::xmldsig::{
     Transform, VerificationRequest, VerifyContext, X509CertificateKeyInfoWriter,
     compute_digest_with_provider, with_verified_request,
 };
+use xml_sec::xmldsig::{KeptInputs, SigningInputs};
 
 /// The signing key, its certificates and the algorithms of one signer.
 pub struct Signer<'a> {
@@ -46,6 +55,29 @@ pub struct Signer<'a> {
     pub digest: DigestAlgorithm,
     /// `CanonicalizationMethod` and the canonicalization of XML references.
     pub canonicalization: C14nAlgorithm,
+    /// Namespace prefixes the new signatures are written with.
+    pub prefixes: Prefixes<'a>,
+}
+
+/// The prefixes of the `XMLDSig` and `XAdES` namespaces in a new signature:
+/// `ds` and `xades` by default. An empty prefix writes the namespace as the
+/// default one. Prefixes change no canonical form a digest covers beyond the
+/// prefix itself; they are a serialization choice, not policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Prefixes<'a> {
+    /// Prefix of `http://www.w3.org/2000/09/xmldsig#`.
+    pub ds: &'a str,
+    /// Prefix of `http://uri.etsi.org/01903/v1.3.2#`.
+    pub xades: &'a str,
+}
+
+impl Default for Prefixes<'_> {
+    fn default() -> Self {
+        Self {
+            ds: "ds",
+            xades: "xades",
+        }
+    }
 }
 
 /// How a document-wide reference leaves signatures out of what it signs.
@@ -92,13 +124,126 @@ pub enum DataObject<'a> {
         /// MIME type of the content.
         mime_type: &'a str,
     },
+    /// Content in a new `Object` of the signature with the caller's `Id`,
+    /// signed through a reference to it with the caller's transforms
+    /// (`XMLDSig` 1.1 §4.5, §6.6.2): base64 content with its `Encoding`,
+    /// decoded by [`Transform::Base64Decode`], say.
+    Object {
+        /// ID of the new `Object`.
+        id: &'a str,
+        /// The object content.
+        content: ObjectContent,
+        /// `Encoding` attribute of the object, if any.
+        encoding: Option<&'a str>,
+        /// The transforms of the reference, in order.
+        transforms: Vec<Transform>,
+        /// MIME type of the content, also the object's `MimeType`.
+        mime_type: &'a str,
+    },
+    /// A `Manifest` in a new `Object` with the caller's `Id`, listing the
+    /// data its references name; the signature signs the `Manifest`, whose
+    /// reference digests the signing operation computes first (`XMLDSig` 1.1
+    /// §5.1, the signing policy processing Manifests).
+    Manifest {
+        /// ID of the `Manifest`; its references take `{id}-reference-{n}`.
+        id: &'a str,
+        /// The data the `Manifest` lists, each digested as dereferenced,
+        /// detached data from [`Request::resources`] included.
+        entries: Vec<ManifestEntry<'a>>,
+        /// MIME type of the `Manifest`.
+        mime_type: &'a str,
+    },
+    /// The signature's own `KeyInfo`, with the signer's certificates the
+    /// operation writes into it (`XMLDSig` 1.1 §4.5), canonicalized as the
+    /// other XML references are.
+    KeyInfo {
+        /// MIME type of the key information.
+        mime_type: &'a str,
+    },
+    /// A reference the caller composes: any URI and the transforms applied to
+    /// what it dereferences, in order (`XMLDSig` 1.1 §4.4.3.1, §6.6). The
+    /// signing policy decides which URIs and transforms are admitted.
+    Reference {
+        /// URI of the reference: empty for the whole document, `#id` for an
+        /// element, `#xpointer(...)` or an external URI.
+        uri: &'a str,
+        /// The transforms, in order; none signs the dereferenced data as is.
+        transforms: Vec<Transform>,
+        /// MIME type of the signed data.
+        mime_type: &'a str,
+    },
+}
+
+/// Where a new signature goes, relative to an element named by its ID. An
+/// enveloped reference signs the document whatever the placement; only
+/// which nodes the signature's own transforms leave out depends on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Placement<'a> {
+    /// The last child of the document element.
+    #[default]
+    DocumentEnd,
+    /// The last child of the element.
+    LastChildOf(&'a str),
+    /// Before every existing child of the element.
+    FirstChildOf(&'a str),
+    /// Immediately before the element.
+    Before(&'a str),
+    /// Immediately after the element.
+    After(&'a str),
+}
+
+/// Where a signature template is inserted: before a node, or appended to one.
+#[derive(Debug, Clone, Copy)]
+enum Anchor {
+    Before(NodeIdentity),
+    Append(NodeIdentity),
+}
+
+/// The anchor of a placement that the signer's append path cannot reach.
+fn anchor<W: Work>(
+    view: DocumentView<'_>,
+    placement: Placement<'_>,
+    registrations: &[IdAttributeRegistration],
+    work: &W,
+) -> Result<Anchor, CreateError> {
+    let (Placement::FirstChildOf(id) | Placement::Before(id) | Placement::After(id)) = placement
+    else {
+        return Err(CreateError::UnknownPlacement(String::new()));
+    };
+    let unknown = || CreateError::UnknownPlacement(id.into());
+    let element = view.node_for_id(id, registrations).ok_or_else(unknown)?;
+    Ok(match placement {
+        Placement::FirstChildOf(_) => match first_child(view, element, work)? {
+            Some(child) => Anchor::Before(child),
+            None => Anchor::Append(element),
+        },
+        Placement::Before(_) => Anchor::Before(element),
+        _ => {
+            let parent = parent(view, element, work)?.ok_or_else(unknown)?;
+            match next_sibling(view, parent, element, work)? {
+                Some(next) => Anchor::Before(next),
+                None => Anchor::Append(parent),
+            }
+        }
+    })
+}
+
+/// One datum a signed `Manifest` lists, with its MIME type: each one gets a
+/// `DataObjectFormat` as a signed data object (EN 319 132-1 §6.3(k)).
+#[derive(Debug, Clone, Copy)]
+pub struct ManifestEntry<'a> {
+    /// URI of the datum.
+    pub uri: &'a str,
+    /// MIME type of the datum.
+    pub mime_type: &'a str,
 }
 
 /// What one new signature signs and where it goes.
 pub struct Request<'a> {
     /// ID of the new `Signature`. The IDs of its parts derive from it, as
-    /// `{id}-signed-properties`, `{id}-value`, `{id}-reference-{n}` and
-    /// `{id}-object-{n}`; none of them may already be declared.
+    /// `{id}-signed-properties`, `{id}-value`, `{id}-reference-{n}`,
+    /// `{id}-object-{n}` and, when [`DataObject::KeyInfo`] signs it,
+    /// `{id}-key-info`; none of them may already be declared.
     pub id: &'a str,
     /// Claimed signing time, an XML Schema dateTime with an explicit timezone.
     /// This is the signer's claim, not a clock reading or temporal evidence.
@@ -106,13 +251,15 @@ pub struct Request<'a> {
     /// The data objects, in reference order. Enveloping content moves into
     /// the signature.
     pub objects: Vec<DataObject<'a>>,
-    /// ID of the element the signature is appended to; the document element
-    /// when absent.
-    pub parent: Option<&'a str>,
+    /// Where the signature goes in the document.
+    pub placement: Placement<'a>,
     /// Detached data, keyed as the signing operation resolves its URIs.
     pub resources: Option<&'a BTreeMap<String, Vec<u8>>>,
     /// ID attributes beyond the standard spellings.
     pub id_attributes: &'a [IdAttributeRegistration],
+    /// The optional qualifying properties; their references name the data
+    /// objects by the reference URIs [`Request::id`] describes.
+    pub properties: Properties<'a>,
 }
 
 /// A countersignature of one existing `XAdES` signature
@@ -126,6 +273,9 @@ pub struct Countersignature<'a> {
     pub signing_time: &'a str,
     /// ID attributes beyond the standard spellings.
     pub id_attributes: &'a [IdAttributeRegistration],
+    /// The optional qualifying properties. A countersignature signs no data
+    /// object, so it takes no commitment and no format details.
+    pub properties: Properties<'a>,
 }
 
 /// The verification that assesses the signed generation before it is published.
@@ -161,6 +311,10 @@ pub enum CreateError {
     /// No `Signature` element has the parent ID.
     #[error("no Signature has the ID {0:?}")]
     UnknownSignature(String),
+    /// No element has the ID the placement names, or it has no parent to
+    /// place a sibling in.
+    #[error("no element to place the signature at: {0:?}")]
+    UnknownPlacement(String),
     /// The parent has no `QualifyingProperties` targeting it.
     #[error("signature {0:?} has no XAdES qualifying properties")]
     NotXades(String),
@@ -168,9 +322,24 @@ pub enum CreateError {
     /// reference. Adding one would change bytes its timestamps may cover.
     #[error("signature {0:?} has no SignatureValue ID to countersign")]
     Uncountersignable(String),
-    /// The shared property rules refused a value.
+    /// The shared property rules or xml-sec refused a property.
     #[error("property construction refused: {0:?}")]
-    Properties(produce::Error<DraftError>),
+    Properties(produce::Error<PropertyError>),
+    /// A commitment or format details on a countersignature, which signs
+    /// no data object they could qualify (EN 319 132-1 §5.2.3, §5.2.4).
+    #[error("a countersignature has no data objects to qualify")]
+    NoQualifiedObject,
+    /// Format details name a reference that is not one of the signature's
+    /// data objects, or name one twice.
+    #[error("format details for {0:?} name no data object or one already described")]
+    FormatReference(String),
+    /// A policy store without the explicit signature policy it stores
+    /// (EN 319 132-1 §5.2.10).
+    #[error("a policy store needs an explicit signature policy")]
+    PolicyStoreWithoutPolicy,
+    /// A content timestamp could not be requested, checked or kept.
+    #[error(transparent)]
+    Content(Box<ContentError>),
     /// The property draft could not be completed.
     #[error(transparent)]
     Draft(#[from] DraftError),
@@ -223,6 +392,12 @@ impl From<MemoryError> for CreateError {
     }
 }
 
+impl From<ContentError> for CreateError {
+    fn from(error: ContentError) -> Self {
+        Self::Content(Box::new(error))
+    }
+}
+
 impl From<PlacementError> for CreateError {
     fn from(error: PlacementError) -> Self {
         match error {
@@ -240,6 +415,7 @@ struct Ids {
     signature: String,
     properties: String,
     value: String,
+    key_info: String,
 }
 
 impl Ids {
@@ -248,6 +424,7 @@ impl Ids {
             signature: signature.into(),
             properties: format!("{signature}-signed-properties"),
             value: format!("{signature}-value"),
+            key_info: format!("{signature}-key-info"),
         }
     }
 }
@@ -269,79 +446,421 @@ pub fn create<W: Work>(
     assessment: &Assessment<'_, '_>,
     work: &W,
 ) -> Result<(), CreateError> {
-    if request.objects.is_empty() {
-        return Err(CreateError::NoDataObject);
+    let layout = Layout::new(document, &request)?;
+    let key_info = checked_key_info(signer, work)?;
+    let stamps = request.properties.content_timestamps;
+    if stamps.is_empty() {
+        let properties = layout.properties(signer, &request, None, work)?;
+        let template = layout.template(signer, request.objects, properties)?;
+        return document.transaction(|document| {
+            let placed = Placed::new(
+                document,
+                signer,
+                &key_info,
+                &layout,
+                &request.placement,
+                (request.resources, request.id_attributes),
+                work,
+            )?;
+            placed.sign(document, &template, signer.policy, KeptInputs::NONE)?;
+            assess(
+                document,
+                &layout.ids.signature,
+                request.id_attributes,
+                assessment,
+                work,
+            )
+        });
     }
-    let ids = Ids::new(request.id);
-    // Same-document URIs; the IDs are the text after '#'.
-    let references: Vec<String> = (0..request.objects.len())
-        .map(|index| format!("#{}-reference-{index}", ids.signature))
-        .collect();
-    let objects: Vec<String> = (0..request.objects.len())
-        .map(|index| format!("#{}-object-{index}", ids.signature))
-        .collect();
-    let enveloping = request
-        .objects
-        .iter()
-        .zip(&objects)
-        .filter(|(object, _)| matches!(object, DataObject::Enveloping { .. }))
-        .map(|(_, uri)| &uri[1..]);
-    let new_ids: Vec<&str> = [ids.signature.as_str(), &ids.properties, &ids.value]
-        .into_iter()
-        .chain(references.iter().map(|uri| &uri[1..]))
-        .chain(enveloping)
-        .collect();
-    require_free(document, &new_ids, request.id_attributes)?;
-
-    let described: Vec<produce::DataObject<'_>> = request
-        .objects
-        .iter()
-        .zip(&references)
-        .map(|(object, reference)| produce::DataObject {
-            reference,
-            mime_type: mime_type(object),
-        })
-        .collect();
-    let target = format!("#{}", ids.signature);
-    let properties = signed_properties(
-        signer,
-        &ids,
-        &target,
-        request.signing_time,
-        &described,
-        None,
+    let replayed = layout.replayed(document, signer, &key_info, &request, work)?;
+    let cms = assessment.context.cms_provider();
+    content::with_checked(
+        &replayed,
+        stamps,
+        request.properties.content_evidence.as_ref(),
+        &cms,
         work,
-    )?;
-
-    let Request {
-        objects: data,
-        parent,
-        resources,
-        id_attributes,
-        ..
-    } = request;
-    let template = data_template(
-        signer,
-        data,
-        &references,
-        &objects,
-        signature_template(signer, &ids),
+        |checked| {
+            let properties =
+                layout.properties(signer, &request, Some((&replayed, checked)), work)?;
+            let template = layout.template(signer, request.objects.clone(), properties)?;
+            document.transaction(|document| {
+                let placed = Placed::new(
+                    document,
+                    signer,
+                    &key_info,
+                    &layout,
+                    &request.placement,
+                    (request.resources, request.id_attributes),
+                    work,
+                )?;
+                let digested = placed.sign(document, &template, signer.policy, CONTENT_INPUTS)?;
+                // The timestamps cover the bytes of the dry run; a reference
+                // that digests others depends on the signature it is part of.
+                if !replayed.unchanged(&digested, stamps) {
+                    return Err(ContentError::Changed.into());
+                }
+                assess(
+                    document,
+                    &layout.ids.signature,
+                    request.id_attributes,
+                    assessment,
+                    work,
+                )
+            })
+        },
     )
-    .add_reference(properties_reference(signer, &ids))
-    .add_object(ObjectBuilder::new(ObjectContent::Element(properties)));
+}
 
-    let key_info = key_info(signer)?;
-    let mut context = context(signer, &key_info, id_attributes);
-    if let Some(resources) = resources {
-        context = context.external_resources(resources);
+/// Encode the RFC 3161 request of each content timestamp of `request`, in
+/// order, for the caller to send to its TSA (EN 319 132-1 §5.2.8).
+///
+/// The input of each timestamp is computed by the signing operation of
+/// [`create`] stopped before any signature value: the key signs nothing and
+/// `document` keeps its generation. Pass the responses in
+/// [`ContentTimestamp::response`](crate::ContentTimestamp::response) to
+/// [`create`] with the same request otherwise, which computes the inputs
+/// again and checks each response against its exact request.
+///
+/// # Errors
+/// Returns the original cause; the document is unchanged.
+///
+/// # Examples
+///
+/// ```no_run
+/// use structured_pkix::algorithm::digest::Algorithm;
+/// use xml_sec_xades::properties::Properties;
+/// use xml_sec_xades::{
+///     Assessment, ContentEvidence, ContentScope, ContentTimestamp, Request, Signer, create,
+///     request_content_timestamps,
+/// };
+/// # fn sign(
+/// #     document: &mut xml_sec::XmlDocument,
+/// #     signer: &Signer<'_>,
+/// #     assessment: &Assessment<'_, '_>,
+/// #     request: impl Fn(Properties<'_>) -> Request<'_>,
+/// #     evidence: ContentEvidence<'_>,
+/// #     tsa: impl Fn(&[u8]) -> Vec<u8>,
+/// #     work: &structured_asn1::memory::Memory,
+/// # ) -> Result<(), xml_sec_xades::CreateError> {
+/// let asked = [ContentTimestamp {
+///     scope: ContentScope::All,
+///     digest: Algorithm::Sha256,
+///     policy: None,
+///     nonce: Some(&[0x2a; 8]),
+///     response: None,
+/// }];
+/// let pending = request_content_timestamps(
+///     document,
+///     signer,
+///     &request(Properties { content_timestamps: &asked, ..Properties::default() }),
+///     assessment,
+///     work,
+/// )?;
+/// let response = tsa(pending.get(0).expect("one request"));
+/// let answered = [ContentTimestamp { response: Some(&response), ..asked[0] }];
+/// create(
+///     document,
+///     signer,
+///     request(Properties {
+///         content_timestamps: &answered,
+///         content_evidence: Some(evidence),
+///         ..Properties::default()
+///     }),
+///     assessment,
+///     work,
+/// )
+/// # }
+/// ```
+pub fn request_content_timestamps<W: Work>(
+    document: &mut XmlDocument,
+    signer: &Signer<'_>,
+    request: &Request<'_>,
+    assessment: &Assessment<'_, '_>,
+    work: &W,
+) -> Result<ContentRequests, CreateError> {
+    let layout = Layout::new(document, request)?;
+    let key_info = checked_key_info(signer, work)?;
+    let replayed = layout.replayed(document, signer, &key_info, request, work)?;
+    let cms = assessment.context.cms_provider();
+    Ok(content::requests(
+        &replayed,
+        request.properties.content_timestamps,
+        &cms,
+        work,
+    )?)
+}
+
+/// The signing inputs a content timestamp covers: every reference's bytes.
+const CONTENT_INPUTS: KeptInputs = KeptInputs::NONE
+    .with_signed_info_references()
+    .with_manifest_references();
+
+/// The names of one new signature's parts that derive from its request,
+/// and the plan its properties resolve their references in.
+struct Layout<'r> {
+    ids: Ids,
+    /// `#ID` of each data object's reference, in order.
+    references: Vec<String>,
+    /// `#ID` of each data object's possible enveloping `Object`.
+    objects: Vec<String>,
+    /// `#ID` of each signed `Manifest`'s references, with their MIME types.
+    manifest_references: Vec<(String, &'r str)>,
+    /// Whether a reference signs `KeyInfo`, which then gets an ID.
+    signs_key_info: bool,
+    plan: Vec<Planned>,
+}
+
+impl<'r> Layout<'r> {
+    /// The layout of `request`, whose new IDs `document` must not declare.
+    fn new(document: &XmlDocument, request: &Request<'r>) -> Result<Self, CreateError> {
+        if request.objects.is_empty() {
+            return Err(CreateError::NoDataObject);
+        }
+        let ids = Ids::new(request.id);
+        // Same-document URIs; the IDs are the text after '#'.
+        let references: Vec<String> = (0..request.objects.len())
+            .map(|index| format!("#{}-reference-{index}", ids.signature))
+            .collect();
+        let objects: Vec<String> = (0..request.objects.len())
+            .map(|index| format!("#{}-object-{index}", ids.signature))
+            .collect();
+        let manifest_references = manifest_references(&request.objects);
+        // KeyInfo gets an ID only when a reference signs it, so every other
+        // signature keeps its exact form.
+        let signs_key_info = request
+            .objects
+            .iter()
+            .any(|object| matches!(object, DataObject::KeyInfo { .. }));
+        let new_ids = new_ids(
+            &request.objects,
+            &ids,
+            signs_key_info.then_some(ids.key_info.as_str()),
+            &references,
+            &objects,
+            &manifest_references,
+        );
+        require_free(document, &new_ids, request.id_attributes)?;
+        let plan = reference_plan(&request.objects, &references, &manifest_references);
+        Ok(Self {
+            ids,
+            references,
+            objects,
+            manifest_references,
+            signs_key_info,
+            plan,
+        })
     }
-    if let Some(parent) = parent {
-        context = context.start_node_id(parent);
+
+    /// The `QualifyingProperties` of the new signature, with the content
+    /// timestamps checked over `content`, if any.
+    fn properties<W: Work>(
+        &self,
+        signer: &Signer<'_>,
+        request: &Request<'_>,
+        content: Option<Stamps<'_, '_>>,
+        work: &W,
+    ) -> Result<ObjectElement, CreateError> {
+        let described: Vec<produce::DataObject<'_>> = request
+            .objects
+            .iter()
+            .zip(&self.references)
+            .map(|(object, reference)| produce::DataObject {
+                reference,
+                mime_type: mime_type(object),
+            })
+            .chain(
+                self.manifest_references
+                    .iter()
+                    .map(|(reference, mime_type)| produce::DataObject {
+                        reference,
+                        mime_type,
+                    }),
+            )
+            .collect();
+        let target = format!("#{}", self.ids.signature);
+        signed_properties(
+            signer,
+            &self.ids,
+            &target,
+            request.signing_time,
+            &described,
+            None,
+            &Optional {
+                properties: &request.properties,
+                plan: &self.plan,
+                content,
+            },
+            work,
+        )
     }
-    document.transaction(|document| {
-        context.sign_document_with_builder(document, &template)?;
-        assess(document, &ids.signature, id_attributes, assessment, work)
-    })
+
+    /// The template of the new signature: one reference per data object,
+    /// then the `SignedProperties` one, and the `Object`s.
+    fn template(
+        &self,
+        signer: &Signer<'_>,
+        data: Vec<DataObject<'_>>,
+        properties: ObjectElement,
+    ) -> Result<SignatureBuilder, CreateError> {
+        let mut skeleton = signature_template(signer, &self.ids);
+        if self.signs_key_info {
+            skeleton = skeleton.key_info_id(self.ids.key_info.as_str());
+        }
+        Ok(data_template(
+            signer,
+            data,
+            &self.references,
+            &self.objects,
+            &self.ids.key_info,
+            skeleton,
+        )?
+        .add_reference(properties_reference(signer, &self.ids))
+        .add_object(ObjectBuilder::new(ObjectContent::Element(properties))))
+    }
+
+    /// The bytes every reference of the new signature digests, from a dry
+    /// run of its signing operation with the properties but no content
+    /// timestamp; `document` keeps its generation.
+    fn replayed<W: Work>(
+        &self,
+        document: &mut XmlDocument,
+        signer: &Signer<'_>,
+        key_info: &X509CertificateKeyInfoWriter,
+        request: &Request<'_>,
+        work: &W,
+    ) -> Result<Replayed<'_>, CreateError> {
+        let properties = self.properties(signer, request, None, work)?;
+        let template = self.template(signer, request.objects.clone(), properties)?;
+        let placed = Placed::new(
+            document,
+            signer,
+            key_info,
+            self,
+            &request.placement,
+            (request.resources, request.id_attributes),
+            work,
+        )?;
+        let inputs = placed.inputs(document, &template, signer.policy)?;
+        Ok(Replayed::new(
+            inputs,
+            &self.references,
+            &self.manifest_references,
+            (&signer.canonicalization, signer.policy),
+        )?)
+    }
+}
+
+/// Content timestamps checked over the dry run, each with its input.
+type Stamps<'s, 'l> = (
+    &'s Replayed<'l>,
+    &'s [(
+        &'s ContentInput<'s, Replayed<'l>>,
+        CheckedContent<'s, 's, 's, Replayed<'l>>,
+    )],
+);
+
+/// Where a template goes and the operation that signs it there.
+struct Placed<'a> {
+    context: SignContext<'a>,
+    at: Option<Anchor>,
+}
+
+impl<'a> Placed<'a> {
+    /// The signing operation of `layout` at `placement` in `document`.
+    fn new<W: Work>(
+        document: &XmlDocument,
+        signer: &'a Signer<'a>,
+        key_info: &'a X509CertificateKeyInfoWriter,
+        layout: &'a Layout<'_>,
+        placement: &Placement<'a>,
+        (resources, id_attributes): (
+            Option<&'a BTreeMap<String, Vec<u8>>>,
+            &'a [IdAttributeRegistration],
+        ),
+        work: &W,
+    ) -> Result<Self, CreateError> {
+        let mut context = context(signer, key_info, id_attributes);
+        if let Some(resources) = resources {
+            context = context.external_resources(resources);
+        }
+        // The signer appends a new signature; any other placement inserts
+        // the template first and signs it where it stands, as a
+        // countersignature is.
+        let at = match *placement {
+            Placement::DocumentEnd => None,
+            Placement::LastChildOf(parent) => {
+                context = context.start_node_id(parent);
+                None
+            }
+            other => Some(document.with_view(|view| anchor(view, other, id_attributes, work))?),
+        };
+        if at.is_some() {
+            context = context
+                .start_node_id(&layout.ids.signature)
+                .signature_template_selection(SignatureTemplateSelection::FirstDescendant);
+        }
+        Ok(Self { context, at })
+    }
+
+    /// Sign `template` in place, keeping the signing inputs `kept` names.
+    fn sign(
+        &self,
+        document: &mut XmlDocument,
+        template: &SignatureBuilder,
+        policy: &SigningPolicy,
+        kept: KeptInputs,
+    ) -> Result<SigningInputs, CreateError> {
+        let Some(at) = self.at else {
+            return Ok(self
+                .context
+                .sign_document_with_builder_keeping(document, template, kept)?
+                .1);
+        };
+        insert(document, template, policy, at)?;
+        Ok(self.context.sign_document_keeping(document, kept)?.1)
+    }
+
+    /// The bytes every reference of `template` digests where it goes,
+    /// without signing; `document` keeps its generation.
+    fn inputs(
+        &self,
+        document: &mut XmlDocument,
+        template: &SignatureBuilder,
+        policy: &SigningPolicy,
+    ) -> Result<SigningInputs, CreateError> {
+        let Some(at) = self.at else {
+            return Ok(self.context.reference_inputs_with_builder(
+                document,
+                template,
+                CONTENT_INPUTS,
+            )?);
+        };
+        // Failing the transaction on purpose discards the inserted template;
+        // the dry run's outcome leaves it as the rollback value.
+        let Err(outcome) = document.transaction(|document| {
+            Err::<core::convert::Infallible, _>(
+                insert(document, template, policy, at)
+                    .and_then(|()| Ok(self.context.reference_inputs(document, CONTENT_INPUTS)?)),
+            )
+        });
+        outcome
+    }
+}
+
+/// Insert `template` at `at`, as markup, before a signing run.
+fn insert(
+    document: &mut XmlDocument,
+    template: &SignatureBuilder,
+    policy: &SigningPolicy,
+    at: Anchor,
+) -> Result<(), CreateError> {
+    let markup = template.build_template_with_policy(policy)?;
+    match at {
+        Anchor::Before(node) => document.insert_before(node, &markup)?,
+        Anchor::Append(node) => document.append_child(node, &markup)?,
+    }
+    Ok(())
 }
 
 /// Add one reference per data object, in order, and an `Object` holding each
@@ -351,11 +870,14 @@ fn data_template(
     data: Vec<DataObject<'_>>,
     references: &[String],
     objects: &[String],
+    key_info: &str,
     mut template: SignatureBuilder,
-) -> SignatureBuilder {
+) -> Result<SignatureBuilder, CreateError> {
     let mut enveloping = Vec::new();
     for ((object, reference), object_uri) in data.into_iter().zip(references).zip(objects) {
         let c14n = || Transform::C14n(signer.canonicalization.clone());
+        // XMLDSig 1.1 §5.1: a reference to a Manifest says so in its Type.
+        let manifest = matches!(object, DataObject::Manifest { .. });
         let (uri, transforms) = match object {
             DataObject::Document { envelope, .. } => (
                 String::new(),
@@ -374,10 +896,37 @@ fn data_template(
                 enveloping.push(ObjectBuilder::new(content).id(&object_uri[1..]));
                 (object_uri.clone(), Vec::from([c14n()]))
             }
+            DataObject::Object {
+                id,
+                content,
+                encoding,
+                transforms,
+                mime_type,
+            } => {
+                let mut object = ObjectBuilder::new(content).id(id).mime_type(mime_type);
+                if let Some(encoding) = encoding {
+                    object = object.encoding(encoding);
+                }
+                enveloping.push(object);
+                (format!("#{id}"), transforms)
+            }
+            DataObject::Manifest { id, entries, .. } => {
+                let element =
+                    ObjectElement::parse(manifest_markup(signer, id, &entries), signer.policy)?;
+                enveloping.push(ObjectBuilder::new(ObjectContent::Element(element)));
+                (format!("#{id}"), Vec::from([c14n()]))
+            }
+            DataObject::KeyInfo { .. } => (format!("#{key_info}"), Vec::from([c14n()])),
+            DataObject::Reference {
+                uri, transforms, ..
+            } => (String::from(uri), transforms),
         };
         let mut built = ReferenceBuilder::new(signer.digest)
             .uri(uri)
             .id(&reference[1..]);
+        if manifest {
+            built = built.ref_type(MANIFEST_TYPE);
+        }
         for transform in transforms {
             built = built.transform(transform);
         }
@@ -386,7 +935,109 @@ fn data_template(
     for object in enveloping {
         template = template.add_object(object);
     }
-    template
+    Ok(template)
+}
+
+/// Every ID a new signature declares: its parts, its references, the
+/// enveloping and named objects and the references of its `Manifest`s.
+fn new_ids<'a>(
+    data: &'a [DataObject<'a>],
+    ids: &'a Ids,
+    key_info: Option<&'a str>,
+    references: &'a [String],
+    objects: &'a [String],
+    manifest_references: &'a [(String, &str)],
+) -> Vec<&'a str> {
+    let enveloping = data
+        .iter()
+        .zip(objects)
+        .filter(|(object, _)| matches!(object, DataObject::Enveloping { .. }))
+        .map(|(_, uri)| &uri[1..]);
+    let named = data.iter().filter_map(|object| match object {
+        DataObject::Object { id, .. } | DataObject::Manifest { id, .. } => Some(*id),
+        _ => None,
+    });
+    [ids.signature.as_str(), &ids.properties, &ids.value]
+        .into_iter()
+        .chain(key_info)
+        .chain(references.iter().map(|uri| &uri[1..]))
+        .chain(enveloping)
+        .chain(named)
+        .chain(manifest_references.iter().map(|(uri, _)| &uri[1..]))
+        .collect()
+}
+
+/// Each reference of a signed `Manifest` among `objects`, as `#ID` with the
+/// MIME type of the datum it names.
+fn manifest_references<'a>(objects: &[DataObject<'a>]) -> Vec<(String, &'a str)> {
+    objects
+        .iter()
+        .filter_map(|object| match object {
+            DataObject::Manifest { id, entries, .. } => Some((*id, entries)),
+            _ => None,
+        })
+        .flat_map(|(id, entries)| {
+            entries.iter().enumerate().map(move |(index, entry)| {
+                (
+                    format!("#{}", manifest_reference_id(id, index)),
+                    entry.mime_type,
+                )
+            })
+        })
+        .collect()
+}
+
+/// The ID of the `index`th reference of `Manifest` `id`.
+fn manifest_reference_id(id: &str, index: usize) -> String {
+    format!("{id}-reference-{index}")
+}
+
+/// `XMLDSig` 1.1 §5.1: the `Type` of a reference to a `Manifest`.
+const MANIFEST_TYPE: &str = "http://www.w3.org/2000/09/xmldsig#Manifest";
+
+/// A `Manifest` whose references name `entries`, with empty digest values
+/// the signing operation fills before it digests the `Manifest` itself.
+/// Each entry is digested as dereferenced, as a detached reference is.
+fn manifest_markup(signer: &Signer<'_>, id: &str, entries: &[ManifestEntry<'_>]) -> String {
+    let (prefix, declaration) = match signer.prefixes.ds {
+        "" => (String::new(), format!(" xmlns=\"{DS}\"")),
+        prefix => (format!("{prefix}:"), format!(" xmlns:{prefix}=\"{DS}\"")),
+    };
+    let escape = |value: &str| {
+        value
+            .replace('&', "&amp;")
+            .replace('"', "&quot;")
+            .replace('<', "&lt;")
+    };
+    let mut markup = format!("<{prefix}Manifest{declaration} Id=\"{}\">", escape(id));
+    let digest_method = signer.digest.uri();
+    for (index, entry) in entries.iter().enumerate() {
+        for piece in [
+            "<",
+            &prefix,
+            "Reference Id=\"",
+            &escape(&manifest_reference_id(id, index)),
+            "\" URI=\"",
+            &escape(entry.uri),
+            "\"><",
+            &prefix,
+            "DigestMethod Algorithm=\"",
+            digest_method,
+            "\"/><",
+            &prefix,
+            "DigestValue></",
+            &prefix,
+            "DigestValue></",
+            &prefix,
+            "Reference>",
+        ] {
+            markup.push_str(piece);
+        }
+    }
+    for piece in ["</", &prefix, "Manifest>"] {
+        markup.push_str(piece);
+    }
+    markup
 }
 
 /// Countersign one existing `XAdES` signature and publish the result as one
@@ -426,6 +1077,9 @@ pub fn countersign<W: Work>(
     })?;
     let value_uri = format!("#{value}");
 
+    if countersignature.properties.qualifies_objects() {
+        return Err(CreateError::NoQualifiedObject);
+    }
     let target = format!("#{}", ids.signature);
     let properties = signed_properties(
         signer,
@@ -434,6 +1088,11 @@ pub fn countersign<W: Work>(
         countersignature.signing_time,
         &[],
         Some(&value_uri),
+        &Optional {
+            properties: &countersignature.properties,
+            plan: &[],
+            content: None,
+        },
         work,
     )?;
     let template = signature_template(signer, &ids)
@@ -452,9 +1111,12 @@ pub fn countersign<W: Work>(
         .start_node_id(&ids.signature)
         .signature_template_selection(SignatureTemplateSelection::FirstDescendant);
 
-    let counter = format!(
-        "<xades:CounterSignature xmlns:xades=\"{XADES}\">{template}</xades:CounterSignature>"
-    );
+    let counter = match signer.prefixes.xades {
+        "" => format!("<CounterSignature xmlns=\"{XADES}\">{template}</CounterSignature>"),
+        prefix => format!(
+            "<{prefix}:CounterSignature xmlns:{prefix}=\"{XADES}\">{template}</{prefix}:CounterSignature>"
+        ),
+    };
     document.transaction(|document| {
         located.unsigned.insert(document, &counter)?;
         context.sign_document(document)?;
@@ -485,7 +1147,11 @@ fn mime_type<'a>(object: &DataObject<'a>) -> &'a str {
         DataObject::Document { mime_type, .. }
         | DataObject::Element { mime_type, .. }
         | DataObject::Detached { mime_type, .. }
-        | DataObject::Enveloping { mime_type, .. } => mime_type,
+        | DataObject::Enveloping { mime_type, .. }
+        | DataObject::Object { mime_type, .. }
+        | DataObject::Manifest { mime_type, .. }
+        | DataObject::KeyInfo { mime_type }
+        | DataObject::Reference { mime_type, .. } => mime_type,
     }
 }
 
@@ -501,8 +1167,128 @@ fn require_free(
     })
 }
 
+/// The reference plan the properties resolve their references in: each data
+/// object's reference with the `MimeType` and `Encoding` of the `ds:Object`
+/// it targets, then the references of the signed `Manifest`s.
+fn reference_plan(
+    objects: &[DataObject<'_>],
+    references: &[String],
+    manifest_references: &[(String, &str)],
+) -> Vec<Planned> {
+    objects
+        .iter()
+        .zip(references)
+        .map(|(object, uri)| {
+            let (mime_type, encoding) = match object {
+                DataObject::Object {
+                    mime_type,
+                    encoding,
+                    ..
+                } => (Some(String::from(*mime_type)), encoding.map(String::from)),
+                _ => (None, None),
+            };
+            Planned {
+                uri: uri.clone(),
+                mime_type,
+                encoding,
+            }
+        })
+        .chain(manifest_references.iter().map(|(uri, _)| Planned {
+            uri: uri.clone(),
+            mime_type: None,
+            encoding: None,
+        }))
+        .collect()
+}
+
+/// The optional properties of one new signature with what drafting them
+/// needs: the reference plan and the checked content timestamps.
+struct Optional<'p, 's, 'l> {
+    properties: &'p Properties<'p>,
+    plan: &'p [Planned],
+    content: Option<Stamps<'s, 'l>>,
+}
+
+/// The explicit signature policy of `properties`, after refusing a store
+/// without one and format details that name no data object of `objects`
+/// or one already described.
+fn checked_optional<'p>(
+    properties: &'p Properties<'p>,
+    objects: &[produce::DataObject<'_>],
+) -> Result<
+    Option<&'p crate::properties::ExplicitPolicy<'p, crate::properties::Fragment>>,
+    CreateError,
+> {
+    // A supplied digest comes without the document a store would carry.
+    let staged = match &properties.policy {
+        Some(Policy::Document(SignaturePolicy::Explicit(policy))) => Some(policy),
+        _ => None,
+    };
+    if properties.policy_store.is_some() && staged.is_none() {
+        return Err(CreateError::PolicyStoreWithoutPolicy);
+    }
+    if properties.formats.is_empty() {
+        return Ok(staged);
+    }
+    // One pass each way: the objects' references, then each format's
+    // reference checked against them and against those already described.
+    let known: alloc::collections::BTreeSet<&str> =
+        objects.iter().map(|object| object.reference).collect();
+    let mut described = alloc::collections::BTreeSet::new();
+    for details in properties.formats {
+        if !known.contains(details.reference) || !described.insert(details.reference) {
+            return Err(CreateError::FormatReference(details.reference.into()));
+        }
+    }
+    Ok(staged)
+}
+
+/// Write `policy`'s `SignaturePolicyIdentifier`; a supplied digest must have
+/// the width of its method, which the signing policy admits.
+fn write_policy<W: Work>(
+    policy: &Policy<'_>,
+    signing: &SigningPolicy,
+    writer: &mut PropertyDraft<'_>,
+    work: &W,
+) -> Result<(), produce::Error<PropertyError>> {
+    match policy {
+        Policy::Document(policy) => policy.write(writer, work),
+        Policy::Supplied(policy) => policy.write(writer, work, |method, _| {
+            Ok(policy_digest_method(signing, method)?.output_len())
+        }),
+    }
+}
+
 /// The `QualifyingProperties` of a new signature, drafted from the shared
-/// B-B rules and checked as `Object` content under the signing policy.
+/// B-B rules and the optional properties, and checked as `Object` content
+/// under the signing policy.
+/// The signer's certificate `leaf`, exactly one DER certificate.
+fn leaf_certificate<'p>(
+    parser: &'p Parser,
+    leaf: &'p [u8],
+) -> Result<Certificate<'p>, CreateError> {
+    let certificate = Certificate::read(parser, leaf, 0).map_err(CreateError::Certificate)?;
+    if certificate.as_bytes().len() != leaf.len() {
+        return Err(CreateError::TrailingBytes);
+    }
+    Ok(certificate)
+}
+
+/// `key_info(signer)` after the signer's certificate is checked, so a leaf
+/// that is no certificate keeps that cause.
+fn checked_key_info<W: Work>(
+    signer: &Signer<'_>,
+    work: &W,
+) -> Result<X509CertificateKeyInfoWriter, CreateError> {
+    let (&leaf, _) = signer.chain.split_first().ok_or(CreateError::EmptyChain)?;
+    leaf_certificate(&Parser::der(work.memory().clone()), leaf)?;
+    key_info(signer)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the B-B inputs of one signature, each a distinct required value"
+)]
 fn signed_properties<W: Work>(
     signer: &Signer<'_>,
     ids: &Ids,
@@ -510,14 +1296,18 @@ fn signed_properties<W: Work>(
     signing_time: &str,
     objects: &[produce::DataObject<'_>],
     counter_signature: Option<&str>,
+    optional: &Optional<'_, '_, '_>,
     work: &W,
 ) -> Result<ObjectElement, CreateError> {
+    let &Optional {
+        properties,
+        plan,
+        content,
+    } = optional;
+    let staged = checked_optional(properties, objects)?;
     let (&leaf, _) = signer.chain.split_first().ok_or(CreateError::EmptyChain)?;
     let parser = Parser::der(work.memory().clone());
-    let certificate = Certificate::read(&parser, leaf, 0).map_err(CreateError::Certificate)?;
-    if certificate.as_bytes().len() != leaf.len() {
-        return Err(CreateError::TrailingBytes);
-    }
+    let certificate = leaf_certificate(&parser, leaf)?;
     // EN 319 132-1 §5.2.2: CertDigest is the digest of the complete
     // certificate encoding, computed here by the operation's provider.
     let digest = compute_digest_with_provider(signer.provider, signer.digest, leaf, work.memory())?;
@@ -531,21 +1321,98 @@ fn signed_properties<W: Work>(
         objects,
         counter_signature,
     };
-    let mut draft = Draft::new();
+    let mut writer = PropertyDraft {
+        draft: Draft::with_prefixes(&[(DS, signer.prefixes.ds), (XADES, signer.prefixes.xades)])?,
+        plan,
+        provider: signer.provider,
+        policy: signer.policy,
+        bound: staged.map_or(Bound::None, Bound::Staged),
+        specified: properties.specified,
+        content: content.map(|(replayed, _)| replayed),
+    };
+    // EN 319 132-1 Annex A orders SignedSignatureProperties as policy,
+    // production place, signer role after the signing certificate, and
+    // SignedDataObjectProperties as formats, commitments, then content
+    // timestamps.
     basic
-        .write(&mut draft, work)
+        .write_with_properties(
+            &mut writer,
+            work,
+            |writer, work| {
+                if let Some(policy) = &properties.policy {
+                    write_policy(policy, signer.policy, writer, work)?;
+                }
+                if let Some(place) = properties.production_place {
+                    place.write(writer, work)?;
+                }
+                if let Some(role) = &properties.signer_role {
+                    role.write(writer, work)?;
+                }
+                Ok(())
+            },
+            |writer, work| {
+                for object in objects {
+                    let details = properties
+                        .formats
+                        .iter()
+                        .find(|details| details.reference == object.reference);
+                    produce::DataObjectFormat {
+                        reference: object.reference,
+                        description: details.and_then(|details| details.description),
+                        identifier: details.and_then(|details| details.identifier),
+                        mime_type: Some(object.mime_type),
+                        encoding: details.and_then(|details| details.encoding),
+                    }
+                    .write(writer, work)?;
+                }
+                for commitment in properties.commitments {
+                    commitment.write(writer, work)?;
+                }
+                for (input, checked) in content.map_or(&[][..], |(_, stamps)| stamps) {
+                    input.write(core::slice::from_ref(checked), writer, work)?;
+                }
+                Ok(())
+            },
+            |writer, work| {
+                let (Some(store), Some(policy)) = (&properties.policy_store, staged) else {
+                    return Ok(());
+                };
+                for local in ["UnsignedProperties", "UnsignedSignatureProperties"] {
+                    writer
+                        .write(
+                            Event::Begin(Name {
+                                namespace: XADES,
+                                local,
+                            }),
+                            work,
+                        )
+                        .map_err(produce::Error::Writer)?;
+                }
+                policy.write_store(store, writer, work)?;
+                for _ in 0..2 {
+                    writer
+                        .write(Event::End, work)
+                        .map_err(produce::Error::Writer)?;
+                }
+                Ok(())
+            },
+        )
         .map_err(CreateError::Properties)?;
-    let (markup, _) = draft.finish()?;
+    let (markup, _) = writer.draft.finish()?;
     Ok(ObjectElement::parse(markup, signer.policy)?)
 }
 
 /// The signature skeleton every new signature shares.
 fn signature_template(signer: &Signer<'_>, ids: &Ids) -> SignatureBuilder {
-    SignatureBuilder::new(signer.canonicalization.clone(), signer.method)
-        .ns_prefix("ds")
+    let template = SignatureBuilder::new(signer.canonicalization.clone(), signer.method)
         .signature_id(ids.signature.as_str())
         .signature_value_id(ids.value.as_str())
-        .key_info(true)
+        .key_info(true);
+    // The builder writes the default namespace when no prefix is set.
+    match signer.prefixes.ds {
+        "" => template,
+        prefix => template.ns_prefix(prefix),
+    }
 }
 
 /// EN 319 132-1 §4.4.2: a typed reference covers the complete `SignedProperties`.

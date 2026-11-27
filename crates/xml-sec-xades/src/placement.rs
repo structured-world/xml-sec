@@ -100,6 +100,8 @@ impl Unsigned {
 /// One `XAdES` signature, located by ID.
 pub(crate) struct Located {
     pub(crate) signature: NodeIdentity,
+    /// The `QualifyingProperties` targeting the signature.
+    pub(crate) qualifying: NodeIdentity,
     pub(crate) unsigned: Unsigned,
 }
 
@@ -151,6 +153,7 @@ pub(crate) fn locate<W: Work>(
     };
     Ok(Located {
         signature,
+        qualifying,
         unsigned,
     })
 }

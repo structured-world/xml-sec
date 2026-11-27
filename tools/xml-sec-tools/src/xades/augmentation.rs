@@ -4,7 +4,8 @@
 //! writes the timestamp requests of a B-B signature xml-sec creates, then,
 //! from the responses so far, those of its first archive timestamp and of
 //! that archive's renewal; the OpenSSL TSA answers every one, so no response
-//! is produced by xml-sec.
+//! is produced by xml-sec. `xades fixtures --content` issues the same PKI for
+//! the content timestamps of a new signature.
 
 use super::fixtures::Generator;
 use super::levels::{Levels, TSA_CONFIG};
@@ -69,8 +70,9 @@ fn probe(corpus: &Corpus, generator: &Generator, action: &str) -> Result<(), Str
     Ok(())
 }
 
-/// Issues the chain and the TSA, then writes the requests and every response.
-pub(crate) fn generate(corpus: &Corpus, generator: &Generator) -> Result<(), String> {
+/// Issues the signer chain and a TSA under the same intermediate, and writes
+/// the certificates and the signer's key.
+fn issue_with_tsa(generator: &Generator) -> Result<(), String> {
     for directory in [&generator.output, &generator.work] {
         std::fs::create_dir_all(directory)
             .map_err(|error| format!("create {}: {error}", directory.display()))?;
@@ -92,6 +94,91 @@ pub(crate) fn generate(corpus: &Corpus, generator: &Generator) -> Result<(), Str
         &generator.output.join("signer.key"),
         read(&generator.work.join("signer.key"))?,
     )?;
+    write(&generator.work.join("tsa.serial"), "01\n")
+}
+
+/// `xades fixtures --content`: the content timestamp and refresh fixtures.
+/// The probe writes the requests of a new signature's content timestamps,
+/// computed before it is signed, and the signature timestamp request of a
+/// B-B signature; the OpenSSL TSA answers each one. Two generations of each
+/// CA's CRL let a B-LT signature take fresher statuses.
+pub(crate) fn content(corpus: &Corpus, generator: &Generator) -> Result<(), String> {
+    issue_with_tsa(generator)?;
+    // Two generations of each CA's CRL: a signature takes B-LT with the first
+    // and has the second added by a refresh.
+    let levels = Levels { generator };
+    for issuer in ["root", "intermediate"] {
+        write(
+            &generator.output.join(format!("{issuer}.crl")),
+            levels.crl(issuer)?,
+        )?;
+        write(
+            &generator.output.join(format!("{issuer}-next.crl")),
+            levels.next_crl(issuer)?,
+        )?;
+    }
+    // An empty delta over the intermediate CA's first CRL: a refresh binds it
+    // to the complete list the document already carries.
+    write(
+        &generator.output.join("intermediate-delta.crl"),
+        levels.delta_crl("intermediate", None)?,
+    )?;
+    // Responses for the signer and the TSA, signed by their CA's delegated
+    // responder: a B-LT signature that carries them can take a fresher CRL by
+    // a refresh.
+    generator.certify(
+        "responder",
+        "intermediate",
+        "/CN=xml-sec XAdES Test OCSP",
+        "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=critical,OCSPSigning\nnoCheck=ignored\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n",
+    )?;
+    for subject in ["signer", "tsa"] {
+        write(
+            &generator.output.join(format!("{subject}.ocsp")),
+            levels.ocsp_delegated("intermediate", "responder", subject)?,
+        )?;
+    }
+    probe(corpus, generator, "content-request")?;
+    for (query, response) in [
+        ("content-all.tsq", "content-all.tsr"),
+        ("content-individual.tsq", "content-individual.tsr"),
+        ("content-changing.tsq", "content-changing.tsr"),
+        ("signature.tsq", "signature.tsr"),
+    ] {
+        write(
+            &generator.output.join(query),
+            read(&generator.work.join(query))?,
+        )?;
+        reply(generator, query, response, true)?;
+    }
+    // The signature timestamp, then the archive timestamp, of the signature
+    // that carries content timestamps and a policy store, each needing the
+    // response before it.
+    for (action, query, response) in [
+        (
+            "content-lta-request",
+            "content-lta-signature.tsq",
+            "content-lta-signature.tsr",
+        ),
+        (
+            "content-lta-archive-request",
+            "content-lta-archive.tsq",
+            "content-lta-archive.tsr",
+        ),
+    ] {
+        probe(corpus, generator, action)?;
+        write(
+            &generator.output.join(query),
+            read(&generator.work.join(query))?,
+        )?;
+        reply(generator, query, response, true)?;
+    }
+    Ok(())
+}
+
+/// Issues the chain and the TSA, then writes the requests and every response.
+pub(crate) fn generate(corpus: &Corpus, generator: &Generator) -> Result<(), String> {
+    issue_with_tsa(generator)?;
     let levels = Levels { generator };
     for issuer in ["root", "intermediate"] {
         write(
@@ -99,7 +186,6 @@ pub(crate) fn generate(corpus: &Corpus, generator: &Generator) -> Result<(), Str
             levels.crl(issuer)?,
         )?;
     }
-    write(&generator.work.join("tsa.serial"), "01\n")?;
     probe(corpus, generator, "request")?;
     for name in ["request.tsq", "request-policy.tsq", "request-no-nonce.tsq"] {
         write(

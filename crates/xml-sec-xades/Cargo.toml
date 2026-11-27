@@ -9,10 +9,10 @@ description = "XAdES baseline validation of signatures verified by xml-sec"
 
 [dependencies]
 xml-sec = { path = "../..", default-features = false, features = ["xmldsig", "c14n", "cms"] }
-structured-xades = { version = "0.30", default-features = false, features = ["alloc"] }
+structured-xades = { version = "0.30.3", default-features = false, features = ["alloc"] }
 structured-asn1 = { version = "0.30", default-features = false, features = ["alloc"] }
 structured-pkix = { version = "0.30", default-features = false, features = ["alloc"] }
-structured-cms = { version = "0.30", default-features = false, features = ["alloc"] }
+structured-cms = { version = "0.30.3", default-features = false, features = ["alloc"] }
 structured-ltv = { version = "0.30", default-features = false, features = ["alloc"] }
 thiserror = { version = "2", default-features = false }
 structured-base64 = { version = "0.30", features = ["alloc"], optional = true }
@@ -22,6 +22,7 @@ structured-base64 = { version = "0.30", features = ["alloc"] }
 divan = "0.1.21"
 roxmltree = "0.21"
 serde_json = "1"
+tempfile = "3"
 
 [features]
 default = ["std", "rustcrypto", "xml-backend-xmloxide"]
@@ -31,6 +32,9 @@ rustcrypto = ["xml-sec/rustcrypto"]
 # Signature creation over the XMLDSig signer. Verification-only builds,
 # including alloc and WASM ones, do not take the signing dependencies.
 produce = ["std", "xml-sec/xmldsig-sign", "dep:structured-base64"]
+# XSLT reference transforms, at creation through `DataObject::Reference` and
+# at validation, from the core's XSLT engine.
+xslt = ["xml-sec/xslt"]
 std = [
     "xml-sec/std",
     "structured-xades/std",
@@ -53,6 +57,10 @@ test = true
 
 [[example]]
 name = "create_probe"
+required-features = ["produce", "xslt"]
+
+[[example]]
+name = "properties_probe"
 required-features = ["produce"]
 
 [[example]]

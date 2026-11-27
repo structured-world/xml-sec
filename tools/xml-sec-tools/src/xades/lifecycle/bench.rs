@@ -282,6 +282,9 @@ struct Binaries {
     level: PathBuf,
     lifecycle_profile: PathBuf,
     level_profile: PathBuf,
+    /// Reads the building-block verdicts a qualified step compares; it is
+    /// not measured.
+    corpus: PathBuf,
 }
 
 impl Binaries {
@@ -312,6 +315,7 @@ impl Binaries {
                 &["allocation-profile"],
                 "level_probe-profile",
             )?,
+            corpus: build("corpus_probe", &[], "corpus_probe")?,
         })
     }
 
@@ -498,7 +502,11 @@ impl Bench<'_> {
             args.extend(line(&[
                 &"create",
                 &run.pki.join(format!("{}.p12", case.algorithm.signer())),
-                &case.packaging.dss(),
+                // `selected` admits only the four packagings, never a form.
+                &case
+                    .packaging
+                    .dss()
+                    .expect("the benchmark measures the four packagings"),
                 &run.data(case),
                 &self.time.to_string(),
                 &output,
@@ -776,8 +784,9 @@ impl Bench<'_> {
 
 fn detached_option(run: &Run<'_>, case: Case) -> Vec<OsString> {
     run.detached(case)
-        .map(|detached| line(&[&"--detached", &detached]))
-        .unwrap_or_default()
+        .iter()
+        .flat_map(|detached| line(&[&"--detached", detached]))
+        .collect()
 }
 
 /// The packaging and signer of a measured case, as `PACKAGING-ALGORITHM`.
@@ -852,6 +861,7 @@ pub(crate) fn execute(corpus: &Corpus, results: &Path, options: &Options) -> Res
         classpath,
         lifecycle_probe: binaries.lifecycle.clone(),
         level_probe: binaries.level.clone(),
+        corpus_probe: binaries.corpus.clone(),
         at: now()? + 86_400,
     };
     run.issue()?;

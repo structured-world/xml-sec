@@ -1,4 +1,6 @@
 import java.nio.file.*;
+import java.util.ArrayList;
+import java.util.List;
 import eu.europa.esig.dss.model.DSSDocument;
 import eu.europa.esig.dss.model.FileDocument;
 
@@ -8,14 +10,17 @@ import eu.europa.esig.dss.model.FileDocument;
  * input, output, level (T, LT or LTA; LTA on a B-LTA signature renews it),
  * trust anchor DER, TSA PKCS#12 (alias "tsa", password "dss"), the token time
  * in Unix seconds, a directory of DER evidence (*.cer, *.crl, *.ocsp), and the
- * detached content the signature's reference names, if any. A refusal prints
+ * detached contents the signature's references name, if any. A refusal prints
  * "refused" with DSS's reason and exits with status 3.
  */
 public class AugmentProbe {
     public static void main(String[] args) throws Exception {
         var verifier = Lifecycle.verifier(Files.readAllBytes(Path.of(args[3])), Path.of(args[6]));
         var tsa = Lifecycle.tsa(Path.of(args[4]), Long.parseLong(args[5]));
-        DSSDocument detached = args.length > 7 ? Lifecycle.named(Path.of(args[7])) : null;
+        List<DSSDocument> detached = new ArrayList<>();
+        for (int index = 7; index < args.length; index++) {
+            detached.add(Lifecycle.named(Path.of(args[index])));
+        }
         DSSDocument extended;
         try {
             extended = Lifecycle.extend(

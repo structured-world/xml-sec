@@ -171,6 +171,13 @@ pub struct ObjectElement {
     markup: String,
 }
 
+impl AsRef<str> for ObjectElement {
+    /// The checked markup exactly as it is copied into a document.
+    fn as_ref(&self) -> &str {
+        &self.markup
+    }
+}
+
 impl ObjectElement {
     /// Check that `markup` is exactly one well-formed element under `policy`.
     ///
@@ -306,6 +313,7 @@ pub struct SignatureBuilder {
     signature_value_id: Option<String>,
     references: Vec<ReferenceBuilder>,
     include_key_info: bool,
+    key_info_id: Option<String>,
     objects: Vec<ObjectBuilder>,
 }
 
@@ -322,6 +330,7 @@ impl SignatureBuilder {
             signature_value_id: None,
             references: Vec::new(),
             include_key_info: false,
+            key_info_id: None,
             objects: Vec::new(),
         }
     }
@@ -374,6 +383,15 @@ impl SignatureBuilder {
     #[must_use]
     pub fn key_info(mut self, include: bool) -> Self {
         self.include_key_info = include;
+        self
+    }
+
+    /// Set the `Id` of the `KeyInfo` placeholder, so a reference can sign the
+    /// key information the signing operation writes into it (`XMLDSig` 1.1
+    /// §4.5: `KeyInfo` may be referenced and signed).
+    #[must_use]
+    pub fn key_info_id(mut self, id: impl Into<String>) -> Self {
+        self.key_info_id = Some(id.into());
         self
     }
 
@@ -490,7 +508,10 @@ impl SignatureBuilder {
         )?;
         if let Some(algorithm) = encapsulation {
             policy.key_establishment.check_encapsulation(algorithm)?;
-            write_start(writer, prefix, "KeyInfo")?;
+            writer.start(
+                &qualified_name(prefix, "KeyInfo"),
+                self.key_info_id.as_deref().map(|id| ("Id", id)),
+            )?;
             // The HMAC key is an ML-KEM shared secret transported in an
             // EncryptedKey (draft-eastlake-rfc9231bis-xmlsec-uris-09 3.6.9).
             writer.start(
@@ -505,7 +526,10 @@ impl SignatureBuilder {
             writer.end("EncryptedKey")?;
             write_end(writer, prefix, "KeyInfo")?;
         } else if self.include_key_info {
-            write_empty(writer, prefix, "KeyInfo")?;
+            writer.empty(
+                &qualified_name(prefix, "KeyInfo"),
+                self.key_info_id.as_deref().map(|id| ("Id", id)),
+            )?;
         }
         for object in &self.objects {
             write_object(writer, prefix, object)?;
@@ -715,21 +739,21 @@ impl SignatureBuilder {
                 prefix.clone(),
             ));
         }
-        if let Some(id) = &self.signature_id
-            && !is_xml_ncname(id)
-        {
-            return Err(SignatureBuilderError::InvalidId {
-                element: "Signature",
-                value: id.clone(),
-            });
-        }
-        if let Some(id) = &self.signature_value_id
-            && !is_xml_ncname(id)
-        {
-            return Err(SignatureBuilderError::InvalidId {
-                element: "SignatureValue",
-                value: id.clone(),
-            });
+        // XMLDSig 1.1 types the Signature, SignatureValue and KeyInfo (§4.5)
+        // Id attributes as xs:ID.
+        for (element, id) in [
+            ("Signature", &self.signature_id),
+            ("SignatureValue", &self.signature_value_id),
+            ("KeyInfo", &self.key_info_id),
+        ] {
+            if let Some(id) = id
+                && !is_xml_ncname(id)
+            {
+                return Err(SignatureBuilderError::InvalidId {
+                    element,
+                    value: id.clone(),
+                });
+            }
         }
         // The template sink stops at the document limit, but escaping builds
         // each value's escaped copy before it reaches the sink: Object content
@@ -1348,3 +1372,6 @@ fn is_namespace_prefix(value: &str) -> bool {
     // Namespaces in XML reserves these names regardless of the URI being bound.
     !matches!(value, "xml" | "xmlns") && is_xml_ncname(value)
 }
+
+#[cfg(test)]
+mod tests;

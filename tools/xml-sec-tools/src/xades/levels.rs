@@ -184,6 +184,12 @@ impl Levels<'_> {
         self.crl_listing(issuer, "")
     }
 
+    /// The next empty complete CRL of `issuer`, number 02, issued after the
+    /// one [`Self::crl`] issues.
+    pub(super) fn next_crl(&self, issuer: &str) -> Result<Vec<u8>, String> {
+        self.crl_numbered(issuer, "", "02\n", &[])
+    }
+
     /// A complete CRL of `issuer` listing `subject` as revoked before the
     /// fixtures' test instant, as DER.
     pub(super) fn crl_revoking(&self, issuer: &str, subject: &str) -> Result<Vec<u8>, String> {
@@ -200,7 +206,7 @@ impl Levels<'_> {
 
     /// A delta over `issuer`'s complete CRL number 01 (RFC 5280 §5.2.4), naming
     /// `subject` as revoked when there is one.
-    fn delta_crl(&self, issuer: &str, subject: Option<&str>) -> Result<Vec<u8>, String> {
+    pub(super) fn delta_crl(&self, issuer: &str, subject: Option<&str>) -> Result<Vec<u8>, String> {
         let index = match subject {
             Some(subject) => format!(
                 "R\t450101000000Z\t261001000000Z\t{}\tunknown\t/CN={subject}\n",
@@ -247,6 +253,18 @@ impl Levels<'_> {
         self.ocsp_response(responder, subject, false, &["-resp_no_certs"])
     }
 
+    /// A response for `subject`, a certificate of the CA `issuer`, signed by
+    /// that CA's delegated `responder` (RFC 6960 §4.2.2.2), as a whole DER
+    /// `OCSPResponse`.
+    pub(super) fn ocsp_delegated(
+        &self,
+        issuer: &str,
+        responder: &str,
+        subject: &str,
+    ) -> Result<Vec<u8>, String> {
+        self.ocsp_under(issuer, responder, subject, false, &[])
+    }
+
     fn ocsp_response(
         &self,
         responder: &str,
@@ -254,6 +272,18 @@ impl Levels<'_> {
         by_key: bool,
         options: &[&str],
     ) -> Result<Vec<u8>, String> {
+        self.ocsp_under("issuer", responder, subject, by_key, options)
+    }
+
+    fn ocsp_under(
+        &self,
+        issuer: &str,
+        responder: &str,
+        subject: &str,
+        by_key: bool,
+        options: &[&str],
+    ) -> Result<Vec<u8>, String> {
+        let issuer = format!("{issuer}.pem");
         let (signer, signer_key) = (format!("{responder}.pem"), format!("{responder}.key"));
         let certificate = format!("{subject}.pem");
         let serial = self.serial(subject)?;
@@ -266,7 +296,7 @@ impl Levels<'_> {
         self.openssl(&[
             "ocsp",
             "-issuer",
-            "issuer.pem",
+            &issuer,
             "-sha256",
             "-cert",
             &certificate,
@@ -279,7 +309,7 @@ impl Levels<'_> {
             "-index",
             "responder.index",
             "-CA",
-            "issuer.pem",
+            &issuer,
             "-rsigner",
             &signer,
             "-rkey",
