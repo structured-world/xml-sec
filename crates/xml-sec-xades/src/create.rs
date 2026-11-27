@@ -1289,6 +1289,11 @@ pub fn countersign<W: Work>(
     if countersignature.properties.qualifies_objects() {
         return Err(CreateError::NoQualifiedObject);
     }
+    // A historical profile carries no countersignature; writing the EN
+    // 319 132-1 one instead would not be the form asked for.
+    if countersignature.properties.historical.is_some() {
+        return Err(CreateError::HistoricalProperty);
+    }
     let target = format!("#{}", ids.signature);
     let properties = signed_properties(
         signer,
