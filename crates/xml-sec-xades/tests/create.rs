@@ -1080,6 +1080,148 @@ fn manifest_statuses(fixture: &Fixture, xml: &str) -> Vec<(String, DsigStatus)> 
     .expect("the created document is read")
 }
 
+#[test]
+fn an_empty_manifest_chain_takes_the_signers_canonicalization() {
+    // The signer's canonicalization is the one of its XML references; a
+    // Manifest reference with no transforms of the caller's is canonicalized
+    // with it, not with whatever the policy generates for a node set.
+    let mut fixture = processing_manifests();
+    fixture.policy.transforms.generated_canonicalization =
+        xml_sec::policy::GeneratedCanonicalization::Implicit;
+    let manifest = ObjectElement::parse(SUPPLIED_MANIFEST, &fixture.policy).expect("one element");
+    let entries = vec![
+        SuppliedEntry {
+            id: "supplied-file",
+            mime_type: "text/plain",
+        },
+        SuppliedEntry {
+            id: "supplied-entry",
+            mime_type: "text/xml",
+        },
+    ];
+    let objects = [
+        DataObject::Manifest {
+            id: "manifest",
+            entries: vec![ManifestEntry {
+                uri: "detached.txt",
+                transforms: Vec::new(),
+                mime_type: "text/plain",
+            }],
+            transforms: Vec::new(),
+            mime_type: "text/xml",
+        },
+        DataObject::SuppliedManifest {
+            manifest,
+            entries,
+            transforms: Vec::new(),
+            mime_type: "text/xml",
+        },
+    ];
+    let mut document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
+    let request = Request {
+        resources: Some(&fixture.resources),
+        ..request("sig", &objects)
+    };
+    fixture
+        .create(&mut document, request)
+        .expect("creation over two Manifests");
+    let created = parse(document.as_xml());
+    for uri in ["#manifest", "#supplied"] {
+        let reference = created
+            .descendants()
+            .find(|node| node.has_tag_name((DS, "Reference")) && node.attribute("URI") == Some(uri))
+            .expect("the Manifest reference");
+        let algorithms: Vec<&str> = reference
+            .descendants()
+            .filter(|node| node.has_tag_name((DS, "Transform")))
+            .filter_map(|node| node.attribute("Algorithm"))
+            .collect();
+        assert_eq!(algorithms, [c14n().uri()], "{uri}");
+    }
+}
+
+#[test]
+fn a_supplied_manifest_is_read_under_the_signers_limits() {
+    // The element may have been parsed under a looser policy; the signer's
+    // own document limit applies when the operation reads it again, and the
+    // refusal is that limit, not a malformed Manifest.
+    let mut fixture = processing_manifests();
+    let manifest = ObjectElement::parse(SUPPLIED_MANIFEST, &fixture.policy).expect("one element");
+    fixture.policy.resources.max_xml_document_bytes = SUPPLIED_MANIFEST.len() - 1;
+    let objects = [DataObject::SuppliedManifest {
+        manifest,
+        entries: Vec::new(),
+        transforms: Vec::new(),
+        mime_type: "text/xml",
+    }];
+    let mut document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
+    let error = fixture
+        .create(&mut document, request("sig", &objects))
+        .expect_err("the Manifest exceeds the signer's limit");
+    assert!(
+        matches!(
+            error,
+            CreateError::Document(XmlDocumentError::Policy(
+                PolicyViolation::ResourceLimit { .. }
+            ))
+        ),
+        "{error:?}"
+    );
+    assert_eq!(document.as_xml(), DOCUMENT, "nothing published");
+}
+
+#[test]
+fn an_unprocessed_manifest_is_refused_as_unchecked() {
+    // A reference to a Manifest nobody processes leaves its data unchecked,
+    // so the signature meets no B-B (EN 319 132-1 §6.3(k)); its entries are
+    // not planned as signed data objects either, so the refusal names the
+    // Manifest reference itself and nothing is published.
+    let fixture = Fixture::new();
+    assert_eq!(
+        fixture.policy.manifest_processing,
+        ManifestProcessing::Ignore
+    );
+    let generated = DataObject::Manifest {
+        id: "manifest",
+        entries: vec![ManifestEntry {
+            uri: "detached.txt",
+            transforms: Vec::new(),
+            mime_type: "text/plain",
+        }],
+        transforms: Vec::new(),
+        mime_type: "text/xml",
+    };
+    let supplied = DataObject::SuppliedManifest {
+        manifest: ObjectElement::parse(SUPPLIED_MANIFEST, &fixture.policy).expect("one element"),
+        entries: Vec::new(),
+        transforms: Vec::new(),
+        mime_type: "text/xml",
+    };
+    for object in [generated, supplied] {
+        let objects = [object];
+        let mut document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
+        let request = Request {
+            resources: Some(&fixture.resources),
+            ..request("sig", &objects)
+        };
+        let error = fixture
+            .create(&mut document, request)
+            .expect_err("an unprocessed Manifest meets no B-B");
+        assert!(
+            matches!(
+                error,
+                CreateError::Validation(xml_sec_xades::ValidationError::Prepare(_))
+            ),
+            "{error:?}"
+        );
+        assert!(
+            format!("{error:?}").contains("Unchecked {"),
+            "the Manifest reference, not an entry: {error:?}"
+        );
+        assert_eq!(document.as_xml(), DOCUMENT, "nothing published");
+    }
+}
+
 /// A fixture whose signing and verification both process Manifests.
 fn processing_manifests() -> Fixture {
     let mut fixture = Fixture::new();

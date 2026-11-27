@@ -1212,10 +1212,21 @@ impl<W: Work, Q: Work> SelectedSignature<'_, '_, '_, '_, W, Q> {
                 reference: owner,
             }));
         };
+        // XMLDSig 1.1 §6.6.4: an enveloped-signature transform removes the
+        // Signature that contains it, here the one around its Transforms.
+        let enveloped_signature = super::super::transforms::enveloped_signature_for_reference(
+            container.map_or(node, |(container, _)| container),
+            &parsed,
+            || {
+                self.work
+                    .charge_work(1)
+                    .map_err(|error| processing(error.into()))
+            },
+        )?;
         self.session.replay_active.set(true);
         let result = super::super::transforms::replay_reference_transforms(
             node,
-            None,
+            enveloped_signature,
             data,
             &parsed,
             &super::super::transforms::ReplayExecution {

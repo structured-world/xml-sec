@@ -289,6 +289,28 @@ fn appended_child_refuses_any_other_change() {
 }
 
 #[test]
+fn appended_child_refuses_an_entity_of_two_elements() {
+    // An entity reference expanding to two elements gives both the
+    // reference's byte range; the append added two children, not one.
+    let mut policy = crate::policy::SigningPolicy::default();
+    policy.xml.allow_internal_dtd = true;
+    let mut document = XmlDocument::parse_with_policy(
+        "<!DOCTYPE root [<!ENTITY pair \"<one/><two/>\">]><root><parent Id=\"parent\"><x/></parent></root>",
+        &policy,
+    )
+    .expect("fixture parses");
+    let parent = element(&document, "parent");
+    let checked = document.transaction(|document| {
+        document.append_child(parent, "&pair;")?;
+        document.appended_child(parent)
+    });
+    assert!(
+        matches!(checked, Err(XmlDocumentError::InvalidReplacement(_))),
+        "{checked:?}"
+    );
+}
+
+#[test]
 fn appended_child_needs_an_open_transaction() {
     // Outside a transaction there is no starting generation to compare with.
     let document = XmlDocument::parse(DOCUMENT).expect("fixture parses");

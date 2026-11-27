@@ -1613,12 +1613,17 @@ impl XmlDocument {
                     return Err(other());
                 }
                 let inserted = at..at + added;
-                let node = view
+                // Every element an entity reference expands to takes the
+                // reference's range, so a second match is a second child.
+                let mut matches = view
                     .parsed
                     .document
                     .descendants()
-                    .find(|node| node.is_element() && node.range() == inserted)
-                    .ok_or_else(other)?;
+                    .filter(|node| node.is_element() && node.range() == inserted);
+                let node = matches.next().ok_or_else(other)?;
+                if matches.next().is_some() {
+                    return Err(other());
+                }
                 // Only the inserted bytes changed, so the enclosing element
                 // starts where `parent` did and keeps its name.
                 let enclosing = node.parent().filter(|enclosing| {
