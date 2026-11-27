@@ -1,16 +1,16 @@
 //! B-LT augmentation: the validation data a B-T signature lacks.
 
 use super::{AugmentError, Publication, Staging, construction, pooled, publish, selected};
-use crate::basic::{Outcome, Stage};
+use crate::basic::{Outcome, Stage, Vocabulary};
 use crate::create::Assessment;
 use crate::draft::Draft;
-use crate::level::{Census, Inputs, Level, Visit, validate_with};
+use crate::level::{Census, ExtendedLevel, Inputs, Level, Visit, validate_with};
 use crate::placement::{self, Unsigned};
-use alloc::string::String;
+use alloc::{string::String, vec::Vec};
 use core::convert::Infallible;
 use structured_asn1::memory::{OwnedVec, Work};
 use structured_ltv::material::ArtifactRef;
-use structured_xades::produce::{Material, write_material};
+use structured_xades::produce::{Material, ReferenceRole, write_extended_values, write_material};
 use structured_xades::unsigned::Requirements;
 use structured_xades::xml::Xml;
 use xml_sec::IdAttributeRegistration;
@@ -107,7 +107,72 @@ pub fn add_validation_data<W: Work>(
     data: &ValidationData<'_, '_>,
     work: &W,
 ) -> Result<DataAdded, AugmentError> {
-    added(document, data, false, work)
+    added(document, data, Form::Any, work)
+}
+
+/// Add to `data.signature` the values of `XAdES-XL` (ETSI TS 101 903 V1.4.2
+/// §§7.6.1 and 7.6.2): every certificate, CRL and OCSP response the B-LT
+/// census of the signature finds missing, as direct `CertificateValues` and
+/// `RevocationValues` properties rather than one `AnyValidationData`.
+///
+/// The references of `XAdES-C` keep a signature from B-LT (EN 319 132-1
+/// §6.3), so the new generation is assessed at `data.inputs.requirements`,
+/// B-T or above.
+///
+/// # Errors
+/// As for [`add_validation_data`], with [`AugmentError::BelowTimestamped`]
+/// for a request below B-T.
+///
+/// # Examples
+///
+/// ```no_run
+/// use xml_sec_xades::{
+///     Assessment, DataAdded, Inputs, Requirements, ValidationData, add_extended_values,
+/// };
+/// # fn xl(
+/// #     document: &mut xml_sec::XmlDocument,
+/// #     assessment: &Assessment<'_, '_>,
+/// #     inputs: &Inputs<'_>,
+/// #     work: &structured_asn1::memory::Memory,
+/// # ) -> Result<(), xml_sec_xades::AugmentError> {
+/// let inputs = Inputs { requirements: Requirements::Timestamped, ..*inputs };
+/// let added = add_extended_values(
+///     document,
+///     &ValidationData { signature: "sig", assessment, inputs: &inputs, id_attributes: &[] },
+///     work,
+/// )?;
+/// assert!(matches!(added, DataAdded::Published | DataAdded::AlreadyPresent));
+/// # Ok(())
+/// # }
+/// ```
+pub fn add_extended_values<W: Work>(
+    document: &mut XmlDocument,
+    data: &ValidationData<'_, '_>,
+    work: &W,
+) -> Result<DataAdded, AugmentError> {
+    added(document, data, Form::Direct, work)
+}
+
+/// Where the census's values go, and whose statuses come first.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Form {
+    /// One `AnyValidationData`, the document's statuses first.
+    Any,
+    /// One `AnyValidationData`, the caller's statuses first.
+    Refresh,
+    /// Direct `CertificateValues` and `RevocationValues`.
+    Direct,
+}
+
+impl Form {
+    /// The vocabulary the signature is read in: the values of `XAdES-XL`
+    /// follow the references of `XAdES-C`.
+    fn vocabulary(self) -> Vocabulary {
+        match self {
+            Self::Any | Self::Refresh => Vocabulary::Baseline,
+            Self::Direct => Vocabulary::ExtendedV2,
+        }
+    }
 }
 
 /// Add to `data.signature` the caller's statuses for its paths that the
@@ -151,23 +216,25 @@ pub fn refresh_validation_data<W: Work>(
     data: &ValidationData<'_, '_>,
     work: &W,
 ) -> Result<DataAdded, AugmentError> {
-    added(document, data, true, work)
+    added(document, data, Form::Refresh, work)
 }
 
-/// The census of `data` with the caller's statuses first when
-/// `supplied_first`, its missing values published.
+/// The census of `data`, its missing values published in `form`.
 fn added<W: Work>(
     document: &mut XmlDocument,
     data: &ValidationData<'_, '_>,
-    supplied_first: bool,
+    form: Form,
     work: &W,
 ) -> Result<DataAdded, AugmentError> {
     let requirements = data.inputs.requirements;
-    if matches!(
-        requirements,
-        Requirements::Basic | Requirements::Timestamped
-    ) {
-        return Err(AugmentError::BelowLongTerm(requirements));
+    match (form, requirements) {
+        (Form::Direct, Requirements::Basic) => {
+            return Err(AugmentError::BelowTimestamped(requirements));
+        }
+        (Form::Any | Form::Refresh, Requirements::Basic | Requirements::Timestamped) => {
+            return Err(AugmentError::BelowLongTerm(requirements));
+        }
+        _ => {}
     }
     let assessment = data.assessment;
     let unsigned = document.with_view(|view| {
@@ -193,11 +260,8 @@ fn added<W: Work>(
         |session| {
             Ok(
                 selected(document, &session, data.signature, data.id_attributes).and_then(|node| {
-                    let visitor = Missing {
-                        unsigned,
-                        supplied_first,
-                    };
-                    match validate_with(&session, node, &census, visitor)? {
+                    let visitor = Missing { unsigned, form };
+                    match validate_with(&session, node, &census, form.vocabulary(), visitor)? {
                         Outcome::Assessed(property) => property,
                         outcome => Err(AugmentError::Unmet(outcome.map(|_| ()))),
                     }
@@ -205,72 +269,83 @@ fn added<W: Work>(
             )
         },
     )??;
-    let added = if property.is_some() {
-        DataAdded::Published
-    } else {
+    let added = if property.is_empty() {
         DataAdded::AlreadyPresent
+    } else {
+        DataAdded::Published
     };
     publish(
         document,
         &Publication {
             assessment,
             inputs: &inputs,
+            vocabulary: form.vocabulary(),
             signature: data.signature,
             id_attributes: data.id_attributes,
             unsigned,
         },
-        property.as_deref(),
+        &property,
         work,
     )?;
     Ok(added)
 }
 
-/// The census visitor: the missing values as one property, if any.
+/// The census visitor: the missing values as properties, if any.
 struct Missing {
     unsigned: Unsigned,
-    /// Whether the caller's statuses come before the document's.
-    supplied_first: bool,
+    form: Form,
 }
 
 impl<W: Work> Visit<W> for Missing {
-    type Output = Result<Option<String>, AugmentError>;
+    type Output = Result<Vec<String>, AugmentError>;
 
     fn supplied_first(&self) -> bool {
-        self.supplied_first
+        self.form == Form::Refresh
     }
 
-    // Only a validation that ended before its B-LT census reaches this.
+    // Only a validation that ended before its B-LT census reaches these.
     fn level(self, _stage: &Stage<'_, '_, '_, '_, W>, level: &Level<'_>) -> Self::Output {
         Err(AugmentError::BelowLongTerm(level.requested()))
     }
 
+    fn extended(self, _stage: &Stage<'_, '_, '_, '_, W>, level: ExtendedLevel) -> Self::Output {
+        Err(AugmentError::BelowLongTerm(level.requested()))
+    }
+
     fn census(self, census: &Census<'_, '_, '_, '_, '_, '_, '_, W>) -> Result<Self::Output, Self> {
-        Ok(missing(census, self.unsigned))
+        Ok(missing(census, self.unsigned, self.form))
     }
 }
 
-/// The `AnyValidationData` of every value B-LT still needs, if any. Whether
-/// the signature also meets B-T is left to the assessment of the result,
-/// since B-LT includes it (EN 319 132-1 §6.3).
+/// The properties of every value B-LT still needs, none when nothing is
+/// missing. Whether the signature also meets B-T is left to the assessment
+/// of the result, since B-LT includes it (EN 319 132-1 §6.3).
 fn missing<W: Work>(
     census: &Census<'_, '_, '_, '_, '_, '_, '_, W>,
     unsigned: Unsigned,
-) -> Result<Option<String>, AugmentError> {
+    form: Form,
+) -> Result<Vec<String>, AugmentError> {
     let stage = census.stage();
     let work = stage.session.execution();
     let entries = plan(census, work)?;
     if entries.is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let mut staging = Staging {
         session: stage.session,
         base: stage.document.snapshot(),
         signature: stage.prepared.bound().containers().signature(),
         unsigned: unsigned.signature_properties(),
-        draft: Draft::new(),
+        draft: Draft::siblings(),
     };
-    write_material(&entries, &mut staging, work).map_err(construction)?;
-    Ok(Some(staging.draft.finish()?.0))
+    match form {
+        Form::Any | Form::Refresh => write_material(&entries, &mut staging, work),
+        Form::Direct => {
+            write_extended_values(&entries, ReferenceRole::Signature, &mut staging, work)
+        }
+    }
+    .map_err(construction)?;
+    Ok(staging.draft.finish_siblings()?)
 }
 
 /// Every value B-LT needs that has no eligible copy, each once: first those

@@ -23,6 +23,39 @@
 //! generation of CRLs and refreshes the B-LT signature with the next, written
 //! as `OUTPUT/b-lt-refreshed.xml`.
 //!
+//! `augment_probe x-request|a-request|extended FIXTURES OUTPUT`, over the
+//! content fixtures, completes `signature.tsq` with `FIXTURES/signature.tsr`
+//! and takes the B-T signature through the TS 101 903 levels: `x-request`
+//! writes `OUTPUT/x.tsq`, `a-request` completes it with `FIXTURES/x.tsr` and
+//! writes `OUTPUT/a.tsq`, and `extended` completes both and writes
+//! `OUTPUT/c.xml`, `x.xml`, `xl.xml` and `a.xml`.
+//!
+//! `augment_probe seal-signature-request|seal-request|seal|parallel-request|
+//! parallel FIXTURES OUTPUT`, over the content fixtures, creates `sig`
+//! excluding every signature from what it signs: `seal-signature-request`
+//! writes its signature timestamp request `OUTPUT/seal-signature.tsq`; the
+//! others complete it with `FIXTURES/seal-signature.tsr`, add the first
+//! generation of CRLs and seal the B-LT signature with an evidence record:
+//! `seal-request` writes `OUTPUT/seal.tsq`, `seal` completes it with
+//! `FIXTURES/seal.tsr` and writes `OUTPUT/e-ers.xml`, `parallel-request`
+//! writes the request of a parallel record `OUTPUT/parallel.tsq`, and
+//! `parallel` completes it with `FIXTURES/parallel.tsr`, writes
+//! `OUTPUT/e-ers-parallel.xml`, adds the parallel B-B signature `sig2` and
+//! writes `OUTPUT/e-ers-signed.xml`.
+//!
+//! `augment_probe historical-request FIXTURES OUTPUT` creates `sig` in the
+//! TS 103 171 profile of V1.3.2 and writes its signature timestamp request
+//! `OUTPUT/historical.tsq`; `historical` completes it with
+//! `FIXTURES/historical.tsr` and writes `OUTPUT/t-pre-en.xml`;
+//! `historical-lt` then adds its validation values and writes
+//! `OUTPUT/lt-pre-en.xml`. The same actions suffixed `-v111` or `-v122` do
+//! this in the ETSI TS 101 903 V1.1.1 or V1.2.2 vocabulary, with
+//! `historical-v111.tsq`/`.tsr` or `historical-v122.tsq`/`.tsr`, writing
+//! `t-v111.xml` and `lt-v111.xml` or `t-v122.xml` and `lt-v122.xml`.
+//! `pre-en-x-request`, `pre-en-a-request`, `pre-en-lta-request` and
+//! `pre-en-levels` take the TS 103 171 signature on through the TS 101 903
+//! levels in the names of V1.3.2, as `extended_levels::pre_en_levels` says.
+//!
 //! `augment_probe complete FIXTURES OUTPUT` completes `request.tsq` with
 //! `FIXTURES/response.tsr` and writes the B-T document `OUTPUT/b-t.xml`.
 //!
@@ -45,6 +78,11 @@
 //! `OUTPUT/renew.tsq`. `augment_probe renew LEVELS OUTPUT` completes it with
 //! `LEVELS/renew.tsr` and writes the B-LTA document `OUTPUT/b-lta-manifest.xml`.
 
+#[path = "support/extended_levels.rs"]
+mod extended_levels;
+#[path = "support/sealing.rs"]
+mod sealing;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -60,6 +98,7 @@ use xml_sec::xmldsig::{
     DefaultKeyResolver, DigestAlgorithm, KeyResolverConfig, RsaSigningKey, SignatureAlgorithm,
     Transform, UriTypeSet, VerificationRequest, VerifyContext, XPathExpression,
 };
+use xml_sec_xades::properties::Profile;
 use xml_sec_xades::{
     Assessment, Completion, ContentEvidence, ContentScope, ContentTimestamp, DataAdded, DataObject,
     DigestRenewal, Envelope, Inputs, PendingTimestamp, Request, Requirements, Signer,
@@ -94,7 +133,7 @@ fn utc() -> Result<LeapTable<'static>, String> {
 
 fn main() -> Result<(), String> {
     let mut args = std::env::args_os().skip(1);
-    let usage = "usage: augment_probe request|content-request|content|content-lta-request|content-lta-archive-request|content-lta|refresh|complete|archive-request|renewal-request|archive|extend|renew-request|renew FIXTURES OUTPUT";
+    let usage = "usage: augment_probe request|content-request|content|content-lta-request|content-lta-archive-request|content-lta|refresh|x-request|a-request|extended|pre-en-x-request|pre-en-a-request|pre-en-lta-request|pre-en-levels|seal-signature-request|seal-request|seal|parallel-request|parallel|complete|archive-request|renewal-request|archive|extend|renew-request|renew FIXTURES OUTPUT";
     let (Some(action), Some(fixtures), Some(output), None) =
         (args.next(), args.next(), args.next(), args.next())
     else {
@@ -189,10 +228,48 @@ fn augmented(
     pki: [&[u8]; 2],
     work: &Memory,
 ) -> Result<(), String> {
-    let mut document = created(signer, assessment, work)?;
     let write = |name: &str, bytes: &[u8]| {
         std::fs::write(output.join(name), bytes).map_err(|error| format!("{name}: {error}"))
     };
+    let (step, profile) = match action.rsplit_once('-') {
+        Some((step, "v111")) => (step, Profile::V111),
+        Some((step, "v122")) => (step, Profile::V122),
+        _ => (action, Profile::PreEn),
+    };
+    if matches!(step, "historical-request" | "historical" | "historical-lt") {
+        let document = created_in(signer, assessment, Some(profile), Envelope::Enveloped, work)?;
+        return extended_levels::historical(
+            document,
+            (profile, step),
+            assessment,
+            fixtures,
+            pki,
+            &write,
+            work,
+        );
+    }
+    if matches!(
+        action,
+        "pre-en-x-request" | "pre-en-a-request" | "pre-en-lta-request" | "pre-en-levels"
+    ) {
+        let document = created_in(
+            signer,
+            assessment,
+            Some(Profile::PreEn),
+            Envelope::Enveloped,
+            work,
+        )?;
+        return extended_levels::pre_en_levels(
+            document, action, assessment, fixtures, pki, &write, work,
+        );
+    }
+    if matches!(
+        action,
+        "seal-signature-request" | "seal-request" | "seal" | "parallel-request" | "parallel"
+    ) {
+        return sealed((signer, assessment), fixtures, pki, action, &write, work);
+    }
+    let mut document = created(signer, assessment, work)?;
     let pending = request_timestamp(&document, &timestamp(None, Some(NONCE)), assessment, work)
         .map_err(|error| format!("request: {error}"))?;
     match action {
@@ -200,9 +277,13 @@ fn augmented(
             write("request.tsq", pending.request())?;
             requests(&document, assessment, &write, work)?;
         }
-        "complete" | "archive-request" | "renewal-request" | "archive" | "refresh" => {
+        "complete" | "archive-request" | "renewal-request" | "archive" | "refresh"
+        | "x-request" | "x" | "a-request" | "a2-request" | "extended" => {
             // The content fixtures answer the same request as `signature.tsr`.
-            let answer = if action == "refresh" {
+            let answer = if matches!(
+                action,
+                "refresh" | "x-request" | "x" | "a-request" | "a2-request" | "extended"
+            ) {
                 "signature.tsr"
             } else {
                 "response.tsr"
@@ -214,6 +295,17 @@ fn augmented(
                 "refresh" => {
                     refreshed(&mut document, assessment, fixtures, pki, work)?;
                     write("b-lt-refreshed.xml", document.as_xml().as_bytes())?;
+                }
+                "x-request" | "x" | "a-request" | "a2-request" | "extended" => {
+                    extended_levels::levels(
+                        &mut document,
+                        assessment,
+                        fixtures,
+                        pki,
+                        action,
+                        &write,
+                        work,
+                    )?;
                 }
                 _ => archived(
                     &mut document,
@@ -741,6 +833,77 @@ fn created(
     assessment: &Assessment<'_, '_>,
     work: &Memory,
 ) -> Result<XmlDocument, String> {
+    created_in(signer, assessment, None, Envelope::Enveloped, work)
+}
+
+/// The B-T signature `sig`, excluding every signature from what it signs,
+/// taken to B-LT and sealed by evidence records as `action` says; `parallel`
+/// also adds the parallel B-B signature `sig2`, written as
+/// `OUTPUT/e-ers-signed.xml`.
+fn sealed(
+    (signer, assessment): (&Signer<'_>, &Assessment<'_, '_>),
+    fixtures: &Path,
+    pki: [&[u8]; 2],
+    action: &str,
+    write: &impl Fn(&str, &[u8]) -> Result<(), String>,
+    work: &Memory,
+) -> Result<(), String> {
+    let mut document = created_in(
+        signer,
+        assessment,
+        None,
+        Envelope::ExcludingSignatures,
+        work,
+    )?;
+    let pending = request_timestamp(&document, &timestamp(None, Some(NONCE)), assessment, work)
+        .map_err(|error| format!("request: {error}"))?;
+    if action == "seal-signature-request" {
+        return write("seal-signature.tsq", pending.request());
+    }
+    let response = read(fixtures, "seal-signature.tsr")?;
+    complete(&mut document, &pending, &response, assessment, pki, work)?;
+    sealing::sealed(
+        &mut document,
+        assessment,
+        fixtures,
+        pki,
+        action,
+        write,
+        work,
+    )?;
+    if action != "parallel" {
+        return Ok(());
+    }
+    create(
+        &mut document,
+        signer,
+        Request {
+            id: "sig2",
+            signing_time: TIME,
+            objects: vec![DataObject::Document {
+                mime_type: "text/xml",
+                envelope: Envelope::ExcludingSignatures,
+            }],
+            placement: xml_sec_xades::Placement::DocumentEnd,
+            resources: None,
+            id_attributes: &[],
+            properties: xml_sec_xades::properties::Properties::default(),
+        },
+        assessment,
+        work,
+    )
+    .map_err(|error| format!("parallel signature: {error}"))?;
+    write("e-ers-signed.xml", document.as_xml().as_bytes())
+}
+
+/// [`created`] in the `historical` vocabulary, if any, with `envelope`.
+fn created_in(
+    signer: &Signer<'_>,
+    assessment: &Assessment<'_, '_>,
+    historical: Option<Profile>,
+    envelope: Envelope,
+    work: &Memory,
+) -> Result<XmlDocument, String> {
     let mut document = XmlDocument::parse(DOCUMENT).map_err(|error| error.to_string())?;
     create(
         &mut document,
@@ -750,12 +913,22 @@ fn created(
             signing_time: TIME,
             objects: vec![DataObject::Document {
                 mime_type: "text/xml",
-                envelope: Envelope::Enveloped,
+                envelope,
             }],
             placement: xml_sec_xades::Placement::DocumentEnd,
             resources: None,
             id_attributes: &[],
-            properties: xml_sec_xades::properties::Properties::default(),
+            properties: xml_sec_xades::properties::Properties {
+                historical,
+                // TS 101 903 V1.1.1 §7.2.3 makes SignaturePolicyIdentifier
+                // mandatory; an implied policy satisfies it.
+                policy: (historical == Some(Profile::V111)).then_some(
+                    xml_sec_xades::properties::Policy::Document(
+                        xml_sec_xades::properties::SignaturePolicy::Implied,
+                    ),
+                ),
+                ..xml_sec_xades::properties::Properties::default()
+            },
         },
         assessment,
         work,

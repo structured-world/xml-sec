@@ -3,6 +3,7 @@
 //! local URI of it, as an unsigned property.
 
 use super::{AugmentError, Publication, publish};
+use crate::basic::Vocabulary;
 use crate::create::Assessment;
 use crate::draft::Draft;
 use crate::level::Inputs;
@@ -142,11 +143,12 @@ pub fn add_policy_store<W: Work>(
         &Publication {
             assessment: request.assessment,
             inputs: request.inputs,
+            vocabulary: Vocabulary::Baseline,
             signature: request.signature,
             id_attributes: request.id_attributes,
             unsigned: located.unsigned,
         },
-        Some(&property),
+        core::slice::from_ref(&property),
         work,
     )
 }

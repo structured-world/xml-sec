@@ -12,7 +12,7 @@ use structured_asn1::memory::Work;
 use structured_xades::certificate::KeyAssociation;
 use structured_xades::container::{self, ContainerError, Selected, Syntax, Syntaxes};
 use structured_xades::legacy::{
-    self as v122, CertificateMatch, Property, SignerCheck, SignerError,
+    self as v122, CertificateMatch, Profile, Property, SignerCheck, SignerError,
 };
 use structured_xades::xml::{Access, Xml as _};
 use xml_sec::document::{DocumentIdentity, NodeIdentity};
@@ -63,6 +63,12 @@ pub enum Ts101903Error {
     Properties(v122::Error<Error, NodeIdentity>),
     /// The signer's certificate could not be compared with its protection.
     Signer(SignerError<Error, Error, NodeIdentity, DocumentIdentity, u64>),
+    /// The timestamp properties could not be read in the profile's grammar.
+    Inventory(v122::ValidationError<Error, NodeIdentity>),
+    /// The signed roles could not be read or assessed.
+    Credentials(v122::CredentialError<Error, core::convert::Infallible, NodeIdentity>),
+    /// The validation data the participants need could not be looked up.
+    Incorporation(structured_xades::material::HistoricalError<NodeIdentity>),
 }
 
 /// The BES facts (TS 101 903 V1.2.2 §4.4.1) of one verified signature.
@@ -141,8 +147,46 @@ pub fn validate_ts101903<W: Work, R>(
                 });
             }
         };
+    bes(session, signature, &access, &layout, certificates, visitor)
+}
+
+/// Validate the BES form of `signature` read in the historical vocabulary of
+/// `profile`, which the caller chose: ETSI TS 101 903 V1.1.1 or V1.2.2, or
+/// the TS 103 171 profile of V1.3.2. Nothing in the document selects it.
+///
+/// # Errors
+/// As for [`validate_ts101903`], with [`Ts101903Error::Container`] when the
+/// signature has no qualifying properties in that vocabulary.
+pub fn validate_historical<W: Work, R>(
+    session: &VerifiedSession<'_, '_, '_, W>,
+    signature: NodeIdentity,
+    profile: Profile,
+    certificates: &[&[u8]],
+    visitor: impl for<'a> FnOnce(&Ts101903Report<'a>) -> R,
+) -> Result<Outcome<R>, ValidationError> {
+    let work = session.execution();
+    path::require_member(session, signature, work)?;
+    let document = Document::new(session);
+    let access = Access::new(&document, document.snapshot(), work);
+    let layout = v122::locate(&access, signature, profile)
+        .map_err(|cause| ValidationError::Ts101903(Box::new(Ts101903Error::Container(cause))))?;
+    bes(session, signature, &access, &layout, certificates, visitor)
+}
+
+/// The BES facts of `signature` over its located historical `layout`.
+fn bes<'d, 'v, 's, 'i, W: Work, R>(
+    session: &'d VerifiedSession<'v, 's, 'i, W>,
+    signature: NodeIdentity,
+    access: &Access<'_, Document<'d, 'v, 's, 'i, W>, W>,
+    layout: &v122::Layout<Document<'d, 'v, 's, 'i, W>>,
+    certificates: &[&[u8]],
+    visitor: impl for<'a> FnOnce(&Ts101903Report<'a>) -> R,
+) -> Result<Outcome<R>, ValidationError> {
+    let fail = |error| ValidationError::Ts101903(Box::new(error));
+    let work = session.execution();
+    let document = Document::new(session);
     let prepared =
-        v122::prepare(&access, &layout).map_err(|cause| fail(Ts101903Error::Properties(cause)))?;
+        v122::prepare(access, layout).map_err(|cause| fail(Ts101903Error::Properties(cause)))?;
 
     let parser = session.certificate_parser();
     let x509 = parser.memory();

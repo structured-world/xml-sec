@@ -14,20 +14,34 @@
 //! a `RenewedDigestsV2` before that archive. Nothing is fetched and no clock
 //! is read here.
 
+mod extended;
+mod historical;
+mod seal;
 mod store;
 mod validation_data;
 
+pub use seal::{EvidenceError, SealKind, VerifyError, request_evidence_record};
+
+pub use extended::{
+    CompleteReferences, ExtendedKind, ReferenceSyntax, add_complete_references,
+    request_extended_timestamp,
+};
+pub use historical::{
+    add_historical_references, add_historical_values, request_historical_extended_timestamp,
+    request_historical_timestamp,
+};
 pub use store::{PolicyStoreRequest, add_policy_store};
+use structured_xades::legacy::Profile;
 pub use validation_data::{
-    DataAdded, ValidationData, add_validation_data, refresh_validation_data,
+    DataAdded, ValidationData, add_extended_values, add_validation_data, refresh_validation_data,
 };
 
 use crate::accuracy;
-use crate::basic::{Outcome, Stage, ValidationError, with_stage};
+use crate::basic::{Outcome, Stage, ValidationError, Vocabulary, with_stage};
 use crate::create::{Assessment, Carried};
-use crate::draft::{Draft, DraftError};
+use crate::draft::{Draft, DraftError, ValueError};
 use crate::level::{
-    Inputs, Level, Visit, read_certificates, unrecognized, validate, validate_with,
+    ExtendedLevel, Inputs, Level, Met, Visit, read_certificates, unrecognized, validate_with,
 };
 use crate::placement::{self, DS, PlacementError, Unsigned};
 use crate::{Error, Snapshot};
@@ -48,8 +62,8 @@ use structured_pkix::algorithm::digest::{self, AsnDigest};
 use structured_pkix::path::EffectiveKey;
 use structured_xades::baseline::{self, Evidence};
 use structured_xades::produce::{
-    self, Augmentation, Event, PreparationError, ResponseCheck, ResponseError, TimestampKind,
-    Transaction, Writer,
+    self, Augmentation, Event, PreparationError, ReferenceWriter, ResponseCheck, ResponseError,
+    TimestampKind, Transaction, Writer,
 };
 use structured_xades::renewed::{self, CreationError};
 use structured_xades::timestamp::InputError;
@@ -105,7 +119,7 @@ pub struct PendingTimestamp {
     document: DocumentIdentity,
     generation: u64,
     signature: String,
-    kind: TimestampKind,
+    kind: Stamp,
     /// The level the signature met when the request was made, and must still
     /// meet when it is completed.
     basis: Requirements,
@@ -113,6 +127,54 @@ pub struct PendingTimestamp {
     /// The `RenewedDigestsV2` the archive input covers, computed over the
     /// requested generation and published only together with the archive.
     renewal: Option<String>,
+    /// What an extended request was made with, so that completion can make
+    /// it again over the current generation.
+    repeat: Option<Repeat>,
+}
+
+/// The parameters of a timestamp request, owned.
+#[derive(Debug)]
+struct Repeat {
+    digest: digest::Algorithm,
+    /// Content octets of the requested policy identifier.
+    policy: Option<alloc::vec::Vec<u8>>,
+    nonce: Option<alloc::vec::Vec<u8>>,
+}
+
+impl Repeat {
+    fn of(request: &TimestampRequest<'_>) -> Self {
+        Self {
+            digest: request.digest,
+            policy: request.policy.map(|oid| oid.as_bytes().to_vec()),
+            nonce: request.nonce.map(<[u8]>::to_vec),
+        }
+    }
+
+    /// The request for `signature` these parameters describe.
+    fn request<'a>(&'a self, signature: &'a str) -> TimestampRequest<'a> {
+        TimestampRequest {
+            signature,
+            digest: self.digest,
+            // The octets came from a parsed identifier, so they are well formed.
+            policy: self.policy.as_deref().map(Oid::from_bytes),
+            nonce: self.nonce.as_deref(),
+            id_attributes: &[],
+        }
+    }
+}
+
+/// The property a pending timestamp completes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stamp {
+    /// An EN 319 132-1 `SignatureTimeStamp` or `ArchiveTimeStamp`.
+    Baseline(TimestampKind),
+    /// A TS 101 903 X timestamp or archive timestamp.
+    Extended(ExtendedKind),
+    /// The `SignatureTimeStamp` of a signature in a historical vocabulary,
+    /// or with a kind, its X timestamp or archive timestamp.
+    Historical(Profile, Option<ExtendedKind>),
+    /// The initial archive timestamp of a new evidence record.
+    Seal(SealKind),
 }
 
 impl PendingTimestamp {
@@ -160,6 +222,11 @@ pub enum AugmentError {
     /// The signature has no `XAdES` qualifying properties targeting it.
     #[error("signature {0:?} has no XAdES qualifying properties")]
     NotXades(String),
+    /// An evidence record seals the signature, which then takes no new
+    /// unsigned property but its records' own edits (ETSI TS 119 132-3
+    /// §5.1.1).
+    #[error("signature {0:?} is sealed by an evidence record")]
+    Sealed(String),
     /// The document changed since the request was made.
     #[error("the document changed since the timestamp was requested")]
     Changed,
@@ -266,6 +333,35 @@ pub enum AugmentError {
     /// value or its digest could not be drafted.
     #[error("policy store refused: {0:?}")]
     Store(Box<produce::Error<crate::properties::PropertyError>>),
+    /// The actors or artifacts of the signature's paths could not be
+    /// attributed.
+    #[error("artifact attribution failed: {0:?}")]
+    Uses(structured_ltv::pki::UsesError<NodeIdentity>),
+    /// A reference digest could not be computed.
+    #[error("reference digest failed: {0:?}")]
+    ReferenceDigest(Box<structured_asn1::digest::OnceError<CmsProviderError>>),
+    /// The reference digest is one these references may not use: MD5 in the
+    /// V2 names, or a method without an external digest.
+    #[error("the reference digest is not permitted for these references")]
+    ProhibitedReferenceDigest,
+    /// The request of an extended timestamp could not be made.
+    #[error("extended timestamp request failed: {0}")]
+    ExtendedRequest(String),
+    /// The signature could not be read in its historical vocabulary.
+    #[error("historical signature processing failed: {0}")]
+    Historical(String),
+    /// The TS 101 903 levels beyond T are written in the names of V1.3.2
+    /// (`CompleteCertificateRefs`, `SigAndRefsTimeStamp`), which only the
+    /// TS 103 171 profile of V1.3.2 uses among the historical vocabularies.
+    #[error("the levels beyond T are not created in the {0:?} vocabulary")]
+    HistoricalLevel(Profile),
+    /// The signer's path is not bound to the signature, so no reference
+    /// names its certificates or statuses.
+    #[error("the signer's path is not bound to the signature")]
+    UnboundSigner,
+    /// An evidence record could not be added.
+    #[error("evidence record refused: {0:?}")]
+    Evidence(Box<EvidenceError>),
     /// The current execution refused work or storage.
     #[error("augmentation resource refusal: {0}")]
     Resource(MemoryError),
@@ -282,6 +378,7 @@ impl From<PlacementError> for AugmentError {
         match error {
             PlacementError::UnknownSignature(id) => Self::UnknownSignature(id),
             PlacementError::NotXades(id) => Self::NotXades(id),
+            PlacementError::Sealed(id) => Self::Sealed(id),
             PlacementError::Tree(error) => Self::Tree(error),
             PlacementError::Scalar(error) => Self::Scalar(error),
             PlacementError::Resource(error) => Self::Resource(error),
@@ -503,10 +600,11 @@ pub fn request_archive_timestamp_with_renewal<W: Work>(
         document: identity,
         generation,
         signature: request.signature.into(),
-        kind: TimestampKind::Archive,
+        kind: Stamp::Baseline(TimestampKind::Archive),
         basis: gate.requirements(),
         request: encoded?,
         renewal: Some(property),
+        repeat: None,
     })
 }
 
@@ -633,10 +731,11 @@ fn requested<W: Work>(
         document: identity,
         generation,
         signature: request.signature.into(),
-        kind,
+        kind: Stamp::Baseline(kind),
         basis: gate.requirements(),
         request: encoded,
         renewal: None,
+        repeat: None,
     })
 }
 
@@ -659,7 +758,7 @@ fn encoded<W: Work>(
                         let method = signed_method(stage, request.signature)?;
                         let execution = stage.session.execution();
                         let mut input = Augmentation::new(stage.document, stage.prepared)
-                            .input(level, kind, method, execution)
+                            .input(level.baseline(), kind, method, execution)
                             .map_err(|error| match error {
                                 PreparationError::Admission(error) => {
                                     AugmentError::Construction(error)
@@ -705,16 +804,7 @@ pub fn complete_timestamp<W: Work>(
     completion: &Completion<'_, '_>,
     work: &W,
 ) -> Result<(), AugmentError> {
-    let requirements = completion.inputs.requirements;
-    match pending.kind {
-        TimestampKind::Signature if requirements == Requirements::Basic => {
-            return Err(AugmentError::BelowTimestamped(requirements));
-        }
-        TimestampKind::Archive if requirements != Requirements::Archival => {
-            return Err(AugmentError::BelowArchival(requirements));
-        }
-        TimestampKind::Signature | TimestampKind::Archive => {}
-    }
+    admitted(pending.kind, completion.inputs.requirements)?;
     if document.with_view(|view| (view.identity(), view.generation()))
         != (pending.document, pending.generation)
     {
@@ -731,9 +821,31 @@ pub fn complete_timestamp<W: Work>(
         requirements: pending.basis,
         ..inputs
     };
-    let gate = match pending.kind {
-        TimestampKind::Signature => Gate::Basic([assessment.certificates, &[]]),
-        TimestampKind::Archive => Gate::LongTerm(&basis),
+    let (gate, kind) = match pending.kind {
+        Stamp::Baseline(TimestampKind::Signature) => (
+            Gate::Basic([assessment.certificates, &[]]),
+            Ok(TimestampKind::Signature),
+        ),
+        Stamp::Baseline(TimestampKind::Archive) => {
+            (Gate::LongTerm(&basis), Ok(TimestampKind::Archive))
+        }
+        Stamp::Extended(kind) => (Gate::Extended(&basis), Err(kind)),
+        // A historical signature is assessed under its own profile's
+        // requirements, not the EN 319 132-1 levels.
+        Stamp::Historical(..) => {
+            return historical::complete(document, pending, response, completion, work);
+        }
+        Stamp::Seal(kind) => {
+            return seal::complete(
+                document,
+                pending,
+                kind,
+                response,
+                completion,
+                [&inputs, &basis],
+                work,
+            );
+        }
     };
     let unsigned = |document: &XmlDocument| {
         document.with_view(|view| {
@@ -757,8 +869,19 @@ pub fn complete_timestamp<W: Work>(
                 Ok(
                     selected(document, &session, signature, completion.id_attributes).and_then(
                         |node| {
-                            gated(&session, node, &gate, |stage, level| {
-                                timestamped(stage, level, pending, response, completion, unsigned)
+                            gated(&session, node, &gate, |stage, level| match kind {
+                                Ok(kind) => timestamped(
+                                    stage,
+                                    level.baseline(),
+                                    kind,
+                                    pending,
+                                    response,
+                                    completion,
+                                    unsigned,
+                                ),
+                                Err(kind) => extended::timestamped(
+                                    stage, kind, pending, response, completion, unsigned,
+                                ),
                             })
                         },
                     ),
@@ -770,14 +893,41 @@ pub fn complete_timestamp<W: Work>(
             &Publication {
                 assessment,
                 inputs: &inputs,
+                vocabulary: match pending.kind {
+                    Stamp::Extended(_) => Vocabulary::ExtendedV2,
+                    _ => Vocabulary::Baseline,
+                },
                 signature,
                 id_attributes: completion.id_attributes,
                 unsigned,
             },
-            Some(&property),
+            core::slice::from_ref(&property),
             work,
         )
     })
+}
+
+/// Whether a completed `kind` may be assessed at `requirements`.
+fn admitted(kind: Stamp, requirements: Requirements) -> Result<(), AugmentError> {
+    match kind {
+        Stamp::Baseline(TimestampKind::Signature) | Stamp::Extended(_)
+            if requirements == Requirements::Basic =>
+        {
+            Err(AugmentError::BelowTimestamped(requirements))
+        }
+        Stamp::Baseline(TimestampKind::Archive) if requirements != Requirements::Archival => {
+            Err(AugmentError::BelowArchival(requirements))
+        }
+        Stamp::Seal(_)
+            if matches!(
+                requirements,
+                Requirements::Basic | Requirements::Timestamped
+            ) =>
+        {
+            Err(AugmentError::BelowLongTerm(requirements))
+        }
+        Stamp::Baseline(_) | Stamp::Extended(_) | Stamp::Historical(..) | Stamp::Seal(_) => Ok(()),
+    }
 }
 
 /// The input certificates, then the ones the assessment's B-B path used.
@@ -802,32 +952,33 @@ fn pooled<'c, W: Work>(
 struct Publication<'p, 'a, 'inputs> {
     assessment: &'p Assessment<'a, 'inputs>,
     inputs: &'p Inputs<'p>,
+    /// The vocabulary the new generation is assessed in.
+    vocabulary: Vocabulary,
     signature: &'p str,
     id_attributes: &'p [IdAttributeRegistration],
     unsigned: Unsigned,
 }
 
-/// Insert `property`, if any, among the unsigned signature properties and
+/// Insert `properties`, in order, among the unsigned signature properties and
 /// keep the result only if it satisfies the assessment's verification request
 /// and meets `inputs.requirements`. Without a property nothing is committed,
 /// so the document keeps its generation either way.
 fn publish<W: Work>(
     document: &mut XmlDocument,
     publication: &Publication<'_, '_, '_>,
-    property: Option<&str>,
+    properties: &[String],
     work: &W,
 ) -> Result<(), AugmentError> {
     let Publication {
         assessment,
         inputs,
+        vocabulary,
         signature,
         id_attributes,
         unsigned,
     } = *publication;
     document.transaction(|document| {
-        if let Some(property) = property {
-            unsigned.insert(document, property)?;
-        }
+        unsigned.insert_all(document, properties)?;
         // The caller's targets and keys name elements of the requested
         // generation; they hold for the same elements in the new one.
         let carried = Carried::new::<_, AugmentError>(document, assessment.request, work)?;
@@ -837,13 +988,8 @@ fn publish<W: Work>(
             &carried.request(assessment.request),
             work,
             |session| {
-                Ok(
-                    selected(document, &session, signature, id_attributes).and_then(|node| {
-                        Ok(validate(&session, node, inputs, |level| {
-                            level.all_requirements_met()
-                        })?)
-                    }),
-                )
+                Ok(selected(document, &session, signature, id_attributes)
+                    .and_then(|node| Ok(validate_with(&session, node, inputs, vocabulary, Met)?)))
             },
         )??;
         match outcome {
@@ -876,13 +1022,16 @@ enum Gate<'g> {
     Basic([&'g [&'g [u8]]; 2]),
     /// `inputs.requirements`, B-LT or B-LTA, with the caller's evidence.
     LongTerm(&'g Inputs<'g>),
+    /// `inputs.requirements` over a signature that may hold the TS 101 903
+    /// references in the EN 319 132-1 Annex A names.
+    Extended(&'g Inputs<'g>),
 }
 
 impl Gate<'_> {
     fn requirements(&self) -> Requirements {
         match self {
             Self::Basic(_) => Requirements::Basic,
-            Self::LongTerm(inputs) => inputs.requirements,
+            Self::LongTerm(inputs) | Self::Extended(inputs) => inputs.requirements,
         }
     }
 }
@@ -893,26 +1042,64 @@ fn gated<W: Work, R>(
     session: &VerifiedSession<'_, '_, '_, W>,
     signature: NodeIdentity,
     gate: &Gate<'_>,
-    then: impl for<'a, 'l> FnOnce(&Stage<'a, '_, '_, '_, W>, &Level<'l>) -> Result<R, AugmentError>,
+    then: impl for<'a, 'j, 'l> FnOnce(
+        &Stage<'a, '_, '_, '_, W>,
+        Judged<'j, 'l>,
+    ) -> Result<R, AugmentError>,
 ) -> Result<R, AugmentError> {
     let outcome = match gate {
         Gate::Basic(certificates) => with_stage(
             session,
             signature,
             Requirements::Basic,
+            Vocabulary::Baseline,
             *certificates,
             None,
             |stage, report| {
                 let level =
                     baseline::assess(Evidence::Basic(report)).map_err(ValidationError::Level)?;
-                Ok(Outcome::Assessed(then(stage, &level)))
+                Ok(Outcome::Assessed(then(stage, Judged::Baseline(&level))))
             },
         )?,
-        Gate::LongTerm(inputs) => validate_with(session, signature, inputs, Then(then))?,
+        Gate::LongTerm(inputs) => {
+            validate_with(session, signature, inputs, Vocabulary::Baseline, Then(then))?
+        }
+        Gate::Extended(inputs) => validate_with(
+            session,
+            signature,
+            inputs,
+            Vocabulary::ExtendedV2,
+            Then(then),
+        )?,
     };
     match outcome {
         Outcome::Assessed(result) => result,
         outcome => Err(AugmentError::Unmet(outcome.map(|_| ()))),
+    }
+}
+
+/// The assessment a gate passed: a baseline level, or the requirements of a
+/// signature that holds TS 101 903 references.
+#[derive(Clone, Copy)]
+enum Judged<'j, 'l> {
+    Baseline(&'j Level<'l>),
+    Extended(ExtendedLevel),
+}
+
+impl<'j, 'l> Judged<'j, 'l> {
+    fn all_requirements_met(self) -> bool {
+        match self {
+            Self::Baseline(level) => level.all_requirements_met(),
+            Self::Extended(level) => level.all_requirements_met(),
+        }
+    }
+
+    /// The baseline level a baseline step runs over.
+    fn baseline(self) -> &'j Level<'l> {
+        match self {
+            Self::Baseline(level) => level,
+            Self::Extended(_) => unreachable!("a baseline step runs behind a baseline gate"),
+        }
     }
 }
 
@@ -921,12 +1108,16 @@ struct Then<F>(F);
 
 impl<W: Work, F, R> Visit<W> for Then<F>
 where
-    F: for<'a, 'l> FnOnce(&Stage<'a, '_, '_, '_, W>, &Level<'l>) -> Result<R, AugmentError>,
+    F: for<'a, 'j, 'l> FnOnce(&Stage<'a, '_, '_, '_, W>, Judged<'j, 'l>) -> Result<R, AugmentError>,
 {
     type Output = Result<R, AugmentError>;
 
     fn level(self, stage: &Stage<'_, '_, '_, '_, W>, level: &Level<'_>) -> Self::Output {
-        (self.0)(stage, level)
+        (self.0)(stage, Judged::Baseline(level))
+    }
+
+    fn extended(self, stage: &Stage<'_, '_, '_, '_, W>, level: ExtendedLevel) -> Self::Output {
+        (self.0)(stage, Judged::Extended(level))
     }
 }
 
@@ -992,7 +1183,31 @@ fn encode(
     request: &TimestampRequest<'_>,
     hashed: &[u8],
 ) -> Result<OwnedVec<u8>, AugmentError> {
-    let oid = request.digest.identifier().as_bytes();
+    with_algorithm(parser, request.digest, |reader, algorithm| {
+        NewRequest {
+            algorithm,
+            hashed_message: hashed,
+            policy: request.policy,
+            nonce: request.nonce,
+            cert_req: true,
+            extensions: &[],
+        }
+        .encode_der(reader)
+        .map_err(|error| AugmentError::Encoding(Box::new(error)))
+    })
+}
+
+/// Run `then` with the `AlgorithmIdentifier` of `digest`, read in the reader
+/// it is passed with.
+fn with_algorithm<R>(
+    parser: &Parser,
+    digest: digest::Algorithm,
+    then: impl for<'r> FnOnce(
+        &Reader<'r>,
+        structured_pkix::AlgorithmIdentifier<'r>,
+    ) -> Result<R, AugmentError>,
+) -> Result<R, AugmentError> {
+    let oid = digest.identifier().as_bytes();
     // X.690 §8.1.3.4: every standard digest identifier is a few octets, so
     // both lengths of `SEQUENCE { OID }` take the short form.
     let length = u8::try_from(oid.len())
@@ -1010,29 +1225,96 @@ fn encode(
     // RFC 5754 §2 and RFC 9688 §2: absent parameters identify each digest.
     let algorithm = structured_pkix::algorithm::read(&reader, &element, "hashAlgorithm")
         .map_err(AugmentError::Pkix)?;
-    NewRequest {
-        algorithm,
-        hashed_message: hashed,
-        policy: request.policy,
-        nonce: request.nonce,
-        cert_req: true,
-        extensions: &[],
-    }
-    .encode_der(&reader)
-    .map_err(|error| AugmentError::Encoding(Box::new(error)))
+    then(&reader, algorithm)
 }
 
-/// The timestamp property of a checked response, as markup.
+/// The `kind` timestamp property of a checked response, as markup.
 fn timestamped<W: Work>(
     stage: &Stage<'_, '_, '_, '_, W>,
     level: &Level<'_>,
+    kind: TimestampKind,
     pending: &PendingTimestamp,
     response: &[u8],
     completion: &Completion<'_, '_>,
     unsigned: Unsigned,
 ) -> Result<String, AugmentError> {
-    let parser = stage.parser;
     let method = signed_method(stage, &pending.signature)?;
+    with_response_check(stage, pending, response, completion, |check, status| {
+        let augmentation = Augmentation::new(stage.document, stage.prepared);
+        let checked = augmentation
+            .check_response(level, kind, method, check, unrecognized())
+            .map_err(|error| AugmentError::Check(Box::new(error)))?;
+        let Some(timestamp) = checked.timestamp() else {
+            return Err(unproven(checked.facts(), status));
+        };
+        let mut staging = Staging::over(stage, unsigned);
+        augmentation
+            .write_timestamp(&timestamp, &mut staging, stage.session.execution())
+            .map_err(construction)?;
+        Ok(staging.draft.finish()?.0)
+    })
+}
+
+/// Why a checked response that carries no evidence for the request failed.
+fn unproven(
+    facts: &structured_cms::timestamp::response::CheckedResponse<'_>,
+    status: Status,
+) -> AugmentError {
+    let Some(facts) = facts.timestamp() else {
+        return AugmentError::Refused(status);
+    };
+    AugmentError::Unproven(TokenFacts {
+        imprint: facts.imprint,
+        requested_imprint: facts.requested_imprint,
+        requested_fields: facts.requested_fields,
+        timeliness: facts.timeliness,
+    })
+}
+
+/// Run `then` with `response` read as a granted RFC 3161 response and the
+/// context it is checked in: the requested `pending.request`, its authority
+/// among the token's and the caller's certificates and the caller's time
+/// facts.
+fn with_response_check<W: Work, R>(
+    stage: &Stage<'_, '_, '_, '_, W>,
+    pending: &PendingTimestamp,
+    response: &[u8],
+    completion: &Completion<'_, '_>,
+    then: impl for<'r> FnOnce(
+        &ResponseCheck<'r, '_, CmsProvider<'_>>,
+        Status,
+    ) -> Result<R, AugmentError>,
+) -> Result<R, AugmentError> {
+    let checking = Checking {
+        session: stage.session,
+        parser: stage.parser,
+        operation: stage.operation,
+        signer_time: stage.signer_time,
+    };
+    checked_response(&checking, pending, response, completion, then)
+}
+
+/// What a TSA response is checked in: the verified session, its parser and
+/// operation reader, and the time the signature is validated at.
+pub(crate) struct Checking<'c, 'v, 's, 'i, W: Work> {
+    pub(crate) session: &'c VerifiedSession<'v, 's, 'i, W>,
+    pub(crate) parser: &'c Parser,
+    pub(crate) operation: &'c Reader<'c>,
+    pub(crate) signer_time: structured_pkix::temporal::Instant,
+}
+
+/// [`with_response_check`] in `checking`.
+fn checked_response<W: Work, R>(
+    checking: &Checking<'_, '_, '_, '_, W>,
+    pending: &PendingTimestamp,
+    response: &[u8],
+    completion: &Completion<'_, '_>,
+    then: impl for<'r> FnOnce(
+        &ResponseCheck<'r, '_, CmsProvider<'_>>,
+        Status,
+    ) -> Result<R, AugmentError>,
+) -> Result<R, AugmentError> {
+    let parser = checking.parser;
     let mut source = parser.read(response, 0).map_err(AugmentError::Asn1)?;
     let response = Response::read(&mut source).map_err(AugmentError::Message)?;
     let status = response.status().status();
@@ -1040,7 +1322,7 @@ fn timestamped<W: Work>(
         return Err(AugmentError::Refused(status));
     };
     let carrier = response
-        .token_reader_in(stage.operation)
+        .token_reader_in(checking.operation)
         .map_err(AugmentError::Message)?
         .ok_or(AugmentError::Refused(status))?;
     let mut asked = parser
@@ -1053,10 +1335,10 @@ fn timestamped<W: Work>(
     let supplied = read_certificates(parser, completion.inputs.certificates)?;
     let anchors = read_certificates(parser, completion.inputs.anchors)?;
     let (certificate, certificate_parent) =
-        authority(token, &carrier, [&supplied, &anchors], stage.operation)?
+        authority(token, &carrier, [&supplied, &anchors], checking.operation)?
             .ok_or(AugmentError::MissingAuthority)?;
     let stated = accuracy::read(parser, completion.inputs.accuracies)?;
-    let policy_accuracy = accuracy::select_outside(&stated, token, &carrier, stage.operation)?;
+    let policy_accuracy = accuracy::select_outside(&stated, token, &carrier, checking.operation)?;
     let context = CheckContext {
         certificate,
         certificate_parent,
@@ -1068,51 +1350,22 @@ fn timestamped<W: Work>(
         utc: completion.inputs.utc,
         // A token generated after the time the signature is validated at
         // cannot timestamp it at that time.
-        reference: Some(stage.signer_time),
+        reference: Some(checking.signer_time),
         window: completion.window,
         // RFC 3161 §2.4.2: the caller's policy accuracy answers only an
         // absent field, as in the level validation of the new generation.
         policy_accuracy,
     };
-    let cms = stage.session.cms_provider();
-    let augmentation = Augmentation::new(stage.document, stage.prepared);
-    let checked = augmentation
-        .check_response(
-            level,
-            pending.kind,
-            method,
-            &ResponseCheck {
-                response: &response,
-                provider: &cms,
-                query: stage.operation,
-                context: &context,
-            },
-            unrecognized(),
-        )
-        .map_err(|error| AugmentError::Check(Box::new(error)))?;
-    let Some(timestamp) = checked.timestamp() else {
-        let facts = checked
-            .facts()
-            .timestamp()
-            .ok_or(AugmentError::Refused(status))?;
-        return Err(AugmentError::Unproven(TokenFacts {
-            imprint: facts.imprint,
-            requested_imprint: facts.requested_imprint,
-            requested_fields: facts.requested_fields,
-            timeliness: facts.timeliness,
-        }));
-    };
-    let mut staging = Staging {
-        session: stage.session,
-        base: stage.document.snapshot(),
-        signature: stage.prepared.bound().containers().signature(),
-        unsigned: unsigned.signature_properties(),
-        draft: Draft::new(),
-    };
-    augmentation
-        .write_timestamp(&timestamp, &mut staging, stage.session.execution())
-        .map_err(construction)?;
-    Ok(staging.draft.finish()?.0)
+    let cms = checking.session.cms_provider();
+    then(
+        &ResponseCheck {
+            response: &response,
+            provider: &cms,
+            query: checking.operation,
+            context: &context,
+        },
+        status,
+    )
 }
 
 /// The certificate `token` names as its signer, carried or supplied.
@@ -1146,6 +1399,14 @@ fn construction(error: produce::Error<StagingError>) -> AugmentError {
     match error {
         produce::Error::Writer(StagingError::Draft(error)) => AugmentError::Draft(error),
         produce::Error::Writer(StagingError::Method(error)) => AugmentError::Method(error),
+        produce::Error::Writer(StagingError::Name(error)) => AugmentError::Pkix(error),
+        produce::Error::Writer(StagingError::Negative) => {
+            AugmentError::Construction(produce::Error::Value("reference.integer"))
+        }
+        produce::Error::Writer(StagingError::Unidentified) => {
+            AugmentError::Construction(produce::Error::Value("historicalTimestamp.reference"))
+        }
+        produce::Error::Writer(StagingError::Placement(cause)) => AugmentError::Historical(cause),
         produce::Error::Resource(error) => AugmentError::Resource(error),
         produce::Error::Value(value) => AugmentError::Construction(produce::Error::Value(value)),
         produce::Error::Foreign => AugmentError::Construction(produce::Error::Foreign),
@@ -1158,6 +1419,51 @@ fn construction(error: produce::Error<StagingError>) -> AugmentError {
 enum StagingError {
     Draft(DraftError),
     Method(DsigError),
+    /// A distinguished name could not be rendered.
+    Name(structured_pkix::Error),
+    /// A negative integer has no `xsd:integer` form these properties allow
+    /// (RFC 5280 §4.1.2.2 and §5.2.3 make serials and CRL numbers positive).
+    Negative,
+    /// An element a property names carries no `Id` or `Algorithm` to name it by.
+    Unidentified,
+    /// The document could not be read where a property names an element.
+    Placement(String),
+}
+
+impl From<ValueError> for StagingError {
+    fn from(error: ValueError) -> Self {
+        match error {
+            ValueError::Draft(error) => Self::Draft(error),
+            ValueError::Name(error) => Self::Name(error),
+            ValueError::Negative => Self::Negative,
+        }
+    }
+}
+
+impl<W: Work> ReferenceWriter for Staging<'_, '_, '_, '_, W> {
+    fn distinguished_name<Q: Work>(
+        &mut self,
+        name: &structured_pkix::Name<'_>,
+        work: &Q,
+    ) -> Result<(), StagingError> {
+        Ok(self.draft.name_text(name, work)?)
+    }
+
+    fn integer<Q: Work>(
+        &mut self,
+        value: structured_asn1::Integer<'_>,
+        work: &Q,
+    ) -> Result<(), StagingError> {
+        Ok(self.draft.integer_text(value, work)?)
+    }
+
+    fn datetime<Q: Work>(
+        &mut self,
+        value: structured_pkix::Time,
+        work: &Q,
+    ) -> Result<(), StagingError> {
+        Ok(self.draft.time_text(value, work)?)
+    }
 }
 
 /// The unpublished property of one augmentation, opened at the original
@@ -1168,6 +1474,20 @@ struct Staging<'s, 'v, 'sc, 'i, W: Work> {
     signature: NodeIdentity,
     unsigned: Option<NodeIdentity>,
     draft: Draft,
+}
+
+impl<'s, 'v, 'sc, 'i, W: Work> Staging<'s, 'v, 'sc, 'i, W> {
+    /// An empty draft of one property over the stage's generation, appended
+    /// at `unsigned`.
+    fn over(stage: &Stage<'s, 'v, 'sc, 'i, W>, unsigned: Unsigned) -> Self {
+        Self {
+            session: stage.session,
+            base: stage.document.snapshot(),
+            signature: stage.prepared.bound().containers().signature(),
+            unsigned: unsigned.signature_properties(),
+            draft: Draft::new(),
+        }
+    }
 }
 
 impl<W: Work> Writer for Staging<'_, '_, '_, '_, W> {
