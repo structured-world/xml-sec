@@ -6,7 +6,7 @@
     "not-applicable": "The class tests DSS's own behaviour, not a signature form xml-sec should make: its API, its validation policy over a PKI scenario, its handling of an input, or a form both implementations refuse or that meets no baseline level."
   },
   "capabilities": {
-    "ts101903-renewal": "a further archive timestamp over a pre-EN XAdES-A, after the TimeStampValidationData of the earlier archive timestamp's TSA; the historical census of the signature primitives does not yet establish what an archive timestamp's TSA needs"
+    "ts101903-renewal": "a further archive timestamp over a pre-EN XAdES-A, after the TimeStampValidationData of the earlier archive timestamp's TSA; the historical census of the signature primitives does not yet say which of an archive timestamp's TSA material lies in its own TimeStampValidationData"
   },
   "reasons": {
     "dss-api": "behaviour of the DSS service API: parameter validation and its exceptions, re-initialised or atomic calls, identifier providers, the document extender class, external signature values, digest documents in place of content, TSA failures",
