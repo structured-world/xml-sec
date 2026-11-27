@@ -14,13 +14,15 @@ use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
 use xml_sec::XmlDocument;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::document::{NodeIdentity, XmlDocumentError};
-use xml_sec::policy::{Instant, ManifestProcessing, SigningPolicy, VerificationPolicy};
+use xml_sec::policy::{
+    Instant, ManifestProcessing, PolicyViolation, SigningPolicy, VerificationPolicy,
+};
 use xml_sec::xmldsig::extension;
 use xml_sec::xmldsig::{
-    DefaultKeyResolver, DigestAlgorithm, KeyInfoWriteError, KeyResolverConfig, ObjectContent,
-    ObjectElement, RsaSigningKey, SignatureAlgorithm, SigningError, Transform, UriTypeSet,
-    VerificationRequest, VerifyContext, XPathExpression, XPathFilter, XPathFilterOperation,
-    with_verified_request,
+    DefaultKeyResolver, DigestAlgorithm, DsigStatus, FailureReason, KeyInfoWriteError,
+    KeyResolverConfig, ObjectContent, ObjectElement, RsaSigningKey, SignatureAlgorithm,
+    SignatureBuilderError, SigningError, Transform, UriTypeSet, VerificationRequest, VerifyContext,
+    XPathExpression, XPathFilter, XPathFilterOperation, with_verified_request,
 };
 use xml_sec_xades::properties::{
     Commitment, CommitmentScope, ExplicitPolicy, FormatDetails, Fragment, Identifier,
@@ -813,6 +815,23 @@ fn references_the_caller_composes_meet_basic() {
             vec![XPATH_URI, EXCLUSIVE],
         ),
         (
+            // The expression binds the signature's own prefix to another
+            // namespace; the choice of signature prefix does not limit it.
+            "xpath-own-ds",
+            vec![
+                Transform::XPath(
+                    XPathExpression::new(
+                        "not(ancestor-or-self::dsig:Signature) and not(ancestor-or-self::ds:Item)",
+                    )
+                    .with_namespace("dsig", DS)
+                    .with_namespace("ds", "urn:payload"),
+                ),
+                exclusive(),
+            ],
+            "",
+            vec![XPATH_URI, EXCLUSIVE],
+        ),
+        (
             // A chain ending in a node set gains the explicit Exclusive C14N
             // the default signing policy generates (XMLDSig 1.1 §4.4.3.2).
             "enveloped-only",
@@ -1018,6 +1037,39 @@ fn a_manifest_of_detached_data_is_signed_with_its_digests_filled() {
         digests.iter().all(|digest| !digest.is_empty()),
         "{digests:?}"
     );
+    // The verifier processed both entries, not only the Manifest reference.
+    let parsed = XmlDocument::parse(document.as_xml()).expect("created XML parses");
+    let context = VerifyContext::new()
+        .policy(fixture.context_policy.clone())
+        .key_resolver(&fixture.resolver);
+    let verification = VerificationRequest {
+        external_resources: Some(&fixture.resources),
+        ..VerificationRequest::default()
+    };
+    let entries = with_verified_request(
+        &parsed,
+        &context,
+        &verification,
+        &account(1 << 30),
+        |session| {
+            Ok(session
+                .evidence()
+                .signatures()
+                .iter()
+                .filter_map(|entry| entry.result().as_ref().ok())
+                .flat_map(|result| result.manifest_references.iter())
+                .map(|reference| (reference.uri.clone(), reference.status))
+                .collect::<Vec<_>>())
+        },
+    )
+    .expect("the created document is read");
+    assert_eq!(
+        entries,
+        [
+            ("detached.txt".to_owned(), DsigStatus::Valid),
+            ("second.txt".to_owned(), DsigStatus::Valid)
+        ]
+    );
 }
 
 #[test]
@@ -1067,12 +1119,55 @@ fn a_reference_to_key_info_signs_the_written_certificates() {
             .evidence()
             .signatures()
             .iter()
-            .map(|entry| format!("{:?}", entry.result().as_ref().map(|result| result.status)))
+            .map(|entry| entry.result().as_ref().ok().map(|result| result.status))
             .collect::<Vec<_>>())
     })
     .expect("the tampered document is read");
-    assert_eq!(status.len(), 1);
-    assert!(status[0].contains("ref_index: 1"), "{status:?}");
+    assert_eq!(
+        status,
+        [Some(DsigStatus::Invalid(
+            FailureReason::ReferenceDigestMismatch { ref_index: 1 }
+        ))]
+    );
+}
+
+#[test]
+fn a_request_beyond_the_reference_limit_is_refused_before_its_ids() {
+    // Signing counts the SignedInfo references and, when the policy
+    // processes them, the Manifest ones against one limit. A request beyond
+    // it is refused by that limit before any of its IDs is laid out or looked
+    // for in the document, here one that also declares the Manifest's ID.
+    const TAKEN: &str = "<Document><Data Id=\"manifest\">x</Data></Document>";
+    let mut fixture = Fixture::new();
+    fixture.policy.manifest_processing = ManifestProcessing::Process;
+    fixture.policy.resources.max_references = 2;
+    let entry = |uri| ManifestEntry {
+        uri,
+        mime_type: "text/plain",
+    };
+    let objects = [DataObject::Manifest {
+        id: "manifest",
+        entries: vec![entry("a.txt"), entry("b.txt"), entry("c.txt")],
+        mime_type: "text/xml",
+    }];
+    let mut document = XmlDocument::parse(TAKEN).expect("fixture parses");
+    let error = fixture
+        .create(&mut document, request("sig", &objects))
+        .expect_err("five references against a limit of two");
+    assert!(
+        matches!(
+            &error,
+            CreateError::Template(SignatureBuilderError::Policy(
+                PolicyViolation::ResourceLimit {
+                    maximum: 2,
+                    actual: 5,
+                    ..
+                }
+            ))
+        ),
+        "{error:?}"
+    );
+    assert_eq!(document.as_xml(), TAKEN, "nothing published");
 }
 
 #[test]
@@ -1806,35 +1901,40 @@ fn every_storage_ceiling_publishes_all_or_nothing() {
 
 #[test]
 fn a_refused_draft_reports_its_resource_cause() {
-    // A work refusal inside the property draft keeps its original class.
+    // A work refusal inside the property draft keeps its original class:
+    // some ceiling passes the certificate reads and stops in the draft, and
+    // that refusal is the draft's own resource error.
     let fixture = Fixture::new();
-    let mut document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
-    refused(
-        &mut document,
-        |document| {
-            fixture.with_assessment(&fixture.resolver, |assessment| {
-                create(
-                    document,
-                    &fixture.signer(&[SIGNER, INTERMEDIATE]),
-                    request("sig", &enveloped(Envelope::Enveloped)),
-                    assessment,
-                    &account_of(1 << 24, 0),
-                )
-            })
-        },
-        |error| {
-            matches!(
-                error,
-                CreateError::Certificate(_)
-                    | CreateError::Resource(MemoryError::WorkExceeded)
-                    | CreateError::Properties(
-                        structured_xades::produce::Error::Resource(MemoryError::WorkExceeded)
-                            | structured_xades::produce::Error::Writer(PropertyError::Draft(
-                                DraftError::Resource(MemoryError::WorkExceeded)
-                            ))
+    let mut ceiling = 0;
+    let mut reached = false;
+    while ceiling <= 1 << 26 && !reached {
+        let mut document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
+        let result = refused(
+            &mut document,
+            |document| {
+                fixture.with_assessment(&fixture.resolver, |assessment| {
+                    create(
+                        document,
+                        &fixture.signer(&[SIGNER, INTERMEDIATE]),
+                        request("sig", &enveloped(Envelope::Enveloped)),
+                        assessment,
+                        &account_of(1 << 24, ceiling),
                     )
-            )
-        },
+                })
+            },
+            |_| true,
+        );
+        reached = matches!(
+            result,
+            CreateError::Properties(structured_xades::produce::Error::Writer(
+                PropertyError::Draft(DraftError::Resource(MemoryError::WorkExceeded))
+            ))
+        );
+        ceiling += ceiling / 16 + 1;
+    }
+    assert!(
+        reached,
+        "a ceiling stops creation inside the property draft"
     );
 }
 

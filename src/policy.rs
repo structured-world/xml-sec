@@ -1041,6 +1041,30 @@ impl ResourcePolicy {
         Ok(())
     }
 
+    /// Reject a signature of `actual` references, the `SignedInfo` ones and
+    /// any processed `Manifest` ones together, beyond this policy snapshot.
+    ///
+    /// # Errors
+    /// Returns a `ResourceLimit` for counts above `max_references`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let resources = xml_sec::policy::ResourcePolicy::default();
+    /// assert!(resources.validate_reference_count(1).is_ok());
+    /// assert!(resources.validate_reference_count(usize::MAX).is_err());
+    /// ```
+    pub fn validate_reference_count(&self, actual: usize) -> Result<(), PolicyViolation> {
+        if actual > self.max_references {
+            return Err(PolicyViolation::ResourceLimit {
+                resource: resource_name::SIGNATURE_REFERENCES,
+                maximum: self.max_references,
+                actual,
+            });
+        }
+        Ok(())
+    }
+
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     /// Reject aggregate key-candidate work beyond this policy snapshot.
     ///

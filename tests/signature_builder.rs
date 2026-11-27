@@ -887,10 +887,12 @@ fn rejects_invalid_filter2_expression_counts() {
 }
 
 #[test]
-fn rejects_xpath_binding_that_shadows_signature_prefix() {
-    // Rebinding the prefix used for ds:XPath changes the element namespace and
-    // produces a template that neither the strict parser nor a signer can use.
-    let error = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+fn an_xpath_binding_of_the_signature_prefix_keeps_its_namespace() {
+    // An expression may bind the prefix the signature uses to another
+    // namespace: its XPath element is written unprefixed in a local default
+    // XMLDSig namespace, so the element stays XMLDSig and the expression's
+    // prefix keeps the caller's namespace.
+    let template = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
         .ns_prefix("ds")
         .add_reference(
             ReferenceBuilder::new(DigestAlgorithm::Sha256).transform(Transform::XPath(
@@ -898,9 +900,23 @@ fn rejects_xpath_binding_that_shadows_signature_prefix() {
             )),
         )
         .build_template()
-        .expect_err("XPath namespace bindings must not shadow the signature prefix");
-
-    assert!(error.to_string().contains("ds"));
+        .expect("the binding is kept in a local scope");
+    let document = roxmltree::Document::parse(&template).expect("well-formed template");
+    let xpath = document
+        .descendants()
+        .find(|node| node.tag_name().name() == "XPath")
+        .expect("XPath parameter");
+    assert_eq!(
+        xpath.tag_name().namespace(),
+        Some("http://www.w3.org/2000/09/xmldsig#"),
+        "{template}"
+    );
+    assert_eq!(
+        xpath.lookup_namespace_uri(Some("ds")),
+        Some("urn:payload"),
+        "{template}"
+    );
+    assert_eq!(xpath.text(), Some("//ds:item"));
 }
 
 #[test]

@@ -26,7 +26,7 @@ use structured_xades::xml::Name;
 use xml_sec::IdAttributeRegistration;
 use xml_sec::c14n::C14nAlgorithm;
 use xml_sec::document::{DocumentView, NodeIdentity, XmlDocument, XmlDocumentError};
-use xml_sec::policy::SigningPolicy;
+use xml_sec::policy::{ManifestProcessing, SigningPolicy};
 use xml_sec::provider::{CryptoProvider, ProviderError};
 use xml_sec::xmldsig::extension::{ScalarError, TreeError, first_child, next_sibling, parent};
 use xml_sec::xmldsig::parse::{KeyInfoParsingSession, ParseError};
@@ -446,6 +446,7 @@ pub fn create<W: Work>(
     assessment: &Assessment<'_, '_>,
     work: &W,
 ) -> Result<(), CreateError> {
+    check_reference_count(signer.policy, &request.objects)?;
     let layout = Layout::new(document, &request)?;
     let key_info = checked_key_info(signer, work)?;
     let stamps = request.properties.content_timestamps;
@@ -579,6 +580,7 @@ pub fn request_content_timestamps<W: Work>(
     assessment: &Assessment<'_, '_>,
     work: &W,
 ) -> Result<ContentRequests, CreateError> {
+    check_reference_count(signer.policy, &request.objects)?;
     let layout = Layout::new(document, request)?;
     let key_info = checked_key_info(signer, work)?;
     let replayed = layout.replayed(document, signer, &key_info, request, work)?;
@@ -969,6 +971,29 @@ fn new_ids<'a>(
 
 /// Each reference of a signed `Manifest` among `objects`, as `#ID` with the
 /// MIME type of the datum it names.
+/// Refuses `objects` before any ID is laid out when the signature they make
+/// would hold more references than `policy` admits: one per data object and
+/// the `SignedProperties` one, with the `Manifest` entries when the policy
+/// processes them, as signing then counts them.
+fn check_reference_count(
+    policy: &SigningPolicy,
+    objects: &[DataObject<'_>],
+) -> Result<(), CreateError> {
+    // A count past usize::MAX is past any limit, so the sums saturate.
+    let mut actual = objects.len().saturating_add(1);
+    if policy.manifest_processing == ManifestProcessing::Process {
+        for object in objects {
+            if let DataObject::Manifest { entries, .. } = object {
+                actual = actual.saturating_add(entries.len());
+            }
+        }
+    }
+    policy
+        .resources
+        .validate_reference_count(actual)
+        .map_err(|violation| CreateError::Template(violation.into()))
+}
+
 fn manifest_references<'a>(objects: &[DataObject<'a>]) -> Vec<(String, &'a str)> {
     objects
         .iter()

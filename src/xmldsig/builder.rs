@@ -41,9 +41,6 @@ pub enum SignatureBuilderError {
     /// A namespace URI could not be represented in an XML 1.0 declaration.
     #[error("XML namespace URI contains a character forbidden by XML 1.0: {0:?}")]
     InvalidNamespaceUri(String),
-    /// An `XPath` binding would rebind the prefix used by `XMLDSig` elements.
-    #[error("XPath namespace binding conflicts with XMLDSig prefix: {0}")]
-    NamespacePrefixConflict(String),
     /// An `XMLDSig` Id attribute was not a valid XML `NCName`.
     #[error("invalid {element} Id: {value}")]
     InvalidId {
@@ -771,14 +768,9 @@ impl SignatureBuilder {
         if self.references.is_empty() {
             return Err(SignatureBuilderError::MissingReference);
         }
-        if self.references.len() > policy.resources.max_references {
-            return Err(PolicyViolation::ResourceLimit {
-                resource: crate::policy::resource_name::SIGNATURE_REFERENCES,
-                maximum: policy.resources.max_references,
-                actual: self.references.len(),
-            }
-            .into());
-        }
+        policy
+            .resources
+            .validate_reference_count(self.references.len())?;
         // Stylesheets are copied into the template verbatim; their sum is bounded by the
         // document limit before any of them is written.
         #[cfg(feature = "xslt")]
@@ -987,31 +979,21 @@ impl SignatureBuilder {
     }
 
     fn validate_namespace_bindings(&self) -> Result<(), SignatureBuilderError> {
-        for (prefix, uri, shares_signature_namespace) in
-            self.references.iter().flat_map(|reference| {
-                reference
-                    .transforms
-                    .iter()
-                    .flat_map(|transform| match transform {
-                        Transform::XPath(xpath) => xpath
-                            .namespaces()
-                            .iter()
-                            .map(|(prefix, uri)| (prefix, uri, true))
-                            .collect::<Vec<_>>(),
-                        Transform::XPathFilter2(filters) => filters
-                            .iter()
-                            .flat_map(|filter| {
-                                filter
-                                    .xpath()
-                                    .namespaces()
-                                    .iter()
-                                    .map(|(prefix, uri)| (prefix, uri, false))
-                            })
-                            .collect(),
-                        _ => Vec::new(),
-                    })
-            })
-        {
+        // An XPath parameter that rebinds the signature prefix is written in a
+        // local default namespace instead, so any NCName prefix is admitted.
+        for (prefix, uri) in self.references.iter().flat_map(|reference| {
+            reference
+                .transforms
+                .iter()
+                .flat_map(|transform| match transform {
+                    Transform::XPath(xpath) => xpath.namespaces().iter().collect::<Vec<_>>(),
+                    Transform::XPathFilter2(filters) => filters
+                        .iter()
+                        .flat_map(|filter| filter.xpath().namespaces().iter())
+                        .collect(),
+                    _ => Vec::new(),
+                })
+        }) {
             // Namespaces in XML reserves the declaration namespace and both
             // sides of the `xml` binding; prefixed declarations cannot be empty.
             if uri.is_empty() || uri == XMLNS_NS || !uri.chars().all(is_xml_1_0_character) {
@@ -1022,16 +1004,6 @@ impl SignatureBuilder {
                 || (prefix != "xml" && !is_namespace_prefix(prefix))
             {
                 return Err(SignatureBuilderError::InvalidNamespacePrefix(
-                    prefix.clone(),
-                ));
-            }
-            // Ordinary XPath parameters share the Signature namespace prefix,
-            // while Filter2 parameters are unprefixed in their own namespace.
-            if shares_signature_namespace
-                && self.ns_prefix.as_ref() == Some(prefix)
-                && uri != XMLDSIG_NS
-            {
-                return Err(SignatureBuilderError::NamespacePrefixConflict(
                     prefix.clone(),
                 ));
             }
@@ -1232,13 +1204,7 @@ fn write_transform<W: Write>(
             writer.end(&name)?;
             Ok(())
         }
-        Transform::XPath(xpath) => {
-            let transform_name = qualified_name(prefix, "Transform");
-            writer.start(&transform_name, [("Algorithm", XPATH_TRANSFORM_URI)])?;
-            write_xpath_expression(writer, prefix, "XPath", None, xpath)?;
-            writer.end(&transform_name)?;
-            Ok(())
-        }
+        Transform::XPath(xpath) => write_xpath_transform(writer, prefix, xpath),
         Transform::XPathFilter2(filters) => {
             let transform_name = qualified_name(prefix, "Transform");
             writer.start(
@@ -1252,6 +1218,7 @@ fn write_transform<W: Write>(
                     "XPath",
                     Some(filter.operation().as_str()),
                     filter.xpath(),
+                    false,
                 )?;
             }
             writer.end(&transform_name)?;
@@ -1293,12 +1260,35 @@ fn write_transform<W: Write>(
     }
 }
 
+/// An `XPath` transform. An expression that binds the signature prefix to
+/// another namespace keeps that binding: its `XPath` element is then written
+/// unprefixed in a local default `XMLDSig` namespace, which no `XPath` 1.0
+/// name test reads (`XPath` 1.0 §2.3).
+fn write_xpath_transform<W: Write>(
+    writer: &mut Writer<W>,
+    prefix: Option<&str>,
+    xpath: &XPathExpression,
+) -> Result<(), std::io::Error> {
+    let transform_name = qualified_name(prefix, "Transform");
+    writer.start(&transform_name, [("Algorithm", XPATH_TRANSFORM_URI)])?;
+    let rebound = prefix.is_some_and(|prefix| {
+        xpath
+            .namespaces()
+            .iter()
+            .any(|(bound, uri)| bound == prefix && uri != XMLDSIG_NS)
+    });
+    let element_prefix = if rebound { None } else { prefix };
+    write_xpath_expression(writer, element_prefix, "XPath", None, xpath, rebound)?;
+    writer.end(&transform_name)
+}
+
 fn write_xpath_expression<W: Write>(
     writer: &mut Writer<W>,
     prefix: Option<&str>,
     local_name: &str,
     filter: Option<&str>,
     xpath: &XPathExpression,
+    rebound: bool,
 ) -> Result<(), std::io::Error> {
     let name = qualified_name(prefix, local_name);
     let namespace_attributes = xpath
@@ -1310,6 +1300,9 @@ fn write_xpath_expression<W: Write>(
     let mut attributes = Vec::new();
     if prefix.is_none() && filter.is_some() {
         attributes.push(("xmlns", XPATH_FILTER2_TRANSFORM_URI));
+    }
+    if rebound {
+        attributes.push(("xmlns", XMLDSIG_NS));
     }
     if let Some(filter) = filter {
         attributes.push(("Filter", filter));
