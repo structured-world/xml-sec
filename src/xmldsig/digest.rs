@@ -139,6 +139,40 @@ impl DigestAlgorithm {
         super::pkix::digest_algorithm(algorithm)
     }
 
+    /// The ASN.1 digest identity of this digest, the inverse of
+    /// [`Self::from_pkix`], or `None` when CMS and X.509 name no such digest
+    /// for this crate.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use structured_pkix::algorithm::digest::Algorithm;
+    /// use xml_sec::xmldsig::DigestAlgorithm;
+    ///
+    /// assert_eq!(DigestAlgorithm::Sha256.to_pkix(), Some(Algorithm::Sha256));
+    /// ```
+    #[must_use]
+    pub fn to_pkix(self) -> Option<structured_pkix::algorithm::digest::Algorithm> {
+        use structured_pkix::algorithm::digest::Algorithm as Hash;
+        Some(match self {
+            Self::Sha1 => Hash::Sha1,
+            Self::Sha224 => Hash::Sha224,
+            Self::Sha256 => Hash::Sha256,
+            Self::Sha384 => Hash::Sha384,
+            Self::Sha512 => Hash::Sha512,
+            Self::Sha3_224 => Hash::Sha3_224,
+            Self::Sha3_256 => Hash::Sha3_256,
+            Self::Sha3_384 => Hash::Sha3_384,
+            Self::Sha3_512 => Hash::Sha3_512,
+            #[cfg(feature = "dstu4145")]
+            Self::Gost34311 => Hash::Gost34311,
+            #[cfg(feature = "dstu4145")]
+            Self::Dstu7564_256 => Hash::Kupyna256,
+            #[cfg(feature = "legacy-algorithms")]
+            Self::Md5 | Self::Ripemd160 => return None,
+        })
+    }
+
     /// Return the XML namespace URI for this digest algorithm.
     #[must_use]
     pub fn uri(self) -> &'static str {

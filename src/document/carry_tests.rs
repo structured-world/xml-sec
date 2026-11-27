@@ -237,3 +237,64 @@ fn identities_of_an_outer_start_carry_inside_and_after_inner_transactions() {
         })
         .expect("transaction succeeds");
 }
+
+#[test]
+fn appended_child_names_the_only_change() {
+    // A check that a draft changed nothing but one appended property reads
+    // the new element from the starting generation's parent.
+    let mut document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
+    let parent = element(&document, "parent");
+    document
+        .transaction(|document| {
+            document.append_child(parent, "<new Id=\"new\"><y/></new>")?;
+            assert_eq!(document.appended_child(parent)?, element(document, "new"));
+            Ok::<_, XmlDocumentError>(())
+        })
+        .expect("transaction succeeds");
+}
+
+#[test]
+fn appended_child_refuses_any_other_change() {
+    // Edits elsewhere, a child inserted before the last one, a child of
+    // another element or a second appended child are not one appended child.
+    type Edit = fn(&mut XmlDocument) -> Result<(), XmlDocumentError>;
+    let edits: [(&str, Edit); 4] = [
+        ("elsewhere", |document| {
+            document.append_child(element(document, "parent"), "<new/>")?;
+            document.append_child(element(document, "after"), "<other/>")
+        }),
+        ("before the last child", |document| {
+            document.insert_before(element(document, "x"), "<new/>")
+        }),
+        ("another parent", |document| {
+            document.append_child(element(document, "after"), "<new/>")
+        }),
+        ("two children", |document| {
+            document.append_child(element(document, "parent"), "<one/>")?;
+            document.append_child(element(document, "parent"), "<two/>")
+        }),
+    ];
+    for (name, edit) in edits {
+        let mut document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
+        let parent = element(&document, "parent");
+        let checked = document.transaction(|document| {
+            edit(document)?;
+            document.appended_child(parent)
+        });
+        assert!(
+            matches!(checked, Err(XmlDocumentError::InvalidReplacement(_))),
+            "{name}: {checked:?}"
+        );
+    }
+}
+
+#[test]
+fn appended_child_needs_an_open_transaction() {
+    // Outside a transaction there is no starting generation to compare with.
+    let document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
+    let parent = element(&document, "parent");
+    assert!(matches!(
+        document.appended_child(parent),
+        Err(XmlDocumentError::StaleIdentity { .. })
+    ));
+}

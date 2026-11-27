@@ -149,6 +149,82 @@ fn a_receiver_refusal_keeps_its_own_cause() {
     );
 }
 
+/// The canonical form of `element` without the subtrees of `excluded`.
+fn canonical_without(
+    session: &VerifiedSession<'_, '_, '_, Memory>,
+    element: NodeIdentity,
+    excluded: &[NodeIdentity],
+    method: NodeIdentity,
+) -> Result<String, ReplayError<()>> {
+    let mut output = Vec::new();
+    session.canonicalize_element_without(
+        element,
+        excluded,
+        method,
+        session.execution(),
+        &mut |bytes: &[u8]| {
+            output.extend_from_slice(bytes);
+            Ok(())
+        },
+    )?;
+    Ok(String::from_utf8(output).expect("canonical XML is UTF-8"))
+}
+
+#[test]
+fn an_excluded_subtree_is_cut_out_of_the_canonical_form() {
+    // RFC 6283 hash-tree renewal canonicalizes a sequence with only its
+    // earlier chains: the result is the whole element's canonical form with
+    // exactly the excluded subtree's bytes removed.
+    verified(
+        |_| {},
+        |session| {
+            let (signed, method, cut) = (
+                element(session, "SignedInfo"),
+                element(session, "CanonicalizationMethod"),
+                element(session, "SignatureMethod"),
+            );
+            let whole = canonical_without(session, signed, &[], method).expect("whole element");
+            let start = whole
+                .find("<ds:SignatureMethod")
+                .expect("the method is signed");
+            let end = whole
+                .find("</ds:SignatureMethod>")
+                .expect("the method has an end tag")
+                + "</ds:SignatureMethod>".len();
+            let expected = format!("{}{}", &whole[..start], &whole[end..]);
+            let pruned =
+                canonical_without(session, signed, &[cut], method).expect("pruned element");
+            assert_eq!(pruned, expected);
+        },
+    );
+}
+
+#[test]
+fn only_a_descendant_element_can_be_excluded() {
+    // Excluding the input itself or a node outside it would not be a subset
+    // of the input; it is refused before any output.
+    verified(
+        |_| {},
+        |session| {
+            let (signed, method, outside) = (
+                element(session, "SignedInfo"),
+                element(session, "CanonicalizationMethod"),
+                element(session, "SignatureValue"),
+            );
+            for excluded in [signed, outside] {
+                let result = canonical_without(session, signed, &[excluded], method);
+                assert!(
+                    matches!(
+                        result,
+                        Err(ReplayError::Processing(DsigError::InvalidRequest { .. }))
+                    ),
+                    "{result:?}"
+                );
+            }
+        },
+    );
+}
+
 #[test]
 fn owned_base64_is_the_scoped_value_and_stays_charged() {
     verified(

@@ -1548,6 +1548,94 @@ impl XmlDocument {
         })
     }
 
+    /// The element that the open transaction appended as the last child of
+    /// `parent`, an element of the generation the transaction started from,
+    /// when that insertion is the transaction's only change: the current
+    /// serialization is the starting one with exactly this element's markup
+    /// inserted before `parent`'s end tag. The identity is of the current
+    /// generation.
+    ///
+    /// # Errors
+    /// [`XmlDocumentError::ForeignIdentity`] or
+    /// [`XmlDocumentError::StaleIdentity`] as for [`Self::carry`],
+    /// [`XmlDocumentError::MissingNode`] when `parent` is not an element with
+    /// an end tag, [`XmlDocumentError::InvalidReplacement`] when the change is
+    /// anything else, and
+    /// [`XmlDocumentError::TreeBackedSerialization`] for a tree-backed
+    /// document, which keeps no starting serialization to compare.
+    #[cfg(feature = "xmldsig-sign")]
+    pub fn appended_child(&self, parent: NodeIdentity) -> Result<NodeIdentity, XmlDocumentError> {
+        if parent.document != self.identity {
+            return Err(XmlDocumentError::ForeignIdentity);
+        }
+        let stale = || XmlDocumentError::StaleIdentity {
+            identity: parent.generation,
+            current: self.generation,
+        };
+        if parent.generation == self.generation {
+            return Err(stale());
+        }
+        let base = self
+            .atomic
+            .iter()
+            .find_map(|frame| match frame {
+                AtomicMutation::Replaced(cell, start) if *start == parent.generation => Some(cell),
+                _ => None,
+            })
+            .ok_or_else(stale)?;
+        #[cfg(feature = "external-tree")]
+        if self.tree.is_some() {
+            return Err(XmlDocumentError::TreeBackedSerialization);
+        }
+        let other =
+            || XmlDocumentError::InvalidReplacement("the change is not one appended child".into());
+        base.with_dependent(|old, earlier| {
+            let element = SemanticDocument::node(&earlier.document, parent.semantic_id)
+                .filter(|node| node.is_element() && node.has_actionable_range())
+                .ok_or(XmlDocumentError::MissingNode)?;
+            let range = element.range();
+            let (content, _, empty) = element_content_range(&old[range.clone()])?;
+            if empty {
+                return Err(XmlDocumentError::MissingNode);
+            }
+            // The insertion point: the start of `parent`'s end tag.
+            let at = range.start + content.end;
+            self.with_view(|view| {
+                let new = view.xml();
+                let added = new
+                    .len()
+                    .checked_sub(old.len())
+                    .filter(|added| *added > 0)
+                    .ok_or_else(other)?;
+                if new.as_bytes()[..at] != old.as_bytes()[..at]
+                    || new.as_bytes()[at + added..] != old.as_bytes()[at..]
+                {
+                    return Err(other());
+                }
+                let inserted = at..at + added;
+                let node = view
+                    .parsed
+                    .document
+                    .descendants()
+                    .find(|node| node.is_element() && node.range() == inserted)
+                    .ok_or_else(other)?;
+                // Only the inserted bytes changed, so the enclosing element
+                // starts where `parent` did and keeps its name.
+                let enclosing = node.parent().filter(|enclosing| {
+                    let (name, found) = (element.tag_name(), enclosing.tag_name());
+                    enclosing.is_element()
+                        && enclosing.range().start == range.start
+                        && found.namespace() == name.namespace()
+                        && found.name() == name.name()
+                });
+                if enclosing.is_none() {
+                    return Err(other());
+                }
+                Ok(view.node_identity(node))
+            })
+        })
+    }
+
     /// End the innermost mutation: success leaves one new generation, failure
     /// leaves the starting serialization and generation exactly as they were.
     #[cfg(feature = "xmldsig-sign")]
