@@ -156,6 +156,40 @@ pub(crate) fn with_historical_census<W: Work, R>(
     inputs: &Inputs<'_>,
     visitor: impl for<'r, 'c> FnOnce(&HistoricalCensus<'r, 'c, '_, '_, '_, W>) -> R,
 ) -> Result<Outcome<R>, ValidationError> {
+    Ok(
+        match census_stage(session, signature, profile, inputs, false, visitor)? {
+            Outcome::Assessed(Some(value)) => Outcome::Assessed(value),
+            Outcome::Assessed(None) => unreachable!("a full census runs its visitor"),
+            outcome => outcome.map(|_| unreachable!("only an assessment carries a value")),
+        },
+    )
+}
+
+/// Establish the signer's path and every timestamp's TSA path to the caller's
+/// anchors, as a baseline B-T does, without the statuses a census closes: the
+/// check a historical timestamp passes before it is published.
+///
+/// # Errors
+/// As for [`with_historical_census`].
+pub(crate) fn historical_tsa_paths<W: Work>(
+    session: &VerifiedSession<'_, '_, '_, W>,
+    signature: N,
+    profile: Profile,
+    inputs: &Inputs<'_>,
+) -> Result<Outcome<()>, ValidationError> {
+    Ok(census_stage(session, signature, profile, inputs, true, |_| ())?.map(|_| ()))
+}
+
+/// The census of `signature`, or with `paths_only` the stages up to its
+/// participants' bound paths; `None` is that early assessment.
+fn census_stage<W: Work, R>(
+    session: &VerifiedSession<'_, '_, '_, W>,
+    signature: N,
+    profile: Profile,
+    inputs: &Inputs<'_>,
+    paths_only: bool,
+    visitor: impl for<'r, 'c> FnOnce(&HistoricalCensus<'r, 'c, '_, '_, '_, W>) -> R,
+) -> Result<Outcome<Option<R>>, ValidationError> {
     let fail = |error| ValidationError::Ts101903(Box::new(error));
     crate::ts101903::require_admitted(session, profile)?;
     let work = session.execution();
@@ -221,6 +255,7 @@ pub(crate) fn with_historical_census<W: Work, R>(
         inputs,
         parser: &parser,
         signer_time,
+        paths_only,
     };
     inventory
         .with_tokens(&document, &operation, token_profile, |operation, tokens| {
@@ -261,6 +296,8 @@ struct Scope<'a, 'c, 'v, 's, 'i, 'p, W: Work> {
     inputs: &'a Inputs<'a>,
     parser: &'a structured_asn1::Parser,
     signer_time: structured_pkix::temporal::Instant,
+    /// Stop once every participant's path is bound, before statuses.
+    paths_only: bool,
 }
 
 impl<'v, 's, 'i, W: Work> Scope<'_, '_, 'v, 's, 'i, '_, W> {
@@ -326,18 +363,15 @@ impl<'v, 's, 'i, W: Work> Scope<'_, '_, 'v, 's, 'i, '_, W> {
         tokens: &Tokens<'_>,
         view: &View<'_, N, D, G>,
         visitor: impl for<'r, 'x> FnOnce(&HistoricalCensus<'r, 'x, 'v, 's, 'i, W>) -> R,
-    ) -> Result<Outcome<R>, ValidationError> {
-        let session = self.session;
-        let parser = self.parser;
+    ) -> Result<Outcome<Option<R>>, ValidationError> {
+        let (session, parser, inputs) = (self.session, self.parser, self.inputs);
         let memory = parser.memory();
-        let inputs = self.inputs;
         let [anchors, supplied, responders] = caller_certificates(parser, inputs)?;
         let supplied_parent = parser.read(&[], 0).map_err(ValidationError::Operation)?;
         let pool = certificate_pool(tokens, view, [&supplied, &responders], memory)?;
-        let anchored = anchored(&anchors, memory)?;
         let authorities = Authorities {
             anchors: &anchors,
-            anchored: &anchored,
+            anchored: &anchored(&anchors, memory)?,
             pool: &pool,
             responders: inputs.responders,
             memory,
@@ -361,6 +395,9 @@ impl<'v, 's, 'i, W: Work> Scope<'_, '_, 'v, 's, 'i, '_, W> {
             .bind_paths(&references, self.access)
             .map_err(ValidationError::Obligation)?
         {
+            TimestampPathBinding::Bound(_) if self.paths_only => {
+                return Ok(Outcome::Assessed(None));
+            }
             TimestampPathBinding::Bound(paths) => paths,
             TimestampPathBinding::Unproven(cause) => {
                 return Ok(Outcome::Timestamp {
@@ -408,7 +445,7 @@ impl<'v, 's, 'i, W: Work> Scope<'_, '_, 'v, 's, 'i, '_, W> {
                             ValidationError::Ts101903(Box::new(Ts101903Error::Incorporation(cause)))
                         },
                     )?;
-                Ok(Outcome::Assessed(visitor(&HistoricalCensus {
+                Ok(Outcome::Assessed(Some(visitor(&HistoricalCensus {
                     session,
                     document: self.document,
                     access: self.access,
@@ -419,7 +456,7 @@ impl<'v, 's, 'i, W: Work> Scope<'_, '_, 'v, 's, 'i, '_, W> {
                     closure: &closure,
                     signer: self.signer.path(),
                     incorporation: &incorporation,
-                })))
+                }))))
             },
         )
         .map_err(|error| ValidationError::Status(Box::new(error)))?;

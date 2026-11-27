@@ -9,7 +9,7 @@ use super::{
 };
 use crate::create::{Assessment, Carried};
 use crate::draft::Draft;
-use crate::level::historical::{HistoricalCensus, with_historical_census};
+use crate::level::historical::{HistoricalCensus, historical_tsa_paths, with_historical_census};
 use crate::level::{Inputs, unrecognized};
 use crate::path;
 use crate::placement::{self, DS, PlacementError, Unsigned};
@@ -527,8 +527,45 @@ pub(super) fn complete<W: Work>(
             },
         )??;
         unsigned.insert_in(document, &property, namespace)?;
-        require_bes(document, signature, profile, completion, work)
+        require_bes(document, signature, profile, completion, work)?;
+        require_tsa_paths(document, signature, profile, completion, work)
     })
+}
+
+/// Keep the new generation only if every timestamp of signature `id`,
+/// the new one included, has a TSA path to the completion's anchors, as a
+/// baseline B-T requires; revocation material is not part of a completion.
+fn require_tsa_paths<W: Work>(
+    document: &XmlDocument,
+    id: &str,
+    profile: Profile,
+    completion: &Completion<'_, '_>,
+    work: &W,
+) -> Result<(), AugmentError> {
+    let assessment = completion.assessment;
+    let carried = Carried::new::<_, AugmentError>(document, assessment.request, work)?;
+    let outcome = with_verified_request(
+        document,
+        assessment.context,
+        &carried.request(assessment.request),
+        work,
+        |session| {
+            Ok(
+                selected(document, &session, id, completion.id_attributes).and_then(|node| {
+                    Ok(historical_tsa_paths(
+                        &session,
+                        node,
+                        profile,
+                        completion.inputs,
+                    )?)
+                }),
+            )
+        },
+    )??;
+    match outcome {
+        Outcome::Assessed(()) => Ok(()),
+        outcome => Err(AugmentError::Unmet(outcome)),
+    }
 }
 
 /// Keep the new generation only if signature `id` still meets the BES

@@ -11,10 +11,10 @@ use content::{CRLS, Fixture, account};
 use structured_pkix::algorithm::digest::Algorithm;
 use xml_sec::xmldsig::DigestAlgorithm;
 use xml_sec_xades::{
-    AugmentError, CompleteReferences, Completion, CreateError, DataAdded, ExtendedKind,
-    ReferenceSyntax, Requirements, TimestampRequest, ValidationData, add_historical_references,
-    add_historical_values, complete_timestamp, request_historical_extended_timestamp,
-    request_historical_timestamp,
+    AugmentError, CompleteReferences, Completion, CreateError, DataAdded, ExtendedKind, Inputs,
+    Outcome, ReferenceSyntax, Requirements, TimestampFailure, TimestampRequest, ValidationData,
+    add_historical_references, add_historical_values, complete_timestamp,
+    request_historical_extended_timestamp, request_historical_timestamp,
 };
 
 /// The TSA's answer to the probe's signature timestamp request in each
@@ -280,6 +280,62 @@ fn a_pre_en_signature_with_its_values_takes_an_archive_timestamp() {
             "ArchiveTimeStamp"
         ]
     );
+}
+
+#[test]
+fn a_historical_timestamp_without_a_trusted_tsa_path_is_not_published() {
+    // As for a baseline B-T: the checked token joins the signature only when
+    // its TSA's path ends at a caller anchor, whatever certificates the
+    // token carries; the root is still one the signer's path may use.
+    let fixture = Fixture::historical();
+    let (profile, response) = RESPONSES[0];
+    let mut document = fixture
+        .signed(Properties {
+            historical: Some(profile),
+            ..Properties::default()
+        })
+        .expect("pre-EN B-B");
+    let before = document.as_xml().to_owned();
+    let request = TimestampRequest {
+        signature: "sig",
+        digest: Algorithm::Sha256,
+        policy: None,
+        nonce: Some(NONCE),
+        id_attributes: &[],
+    };
+    let untrusted = Inputs {
+        anchors: &[],
+        certificates: &[content::INTERMEDIATE, content::ROOT],
+        ..fixture.inputs(Requirements::Timestamped, &[])
+    };
+    let refused = fixture.with_assessment(|assessment| {
+        let pending =
+            request_historical_timestamp(&document, &request, profile, assessment, &account())
+                .expect("the request");
+        complete_timestamp(
+            &mut document,
+            &pending,
+            response,
+            &Completion {
+                assessment,
+                inputs: &untrusted,
+                window: None,
+                id_attributes: &[],
+            },
+            &account(),
+        )
+    });
+    assert!(
+        matches!(
+            refused,
+            Err(AugmentError::Unmet(Outcome::Timestamp {
+                failure: TimestampFailure::Path(_),
+                ..
+            }))
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(document.as_xml(), before, "nothing published");
 }
 
 #[test]
