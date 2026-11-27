@@ -238,6 +238,16 @@ fn signed<'a>(
     })
 }
 
+/// One detached data object per file of `uris`.
+fn detached_files(uris: &[String]) -> Vec<DataObject<'_>> {
+    uris.iter()
+        .map(|uri| DataObject::Detached {
+            uri,
+            mime_type: "text/plain",
+        })
+        .collect()
+}
+
 /// The signatures of one B-B document: each new signature's `Id` and data
 /// objects, then each countersignature as `(parent, id)`.
 struct Plan<'a> {
@@ -246,6 +256,8 @@ struct Plan<'a> {
     countersignatures: &'static [(&'static str, &'static str)],
     /// Inclusive canonicalization of `SignedInfo` and the references.
     inclusive: bool,
+    /// The `XMLDSig` and `XAdES` prefixes the signer chooses.
+    prefixes: xml_sec_xades::Prefixes<'static>,
 }
 
 /// The B-B document of `shape`: one of the four packagings as [`signed`]
@@ -268,8 +280,39 @@ fn plan<'a>(
         signatures: vec![("sig", vec![object])],
         countersignatures: &[],
         inclusive: false,
+        prefixes: xml_sec_xades::Prefixes::default(),
     };
     Ok(match shape {
+        // DSS's custom-prefix tests: the signature and its properties under
+        // prefixes of the signer's choice, kept by every later level.
+        "custom-prefixes" => {
+            let (host, object) = signed("enveloped", data, &uris[0], policy)?;
+            Plan {
+                prefixes: xml_sec_xades::Prefixes {
+                    ds: "dsig",
+                    xades: "xa",
+                },
+                ..one(host, object)
+            }
+        }
+        // A countersignature over a signature of detached data.
+        "countersigned-detached" => Plan {
+            signatures: vec![("sig", detached_files(&uris[..1]))],
+            countersignatures: &[("sig", "counter")],
+            ..one(HOST.to_owned(), excluding())
+        },
+        "countersigned-internally-detached" => {
+            let (host, object) = signed("internally-detached", data, &uris[0], policy)?;
+            Plan {
+                countersignatures: &[("sig", "counter")],
+                ..one(host, object)
+            }
+        }
+        "countersigned-detached-multiple" => Plan {
+            signatures: vec![("sig", detached_files(uris))],
+            countersignatures: &[("sig", "counter")],
+            ..one(HOST.to_owned(), excluding())
+        },
         "parallel" => Plan {
             signatures: vec![("sig", vec![excluding()]), ("sig-2", vec![excluding()])],
             ..one(xml()?, excluding())
@@ -283,15 +326,7 @@ fn plan<'a>(
             ..one(xml()?, excluding())
         },
         "detached-multiple" => Plan {
-            signatures: vec![(
-                "sig",
-                uris.iter()
-                    .map(|uri| DataObject::Detached {
-                        uri,
-                        mime_type: "text/plain",
-                    })
-                    .collect(),
-            )],
+            signatures: vec![("sig", detached_files(uris))],
             ..one(HOST.to_owned(), excluding())
         },
         // XAdES's LT augmentation adds validation data beside the KeyInfo the
@@ -342,7 +377,7 @@ fn created(args: &[String], samples: Option<timing::Sampling>) -> Result<(), Str
     // A detached signature over two files signs the second beside the first.
     let mut uris = vec![file_name(&data)?];
     let mut resources = BTreeMap::from([(uris[0].clone(), bytes.clone())]);
-    if packaging == "detached-multiple" {
+    if packaging.ends_with("detached-multiple") {
         let second = data.with_file_name("detached-2.txt");
         uris.push(file_name(&second)?);
         resources.insert(uris[1].clone(), read(&second)?);
@@ -364,7 +399,7 @@ fn created(args: &[String], samples: Option<timing::Sampling>) -> Result<(), Str
         method,
         digest: DigestAlgorithm::Sha256,
         canonicalization: C14nAlgorithm::new(mode, false),
-        prefixes: xml_sec_xades::Prefixes::default(),
+        prefixes: plan.prefixes,
     };
     let resolver = DefaultKeyResolver::new(KeyResolverConfig {
         trusted_certs: vec![root.clone()],

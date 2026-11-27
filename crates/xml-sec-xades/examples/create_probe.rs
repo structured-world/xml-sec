@@ -268,6 +268,28 @@ fn shaped() -> Vec<(&'static str, Signatures)> {
                 mime_type: "text/xml",
             }]),
         ),
+        // Two Manifests in one signature, each listing one file.
+        (
+            "manifest-multiple",
+            one(vec![
+                DataObject::Manifest {
+                    id: "manifest-1",
+                    entries: vec![ManifestEntry {
+                        uri: "detached.txt",
+                        mime_type: "text/plain",
+                    }],
+                    mime_type: "text/xml",
+                },
+                DataObject::Manifest {
+                    id: "manifest-2",
+                    entries: vec![ManifestEntry {
+                        uri: "detached-2.txt",
+                        mime_type: "text/plain",
+                    }],
+                    mime_type: "text/xml",
+                },
+            ]),
+        ),
         (
             "signed-key-info",
             one(vec![

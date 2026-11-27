@@ -46,7 +46,7 @@ const fn created(name: &'static str, signatures: usize) -> Case {
     }
 }
 
-pub(crate) const CASES: [Case; 44] = [
+pub(crate) const CASES: [Case; 45] = [
     created("enveloped", 1),
     created("enveloping", 1),
     created("internally-detached", 1),
@@ -65,6 +65,7 @@ pub(crate) const CASES: [Case; 44] = [
     created("reference-detached-xml", 1),
     created("signed-key-info", 1),
     created("manifest", 1),
+    created("manifest-multiple", 1),
     // References the caller composes (`DataObject::Reference`).
     created("reference-filter2", 1),
     created("reference-xpath", 1),
@@ -192,7 +193,9 @@ const FORM_DETACHED: [(&str, &str); 2] = [
 fn detached_files(name: &str) -> &'static [&'static str] {
     match name {
         "detached" | "commitment" => &["detached.txt"],
-        "detached-multiple" | "manifest" => &["detached.txt", "detached-2.txt"],
+        "detached-multiple" | "manifest" | "manifest-multiple" => {
+            &["detached.txt", "detached-2.txt"]
+        }
         "reference-detached-xml" => &["detached-data.xml"],
         _ => &[],
     }

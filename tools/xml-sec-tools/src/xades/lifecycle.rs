@@ -58,7 +58,8 @@ impl Actor {
 /// packagings, or one of the signature forms DSS's signature tests make
 /// (parallel signatures, a countersignature and a nested one, a detached
 /// signature over two files, inclusive canonicalization, DSS's indented
-/// serialization, a signed `KeyInfo`).
+/// serialization, a signed `KeyInfo`, chosen namespace prefixes, and a
+/// detached, internally detached or two-file detached signature countersigned).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Packaging {
     Enveloped,
@@ -72,6 +73,10 @@ pub(crate) enum Packaging {
     Inclusive,
     PrettyPrint,
     SignedKeyInfo,
+    CustomPrefixes,
+    CountersignedDetached,
+    CountersignedInternallyDetached,
+    CountersignedDetachedMultiple,
 }
 
 impl Packaging {
@@ -83,7 +88,7 @@ impl Packaging {
     ];
 
     /// The signature forms, each run with an RSA signer and CRL evidence.
-    pub(crate) const FORMS: [Self; 7] = [
+    pub(crate) const FORMS: [Self; 11] = [
         Self::Parallel,
         Self::Countersigned,
         Self::CountersignedNested,
@@ -91,6 +96,10 @@ impl Packaging {
         Self::Inclusive,
         Self::PrettyPrint,
         Self::SignedKeyInfo,
+        Self::CustomPrefixes,
+        Self::CountersignedDetached,
+        Self::CountersignedInternallyDetached,
+        Self::CountersignedDetachedMultiple,
     ];
 
     /// The case name part; for a form also the name both probes take.
@@ -107,6 +116,10 @@ impl Packaging {
             Self::Inclusive => "inclusive",
             Self::PrettyPrint => "pretty-print",
             Self::SignedKeyInfo => "signed-key-info",
+            Self::CustomPrefixes => "custom-prefixes",
+            Self::CountersignedDetached => "countersigned-detached",
+            Self::CountersignedInternallyDetached => "countersigned-internally-detached",
+            Self::CountersignedDetachedMultiple => "countersigned-detached-multiple",
         }
     }
 
@@ -125,8 +138,10 @@ impl Packaging {
     /// The detached files the references of this shape name.
     fn detached(self) -> &'static [&'static str] {
         match self {
-            Self::Detached => &["detached.txt"],
-            Self::DetachedMultiple => &["detached.txt", "detached-2.txt"],
+            Self::Detached | Self::CountersignedDetached => &["detached.txt"],
+            Self::DetachedMultiple | Self::CountersignedDetachedMultiple => {
+                &["detached.txt", "detached-2.txt"]
+            }
             _ => &[],
         }
     }
@@ -352,7 +367,7 @@ type PartKey = (String, usize);
 /// owns it, nearest first.
 type PartPath = &'static [(&'static str, &'static str)];
 
-/// `SignedInfo`, a child of its `Signature` (XMLDSig 1.1 §4.1).
+/// `SignedInfo`, a child of its `Signature` (`XMLDSig` 1.1 §4.1).
 const SIGNED_INFO: PartPath = &[(DS, "SignedInfo"), (DS, "Signature")];
 /// `SignatureValue`, a child of its `Signature`.
 const SIGNATURE_VALUE: PartPath = &[(DS, "SignatureValue"), (DS, "Signature")];
@@ -430,6 +445,18 @@ fn unsigned_properties(text: &str) -> Result<BTreeMap<PartKey, Vec<Vec<u8>>>, St
         found.insert(key, canonical);
     }
     Ok(found)
+}
+
+/// The octets of the first signature value of `text`, which tell DSS's
+/// short P-521 encoding (130 octets) from the `XMLDSig` 1.1 §6.4.3 one (132).
+fn signature_octets(text: &str) -> Result<usize, String> {
+    let document = xml::parse(text, "created document")?;
+    let (_, value) = parts(&document, SIGNATURE_VALUE)
+        .into_iter()
+        .next()
+        .ok_or("the created document has no SignatureValue")?;
+    let encoded: String = value.children().filter_map(xml::Node::text).collect();
+    Ok(super::corpus::base64(&encoded)?.len())
 }
 
 /// Whether `later` keeps every signature of `created` byte for byte and every
@@ -528,6 +555,38 @@ pub(crate) fn with_ber(mut outcome: Value, ber: &Value) -> Value {
     outcome
 }
 
+/// Each signature's building-block verdicts in `facts`, in document order:
+/// the verdict of every compared block, without the fact it reads.
+pub(crate) fn our_verdicts(facts: &Value) -> Vec<Value> {
+    facts["signatures"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|signature| {
+            let blocks = super::upstream::our_blocks(signature);
+            Value::Object(
+                blocks
+                    .into_iter()
+                    .map(|(name, verdict)| (name, verdict["verdict"].clone()))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// `outcome` with the first of `blocks` beside the first signature and each
+/// later one beside the signature it reads.
+pub(crate) fn with_blocks(mut outcome: Value, blocks: Vec<Value>) -> Value {
+    let mut blocks = blocks.into_iter();
+    outcome["blocks"] = blocks.next().unwrap_or(Value::Null);
+    if let Some(others) = outcome.get_mut("others").and_then(Value::as_array_mut) {
+        for other in others {
+            other["blocks"] = blocks.next().unwrap_or(Value::Null);
+        }
+    }
+    outcome
+}
+
 /// What DSS's `LevelProbe` reports, reduced to the compared fields.
 pub(crate) fn dss_outcome(output: &str, reports: &Path) -> Result<Value, String> {
     let line = output
@@ -609,7 +668,26 @@ pub(crate) fn dss_outcome(output: &str, reports: &Path) -> Result<Value, String>
     if !others.is_empty() {
         outcome["others"] = others.into();
     }
-    Ok(outcome)
+    // Each signature's building-block conclusions, matched by its token in
+    // the order the simple report lists the signatures.
+    let signatures = super::upstream::dss_signatures_of(
+        &diagnostic_text,
+        &xml::read(&reports.join("detailed.xml"))?,
+        &xml::read(&reports.join("simple.xml"))?,
+        &["SIGNATURE", "COUNTER_SIGNATURE"],
+    )?;
+    let blocks = output
+        .lines()
+        .filter(|line| line.contains(" format="))
+        .map(|line| {
+            let token = line.split(' ').next().unwrap_or_default();
+            signatures
+                .iter()
+                .find(|signature| signature["token"] == token)
+                .map_or(Value::Null, |signature| signature["blocks"].clone())
+        })
+        .collect();
+    Ok(with_blocks(outcome, blocks))
 }
 
 /// The fields of `expected` that `observed` does not repeat.
@@ -716,6 +794,8 @@ struct Run<'a> {
     classpath: String,
     lifecycle_probe: PathBuf,
     level_probe: PathBuf,
+    /// The probe whose facts give xml-sec's building-block verdicts.
+    corpus_probe: PathBuf,
     /// The validation instant of every step, after every token of the run.
     at: u64,
 }
@@ -872,7 +952,18 @@ impl Run<'_> {
                 )?;
             }
         }
-        write(&self.pki.join("root.der"), generator.der("root")?)?;
+        self.inputs(&generator.der("root")?)
+    }
+
+    /// The trust anchor, the TSA's configuration and the signed data every
+    /// lifecycle reads.
+    fn inputs(&self, root: &[u8]) -> Result<(), String> {
+        // The corpus probe reads its trust anchors from a directory: the root
+        // alone, the anchor every other validation takes.
+        let anchors = self.results.join("anchors");
+        std::fs::create_dir_all(&anchors).map_err(|error| error.to_string())?;
+        write(&anchors.join("0.der"), root)?;
+        write(&self.pki.join("root.der"), root)?;
         write(&self.pki.join("tsa.serial"), "01\n")?;
         let pki = self.pki.display().to_string();
         write(&self.pki.join("tsa.cnf"), TSA_CONFIG.replace("PKI", &pki))?;
@@ -1090,9 +1181,34 @@ impl Run<'_> {
                 // The same document with unmarked tokens read as BER: the
                 // two readings differ only for a token that is not DER.
                 let ber = self.xml_sec_reading(step, true, &reports.with_extension("ber"))?;
-                Ok(with_ber(outcome, &ber))
+                let blocks = self.xml_sec_blocks(step, &reports.with_extension("facts"))?;
+                Ok(with_blocks(with_ber(outcome, &ber), blocks))
             }
         }
+    }
+
+    /// xml-sec's EN 319 102-1 building-block verdicts for each signature of
+    /// the output of `step`, in document order, from the corpus probe's facts
+    /// under the conformant `XAdES` profile, which admits the transforms and
+    /// URIs the lifecycle's own verification admits (DSS signs an enveloped
+    /// document through an `XPath` Filter 2.0 transform).
+    fn xml_sec_blocks(&self, step: &Step<'_>, log: &Path) -> Result<Vec<Value>, String> {
+        let anchors = self.results.join("anchors");
+        let mut args = line(&[
+            &self.corpus_probe,
+            &"facts",
+            &step.output(),
+            &anchors,
+            &self.at.to_string(),
+            &super::upstream::PROFILES[2].1,
+        ]);
+        for detached in self.detached(step.case) {
+            args.extend(line(&[&"--detached", &detached]));
+        }
+        let run = self.corpus.require(&args, log)?;
+        let facts: Value = serde_json::from_slice(&run.stdout)
+            .map_err(|error| format!("corpus probe facts: {error}"))?;
+        Ok(our_verdicts(&facts))
     }
 
     /// xml-sec's reading of the output of `step`, with unmarked tokens read
@@ -1157,6 +1273,10 @@ impl Run<'_> {
             let output = step.output();
             let text = xml::read(&output)?;
             let created = created.get_or_insert_with(|| text.clone());
+            if name == "b" {
+                // A reviewed alternative may hold only for one encoding width.
+                row.insert("signature_octets".into(), signature_octets(created)?.into());
+            }
             let earlier = previous_text.as_deref().unwrap_or(created);
             row.insert(
                 "preserved".into(),
@@ -1293,6 +1413,12 @@ pub(crate) fn execute(corpus: &Corpus, results: &Path, record: bool) -> Result<(
             &[],
             Build::Dev,
             &results.join("level-probe-build"),
+        )?,
+        corpus_probe: corpus.build_example(
+            "corpus_probe",
+            &[],
+            Build::Dev,
+            &results.join("corpus-probe-build"),
         )?,
         at: now()? + 86_400,
     };

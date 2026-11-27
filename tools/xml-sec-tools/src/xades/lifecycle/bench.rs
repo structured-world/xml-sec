@@ -282,6 +282,9 @@ struct Binaries {
     level: PathBuf,
     lifecycle_profile: PathBuf,
     level_profile: PathBuf,
+    /// Reads the building-block verdicts a qualified step compares; it is
+    /// not measured.
+    corpus: PathBuf,
 }
 
 impl Binaries {
@@ -312,6 +315,7 @@ impl Binaries {
                 &["allocation-profile"],
                 "level_probe-profile",
             )?,
+            corpus: build("corpus_probe", &[], "corpus_probe")?,
         })
     }
 
@@ -857,6 +861,7 @@ pub(crate) fn execute(corpus: &Corpus, results: &Path, options: &Options) -> Res
         classpath,
         lifecycle_probe: binaries.lifecycle.clone(),
         level_probe: binaries.level.clone(),
+        corpus_probe: binaries.corpus.clone(),
         at: now()? + 86_400,
     };
     run.issue()?;

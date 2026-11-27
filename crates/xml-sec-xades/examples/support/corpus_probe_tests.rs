@@ -61,6 +61,39 @@ fn a_rejected_token_keeps_its_cause_in_the_etsi_finding() {
 }
 
 #[test]
+fn supplied_detached_objects_are_signed_data_the_probe_obtains() {
+    // EN 319 102-1 V1.4.1 clause 5.2.7.4 step 1: a detached object neither
+    // validator receives is signed data that cannot be obtained; the same
+    // object supplied by name verifies.
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/levels");
+    let directory =
+        std::env::temp_dir().join(format!("xml-sec-probe-detached-{}", std::process::id()));
+    let anchors = directory.join("anchors");
+    std::fs::create_dir_all(&anchors).unwrap();
+    std::fs::copy(fixtures.join("root.der"), anchors.join("0.der")).unwrap();
+    let xml = fixtures.join("b-lt-detached.xml");
+    let status = |resources: &std::collections::BTreeMap<String, Vec<u8>>| {
+        let facts = super::facts(
+            xml.to_str().unwrap(),
+            &anchors,
+            1_800_000_000,
+            xml_sec::policy::PolicyProfile::Xades,
+            resources,
+        )
+        .unwrap();
+        facts["signatures"][0]["verification"].clone()
+    };
+    let missing = status(&std::collections::BTreeMap::new());
+    assert_ne!(missing["status"], "Valid", "{missing}");
+    let supplied = status(&std::collections::BTreeMap::from([(
+        "detached.txt".to_owned(),
+        std::fs::read(fixtures.join("detached.txt")).unwrap(),
+    )]));
+    assert_eq!(supplied["status"], "Valid", "{supplied}");
+    std::fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
 fn the_probe_reports_each_cause_of_a_corrupted_token() {
     // The probe's own token rows carry the cause check_tokens established:
     // TSA signature bytes altered are a cryptographic failure, a TSTInfo
@@ -99,6 +132,7 @@ fn the_probe_reports_each_cause_of_a_corrupted_token() {
             &anchors,
             1_800_000_000,
             xml_sec::policy::PolicyProfile::Xades,
+            &std::collections::BTreeMap::new(),
         )
         .unwrap();
         assert_eq!(

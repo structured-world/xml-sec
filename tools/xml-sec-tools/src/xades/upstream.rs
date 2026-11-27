@@ -343,6 +343,18 @@ pub(crate) fn dss_signatures(
     detailed: &str,
     simple: &str,
 ) -> Result<Vec<Value>, String> {
+    dss_signatures_of(diagnostic, detailed, simple, &["SIGNATURE"])
+}
+
+/// [`dss_signatures`] with each signature's blocks read from the first of
+/// `kinds` DSS reports for its token: a countersignature's are of type
+/// `COUNTER_SIGNATURE`.
+pub(crate) fn dss_signatures_of(
+    diagnostic: &str,
+    detailed: &str,
+    simple: &str,
+    kinds: &[&str],
+) -> Result<Vec<Value>, String> {
     let diagnostic = xml::parse(diagnostic, "diagnostic report")?;
     let detailed = xml::parse(detailed, "detailed report")?;
     let simple = xml::parse(simple, "simple report")?;
@@ -368,7 +380,11 @@ pub(crate) fn dss_signatures(
         .filter(|node| node.tag_name().name() == "Signature");
     for signature in signatures {
         let token = signature.attribute("Id").unwrap_or_default().to_owned();
-        let own = blocks(&token, "SIGNATURE");
+        let own = kinds
+            .iter()
+            .map(|kind| blocks(&token, kind))
+            .find(|found| !found.is_empty())
+            .unwrap_or_default();
         let mut row = Map::new();
         for name in ["FC", "ISC", "CV", "XCV", "SAV"] {
             let block = own.first().and_then(|block| xml::child(*block, name));

@@ -6,6 +6,43 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
 #[test]
+fn the_short_p521_alternative_needs_the_short_encoding() {
+    // The reviewed alternative describes DSS's 130-octet P-521 value; the
+    // same refusal of a conformant 132-octet value keeps the primary
+    // expectation and fails the comparison.
+    let expected = json!({ "cases": { "p521": {
+        "steps": [{ "step": "b", "validated": { "crypto": "Valid" } }],
+        "alternatives": [{ "note": "p521", "steps": [
+            { "step": "b", "signature_octets": 130, "validated": { "crypto": "Err" } }
+        ] }]
+    } } });
+    let observed = |octets: u64| {
+        json!({ "case": "p521", "steps": [
+            { "step": "b", "signature_octets": octets, "validated": { "crypto": "Err" } }
+        ] })
+    };
+    assert_eq!(compare(&expected, &[observed(130)]), Vec::<String>::new());
+    assert_eq!(
+        compare(&expected, &[observed(132)]),
+        ["p521[0].validated.crypto: expected \"Valid\", got \"Err\""]
+    );
+    // The recorded alternative carries that condition.
+    let recorded: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../../interop/xades/lifecycle/expectations.json"
+    ))
+    .expect("expectations parse");
+    assert_eq!(
+        recorded["cases"]["dss-first-enveloping-ec-p521-crl"]["alternatives"][0]["steps"][0]["signature_octets"],
+        130
+    );
+    let created = signature(
+        "s",
+        "<SignedInfo>a</SignedInfo><SignatureValue>AAEC\nAw==</SignatureValue>",
+    );
+    assert_eq!(super::signature_octets(&created), Ok(4));
+}
+
+#[test]
 fn unreadable_expectations_are_never_recorded_over() {
     // A first recording starts from nothing; an existing file that does not
     // parse is an error, so its reviewed alternatives and notes are not
@@ -51,11 +88,49 @@ fn every_signature_keeps_its_ber_reading_and_dss_crypto_result() {
          </Signatures></DiagnosticData>",
     )
     .expect("write diagnostic report");
+    // EN 319 102-1 building blocks: each signature's own conclusions,
+    // matched by token, beside its entry.
+    std::fs::write(
+        reports.path().join("detailed.xml"),
+        "<DetailedReport>\
+         <BasicBuildingBlocks Id=\"S-1\" Type=\"SIGNATURE\"><CV><Conclusion><Indication>PASSED</Indication></Conclusion></CV></BasicBuildingBlocks>\
+         <BasicBuildingBlocks Id=\"S-2\" Type=\"COUNTER_SIGNATURE\"><CV><Conclusion><Indication>FAILED</Indication><SubIndication>SIG_CRYPTO_FAILURE</SubIndication></Conclusion></CV></BasicBuildingBlocks>\
+         </DetailedReport>",
+    )
+    .expect("write detailed report");
+    std::fs::write(
+        reports.path().join("simple.xml"),
+        "<SimpleReport><Signature Id=\"S-1\"/><Signature Id=\"S-2\"/></SimpleReport>",
+    )
+    .expect("write simple report");
     let output = "S-1 format=XAdES-BASELINE-B indication=TOTAL_PASSED subindication=null errors=[]\n\
                   S-2 format=XAdES-BASELINE-B indication=TOTAL_FAILED subindication=SIG_CRYPTO_FAILURE errors=[]\n";
     let outcome = super::dss_outcome(output, reports.path()).expect("reports read");
     assert_eq!(outcome["crypto"], "intact");
     assert_eq!(outcome["others"][0]["crypto"], "broken");
+    assert_eq!(outcome["blocks"]["CV"], "PASSED");
+    assert_eq!(
+        outcome["others"][0]["blocks"]["CV"],
+        "FAILED:SIG_CRYPTO_FAILURE"
+    );
+}
+
+#[test]
+fn xml_sec_verdicts_stand_beside_each_signature() {
+    // The corpus probe's facts give one verdict per block and signature, in
+    // document order; a later signature's verdicts go to its own entry.
+    let facts = json!({ "signatures": [
+        { "declared_timestamps": 0, "verification": { "status": "Valid", "references": ["Valid"], "trust": "ValidatedX509" } },
+        { "declared_timestamps": 0, "verification": { "status": "Invalid", "references": ["Valid"], "trust": "ValidatedX509" } }
+    ] });
+    let verdicts = super::our_verdicts(&facts);
+    let outcome = super::with_blocks(
+        json!({ "crypto": "Valid", "others": [{ "crypto": "Invalid" }] }),
+        verdicts,
+    );
+    assert_eq!(outcome["blocks"]["CV"], "pass");
+    assert_eq!(outcome["blocks"]["TIMESTAMPS"], "none");
+    assert_eq!(outcome["others"][0]["blocks"]["CV"], "fail");
 }
 
 #[test]
@@ -239,7 +314,7 @@ fn signature_parts_match_under_any_prefix() {
     assert!(!preserved(created, created, rewritten).unwrap());
 }
 
-/// `body` inside an XMLDSig `Signature` with the given `Id`.
+/// `body` inside an `XMLDSig` `Signature` with the given `Id`.
 fn signature(id: &str, body: &str) -> String {
     format!(
         r#"<Signature xmlns="http://www.w3.org/2000/09/xmldsig#" xmlns:x="http://uri.etsi.org/01903/v1.3.2#" Id="{id}">{body}</Signature>"#

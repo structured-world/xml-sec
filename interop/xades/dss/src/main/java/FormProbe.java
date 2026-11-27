@@ -5,6 +5,9 @@ import eu.europa.esig.dss.enumerations.SignaturePackaging;
 import eu.europa.esig.dss.model.DSSDocument;
 import eu.europa.esig.dss.validation.SignedDocumentValidator;
 import eu.europa.esig.dss.xades.XAdESSignatureParameters;
+import eu.europa.esig.dss.xades.definition.XAdESNamespace;
+import eu.europa.esig.dss.xml.common.definition.DSSNamespace;
+import eu.europa.esig.dss.xml.common.definition.xmldsig.XMLDSigNamespace;
 import eu.europa.esig.dss.xades.signature.XAdESCounterSignatureParameters;
 import eu.europa.esig.dss.xades.signature.XAdESService;
 
@@ -19,8 +22,13 @@ import eu.europa.esig.dss.xades.signature.XAdESService;
  * countersignature countersigned in turn), {@code detached-multiple} (one
  * detached signature over two files), {@code inclusive} (inclusive
  * canonicalization of SignedInfo and SignedProperties),
- * {@code pretty-print} (DSS's indented serialization) and
- * {@code signed-key-info} (a reference signing the KeyInfo).
+ * {@code pretty-print} (DSS's indented serialization),
+ * {@code signed-key-info} (a reference signing the KeyInfo),
+ * {@code custom-prefixes} (an enveloped signature under the prefixes
+ * {@code dsig} and {@code xa}), and {@code countersigned-detached},
+ * {@code countersigned-internally-detached} and
+ * {@code countersigned-detached-multiple} (a detached, an internally detached
+ * and a two-file detached signature, each countersigned).
  */
 public class FormProbe {
     public static void main(String[] args) throws Exception {
@@ -58,6 +66,34 @@ public class FormProbe {
                 service, signer, time, "ENVELOPED", List.of(document), parameters -> parameters.setPrettyPrint(true));
             case "signed-key-info" -> sign(
                 service, signer, time, "ENVELOPED", List.of(document), parameters -> parameters.setSignKeyInfo(true));
+            case "custom-prefixes" -> sign(service, signer, time, "ENVELOPED", List.of(document), parameters -> {
+                parameters.setXmldsigNamespace(new DSSNamespace(XMLDSigNamespace.NS.getUri(), "dsig"));
+                parameters.setXadesNamespace(new DSSNamespace(XAdESNamespace.XADES_132.getUri(), "xa"));
+            });
+            case "countersigned-detached" -> counter(
+                service,
+                signer,
+                time + 1,
+                sign(service, signer, time, "DETACHED", List.of(Lifecycle.named(data.resolve("detached.txt"))), parameters -> {}),
+                false);
+            case "countersigned-internally-detached" -> counter(
+                service,
+                signer,
+                time + 1,
+                sign(service, signer, time, "INTERNALLY_DETACHED", List.of(document), parameters -> {}),
+                false);
+            case "countersigned-detached-multiple" -> counter(
+                service,
+                signer,
+                time + 1,
+                sign(
+                    service,
+                    signer,
+                    time,
+                    "DETACHED",
+                    List.of(Lifecycle.named(data.resolve("detached.txt")), Lifecycle.named(data.resolve("detached-2.txt"))),
+                    parameters -> {}),
+                false);
             default -> throw new IllegalArgumentException("unknown form " + args[1]);
         };
         signed.save(args[4]);

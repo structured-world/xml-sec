@@ -102,9 +102,9 @@ pub(crate) fn problems(
         let mut named: Vec<&str> = Vec::new();
         match &entry[status] {
             Value::String(name) => named.push(name.as_str()),
-            Value::Array(names) => {
-                for (index, name) in names.iter().enumerate() {
-                    match name.as_str() {
+            Value::Array(listed) => {
+                for (index, element) in listed.iter().enumerate() {
+                    match element.as_str() {
                         Some(name) => named.push(name),
                         None => found.push(format!(
                             "{class}: {status} element {} is not a name",
@@ -118,7 +118,7 @@ pub(crate) fn problems(
         if named.is_empty()
             && entry[status]
                 .as_array()
-                .is_some_and(|names| !names.is_empty())
+                .is_some_and(|listed| !listed.is_empty())
         {
             continue;
         }
