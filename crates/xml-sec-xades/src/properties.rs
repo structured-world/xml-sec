@@ -292,8 +292,9 @@ pub(crate) enum SignedPlan {
     /// The signed `ds:Transforms`.
     Transforms(PolicyTransforms),
     /// The digest a named technical specification defines
-    /// (`SPDocDigestAsInSpecification`).
-    InSpecification,
+    /// (`SPDocDigestAsInSpecification`), with the collapsed identifiers of
+    /// the specifications the signed `SPDocSpecification` qualifiers name.
+    InSpecification(Vec<String>),
 }
 
 /// The draft of one new signature's `QualifyingProperties`, or of a policy
@@ -501,8 +502,15 @@ impl PolicyWriter for PropertyDraft<'_> {
                             work,
                         )?
                     }
-                    (SignedPlan::None, plan @ PolicyTransform::None)
-                    | (SignedPlan::InSpecification, plan @ PolicyTransform::InSpecification(_)) => {
+                    (SignedPlan::None, plan @ PolicyTransform::None) => {
+                        self.policy_digest(policy.document, policy.digest_method, plan, work)?
+                    }
+                    // The rule is the one of a specification the signature
+                    // named, so the store cannot declare another one.
+                    (
+                        SignedPlan::InSpecification(named),
+                        plan @ PolicyTransform::InSpecification(specification),
+                    ) if named.contains(&collapse(specification.uri)) => {
                         self.policy_digest(policy.document, policy.digest_method, plan, work)?
                     }
                     _ => return Ok(false),

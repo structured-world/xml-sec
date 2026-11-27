@@ -393,13 +393,15 @@ impl<'e, 'x, W: Work> Engine<'e, 'x, '_, '_, '_, W> {
     }
 
     /// An OCSP response for `target` its issuer, a delegate of that issuer or a
-    /// responder the caller configured for it signed. Configured trust is never
-    /// inferred from a document.
+    /// responder the caller configured for it signed, stating the target
+    /// revoked when `revoked` is set. Configured trust is never inferred from
+    /// a document.
     fn ocsp(
         &self,
         target: &'x Certificate<'x>,
         issuer: &'x Certificate<'x>,
         issuing: EffectiveKey<'x>,
+        revoked: bool,
         roots: usize,
         extra: &mut OwnedVec<CheckedPath<'x>, structured_asn1::memory::Memory>,
     ) -> Result<Selection<'e, 'x>, StatusError> {
@@ -466,6 +468,14 @@ impl<'e, 'x, W: Work> Engine<'e, 'x, '_, '_, '_, W> {
             let Some(evidence) = reading.evidence() else {
                 continue;
             };
+            if revoked
+                && !matches!(
+                    evidence.evidence().status(),
+                    ocsp::Status::Revoked { .. } | ocsp::Status::NotIssued
+                )
+            {
+                continue;
+            }
             let responder = if delegated && !configured {
                 match self.authority_path(signed.signer(), roots, extra)? {
                     Ok(path) => Some(path),
@@ -506,11 +516,17 @@ impl<'e, 'x, W: Work> Engine<'e, 'x, '_, '_, '_, W> {
         signers: &mut OwnedVec<CrlAuthoritySource, structured_asn1::memory::Memory>,
     ) -> Result<Option<Result<(Selected<'e, 'x>, bool), PathFailure>>, StatusError> {
         // A listed entry decides whatever another source omits (RFC 5280
-        // §6.3.3(i)), so a good OCSP answer cannot hide it from the report.
-        let issuer = match issuer {
-            Some(issuer) if !self.listed(target)? => Some(issuer),
-            _ => None,
-        };
+        // §6.3.3(i)), so a good OCSP answer cannot hide it from the report;
+        // the caller's response that states the revocation too is still the
+        // caller's status.
+        let listed = self.listed(target)?;
+        if listed
+            && let (Some(supplied), Some((issuer, issuing))) = (supplied, issuer)
+            && let Some(found) = supplied.ocsp(target, issuer, issuing, true, roots, extra)?
+        {
+            return Ok(Some(found));
+        }
+        let issuer = if listed { None } else { issuer };
         for engine in supplied.into_iter().chain(core::iter::once(self)) {
             if let Some(found) = engine.choose(anchor, target, issuer, roots, extra, signers)? {
                 return Ok(Some(found));
@@ -536,7 +552,7 @@ impl<'e, 'x, W: Work> Engine<'e, 'x, '_, '_, '_, W> {
         signers: &mut OwnedVec<CrlAuthoritySource, structured_asn1::memory::Memory>,
     ) -> Result<Option<Result<(Selected<'e, 'x>, bool), PathFailure>>, StatusError> {
         if let Some((issuer, issuing)) = issuer
-            && let Some(found) = self.ocsp(target, issuer, issuing, roots, extra)?
+            && let Some(found) = self.ocsp(target, issuer, issuing, false, roots, extra)?
         {
             return Ok(Some(found));
         }

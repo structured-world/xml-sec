@@ -11,6 +11,10 @@ use super::fixtures::Generator;
 use super::levels::{Levels, TSA_CONFIG};
 use super::{Corpus, line, read, write};
 
+/// When the content fixtures' signer is revoked: after the signature
+/// timestamps a run issues, before the tests' assessment time (2027-01-15).
+const SIGNER_REVOKED: &str = "270110000000Z";
+
 const TSA_EXTENSIONS: &str = "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=critical,timeStamping\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n";
 
 /// Each request the probe writes, the response the TSA gives to it, and
@@ -138,6 +142,16 @@ pub(crate) fn content(corpus: &Corpus, generator: &Generator) -> Result<(), Stri
             levels.ocsp_delegated("intermediate", "responder", subject)?,
         )?;
     }
+    // The signer revoked after its signature timestamp and before the tests'
+    // assessment time, stated by a CRL and by a newer OCSP response.
+    write(
+        &generator.output.join("intermediate-revoking.crl"),
+        levels.crl_revoking_at("intermediate", "signer", SIGNER_REVOKED)?,
+    )?;
+    write(
+        &generator.output.join("signer-revoked.ocsp"),
+        levels.ocsp_delegated_revoked("intermediate", "responder", "signer", SIGNER_REVOKED)?,
+    )?;
     probe(corpus, generator, "content-request")?;
     for (query, response) in [
         ("content-all.tsq", "content-all.tsr"),

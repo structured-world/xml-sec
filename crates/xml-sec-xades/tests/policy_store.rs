@@ -560,6 +560,44 @@ fn an_asn1_policy_is_digested_as_its_specification_defines() {
 }
 
 #[test]
+fn a_store_names_the_specification_the_signature_named() {
+    // EN 319 132-1 §5.2.9.2: SPDocDigestAsInSpecification follows the
+    // specification the signed SPDocSpecification qualifier names. A store
+    // declaring another specification under the same rule is refused, though
+    // the digest it computes is the same.
+    const OTHER: &str = "urn:example:other-specification";
+    let fixture = Fixture::new();
+    let der = asn1_policy::document(None);
+    let mut document = fixture
+        .created(Properties {
+            policy: Some(Policy::Document(SignaturePolicy::Explicit(asn1_explicit(
+                &der,
+                DigestAlgorithm::Sha256.uri(),
+            )))),
+            specified: Some(ASN1_RULE),
+            ..Properties::default()
+        })
+        .expect("an ASN.1 policy");
+    let original = document.as_xml().to_owned();
+    let other = ExplicitPolicy {
+        transform: PolicyTransform::InSpecification(identifier(OTHER)),
+        ..asn1_explicit(&der, DigestAlgorithm::Sha256.uri())
+    };
+    let refused = fixture
+        .store_specified(
+            &mut document,
+            &other,
+            Some(SpecifiedDigest {
+                specification: OTHER,
+                rule: DigestRule::Asn1Policy,
+            }),
+        )
+        .expect_err("another specification");
+    assert!(matches!(refused, AugmentError::Store(_)), "{refused:?}");
+    assert_eq!(document.as_xml(), original);
+}
+
+#[test]
 fn an_asn1_policy_that_contradicts_its_digest_is_refused() {
     // TR 102 272 §6.1: the document names its own hash, which must be the
     // policy digest method, and a stored signPolicyHash must be the digest;

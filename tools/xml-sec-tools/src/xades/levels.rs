@@ -193,10 +193,21 @@ impl Levels<'_> {
     /// A complete CRL of `issuer` listing `subject` as revoked before the
     /// fixtures' test instant, as DER.
     pub(super) fn crl_revoking(&self, issuer: &str, subject: &str) -> Result<Vec<u8>, String> {
+        self.crl_revoking_at(issuer, subject, "261001000000Z")
+    }
+
+    /// As [`Self::crl_revoking`], revoked at `revoked` (an OpenSSL index
+    /// time, `YYMMDDHHMMSSZ`).
+    pub(super) fn crl_revoking_at(
+        &self,
+        issuer: &str,
+        subject: &str,
+        revoked: &str,
+    ) -> Result<Vec<u8>, String> {
         let serial = self.serial(subject)?;
         self.crl_listing(
             issuer,
-            &format!("R\t450101000000Z\t261001000000Z\t{serial}\tunknown\t/CN={subject}\n"),
+            &format!("R\t450101000000Z\t{revoked}\t{serial}\tunknown\t/CN={subject}\n"),
         )
     }
 
@@ -275,6 +286,18 @@ impl Levels<'_> {
         self.ocsp_under("issuer", responder, subject, by_key, options)
     }
 
+    /// As [`Self::ocsp_delegated`], stating `subject` revoked at `revoked`
+    /// (an OpenSSL index time, `YYMMDDHHMMSSZ`).
+    pub(super) fn ocsp_delegated_revoked(
+        &self,
+        issuer: &str,
+        responder: &str,
+        subject: &str,
+        revoked: &str,
+    ) -> Result<Vec<u8>, String> {
+        self.ocsp_entry(issuer, responder, subject, Some(revoked), false, &[])
+    }
+
     fn ocsp_under(
         &self,
         issuer: &str,
@@ -283,14 +306,27 @@ impl Levels<'_> {
         by_key: bool,
         options: &[&str],
     ) -> Result<Vec<u8>, String> {
+        self.ocsp_entry(issuer, responder, subject, None, by_key, options)
+    }
+
+    fn ocsp_entry(
+        &self,
+        issuer: &str,
+        responder: &str,
+        subject: &str,
+        revoked: Option<&str>,
+        by_key: bool,
+        options: &[&str],
+    ) -> Result<Vec<u8>, String> {
         let issuer = format!("{issuer}.pem");
         let (signer, signer_key) = (format!("{responder}.pem"), format!("{responder}.key"));
         let certificate = format!("{subject}.pem");
         let serial = self.serial(subject)?;
-        self.write(
-            "responder.index",
-            format!("V\t450101000000Z\t\t{serial}\tunknown\t/CN={subject}\n"),
-        )?;
+        let entry = match revoked {
+            Some(time) => format!("R\t450101000000Z\t{time}\t{serial}\tunknown\t/CN={subject}\n"),
+            None => format!("V\t450101000000Z\t\t{serial}\tunknown\t/CN={subject}\n"),
+        };
+        self.write("responder.index", entry)?;
         self.write("responder.index.attr", "unique_subject = no\n")?;
         let (request, response) = (format!("{subject}.ocsq"), format!("{subject}.ocsp"));
         self.openssl(&[

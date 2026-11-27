@@ -187,22 +187,24 @@ fn signed_policy<W: Work>(
             .into(),
         digest: Vec::from(&extension::base64_owned(view, value, work)?[..]),
         plan: match placement::child(view, node, placement::DS, "Transforms", work)? {
-            Some(transforms) => signed_plan(view, transforms, id, signing)?,
+            Some(transforms) => signed_plan(view, transforms, id, signing, work)?,
             None => SignedPlan::None,
         },
     })
 }
 
 /// The policy digest plan of the signed `ds:Transforms` `transforms`: the one
-/// `SPDocDigestAsInSpecification` transform (EN 319 132-1 §5.2.9.2), or the
+/// `SPDocDigestAsInSpecification` transform (EN 319 132-1 §5.2.9.2) with the
+/// specifications the policy's `SPDocSpecification` qualifiers name, or the
 /// transforms as self-contained markup, the subtree in inclusive Canonical
 /// XML 1.0, which carries every namespace in scope so an `XPath` expression
-/// keeps its prefixes.
-fn signed_plan(
+/// keeps its prefixes. Each walk and the markup are charged to `work` first.
+fn signed_plan<W: Work>(
     view: DocumentView<'_>,
     transforms: NodeIdentity,
     id: &str,
     signing: &SigningPolicy,
+    work: &W,
 ) -> Result<SignedPlan, AugmentError> {
     fn is(node: XmlDomNode<'_, '_>, namespace: &str, local: &str) -> bool {
         node.is_element()
@@ -210,11 +212,16 @@ fn signed_plan(
             && node.tag_name().name() == local
     }
     let unreadable = || AugmentError::NoExplicitPolicy(id.into());
-    // The element located in this view, read in the same tree.
+    // The element located in this view, read in the same tree: its document
+    // order is its position in a preorder walk from the root.
     let parsed: &XmlDomDocument<'_> = view.document();
+    let order = view.document_order(transforms).map_err(|_| unreadable())?;
+    work.charge_work(order as u64 + 1)?;
     let transforms = parsed
+        .root()
         .descendants()
-        .find(|node| {
+        .nth(order)
+        .filter(|node| {
             view.identity_of(*node)
                 .is_ok_and(|found| found == transforms)
         })
@@ -224,7 +231,7 @@ fn signed_plan(
         && is(step, placement::DS, "Transform")
         && step.attribute("Algorithm") == Some(SPECIFICATION_TRANSFORM)
     {
-        return Ok(SignedPlan::InSpecification);
+        return signed_specifications(transforms, work).map(SignedPlan::InSpecification);
     }
     let within = |node: XmlDomNode<'_, '_>| {
         node.id() == transforms.id()
@@ -232,6 +239,10 @@ fn signed_plan(
                 .ancestors()
                 .any(|ancestor| ancestor.id() == transforms.id())
     };
+    // The canonical walk visits every node; its output is the subtree's
+    // markup with the namespaces in scope.
+    work.charge_work(view.node_count() as u64)?;
+    work.charge_work(transforms.range().len() as u64)?;
     let mut markup = Vec::new();
     canonicalize(
         parsed,
@@ -240,6 +251,7 @@ fn signed_plan(
         &mut markup,
     )
     .map_err(|_| unreadable())?;
+    work.charge_work(markup.len() as u64)?;
     let markup = String::from_utf8(markup).map_err(|_| unreadable())?;
     PolicyTransforms::parse(markup, signing)
         .map(SignedPlan::Transforms)
@@ -248,6 +260,47 @@ fn signed_plan(
                 PropertyError::from(error),
             )))
         })
+}
+
+/// The identifiers of the `SPDocSpecification` qualifiers of the
+/// `SignaturePolicyId` that holds `transforms`, as collapsed anyURIs: the
+/// specifications whose digest rule the signed hash follows (EN 319 132-1
+/// §5.2.9.2).
+fn signed_specifications<W: Work>(
+    transforms: XmlDomNode<'_, '_>,
+    work: &W,
+) -> Result<Vec<String>, AugmentError> {
+    let mut specifications = Vec::new();
+    let Some(policy) = transforms.parent() else {
+        return Ok(specifications);
+    };
+    let named = |node: &XmlDomNode<'_, '_>, namespace: &str, local: &str| {
+        node.is_element()
+            && node.tag_name().namespace() == Some(namespace)
+            && node.tag_name().name() == local
+    };
+    for qualifiers in policy
+        .children()
+        .filter(|node| named(node, XADES, "SigPolicyQualifiers"))
+    {
+        for qualifier in qualifiers.children() {
+            for specification in qualifier
+                .children()
+                .filter(|node| named(node, XADES_141, "SPDocSpecification"))
+            {
+                for identifier in specification
+                    .children()
+                    .filter(|node| named(node, XADES, "Identifier"))
+                {
+                    let value: String =
+                        identifier.children().filter_map(XmlDomNode::text).collect();
+                    work.charge_work(value.len() as u64 + 1)?;
+                    specifications.push(crate::properties::collapse(&value));
+                }
+            }
+        }
+    }
+    Ok(specifications)
 }
 
 /// The character data of `node`'s children, in order.

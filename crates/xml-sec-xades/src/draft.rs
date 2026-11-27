@@ -91,6 +91,10 @@ pub struct Draft {
 /// The namespace the `xml` prefix is bound to (Namespaces in XML 1.0 §3).
 const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
 
+/// The namespace of namespace declarations, bound to no prefix (Namespaces in
+/// XML 1.0 §3).
+const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
+
 impl Draft {
     /// An empty draft; it allocates nothing until the first event.
     #[must_use]
@@ -116,13 +120,14 @@ impl Draft {
                     .iter()
                     .any(|(other, earlier)| earlier == prefix && other != namespace);
             // Namespaces in XML 1.0 §3: `xmlns` is never declared, `xml` is
-            // bound to the XML namespace only, and that namespace to no other
-            // prefix and not as the default.
-            let reserved = match *prefix {
-                "xmlns" => true,
-                "xml" => *namespace != XML_NAMESPACE,
-                _ => *namespace == XML_NAMESPACE,
-            };
+            // bound to the XML namespace only, that namespace to no other
+            // prefix and not as the default, and the xmlns namespace to none.
+            let reserved = *namespace == XMLNS_NAMESPACE
+                || match *prefix {
+                    "xmlns" => true,
+                    "xml" => *namespace != XML_NAMESPACE,
+                    _ => *namespace == XML_NAMESPACE,
+                };
             if (!prefix.is_empty() && !is_ncname(prefix)) || reserved || reused {
                 return Err(DraftError::Name("a chosen namespace prefix"));
             }
@@ -155,14 +160,19 @@ impl Draft {
         None
     }
 
-    /// The default namespace in scope, if one is declared.
+    /// The default namespace in scope: the innermost default declaration,
+    /// none when that is `xmlns=""` or there is none.
     fn default_namespace(&self) -> Option<&'static str> {
-        self.frames.iter().rev().find_map(|frame| {
-            frame
-                .bindings
-                .iter()
-                .find_map(|(bound, prefix)| prefix.is_empty().then_some(*bound))
-        })
+        self.frames
+            .iter()
+            .rev()
+            .find_map(|frame| {
+                frame
+                    .bindings
+                    .iter()
+                    .find_map(|(bound, prefix)| prefix.is_empty().then_some(*bound))
+            })
+            .filter(|bound| !bound.is_empty())
     }
 
     /// The finished element and every ID it declares.
@@ -203,17 +213,24 @@ impl Draft {
     }
 
     /// The prefix bound to `namespace` in scope, and whether it is a new
-    /// binding of the innermost element that its start tag must declare.
+    /// binding of the innermost element that its start tag must declare; a
+    /// `named` binding never takes the default namespace.
     fn bind(
         &mut self,
         namespace: &'static str,
+        named: bool,
         work: &impl Work,
     ) -> Result<(String, bool), DraftError> {
         work.charge_work(self.frames.len() as u64 + 1)?;
+        // Namespaces in XML 1.0 §3: the xmlns namespace is never declared.
+        if namespace == XMLNS_NAMESPACE {
+            return Err(DraftError::Name("a name in the xmlns namespace"));
+        }
         let chosen = self
             .chosen
             .iter()
-            .find_map(|(bound, prefix)| (*bound == namespace).then(|| prefix.clone()));
+            .find_map(|(bound, prefix)| (*bound == namespace).then(|| prefix.clone()))
+            .filter(|prefix| !(named && prefix.is_empty()));
         // The default namespace is in scope only until an inner element
         // declares another, so it is declared again whenever it changes.
         if chosen.as_deref() == Some("") {
@@ -305,16 +322,22 @@ impl Draft {
             attributes: Vec::new(),
             open: true,
         });
-        // An element in no namespace stays unprefixed; the Object content
-        // check undeclares any default namespace around it. Under a default
-        // namespace of this draft it would change namespace, so it is refused.
+        // An element in no namespace stays unprefixed; under a default
+        // namespace of this draft it undeclares it with xmlns="" (Namespaces
+        // in XML 1.0 §6.2), which holds for its subtree only.
         let (qualified, declaration) = if name.namespace.is_empty() {
-            if self.default_namespace().is_some() {
-                return Err(DraftError::Name(name.local));
+            if self.default_namespace().is_none() {
+                (String::from(name.local), None)
+            } else {
+                let frame = self
+                    .frames
+                    .last_mut()
+                    .ok_or(DraftError::Order("no open element"))?;
+                frame.bindings.push(("", String::new()));
+                (String::from(name.local), Some(String::new()))
             }
-            (String::from(name.local), None)
         } else {
-            let (prefix, new) = self.bind(name.namespace, work)?;
+            let (prefix, new) = self.bind(name.namespace, false, work)?;
             let qualified = if prefix.is_empty() {
                 String::from(name.local)
             } else {
@@ -370,15 +393,9 @@ impl Draft {
             String::from(name.local)
         } else {
             // Namespaces in XML 1.0 §6.2: a default namespace never applies to
-            // an attribute, so a namespaced one needs a prefix.
-            if self
-                .chosen
-                .iter()
-                .any(|(bound, prefix)| *bound == name.namespace && prefix.is_empty())
-            {
-                return Err(DraftError::Name(name.local));
-            }
-            let (prefix, new) = self.bind(name.namespace, work)?;
+            // an attribute, so a namespaced one takes a named prefix even
+            // when its namespace is the chosen default.
+            let (prefix, new) = self.bind(name.namespace, true, work)?;
             if new {
                 self.declare(&prefix, name.namespace, work)?;
             }

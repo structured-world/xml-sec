@@ -39,6 +39,10 @@ const NEXT_CRLS: [&[u8]; 2] = [
 ];
 /// An empty delta over the intermediate CA's first CRL.
 const DELTA: &[u8] = include_bytes!("fixtures/content/intermediate-delta.crl");
+/// The intermediate CA's CRL listing the signer, revoked after its timestamp.
+const REVOKING: &[u8] = include_bytes!("fixtures/content/intermediate-revoking.crl");
+/// A response stating the same revocation.
+const REVOKED: &[u8] = include_bytes!("fixtures/content/signer-revoked.ocsp");
 /// Responses for the signer and the TSA their CA signed.
 const OCSP: [&[u8]; 2] = [
     include_bytes!("fixtures/content/signer.ocsp"),
@@ -272,6 +276,36 @@ fn a_refresh_binds_the_callers_delta_to_the_documents_complete_crl() {
         DataAdded::Published
     );
     assert_eq!(crls(document.as_xml()), before + 1);
+}
+
+#[test]
+fn a_refresh_takes_the_callers_revoked_response_for_a_listed_member() {
+    // RFC 5280 §6.3.3(i): a listed entry decides whatever another source
+    // omits, so a good response never hides it; a caller's response that
+    // also states revocation is still the caller's status and is added.
+    let fixture = Fixture::new();
+    let mut document = fixture.timestamped();
+    assert_eq!(
+        fixture
+            .extend(&mut document, &[CRLS[0], REVOKING], false)
+            .expect("B-LT with the signer listed"),
+        DataAdded::Published
+    );
+    let responses = |xml: &str| {
+        roxmltree::Document::parse(xml)
+            .expect("XML parses")
+            .descendants()
+            .filter(|node| node.tag_name().name() == "EncapsulatedOCSPValue")
+            .count()
+    };
+    let before = responses(document.as_xml());
+    assert_eq!(
+        fixture
+            .extend_with(&mut document, &[], &[REVOKED], true)
+            .expect("refresh with the revoked response"),
+        DataAdded::Published
+    );
+    assert_eq!(responses(document.as_xml()), before + 1);
 }
 
 #[test]

@@ -6,6 +6,7 @@ use structured_xades::xml::Name;
 
 const XADES: &str = "http://uri.etsi.org/01903/v1.3.2#";
 const DS: &str = "http://www.w3.org/2000/09/xmldsig#";
+const XMLNS: &str = "http://www.w3.org/2000/xmlns/";
 
 fn account() -> Memory {
     Memory::new(Arc::new(MemoryAccount::new(1 << 20, 1 << 20)))
@@ -68,6 +69,9 @@ fn reserved_prefixes_are_refused_for_a_foreign_namespace() {
         (XML, "xmlns"),
         (XML, "p"),
         (XML, ""),
+        // The xmlns namespace is bound to no prefix, not even as the default.
+        (XMLNS, "p"),
+        (XMLNS, ""),
     ] {
         assert!(
             matches!(Draft::with_prefixes(&[chosen]), Err(DraftError::Name(_))),
@@ -75,6 +79,70 @@ fn reserved_prefixes_are_refused_for_a_foreign_namespace() {
         );
     }
     assert!(Draft::with_prefixes(&[(XML, "xml")]).is_ok());
+    // Nor is an element in it written under a generated prefix.
+    let mut draft = Draft::new();
+    assert!(matches!(
+        write(&mut draft, &[Event::Begin(name(XMLNS, "a"))]),
+        Err(DraftError::Name(_))
+    ));
+}
+
+/// The expanded names of the elements and attributes of `markup`.
+fn expanded(markup: &str) -> Vec<(Option<String>, String)> {
+    let document = roxmltree::Document::parse(markup).expect("well-formed");
+    let mut names = Vec::new();
+    for node in document.descendants().filter(roxmltree::Node::is_element) {
+        // roxmltree reports an element under xmlns="" with an empty URI.
+        names.push((
+            node.tag_name()
+                .namespace()
+                .filter(|uri| !uri.is_empty())
+                .map(String::from),
+            node.tag_name().name().into(),
+        ));
+        for attribute in node.attributes() {
+            names.push((
+                attribute.namespace().map(String::from),
+                attribute.name().into(),
+            ));
+        }
+    }
+    names
+}
+
+#[test]
+fn a_default_namespace_takes_namespaced_attributes_and_plain_children() {
+    // Namespaces in XML 1.0 §6.2: a default namespace never applies to an
+    // attribute, so a namespaced attribute in it takes a named prefix; a
+    // child in no namespace undeclares the default with xmlns="" and the
+    // outer default is in scope again after it.
+    const OUTER: &str = "urn:outer";
+    let mut draft = Draft::with_prefixes(&[(OUTER, "")]).expect("a default namespace");
+    write(
+        &mut draft,
+        &[
+            Event::Begin(name(OUTER, "Root")),
+            Event::Attribute(name(OUTER, "flag"), value("1", Datatype::String)),
+            Event::Begin(name("", "Child")),
+            Event::End,
+            Event::Begin(name(OUTER, "Sibling")),
+            Event::End,
+            Event::End,
+        ],
+    )
+    .expect("events are accepted");
+    let markup = draft.finish().expect("one complete element").0;
+    let outer = Some(String::from(OUTER));
+    assert_eq!(
+        expanded(&markup),
+        [
+            (outer.clone(), "Root".into()),
+            (outer.clone(), "flag".into()),
+            (None, "Child".into()),
+            (outer, "Sibling".into()),
+        ],
+        "{markup}"
+    );
 }
 
 #[test]
@@ -111,6 +179,17 @@ fn a_fallback_prefix_never_shadows_a_chosen_one() {
             (Some(DS), "Child"),
             (Some(OUTER), "Leaf")
         ],
+        "{markup}"
+    );
+    // The chosen prefix itself stays bound to the chosen namespace on the
+    // XMLDSig child, not rebound there and bound back on the leaf.
+    let child = document
+        .descendants()
+        .find(|node| node.tag_name().name() == "Child")
+        .expect("Child");
+    assert_eq!(
+        child.lookup_namespace_uri(Some("ds")),
+        Some(OUTER),
         "{markup}"
     );
 }
