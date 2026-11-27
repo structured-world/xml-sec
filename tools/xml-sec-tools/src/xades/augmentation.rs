@@ -15,6 +15,24 @@ use super::{Corpus, line, read, write};
 /// timestamps a run issues, before the tests' assessment time (2027-01-15).
 const SIGNER_REVOKED: &str = "270110000000Z";
 
+/// [`SIGNER_REVOKED`] as Unix seconds (2027-01-10T00:00:00Z).
+const SIGNER_REVOKED_UNIX: u64 = 1_799_539_200;
+
+/// Refuses a run whose TSA, on the system clock, would stamp at or after
+/// the signer's revocation, before any fixture is written.
+fn before_revocation() -> Result<(), String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_secs();
+    if now >= SIGNER_REVOKED_UNIX {
+        return Err(format!(
+            "the content fixtures revoke their signer at {SIGNER_REVOKED}; a run now would stamp after it, so move the revocation and the tests' assessment time"
+        ));
+    }
+    Ok(())
+}
+
 const TSA_EXTENSIONS: &str = "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=critical,timeStamping\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n";
 
 /// Each request the probe writes, the response the TSA gives to it, and
@@ -107,6 +125,7 @@ fn issue_with_tsa(generator: &Generator) -> Result<(), String> {
 /// B-B signature; the OpenSSL TSA answers each one. Two generations of each
 /// CA's CRL let a B-LT signature take fresher statuses.
 pub(crate) fn content(corpus: &Corpus, generator: &Generator) -> Result<(), String> {
+    before_revocation()?;
     issue_with_tsa(generator)?;
     // Two generations of each CA's CRL: a signature takes B-LT with the first
     // and has the second added by a refresh.

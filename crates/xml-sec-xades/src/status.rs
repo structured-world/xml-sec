@@ -526,7 +526,14 @@ impl<'e, 'x, W: Work> Engine<'e, 'x, '_, '_, '_, W> {
         {
             return Ok(Some(found));
         }
-        let issuer = if listed { None } else { issuer };
+        // The listing decides over an absence a caller's list reports too:
+        // only the full engine, whose CRL walk returns the first listing and
+        // reads the caller's lists first, answers a listed member.
+        let (issuer, supplied) = if listed {
+            (None, None)
+        } else {
+            (issuer, supplied)
+        };
         for engine in supplied.into_iter().chain(core::iter::once(self)) {
             if let Some(found) = engine.choose(anchor, target, issuer, roots, extra, signers)? {
                 return Ok(Some(found));

@@ -598,6 +598,41 @@ fn a_store_names_the_specification_the_signature_named() {
 }
 
 #[test]
+fn a_comment_in_the_signed_specification_is_not_its_identifier() {
+    // The specification identifier is the element's character data; a
+    // comment inside it (outside the signed canonical form) is not part of
+    // it, so the store under the named specification is still accepted.
+    let fixture = Fixture::new();
+    let der = asn1_policy::document(None);
+    let signed = fixture
+        .created(Properties {
+            policy: Some(Policy::Document(SignaturePolicy::Explicit(asn1_explicit(
+                &der,
+                DigestAlgorithm::Sha256.uri(),
+            )))),
+            specified: Some(ASN1_RULE),
+            ..Properties::default()
+        })
+        .expect("an ASN.1 policy");
+    let named = format!("{}</", asn1_policy::SPECIFICATION);
+    let commented = signed.as_xml().replacen(
+        &named,
+        &format!("{}<!--note--></", asn1_policy::SPECIFICATION),
+        1,
+    );
+    assert_ne!(commented, signed.as_xml());
+    let mut document = XmlDocument::parse(commented).expect("the commented document parses");
+    fixture
+        .store_specified(
+            &mut document,
+            &asn1_explicit(&der, DigestAlgorithm::Sha256.uri()),
+            Some(ASN1_RULE),
+        )
+        .expect("the store under the named specification");
+    assert_eq!(stores(document.as_xml()), 1);
+}
+
+#[test]
 fn an_asn1_policy_that_contradicts_its_digest_is_refused() {
     // TR 102 272 §6.1: the document names its own hash, which must be the
     // policy digest method, and a stored signPolicyHash must be the digest;

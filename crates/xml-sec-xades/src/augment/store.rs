@@ -292,8 +292,12 @@ fn signed_specifications<W: Work>(
                     .children()
                     .filter(|node| named(node, XADES, "Identifier"))
                 {
-                    let value: String =
-                        identifier.children().filter_map(XmlDomNode::text).collect();
+                    // Character data only: a comment is not part of it.
+                    let value: String = identifier
+                        .children()
+                        .filter(XmlDomNode::is_text)
+                        .filter_map(XmlDomNode::text)
+                        .collect();
                     work.charge_work(value.len() as u64 + 1)?;
                     specifications.push(crate::properties::collapse(&value));
                 }

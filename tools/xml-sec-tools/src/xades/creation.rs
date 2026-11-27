@@ -544,12 +544,16 @@ fn document_problems(name: &str, document: &str, problems: &mut Vec<String>) {
             return;
         }
     };
-    // The format the signature `sig` signed: in its XAdES signed data object
-    // properties, not an element of the same name elsewhere.
+    // The format the signature `sig` signed: only along the direct chain
+    // ds:Object/QualifyingProperties/SignedProperties/SignedDataObjectProperties,
+    // not an element of the same name elsewhere in or outside the signature.
     let format = xml::below(parsed.root_element(), "Signature", Some(super::DS))
         .filter(|node| node.attribute("Id") == Some("sig"))
-        .flat_map(|signature| xml::below(signature, "SignedDataObjectProperties", Some(super::SP)))
-        .flat_map(|properties| xml::below(properties, "DataObjectFormat", Some(super::SP)))
+        .flat_map(|signature| xml::children_named(signature, "Object", super::DS))
+        .flat_map(|object| xml::children_named(object, "QualifyingProperties", super::SP))
+        .flat_map(|qualifying| xml::children_named(qualifying, "SignedProperties", super::SP))
+        .flat_map(|signed| xml::children_named(signed, "SignedDataObjectProperties", super::SP))
+        .flat_map(|properties| xml::children_named(properties, "DataObjectFormat", super::SP))
         .find(|node| node.attribute("ObjectReference") == Some("#sig-reference-0"));
     for (local, expected) in [
         ("Description", "Base64 encoded text"),

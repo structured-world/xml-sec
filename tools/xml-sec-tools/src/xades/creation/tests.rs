@@ -357,6 +357,15 @@ fn the_format_details_are_read_in_the_created_document() {
     assert_eq!(problems_of(&signed("", &good)).len(), 3);
     let unqualified = good.replace("xades:", "");
     assert_eq!(problems_of(&signed(&unqualified, "")).len(), 3);
+    // Nor in signed data object properties of another object of the same
+    // signature, outside its QualifyingProperties.
+    let elsewhere = signed("", "").replace(
+        "</ds:Signature>",
+        &format!(
+            "<ds:Object><xades:SignedDataObjectProperties>{good}</xades:SignedDataObjectProperties></ds:Object></ds:Signature>"
+        ),
+    );
+    assert_eq!(problems_of(&elsewhere).len(), 3);
 }
 
 #[test]
