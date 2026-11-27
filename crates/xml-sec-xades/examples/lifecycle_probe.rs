@@ -174,8 +174,10 @@ fn signing_key(
         "dsa" => A::DsaSha256,
         _ => return Err(format!("unknown signature algorithm {algorithm}")),
     };
-    // The key is a test key the harness issues for this run only: no other
-    // party can reach the process memory it would protect.
+    // The key is a test key the harness issues for this run, or one the
+    // caller reads from its own directory into its own process: no other
+    // account or party can reach the memory wiping would protect, so the
+    // buffers are not zeroized.
     let body: Vec<u8> = pem
         .lines()
         .filter(|line| !line.starts_with("-----"))
@@ -551,7 +553,7 @@ impl<'a> Tsa<'a> {
             }
             return Ok(Cow::Borrowed(reply));
         }
-        let response = self.acquire(request)?;
+        let response = self.acquire(ordinal, request)?;
         if let Some(tokens) = self.tokens {
             write(&tokens.join(format!("{ordinal}.tsq")), request)?;
             write(&tokens.join(format!("{ordinal}.tsr")), &response)?;
@@ -559,17 +561,24 @@ impl<'a> Tsa<'a> {
         Ok(Cow::Owned(response))
     }
 
-    /// The TSA's response to `request`, through the caller's command.
-    fn acquire(&self, request: &[u8]) -> Result<Vec<u8>, String> {
+    /// The TSA's response to exchange `ordinal`'s `request`, through the
+    /// caller's command. Each exchange has its own files, so a command that
+    /// writes no response fails here instead of returning an earlier one.
+    fn acquire(&self, ordinal: usize, request: &[u8]) -> Result<Vec<u8>, String> {
         let [program, args @ ..] = self.command else {
             return Err(
                 "no recorded response and no TSA command: this run acquires nothing".into(),
             );
         };
         let (query, reply) = (
-            self.scratch.with_extension("tsq"),
-            self.scratch.with_extension("tsr"),
+            self.scratch.with_extension(format!("{ordinal}.tsq")),
+            self.scratch.with_extension(format!("{ordinal}.tsr")),
         );
+        // A response left by an earlier run is not this exchange's.
+        if reply.exists() {
+            std::fs::remove_file(&reply)
+                .map_err(|error| format!("{}: {error}", reply.display()))?;
+        }
         write(&query, request)?;
         let substitute = |arg: &String| match arg.as_str() {
             "{request}" => query.display().to_string(),
@@ -727,10 +736,18 @@ impl Options {
             tokens: None,
             positional: Vec::new(),
         };
-        // `--detached` may repeat, one file each; the others are taken once.
+        // `--detached` may repeat, one file each, of distinct file names since
+        // a reference names the file; the others are taken once.
         while let Some(index) = options.iter().position(|arg| arg == "--detached") {
             let path = PathBuf::from(options.get(index + 1).ok_or(AUGMENT)?);
-            taken.resources.insert(file_name(&path)?, read(&path)?);
+            let name = file_name(&path)?;
+            if taken.resources.contains_key(&name) {
+                return Err(format!(
+                    "--detached {}: another file has the name {name}",
+                    path.display()
+                ));
+            }
+            taken.resources.insert(name, read(&path)?);
             options.drain(index..index + 2);
         }
         for flag in ["--accuracy", "--tokens"] {

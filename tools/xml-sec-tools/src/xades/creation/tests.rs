@@ -289,12 +289,59 @@ fn counted_facts_need_their_number() {
 }
 
 #[test]
+fn a_policy_field_is_read_from_the_policy_itself() {
+    // The supplied policy and its DocSpecification share an identifier and
+    // a description; the policy's own must be there, not only the copy.
+    let report = |policy: &str| {
+        format!(
+            "<DiagnosticData><Policy>{policy}<Url>http://spuri.test</Url><DocumentationReference>http://nowina.lu/signature-policy.pdf</DocumentationReference><Organization>Nowina Solutions</Organization><ExplicitText>This is a test policy</ExplicitText><DocSpecification><Id>1.2.3.4.5.6</Id><Description>Test description</Description></DocSpecification></Policy></DiagnosticData>"
+        )
+    };
+    assert_eq!(
+        diagnostic_problems(
+            "policy-supplied",
+            &report("<Id>1.2.3.4.5.6</Id><Description>Test description</Description>")
+        ),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        diagnostic_problems("policy-supplied", &report("<Id>9.9</Id>")).len(),
+        2
+    );
+}
+
+#[test]
+fn each_signer_role_is_read_with_its_category() {
+    // Two claimed roles and one signed assertion: a role reported under
+    // another category does not count.
+    let report = |manager: &str| {
+        format!(
+            "<DiagnosticData><SignerRole Category=\"{manager}\"><Role>Manager</Role></SignerRole><SignerRole Category=\"claimed\"><Role>Approver</Role></SignerRole><SignerRole Category=\"signed\"><Role>Signer is authorized</Role></SignerRole></DiagnosticData>"
+        )
+    };
+    assert_eq!(
+        diagnostic_problems("signer-role", &report("claimed")),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        diagnostic_problems("signer-role", &report("certified")).len(),
+        2
+    );
+}
+
+#[test]
 fn the_format_details_are_read_in_the_created_document() {
     // DSS keeps only the MIME type of a DataObjectFormat: the description,
-    // identifier and encoding are checked in the document itself.
+    // identifier and encoding are checked in the document itself, in the
+    // XAdES signed data object properties of signature `sig`.
     let format = |description: &str| {
         format!(
-            "<Root><DataObjectFormat ObjectReference=\"#sig-reference-0\"><Description>{description}</Description><ObjectIdentifier><Identifier>urn:oid:1.2.840.113549.1.7.1</Identifier></ObjectIdentifier><Encoding>http://www.w3.org/2000/09/xmldsig#base64</Encoding></DataObjectFormat></Root>"
+            "<xades:DataObjectFormat ObjectReference=\"#sig-reference-0\"><xades:Description>{description}</xades:Description><xades:ObjectIdentifier><xades:Identifier>urn:oid:1.2.840.113549.1.7.1</xades:Identifier></xades:ObjectIdentifier><xades:Encoding>http://www.w3.org/2000/09/xmldsig#base64</xades:Encoding></xades:DataObjectFormat>"
+        )
+    };
+    let signed = |inside: &str, outside: &str| {
+        format!(
+            "<Root xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\" xmlns:xades=\"http://uri.etsi.org/01903/v1.3.2#\">{outside}<ds:Signature Id=\"sig\"><ds:Object><xades:QualifyingProperties><xades:SignedProperties><xades:SignedDataObjectProperties>{inside}</xades:SignedDataObjectProperties></xades:SignedProperties></xades:QualifyingProperties></ds:Object></ds:Signature></Root>"
         )
     };
     let problems_of = |document: &str| {
@@ -302,11 +349,14 @@ fn the_format_details_are_read_in_the_created_document() {
         super::document_problems("data-object-format", document, &mut problems);
         problems
     };
-    assert_eq!(
-        problems_of(&format("Base64 encoded text")),
-        Vec::<String>::new()
-    );
-    assert_eq!(problems_of(&format("other")).len(), 1);
+    let good = format("Base64 encoded text");
+    assert_eq!(problems_of(&signed(&good, "")), Vec::<String>::new());
+    assert_eq!(problems_of(&signed(&format("other"), "")).len(), 1);
+    // The same format outside the signed properties, or in no namespace,
+    // is not the one the signature signed.
+    assert_eq!(problems_of(&signed("", &good)).len(), 3);
+    let unqualified = good.replace("xades:", "");
+    assert_eq!(problems_of(&signed(&unqualified, "")).len(), 3);
 }
 
 #[test]

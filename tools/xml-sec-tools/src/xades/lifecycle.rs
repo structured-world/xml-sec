@@ -692,6 +692,14 @@ pub(crate) fn dss_outcome(output: &str, reports: &Path) -> Result<Value, String>
 
 /// The fields of `expected` that `observed` does not repeat.
 pub(crate) fn deviations(expected: &Value, observed: &Value, path: &str, found: &mut Vec<String>) {
+    // `{"less_than": N}` expects any number below N, such as every width an
+    // encoder that drops leading zero octets can give.
+    if let Some(bound) = expected.get("less_than").and_then(Value::as_u64) {
+        if observed.as_u64().is_none_or(|value| value >= bound) {
+            found.push(format!("{path}: expected below {bound}, got {observed}"));
+        }
+        return;
+    }
     match expected {
         Value::Object(fields) => {
             for (name, value) in fields {
@@ -700,6 +708,17 @@ pub(crate) fn deviations(expected: &Value, observed: &Value, path: &str, found: 
                     continue;
                 }
                 deviations(value, &observed[name], &format!("{path}.{name}"), found);
+            }
+            // An outcome that expects no further signatures holds none: an
+            // omitted `others` means zero, not "any".
+            if !fields.contains_key("others")
+                && let Some(others) = observed.get("others").and_then(Value::as_array)
+                && !others.is_empty()
+            {
+                found.push(format!(
+                    "{path}.others: no further signature expected, {} reported",
+                    others.len()
+                ));
             }
         }
         _ if expected != observed => {
@@ -1363,8 +1382,14 @@ pub(crate) fn compare(expected: &Value, observed: &[Value]) -> Vec<String> {
 /// the `observed` steps: an observation one of the reviewed alternatives
 /// already describes keeps the expectation as it was, so a run that met the
 /// alternative never replaces the expected outcome; any other observation
-/// becomes the expected outcome for review, keeping the alternatives.
-pub(crate) fn recorded_case(previous: &Value, observed: &Value) -> Value {
+/// becomes the expected outcome for review, keeping the alternatives. Under a
+/// new DSS release (`same_release` false) the kept steps would be credited to
+/// a release that never produced them, so such a case gives `None`.
+pub(crate) fn recorded_case(
+    previous: &Value,
+    observed: &Value,
+    same_release: bool,
+) -> Option<Value> {
     let alternatives = &previous["alternatives"];
     let reviewed = alternatives
         .as_array()
@@ -1380,13 +1405,13 @@ pub(crate) fn recorded_case(previous: &Value, observed: &Value) -> Value {
             steps.len() == actual.len() && found.is_empty()
         });
     if reviewed {
-        return previous.clone();
+        return same_release.then(|| previous.clone());
     }
     let mut case = json!({ "steps": observed });
     if !alternatives.is_null() {
         case["alternatives"] = alternatives.clone();
     }
-    case
+    Some(case)
 }
 
 /// Runs every lifecycle and compares it with the expectations.
@@ -1438,14 +1463,25 @@ pub(crate) fn execute(corpus: &Corpus, results: &Path, record: bool) -> Result<(
         // The reviewed explanations and alternatives outlive a new recording;
         // `dss` names the release the outcomes were recorded against.
         let previous = previous_expectations(&path)?;
-        let cases: Map<String, Value> = observed
-            .iter()
-            .map(|row| {
-                let name = row["case"].as_str().unwrap_or_default().to_owned();
-                let case = recorded_case(&previous["cases"][&name], &row["steps"]);
-                (name, case)
-            })
-            .collect();
+        let same_release = previous["dss"] == release.dss.as_str();
+        let mut cases = Map::new();
+        let mut unobserved = Vec::new();
+        for row in &observed {
+            let name = row["case"].as_str().unwrap_or_default().to_owned();
+            match recorded_case(&previous["cases"][&name], &row["steps"], same_release) {
+                Some(case) => {
+                    cases.insert(name, case);
+                }
+                None => unobserved.push(name),
+            }
+        }
+        if !unobserved.is_empty() {
+            return Err(format!(
+                "under DSS {} these cases met only a reviewed alternative; record again for their expected outcome: {}",
+                release.dss,
+                unobserved.join(", ")
+            ));
+        }
         let notes = previous["notes"].clone();
         return write_json(
             &path,

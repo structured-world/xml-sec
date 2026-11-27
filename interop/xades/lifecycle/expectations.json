@@ -9,7 +9,7 @@
     "unmet": "Under TimestampTokenEncoding::Ber xml-sec reads DSS's tokens and finds DSS's B-T met, but not the B-LT and B-LTA DSS makes: DSS places the CRL that covers the TSA certificate only in RevocationValues, while EN 319 132-1 §6.3(x) requires the validation data of a time-stamp in TimeStampValidationData, AnyValidationData or the token itself. Normative difference, intended. xml-sec therefore refuses to renew such an archive (§6.3(aa)).",
     "revoked": "The CRL lists the signer as revoked before signing. DSS refuses to augment to B-LT or to renew; xml-sec adds the evidence, because a level states what the document carries, and DSS then reads it as INDETERMINATE/REVOKED_NO_POE.",
     "crl": "Every certificate of the run carries a CRL distribution point that is never fetched: DSS looks a CRL up only through one (RFC 5280 §4.2.1.13), while the run supplies the CRLs offline.",
-    "p521": "XMLDSig 1.1 §6.4.3 encodes ECDSA r and s by I2OSP with the length of the curve order, 66 octets each for P-521. DSS drops leading zero octets common to both, so about one P-521 signature in four (r and s both below 2^520) carries 130 octets; xml-sec refuses it as InvalidSignatureFormat and the lifecycle stops. Normative difference on DSS's side; the conformant outcome is the expected one, the refused one a reviewed alternative.",
+    "p521": "XMLDSig 1.1 §6.4.3 encodes ECDSA r and s by I2OSP with the length of the curve order, 66 octets each for P-521. DSS sizes both from the larger of r and s, dropping leading zero octets common to both, so about one P-521 signature in four (r and s both below 2^520) carries 130 octets, and more rarely 128 or fewer; xml-sec refuses any width below 132 as InvalidSignatureFormat and the lifecycle stops. Normative difference on DSS's side; the conformant outcome is the expected one, the refused one a reviewed alternative.",
     "forms": "Each signature form DSS's signature tests make runs its own lifecycle with an RSA signer and CRL evidence, in both directions, except DSS's indented serialization, which only DSS makes and xml-sec augments: two parallel enveloped signatures, a countersignature and a nested one, a detached signature over two files, inclusive canonicalization. Every top-level signature is augmented at each step; `others` reports each signature after the first. A countersignature carries no SignatureTimeStamp of its own: xml-sec finds it missing at B-T and later (Prepare), and DSS reads it as XAdES-BASELINE-B, the same conclusion.",
     "algorithms": "Each further signature algorithm DSS's signature tests use (RSA with SHA-512, RSASSA-PSS with SHA-256 and MGF1, ECDSA on P-384 and P-521, ECDSA P-256 with SHA3-512, Ed25519, Ed448, DSA with (L, N) = (2048, 256)) runs one enveloping lifecycle in each direction, references digested with SHA-256. Every step is made and validated by the other side. Once revocation data exists, DSS's default validation policy reads Ed25519 and Ed448 signatures as INDETERMINATE/CRYPTO_CONSTRAINTS_FAILURE_NO_POE: 'The algorithm EdDSA with SHA512 is not authorised for signature creation'. That is DSS's policy verdict on the algorithm, not a fault of the signature."
   },
@@ -6197,7 +6197,9 @@
               "step": "b",
               "by": "dss",
               "made": "made",
-              "signature_octets": 130,
+              "signature_octets": {
+                "less_than": 132
+              },
               "preserved": true,
               "validated": {
                 "crypto": "Err(Crypto(InvalidSignatureFormat",

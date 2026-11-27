@@ -319,10 +319,19 @@ fn expected_properties(name: &str) -> &'static [Expect] {
                 ],
             ),
         ],
+        // Each role with its category: two claimed roles and one signed
+        // assertion.
         "signer-role" => &[
-            Text("Role", "Manager"),
-            Text("Role", "Approver"),
-            Text("SignerRole@Category", "signed"),
+            Together(
+                "SignerRole",
+                &[("Role", "Manager"), ("@Category", "claimed")],
+            ),
+            Together(
+                "SignerRole",
+                &[("Role", "Approver"), ("@Category", "claimed")],
+            ),
+            Counted("SignerRole", "Category", "claimed", 2),
+            Counted("SignerRole", "Category", "signed", 1),
         ],
         "production-place" => &[
             Text("City", "Prague"),
@@ -397,10 +406,12 @@ fn policy_properties(name: &str) -> &'static [Expect] {
         "policy-implied" => &[Text("Id", "IMPLICIT_POLICY")],
         // DSS reads the identifier and its qualifiers; without the document
         // it cannot check the supplied digest.
+        // The policy's own fields are its direct children, apart from the
+        // same values its DocSpecification repeats.
         "policy-supplied" => &[
-            Text("Policy/Id", "1.2.3.4.5.6"),
+            Text("Policy>Id", "1.2.3.4.5.6"),
             Text("Policy/Url", "http://spuri.test"),
-            Text("Policy/Description", "Test description"),
+            Text("Policy>Description", "Test description"),
             Text(
                 "Policy/DocumentationReference",
                 "http://nowina.lu/signature-policy.pdf",
@@ -437,11 +448,21 @@ fn policy_properties(name: &str) -> &'static [Expect] {
 }
 
 /// Whether some element at the `Text` path `element` below `root` holds
-/// `expected`.
+/// `expected`: `scope/element` searches below each `scope`, `scope>element`
+/// reads only its direct children, and `@attribute` alone reads `root`'s own
+/// attribute.
 fn holds_text(root: xml::Node<'_, '_>, element: &str, expected: &str) -> bool {
-    let (scope, named) = element
-        .split_once('/')
-        .map_or((None, element), |(scope, named)| (Some(scope), named));
+    if let Some(attribute) = element.strip_prefix('@') {
+        return root.attribute(attribute) == Some(expected);
+    }
+    let (scope, direct, named) = match element.split_once('>') {
+        Some((scope, named)) => (Some(scope), true, named),
+        None => element
+            .split_once('/')
+            .map_or((None, false, element), |(scope, named)| {
+                (Some(scope), false, named)
+            }),
+    };
     let (local, attribute) = named
         .split_once('@')
         .map_or((named, None), |(local, attribute)| (local, Some(attribute)));
@@ -450,6 +471,12 @@ fn holds_text(root: xml::Node<'_, '_>, element: &str, expected: &str) -> bool {
         None => xml::text_at(node, &[]).as_deref() == Some(expected),
     };
     match scope {
+        Some(scope) if direct => xml::below(root, scope, None).any(|parent| {
+            parent
+                .children()
+                .filter(|child| child.is_element() && child.tag_name().name() == local)
+                .any(holds)
+        }),
         Some(scope) => {
             xml::below(root, scope, None).any(|parent| xml::below(parent, local, None).any(holds))
         }
@@ -517,7 +544,12 @@ fn document_problems(name: &str, document: &str, problems: &mut Vec<String>) {
             return;
         }
     };
-    let format = xml::below(parsed.root_element(), "DataObjectFormat", None)
+    // The format the signature `sig` signed: in its XAdES signed data object
+    // properties, not an element of the same name elsewhere.
+    let format = xml::below(parsed.root_element(), "Signature", Some(super::DS))
+        .filter(|node| node.attribute("Id") == Some("sig"))
+        .flat_map(|signature| xml::below(signature, "SignedDataObjectProperties", Some(super::SP)))
+        .flat_map(|properties| xml::below(properties, "DataObjectFormat", Some(super::SP)))
         .find(|node| node.attribute("ObjectReference") == Some("#sig-reference-0"));
     for (local, expected) in [
         ("Description", "Base64 encoded text"),
@@ -525,7 +557,7 @@ fn document_problems(name: &str, document: &str, problems: &mut Vec<String>) {
         ("Encoding", "http://www.w3.org/2000/09/xmldsig#base64"),
     ] {
         let found = format.and_then(|format| {
-            xml::below(format, local, None)
+            xml::below(format, local, Some(super::SP))
                 .next()
                 .and_then(|node| xml::text_at(node, &[]))
         });
@@ -683,7 +715,12 @@ pub(crate) fn execute(corpus: &Corpus, results: &Path) -> Result<(), String> {
         ]);
         probe.extend(action.map(Into::into));
         probe.extend(line(&[&fixtures.join(directory), &signed]));
-        corpus.require(&probe, &results.join(example))?;
+        // One log per action, so a later run of the same example keeps it.
+        let log = match action {
+            Some(action) => format!("{example}-{action}"),
+            None => example.to_owned(),
+        };
+        corpus.require(&probe, &results.join(log))?;
     }
     let classpath = super::dss::build(corpus, results)?.classpath;
     let mut summary = Vec::new();

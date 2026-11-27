@@ -26,14 +26,15 @@ fn the_short_p521_alternative_needs_the_short_encoding() {
         compare(&expected, &[observed(132)]),
         ["p521[0].validated.crypto: expected \"Valid\", got \"Err\""]
     );
-    // The recorded alternative carries that condition.
+    // The recorded alternative carries that condition: every width below
+    // the conformant 132 octets.
     let recorded: serde_json::Value = serde_json::from_str(include_str!(
         "../../../../../interop/xades/lifecycle/expectations.json"
     ))
     .expect("expectations parse");
     assert_eq!(
         recorded["cases"]["dss-first-enveloping-ec-p521-crl"]["alternatives"][0]["steps"][0]["signature_octets"],
-        130
+        json!({ "less_than": 132 })
     );
     let created = signature(
         "s",
@@ -143,16 +144,68 @@ fn recording_a_reviewed_alternative_keeps_the_expected_outcome() {
         "alternatives": [{ "note": "p521", "steps": [{ "step": "b", "made": { "refused": "r" } }] }]
     });
     let refused = json!([{ "step": "b", "made": { "refused": "r" } }]);
-    assert_eq!(super::recorded_case(&previous, &refused), previous);
+    assert_eq!(
+        super::recorded_case(&previous, &refused, true),
+        Some(previous.clone())
+    );
     let new = json!([{ "step": "b", "made": { "refused": "other" } }]);
     assert_eq!(
-        super::recorded_case(&previous, &new),
-        json!({ "steps": new, "alternatives": previous["alternatives"] })
+        super::recorded_case(&previous, &new, true),
+        Some(json!({ "steps": new, "alternatives": previous["alternatives"] }))
     );
     assert_eq!(
-        super::recorded_case(&serde_json::Value::Null, &refused),
-        json!({ "steps": refused })
+        super::recorded_case(&serde_json::Value::Null, &refused, true),
+        Some(json!({ "steps": refused }))
     );
+    // Under a new release the kept steps would be credited to a release that
+    // never produced them: the case needs a new expected observation, while
+    // a new outcome is still recorded.
+    assert_eq!(super::recorded_case(&previous, &refused, false), None);
+    assert_eq!(
+        super::recorded_case(&previous, &new, false),
+        Some(json!({ "steps": new, "alternatives": previous["alternatives"] }))
+    );
+}
+
+#[test]
+fn a_bound_matches_every_width_below_it() {
+    // DSS's short P-521 encodings: 130, 128 or fewer octets all match the
+    // reviewed alternative's bound; the conformant 132 does not.
+    let expected = json!({ "signature_octets": { "less_than": 132 } });
+    for (octets, deviates) in [(130, false), (128, false), (126, false), (132, true)] {
+        let mut found = Vec::new();
+        deviations(
+            &expected,
+            &json!({ "signature_octets": octets }),
+            "c[0]",
+            &mut found,
+        );
+        assert_eq!(!found.is_empty(), deviates, "{octets}: {found:?}");
+    }
+}
+
+#[test]
+fn an_outcome_without_further_signatures_refuses_one() {
+    // A single-signature expectation omits `others`; an observation that
+    // reports another signature deviates instead of passing unread.
+    let expected = json!({ "validated": { "crypto": "Valid" } });
+    let mut found = Vec::new();
+    deviations(
+        &expected,
+        &json!({ "validated": { "crypto": "Valid", "others": [{ "crypto": "Valid" }] } }),
+        "c[0]",
+        &mut found,
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].starts_with("c[0].validated.others"), "{found:?}");
+    found.clear();
+    deviations(
+        &expected,
+        &json!({ "validated": { "crypto": "Valid" } }),
+        "c[0]",
+        &mut found,
+    );
+    assert!(found.is_empty(), "{found:?}");
 }
 
 #[test]

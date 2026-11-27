@@ -27,7 +27,9 @@ fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
 pub fn document(stored: Option<&[u8]>) -> Vec<u8> {
     // 2.16.840.1.101.3.4.2.1, id-sha256, without parameters.
     let algorithm = tlv(0x30, &tlv(0x06, &[96, 134, 72, 1, 101, 3, 4, 2, 1]));
-    let issued = tlv(0x18, b"20261126000000Z");
+    // Issued, and valid from, before the signing time the examples claim
+    // (2026-10-18), so a signature made under it falls in its signing period.
+    let issued = tlv(0x18, b"20261001000000Z");
     let period = tlv(0x30, &issued);
     let rules = tlv(
         0x30,

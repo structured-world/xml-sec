@@ -94,7 +94,7 @@ fn utc() -> Result<LeapTable<'static>, String> {
 
 fn main() -> Result<(), String> {
     let mut args = std::env::args_os().skip(1);
-    let usage = "usage: augment_probe request|content-request|content|refresh|complete|archive-request|renewal-request|archive|extend|renew-request|renew FIXTURES OUTPUT";
+    let usage = "usage: augment_probe request|content-request|content|content-lta-request|content-lta-archive-request|content-lta|refresh|complete|archive-request|renewal-request|archive|extend|renew-request|renew FIXTURES OUTPUT";
     let (Some(action), Some(fixtures), Some(output), None) =
         (args.next(), args.next(), args.next(), args.next())
     else {

@@ -53,11 +53,13 @@ fn terminal(certificate: &[u8], pool: &[Vec<u8>]) -> bool {
             .any(|other| names(&other))
 }
 
-/// Every `--detached FILE` object, by its file name, taken out of `args`.
+/// Every `--detached FILE` object, by its file name, taken out of `args`;
+/// two files of one name would make the reference ambiguous and are refused.
 fn detached(
     args: &mut Vec<String>,
 ) -> Result<BTreeMap<String, Vec<u8>>, Box<dyn std::error::Error>> {
     let mut resources = BTreeMap::new();
+    let mut paths = BTreeMap::new();
     while let Some(flag) = args.iter().position(|arg| arg == "--detached") {
         let path = args.get(flag + 1).ok_or("--detached needs a file")?.clone();
         let name = std::path::Path::new(&path)
@@ -65,6 +67,9 @@ fn detached(
             .ok_or("--detached needs a file")?
             .to_string_lossy()
             .into_owned();
+        if let Some(earlier) = paths.insert(name.clone(), path.clone()) {
+            return Err(format!("--detached {earlier} and {path} have one file name").into());
+        }
         resources.insert(name, std::fs::read(&path)?);
         args.drain(flag..flag + 2);
     }

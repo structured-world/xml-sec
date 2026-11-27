@@ -147,7 +147,11 @@ const ASN1_RULE: SpecifiedDigest<'static> = SpecifiedDigest {
 /// A policy store of `document` with its syntax specification.
 fn store(document: PolicyDocument<'_>) -> PolicyStore<'_> {
     PolicyStore {
-        specification: identifier("urn:oid:1.3.6.1.4.1.13762.3.2"),
+        // EN 319 132-1 §5.2.10: an OID identifier is qualified OIDAsURN.
+        specification: Identifier {
+            qualifier: Some(Qualifier::Urn),
+            ..identifier("urn:oid:1.3.6.1.4.1.13762.3.2")
+        },
         document,
     }
 }
