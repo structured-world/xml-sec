@@ -146,6 +146,46 @@ fn a_default_namespace_takes_namespaced_attributes_and_plain_children() {
 }
 
 #[test]
+fn a_copied_element_keeps_its_own_namespaces_under_a_default() {
+    // Namespaces in XML 1.0 §6.2: a default namespace applies to unprefixed
+    // element names. A copied element in no namespace stays in none under
+    // the draft's default namespace, and one that declares its own default
+    // keeps it.
+    const OUTER: &str = "urn:outer";
+    let copy = |markup: &str| {
+        let mut draft = Draft::with_prefixes(&[(OUTER, "")]).expect("a default namespace");
+        let work = account();
+        draft
+            .write(Event::Begin(name(OUTER, "Role")), &work)
+            .expect("begin");
+        draft.copied(markup.as_bytes(), &work).expect("copied");
+        draft.write(Event::End, &work).expect("end");
+        draft.finish().expect("one complete element").0
+    };
+    let plain = copy("<Role a=\"x > y\">Approver<Inner/></Role>");
+    let outer = Some(String::from(OUTER));
+    assert_eq!(
+        expanded(&plain),
+        [
+            (outer.clone(), "Role".into()),
+            (None, "Role".into()),
+            (None, "a".into()),
+            (None, "Inner".into()),
+        ],
+        "{plain}"
+    );
+    let own = copy("<Role xmlns=\"urn:own\">Approver</Role>");
+    assert_eq!(
+        expanded(&own),
+        [
+            (outer, "Role".into()),
+            (Some("urn:own".into()), "Role".into())
+        ],
+        "{own}"
+    );
+}
+
+#[test]
 fn a_fallback_prefix_never_shadows_a_chosen_one() {
     // Namespaces in XML 1.0 §6.1: an inner declaration of a prefix rebinds it
     // for the whole subtree. With `ds` chosen for another namespace, the XMLDSig

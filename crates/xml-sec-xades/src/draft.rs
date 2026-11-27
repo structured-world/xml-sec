@@ -437,6 +437,19 @@ impl Draft {
     /// as a canonical copy of an existing element, as content of the open one.
     pub(crate) fn copied(&mut self, bytes: &[u8], work: &impl Work) -> Result<(), DraftError> {
         self.content(work)?;
+        // Namespaces in XML 1.0 §6.2: the draft's default namespace would
+        // apply to the copy's unprefixed names; a copy that does not declare
+        // its own default undeclares it, so its names keep their meaning.
+        if self.default_namespace().is_some() {
+            work.charge_work(bytes.len() as u64)?;
+            if let Some(name_end) = root_name_end(bytes)
+                && !declares_default(&bytes[name_end..])
+            {
+                self.push(&bytes[..name_end], work)?;
+                self.push(b" xmlns=\"\"", work)?;
+                return self.push(&bytes[name_end..], work);
+            }
+        }
         self.push(bytes, work)
     }
 
@@ -469,6 +482,61 @@ impl Writer for Draft {
             Event::Text(value) => self.text(value, work),
             Event::Binary(bytes) => self.binary(bytes, work),
             Event::End => self.end(work),
+        }
+    }
+}
+
+/// The offset just past the name of the root start tag of element markup
+/// `bytes`, when it starts with one.
+fn root_name_end(bytes: &[u8]) -> Option<usize> {
+    if bytes.first() != Some(&b'<') {
+        return None;
+    }
+    let end = bytes[1..]
+        .iter()
+        .position(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>'))?;
+    Some(end + 1)
+}
+
+/// Whether the attributes of a start tag, `rest` running from just past its
+/// name, declare the default namespace (`xmlns="..."`), scanning only up to
+/// the tag's end outside quoted values.
+fn declares_default(rest: &[u8]) -> bool {
+    let mut position = 0;
+    loop {
+        while rest.get(position).is_some_and(u8::is_ascii_whitespace) {
+            position += 1;
+        }
+        let Some(&byte) = rest.get(position) else {
+            return false;
+        };
+        if matches!(byte, b'/' | b'>') {
+            return false;
+        }
+        let name_start = position;
+        while rest
+            .get(position)
+            .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'=')
+        {
+            position += 1;
+        }
+        let name = &rest[name_start..position];
+        while rest
+            .get(position)
+            .is_some_and(|byte| *byte != b'"' && *byte != b'\'')
+        {
+            position += 1;
+        }
+        let Some(&quote) = rest.get(position) else {
+            return false;
+        };
+        position += 1;
+        while rest.get(position).is_some_and(|byte| *byte != quote) {
+            position += 1;
+        }
+        position += 1;
+        if name == b"xmlns" {
+            return true;
         }
     }
 }
