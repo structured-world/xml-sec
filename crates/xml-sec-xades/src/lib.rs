@@ -115,7 +115,7 @@ pub use content::{
 #[cfg(feature = "produce")]
 pub use create::{
     Assessment, Countersignature, CreateError, DataObject, Envelope, ManifestEntry, Placement,
-    Prefixes, Request, Signer, countersign, create, request_content_timestamps,
+    Prefixes, Request, Signer, SuppliedEntry, countersign, create, request_content_timestamps,
 };
 #[cfg(feature = "produce")]
 pub use draft::{Draft, DraftError};

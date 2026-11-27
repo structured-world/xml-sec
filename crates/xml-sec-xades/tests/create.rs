@@ -32,7 +32,8 @@ use xml_sec_xades::properties::{
 };
 use xml_sec_xades::{
     Assessment, Countersignature, CreateError, DataObject, DraftError, Envelope, ManifestEntry,
-    Outcome, Placement, Prefixes, Request, Signer, countersign, create, validate_basic,
+    Outcome, Placement, Prefixes, Request, Signer, SuppliedEntry, countersign, create,
+    validate_basic,
 };
 
 const ROOT: &[u8] = include_bytes!("fixtures/creation/root.der");
@@ -997,11 +998,13 @@ fn a_manifest_of_detached_data_is_signed_with_its_digests_filled() {
     fixture.context_policy.manifest_processing = ManifestProcessing::Process;
     let entry = |uri| ManifestEntry {
         uri,
+        transforms: Vec::new(),
         mime_type: "text/plain",
     };
     let objects = [DataObject::Manifest {
         id: "manifest",
         entries: vec![entry("detached.txt"), entry("second.txt")],
+        transforms: Vec::new(),
         mime_type: "text/xml",
     }];
     let mut document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
@@ -1038,7 +1041,19 @@ fn a_manifest_of_detached_data_is_signed_with_its_digests_filled() {
         "{digests:?}"
     );
     // The verifier processed both entries, not only the Manifest reference.
-    let parsed = XmlDocument::parse(document.as_xml()).expect("created XML parses");
+    assert_eq!(
+        manifest_statuses(&fixture, document.as_xml()),
+        [
+            ("detached.txt".to_owned(), DsigStatus::Valid),
+            ("second.txt".to_owned(), DsigStatus::Valid)
+        ]
+    );
+}
+
+/// The URI and status of each `Manifest` reference an independent
+/// verification processing Manifests reports for `xml`.
+fn manifest_statuses(fixture: &Fixture, xml: &str) -> Vec<(String, DsigStatus)> {
+    let parsed = XmlDocument::parse(xml).expect("created XML parses");
     let context = VerifyContext::new()
         .policy(fixture.context_policy.clone())
         .key_resolver(&fixture.resolver);
@@ -1046,7 +1061,7 @@ fn a_manifest_of_detached_data_is_signed_with_its_digests_filled() {
         external_resources: Some(&fixture.resources),
         ..VerificationRequest::default()
     };
-    let entries = with_verified_request(
+    with_verified_request(
         &parsed,
         &context,
         &verification,
@@ -1062,14 +1077,207 @@ fn a_manifest_of_detached_data_is_signed_with_its_digests_filled() {
                 .collect::<Vec<_>>())
         },
     )
-    .expect("the created document is read");
+    .expect("the created document is read")
+}
+
+/// A fixture whose signing and verification both process Manifests.
+fn processing_manifests() -> Fixture {
+    let mut fixture = Fixture::new();
+    fixture.policy.manifest_processing = ManifestProcessing::Process;
+    fixture.context_policy.manifest_processing = ManifestProcessing::Process;
+    fixture
+}
+
+#[test]
+fn each_manifest_entry_is_digested_after_its_own_transforms() {
+    // XMLDSig 1.1 §5.1, §4.4.3: a Manifest Reference carries its own
+    // transforms, as a SignedInfo one does: the document holding the
+    // signature without it, and a Filter 2.0 selection of the payload; the
+    // signature's reference to the Manifest canonicalizes it with C14N 1.1.
+    let fixture = processing_manifests();
+    let objects = [DataObject::Manifest {
+        id: "manifest",
+        entries: vec![
+            ManifestEntry {
+                uri: "",
+                transforms: vec![
+                    Transform::Enveloped,
+                    Transform::C14n(C14nAlgorithm::new(C14nMode::Exclusive1_0, false)),
+                ],
+                mime_type: "text/xml",
+            },
+            ManifestEntry {
+                uri: "#payload",
+                transforms: vec![Transform::XPathFilter2(vec![XPathFilter::new(
+                    XPathFilterOperation::Intersect,
+                    XPathExpression::new("//Data"),
+                )])],
+                mime_type: "text/xml",
+            },
+        ],
+        transforms: vec![Transform::C14n(C14nAlgorithm::new(
+            C14nMode::Inclusive1_1,
+            false,
+        ))],
+        mime_type: "text/xml",
+    }];
+    let mut document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
+    fixture
+        .create(&mut document, request("sig", &objects))
+        .expect("creation over a Manifest with transforms");
+    assert!(fixture.meets_basic(document.as_xml(), "sig"), "B-B");
+    let created = parse(document.as_xml());
+    let manifest = created
+        .descendants()
+        .find(|node| node.has_tag_name((DS, "Manifest")))
+        .expect("the Manifest");
+    let algorithms: Vec<&str> = manifest
+        .descendants()
+        .filter(|node| node.has_tag_name((DS, "Transform")))
+        .filter_map(|node| node.attribute("Algorithm"))
+        .collect();
     assert_eq!(
-        entries,
+        algorithms,
         [
-            ("detached.txt".to_owned(), DsigStatus::Valid),
-            ("second.txt".to_owned(), DsigStatus::Valid)
+            "http://www.w3.org/2000/09/xmldsig#enveloped-signature",
+            "http://www.w3.org/2001/10/xml-exc-c14n#",
+            "http://www.w3.org/2002/06/xmldsig-filter2",
+            "http://www.w3.org/2001/10/xml-exc-c14n#",
+        ],
+        "the generated canonicalization ends the Filter 2.0 chain"
+    );
+    assert_eq!(
+        manifest_statuses(&fixture, document.as_xml()),
+        [
+            (String::new(), DsigStatus::Valid),
+            ("#payload".to_owned(), DsigStatus::Valid)
         ]
     );
+}
+
+/// A `ds:Manifest` of detached data, built outside the signature, as DSS's
+/// external Manifest tests sign one.
+const SUPPLIED_MANIFEST: &str = concat!(
+    "<ds:Manifest xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\" Id=\"supplied\">",
+    "<ds:Reference Id=\"supplied-file\" URI=\"detached.txt\">",
+    "<ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>",
+    "<ds:DigestValue/></ds:Reference>",
+    "<ds:Reference Id=\"supplied-entry\" URI=\"#payload\">",
+    "<ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha512\"/>",
+    "<ds:DigestValue/></ds:Reference></ds:Manifest>"
+);
+
+#[test]
+fn a_supplied_manifest_is_signed_through_its_id() {
+    // XMLDSig 1.1 §5.1: a Manifest the caller built goes into an Object and
+    // the signature references its root's Id, typed as a Manifest; signing
+    // processing Manifests digests its references, which then verify.
+    let fixture = processing_manifests();
+    let objects = [DataObject::SuppliedManifest {
+        manifest: ObjectElement::parse(SUPPLIED_MANIFEST, &fixture.policy).expect("one element"),
+        // Each reference is a signed data object of its own (EN 319 132-1
+        // §6.3(k)) once the policies process the Manifest.
+        entries: vec![
+            SuppliedEntry {
+                id: "supplied-file",
+                mime_type: "text/plain",
+            },
+            SuppliedEntry {
+                id: "supplied-entry",
+                mime_type: "text/xml",
+            },
+        ],
+        transforms: vec![Transform::C14n(C14nAlgorithm::new(
+            C14nMode::Inclusive1_0,
+            false,
+        ))],
+        mime_type: "text/xml",
+    }];
+    let mut document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
+    let request = Request {
+        resources: Some(&fixture.resources),
+        ..request("sig", &objects)
+    };
+    fixture
+        .create(&mut document, request)
+        .expect("creation over a supplied Manifest");
+    assert!(fixture.meets_basic(document.as_xml(), "sig"), "B-B");
+    let created = parse(document.as_xml());
+    let signed = created
+        .descendants()
+        .find(|node| node.has_tag_name((DS, "Reference")))
+        .expect("the Manifest reference comes first");
+    assert_eq!(signed.attribute("URI"), Some("#supplied"));
+    assert_eq!(
+        signed.attribute("Type"),
+        Some("http://www.w3.org/2000/09/xmldsig#Manifest")
+    );
+    assert_eq!(
+        manifest_statuses(&fixture, document.as_xml()),
+        [
+            ("detached.txt".to_owned(), DsigStatus::Valid),
+            ("#payload".to_owned(), DsigStatus::Valid)
+        ]
+    );
+}
+
+#[test]
+fn a_supplied_manifest_needs_an_id_and_its_own_ids_free() {
+    // No reference can name a Manifest without an Id (XMLDSig 1.1 §5.1),
+    // and the IDs a supplied Manifest declares become the document's own,
+    // so neither may collide with one it already declares.
+    let fixture = processing_manifests();
+    let cases = [
+        (
+            SUPPLIED_MANIFEST.replace(" Id=\"supplied\"", ""),
+            DOCUMENT,
+            "no Id",
+        ),
+        (
+            "<Data xmlns=\"urn:x\" Id=\"x\"/>".to_owned(),
+            DOCUMENT,
+            "not a Manifest",
+        ),
+        (
+            SUPPLIED_MANIFEST.to_owned(),
+            "<Document><Data Id=\"payload\">x</Data><Item Id=\"supplied-entry\"/></Document>",
+            "taken entry Id",
+        ),
+        (SUPPLIED_MANIFEST.to_owned(), DOCUMENT, "unknown entry"),
+    ];
+    for (manifest, xml, case) in cases {
+        // A format for a reference the Manifest does not have names nothing.
+        let entries = match case {
+            "unknown entry" => vec![SuppliedEntry {
+                id: "elsewhere",
+                mime_type: "text/plain",
+            }],
+            _ => Vec::new(),
+        };
+        let objects = [DataObject::SuppliedManifest {
+            manifest: ObjectElement::parse(manifest, &fixture.policy).expect("one element"),
+            entries,
+            transforms: Vec::new(),
+            mime_type: "text/xml",
+        }];
+        let mut document = XmlDocument::parse(xml).expect("fixture parses");
+        let error = fixture
+            .create(&mut document, request("sig", &objects))
+            .expect_err(case);
+        match case {
+            "no Id" => assert!(matches!(error, CreateError::ManifestWithoutId), "{error}"),
+            "not a Manifest" => assert!(matches!(error, CreateError::NotManifest), "{error}"),
+            "unknown entry" => assert!(
+                matches!(error, CreateError::FormatReference(ref uri) if uri == "#elsewhere"),
+                "{error}"
+            ),
+            _ => assert!(
+                matches!(error, CreateError::IdInUse(ref id) if id == "supplied-entry"),
+                "{error}"
+            ),
+        }
+        assert_eq!(document.as_xml(), xml, "{case}: nothing published");
+    }
 }
 
 #[test]
@@ -1143,11 +1351,13 @@ fn a_request_beyond_the_reference_limit_is_refused_before_its_ids() {
     fixture.policy.resources.max_references = 2;
     let entry = |uri| ManifestEntry {
         uri,
+        transforms: Vec::new(),
         mime_type: "text/plain",
     };
     let objects = [DataObject::Manifest {
         id: "manifest",
         entries: vec![entry("a.txt"), entry("b.txt"), entry("c.txt")],
+        transforms: Vec::new(),
         mime_type: "text/xml",
     }];
     let mut document = XmlDocument::parse(TAKEN).expect("fixture parses");
