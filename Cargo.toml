@@ -239,6 +239,10 @@ name = "signing_digest"
 required-features = ["xmldsig-sign", "c14n"]
 
 [[test]]
+name = "manifest_builder"
+required-features = ["xmldsig-sign", "c14n"]
+
+[[test]]
 name = "signature_pipeline_integration"
 required-features = ["xmldsig"]
 
