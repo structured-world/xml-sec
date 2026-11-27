@@ -22,7 +22,7 @@ use xml_sec::xmldsig::{
 use xml_sec_xades::properties::Properties;
 use xml_sec_xades::{
     Assessment, Countersignature, DataObject, Envelope, ManifestEntry, Placement, Prefixes,
-    Request, Signer, countersign, create,
+    Request, Signer, SuppliedEntry, countersign, create,
 };
 
 /// The payload carries a comment, which only the `reference-comments` case signs.
@@ -31,7 +31,8 @@ const DOCUMENT: &str =
 const DETACHED: &[u8] = b"Detached payload\n";
 const SECOND_DETACHED: &[u8] = b"Second detached payload\n";
 /// Detached XML a reference canonicalizes, as DSS's detached transform tests do.
-const DETACHED_XML: &[u8] = b"<Detached xmlns=\"urn:detached\"><Item>Payload</Item></Detached>";
+const DETACHED_XML: &[u8] =
+    b"<Detached xmlns=\"urn:detached\"><Item Id=\"item\">Payload</Item><Other/></Detached>";
 const TIME: &str = "2026-10-18T12:00:00Z";
 
 fn read(directory: &Path, name: &str) -> Result<Vec<u8>, String> {
@@ -211,6 +212,7 @@ fn cases(element: ObjectElement) -> Vec<(&'static str, Signatures)> {
     .into_iter()
     .chain(composed_references())
     .chain(shaped())
+    .chain(custom_manifests())
     .collect()
 }
 
@@ -253,41 +255,18 @@ fn shaped() -> Vec<(&'static str, Signatures)> {
         ),
         (
             "manifest",
-            one(vec![DataObject::Manifest {
-                id: "manifest",
-                entries: vec![
-                    ManifestEntry {
-                        uri: "detached.txt",
-                        mime_type: "text/plain",
-                    },
-                    ManifestEntry {
-                        uri: "detached-2.txt",
-                        mime_type: "text/plain",
-                    },
-                ],
-                mime_type: "text/xml",
-            }]),
+            one(vec![manifest(
+                "manifest",
+                vec![file("detached.txt"), file("detached-2.txt")],
+                Vec::new(),
+            )]),
         ),
         // Two Manifests in one signature, each listing one file.
         (
             "manifest-multiple",
             one(vec![
-                DataObject::Manifest {
-                    id: "manifest-1",
-                    entries: vec![ManifestEntry {
-                        uri: "detached.txt",
-                        mime_type: "text/plain",
-                    }],
-                    mime_type: "text/xml",
-                },
-                DataObject::Manifest {
-                    id: "manifest-2",
-                    entries: vec![ManifestEntry {
-                        uri: "detached-2.txt",
-                        mime_type: "text/plain",
-                    }],
-                    mime_type: "text/xml",
-                },
+                manifest("manifest-1", vec![file("detached.txt")], Vec::new()),
+                manifest("manifest-2", vec![file("detached-2.txt")], Vec::new()),
             ]),
         ),
         (
@@ -298,6 +277,76 @@ fn shaped() -> Vec<(&'static str, Signatures)> {
                     mime_type: "text/xml",
                 },
             ]),
+        ),
+    ]
+}
+
+/// One signature per Manifest the caller shapes: entries with transforms,
+/// and a Manifest built outside the signature.
+fn custom_manifests() -> Vec<(&'static str, Signatures)> {
+    let one = |objects| vec![("sig", objects)];
+    vec![
+        // Entries with transforms of their own, as DSS's custom Manifest
+        // references: the document without the signature, an XPath and a
+        // Filter 2.0 selection of detached XML; the reference to the
+        // Manifest canonicalizes it exclusively.
+        (
+            "manifest-transforms",
+            one(vec![manifest(
+                "manifest",
+                vec![
+                    ManifestEntry {
+                        uri: "",
+                        transforms: vec![Transform::Enveloped, exclusive()],
+                        mime_type: "text/xml",
+                    },
+                    ManifestEntry {
+                        uri: "detached-data.xml",
+                        // Attribute predicates, as DSS's own, read no value
+                        // the signing operation fills.
+                        transforms: vec![Transform::XPath(XPathExpression::new(
+                            "ancestor-or-self::*[@Id='item']",
+                        ))],
+                        mime_type: "text/xml",
+                    },
+                    ManifestEntry {
+                        uri: "detached-data.xml",
+                        transforms: vec![
+                            Transform::XPathFilter2(vec![XPathFilter::new(
+                                XPathFilterOperation::Intersect,
+                                XPathExpression::new("//*[@Id='item']"),
+                            )]),
+                            exclusive(),
+                        ],
+                        mime_type: "text/xml",
+                    },
+                ],
+                vec![exclusive()],
+            )]),
+        ),
+        // A Manifest built outside the signature, as DSS's external Manifest
+        // signs one, with the reference to it canonicalized by C14N 1.1.
+        (
+            "manifest-supplied",
+            one(vec![DataObject::SuppliedManifest {
+                manifest: ObjectElement::parse(SUPPLIED_MANIFEST, &SigningPolicy::default())
+                    .expect("the supplied Manifest is one element"),
+                entries: vec![
+                    SuppliedEntry {
+                        id: "supplied-file",
+                        mime_type: "text/plain",
+                    },
+                    SuppliedEntry {
+                        id: "supplied-xml",
+                        mime_type: "text/xml",
+                    },
+                ],
+                transforms: vec![Transform::C14n(C14nAlgorithm::new(
+                    C14nMode::Inclusive1_1,
+                    false,
+                ))],
+                mime_type: "text/xml",
+            }]),
         ),
     ]
 }
@@ -371,6 +420,42 @@ fn composed_references() -> Vec<(&'static str, Signatures)> {
 const DS: &str = "http://www.w3.org/2000/09/xmldsig#";
 /// Signs the text of the payload, as DSS's XSLT test does with its own sheet.
 const STYLESHEET: &str = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="."/></xsl:template></xsl:stylesheet>"#;
+
+/// A Manifest of two detached files, built outside the signature; signing
+/// processing Manifests fills its digests.
+const SUPPLIED_MANIFEST: &str = concat!(
+    "<ds:Manifest xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\" Id=\"supplied\">",
+    "<ds:Reference Id=\"supplied-file\" URI=\"detached.txt\">",
+    "<ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>",
+    "<ds:DigestValue/></ds:Reference>",
+    "<ds:Reference Id=\"supplied-xml\" URI=\"detached-data.xml\">",
+    "<ds:Transforms><ds:Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>",
+    "</ds:Transforms>",
+    "<ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha512\"/>",
+    "<ds:DigestValue/></ds:Reference></ds:Manifest>"
+);
+
+/// A Manifest entry naming a detached text file, digested as it is.
+fn file(uri: &'static str) -> ManifestEntry<'static> {
+    ManifestEntry {
+        uri,
+        transforms: Vec::new(),
+        mime_type: "text/plain",
+    }
+}
+
+fn manifest(
+    id: &'static str,
+    entries: Vec<ManifestEntry<'static>>,
+    transforms: Vec<Transform>,
+) -> DataObject<'static> {
+    DataObject::Manifest {
+        id,
+        entries,
+        transforms,
+        mime_type: "text/xml",
+    }
+}
 
 fn exclusive() -> Transform {
     Transform::C14n(C14nAlgorithm::new(C14nMode::Exclusive1_0, false))
