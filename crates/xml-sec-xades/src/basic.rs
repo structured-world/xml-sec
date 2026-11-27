@@ -385,7 +385,9 @@ pub(crate) enum Vocabulary {
     /// EN 319 132-1 baseline signatures, which hold no validation references.
     Baseline,
     /// Also the TS 101 903 C, X, XL and A properties in the EN 319 132-1
-    /// Annex A names (`CompleteCertificateRefsV2`, `SigAndRefsTimeStampV2`).
+    /// Annex A names (`CompleteCertificateRefsV2`, `SigAndRefsTimeStampV2`),
+    /// which only the augmentation that writes them reads.
+    #[cfg(feature = "produce")]
     ExtendedV2,
 }
 
@@ -401,6 +403,7 @@ impl Vocabulary {
     ) -> Result<prepare::Preparation<NodeIdentity, DocumentIdentity, u64>, ValidationError> {
         match self {
             Self::Baseline => prepare::prepare(access, signature, requirements, enclosing),
+            #[cfg(feature = "produce")]
             Self::ExtendedV2 => {
                 prepare::prepare_extended_v2(access, signature, requirements, enclosing)
             }

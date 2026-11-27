@@ -122,8 +122,10 @@ where
 
 /// The visitor that reads whether every requirement holds, in either
 /// vocabulary.
+#[cfg(feature = "produce")]
 pub(crate) struct Met;
 
+#[cfg(feature = "produce")]
 impl<W: Work> Visit<W> for Met {
     type Output = bool;
 
@@ -1354,12 +1356,14 @@ impl ExtendedLevel {
     }
 
     /// The structural requirements assessed.
+    #[cfg(feature = "produce")]
     #[must_use]
     pub fn requested(self) -> Requirements {
         self.requested
     }
 
     /// Every stage predicate of the requested requirements holds.
+    #[cfg(feature = "produce")]
     #[must_use]
     pub fn all_requirements_met(self) -> bool {
         self.met
