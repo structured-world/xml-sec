@@ -505,6 +505,31 @@ fn a_historical_timestamp_without_a_trusted_tsa_path_is_not_published() {
 }
 
 #[test]
+fn a_historical_countersignature_is_refused() {
+    // The historical profiles carry no countersignature this library writes:
+    // asking for one is refused before anything is published, rather than
+    // writing an EN 319 132-1 countersignature the caller did not ask for.
+    let fixture = Fixture::historical();
+    let mut document = fixture.signed(Properties::default()).expect("B-B");
+    let before = document.as_xml().to_owned();
+    for profile in [Profile::PreEn, Profile::V111, Profile::V122] {
+        let refused = fixture.countersign_in(
+            &mut document,
+            "sig",
+            Properties {
+                historical: Some(profile),
+                ..Properties::default()
+            },
+        );
+        assert!(
+            matches!(refused, Err(CreateError::HistoricalProperty)),
+            "{profile:?}: {refused:?}"
+        );
+        assert_eq!(document.as_xml(), before, "{profile:?}: nothing published");
+    }
+}
+
+#[test]
 fn a_historical_vocabulary_needs_a_policy_that_reads_it() {
     // The operation's XadesSyntax, not the caller's argument alone, decides
     // which vocabularies are read: under EN 319 132-1 only, creating a
