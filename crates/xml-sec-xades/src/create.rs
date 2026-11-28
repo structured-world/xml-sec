@@ -1638,9 +1638,21 @@ fn signed_properties<W: Work>(
 
 /// Refuse every optional property a historical profile does not carry here:
 /// it signs a signature policy beside the signing certificate, and nothing
-/// else (`content` for content timestamps or a countersignature).
+/// else (`content` for content timestamps or a countersignature). Nor does
+/// TS 101 903 know a policy digested as its specification defines, or the
+/// specification qualifier: EN 319 132-1 §5.2.9.2 introduced both, so a rule
+/// the caller supplies for them has nothing to apply to.
 fn refuse_beyond_policy(properties: &Properties<'_>, content: bool) -> Result<(), CreateError> {
-    let beyond = properties.policy_store.is_some()
+    let specified_only = matches!(
+        properties.policy,
+        Some(Policy::Document(SignaturePolicy::Explicit(ref explicit)))
+            if matches!(explicit.transform, produce::PolicyTransform::InSpecification(_))
+                || explicit.qualifiers.iter().any(|qualifier| {
+                    matches!(qualifier, produce::PolicyQualifier::DocumentSpecification(_))
+                })
+    );
+    let beyond = specified_only
+        || properties.policy_store.is_some()
         || properties.production_place.is_some()
         || properties.signer_role.is_some()
         || !properties.commitments.is_empty()
@@ -1692,6 +1704,8 @@ fn historical_properties<W: Work>(
         provider: signer.provider,
         policy: signer.policy,
         bound: Bound::None,
+        // A specified digest rule serves only the EN 319 132-1 policy
+        // transform, which `refuse_beyond_policy` refuses for these profiles.
         specified: None,
         content: None,
     };
