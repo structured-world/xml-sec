@@ -12,6 +12,7 @@
 
 use crate::accuracy::{self, AuthorityAccuracy};
 use crate::augment::{TokenFacts, authority};
+use crate::create::ManifestReference;
 use crate::level::{read_certificates, unrecognized};
 use crate::properties::{PropertyDraft, PropertyError};
 use alloc::{boxed::Box, string::String, vec::Vec};
@@ -213,7 +214,7 @@ impl<'l> Replayed<'l> {
     pub(crate) fn new(
         inputs: SigningInputs,
         data: &'l [String],
-        manifest: &'l [(String, &str)],
+        manifest: &'l [ManifestReference<'_>],
         signer: (&C14nAlgorithm, &SigningPolicy),
     ) -> Result<Self, ContentError> {
         let SigningInputs {
@@ -240,9 +241,11 @@ impl<'l> Replayed<'l> {
         let manifest = manifest
             .iter()
             .enumerate()
-            .map(|(index, (uri, _))| ContentReference {
+            // A supplied Manifest's reference without an Id has no URI an
+            // individual timestamp could include.
+            .map(|(index, entry)| ContentReference {
                 node: data.len() + 1 + index,
-                include_uri: Some(uri.as_str()),
+                include_uri: entry.uri.as_deref(),
                 signed_properties: false,
             })
             .collect();

@@ -46,7 +46,7 @@ const fn created(name: &'static str, signatures: usize) -> Case {
     }
 }
 
-pub(crate) const CASES: [Case; 47] = [
+pub(crate) const CASES: [Case; 49] = [
     created("enveloped", 1),
     created("enveloping", 1),
     created("internally-detached", 1),
@@ -66,6 +66,8 @@ pub(crate) const CASES: [Case; 47] = [
     created("signed-key-info", 1),
     created("manifest", 1),
     created("manifest-multiple", 1),
+    created("manifest-transforms", 1),
+    created("manifest-supplied", 1),
     // References the caller composes (`DataObject::Reference`).
     created("reference-filter2", 1),
     created("reference-xpath", 1),
@@ -212,7 +214,8 @@ fn detached_files(name: &str) -> &'static [&'static str] {
         "detached-multiple" | "manifest" | "manifest-multiple" => {
             &["detached.txt", "detached-2.txt"]
         }
-        "reference-detached-xml" => &["detached-data.xml"],
+        "reference-detached-xml" | "manifest-transforms" => &["detached-data.xml"],
+        "manifest-supplied" => &["detached.txt", "detached-data.xml"],
         _ => &[],
     }
 }
@@ -377,6 +380,15 @@ fn expected_properties(name: &str) -> &'static [Expect] {
         // Both signed Manifests, each with its own entry.
         "manifest-multiple" => &[
             Counted("DigestMatcher", "type", "MANIFEST", 2),
+            Counted("DigestMatcher", "type", "MANIFEST_ENTRY", 2),
+        ],
+        // DSS finds every Manifest entry, each after its own transforms.
+        "manifest-transforms" => &[
+            Counted("DigestMatcher", "type", "MANIFEST", 1),
+            Counted("DigestMatcher", "type", "MANIFEST_ENTRY", 3),
+        ],
+        "manifest-supplied" => &[
+            Counted("DigestMatcher", "type", "MANIFEST", 1),
             Counted("DigestMatcher", "type", "MANIFEST_ENTRY", 2),
         ],
         // Both generations of both CAs' CRLs are incorporated.

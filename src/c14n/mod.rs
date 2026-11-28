@@ -330,6 +330,43 @@ impl NodeVisibility for SubtreeVisibility<'_, '_> {
     }
 }
 
+/// One element's subtree without the subtrees of some of its descendants.
+#[cfg(feature = "xmldsig")]
+pub(crate) struct PrunedSubtreeVisibility<'a, 'input> {
+    pub(crate) apex: Node<'a, 'input>,
+    pub(crate) excluded: &'a [Node<'a, 'input>],
+}
+
+#[cfg(feature = "xmldsig")]
+impl NodeVisibility for PrunedSubtreeVisibility<'_, '_> {
+    fn contains_node(&self, node: Node<'_, '_>) -> Result<bool, C14nError> {
+        let id = node.id();
+        Ok(self.apex.subtree_contains_id(id)
+            && !self
+                .excluded
+                .iter()
+                .any(|excluded| excluded.subtree_contains_id(id)))
+    }
+
+    fn contains_attribute(
+        &self,
+        owner: Node<'_, '_>,
+        _namespace: Option<&str>,
+        _local_name: &str,
+    ) -> Result<bool, C14nError> {
+        self.contains_node(owner)
+    }
+
+    fn contains_namespace(
+        &self,
+        owner: Node<'_, '_>,
+        _prefix: &str,
+        _uri: &str,
+    ) -> Result<bool, C14nError> {
+        self.contains_node(owner)
+    }
+}
+
 /// Canonicalize an XML document or document subset.
 ///
 /// - `doc`: parsed backend-neutral semantic document (read-only DOM).

@@ -52,11 +52,68 @@ impl<W: Work> VerifiedSession<'_, '_, '_, W> {
         work: &Q,
         receiver: &mut impl FnMut(&[u8]) -> Result<(), E>,
     ) -> Result<(), ReplayError<E>> {
+        self.canonicalize_element_without(element, &[], method, work, receiver)
+    }
+
+    /// [`Self::canonicalize_element`] with the subtrees of the `excluded`
+    /// descendant elements left out, as RFC 6283 §4.2.2 hash-tree renewal
+    /// canonicalizes an `ArchiveTimeStampSequence` with only its earlier
+    /// chains. The selection is a document subset (C14N 1.0 §2.1), so the
+    /// remaining nodes keep their document order.
+    ///
+    /// # Errors
+    /// As [`Self::canonicalize_element`], and a processing error for an
+    /// excluded identity that is not a descendant element of `element`.
+    pub fn canonicalize_element_without<Q: Work, E>(
+        &self,
+        element: NodeIdentity,
+        excluded: &[NodeIdentity],
+        method: NodeIdentity,
+        work: &Q,
+        receiver: &mut impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), ReplayError<E>> {
         let processing = ReplayError::Processing;
         work.charge_work(1)
             .map_err(|error| processing(error.into()))?;
         let allowed = self.context.policy.transforms.allowed_algorithms.as_ref();
         let (algorithm, prefixes) = self.timestamp_method(method, allowed, work)?;
+        self.canonicalize_subset(element, excluded, &algorithm, prefixes, work, receiver)
+    }
+
+    /// The canonical form of `element`'s whole subtree under `algorithm`,
+    /// for an input whose canonicalization no element names, such as a
+    /// TS 101 903 V1.2.2 timestamp without `CanonicalizationMethod`, which
+    /// uses the `XMLDSig` default (§7.1.4). The algorithm passes the
+    /// operation's transform permission.
+    ///
+    /// # Errors
+    /// As [`Self::canonicalize_element`].
+    pub fn canonicalize_element_as<Q: Work, E>(
+        &self,
+        element: NodeIdentity,
+        algorithm: &crate::c14n::C14nAlgorithm,
+        work: &Q,
+        receiver: &mut impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), ReplayError<E>> {
+        let processing = ReplayError::Processing;
+        work.charge_work(1)
+            .map_err(|error| processing(error.into()))?;
+        let allowed = self.context.policy.transforms.allowed_algorithms.as_ref();
+        enforce_current_transform_allowed(allowed, algorithm.uri(), work).map_err(processing)?;
+        self.canonicalize_subset(element, &[], algorithm, None, work, receiver)
+    }
+
+    /// The canonical form of `element` without the `excluded` subtrees.
+    fn canonicalize_subset<Q: Work, E>(
+        &self,
+        element: NodeIdentity,
+        excluded: &[NodeIdentity],
+        algorithm: &crate::c14n::C14nAlgorithm,
+        prefixes: Option<&str>,
+        work: &Q,
+        receiver: &mut impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), ReplayError<E>> {
+        let processing = ReplayError::Processing;
         let node = self
             .view
             .resolve_node(element)
@@ -66,6 +123,45 @@ impl<W: Work> VerifiedSession<'_, '_, '_, W> {
                 reason: "canonicalization input is not an element",
             }));
         }
+        let mut pruned = work.vector();
+        if !excluded.is_empty() {
+            // Each visited node is tested against every excluded subtree.
+            (self.view.node_count() as u64)
+                .checked_mul(excluded.len() as u64)
+                .ok_or(structured_asn1::memory::MemoryError::WorkExceeded)
+                .and_then(|tests| work.charge_work(tests))
+                .map_err(|error| processing(error.into()))?;
+            pruned
+                .try_reserve_exact(excluded.len())
+                .map_err(|error| processing(error.into()))?;
+            for identity in excluded {
+                let child = self
+                    .view
+                    .resolve_node(*identity)
+                    .map_err(|error| processing(error.into()))?;
+                if !child.is_element()
+                    || child.id() == node.id()
+                    || !node.subtree_contains_id(child.id())
+                {
+                    return Err(processing(DsigError::InvalidRequest {
+                        reason: "an excluded node is not a descendant element of the input",
+                    }));
+                }
+                pruned
+                    .try_push(child)
+                    .map_err(|error| processing(error.into()))?;
+            }
+        }
+        let subtree = crate::c14n::SubtreeVisibility { apex: node };
+        let without = crate::c14n::PrunedSubtreeVisibility {
+            apex: node,
+            excluded: &pruned,
+        };
+        let visibility: &dyn crate::c14n::NodeVisibility<_> = if pruned.is_empty() {
+            &subtree
+        } else {
+            &without
+        };
         let budget = &self.budgets.transforms;
         let mut output = ReplayWriter {
             work,
@@ -76,8 +172,8 @@ impl<W: Work> VerifiedSession<'_, '_, '_, W> {
         };
         let result = crate::c14n::canonicalize_visible_to_writer_accounted(
             node.document(),
-            Some(&crate::c14n::SubtreeVisibility { apex: node }),
-            &algorithm,
+            Some(visibility),
+            algorithm,
             super::super::super::transforms::replay_output_limit(budget),
             budget.xml_base_resolution(),
             &mut output,
