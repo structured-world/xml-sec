@@ -47,6 +47,34 @@ pub(crate) fn account() -> Memory {
     Memory::new(Arc::new(MemoryAccount::new(1 << 26, 1 << 31)))
 }
 
+/// Add the enveloped signature `id` with `properties` to `document`.
+fn create_in(
+    document: &mut XmlDocument,
+    signer: &Signer<'_>,
+    id: &str,
+    properties: Properties<'_>,
+    assessment: &Assessment<'_, '_>,
+) -> Result<(), CreateError> {
+    create(
+        document,
+        signer,
+        Request {
+            id,
+            signing_time: TIME,
+            objects: vec![DataObject::Document {
+                mime_type: "text/xml",
+                envelope: Envelope::Enveloped,
+            }],
+            placement: xml_sec_xades::Placement::DocumentEnd,
+            resources: None,
+            id_attributes: &[],
+            properties,
+        },
+        assessment,
+        &account(),
+    )
+}
+
 pub(crate) struct Fixture {
     key: RsaSigningKey,
     signing: SigningPolicy,
@@ -130,6 +158,15 @@ impl Fixture {
     }
 
     pub(crate) fn with_assessment<R>(&self, operation: impl FnOnce(&Assessment<'_, '_>) -> R) -> R {
+        self.with_assessment_certificates(&[ROOT], operation)
+    }
+
+    /// [`Self::with_assessment`] whose assessment carries `certificates`.
+    pub(crate) fn with_assessment_certificates<R>(
+        &self,
+        certificates: &[&[u8]],
+        operation: impl FnOnce(&Assessment<'_, '_>) -> R,
+    ) -> R {
         let context = VerifyContext::new()
             .policy(self.verification.clone())
             .key_resolver(&self.resolver);
@@ -137,7 +174,7 @@ impl Fixture {
         operation(&Assessment {
             context: &context,
             request: &request,
-            certificates: &[ROOT],
+            certificates,
         })
     }
 
@@ -174,24 +211,7 @@ impl Fixture {
     ) -> Result<(), CreateError> {
         self.with_signer(|signer| {
             self.with_assessment(|assessment| {
-                create(
-                    document,
-                    signer,
-                    Request {
-                        id,
-                        signing_time: TIME,
-                        objects: vec![DataObject::Document {
-                            mime_type: "text/xml",
-                            envelope: Envelope::Enveloped,
-                        }],
-                        placement: xml_sec_xades::Placement::DocumentEnd,
-                        resources: None,
-                        id_attributes: &[],
-                        properties,
-                    },
-                    assessment,
-                    &account(),
-                )
+                create_in(document, signer, id, properties, assessment)
             })
         })
     }

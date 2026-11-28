@@ -30,7 +30,7 @@ use structured_xades::produce::{
 };
 use structured_xades::unsigned::Requirements;
 use structured_xades::xml::{Access, Name, Xml as _};
-use xml_sec::document::{NodeIdentity, XmlDocument};
+use xml_sec::document::{DocumentView, NodeIdentity, XmlDocument};
 use xml_sec::xmldsig::DigestAlgorithm;
 use xml_sec::xmldsig::VerificationRequest;
 use xml_sec::xmldsig::{ReplayError, VerifiedSession, with_verified_request};
@@ -246,17 +246,21 @@ pub fn add_historical_values<W: Work>(
     // What the generation lacks, read in that generation: a node identity
     // names one generation only.
     let plan = |document: &XmlDocument, request: &VerificationRequest<'_>| {
-        let (unsigned, archived) = document.with_view(|view| {
+        let (unsigned, held, archived) = document.with_view(|view| {
             let unsigned =
                 placement::locate_in(view, data.signature, data.id_attributes, namespace, work)?
                     .unsigned;
-            Ok::<_, AugmentError>((unsigned, archived(view, unsigned, namespace, work)?))
+            Ok::<_, AugmentError>((
+                unsigned,
+                Held::of(view, unsigned, profile, work)?,
+                archived(view, unsigned, namespace, work)?,
+            ))
         })?;
         with_verified_request(document, assessment.context, request, work, |session| {
             Ok(
                 selected(document, &session, data.signature, data.id_attributes).and_then(|node| {
                     match with_historical_census(&session, node, profile, &inputs, |census| {
-                        missing_values(census, unsigned, profile, archived)
+                        missing_values(census, unsigned, held, profile, archived)
                     })? {
                         Outcome::Assessed(plan) => plan,
                         outcome => Err(AugmentError::Unmet(outcome.map(|_| ()))),
@@ -271,15 +275,15 @@ pub fn add_historical_values<W: Work>(
     }
     document.transaction(|document| {
         loop {
-            step.apply(document, namespace, work)?;
+            step.apply(document, data, namespace, work)?;
             let carried = Carried::new::<_, AugmentError>(document, assessment.request, work)?;
             let next = plan(document, &carried.request(assessment.request))?;
             if next.is_empty() {
                 break;
             }
-            // Each step adds what the census lacked; the same lack again
-            // means the census does not count the added copy.
-            if next == step {
+            // Each step adds what the census lacked; the same material
+            // drafted again means the census does not count the added copy.
+            if next.drafts_same(&step) {
                 return Err(AugmentError::Unmet(Outcome::Assessed(())));
             }
             work.charge_work(1)?;
@@ -321,10 +325,9 @@ fn archived<W: Work>(
 /// One step of [`add_historical_values`]: the values properties the census
 /// found missing, else the first timestamp whose TSA material is missing and
 /// the `TimeStampValidationData` that follows it.
-#[derive(PartialEq, Eq)]
 struct ValuesStep {
     unsigned: Unsigned,
-    values: Vec<String>,
+    values: Vec<(String, Join)>,
     timestamp: Option<(NodeIdentity, String)>,
 }
 
@@ -333,18 +336,26 @@ impl ValuesStep {
         self.values.is_empty() && self.timestamp.is_none()
     }
 
-    /// Insert the values, or else the timestamp's validation data right
-    /// after its property: one insertion, one new generation.
+    /// Whether `other` drafts the same material. Node identities name one
+    /// generation only, so each insertion changes them; the drafted markup
+    /// does not, and the same markup twice is the same lack again.
+    fn drafts_same(&self, other: &Self) -> bool {
+        self.values == other.values
+            && self.timestamp.as_ref().map(|(_, data)| data)
+                == other.timestamp.as_ref().map(|(_, data)| data)
+    }
+
+    /// Insert the values where they join the signature, or else the
+    /// timestamp's validation data right after its property.
     fn apply<W: Work>(
         &self,
         document: &mut XmlDocument,
+        data: &ValidationData<'_, '_>,
         namespace: &str,
         work: &W,
     ) -> Result<(), AugmentError> {
         if !self.values.is_empty() {
-            return Ok(self
-                .unsigned
-                .insert_in(document, &self.values.concat(), namespace)?);
+            return insert_values(document, data, namespace, &self.values, work);
         }
         let (Some((property, data)), Some(parent)) =
             (&self.timestamp, self.unsigned.signature_properties())
@@ -526,15 +537,287 @@ fn census_material<'r, W: Work>(
     })
 }
 
+/// The values containers a signature already holds. TS 101 903 V1.1.1 §7.6
+/// allows one `CertificateValues` and one `RevocationValues`, in that order,
+/// each `RevocationValues` holding `CRLValues`, `OCSPValues` and
+/// `OtherValues` in turn; new values of a V1.1.1 signature join those
+/// containers. The later vocabularies repeat them, so nothing is held there.
+#[derive(Clone, Copy, Default)]
+struct Held {
+    certificates: bool,
+    revocation: Option<HeldRevocation>,
+}
+
+/// The containers a held `RevocationValues` holds.
+#[derive(Clone, Copy)]
+struct HeldRevocation {
+    crls: bool,
+    ocsps: bool,
+}
+
+impl Held {
+    /// The containers of `profile` the `unsigned` properties hold.
+    fn of<W: Work>(
+        view: DocumentView<'_>,
+        unsigned: Unsigned,
+        profile: Profile,
+        work: &W,
+    ) -> Result<Self, PlacementError> {
+        let Some(properties) = unsigned.signature_properties() else {
+            return Ok(Self::default());
+        };
+        if profile != Profile::V111 {
+            return Ok(Self::default());
+        }
+        let namespace = profile.namespace();
+        let held = |parent, local| {
+            Ok::<_, PlacementError>(
+                placement::child(view, parent, namespace, local, work)?.is_some(),
+            )
+        };
+        let revocation =
+            match placement::child(view, properties, namespace, "RevocationValues", work)? {
+                Some(revocation) => Some(HeldRevocation {
+                    crls: held(revocation, "CRLValues")?,
+                    ocsps: held(revocation, "OCSPValues")?,
+                }),
+                None => None,
+            };
+        Ok(Self {
+            certificates: held(properties, "CertificateValues")?,
+            revocation,
+        })
+    }
+}
+
+/// Where a drafted piece of values joins the signature.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Join {
+    /// A new property after the unsigned signature properties.
+    Property,
+    /// A new `CertificateValues` before the held `RevocationValues`.
+    BeforeRevocation,
+    /// Into the held `CertificateValues`.
+    Certificates,
+    /// A new `CRLValues`, the first child of the held `RevocationValues`.
+    FirstInRevocation,
+    /// A new `OCSPValues`, before the held `OtherValues` or last.
+    AfterCrls,
+    /// Into the held `CRLValues`.
+    Crls,
+    /// Into the held `OCSPValues`.
+    Ocsps,
+}
+
+/// One output of [`Split`]: the elements at least `skip` levels below the
+/// values containers, as siblings.
+struct Part {
+    draft: Draft,
+    skip: usize,
+    join: Join,
+    used: bool,
+}
+
+impl Part {
+    fn new(skip: usize, join: Join) -> Self {
+        Self {
+            draft: Draft::siblings(),
+            skip,
+            join,
+            used: false,
+        }
+    }
+
+    fn finish(self) -> Result<Option<(String, Join)>, AugmentError> {
+        if !self.used {
+            return Ok(None);
+        }
+        Ok(Some((self.draft.finish_siblings()?.concat(), self.join)))
+    }
+}
+
+/// The values written once, routed to the containers the signature holds:
+/// a held container receives only the elements below it, a missing one is
+/// written whole.
+struct Split {
+    path: Vec<&'static str>,
+    certificates: Part,
+    revocation: Revocation,
+}
+
+/// Where the revocation values go.
+enum Revocation {
+    /// A new `RevocationValues`.
+    Whole(Part),
+    /// Into the held one: its CRLs and its OCSP responses.
+    Held { crls: Part, ocsps: Part },
+}
+
+impl Split {
+    fn new(held: Held) -> Self {
+        let certificates = match (held.certificates, held.revocation.is_some()) {
+            (true, _) => Part::new(1, Join::Certificates),
+            (false, true) => Part::new(0, Join::BeforeRevocation),
+            (false, false) => Part::new(0, Join::Property),
+        };
+        let nested = |held, into, new| {
+            if held {
+                Part::new(2, into)
+            } else {
+                Part::new(1, new)
+            }
+        };
+        let revocation = match held.revocation {
+            None => Revocation::Whole(Part::new(0, Join::Property)),
+            Some(revocation) => Revocation::Held {
+                crls: nested(revocation.crls, Join::Crls, Join::FirstInRevocation),
+                ocsps: nested(revocation.ocsps, Join::Ocsps, Join::AfterCrls),
+            },
+        };
+        Self {
+            path: Vec::new(),
+            certificates,
+            revocation,
+        }
+    }
+
+    /// The part the current element belongs to, if it is written at all.
+    fn part(&mut self) -> Option<&mut Part> {
+        let part = match (self.path.first().copied(), self.path.get(1).copied()) {
+            (Some("CertificateValues" | "AttrAuthoritiesCertValues"), _) => &mut self.certificates,
+            (Some(_), second) => match (&mut self.revocation, second) {
+                (Revocation::Whole(whole), _) => whole,
+                (Revocation::Held { crls, .. }, Some("CRLValues")) => crls,
+                (Revocation::Held { ocsps, .. }, Some("OCSPValues")) => ocsps,
+                (Revocation::Held { .. }, _) => return None,
+            },
+            (None, _) => return None,
+        };
+        (self.path.len() > part.skip).then_some(part)
+    }
+
+    fn forward<Q: Work>(&mut self, event: Event<'_>, work: &Q) -> Result<(), StagingError> {
+        if let Some(part) = self.part() {
+            part.used = true;
+            part.draft.write(event, work).map_err(StagingError::Draft)?;
+        }
+        Ok(())
+    }
+
+    /// The pieces in insertion order.
+    fn finish(self) -> Result<Vec<(String, Join)>, AugmentError> {
+        let mut pieces = Vec::new();
+        pieces.extend(self.certificates.finish()?);
+        match self.revocation {
+            Revocation::Whole(whole) => pieces.extend(whole.finish()?),
+            Revocation::Held { crls, ocsps } => {
+                pieces.extend(crls.finish()?);
+                pieces.extend(ocsps.finish()?);
+            }
+        }
+        Ok(pieces)
+    }
+}
+
+impl Writer for Split {
+    type Error = StagingError;
+
+    fn write<Q: Work>(&mut self, event: Event<'_>, work: &Q) -> Result<(), StagingError> {
+        match event {
+            Event::Begin(name) => {
+                self.path.push(name.local);
+                self.forward(event, work)
+            }
+            Event::End => {
+                self.forward(event, work)?;
+                self.path.pop();
+                Ok(())
+            }
+            Event::Attribute(..) | Event::Text(_) | Event::Binary(_) => self.forward(event, work),
+        }
+    }
+}
+
+/// Insert `pieces` into `signature`, each where its [`Join`] says; the new
+/// properties go in one insertion after the existing ones.
+fn insert_values<W: Work>(
+    document: &mut XmlDocument,
+    data: &ValidationData<'_, '_>,
+    namespace: &str,
+    pieces: &[(String, Join)],
+    work: &W,
+) -> Result<(), AugmentError> {
+    let mut properties = String::new();
+    for (markup, join) in pieces {
+        if *join == Join::Property {
+            properties.push_str(markup);
+            continue;
+        }
+        // One insertion per generation: each target is located afresh.
+        let (node, before) = document.with_view(|view| {
+            let located =
+                placement::locate_in(view, data.signature, data.id_attributes, namespace, work)?;
+            let held = || AugmentError::Construction(structured_xades::produce::Error::Foreign);
+            let properties = located.unsigned.signature_properties().ok_or_else(held)?;
+            let child = |parent, local| {
+                placement::child(view, parent, namespace, local, work)?.ok_or_else(held)
+            };
+            Ok::<_, AugmentError>(match join {
+                Join::Certificates => (child(properties, "CertificateValues")?, false),
+                Join::BeforeRevocation => (child(properties, "RevocationValues")?, true),
+                Join::Crls => (
+                    child(child(properties, "RevocationValues")?, "CRLValues")?,
+                    false,
+                ),
+                Join::Ocsps => (
+                    child(child(properties, "RevocationValues")?, "OCSPValues")?,
+                    false,
+                ),
+                Join::FirstInRevocation => {
+                    let revocation = child(properties, "RevocationValues")?;
+                    let mut first = None;
+                    for node in placement::children(view, revocation, work)? {
+                        if placement::is_element_node(view, node, work)? {
+                            first = Some(node);
+                            break;
+                        }
+                    }
+                    first.map_or((revocation, false), |first| (first, true))
+                }
+                Join::AfterCrls => {
+                    let revocation = child(properties, "RevocationValues")?;
+                    placement::child(view, revocation, namespace, "OtherValues", work)?
+                        .map_or((revocation, false), |other| (other, true))
+                }
+                Join::Property => unreachable!("new properties are inserted together"),
+            })
+        })?;
+        if before {
+            document.insert_before(node, markup)?;
+        } else {
+            document.append_child(node, markup)?;
+        }
+    }
+    if !properties.is_empty() {
+        let unsigned = document.with_view(|view| {
+            placement::locate_in(view, data.signature, data.id_attributes, namespace, work)
+                .map(|located| located.unsigned)
+        })?;
+        unsigned.insert_in(document, &properties, namespace)?;
+    }
+    Ok(())
+}
+
 /// What the census finds missing, as the next [`ValuesStep`]. Before an
-/// archive timestamp everything goes into the signature's values; once one
-/// covers them, each timestamp's missing TSA material goes into the
-/// `TimeStampValidationData` right after it (ETSI TS 101 903 V1.4.2 §8.1.1,
-/// TS 103 171 V2.1.1 §8.1.5) and only what no timestamp needs into new
-/// values.
+/// archive timestamp everything goes into the signature's values, drafted
+/// for the containers `held`; once one covers them, each timestamp's missing
+/// TSA material goes into the `TimeStampValidationData` right after it (ETSI
+/// TS 101 903 V1.4.2 §8.1.1, TS 103 171 V2.1.1 §8.1.5) and only what no
+/// timestamp needs into new values.
 fn missing_values<W: Work>(
     census: &HistoricalCensus<'_, '_, '_, '_, '_, W>,
     unsigned: Unsigned,
+    held: Held,
     profile: Profile,
     archived: bool,
 ) -> Result<ValuesStep, AugmentError> {
@@ -588,16 +871,16 @@ fn missing_values<W: Work>(
     };
     let mut values = Vec::new();
     if !entries.is_empty() {
-        let mut staging = staging();
+        let mut split = Split::new(held);
         write_historical_values(
             &entries,
             profile,
             ReferenceRole::Signature,
-            &mut staging,
+            &mut split,
             work,
         )
         .map_err(construction)?;
-        values = staging.draft.finish_siblings()?;
+        values = split.finish()?;
     }
     let timestamp = match timestamp {
         Some(property) if !timestamp_entries.is_empty() => {
@@ -618,18 +901,24 @@ fn missing_values<W: Work>(
 /// Check `response` against `pending` and publish its token as the
 /// `SignatureTimeStamp` of the historical signature, or as its `kind`
 /// timestamp, after the new generation still meets the BES requirements of
-/// `profile`.
+/// `profile`. `pooled` are the completion's inputs with the assessment's
+/// certificates added, which every path check reads.
 pub(super) fn complete<W: Work>(
     document: &mut XmlDocument,
     pending: &PendingTimestamp,
     response: &[u8],
     completion: &Completion<'_, '_>,
+    pooled: &Inputs<'_>,
     work: &W,
 ) -> Result<(), AugmentError> {
     let Stamp::Historical(profile, kind) = pending.kind else {
         return Err(AugmentError::Construction(
             structured_xades::produce::Error::Prerequisites,
         ));
+    };
+    let completion = &Completion {
+        inputs: pooled,
+        ..*completion
     };
     let assessment = completion.assessment;
     let signature = pending.signature.as_str();
@@ -803,7 +1092,7 @@ impl<'p, 'c, 'v, 's, 'i, W: Work> Historical<'p, 'c, 'v, 's, 'i, W> {
                         extensions: &[],
                     },
                 )
-                .map_err(|error| AugmentError::ExtendedRequest(alloc::format!("{error:?}")))?;
+                .map_err(|error| AugmentError::ExtendedRequest(Box::new(error)))?;
             let mut owned = work.memory().vector();
             owned.try_extend_from_slice(encoded)?;
             Ok(owned.into_owned())

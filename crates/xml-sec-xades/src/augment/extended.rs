@@ -404,7 +404,7 @@ fn with_prepared<W: Work, R>(
                     extensions: &[],
                 },
             )
-            .map_err(|error| AugmentError::ExtendedRequest(alloc::format!("{error:?}")))?;
+            .map_err(|error| AugmentError::ExtendedRequest(Box::new(error)))?;
         let mut owned = execution.memory().vector();
         owned.try_extend_from_slice(encoded)?;
         let owned = owned.into_owned();

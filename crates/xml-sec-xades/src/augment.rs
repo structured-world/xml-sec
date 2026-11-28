@@ -62,8 +62,8 @@ use structured_pkix::algorithm::digest::{self, AsnDigest};
 use structured_pkix::path::EffectiveKey;
 use structured_xades::baseline::{self, Evidence};
 use structured_xades::produce::{
-    self, Augmentation, Event, PreparationError, ReferenceWriter, ResponseCheck, ResponseError,
-    TimestampKind, Transaction, Writer,
+    self, Augmentation, Event, ExtendedRequestError, PreparationError, ReferenceWriter,
+    ResponseCheck, ResponseError, TimestampKind, Transaction, Writer,
 };
 use structured_xades::renewed::{self, CreationError};
 use structured_xades::timestamp::InputError;
@@ -191,7 +191,9 @@ pub struct Completion<'a, 'inputs> {
     /// is added.
     pub assessment: &'a Assessment<'a, 'inputs>,
     /// Evidence of the level the new generation must meet, B-T or above:
-    /// anchors of the TSA's path, UTC facts and authority accuracies.
+    /// anchors of the TSA's path, UTC facts and authority accuracies. A
+    /// historical signature's timestamp reads only the evidence; its level
+    /// does not apply (see [`complete_timestamp`]).
     pub inputs: &'a Inputs<'a>,
     /// Caller-established window in which the request was uniquely
     /// outstanding (RFC 3161 §6); it proves freshness when no nonce was sent.
@@ -345,8 +347,8 @@ pub enum AugmentError {
     #[error("the reference digest is not permitted for these references")]
     ProhibitedReferenceDigest,
     /// The request of an extended timestamp could not be made.
-    #[error("extended timestamp request failed: {0}")]
-    ExtendedRequest(String),
+    #[error("extended timestamp request failed: {0:?}")]
+    ExtendedRequest(Box<ExtendedRequestError<Error, NodeIdentity, CmsProviderError>>),
     /// The signature could not be read in its historical vocabulary.
     #[error("historical signature processing failed: {0}")]
     Historical(String),
@@ -793,6 +795,14 @@ fn encoded<W: Work>(
 /// `completion.inputs`. Freshness comes from the request nonce or from
 /// `completion.window`.
 ///
+/// A timestamp of a historical signature (from
+/// [`request_historical_timestamp`] or
+/// [`request_historical_extended_timestamp`]) has no EN 319 132-1 level to
+/// meet, so `completion.inputs.requirements` does not apply to it: the new
+/// generation is published once it still meets the BES requirements of its
+/// profile and every timestamp has a TSA path to the caller's anchors. Its
+/// validation values are checked by [`add_historical_values`].
+///
 /// # Errors
 /// Returns the original cause, and [`AugmentError::Changed`] when the
 /// document is not the generation the request was made for; the document is
@@ -831,9 +841,9 @@ pub fn complete_timestamp<W: Work>(
         }
         Stamp::Extended(kind) => (Gate::Extended(&basis), Err(kind)),
         // A historical signature is assessed under its own profile's
-        // requirements, not the EN 319 132-1 levels.
+        // requirements, over the same pooled certificates as the others.
         Stamp::Historical(..) => {
-            return historical::complete(document, pending, response, completion, work);
+            return historical::complete(document, pending, response, completion, &inputs, work);
         }
         Stamp::Seal(kind) => {
             return seal::complete(

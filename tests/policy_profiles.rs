@@ -1460,6 +1460,65 @@ fn only_the_conformant_profile_verifies_ts_101_903_v1_2_2_signatures() {
     ));
 }
 
+#[test]
+fn v111_signed_properties_without_signature_properties_refused() {
+    // TS 101 903 V1.1.1 §6.2.1, like V1.2.2, makes SignedSignatureProperties
+    // a mandatory child of SignedProperties: a V1.1.1 signature with only
+    // SignedDataObjectProperties is refused where V1.1.1 is read at all.
+    let key = HmacSigningKey::new(vec![0x53; 32]).unwrap();
+    let verifier = HmacVerificationKey::new(vec![0x53; 32]).unwrap();
+    let general = compiler(PolicyProfile::Modern).compile(&context()).unwrap();
+    let v111 = |properties: &str| {
+        xades_template(properties)
+            .replace(
+                "http://uri.etsi.org/01903#SignedProperties",
+                "http://uri.etsi.org/01903/v1.1.1#SignedProperties",
+            )
+            .replace(
+                "http://uri.etsi.org/01903/v1.3.2#",
+                "http://uri.etsi.org/01903/v1.1.1#",
+            )
+    };
+    let conformant = compiler(PolicyProfile::XadesConformant)
+        .compile(&context())
+        .unwrap();
+    let mut policy = conformant.verification().unwrap().clone();
+    policy.xades_syntax = xml_sec::policy::XadesSyntax::WithHistoricalVocabularies;
+    let verify = |properties: &str| {
+        let xml = SignContext::new(&key)
+            .policy(general.signing().unwrap().clone())
+            .sign_template(&v111(properties))
+            .unwrap()
+            .output;
+        let document = XmlDocument::parse(xml).unwrap();
+        let targets = document.with_view(|view| [view.root_element()]);
+        let evidence = VerifyContext::new()
+            .key(&verifier)
+            .policy(policy.clone())
+            .verify_request(
+                &document,
+                &VerificationRequest {
+                    expected_targets: &targets,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        (
+            evidence.accepted(&document).unwrap(),
+            format!("{evidence:?}"),
+        )
+    };
+    let (accepted, evidence) = verify(
+        "<x:SignedSignatureProperties><x:SigningTime>2003-11-07T09:48:27Z</x:SigningTime></x:SignedSignatureProperties>",
+    );
+    assert!(accepted, "{evidence}");
+    let (accepted, evidence) = verify("<x:SignedDataObjectProperties/>");
+    assert!(
+        !accepted && evidence.contains("SignatureProfile"),
+        "{evidence}"
+    );
+}
+
 /// `xades_template` with one more `Reference`, to a `ds:Object` holding
 /// base64 text, under `transform`.
 fn xades_with_object_reference(transform: &str) -> String {

@@ -30,10 +30,10 @@ const NONCES: [&[u8]; 2] = [
 const ERS: &str = "urn:ietf:params:xml:ns:ers";
 const XADES_ERS: &str = "http://uri.etsi.org/19132/v1.1.1#";
 
-fn request(nonce: &'static [u8]) -> TimestampRequest<'static> {
+fn request(nonce: &'static [u8], digest: Algorithm) -> TimestampRequest<'static> {
     TimestampRequest {
         signature: "sig",
-        digest: Algorithm::Sha256,
+        digest,
         policy: None,
         nonce: Some(nonce),
         id_attributes: &[],
@@ -68,15 +68,17 @@ fn seal_request(
     kind: SealKind,
     requirements: Requirements,
 ) -> Result<PendingTimestamp, AugmentError> {
-    let nonce = match kind {
-        SealKind::Initial => NONCES[0],
-        SealKind::Parallel => NONCES[1],
+    // ETSI TS 119 132-3 §5: from one TSA, the parallel record hashes with
+    // another algorithm.
+    let (nonce, digest) = match kind {
+        SealKind::Initial => (NONCES[0], Algorithm::Sha256),
+        SealKind::Parallel => (NONCES[1], Algorithm::Sha512),
     };
     let inputs = fixture.inputs(requirements, &CRLS);
     fixture.with_assessment(|assessment| {
         request_evidence_record(
             document,
-            &request(nonce),
+            &request(nonce, digest),
             kind,
             assessment,
             &inputs,
@@ -143,6 +145,44 @@ fn census(xml: &str) -> Vec<usize> {
                 .count()
         })
         .collect()
+}
+
+#[test]
+fn seal_tsa_intermediate_only_in_document_values_published() {
+    // A seal's TSA path may run through any certificate the document already
+    // holds, as a level assessment's does: with nothing supplied by the
+    // caller, the intermediate in the signature's CertificateValues still
+    // links the TSA to the caller's anchor.
+    let fixture = Fixture::new();
+    let mut document = long_term(&fixture);
+    let pending = seal_request(
+        &fixture,
+        &document,
+        SealKind::Initial,
+        Requirements::LongTerm,
+    )
+    .expect("seal request");
+    let inputs = xml_sec_xades::Inputs {
+        certificates: &[],
+        ..fixture.inputs(Requirements::LongTerm, &CRLS)
+    };
+    fixture
+        .with_assessment(|assessment| {
+            complete_timestamp(
+                &mut document,
+                &pending,
+                SEAL_RESPONSE,
+                &Completion {
+                    assessment,
+                    inputs: &inputs,
+                    window: None,
+                    id_attributes: &[],
+                },
+                &account(),
+            )
+        })
+        .expect("the TSA path reaches the anchor");
+    assert_eq!(census(document.as_xml()), [1]);
 }
 
 #[test]
@@ -329,13 +369,13 @@ fn a_sealed_signature_takes_no_other_unsigned_property() {
         };
         assert!(sealed(request_timestamp(
             &document,
-            &request(NONCES[0]),
+            &request(NONCES[0], Algorithm::Sha256),
             assessment,
             &account()
         )));
         assert!(sealed(request_archive_timestamp(
             &document,
-            &request(NONCES[0]),
+            &request(NONCES[0], Algorithm::Sha256),
             assessment,
             &inputs,
             &account()

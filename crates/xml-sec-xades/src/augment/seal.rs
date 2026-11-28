@@ -13,7 +13,7 @@ use super::{
     TimestampRequest, archival, construction, encode, gated, selected, unproven,
     with_response_check,
 };
-use crate::basic::Outcome;
+use crate::basic::{Outcome, ValidationError};
 use crate::create::{Assessment, Carried};
 use crate::draft::Draft;
 use crate::evidence::{Kind, Sealing};
@@ -39,7 +39,9 @@ use structured_xades::evidence::{
     self as records, Edit, EditError, EditPlan, Format, InitialError, InitialImprint, ObjectError,
     Placement, SealingWriter,
 };
+use structured_xades::material::{self, Value};
 use structured_xades::produce::{Event, Transaction, Writer};
+use structured_xades::timestamp;
 use structured_xades::xml::{Access, Xml};
 use xml_sec::document::{DocumentIdentity, NodeIdentity, XmlDocument};
 use xml_sec::xmldsig::cms::{CmsProvider, CmsProviderError};
@@ -459,16 +461,20 @@ fn committed<W: Work>(
     let access = Access::new(&owner, owner.snapshot(), execution);
     let census = records::read(&access, stage.prepared.bound()).map_err(EvidenceError::Records)?;
     let carried: Vec<&[u8]> = drafted.carried.iter().map(Vec::as_slice).collect();
+    let held = document_certificates(stage)?;
+    let held: Vec<&[u8]> = held.iter().map(Vec::as_slice).collect();
     let parser = stage.parser;
     let anchors = read_certificates(parser, inputs.anchors)?;
     let supplied = read_certificates(parser, inputs.certificates)?;
     let carried = read_certificates(parser, &carried)?;
+    let held = read_certificates(parser, &held)?;
     let mut anchored = parser.memory().vector();
     let mut pool = parser.memory().vector();
     for anchor in &anchors {
         anchored.try_push(Anchor::from_certificate(anchor))?;
     }
-    for certificate in supplied.iter().chain(&carried).chain(&anchors) {
+    // Candidates only: a path still has to end at one of `anchors`.
+    for certificate in supplied.iter().chain(&carried).chain(&held).chain(&anchors) {
         pool.try_push(certificate)?;
     }
     let authorities = Authorities {
@@ -510,6 +516,55 @@ fn committed<W: Work>(
         .authorize_commit(&access, &census, &proof)
         .map_err(EvidenceError::Edit)?;
     Ok(())
+}
+
+/// The certificates the document already holds, in its values, their OCSP
+/// responses and its timestamp tokens: the pool a level assessment builds
+/// paths over, copied out of the readers that own them.
+fn document_certificates<W: Work>(
+    stage: &crate::basic::Stage<'_, '_, '_, '_, W>,
+) -> Result<Vec<Vec<u8>>, AugmentError> {
+    let stamps = timestamp::counter_timestamps(stage.access, stage.counters)
+        .map_err(|error| ValidationError::Stamps(Box::new(error)))?;
+    timestamp::with_counter_tokens(
+        stage.document,
+        stage.prepared,
+        &stamps,
+        stage.operation,
+        stage.token_profile,
+        |operation, tokens| {
+            Ok::<_, Infallible>(
+                material::with_counter_values(
+                    stage.document,
+                    stage.prepared,
+                    stage.counters,
+                    operation,
+                    |_, view| {
+                        let mut held = Vec::new();
+                        for value in view.values() {
+                            if let Value::Certificate(certificate) = &value.value {
+                                held.push(certificate.as_bytes().to_vec());
+                            }
+                        }
+                        for basic in view.basic_responses() {
+                            for certificate in basic.response().certificates() {
+                                held.push(certificate.as_bytes().to_vec());
+                            }
+                        }
+                        for reading in tokens.readings() {
+                            for certificate in reading.token().message().certificates() {
+                                held.push(certificate.as_bytes().to_vec());
+                            }
+                        }
+                        Ok::<_, Infallible>(held)
+                    },
+                )
+                .map_err(|error| ValidationError::Material(Box::new(error))),
+            )
+        },
+    )
+    .map_err(|error| ValidationError::Tokens(Box::new(error)))?
+    .map_err(AugmentError::from)
 }
 
 /// The historical decision on a staged record's token: its signer has a
@@ -577,6 +632,9 @@ pub enum SignerError {
     Comparison(structured_cms::directory::Error),
     /// The current execution refused work.
     Resource(MemoryError),
+    /// The token's accuracy could not be matched with the caller's stated
+    /// accuracies.
+    Accuracy(Box<ValidationError>),
 }
 
 impl Authority<NodeIdentity> for Candidates<'_> {
@@ -599,8 +657,7 @@ impl Authority<NodeIdentity> for Candidates<'_> {
             ) {
                 let policy_accuracy =
                     accuracy::select_outside(self.stated, token, reader, self.operation)
-                        .ok()
-                        .flatten();
+                        .map_err(|error| SignerError::Accuracy(Box::new(error)))?;
                 return Ok(Selection {
                     certificate,
                     certificate_parent: self.parent,

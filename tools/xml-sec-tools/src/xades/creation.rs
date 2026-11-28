@@ -440,15 +440,24 @@ pub(crate) enum Expect {
     /// The fact holds within the diagnostic signature of the `ds:Signature`
     /// with this `Id` (its `DAIdentifier`).
     In(&'static str, &'static Expect),
+    /// Exactly `count` elements of local name `local`, each holding every
+    /// one of these (element, text) facts below itself.
+    Each(&'static str, usize, &'static [(&'static str, &'static str)]),
 }
 
 const POLICY: &str = "1.3.6.1.4.1.13762.3.1";
 const PROOF_OF_ORIGIN: &str = "http://uri.etsi.org/01903/v1.2.2#ProofOfOrigin";
 const PROOF_OF_APPROVAL: &str = "http://uri.etsi.org/01903/v1.2.2#ProofOfApproval";
 
+/// What DSS reports of a well-formed evidence record over intact objects.
+const EVIDENCE_RECORD: &[(&str, &str)] = &[
+    ("StructuralValidation@valid", "true"),
+    ("DataIntact", "true"),
+];
+
 /// The facts of the optional properties DSS must report for `name`.
 fn expected_properties(name: &str) -> &'static [Expect] {
-    use Expect::{Counted, In, Text, Together};
+    use Expect::{Counted, Each, In, Text, Together};
     if name.starts_with("policy-") {
         return policy_properties(name);
     }
@@ -525,11 +534,10 @@ fn expected_properties(name: &str) -> &'static [Expect] {
             Text("CertificateRef/DigestAlgoAndValue@match", "true"),
         ],
         // Each record is well formed and its data objects are the signature's
-        // own: DSS finds the signature it seals intact.
-        "e-ers" | "e-ers-parallel" => &[
-            Text("EvidenceRecord/StructuralValidation@valid", "true"),
-            Text("EvidenceRecord/DataIntact", "true"),
-        ],
+        // own: DSS finds the signature it seals intact. The parallel case
+        // holds two records, each judged on its own.
+        "e-ers" => &[Each("EvidenceRecord", 1, EVIDENCE_RECORD)],
+        "e-ers-parallel" => &[Each("EvidenceRecord", 2, EVIDENCE_RECORD)],
         _ => timestamp_properties(name),
     }
 }
@@ -725,6 +733,32 @@ fn unmet(root: xml::Node<'_, '_>, expect: &Expect) -> Option<String> {
                 Some(signature) => unmet(signature, inner).map(|why| format!("{id}: {why}")),
                 None => Some(format!("DSS reported no signature {id}")),
             }
+        }
+        Expect::Each(local, count, facts) => {
+            let nodes: Vec<_> = xml::below(root, local, None).collect();
+            if nodes.len() != *count {
+                return Some(format!(
+                    "DSS read {} {local}, {count} expected",
+                    nodes.len()
+                ));
+            }
+            let failing: Vec<String> = nodes
+                .iter()
+                .enumerate()
+                .filter_map(|(index, node)| {
+                    let missing: Vec<_> = facts
+                        .iter()
+                        .filter(|(element, expected)| !holds_text(*node, element, expected))
+                        .collect();
+                    (!missing.is_empty()).then(|| {
+                        let name = node
+                            .attribute("Id")
+                            .map_or_else(|| format!("#{index}"), String::from);
+                        format!("{local} {name} lacks {missing:?}")
+                    })
+                })
+                .collect();
+            (!failing.is_empty()).then(|| format!("DSS: {}", failing.join("; ")))
         }
     }
 }

@@ -296,6 +296,37 @@ fn a_fact_of_one_signature_is_read_in_that_signature() {
 }
 
 #[test]
+fn parallel_evidence_records_each_judged() {
+    // Two parallel records each need a valid structure over intact data: one
+    // valid record cannot stand for the other, nor for a missing second one.
+    let record = |id: &str, valid: &str| {
+        format!(
+            "<EvidenceRecord Id=\"{id}\"><StructuralValidation valid=\"{valid}\"/><DataIntact>true</DataIntact></EvidenceRecord>"
+        )
+    };
+    let report = |records: &[String]| {
+        format!(
+            "<DiagnosticData><EvidenceRecords>{}</EvidenceRecords></DiagnosticData>",
+            records.concat()
+        )
+    };
+    let both = report(&[record("ER-1", "true"), record("ER-2", "true")]);
+    assert_eq!(
+        diagnostic_problems("e-ers-parallel", &both),
+        Vec::<String>::new()
+    );
+    let one = report(&[record("ER-1", "true")]);
+    assert_eq!(
+        diagnostic_problems("e-ers-parallel", &one),
+        ["DSS read 1 EvidenceRecord, 2 expected"]
+    );
+    let broken = report(&[record("ER-1", "true"), record("ER-2", "false")]);
+    let problems = diagnostic_problems("e-ers-parallel", &broken);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(problems[0].contains("ER-2"), "{problems:?}");
+}
+
+#[test]
 fn counted_facts_need_their_number() {
     // Two all-data-object timestamps, not one of each role; both Manifests
     // of a two-Manifest signature.

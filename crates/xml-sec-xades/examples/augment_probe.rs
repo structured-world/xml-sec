@@ -23,12 +23,15 @@
 //! generation of CRLs and refreshes the B-LT signature with the next, written
 //! as `OUTPUT/b-lt-refreshed.xml`.
 //!
-//! `augment_probe x-request|a-request|extended FIXTURES OUTPUT`, over the
-//! content fixtures, completes `signature.tsq` with `FIXTURES/signature.tsr`
-//! and takes the B-T signature through the TS 101 903 levels: `x-request`
-//! writes `OUTPUT/x.tsq`, `a-request` completes it with `FIXTURES/x.tsr` and
-//! writes `OUTPUT/a.tsq`, and `extended` completes both and writes
-//! `OUTPUT/c.xml`, `x.xml`, `xl.xml` and `a.xml`.
+//! `augment_probe x-request|a-request|a2-request|extended FIXTURES OUTPUT`,
+//! over the content fixtures, completes `signature.tsq` with
+//! `FIXTURES/signature.tsr` and takes the B-T signature through the TS 101
+//! 903 levels: `x-request` writes `OUTPUT/x.tsq`, `a-request` completes it
+//! with `FIXTURES/x.tsr` and writes `OUTPUT/a.tsq`, `a2-request` completes
+//! that with `FIXTURES/a.tsr` and writes the request of a second archive
+//! timestamp `OUTPUT/a2.tsq`, and `extended` completes all three, the last
+//! with `FIXTURES/a2.tsr`, and writes `OUTPUT/c.xml`, `x.xml`, `xl.xml`,
+//! `a.xml` and `a-renewed.xml`.
 //!
 //! `augment_probe seal-signature-request|seal-request|seal|parallel-request|
 //! parallel FIXTURES OUTPUT`, over the content fixtures, creates `sig`

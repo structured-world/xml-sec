@@ -201,6 +201,10 @@ pub(crate) fn pre_en_levels(
         request_historical_timestamp(&document, &request, Profile::PreEn, assessment, work)
             .map_err(|error| format!("historical request: {error}"))?;
     step.complete(&mut document, &pending, "historical.tsr")?;
+    // The X and A requests need nothing of the B-LT branch.
+    if matches!(action, "pre-en-x-request" | "pre-en-a-request") {
+        return step.extended(&mut document);
+    }
     // The B-LT branch: the values alone, then an archive timestamp.
     let mut long_term = XmlDocument::parse(document.as_xml())
         .map_err(|error| format!("reparse the B-T document: {error}"))?;
