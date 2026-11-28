@@ -237,3 +237,156 @@ fn identities_of_an_outer_start_carry_inside_and_after_inner_transactions() {
         })
         .expect("transaction succeeds");
 }
+
+#[test]
+fn appended_child_names_the_only_change() {
+    // A check that a draft changed nothing but one appended property reads
+    // the new element from the starting generation's parent.
+    let mut document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
+    let parent = element(&document, "parent");
+    document
+        .transaction(|document| {
+            document.append_child(parent, "<new Id=\"new\"><y/></new>")?;
+            assert_eq!(document.appended_child(parent)?, element(document, "new"));
+            Ok::<_, XmlDocumentError>(())
+        })
+        .expect("transaction succeeds");
+}
+
+#[test]
+fn appended_child_refuses_any_other_change() {
+    // Edits elsewhere, a child inserted before the last one, a child of
+    // another element or a second appended child are not one appended child.
+    type Edit = fn(&mut XmlDocument) -> Result<(), XmlDocumentError>;
+    let edits: [(&str, Edit); 5] = [
+        // The inserted bytes `<new/></parent><parent>` close the parent
+        // early and open a sibling: the first `parent` holds `x` and `new`,
+        // but it no longer spans the bytes the old one did plus the insertion.
+        ("an escaped parent boundary", |document| {
+            document.replace_node_with_fragment(
+                element(document, "parent"),
+                "<parent Id=\"parent\"><x Id=\"x\"/><new/></parent><parent></parent>",
+            )
+        }),
+        ("elsewhere", |document| {
+            document.append_child(element(document, "parent"), "<new/>")?;
+            document.append_child(element(document, "after"), "<other/>")
+        }),
+        ("before the last child", |document| {
+            document.insert_before(element(document, "x"), "<new/>")
+        }),
+        ("another parent", |document| {
+            document.append_child(element(document, "after"), "<new/>")
+        }),
+        ("two children", |document| {
+            document.append_child(element(document, "parent"), "<one/>")?;
+            document.append_child(element(document, "parent"), "<two/>")
+        }),
+    ];
+    for (name, edit) in edits {
+        let mut document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
+        let parent = element(&document, "parent");
+        let checked = document.transaction(|document| {
+            edit(document)?;
+            document.appended_child(parent)
+        });
+        assert!(
+            matches!(checked, Err(XmlDocumentError::InvalidReplacement(_))),
+            "{name}: {checked:?}"
+        );
+    }
+}
+
+#[test]
+fn appended_child_refuses_an_entity_of_two_elements() {
+    // An entity reference expanding to two elements gives both the
+    // reference's byte range; the append added two children, not one.
+    let mut policy = crate::policy::SigningPolicy::default();
+    policy.xml.allow_internal_dtd = true;
+    let mut document = XmlDocument::parse_with_policy(
+        "<!DOCTYPE root [<!ENTITY pair \"<one/><two/>\">]><root><parent Id=\"parent\"><x/></parent></root>",
+        &policy,
+    )
+    .expect("fixture parses");
+    let parent = element(&document, "parent");
+    let checked = document.transaction(|document| {
+        document.append_child(parent, "&pair;")?;
+        document.appended_child(parent)
+    });
+    assert!(
+        matches!(checked, Err(XmlDocumentError::InvalidReplacement(_))),
+        "{checked:?}"
+    );
+}
+
+/// `entity`'s replacement text appended to `parent` by a reference, then
+/// checked as one appended child.
+fn appended_entity(entity: &str) -> (XmlDocument, Result<NodeIdentity, XmlDocumentError>) {
+    let mut policy = crate::policy::SigningPolicy::default();
+    policy.xml.allow_internal_dtd = true;
+    let mut document = XmlDocument::parse_with_policy(
+        format!(
+            "<!DOCTYPE root [<!ENTITY e \"{entity}\">]><root><parent Id=\"parent\"><x/></parent></root>"
+        ),
+        &policy,
+    )
+    .expect("fixture parses");
+    let parent = element(&document, "parent");
+    let checked = document.transaction(|document| {
+        document.append_child(parent, "&e;")?;
+        document.appended_child(parent)
+    });
+    (document, checked)
+}
+
+#[test]
+fn appended_child_refuses_an_entity_of_an_element_and_text() {
+    // The text after the element is a second child the append added, though
+    // it is no element.
+    let (_, checked) = appended_entity("<one/>tail");
+    assert!(
+        matches!(checked, Err(XmlDocumentError::InvalidReplacement(_))),
+        "{checked:?}"
+    );
+}
+
+#[test]
+fn appended_child_takes_an_entity_of_one_element_with_content() {
+    // One element whose own child came from the same reference is still one
+    // appended child: only the parent's direct children count, on every
+    // backend, wherever it places the range of an entity's nodes.
+    let (document, checked) = appended_entity("<one><two/></one>");
+    let appended = checked.expect("one appended child");
+    document.with_view(|view| {
+        let node = view.resolve_node(appended).expect("the appended element");
+        assert_eq!(node.tag_name().name(), "one");
+    });
+}
+
+#[test]
+fn appended_child_refuses_text_merged_into_the_last_child() {
+    // Text inserted after the parent's own trailing text joins it: the last
+    // earlier child changed, so this is not one appended child.
+    let mut document = XmlDocument::parse("<root><parent Id=\"parent\"><x/>tail</parent></root>")
+        .expect("fixture parses");
+    let parent = element(&document, "parent");
+    let checked = document.transaction(|document| {
+        document.append_child(parent, "more<one/>")?;
+        document.appended_child(parent)
+    });
+    assert!(
+        matches!(checked, Err(XmlDocumentError::InvalidReplacement(_))),
+        "{checked:?}"
+    );
+}
+
+#[test]
+fn appended_child_needs_an_open_transaction() {
+    // Outside a transaction there is no starting generation to compare with.
+    let document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
+    let parent = element(&document, "parent");
+    assert!(matches!(
+        document.appended_child(parent),
+        Err(XmlDocumentError::StaleIdentity { .. })
+    ));
+}

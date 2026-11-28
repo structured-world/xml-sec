@@ -330,6 +330,57 @@ impl NodeVisibility for SubtreeVisibility<'_, '_> {
     }
 }
 
+/// One element's subtree without the subtrees of some of its descendants.
+#[cfg(feature = "xmldsig")]
+pub(crate) struct PrunedSubtreeVisibility<'a, 'input> {
+    pub(crate) apex: Node<'a, 'input>,
+    /// Disjoint subtrees in document order: a node lies in at most one, the
+    /// last that starts at or before it.
+    pub(crate) excluded: &'a [Node<'a, 'input>],
+    /// The last node asked about and the answer: an element's attributes and
+    /// namespaces ask again about the same owner.
+    pub(crate) last: core::cell::Cell<Option<(NodeId, bool)>>,
+}
+
+#[cfg(feature = "xmldsig")]
+impl NodeVisibility for PrunedSubtreeVisibility<'_, '_> {
+    fn contains_node(&self, node: Node<'_, '_>) -> Result<bool, C14nError> {
+        let id = node.id();
+        if let Some((last, visible)) = self.last.get()
+            && last == id
+        {
+            return Ok(visible);
+        }
+        let following = self
+            .excluded
+            .partition_point(|excluded| excluded.id() <= id);
+        let visible = self.apex.subtree_contains_id(id)
+            && !following
+                .checked_sub(1)
+                .is_some_and(|before| self.excluded[before].subtree_contains_id(id));
+        self.last.set(Some((id, visible)));
+        Ok(visible)
+    }
+
+    fn contains_attribute(
+        &self,
+        owner: Node<'_, '_>,
+        _namespace: Option<&str>,
+        _local_name: &str,
+    ) -> Result<bool, C14nError> {
+        self.contains_node(owner)
+    }
+
+    fn contains_namespace(
+        &self,
+        owner: Node<'_, '_>,
+        _prefix: &str,
+        _uri: &str,
+    ) -> Result<bool, C14nError> {
+        self.contains_node(owner)
+    }
+}
+
 /// Canonicalize an XML document or document subset.
 ///
 /// - `doc`: parsed backend-neutral semantic document (read-only DOM).

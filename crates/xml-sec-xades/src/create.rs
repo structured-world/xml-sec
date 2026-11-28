@@ -31,8 +31,8 @@ use xml_sec::provider::{CryptoProvider, ProviderError};
 use xml_sec::xmldsig::extension::{ScalarError, TreeError, first_child, next_sibling, parent};
 use xml_sec::xmldsig::parse::{KeyInfoParsingSession, ParseError};
 use xml_sec::xmldsig::{
-    CallerTrustedSignatureKey, DigestAlgorithm, DsigError, KeyInfoWriteError, ObjectBuilder,
-    ObjectContent, ObjectElement, ReferenceBuilder, SignContext, SignatureAlgorithm,
+    CallerTrustedSignatureKey, DigestAlgorithm, DsigError, KeyInfoWriteError, ManifestBuilder,
+    ObjectBuilder, ObjectContent, ObjectElement, ReferenceBuilder, SignContext, SignatureAlgorithm,
     SignatureBuilder, SignatureBuilderError, SignatureTemplateSelection, SigningError, SigningKey,
     Transform, VerificationRequest, VerifyContext, X509CertificateKeyInfoWriter,
     compute_digest_with_provider, with_verified_request,
@@ -147,9 +147,31 @@ pub enum DataObject<'a> {
     Manifest {
         /// ID of the `Manifest`; its references take `{id}-reference-{n}`.
         id: &'a str,
-        /// The data the `Manifest` lists, each digested as dereferenced,
-        /// detached data from [`Request::resources`] included.
+        /// The data the `Manifest` lists, each digested after its own
+        /// transforms, detached data from [`Request::resources`] included.
         entries: Vec<ManifestEntry<'a>>,
+        /// The transforms of the signature's reference to the `Manifest`;
+        /// none canonicalizes it as [`Signer::canonicalization`] says.
+        transforms: Vec<Transform>,
+        /// MIME type of the `Manifest`.
+        mime_type: &'a str,
+    },
+    /// A `Manifest` the caller built, carried in a new `Object` and signed
+    /// through a reference to the `Id` of its root element (`XMLDSig` 1.1
+    /// §5.1). As for any `Manifest`, the signature meets B-B only when the
+    /// signing and verification policies process Manifests; signing then
+    /// digests its references.
+    SuppliedManifest {
+        /// The `ds:Manifest` element, with an `Id`, read again under the
+        /// signer's XML and resource limits.
+        manifest: ObjectElement,
+        /// The MIME type of each reference of the `Manifest` the signature
+        /// describes, named by its `Id`: each processed reference is a signed
+        /// data object that needs one (EN 319 132-1 §6.3(k)).
+        entries: Vec<SuppliedEntry<'a>>,
+        /// The transforms of the signature's reference to the `Manifest`;
+        /// none canonicalizes it as [`Signer::canonicalization`] says.
+        transforms: Vec<Transform>,
         /// MIME type of the `Manifest`.
         mime_type: &'a str,
     },
@@ -230,10 +252,24 @@ fn anchor<W: Work>(
 
 /// One datum a signed `Manifest` lists, with its MIME type: each one gets a
 /// `DataObjectFormat` as a signed data object (EN 319 132-1 §6.3(k)).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ManifestEntry<'a> {
-    /// URI of the datum.
+    /// URI of the datum: empty for the document holding the signature, `#id`
+    /// for an element, or detached data.
     pub uri: &'a str,
+    /// The transforms applied to what the URI dereferences, in order
+    /// (`XMLDSig` 1.1 §4.4.3.1); none digests detached data as it is.
+    pub transforms: Vec<Transform>,
+    /// MIME type of the datum.
+    pub mime_type: &'a str,
+}
+
+/// One reference of a supplied `Manifest`, named by its `Id`, with the MIME
+/// type of the datum its `DataObjectFormat` states.
+#[derive(Debug, Clone, Copy)]
+pub struct SuppliedEntry<'a> {
+    /// `Id` of the reference.
+    pub id: &'a str,
     /// MIME type of the datum.
     pub mime_type: &'a str,
 }
@@ -329,10 +365,23 @@ pub enum CreateError {
     /// no data object they could qualify (EN 319 132-1 §5.2.3, §5.2.4).
     #[error("a countersignature has no data objects to qualify")]
     NoQualifiedObject,
+    /// A supplied `Manifest` is not one `ds:Manifest` element.
+    #[error("the supplied Manifest is not a ds:Manifest element")]
+    NotManifest,
+    /// A supplied `Manifest` has no `Id`, so no reference can name it
+    /// (`XMLDSig` 1.1 §5.1).
+    #[error("the supplied Manifest has no Id")]
+    ManifestWithoutId,
     /// Format details name a reference that is not one of the signature's
     /// data objects, or name one twice.
     #[error("format details for {0:?} name no data object or one already described")]
     FormatReference(String),
+    /// Signing processes `Manifest`s, so each reference of a supplied one is
+    /// a signed data object that needs its `DataObjectFormat` (EN 319 132-1
+    /// §6.3(k)): no entry names this reference, `#Id`, or it has no `Id`
+    /// (`None`) an entry could name.
+    #[error("the supplied Manifest reference {0:?} has no format a signed data object needs")]
+    UndescribedManifestReference(Option<String>),
     /// A policy store without the explicit signature policy it stores
     /// (EN 319 132-1 §5.2.10).
     #[error("a policy store needs an explicit signature policy")]
@@ -446,8 +495,7 @@ pub fn create<W: Work>(
     assessment: &Assessment<'_, '_>,
     work: &W,
 ) -> Result<(), CreateError> {
-    check_reference_count(signer.policy, &request.objects)?;
-    let layout = Layout::new(document, &request)?;
+    let layout = Layout::new(document, &request, signer.policy, work)?;
     let key_info = checked_key_info(signer, work)?;
     let stamps = request.properties.content_timestamps;
     if stamps.is_empty() {
@@ -580,8 +628,7 @@ pub fn request_content_timestamps<W: Work>(
     assessment: &Assessment<'_, '_>,
     work: &W,
 ) -> Result<ContentRequests, CreateError> {
-    check_reference_count(signer.policy, &request.objects)?;
-    let layout = Layout::new(document, request)?;
+    let layout = Layout::new(document, request, signer.policy, work)?;
     let key_info = checked_key_info(signer, work)?;
     let replayed = layout.replayed(document, signer, &key_info, request, work)?;
     let cms = assessment.context.cms_provider();
@@ -606,19 +653,44 @@ struct Layout<'r> {
     references: Vec<String>,
     /// `#ID` of each data object's possible enveloping `Object`.
     objects: Vec<String>,
-    /// `#ID` of each signed `Manifest`'s references, with their MIME types.
-    manifest_references: Vec<(String, &'r str)>,
+    /// Each signed `Manifest`'s references, in order.
+    manifest_references: Vec<ManifestReference<'r>>,
+    /// Whether signing processes the `Manifest`s, which makes their
+    /// references signed data objects (EN 319 132-1 §6.3(k)).
+    processes_manifests: bool,
+    /// The `Id` of each supplied `Manifest`, in order.
+    supplied: Vec<String>,
     /// Whether a reference signs `KeyInfo`, which then gets an ID.
     signs_key_info: bool,
     plan: Vec<Planned>,
 }
 
 impl<'r> Layout<'r> {
-    /// The layout of `request`, whose new IDs `document` must not declare.
-    fn new(document: &XmlDocument, request: &Request<'r>) -> Result<Self, CreateError> {
+    /// The layout of `request`, whose new IDs `document` must not declare,
+    /// after refusing more references than `policy` admits.
+    fn new<W: Work>(
+        document: &XmlDocument,
+        request: &Request<'r>,
+        policy: &SigningPolicy,
+        work: &W,
+    ) -> Result<Self, CreateError> {
         if request.objects.is_empty() {
             return Err(CreateError::NoDataObject);
         }
+        // The generated entries are counted before any of their IDs exists;
+        // a supplied Manifest's references only once it is read.
+        let generated = request
+            .objects
+            .iter()
+            .map(|object| match object {
+                DataObject::Manifest { entries, .. } => entries.len(),
+                _ => 0,
+            })
+            .fold(0_usize, usize::saturating_add);
+        check_reference_count(policy, request.objects.len(), generated)?;
+        let (manifest_references, supplied) = manifest_references(&request.objects, policy, work)?;
+        check_reference_count(policy, request.objects.len(), manifest_references.len())?;
+        let processes_manifests = policy.manifest_processing == ManifestProcessing::Process;
         let ids = Ids::new(request.id);
         // Same-document URIs; the IDs are the text after '#'.
         let references: Vec<String> = (0..request.objects.len())
@@ -627,7 +699,6 @@ impl<'r> Layout<'r> {
         let objects: Vec<String> = (0..request.objects.len())
             .map(|index| format!("#{}-object-{index}", ids.signature))
             .collect();
-        let manifest_references = manifest_references(&request.objects);
         // KeyInfo gets an ID only when a reference signs it, so every other
         // signature keeps its exact form.
         let signs_key_info = request
@@ -640,18 +711,46 @@ impl<'r> Layout<'r> {
             signs_key_info.then_some(ids.key_info.as_str()),
             &references,
             &objects,
-            &manifest_references,
+            (&manifest_references, &supplied),
         );
         require_free(document, &new_ids, request.id_attributes)?;
-        let plan = reference_plan(&request.objects, &references, &manifest_references);
+        let signed = if processes_manifests {
+            manifest_references.as_slice()
+        } else {
+            &[]
+        };
+        // Each signed Manifest reference is a data object the signature
+        // describes (EN 319 132-1 §6.3(k)); one it cannot is refused here,
+        // before anything is signed.
+        if let Some(undescribed) = signed
+            .iter()
+            .find(|reference| reference.uri.is_none() || reference.mime_type.is_none())
+        {
+            return Err(CreateError::UndescribedManifestReference(
+                undescribed.uri.clone(),
+            ));
+        }
+        let plan = reference_plan(&request.objects, &references, signed);
         Ok(Self {
             ids,
             references,
             objects,
             manifest_references,
+            processes_manifests,
+            supplied,
             signs_key_info,
             plan,
         })
+    }
+
+    /// The `Manifest` references signing digests, none when it leaves the
+    /// `Manifest`s unprocessed.
+    fn signed_manifest_references(&self) -> &[ManifestReference<'r>] {
+        if self.processes_manifests {
+            &self.manifest_references
+        } else {
+            &[]
+        }
     }
 
     /// The `QualifyingProperties` of the new signature, with the content
@@ -672,11 +771,13 @@ impl<'r> Layout<'r> {
                 mime_type: mime_type(object),
             })
             .chain(
-                self.manifest_references
+                self.signed_manifest_references()
                     .iter()
-                    .map(|(reference, mime_type)| produce::DataObject {
-                        reference,
-                        mime_type,
+                    .filter_map(|entry| {
+                        Some(produce::DataObject {
+                            reference: entry.uri.as_deref()?,
+                            mime_type: entry.mime_type?,
+                        })
                     }),
             )
             .collect();
@@ -712,8 +813,7 @@ impl<'r> Layout<'r> {
         Ok(data_template(
             signer,
             data,
-            &self.references,
-            &self.objects,
+            (&self.references, &self.objects, &self.supplied),
             &self.ids.key_info,
             skeleton,
         )?
@@ -747,7 +847,7 @@ impl<'r> Layout<'r> {
         Ok(Replayed::new(
             inputs,
             &self.references,
-            &self.manifest_references,
+            self.signed_manifest_references(),
             (&signer.canonicalization, signer.policy),
         )?)
     }
@@ -870,16 +970,28 @@ fn insert(
 fn data_template(
     signer: &Signer<'_>,
     data: Vec<DataObject<'_>>,
-    references: &[String],
-    objects: &[String],
+    (references, objects, supplied): (&[String], &[String], &[String]),
     key_info: &str,
     mut template: SignatureBuilder,
 ) -> Result<SignatureBuilder, CreateError> {
     let mut enveloping = Vec::new();
+    let mut supplied = supplied.iter();
     for ((object, reference), object_uri) in data.into_iter().zip(references).zip(objects) {
         let c14n = || Transform::C14n(signer.canonicalization.clone());
+        // A Manifest is XML the signature references: with no transforms of
+        // the caller's, the signer canonicalizes it as its other XML ones.
+        let or_canonicalized = |transforms: Vec<Transform>| {
+            if transforms.is_empty() {
+                Vec::from([c14n()])
+            } else {
+                transforms
+            }
+        };
         // XMLDSig 1.1 §5.1: a reference to a Manifest says so in its Type.
-        let manifest = matches!(object, DataObject::Manifest { .. });
+        let manifest = matches!(
+            object,
+            DataObject::Manifest { .. } | DataObject::SuppliedManifest { .. }
+        );
         let (uri, transforms) = match object {
             DataObject::Document { envelope, .. } => (
                 String::new(),
@@ -912,11 +1024,25 @@ fn data_template(
                 enveloping.push(object);
                 (format!("#{id}"), transforms)
             }
-            DataObject::Manifest { id, entries, .. } => {
-                let element =
-                    ObjectElement::parse(manifest_markup(signer, id, &entries), signer.policy)?;
+            DataObject::Manifest {
+                id,
+                entries,
+                transforms,
+                ..
+            } => {
+                let element = manifest_element(signer, id, entries)?;
                 enveloping.push(ObjectBuilder::new(ObjectContent::Element(element)));
-                (format!("#{id}"), Vec::from([c14n()]))
+                (format!("#{id}"), or_canonicalized(transforms))
+            }
+            DataObject::SuppliedManifest {
+                manifest,
+                transforms,
+                ..
+            } => {
+                // Layout read one Id per supplied Manifest, in order.
+                let id = supplied.next().ok_or(CreateError::ManifestWithoutId)?;
+                enveloping.push(ObjectBuilder::new(ObjectContent::Element(manifest)));
+                (format!("#{id}"), or_canonicalized(transforms))
             }
             DataObject::KeyInfo { .. } => (format!("#{key_info}"), Vec::from([c14n()])),
             DataObject::Reference {
@@ -948,7 +1074,7 @@ fn new_ids<'a>(
     key_info: Option<&'a str>,
     references: &'a [String],
     objects: &'a [String],
-    manifest_references: &'a [(String, &str)],
+    (manifest_references, supplied): (&'a [ManifestReference<'_>], &'a [String]),
 ) -> Vec<&'a str> {
     let enveloping = data
         .iter()
@@ -965,28 +1091,28 @@ fn new_ids<'a>(
         .chain(references.iter().map(|uri| &uri[1..]))
         .chain(enveloping)
         .chain(named)
-        .chain(manifest_references.iter().map(|(uri, _)| &uri[1..]))
+        .chain(supplied.iter().map(String::as_str))
+        .chain(
+            manifest_references
+                .iter()
+                .filter_map(|entry| Some(&entry.uri.as_deref()?[1..])),
+        )
         .collect()
 }
 
-/// Each reference of a signed `Manifest` among `objects`, as `#ID` with the
-/// MIME type of the datum it names.
-/// Refuses `objects` before any ID is laid out when the signature they make
-/// would hold more references than `policy` admits: one per data object and
-/// the `SignedProperties` one, with the `Manifest` entries when the policy
+/// Refuses a signature before any ID is laid out when it would hold more
+/// references than `policy` admits: one per data object and the
+/// `SignedProperties` one, with the `Manifest` references when the policy
 /// processes them, as signing then counts them.
 fn check_reference_count(
     policy: &SigningPolicy,
-    objects: &[DataObject<'_>],
+    objects: usize,
+    manifest_references: usize,
 ) -> Result<(), CreateError> {
     // A count past usize::MAX is past any limit, so the sums saturate.
-    let mut actual = objects.len().saturating_add(1);
+    let mut actual = objects.saturating_add(1);
     if policy.manifest_processing == ManifestProcessing::Process {
-        for object in objects {
-            if let DataObject::Manifest { entries, .. } = object {
-                actual = actual.saturating_add(entries.len());
-            }
-        }
+        actual = actual.saturating_add(manifest_references);
     }
     policy
         .resources
@@ -994,22 +1120,81 @@ fn check_reference_count(
         .map_err(|violation| CreateError::Template(violation.into()))
 }
 
-fn manifest_references<'a>(objects: &[DataObject<'a>]) -> Vec<(String, &'a str)> {
-    objects
-        .iter()
-        .filter_map(|object| match object {
-            DataObject::Manifest { id, entries, .. } => Some((*id, entries)),
-            _ => None,
-        })
-        .flat_map(|(id, entries)| {
-            entries.iter().enumerate().map(move |(index, entry)| {
-                (
-                    format!("#{}", manifest_reference_id(id, index)),
-                    entry.mime_type,
-                )
-            })
-        })
-        .collect()
+/// One reference of a signed `Manifest`: `#ID` when it has one, and the MIME
+/// type of its datum when the signature describes it.
+pub(crate) struct ManifestReference<'a> {
+    pub(crate) uri: Option<String>,
+    mime_type: Option<&'a str>,
+}
+
+/// Each reference of the signed `Manifest`s among `objects`, then the `Id`
+/// of each supplied `Manifest`, read from its element under `policy`.
+fn manifest_references<'a, W: Work>(
+    objects: &[DataObject<'a>],
+    policy: &SigningPolicy,
+    work: &W,
+) -> Result<(Vec<ManifestReference<'a>>, Vec<String>), CreateError> {
+    let mut references = Vec::new();
+    let mut supplied = Vec::new();
+    for object in objects {
+        match object {
+            DataObject::Manifest { id, entries, .. } => {
+                references.extend(entries.iter().enumerate().map(|(index, entry)| {
+                    ManifestReference {
+                        uri: Some(format!("#{}", manifest_reference_id(id, index))),
+                        mime_type: Some(entry.mime_type),
+                    }
+                }));
+            }
+            DataObject::SuppliedManifest {
+                manifest, entries, ..
+            } => {
+                let (id, ids) = supplied_manifest(manifest, policy, work)?;
+                let start = references.len();
+                references.extend(ids.into_iter().map(|id| ManifestReference {
+                    uri: id.map(|id| format!("#{id}")),
+                    mime_type: None,
+                }));
+                for entry in entries {
+                    let uri = format!("#{}", entry.id);
+                    let reference = references[start..]
+                        .iter_mut()
+                        .find(|reference| reference.uri.as_deref() == Some(uri.as_str()))
+                        .filter(|reference| reference.mime_type.is_none())
+                        .ok_or_else(|| CreateError::FormatReference(uri.clone()))?;
+                    reference.mime_type = Some(entry.mime_type);
+                }
+                supplied.push(id);
+            }
+            _ => {}
+        }
+    }
+    Ok((references, supplied))
+}
+
+/// The `Id` of a supplied `ds:Manifest` and the `Id`, if any, of each of
+/// its references, read under the signer's XML and resource limits.
+fn supplied_manifest<W: Work>(
+    manifest: &ObjectElement,
+    policy: &SigningPolicy,
+    work: &W,
+) -> Result<(String, Vec<Option<String>>), CreateError> {
+    let document = XmlDocument::parse_with_policy(manifest.as_ref(), policy)?;
+    document.with_view(|view| {
+        let root = view.root_element();
+        if !placement::is_element(view, root, DS, "Manifest", work)? {
+            return Err(CreateError::NotManifest);
+        }
+        let id =
+            placement::attribute(view, root, "Id", work)?.ok_or(CreateError::ManifestWithoutId)?;
+        let mut references = Vec::new();
+        for child in placement::children(view, root, work)? {
+            if placement::is_element(view, child, DS, "Reference", work)? {
+                references.push(placement::attribute(view, child, "Id", work)?);
+            }
+        }
+        Ok((id, references))
+    })
 }
 
 /// The ID of the `index`th reference of `Manifest` `id`.
@@ -1020,49 +1205,28 @@ fn manifest_reference_id(id: &str, index: usize) -> String {
 /// `XMLDSig` 1.1 §5.1: the `Type` of a reference to a `Manifest`.
 const MANIFEST_TYPE: &str = "http://www.w3.org/2000/09/xmldsig#Manifest";
 
-/// A `Manifest` whose references name `entries`, with empty digest values
-/// the signing operation fills before it digests the `Manifest` itself.
-/// Each entry is digested as dereferenced, as a detached reference is.
-fn manifest_markup(signer: &Signer<'_>, id: &str, entries: &[ManifestEntry<'_>]) -> String {
-    let (prefix, declaration) = match signer.prefixes.ds {
-        "" => (String::new(), format!(" xmlns=\"{DS}\"")),
-        prefix => (format!("{prefix}:"), format!(" xmlns:{prefix}=\"{DS}\"")),
-    };
-    let escape = |value: &str| {
-        value
-            .replace('&', "&amp;")
-            .replace('"', "&quot;")
-            .replace('<', "&lt;")
-    };
-    let mut markup = format!("<{prefix}Manifest{declaration} Id=\"{}\">", escape(id));
-    let digest_method = signer.digest.uri();
-    for (index, entry) in entries.iter().enumerate() {
-        for piece in [
-            "<",
-            &prefix,
-            "Reference Id=\"",
-            &escape(&manifest_reference_id(id, index)),
-            "\" URI=\"",
-            &escape(entry.uri),
-            "\"><",
-            &prefix,
-            "DigestMethod Algorithm=\"",
-            digest_method,
-            "\"/><",
-            &prefix,
-            "DigestValue></",
-            &prefix,
-            "DigestValue></",
-            &prefix,
-            "Reference>",
-        ] {
-            markup.push_str(piece);
+/// A `Manifest` whose references name `entries`, each with its own
+/// transforms, with empty digest values the signing operation fills before
+/// it digests the `Manifest` itself.
+fn manifest_element(
+    signer: &Signer<'_>,
+    id: &str,
+    entries: Vec<ManifestEntry<'_>>,
+) -> Result<ObjectElement, CreateError> {
+    let mut manifest = ManifestBuilder::new(id);
+    if !signer.prefixes.ds.is_empty() {
+        manifest = manifest.ns_prefix(signer.prefixes.ds);
+    }
+    for (index, entry) in entries.into_iter().enumerate() {
+        let mut reference = ReferenceBuilder::new(signer.digest)
+            .uri(entry.uri)
+            .id(manifest_reference_id(id, index));
+        for transform in entry.transforms {
+            reference = reference.transform(transform);
         }
+        manifest = manifest.add_reference(reference);
     }
-    for piece in ["</", &prefix, "Manifest>"] {
-        markup.push_str(piece);
-    }
-    markup
+    Ok(manifest.build_with_policy(signer.policy)?)
 }
 
 /// Countersign one existing `XAdES` signature and publish the result as one
@@ -1175,6 +1339,7 @@ fn mime_type<'a>(object: &DataObject<'a>) -> &'a str {
         | DataObject::Enveloping { mime_type, .. }
         | DataObject::Object { mime_type, .. }
         | DataObject::Manifest { mime_type, .. }
+        | DataObject::SuppliedManifest { mime_type, .. }
         | DataObject::KeyInfo { mime_type }
         | DataObject::Reference { mime_type, .. } => mime_type,
     }
@@ -1198,7 +1363,7 @@ fn require_free(
 fn reference_plan(
     objects: &[DataObject<'_>],
     references: &[String],
-    manifest_references: &[(String, &str)],
+    manifest_references: &[ManifestReference<'_>],
 ) -> Vec<Planned> {
     objects
         .iter()
@@ -1218,10 +1383,12 @@ fn reference_plan(
                 encoding,
             }
         })
-        .chain(manifest_references.iter().map(|(uri, _)| Planned {
-            uri: uri.clone(),
-            mime_type: None,
-            encoding: None,
+        .chain(manifest_references.iter().filter_map(|entry| {
+            Some(Planned {
+                uri: entry.uri.clone()?,
+                mime_type: None,
+                encoding: None,
+            })
         }))
         .collect()
 }

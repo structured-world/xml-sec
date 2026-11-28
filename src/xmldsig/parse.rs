@@ -4135,6 +4135,21 @@ fn format_x509_serial_value_hex(serial: &[u8]) -> String {
     format_x509_serial_hex(canonical)
 }
 
+/// The decimal text of the unsigned big-endian integer `magnitude`, the form
+/// an `xsd:integer` such as `X509SerialNumber` carries (`XMLDSig` 1.1 section
+/// 4.5.4.1). Leading zero octets do not change the value.
+///
+/// # Examples
+///
+/// ```
+/// assert_eq!(xml_sec::xmldsig::unsigned_decimal(&[0x01, 0x00]), "256");
+/// assert_eq!(xml_sec::xmldsig::unsigned_decimal(&[]), "0");
+/// ```
+#[must_use]
+pub fn unsigned_decimal(magnitude: &[u8]) -> String {
+    format_x509_serial_decimal(magnitude)
+}
+
 /// The decimal text of the unsigned big-endian serial value `serial`, the
 /// form `X509SerialNumber` carries (`XMLDSig` 1.1 section 4.5.4.1:
 /// `xsd:integer`).

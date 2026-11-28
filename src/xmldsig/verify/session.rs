@@ -933,6 +933,22 @@ impl<W: Work> Drop for AdmittedReplay<'_, W> {
         self.active.set(false);
     }
 }
+/// The session's running replay, ended when this goes out of scope.
+struct ActiveReplay<'a>(&'a Cell<bool>);
+
+impl<'a> ActiveReplay<'a> {
+    fn start(active: &'a Cell<bool>) -> Self {
+        active.set(true);
+        Self(active)
+    }
+}
+
+impl Drop for ActiveReplay<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
 impl<W: Work, E, F: FnMut(&[u8]) -> Result<(), E>> ReplayWriter<'_, W, E, F> {
     fn deliver(&mut self, bytes: &[u8]) -> Result<(), ReplayError<E>> {
         // The receiver sees only nonempty chunks; empty output delivers none.
@@ -1074,6 +1090,22 @@ impl<W: Work, Q: Work> SelectedSignature<'_, '_, '_, '_, W, Q> {
             .children()
             .filter(|child| child.has_tag_name((XMLDSIG_NS, "Transforms")))
         {
+            self.validate_transform_container(transforms, allowed, maximum, &mut transform_count)?;
+        }
+        Ok(allowed)
+    }
+
+    /// Admit every `Transform` of one transforms container under the
+    /// operation's transform permission and per-instruction count.
+    fn validate_transform_container<E>(
+        &self,
+        transforms: Node<'_, '_>,
+        allowed: Option<&BTreeSet<String>>,
+        maximum: usize,
+        transform_count: &mut usize,
+    ) -> Result<(), ReplayError<E>> {
+        let processing = ReplayError::Processing;
+        {
             self.work
                 .charge_work(transforms.children().len() as u64)
                 .map_err(|error| processing(error.into()))?;
@@ -1081,13 +1113,13 @@ impl<W: Work, Q: Work> SelectedSignature<'_, '_, '_, '_, W, Q> {
                 self.work
                     .charge_work(1)
                     .map_err(|error| processing(error.into()))?;
-                transform_count += 1;
-                if transform_count > maximum {
+                *transform_count += 1;
+                if *transform_count > maximum {
                     return Err(processing(
                         crate::policy::PolicyViolation::ResourceLimit {
                             resource: crate::policy::resource_name::REFERENCE_TRANSFORMS,
                             maximum,
-                            actual: transform_count,
+                            actual: *transform_count,
                         }
                         .into(),
                     ));
@@ -1104,7 +1136,130 @@ impl<W: Work, Q: Work> SelectedSignature<'_, '_, '_, '_, W, Q> {
                 }
             }
         }
-        Ok(allowed)
+        Ok(())
+    }
+
+    /// Dereference `uri` from `owner` and run the `XMLDSig` `Transform`
+    /// children of `transforms`, a `Transforms` element in the namespace the
+    /// instruction's own format declares it in, over it, as the reference
+    /// processing model does (`XMLDSig` 1.1 §4.4.3.2); a node-set result is
+    /// canonicalized with the implicit Canonical XML 1.0. This serves an
+    /// instruction outside `SignedInfo`, such as a TS 101 903 V1.1.1
+    /// `HashDataInfo`, whose output another signer stamped: the replay
+    /// authenticates nothing by itself.
+    ///
+    /// # Errors
+    /// Returns a processing error for a foreign or stale identity, a URI or
+    /// transform the operation's policy refuses, reentrancy, or resource
+    /// refusal. Preserves receiver errors separately.
+    pub fn replay_transforms<E>(
+        &self,
+        owner: NodeIdentity,
+        uri: &str,
+        transforms: Option<(NodeIdentity, &str)>,
+        receiver: &mut impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<ReplayOutcome, ReplayError<E>> {
+        let processing = ReplayError::Processing;
+        self.work
+            .charge_work(1)
+            .map_err(|error| processing(error.into()))?;
+        if self.session.replay_active.get() {
+            return Err(processing(DsigError::InvalidRequest {
+                reason: "reentrant replay would reset the active transform chain",
+            }));
+        }
+        let view = self.session.view;
+        let node = view
+            .resolve_node(owner)
+            .map_err(|error| processing(error.into()))?;
+        if !self.session.context.policy.uris.references.allows(uri) {
+            return Err(processing(
+                crate::policy::PolicyViolation::Uri {
+                    operation: "transform replay",
+                    reason: "URI class is not permitted",
+                }
+                .into(),
+            ));
+        }
+        let allowed = self
+            .session
+            .context
+            .policy
+            .transforms
+            .allowed_algorithms
+            .as_ref();
+        let container = transforms
+            .map(|(identity, namespace)| view.resolve_node(identity).map(|node| (node, namespace)))
+            .transpose()
+            .map_err(|error| processing(error.into()))?;
+        let scratch = crate::c14n::scratch::Accounted(self.work);
+        let parsed = if let Some((container, namespace)) = container {
+            let maximum = self
+                .session
+                .context
+                .policy
+                .resources
+                .max_transforms_per_reference;
+            self.validate_transform_container(container, allowed, maximum, &mut 0)?;
+            super::super::transforms::parse_reference_transforms_in(
+                container,
+                namespace,
+                &mut self.session.budgets.xpath_parse.borrow_mut(),
+                &scratch,
+            )
+            .map_err(|error| replay_parse_failure(error.into()))?
+        } else {
+            use crate::c14n::scratch::Scratch as _;
+            scratch.values()
+        };
+        if transform_chain_uses_implicit_c14n(classify_uri(uri) == UriClass::External, &parsed) {
+            enforce_transform_allowed(allowed, DEFAULT_IMPLICIT_C14N_URI).map_err(processing)?;
+        }
+        let budget = &self.session.budgets.transforms;
+        let Some(data) = self.session.resolver.replay_input_from_with_budget(
+            uri,
+            node,
+            budget.node_set_materialization(),
+            budget.xml_base_resolution(),
+            &scratch,
+        )?
+        else {
+            return Ok(ReplayOutcome::Unavailable(ExternalResourceUnavailable {
+                reference: owner,
+            }));
+        };
+        // XMLDSig 1.1 §6.6.4: an enveloped-signature transform removes the
+        // Signature that contains it, here the one around its Transforms.
+        let enveloped_signature = super::super::transforms::enveloped_signature_for_reference(
+            container.map_or(node, |(container, _)| container),
+            &parsed,
+            || {
+                self.work
+                    .charge_work(1)
+                    .map_err(|error| processing(error.into()))
+            },
+        )?;
+        // Cleared on every exit, a panicking receiver's included, so a caller
+        // that catches the panic can replay again.
+        let _active = ActiveReplay::start(&self.session.replay_active);
+        super::super::transforms::replay_reference_transforms(
+            node,
+            enveloped_signature,
+            data,
+            &parsed,
+            &super::super::transforms::ReplayExecution {
+                options: self.session.context.transform_options(),
+                budget,
+                work: self.work,
+            },
+            ReplayTerminal {
+                work: self.work,
+                receiver,
+                timestamp: None,
+                error: core::marker::PhantomData,
+            },
+        )?;
+        Ok(ReplayOutcome::Complete)
     }
 
     fn replay_instruction<E>(

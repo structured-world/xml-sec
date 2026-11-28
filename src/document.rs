@@ -1548,6 +1548,118 @@ impl XmlDocument {
         })
     }
 
+    /// The element that the open transaction appended as the last child of
+    /// `parent`, an element of the generation the transaction started from,
+    /// when that insertion is the transaction's only change: the current
+    /// serialization is the starting one with exactly this element's markup
+    /// inserted before `parent`'s end tag. The identity is of the current
+    /// generation.
+    ///
+    /// # Errors
+    /// [`XmlDocumentError::ForeignIdentity`] or
+    /// [`XmlDocumentError::StaleIdentity`] as for [`Self::carry`],
+    /// [`XmlDocumentError::MissingNode`] when `parent` is not an element with
+    /// an end tag, [`XmlDocumentError::InvalidReplacement`] when the change is
+    /// anything else, and
+    /// [`XmlDocumentError::TreeBackedSerialization`] for a tree-backed
+    /// document, which keeps no starting serialization to compare.
+    #[cfg(feature = "xmldsig-sign")]
+    pub fn appended_child(&self, parent: NodeIdentity) -> Result<NodeIdentity, XmlDocumentError> {
+        if parent.document != self.identity {
+            return Err(XmlDocumentError::ForeignIdentity);
+        }
+        let stale = || XmlDocumentError::StaleIdentity {
+            identity: parent.generation,
+            current: self.generation,
+        };
+        if parent.generation == self.generation {
+            return Err(stale());
+        }
+        let base = self
+            .atomic
+            .iter()
+            .find_map(|frame| match frame {
+                AtomicMutation::Replaced(cell, start) if *start == parent.generation => Some(cell),
+                _ => None,
+            })
+            .ok_or_else(stale)?;
+        #[cfg(feature = "external-tree")]
+        if self.tree.is_some() {
+            return Err(XmlDocumentError::TreeBackedSerialization);
+        }
+        let other =
+            || XmlDocumentError::InvalidReplacement("the change is not one appended child".into());
+        base.with_dependent(|old, earlier| {
+            let element = SemanticDocument::node(&earlier.document, parent.semantic_id)
+                .filter(|node| node.is_element() && node.has_actionable_range())
+                .ok_or(XmlDocumentError::MissingNode)?;
+            let range = element.range();
+            let (content, _, empty) = element_content_range(&old[range.clone()])?;
+            if empty {
+                return Err(XmlDocumentError::MissingNode);
+            }
+            // The insertion point: the start of `parent`'s end tag.
+            let at = range.start + content.end;
+            self.with_view(|view| {
+                let new = view.xml();
+                let added = new
+                    .len()
+                    .checked_sub(old.len())
+                    .filter(|added| *added > 0)
+                    .ok_or_else(other)?;
+                if new.as_bytes()[..at] != old.as_bytes()[..at]
+                    || new.as_bytes()[at + added..] != old.as_bytes()[at..]
+                {
+                    return Err(other());
+                }
+                // Only the inserted bytes changed, so `parent` still starts
+                // where it did, keeps its name and now spans its old bytes
+                // plus the insertion. An insertion that closes it early and
+                // opens a sibling, `<new/></parent><parent>`, leaves an
+                // element there that ends sooner. Both ends lie within the
+                // new document, so the sum cannot wrap.
+                let name = element.tag_name();
+                let spans = range.start..range.end + added;
+                let enclosing = view
+                    .parsed
+                    .document
+                    .descendants()
+                    .find(|node| {
+                        let found = node.tag_name();
+                        node.is_element()
+                            && node.range() == spans
+                            && found.namespace() == name.namespace()
+                            && found.name() == name.name()
+                    })
+                    .ok_or_else(other)?;
+                // The bytes changed only before `parent`'s end tag, so its
+                // children are the earlier ones, each unchanged, followed by
+                // what the insertion produced: exactly one element is one
+                // appended child. This compares the child sequences, not
+                // where a node's range points, so it holds alike whether a
+                // backend gives the nodes an entity expands to the reference's
+                // range (xmloxide) or the declaration's (roxmltree). An earlier
+                // child the insertion changed, such as text it merged into, is
+                // no longer the same child.
+                let mut after = enclosing.children();
+                for earlier in element.children() {
+                    let current = after.next().ok_or_else(other)?;
+                    if current.node_type() != earlier.node_type()
+                        || current.range() != earlier.range()
+                        || current.text() != earlier.text()
+                    {
+                        return Err(other());
+                    }
+                }
+                let node = after.next().filter(Node::is_element).ok_or_else(other)?;
+                if after.next().is_some() {
+                    return Err(other());
+                }
+                Ok(view.node_identity(node))
+            })
+        })
+    }
+
     /// End the innermost mutation: success leaves one new generation, failure
     /// leaves the starting serialization and generation exactly as they were.
     #[cfg(feature = "xmldsig-sign")]

@@ -49,8 +49,9 @@ pub enum SignatureBuilderError {
         /// Rejected attribute value.
         value: String,
     },
-    /// `XMLDSig` requires at least one reference in `SignedInfo`.
-    #[error("a signature template requires at least one Reference")]
+    /// `XMLDSig` requires at least one reference in `SignedInfo` and in each
+    /// `Manifest` (`XMLDSig` 1.1 §4.4, §5.1).
+    #[error("a SignedInfo or Manifest requires at least one Reference")]
     MissingReference,
     /// `<Object>` content is not one complete element.
     #[error("invalid Object content: {0}")]
@@ -296,6 +297,152 @@ impl ObjectBuilder {
     pub fn encoding(mut self, encoding: impl Into<String>) -> Self {
         self.encoding = Some(encoding.into());
         self
+    }
+}
+
+/// Builder for one `XMLDSig` `<Manifest>` (`XMLDSig` 1.1 §5.1), written with
+/// empty digest values that a signing operation processing Manifests fills.
+///
+/// Its references are checked and written exactly as the ones of
+/// [`SignatureBuilder`] are, so a reference behaves the same in either place.
+///
+/// # Examples
+///
+/// ```
+/// use xml_sec::policy::SigningPolicy;
+/// use xml_sec::xmldsig::{
+///     DigestAlgorithm, ManifestBuilder, ObjectBuilder, ObjectContent, ReferenceBuilder,
+///     UriTypeSet,
+/// };
+///
+/// let mut policy = SigningPolicy::default();
+/// policy.uris.references = UriTypeSet::ALL;
+/// let manifest = ManifestBuilder::new("manifest")
+///     .ns_prefix("ds")
+///     .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("data.txt"))
+///     .build_with_policy(&policy)?;
+/// let object = ObjectBuilder::new(ObjectContent::Element(manifest));
+/// # let _ = object;
+/// # Ok::<(), xml_sec::xmldsig::SignatureBuilderError>(())
+/// ```
+#[derive(Debug, Clone)]
+pub struct ManifestBuilder {
+    id: String,
+    ns_prefix: Option<String>,
+    references: Vec<ReferenceBuilder>,
+}
+
+impl ManifestBuilder {
+    /// A `Manifest` with the `Id` a reference to it names.
+    #[must_use]
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            ns_prefix: None,
+            references: Vec::new(),
+        }
+    }
+
+    /// Write the `XMLDSig` elements with `prefix` instead of a default
+    /// namespace declaration.
+    #[must_use]
+    pub fn ns_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.ns_prefix = Some(prefix.into());
+        self
+    }
+
+    /// Append a reference, preserving insertion order.
+    #[must_use]
+    pub fn add_reference(mut self, reference: ReferenceBuilder) -> Self {
+        self.references.push(reference);
+        self
+    }
+
+    /// The `Manifest` as one element for an `<Object>`, after checking it
+    /// against the policy snapshot of the signing operation that will fill it.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid `Id` or prefix, no reference, a
+    /// reference or transform `policy` refuses, or a serialization failure.
+    pub fn build_with_policy(
+        &self,
+        policy: &SigningPolicy,
+    ) -> Result<ObjectElement, SignatureBuilderError> {
+        policy.validate()?;
+        let prefix = self.ns_prefix.as_deref();
+        if let Some(prefix) = prefix
+            && !is_namespace_prefix(prefix)
+        {
+            return Err(SignatureBuilderError::InvalidNamespacePrefix(prefix.into()));
+        }
+        // XMLDSig 1.1 §5.1 types Manifest/@Id as ID and requires at least
+        // one Reference.
+        if !is_xml_ncname(&self.id) {
+            return Err(SignatureBuilderError::InvalidId {
+                element: "Manifest",
+                value: self.id.clone(),
+            });
+        }
+        if self.references.is_empty() {
+            return Err(SignatureBuilderError::MissingReference);
+        }
+        policy
+            .resources
+            .validate_reference_count(self.references.len())?;
+        let mut xpath_parse_budget = XPathSignatureParseBudget::from_resources(&policy.resources);
+        #[cfg(feature = "xslt")]
+        let mut stylesheet_bytes = 0usize;
+        for reference in &self.references {
+            validate_reference_transforms(
+                prefix,
+                reference,
+                policy,
+                &mut xpath_parse_budget,
+                #[cfg(feature = "xslt")]
+                &mut stylesheet_bytes,
+            )?;
+        }
+        validate_namespace_bindings(&self.references)?;
+        validate_reference_ids_and_digests(&self.references, Some(&self.id), policy)?;
+        policy.resources.validate_xml_document_len(
+            references_output_len(&self.references).unwrap_or(usize::MAX),
+        )?;
+
+        let mut writer = Writer::new(BoundedOutput {
+            bytes: Vec::new(),
+            maximum: policy.resources.max_xml_document_bytes,
+            refused: None,
+        });
+        let written = self.write(&mut writer, policy);
+        let output = writer.into_inner();
+        if let Some(actual) = output.refused {
+            policy.resources.validate_xml_document_len(actual)?;
+        }
+        written?;
+        ObjectElement::parse(String::from_utf8(output.bytes)?, policy)
+    }
+
+    fn write<W: Write>(
+        &self,
+        writer: &mut Writer<W>,
+        policy: &SigningPolicy,
+    ) -> Result<(), std::io::Error> {
+        let prefix = self.ns_prefix.as_deref();
+        let name = qualified_name(prefix, "Manifest");
+        let namespace = prefix.map_or_else(|| "xmlns".to_owned(), |p| format!("xmlns:{p}"));
+        writer.start(
+            &name,
+            [(namespace.as_str(), XMLDSIG_NS), ("Id", self.id.as_str())],
+        )?;
+        for reference in &self.references {
+            write_reference(
+                writer,
+                prefix,
+                reference,
+                policy.transforms.generated_canonicalization,
+            )?;
+        }
+        writer.end(&name)
     }
 }
 
@@ -754,8 +901,9 @@ impl SignatureBuilder {
         }
         // The template sink stops at the document limit, but escaping builds
         // each value's escaped copy before it reaches the sink: Object content
-        // and attributes, the caller-sized values, are measured escaped first.
-        let mut object_bytes = Some(0_usize);
+        // and attributes and the references' attributes, the caller-sized
+        // values, are measured escaped first.
+        let mut object_bytes = references_output_len(&self.references);
         for object in &self.objects {
             Self::validate_object(object)?;
             object_bytes = object_bytes
@@ -776,7 +924,8 @@ impl SignatureBuilder {
         #[cfg(feature = "xslt")]
         let mut stylesheet_bytes = 0usize;
         for reference in &self.references {
-            self.validate_reference_transforms(
+            validate_reference_transforms(
+                self.ns_prefix.as_deref(),
                 reference,
                 policy,
                 xpath_signature_budget,
@@ -784,7 +933,7 @@ impl SignatureBuilder {
                 &mut stylesheet_bytes,
             )?;
         }
-        self.validate_namespace_bindings()?;
+        validate_namespace_bindings(&self.references)?;
         policy.check_signature_algorithm(self.sign_method)?;
         if policy
             .transforms
@@ -798,18 +947,7 @@ impl SignatureBuilder {
             }
             .into());
         }
-        for reference in &self.references {
-            if let Some(id) = &reference.id
-                && !is_xml_ncname(id)
-            {
-                return Err(SignatureBuilderError::InvalidId {
-                    element: "Reference",
-                    value: id.clone(),
-                });
-            }
-            policy.check_digest_algorithm(reference.digest_method)?;
-        }
-        Ok(())
+        validate_reference_ids_and_digests(&self.references, None, policy)
     }
 
     /// `XMLDSig` 1.1 §4.5 types `Object/@Id` as ID, `MimeType` as string and
@@ -866,150 +1004,211 @@ impl SignatureBuilder {
                 sum.checked_add(lexical::escaped_attribute_len(value)?)
             })
     }
+}
 
-    fn validate_reference_transforms(
-        &self,
-        reference: &ReferenceBuilder,
-        policy: &SigningPolicy,
-        xpath_signature_budget: &mut XPathSignatureParseBudget,
-        #[cfg(feature = "xslt")] stylesheet_bytes: &mut usize,
-    ) -> Result<(), SignatureBuilderError> {
-        validate_signing_reference_uri(&reference.uri, policy)?;
-        // Bound newly introduced owned parameters before cloning the chain
-        // or serializing a generated template.
-        for transform in &reference.transforms {
-            if let Transform::Relationship(selectors) = transform {
-                xpath_signature_budget
-                    .validate_relationship_selectors(selectors)
-                    .map_err(|error| match error {
-                        super::TransformError::Policy(violation) => {
-                            SignatureBuilderError::Policy(violation)
-                        }
-                        other => SignatureBuilderError::InvalidTransform(other.to_string()),
-                    })?;
+/// Escaped bytes of the references' caller-sized attributes (`URI`, `Id`,
+/// `Type`); `None` when it exceeds `usize`. Escaping builds each value's
+/// escaped copy before the bounded sink sees it, so the sum is checked
+/// against the document limit before anything is written.
+fn references_output_len(references: &[ReferenceBuilder]) -> Option<usize> {
+    references.iter().try_fold(0_usize, |sum, reference| {
+        [
+            Some(&reference.uri),
+            reference.id.as_ref(),
+            reference.ref_type.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .try_fold(sum, |sum, value| {
+            sum.checked_add(lexical::escaped_attribute_len(value)?)
+        })
+    })
+}
+
+/// `XMLDSig` 1.1 §4.4.3 types `Reference/@Id` as ID, so each is an `NCName`
+/// declared once, and none is `reserved`; each digest method must be one
+/// `policy` admits.
+fn validate_reference_ids_and_digests(
+    references: &[ReferenceBuilder],
+    reserved: Option<&str>,
+    policy: &SigningPolicy,
+) -> Result<(), SignatureBuilderError> {
+    for (index, reference) in references.iter().enumerate() {
+        if let Some(id) = &reference.id {
+            let repeated = reserved == Some(id.as_str())
+                || references[..index]
+                    .iter()
+                    .any(|earlier| earlier.id.as_ref() == Some(id));
+            if repeated || !is_xml_ncname(id) {
+                return Err(SignatureBuilderError::InvalidId {
+                    element: "Reference",
+                    value: id.clone(),
+                });
             }
-            #[cfg(feature = "xslt")]
-            if let Transform::Xslt(stylesheet) = transform {
-                // Validate the target policy before cloning the transform
-                // chain, not merely before writing the generated template.
-                let actual = stylesheet.markup_len();
-                if actual > policy.resources.max_xslt_workspace_bytes {
+        }
+        policy.check_digest_algorithm(reference.digest_method)?;
+    }
+    Ok(())
+}
+
+/// Check one reference's URI and transform chain against `policy` before it
+/// is written under the `XMLDSig` prefix `ns_prefix`.
+fn validate_reference_transforms(
+    ns_prefix: Option<&str>,
+    reference: &ReferenceBuilder,
+    policy: &SigningPolicy,
+    xpath_signature_budget: &mut XPathSignatureParseBudget,
+    #[cfg(feature = "xslt")] stylesheet_bytes: &mut usize,
+) -> Result<(), SignatureBuilderError> {
+    validate_signing_reference_uri(&reference.uri, policy)?;
+    // A chain already longer than the limit is refused as the caller gave
+    // it, before its parameters are scanned or it is cloned; the generated
+    // count below still catches one the appended canonicalization tips over.
+    let maximum = policy.resources.max_transforms_per_reference;
+    if reference.transforms.len() > maximum {
+        return Err(PolicyViolation::ResourceLimit {
+            resource: crate::policy::resource_name::REFERENCE_TRANSFORMS,
+            maximum,
+            actual: reference.transforms.len(),
+        }
+        .into());
+    }
+    // Bound newly introduced owned parameters before cloning the chain
+    // or serializing a generated template.
+    for transform in &reference.transforms {
+        if let Transform::Relationship(selectors) = transform {
+            xpath_signature_budget
+                .validate_relationship_selectors(selectors)
+                .map_err(|error| match error {
+                    super::TransformError::Policy(violation) => {
+                        SignatureBuilderError::Policy(violation)
+                    }
+                    other => SignatureBuilderError::InvalidTransform(other.to_string()),
+                })?;
+        }
+        #[cfg(feature = "xslt")]
+        if let Transform::Xslt(stylesheet) = transform {
+            // Validate the target policy before cloning the transform
+            // chain, not merely before writing the generated template.
+            let actual = stylesheet.markup_len();
+            if actual > policy.resources.max_xslt_workspace_bytes {
+                return Err(PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XSLT_WORKSPACE_BYTES,
+                    maximum: policy.resources.max_xslt_workspace_bytes,
+                    actual,
+                }
+                .into());
+            }
+            // Check aggregate stylesheet markup before copying it.
+            *stylesheet_bytes = stylesheet_bytes.saturating_add(actual);
+            policy
+                .resources
+                .validate_xml_document_len(*stylesheet_bytes)?;
+        }
+    }
+    let generated_transforms = reference_transforms_for_generation(
+        reference,
+        policy.transforms.generated_canonicalization,
+    );
+    super::transforms::validate_relationship_chain(
+        &generated_transforms,
+        policy.transforms.opc_relationship_edition,
+    )
+    .map_err(|error| SignatureBuilderError::InvalidTransform(error.to_string()))?;
+    if generated_transforms.len() > policy.resources.max_transforms_per_reference {
+        return Err(PolicyViolation::ResourceLimit {
+            resource: crate::policy::resource_name::REFERENCE_TRANSFORMS,
+            maximum: policy.resources.max_transforms_per_reference,
+            actual: generated_transforms.len(),
+        }
+        .into());
+    }
+    let initial_binary = !reference.uri.is_empty() && !reference.uri.starts_with('#');
+    validate_signing_transform_policy(
+        initial_binary,
+        &generated_transforms,
+        policy.transforms.allowed_algorithms.as_ref(),
+    )?;
+    validate_reference_xpath(reference, policy, xpath_signature_budget)?;
+    validate_xpath_namespace_budget_with_resources(
+        &reference.transforms,
+        ns_prefix.map(|prefix| (prefix, XMLDSIG_NS)),
+        &policy.resources,
+    )
+    .map_err(map_transform_validation_error)?;
+    Ok(())
+}
+
+fn validate_reference_xpath(
+    reference: &ReferenceBuilder,
+    policy: &SigningPolicy,
+    xpath_signature_budget: &mut XPathSignatureParseBudget,
+) -> Result<(), SignatureBuilderError> {
+    for transform in &reference.transforms {
+        match transform {
+            Transform::XpathExcludeAllSignatures => {
+                validate_xpath_source(ENVELOPED_SIGNATURE_XPATH_EXPR, xpath_signature_budget)?;
+            }
+            Transform::XPath(xpath) => {
+                validate_xpath_source(xpath.expression(), xpath_signature_budget)?;
+            }
+            Transform::XPathFilter2(filters) => {
+                if filters.is_empty() {
+                    return Err(SignatureBuilderError::InvalidXPath(
+                        "XPath Filter 2.0 requires at least one expression".into(),
+                    ));
+                }
+                if filters.len() > policy.resources.max_xpath_filters {
                     return Err(PolicyViolation::ResourceLimit {
-                        resource: crate::policy::resource_name::XSLT_WORKSPACE_BYTES,
-                        maximum: policy.resources.max_xslt_workspace_bytes,
-                        actual,
+                        resource: crate::policy::resource_name::XPATH_FILTERS,
+                        maximum: policy.resources.max_xpath_filters,
+                        actual: filters.len(),
                     }
                     .into());
                 }
-                // Check aggregate stylesheet markup before copying it.
-                *stylesheet_bytes = stylesheet_bytes.saturating_add(actual);
-                policy
-                    .resources
-                    .validate_xml_document_len(*stylesheet_bytes)?;
+                for filter in filters {
+                    validate_xpath_source(filter.xpath().expression(), xpath_signature_budget)?;
+                }
             }
+            _ => {}
         }
-        let generated_transforms = reference_transforms_for_generation(
-            reference,
-            policy.transforms.generated_canonicalization,
-        );
-        super::transforms::validate_relationship_chain(
-            &generated_transforms,
-            policy.transforms.opc_relationship_edition,
-        )
-        .map_err(|error| SignatureBuilderError::InvalidTransform(error.to_string()))?;
-        if generated_transforms.len() > policy.resources.max_transforms_per_reference {
-            return Err(PolicyViolation::ResourceLimit {
-                resource: crate::policy::resource_name::REFERENCE_TRANSFORMS,
-                maximum: policy.resources.max_transforms_per_reference,
-                actual: generated_transforms.len(),
-            }
-            .into());
-        }
-        let initial_binary = !reference.uri.is_empty() && !reference.uri.starts_with('#');
-        validate_signing_transform_policy(
-            initial_binary,
-            &generated_transforms,
-            policy.transforms.allowed_algorithms.as_ref(),
-        )?;
-        Self::validate_reference_xpath(reference, policy, xpath_signature_budget)?;
-        validate_xpath_namespace_budget_with_resources(
-            &reference.transforms,
-            self.ns_prefix.as_deref().map(|prefix| (prefix, XMLDSIG_NS)),
-            &policy.resources,
-        )
-        .map_err(map_transform_validation_error)?;
-        Ok(())
     }
+    Ok(())
+}
 
-    fn validate_reference_xpath(
-        reference: &ReferenceBuilder,
-        policy: &SigningPolicy,
-        xpath_signature_budget: &mut XPathSignatureParseBudget,
-    ) -> Result<(), SignatureBuilderError> {
-        for transform in &reference.transforms {
-            match transform {
-                Transform::XpathExcludeAllSignatures => {
-                    validate_xpath_source(ENVELOPED_SIGNATURE_XPATH_EXPR, xpath_signature_budget)?;
-                }
-                Transform::XPath(xpath) => {
-                    validate_xpath_source(xpath.expression(), xpath_signature_budget)?;
-                }
-                Transform::XPathFilter2(filters) => {
-                    if filters.is_empty() {
-                        return Err(SignatureBuilderError::InvalidXPath(
-                            "XPath Filter 2.0 requires at least one expression".into(),
-                        ));
-                    }
-                    if filters.len() > policy.resources.max_xpath_filters {
-                        return Err(PolicyViolation::ResourceLimit {
-                            resource: crate::policy::resource_name::XPATH_FILTERS,
-                            maximum: policy.resources.max_xpath_filters,
-                            actual: filters.len(),
-                        }
-                        .into());
-                    }
-                    for filter in filters {
-                        validate_xpath_source(filter.xpath().expression(), xpath_signature_budget)?;
-                    }
-                }
-                _ => {}
-            }
+fn validate_namespace_bindings(
+    references: &[ReferenceBuilder],
+) -> Result<(), SignatureBuilderError> {
+    // An XPath parameter that rebinds the signature prefix is written in a
+    // local default namespace instead, so any NCName prefix is admitted.
+    for (prefix, uri) in references.iter().flat_map(|reference| {
+        reference
+            .transforms
+            .iter()
+            .flat_map(|transform| match transform {
+                Transform::XPath(xpath) => xpath.namespaces().iter().collect::<Vec<_>>(),
+                Transform::XPathFilter2(filters) => filters
+                    .iter()
+                    .flat_map(|filter| filter.xpath().namespaces().iter())
+                    .collect(),
+                _ => Vec::new(),
+            })
+    }) {
+        // Namespaces in XML reserves the declaration namespace and both
+        // sides of the `xml` binding; prefixed declarations cannot be empty.
+        if uri.is_empty() || uri == XMLNS_NS || !uri.chars().all(is_xml_1_0_character) {
+            return Err(SignatureBuilderError::InvalidNamespaceUri(uri.clone()));
         }
-        Ok(())
-    }
-
-    fn validate_namespace_bindings(&self) -> Result<(), SignatureBuilderError> {
-        // An XPath parameter that rebinds the signature prefix is written in a
-        // local default namespace instead, so any NCName prefix is admitted.
-        for (prefix, uri) in self.references.iter().flat_map(|reference| {
-            reference
-                .transforms
-                .iter()
-                .flat_map(|transform| match transform {
-                    Transform::XPath(xpath) => xpath.namespaces().iter().collect::<Vec<_>>(),
-                    Transform::XPathFilter2(filters) => filters
-                        .iter()
-                        .flat_map(|filter| filter.xpath().namespaces().iter())
-                        .collect(),
-                    _ => Vec::new(),
-                })
-        }) {
-            // Namespaces in XML reserves the declaration namespace and both
-            // sides of the `xml` binding; prefixed declarations cannot be empty.
-            if uri.is_empty() || uri == XMLNS_NS || !uri.chars().all(is_xml_1_0_character) {
-                return Err(SignatureBuilderError::InvalidNamespaceUri(uri.clone()));
-            }
-            if prefix == "xmlns"
-                || (prefix == "xml") != (uri == XML_NS)
-                || (prefix != "xml" && !is_namespace_prefix(prefix))
-            {
-                return Err(SignatureBuilderError::InvalidNamespacePrefix(
-                    prefix.clone(),
-                ));
-            }
+        if prefix == "xmlns"
+            || (prefix == "xml") != (uri == XML_NS)
+            || (prefix != "xml" && !is_namespace_prefix(prefix))
+        {
+            return Err(SignatureBuilderError::InvalidNamespacePrefix(
+                prefix.clone(),
+            ));
         }
-        Ok(())
     }
+    Ok(())
 }
 
 fn validate_xpath_source(
