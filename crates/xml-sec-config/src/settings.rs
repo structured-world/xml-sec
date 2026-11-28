@@ -667,7 +667,8 @@ fn verification(p: &mut VerificationPolicy, t: &Table, syntax_only: bool) -> Res
                     value,
                     key,
                     XadesSyntax::En319132,
-                    XadesSyntax::WithTs101903V122
+                    XadesSyntax::WithTs101903V122,
+                    XadesSyntax::WithHistoricalVocabularies
                 );
             }
             _ => signature_fields!(p, key, value, TransformTable::Processing),
@@ -1605,7 +1606,8 @@ fn direction(field: &str, old: Option<&Value>, new: Option<&Value>) -> Direction
             ),
         )
         | (Some("AllSupported" | "Sha1Supported"), Some("SecureSupported"))
-        | (Some("AllSupported"), Some("Sha1Supported")) => Restrictive,
+        | (Some("AllSupported"), Some("Sha1Supported"))
+        | (Some("WithHistoricalVocabularies"), Some("WithTs101903V122")) => Restrictive,
         _ => Relaxing,
     }
 }
@@ -1869,6 +1871,11 @@ mod tests {
                 "verification.xades_syntax",
                 text("En319132"),
                 text("WithTs101903V122"),
+            ),
+            (
+                "verification.xades_syntax",
+                text("WithTs101903V122"),
+                text("WithHistoricalVocabularies"),
             ),
             (
                 "verification.key_trust.trust_anchor_signer",

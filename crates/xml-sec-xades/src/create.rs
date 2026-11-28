@@ -12,7 +12,7 @@ use crate::content::{self, ContentError, ContentRequests, Replayed};
 use crate::draft::{Draft, DraftError};
 use crate::placement::{self, DS, PlacementError, XADES};
 use crate::properties::{
-    Bound, Planned, Policy, Properties, PropertyDraft, PropertyError, SignaturePolicy,
+    Bound, Planned, Policy, Profile, Properties, PropertyDraft, PropertyError, SignaturePolicy,
     policy_digest_method,
 };
 use alloc::{collections::BTreeMap, format, string::String, vec::Vec};
@@ -347,6 +347,10 @@ pub enum CreateError {
     /// No `Signature` element has the parent ID.
     #[error("no Signature has the ID {0:?}")]
     UnknownSignature(String),
+    /// An evidence record seals the parent signature, which then takes no
+    /// countersignature (ETSI TS 119 132-3 §5.1.1).
+    #[error("signature {0:?} is sealed by an evidence record")]
+    Sealed(String),
     /// No element has the ID the placement names, or it has no parent to
     /// place a sibling in.
     #[error("no element to place the signature at: {0:?}")]
@@ -386,6 +390,11 @@ pub enum CreateError {
     /// (EN 319 132-1 §5.2.10).
     #[error("a policy store needs an explicit signature policy")]
     PolicyStoreWithoutPolicy,
+    /// A historical profile carries a signature policy computed from its
+    /// document beside the signing certificate, and no other optional
+    /// property, content timestamp or countersignature.
+    #[error("the historical profile carries no such property")]
+    HistoricalProperty,
     /// A content timestamp could not be requested, checked or kept.
     #[error(transparent)]
     Content(Box<ContentError>),
@@ -452,6 +461,7 @@ impl From<PlacementError> for CreateError {
         match error {
             PlacementError::UnknownSignature(id) => Self::UnknownSignature(id),
             PlacementError::NotXades(id) => Self::NotXades(id),
+            PlacementError::Sealed(id) => Self::Sealed(id),
             PlacementError::Tree(error) => Self::Tree(error),
             PlacementError::Scalar(error) => Self::Scalar(error),
             PlacementError::Resource(error) => Self::Resource(error),
@@ -500,7 +510,8 @@ pub fn create<W: Work>(
     let stamps = request.properties.content_timestamps;
     if stamps.is_empty() {
         let properties = layout.properties(signer, &request, None, work)?;
-        let template = layout.template(signer, request.objects, properties)?;
+        let historical = request.properties.historical;
+        let template = layout.template(signer, request.objects, properties, historical)?;
         return document.transaction(|document| {
             let placed = Placed::new(
                 document,
@@ -512,13 +523,23 @@ pub fn create<W: Work>(
                 work,
             )?;
             placed.sign(document, &template, signer.policy, KeptInputs::NONE)?;
-            assess(
-                document,
-                &layout.ids.signature,
-                request.id_attributes,
-                assessment,
-                work,
-            )
+            match historical {
+                Some(profile) => assess_historical(
+                    document,
+                    &layout.ids.signature,
+                    profile,
+                    request.id_attributes,
+                    assessment,
+                    work,
+                ),
+                None => assess(
+                    document,
+                    &layout.ids.signature,
+                    request.id_attributes,
+                    assessment,
+                    work,
+                ),
+            }
         });
     }
     let replayed = layout.replayed(document, signer, &key_info, &request, work)?;
@@ -532,7 +553,8 @@ pub fn create<W: Work>(
         |checked| {
             let properties =
                 layout.properties(signer, &request, Some((&replayed, checked)), work)?;
-            let template = layout.template(signer, request.objects.clone(), properties)?;
+            // Content timestamps exist only in the EN 319 132-1 vocabulary.
+            let template = layout.template(signer, request.objects.clone(), properties, None)?;
             document.transaction(|document| {
                 let placed = Placed::new(
                     document,
@@ -782,6 +804,19 @@ impl<'r> Layout<'r> {
             )
             .collect();
         let target = format!("#{}", self.ids.signature);
+        if let Some(profile) = request.properties.historical {
+            refuse_beyond_policy(&request.properties, content.is_some())?;
+            let (&leaf, _) = signer.chain.split_first().ok_or(CreateError::EmptyChain)?;
+            return historical_properties(
+                signer,
+                profile,
+                [&self.ids.properties, &target, request.signing_time],
+                leaf,
+                &described,
+                request.properties.policy.as_ref(),
+                work,
+            );
+        }
         signed_properties(
             signer,
             &self.ids,
@@ -805,6 +840,7 @@ impl<'r> Layout<'r> {
         signer: &Signer<'_>,
         data: Vec<DataObject<'_>>,
         properties: ObjectElement,
+        historical: Option<Profile>,
     ) -> Result<SignatureBuilder, CreateError> {
         let mut skeleton = signature_template(signer, &self.ids);
         if self.signs_key_info {
@@ -817,7 +853,7 @@ impl<'r> Layout<'r> {
             &self.ids.key_info,
             skeleton,
         )?
-        .add_reference(properties_reference(signer, &self.ids))
+        .add_reference(properties_reference(signer, &self.ids, historical))
         .add_object(ObjectBuilder::new(ObjectContent::Element(properties))))
     }
 
@@ -833,7 +869,8 @@ impl<'r> Layout<'r> {
         work: &W,
     ) -> Result<Replayed<'_>, CreateError> {
         let properties = self.properties(signer, request, None, work)?;
-        let template = self.template(signer, request.objects.clone(), properties)?;
+        // Content timestamps exist only in the EN 319 132-1 vocabulary.
+        let template = self.template(signer, request.objects.clone(), properties, None)?;
         let placed = Placed::new(
             document,
             signer,
@@ -1269,6 +1306,11 @@ pub fn countersign<W: Work>(
     if countersignature.properties.qualifies_objects() {
         return Err(CreateError::NoQualifiedObject);
     }
+    // A historical profile carries no countersignature; writing the EN
+    // 319 132-1 one instead would not be the form asked for.
+    if countersignature.properties.historical.is_some() {
+        return Err(CreateError::HistoricalProperty);
+    }
     let target = format!("#{}", ids.signature);
     let properties = signed_properties(
         signer,
@@ -1292,7 +1334,7 @@ pub fn countersign<W: Work>(
                 .ref_type(ReferenceKind::CounterSignature.type_uri())
                 .transform(Transform::C14n(signer.canonicalization.clone())),
         )
-        .add_reference(properties_reference(signer, &ids))
+        .add_reference(properties_reference(signer, &ids, None))
         .add_object(ObjectBuilder::new(ObjectContent::Element(properties)))
         .build_template_with_policy(signer.policy)?;
     let key_info = key_info(signer)?;
@@ -1594,6 +1636,90 @@ fn signed_properties<W: Work>(
     Ok(ObjectElement::parse(markup, signer.policy)?)
 }
 
+/// Refuse every optional property a historical profile does not carry here:
+/// it signs a signature policy beside the signing certificate, and nothing
+/// else (`content` for content timestamps or a countersignature). Nor does
+/// TS 101 903 know a policy digested as its specification defines, or the
+/// specification qualifier: EN 319 132-1 §5.2.9.2 introduced both, so a rule
+/// the caller supplies for them has nothing to apply to.
+fn refuse_beyond_policy(properties: &Properties<'_>, content: bool) -> Result<(), CreateError> {
+    let specified_only = matches!(
+        properties.policy,
+        Some(Policy::Document(SignaturePolicy::Explicit(ref explicit)))
+            if matches!(explicit.transform, produce::PolicyTransform::InSpecification(_))
+                || explicit.qualifiers.iter().any(|qualifier| {
+                    matches!(qualifier, produce::PolicyQualifier::DocumentSpecification(_))
+                })
+    );
+    let beyond = specified_only
+        || properties.policy_store.is_some()
+        || properties.production_place.is_some()
+        || properties.signer_role.is_some()
+        || !properties.commitments.is_empty()
+        || !properties.formats.is_empty()
+        || !properties.content_timestamps.is_empty()
+        || content
+        || matches!(properties.policy, Some(Policy::Supplied(_)));
+    if beyond {
+        return Err(CreateError::HistoricalProperty);
+    }
+    Ok(())
+}
+
+/// The `QualifyingProperties` of a new signature in the historical
+/// vocabulary of `profile`: `SigningTime`, `SigningCertificate` with the
+/// issuer and serial of `leaf`, the signature policy (which V1.1.1 requires)
+/// and each object's `DataObjectFormat`.
+fn historical_properties<W: Work>(
+    signer: &Signer<'_>,
+    profile: Profile,
+    [properties_id, target, signing_time]: [&str; 3],
+    leaf: &[u8],
+    objects: &[produce::DataObject<'_>],
+    policy: Option<&Policy<'_>>,
+    work: &W,
+) -> Result<ObjectElement, CreateError> {
+    let parser = Parser::der(work.memory().clone());
+    let certificate = Certificate::read(&parser, leaf, 0).map_err(CreateError::Certificate)?;
+    if certificate.as_bytes().len() != leaf.len() {
+        return Err(CreateError::TrailingBytes);
+    }
+    let digest = compute_digest_with_provider(signer.provider, signer.digest, leaf, work.memory())?;
+    let basic = produce::Basic {
+        target,
+        signed_properties_id: properties_id,
+        signing_time,
+        certificate: &certificate,
+        certificate_digest_method: signer.digest.uri(),
+        certificate_digest: &digest,
+        objects,
+        counter_signature: None,
+    };
+    let mut writer = PropertyDraft {
+        draft: Draft::with_prefixes(&[
+            (DS, signer.prefixes.ds),
+            (profile.namespace(), signer.prefixes.xades),
+        ])?,
+        plan: &[],
+        provider: signer.provider,
+        policy: signer.policy,
+        bound: Bound::None,
+        // A specified digest rule serves only the EN 319 132-1 policy
+        // transform, which `refuse_beyond_policy` refuses for these profiles.
+        specified: None,
+        content: None,
+    };
+    let policy = match policy {
+        Some(Policy::Document(policy)) => Some(policy),
+        _ => None,
+    };
+    basic
+        .write_historical(profile, policy, &mut writer, work)
+        .map_err(CreateError::Properties)?;
+    let (markup, _) = writer.draft.finish()?;
+    Ok(ObjectElement::parse(markup, signer.policy)?)
+}
+
 /// The signature skeleton every new signature shares.
 fn signature_template(signer: &Signer<'_>, ids: &Ids) -> SignatureBuilder {
     let template = SignatureBuilder::new(signer.canonicalization.clone(), signer.method)
@@ -1607,11 +1733,20 @@ fn signature_template(signer: &Signer<'_>, ids: &Ids) -> SignatureBuilder {
     }
 }
 
-/// EN 319 132-1 §4.4.2: a typed reference covers the complete `SignedProperties`.
-fn properties_reference(signer: &Signer<'_>, ids: &Ids) -> ReferenceBuilder {
+/// EN 319 132-1 §4.4.2: a typed reference covers the complete
+/// `SignedProperties`; a historical profile names its own `Type`.
+fn properties_reference(
+    signer: &Signer<'_>,
+    ids: &Ids,
+    historical: Option<Profile>,
+) -> ReferenceBuilder {
+    let kind = historical.map_or(
+        ReferenceKind::SignedProperties.type_uri(),
+        Profile::signed_properties_type,
+    );
     ReferenceBuilder::new(signer.digest)
         .uri(format!("#{}", ids.properties))
-        .ref_type(ReferenceKind::SignedProperties.type_uri())
+        .ref_type(kind)
         .transform(Transform::C14n(signer.canonicalization.clone()))
 }
 
@@ -1679,6 +1814,53 @@ fn assess<W: Work>(
         Outcome::Assessed(true) => Ok(()),
         outcome => Err(CreateError::Unmet(outcome.map(|_| ()))),
     }
+}
+
+/// [`assess`] for a signature in the historical vocabulary of `profile`,
+/// which must meet the BES requirements of that profile (TS 101 903 V1.2.2
+/// §4.4.1): signed properties bound to the signature and a protected signing
+/// certificate holding the verifying key.
+fn assess_historical<W: Work>(
+    document: &XmlDocument,
+    signature: &str,
+    profile: Profile,
+    registrations: &[IdAttributeRegistration],
+    assessment: &Assessment<'_, '_>,
+    work: &W,
+) -> Result<(), CreateError> {
+    let carried = Carried::new::<_, CreateError>(document, assessment.request, work)?;
+    let outcome = with_verified_request(
+        document,
+        assessment.context,
+        &carried.request(assessment.request),
+        work,
+        |session| {
+            if !session.evidence().accepted(document)? {
+                return Ok(Err(CreateError::NotAccepted));
+            }
+            let Some(node) = session.view().node_for_id(signature, registrations) else {
+                return Ok(Err(CreateError::UnknownSignature(signature.into())));
+            };
+            Ok(crate::ts101903::validate_historical(
+                &session,
+                node,
+                profile,
+                assessment.certificates,
+                bes_met,
+            )
+            .map_err(CreateError::from))
+        },
+    )??;
+    match outcome {
+        Outcome::Assessed(true) => Ok(()),
+        outcome => Err(CreateError::Unmet(outcome.map(|_| ()))),
+    }
+}
+
+/// Whether the historical signature meets its BES requirements; a function
+/// item is general over the report's lifetime where a method path is not.
+fn bes_met(report: &crate::ts101903::Ts101903Report<'_>) -> bool {
+    report.bes_met()
 }
 
 /// The node requirements of a verification request, carried into the current

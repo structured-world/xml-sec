@@ -20,10 +20,13 @@ mod tests;
 
 /// Prefixes for the namespaces the shared rules emit, so the draft reads
 /// like the documents other implementations produce.
-const KNOWN_PREFIXES: [(&str, &str); 3] = [
+const KNOWN_PREFIXES: [(&str, &str); 5] = [
     ("http://www.w3.org/2000/09/xmldsig#", "ds"),
     ("http://uri.etsi.org/01903/v1.3.2#", "xades"),
     ("http://uri.etsi.org/01903/v1.4.1#", "xades141"),
+    // ETSI TS 119 132-3 §4.1 Table 1.
+    ("http://uri.etsi.org/19132/v1.1.1#", "xadesen"),
+    ("urn:ietf:params:xml:ns:ers", "ers"),
 ];
 
 /// A construction event the draft refused; nothing of it was written.
@@ -86,6 +89,9 @@ pub struct Draft {
     /// Prefixes the caller chose, as (namespace, prefix), ahead of the known
     /// ones; an empty prefix writes the namespace as the default one.
     chosen: Vec<(&'static str, String)>,
+    /// For a draft of sibling elements, where each completed one after the
+    /// first starts in the output.
+    siblings: Option<Vec<usize>>,
 }
 
 /// The namespace the `xml` prefix is bound to (Namespaces in XML 1.0 §3).
@@ -95,11 +101,106 @@ const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
 /// XML 1.0 §3).
 const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
 
+/// Why a PKIX value could not be written as the text of an element.
+#[derive(Debug)]
+pub(crate) enum ValueError {
+    /// The draft refused the text.
+    Draft(DraftError),
+    /// The distinguished name could not be rendered.
+    Name(structured_pkix::Error),
+    /// A negative integer has no `xsd:integer` form these properties allow
+    /// (RFC 5280 §4.1.2.2 and §5.2.3 make serials and CRL numbers positive).
+    Negative,
+}
+
+impl From<DraftError> for ValueError {
+    fn from(error: DraftError) -> Self {
+        Self::Draft(error)
+    }
+}
+
+impl Draft {
+    /// The text of `name` as `XMLDSig` 1.1 §4.5.4.1 renders an
+    /// `X509IssuerName`: the RFC 4514 string.
+    pub(crate) fn name_text<Q: Work>(
+        &mut self,
+        name: &structured_pkix::Name<'_>,
+        work: &Q,
+    ) -> Result<(), ValueError> {
+        let memory = work.memory();
+        let text = name.rfc4514_readable(memory).map_err(ValueError::Name)?;
+        let text = text.as_str(memory).map_err(|cause| {
+            ValueError::Name(structured_pkix::Error::resource(cause, "name", 0))
+        })?;
+        self.value_text(text, Datatype::String, work)
+    }
+
+    /// The text of a non-negative `value` as an `xsd:integer`.
+    pub(crate) fn integer_text<Q: Work>(
+        &mut self,
+        value: structured_asn1::Integer<'_>,
+        work: &Q,
+    ) -> Result<(), ValueError> {
+        if value.is_negative() {
+            return Err(ValueError::Negative);
+        }
+        work.charge_work(value.as_bytes().len() as u64)
+            .map_err(DraftError::from)?;
+        let decimal = xml_sec::xmldsig::unsigned_decimal(value.as_bytes());
+        self.value_text(&decimal, Datatype::String, work)
+    }
+
+    /// The text of `value`, its UTC label as an `xsd:dateTime` with `Z`.
+    pub(crate) fn time_text<Q: Work>(
+        &mut self,
+        value: structured_pkix::Time,
+        work: &Q,
+    ) -> Result<(), ValueError> {
+        let text = format!("{value}");
+        self.value_text(&text, Datatype::ZonedDateTime, work)
+    }
+
+    fn value_text<Q: Work>(
+        &mut self,
+        lexical: &str,
+        datatype: Datatype,
+        work: &Q,
+    ) -> Result<(), ValueError> {
+        Ok(self.write(Event::Text(Value { lexical, datatype }), work)?)
+    }
+}
+
 impl Draft {
     /// An empty draft; it allocates nothing until the first event.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An empty draft of one or more sibling elements, each declaring every
+    /// namespace it uses; take them with [`Draft::finish_siblings`].
+    pub(crate) fn siblings() -> Self {
+        Self {
+            siblings: Some(Vec::new()),
+            ..Self::default()
+        }
+    }
+
+    /// The finished sibling elements, in order.
+    ///
+    /// # Errors
+    /// Returns [`DraftError::Order`] unless at least one element was
+    /// completed and the last one is complete.
+    pub(crate) fn finish_siblings(self) -> Result<Vec<String>, DraftError> {
+        let starts = self.siblings.clone().unwrap_or_default();
+        let (markup, _) = self.finish()?;
+        let mut elements = Vec::with_capacity(starts.len() + 1);
+        let mut from = 0;
+        for start in starts.into_iter().chain([markup.len()]) {
+            elements.push(markup[from..start].into());
+            from = start;
+        }
+        Ok(elements)
     }
 
     /// An empty draft writing each namespace of `chosen` with its prefix, an
@@ -307,7 +408,14 @@ impl Draft {
 
     fn begin(&mut self, name: Name<'static>, work: &impl Work) -> Result<(), DraftError> {
         if self.complete {
-            return Err(DraftError::Order("a second element"));
+            let written = self.output.as_ref().map_or(0, |output| output.len());
+            let Some(starts) = &mut self.siblings else {
+                return Err(DraftError::Order("a second element"));
+            };
+            // Every element completed so far closed all of its frames, so the
+            // next one declares its namespaces itself.
+            starts.push(written);
+            self.complete = false;
         }
         if !self.frames.is_empty() {
             self.content(work)?;

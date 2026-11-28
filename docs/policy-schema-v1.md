@@ -47,7 +47,7 @@ a disabled operation. Encryption tables require an encryption-enabled build.
 | `request_selections` | verify, sign | Table of arrays a request may select in place of the policy's value: `same_document_id_semantics` (`Specification`, `XmlSecBarename`, `XmlSecVisa3d`), `ecdsa_signature_value_encodings` (`XmlDsig`, `XmlSecAsn1Der`), `manifest_processing` (`Ignore`, `Process`). Layers intersect; fewer values is restrictive |
 | `detached_digest_attestation` | verify | `Forbidden`, `Accepted` |
 | `timestamp_token_encoding` | verify | `Declared`, `Ber` |
-| `xades_syntax` | verify | `En319132` (ETSI EN 319 132-1 only), `WithTs101903V122` (also ETSI TS 101 903 V1.2.2 qualifying properties and their `SignedProperties` reference type). `XadesConformant` reads both; the others, and every signature this library writes, use EN 319 132-1. V1.2.2 is read only where every layer reads it |
+| `xades_syntax` | verify | `En319132` (ETSI EN 319 132-1 only), `WithTs101903V122` (also ETSI TS 101 903 V1.2.2 qualifying properties and their `SignedProperties` reference type), `WithHistoricalVocabularies` (also TS 101 903 V1.1.1 and the TS 103 171 profile of V1.3.2, which an operation names explicitly). `XadesConformant` reads EN 319 132-1 and V1.2.2; the other profiles use EN 319 132-1. A syntax is read only where every layer reads it |
 | `hmac` | verify, sign | `minimum_key_bits`, `minimum_output_bits` (nonnegative integers) |
 | `uris` | all | Nested table below |
 | `transforms` | verify, sign, decrypt | Nested table below |

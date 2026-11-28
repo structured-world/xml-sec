@@ -8,6 +8,7 @@
 
 use alloc::{format, string::String, vec::Vec};
 use structured_asn1::memory::{MemoryError, Work};
+use structured_xades::evidence::XADES_ERS;
 use xml_sec::IdAttributeRegistration;
 use xml_sec::document::{DocumentView, NodeIdentity, XmlDocument, XmlDocumentError};
 use xml_sec::xmldsig::extension::{self, InspectionError, NodeView, ScalarError, TreeError};
@@ -22,6 +23,10 @@ pub(crate) enum PlacementError {
     UnknownSignature(String),
     /// The signature has no `QualifyingProperties` targeting it.
     NotXades(String),
+    /// An evidence record seals the signature: after its first
+    /// `SealingEvidenceRecords` only edits of the records themselves are
+    /// permitted (ETSI TS 119 132-3 §5.1.1).
+    Sealed(String),
     /// The document could not be read.
     Tree(TreeError),
     /// An attribute could not be read.
@@ -71,6 +76,20 @@ impl Unsigned {
         }
     }
 
+    /// Insert `properties`, complete elements in order, after the existing
+    /// unsigned signature properties, creating the containers they need once.
+    pub(crate) fn insert_all(
+        self,
+        document: &mut XmlDocument,
+        properties: &[String],
+    ) -> Result<(), XmlDocumentError> {
+        // One insertion: a node identity names one generation only.
+        if properties.is_empty() {
+            return Ok(());
+        }
+        self.insert(document, &properties.concat())
+    }
+
     /// Insert `property`, one complete element, after the existing unsigned
     /// signature properties, creating the containers it needs.
     pub(crate) fn insert(
@@ -78,9 +97,20 @@ impl Unsigned {
         document: &mut XmlDocument,
         property: &str,
     ) -> Result<(), XmlDocumentError> {
+        self.insert_in(document, property, XADES)
+    }
+
+    /// [`Self::insert`] creating containers in the `namespace` of the
+    /// signature's vocabulary.
+    pub(crate) fn insert_in(
+        self,
+        document: &mut XmlDocument,
+        property: &str,
+        namespace: &str,
+    ) -> Result<(), XmlDocumentError> {
         let wrapped = || {
             format!(
-                "<xades:UnsignedSignatureProperties xmlns:xades=\"{XADES}\">{property}</xades:UnsignedSignatureProperties>"
+                "<xades:UnsignedSignatureProperties xmlns:xades=\"{namespace}\">{property}</xades:UnsignedSignatureProperties>"
             )
         };
         match self {
@@ -90,7 +120,7 @@ impl Unsigned {
             Self::Absent(qualifying) => document.append_child(
                 qualifying,
                 &format!(
-                    "<xades:UnsignedProperties xmlns:xades=\"{XADES}\"><xades:UnsignedSignatureProperties>{property}</xades:UnsignedSignatureProperties></xades:UnsignedProperties>"
+                    "<xades:UnsignedProperties xmlns:xades=\"{namespace}\"><xades:UnsignedSignatureProperties>{property}</xades:UnsignedSignatureProperties></xades:UnsignedProperties>"
                 ),
             ),
         }
@@ -112,6 +142,17 @@ pub(crate) fn locate<W: Work>(
     registrations: &[IdAttributeRegistration],
     work: &W,
 ) -> Result<Located, PlacementError> {
+    locate_in(view, id, registrations, XADES, work)
+}
+
+/// [`locate`] for qualifying properties in the `namespace` of a vocabulary.
+pub(crate) fn locate_in<W: Work>(
+    view: DocumentView<'_>,
+    id: &str,
+    registrations: &[IdAttributeRegistration],
+    namespace: &str,
+    work: &W,
+) -> Result<Located, PlacementError> {
     let unknown = || PlacementError::UnknownSignature(id.into());
     let signature = view.node_for_id(id, registrations).ok_or_else(unknown)?;
     if !is_element(view, signature, DS, "Signature", work)? {
@@ -124,7 +165,7 @@ pub(crate) fn locate<W: Work>(
             continue;
         }
         for candidate in children(view, object, work)? {
-            if is_element(view, candidate, XADES, "QualifyingProperties", work)?
+            if is_element(view, candidate, namespace, "QualifyingProperties", work)?
                 && attribute(view, candidate, "Target", work)?
                     .is_some_and(|value| value.trim() == target)
             {
@@ -133,15 +174,21 @@ pub(crate) fn locate<W: Work>(
         }
     }
     let qualifying = qualifying.ok_or_else(|| PlacementError::NotXades(id.into()))?;
-    let unsigned = match child(view, qualifying, XADES, "UnsignedProperties", work)? {
+    let unsigned = match child(view, qualifying, namespace, "UnsignedProperties", work)? {
         None => Unsigned::Absent(qualifying),
         Some(properties) => {
-            match child(view, properties, XADES, "UnsignedSignatureProperties", work)? {
+            match child(
+                view,
+                properties,
+                namespace,
+                "UnsignedSignatureProperties",
+                work,
+            )? {
                 Some(signature_properties) => Unsigned::Signature(signature_properties),
                 None => match child(
                     view,
                     properties,
-                    XADES,
+                    namespace,
                     "UnsignedDataObjectProperties",
                     work,
                 )? {
@@ -151,6 +198,14 @@ pub(crate) fn locate<W: Work>(
             }
         }
     };
+    // ETSI TS 119 132-3 §5.1.1: a sealed signature takes no new unsigned
+    // property but the edits of its evidence records.
+    // https://www.etsi.org/deliver/etsi_ts/119100_119199/11913203/01.01.01_60/ts_11913203v010101p.pdf
+    if let Unsigned::Signature(properties) = unsigned
+        && child(view, properties, XADES_ERS, "SealingEvidenceRecords", work)?.is_some()
+    {
+        return Err(PlacementError::Sealed(id.into()));
+    }
     Ok(Located {
         signature,
         qualifying,
@@ -186,6 +241,17 @@ pub(crate) fn child<W: Work>(
         }
     }
     Ok(None)
+}
+
+/// Whether `node` is an element, whatever its name.
+pub(crate) fn is_element_node<W: Work>(
+    view: DocumentView<'_>,
+    node: NodeIdentity,
+    work: &W,
+) -> Result<bool, PlacementError> {
+    Ok(extension::inspect_node(view, node, work, |node| {
+        matches!(node, NodeView::Element { .. })
+    })?)
 }
 
 pub(crate) fn is_element<W: Work>(
