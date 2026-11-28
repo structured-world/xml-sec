@@ -4,6 +4,8 @@
 
 #![cfg(feature = "produce")]
 
+#[path = "../examples/support/asn1_policy.rs"]
+mod asn1_policy;
 #[path = "support/content.rs"]
 mod content;
 
@@ -339,6 +341,47 @@ fn a_historical_timestamp_without_a_trusted_tsa_path_is_not_published() {
 }
 
 #[test]
+fn historical_policy_digested_in_specification_refused_as_beyond_profile() {
+    // EN 319 132-1 §5.2.9.2 introduced the policy digested as its
+    // specification defines; TS 101 903 has no such transform, so even with
+    // the rule supplied a historical signature cannot carry it, and creation
+    // refuses it as beyond the profile before anything is signed.
+    let fixture = Fixture::historical();
+    let der = asn1_policy::document(None);
+    let explicit = ExplicitPolicy {
+        identifier: Identifier {
+            uri: asn1_policy::POLICY_OID,
+            qualifier: Some(Qualifier::Urn),
+            description: None,
+            documentation: &[],
+        },
+        document: &der,
+        digest_method: DigestAlgorithm::Sha256.uri(),
+        transform: PolicyTransform::InSpecification(Identifier {
+            uri: asn1_policy::SPECIFICATION,
+            qualifier: None,
+            description: None,
+            documentation: &[],
+        }),
+        qualifiers: &[],
+    };
+    let refused = fixture.signed(Properties {
+        historical: Some(Profile::PreEn),
+        policy: Some(Policy::Document(SignaturePolicy::Explicit(explicit))),
+        specified: Some(SpecifiedDigest {
+            specification: asn1_policy::SPECIFICATION,
+            rule: DigestRule::Asn1Policy,
+        }),
+        ..Properties::default()
+    });
+    let refused = refused.err().expect("refused");
+    assert!(
+        matches!(refused, CreateError::HistoricalProperty),
+        "{refused:?}"
+    );
+}
+
+#[test]
 fn a_historical_countersignature_is_refused() {
     // The historical profiles carry no countersignature this library writes:
     // asking for one is refused before anything is published, rather than
@@ -428,7 +471,8 @@ fn the_levels_beyond_t_are_refused_in_the_earlier_vocabularies() {
     );
 }
 use xml_sec_xades::properties::{
-    ExplicitPolicy, Identifier, Policy, PolicyTransform, Profile, Properties, SignaturePolicy,
+    DigestRule, ExplicitPolicy, Identifier, Policy, PolicyTransform, Profile, Properties,
+    Qualifier, SignaturePolicy, SpecifiedDigest,
 };
 
 const POLICY: &[u8] = b"<Policy xmlns=\"urn:policy\">Sign</Policy>";
