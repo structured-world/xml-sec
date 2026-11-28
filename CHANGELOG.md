@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/structured-world/xml-sec/compare/v0.7.0...v0.8.0) - 2026-11-28
+
+### Added
+
+- *(xades)* [**breaking**] TS 101 903 levels, historical vocabularies and evidence records ([#523](https://github.com/structured-world/xml-sec/pull/523))
+- *(xades)* [**breaking**] Manifest entries with transforms and supplied Manifests ([#525](https://github.com/structured-world/xml-sec/pull/525))
+- *(xades)* [**breaking**] compare signature creation with EU DSS per test class ([#520](https://github.com/structured-world/xml-sec/pull/520))
+
 ## [0.7.0](https://github.com/structured-world/xml-sec/compare/v0.6.0...v0.7.0) - 2026-11-26
 
 ### Added
