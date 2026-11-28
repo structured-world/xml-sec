@@ -541,21 +541,26 @@ fn historical_v2_references_refused_before_writing() {
             ),
             "{references:?}"
         );
-        let timestamp = request_historical_extended_timestamp(
-            &document,
-            &request,
+        for kind in [
             ExtendedKind::SignatureAndReferences(ReferenceSyntax::V2),
-            Profile::PreEn,
-            assessment,
-            &account(),
-        );
-        assert!(
-            matches!(
-                timestamp,
-                Err(AugmentError::HistoricalReferenceSyntax(ReferenceSyntax::V2))
-            ),
-            "{timestamp:?}"
-        );
+            ExtendedKind::ReferencesOnly(ReferenceSyntax::V2),
+        ] {
+            let timestamp = request_historical_extended_timestamp(
+                &document,
+                &request,
+                kind,
+                Profile::PreEn,
+                assessment,
+                &account(),
+            );
+            assert!(
+                matches!(
+                    timestamp,
+                    Err(AugmentError::HistoricalReferenceSyntax(ReferenceSyntax::V2))
+                ),
+                "{kind:?}: {timestamp:?}"
+            );
+        }
     });
     assert_eq!(document.as_xml(), before);
 }

@@ -372,6 +372,11 @@ pub enum AugmentError {
     /// URI (ETSI TS 101 903 V1.4.2 §8.1.1), but the timestamp has no `Id`.
     #[error("a signed timestamp whose validation data is missing has no Id")]
     TimestampDataUnaddressed,
+    /// A signed content timestamp's missing validation data has no place
+    /// after the last archive timestamp that does not follow another
+    /// timestamp, which readers would take it for (EN 319 132-1 §5.5.1.2).
+    #[error("no place for a signed timestamp's validation data follows no other timestamp")]
+    TimestampDataAmbiguous,
     /// The signer's path is not bound to the signature, so no reference
     /// names its certificates or statuses.
     #[error("the signer's path is not bound to the signature")]

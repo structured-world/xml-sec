@@ -148,7 +148,9 @@ pub fn request_historical_extended_timestamp<W: Work>(
     if profile != Profile::PreEn {
         return Err(AugmentError::HistoricalLevel(profile));
     }
-    if let ExtendedKind::SignatureAndReferences(syntax @ ReferenceSyntax::V2) = kind {
+    if let ExtendedKind::SignatureAndReferences(syntax @ ReferenceSyntax::V2)
+    | ExtendedKind::ReferencesOnly(syntax @ ReferenceSyntax::V2) = kind
+    {
         return Err(AugmentError::HistoricalReferenceSyntax(syntax));
     }
     request_stamp(document, request, (profile, Some(kind)), assessment, work)
@@ -327,6 +329,9 @@ struct ValuesStep {
 enum Placement {
     /// Right after the unsigned timestamp property it serves.
     After(NodeIdentity),
+    /// Right before this unsigned property, its `URI` naming the signed
+    /// content timestamp property it serves.
+    Before(NodeIdentity),
     /// Last among the unsigned signature properties, its `URI` naming the
     /// signed content timestamp property it serves.
     Last,
@@ -367,6 +372,7 @@ impl ValuesStep {
             Placement::After(property) => document.with_view(|view| {
                 xml_sec::xmldsig::extension::next_sibling(view, parent, *property, work)
             })?,
+            Placement::Before(next) => Some(*next),
             Placement::Last => None,
         };
         match next {
@@ -545,11 +551,17 @@ fn census_material<'r, W: Work>(
 }
 
 /// Where the validation data of the timestamp `property` goes, and the `URI`
-/// that names it there (ETSI TS 101 903 V1.4.2 §8.1.1). An unsigned
-/// timestamp's data goes right after it, unless a later archive timestamp
-/// covers that place: inserting there would change that archive's input. A
-/// signed content timestamp's data goes last, its `URI` naming the property
-/// by its `Id`.
+/// that names it there (ETSI TS 101 903 V1.4.2 §8.1.1).
+///
+/// An unsigned timestamp's data goes right after it, unless a later v1.4.1
+/// archive timestamp covers that place: its input takes every property before
+/// it (§8.2), while a V1.3.2 archive timestamp takes only the properties
+/// V1.3.2 names (§7.7.1), which `TimeStampValidationData` is not.
+///
+/// A signed content timestamp's data names the property by its `Id`, after
+/// the last v1.4.1 archive timestamp and never right after a timestamp:
+/// readers associate data with an adjacent timestamp before its `URI` (EN 319
+/// 132-1 §5.5.1.2).
 fn timestamp_placement<W: Work>(
     document: &XmlDocument,
     unsigned: Unsigned,
@@ -563,20 +575,86 @@ fn timestamp_placement<W: Work>(
         ))?;
     document.with_view(|view| {
         let children = placement::children(view, properties, work)?;
+        let archive = |node| placement::is_element(view, node, XADES_141, "ArchiveTimeStamp", work);
         let Some(at) = children.iter().position(|node| *node == property) else {
             let id = placement::attribute(view, property, "Id", work)?
                 .ok_or(AugmentError::TimestampDataUnaddressed)?;
-            return Ok((Placement::Last, Some(format!("#{id}"))));
+            let mut open = 0;
+            for (index, node) in children.iter().enumerate() {
+                if archive(*node)? {
+                    open = index + 1;
+                }
+            }
+            // The last place after `open` whose predecessor is no timestamp.
+            for place in (open..=children.len()).rev() {
+                if place > 0 && adjacent_timestamp(view, children[place - 1], work)? {
+                    continue;
+                }
+                let placement = match children.get(place) {
+                    Some(next) => Placement::Before(*next),
+                    None => Placement::Last,
+                };
+                return Ok((placement, Some(format!("#{id}"))));
+            }
+            return Err(AugmentError::TimestampDataAmbiguous);
         };
         for later in &children[at + 1..] {
-            if placement::is_element(view, *later, XADES_141, "ArchiveTimeStamp", work)?
-                || placement::is_element(view, *later, XADES, "ArchiveTimeStamp", work)?
-            {
+            if archive(*later)? {
                 return Err(AugmentError::TimestampDataCovered);
             }
         }
         Ok((Placement::After(property), None))
     })
+}
+
+/// Where a timestamp's validation data goes, and the `URI` it carries there.
+type Placed = (Placement, Option<String>);
+
+/// The first of the `lacking` timestamps, in the census's order, whose
+/// validation data has a place, with that place. One a later archive
+/// timestamp covers is passed over; only when every one is covered is the
+/// data refused (`TimestampDataCovered`).
+fn placed_timestamp<W: Work>(
+    document: &XmlDocument,
+    unsigned: Unsigned,
+    lacking: &[NodeIdentity],
+    work: &W,
+) -> Result<Option<(NodeIdentity, Placed)>, AugmentError> {
+    let mut covered = false;
+    for property in lacking.iter().copied() {
+        match timestamp_placement(document, unsigned, property, work) {
+            Ok(placed) => return Ok(Some((property, placed))),
+            Err(AugmentError::TimestampDataCovered) => covered = true,
+            Err(error) => return Err(error),
+        }
+    }
+    if covered {
+        Err(AugmentError::TimestampDataCovered)
+    } else {
+        Ok(None)
+    }
+}
+
+/// Whether readers take `node` as the timestamp a following
+/// `TimeStampValidationData` serves (EN 319 132-1 §5.5.1.2; TS 103 171 V2.1.1
+/// §§8-9 keeps the V1.3.2 timestamp names).
+fn adjacent_timestamp<W: Work>(
+    view: xml_sec::document::DocumentView<'_>,
+    node: NodeIdentity,
+    work: &W,
+) -> Result<bool, PlacementError> {
+    for (namespace, local) in [
+        (XADES, "SignatureTimeStamp"),
+        (XADES_141, "ArchiveTimeStamp"),
+        (XADES, "ArchiveTimeStamp"),
+        (XADES, "SigAndRefsTimeStamp"),
+        (XADES, "RefsOnlyTimeStamp"),
+    ] {
+        if placement::is_element(view, node, namespace, local, work)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// A writer that puts `uri` on the first element it begins.
@@ -636,7 +714,10 @@ fn missing_values<W: Work>(
     let session = census.session();
     let work = session.execution();
     let material = |artifact| census_material(census, artifact);
-    // Each timestamp's missing material, gathered for the first such timestamp.
+    // Every timestamp's missing material stays out of the signature's values.
+    // Its validation data goes to the first timestamp, in the census's order,
+    // that has a place for it: one a later archive timestamp covers is passed
+    // over, and another timestamp lacking the same material hosts it instead.
     let mut stamped = work.map();
     let mut timestamp = None;
     let mut timestamp_entries = work.vector();
@@ -646,18 +727,33 @@ fn missing_values<W: Work>(
                 Ts101903Error::TimestampMaterial(cause),
             )))
         })?;
+        let mut lacking = work.vector();
         for row in rows.artifacts() {
             work.charge_work(1)?;
             if !row.is_missing() {
                 continue;
             }
-            let identity = row.artifact.identity();
-            if stamped.try_insert(identity, ())?.is_some() {
-                continue;
+            stamped.try_insert(row.artifact.identity(), ())?;
+            if !lacking.contains(&row.property) {
+                lacking.try_push(row.property)?;
             }
-            let property = *timestamp.get_or_insert(row.property);
-            if property == row.property {
-                timestamp_entries.try_push(material(row.artifact)?)?;
+        }
+        // TimeStampValidationData is the v1.4.1 vocabulary only the TS 103
+        // 171 profile of V1.3.2 reads (TS 103 171 V2.1.1 §8.1.5).
+        if !lacking.is_empty() && profile != Profile::PreEn {
+            return Err(AugmentError::HistoricalLevel(profile));
+        }
+        timestamp = placed_timestamp(document, unsigned, &lacking, work)?;
+        if let Some((property, _)) = &timestamp {
+            let mut chosen = work.map();
+            for row in rows.artifacts() {
+                work.charge_work(1)?;
+                if row.is_missing()
+                    && row.property == *property
+                    && chosen.try_insert(row.artifact.identity(), ())?.is_none()
+                {
+                    timestamp_entries.try_push(material(row.artifact)?)?;
+                }
             }
         }
     }
@@ -695,13 +791,7 @@ fn missing_values<W: Work>(
         values = split.finish()?;
     }
     let timestamp = match timestamp {
-        Some(property) if !timestamp_entries.is_empty() => {
-            // TimeStampValidationData is the v1.4.1 vocabulary only the
-            // TS 103 171 profile of V1.3.2 reads (TS 103 171 V2.1.1 §8.1.5).
-            if profile != Profile::PreEn {
-                return Err(AugmentError::HistoricalLevel(profile));
-            }
-            let (placement, uri) = timestamp_placement(document, unsigned, property, work)?;
+        Some((_, (placement, uri))) if !timestamp_entries.is_empty() => {
             let mut staging = staging();
             write_historical_timestamp_values(
                 &timestamp_entries,

@@ -164,8 +164,18 @@ pub(crate) fn pre_en_levels(
         id_attributes: &[],
     };
     // The archive TSA's own CA and its CRL, which only the renewal branch's
-    // first archive timestamp needs.
-    let (archive_ca, archive_crl) = (read("archive-ca.der")?, read("archive-ca.crl")?);
+    // first archive timestamp needs: the other actions run without them.
+    let renewal_file = |name: &str| {
+        if matches!(action, "pre-en-a2-request" | "pre-en-levels") {
+            read(name)
+        } else {
+            Ok(Vec::new())
+        }
+    };
+    let (archive_ca, archive_crl) = (
+        renewal_file("archive-ca.der")?,
+        renewal_file("archive-ca.crl")?,
+    );
     let (renewal_certificates, renewal_crls): ([&[u8]; 2], [&[u8]; 3]) = (
         [intermediate, &archive_ca],
         [&lists[0], &lists[1], &archive_crl],
