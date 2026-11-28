@@ -1,7 +1,10 @@
 //! The signature timestamp of a signature in a historical vocabulary: ETSI
 //! TS 101 903 V1.1.1 or V1.2.2, or the TS 103 171 profile of V1.3.2.
 
-use super::extended::{CompleteReferences, ExtendedKind, reference_error, signer_artifacts};
+use super::extended::{
+    CompleteReferences, ExtendedKind, ReferenceSyntax, reference_error, signer_artifacts,
+};
+use super::values::{Held, Join, Split, archived, insert_values};
 use super::{
     AugmentError, Checking, Completion, DataAdded, PendingTimestamp, Repeat, Staging, StagingError,
     Stamp, TimestampRequest, ValidationData, checked_response, construction, pooled, selected,
@@ -13,11 +16,11 @@ use crate::draft::Draft;
 use crate::level::historical::{HistoricalCensus, historical_tsa_paths, with_historical_census};
 use crate::level::{Inputs, unrecognized};
 use crate::path;
-use crate::placement::{self, DS, PlacementError, Unsigned, XADES_141};
+use crate::placement::{self, DS, PlacementError, Unsigned, XADES, XADES_141};
 use crate::signature::hash_class;
 use crate::ts101903::{Ts101903Error, Ts101903Report, validate_historical};
 use crate::{Document, Outcome};
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::{boxed::Box, format, string::String, vec::Vec};
 use core::convert::Infallible;
 use structured_asn1::digest::Resolution;
 use structured_asn1::memory::{OwnedVec, Work};
@@ -25,12 +28,12 @@ use structured_ltv::material::ArtifactRef;
 use structured_xades::legacy::{self, Profile};
 use structured_xades::produce::References;
 use structured_xades::produce::{
-    ContentRequest, Event, ExtendedAugmentation, HistoricalTimestampWriter, Material,
-    ReferenceRole, Writer, write_historical_timestamp_values, write_historical_values,
+    ContentRequest, Datatype, Event, ExtendedAugmentation, HistoricalTimestampWriter, Material,
+    ReferenceRole, Value, Writer, write_historical_timestamp_values, write_historical_values,
 };
 use structured_xades::unsigned::Requirements;
 use structured_xades::xml::{Access, Name, Xml as _};
-use xml_sec::document::{DocumentView, NodeIdentity, XmlDocument};
+use xml_sec::document::{NodeIdentity, XmlDocument};
 use xml_sec::xmldsig::DigestAlgorithm;
 use xml_sec::xmldsig::VerificationRequest;
 use xml_sec::xmldsig::{ReplayError, VerifiedSession, with_verified_request};
@@ -56,15 +59,17 @@ use xml_sec::xmldsig::{ReplayError, VerifiedSession, with_verified_request};
 /// # fn t(
 /// #     document: &xml_sec::XmlDocument,
 /// #     assessment: &Assessment<'_, '_>,
+/// #     nonce: &[u8],
 /// #     work: &structured_asn1::memory::Memory,
 /// # ) -> Result<xml_sec_xades::PendingTimestamp, xml_sec_xades::AugmentError> {
+/// // A fresh random nonce per request (RFC 3161 §2.4.1).
 /// request_historical_timestamp(
 ///     document,
 ///     &TimestampRequest {
 ///         signature: "sig",
 ///         digest: Algorithm::Sha256,
 ///         policy: None,
-///         nonce: Some(&[0x2a; 8]),
+///         nonce: Some(nonce),
 ///         id_attributes: &[],
 ///     },
 ///     Profile::PreEn,
@@ -96,7 +101,9 @@ pub fn request_historical_timestamp<W: Work>(
 ///
 /// # Errors
 /// Returns the original cause, [`AugmentError::HistoricalLevel`] for the
-/// V1.1.1 and V1.2.2 vocabularies; the document is never changed.
+/// V1.1.1 and V1.2.2 vocabularies and
+/// [`AugmentError::HistoricalReferenceSyntax`] for the V2 reference names;
+/// the document is never changed.
 ///
 /// # Examples
 ///
@@ -110,15 +117,17 @@ pub fn request_historical_timestamp<W: Work>(
 /// # fn x(
 /// #     document: &xml_sec::XmlDocument,
 /// #     assessment: &Assessment<'_, '_>,
+/// #     nonce: &[u8],
 /// #     work: &structured_asn1::memory::Memory,
 /// # ) -> Result<xml_sec_xades::PendingTimestamp, xml_sec_xades::AugmentError> {
+/// // A fresh random nonce per request (RFC 3161 §2.4.1).
 /// request_historical_extended_timestamp(
 ///     document,
 ///     &TimestampRequest {
 ///         signature: "sig",
 ///         digest: Algorithm::Sha256,
 ///         policy: None,
-///         nonce: Some(&[0x2a; 8]),
+///         nonce: Some(nonce),
 ///         id_attributes: &[],
 ///     },
 ///     ExtendedKind::SignatureAndReferences(ReferenceSyntax::Original),
@@ -138,6 +147,9 @@ pub fn request_historical_extended_timestamp<W: Work>(
 ) -> Result<PendingTimestamp, AugmentError> {
     if profile != Profile::PreEn {
         return Err(AugmentError::HistoricalLevel(profile));
+    }
+    if let ExtendedKind::SignatureAndReferences(syntax @ ReferenceSyntax::V2) = kind {
+        return Err(AugmentError::HistoricalReferenceSyntax(syntax));
     }
     request_stamp(document, request, (profile, Some(kind)), assessment, work)
 }
@@ -252,7 +264,7 @@ pub fn add_historical_values<W: Work>(
                     .unsigned;
             Ok::<_, AugmentError>((
                 unsigned,
-                Held::of(view, unsigned, profile, work)?,
+                Held::of(view, unsigned, namespace, work)?,
                 archived(view, unsigned, namespace, work)?,
             ))
         })?;
@@ -260,7 +272,7 @@ pub fn add_historical_values<W: Work>(
             Ok(
                 selected(document, &session, data.signature, data.id_attributes).and_then(|node| {
                     match with_historical_census(&session, node, profile, &inputs, |census| {
-                        missing_values(census, unsigned, held, profile, archived)
+                        missing_values(census, document, unsigned, held, profile, archived)
                     })? {
                         Outcome::Assessed(plan) => plan,
                         outcome => Err(AugmentError::Unmet(outcome.map(|_| ()))),
@@ -300,35 +312,24 @@ pub fn add_historical_values<W: Work>(
     })
 }
 
-/// Whether the signature's unsigned properties already hold an archive
-/// timestamp, which then covers its values: TSA material found missing later
-/// goes after its own timestamp (ETSI TS 101 903 V1.4.2 §8.1.1).
-fn archived<W: Work>(
-    view: xml_sec::document::DocumentView<'_>,
-    unsigned: Unsigned,
-    namespace: &str,
-    work: &W,
-) -> Result<bool, PlacementError> {
-    let Some(properties) = unsigned.signature_properties() else {
-        return Ok(false);
-    };
-    for node in placement::children(view, properties, work)? {
-        if placement::is_element(view, node, XADES_141, "ArchiveTimeStamp", work)?
-            || placement::is_element(view, node, namespace, "ArchiveTimeStamp", work)?
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 /// One step of [`add_historical_values`]: the values properties the census
 /// found missing, else the first timestamp whose TSA material is missing and
-/// the `TimeStampValidationData` that follows it.
+/// its `TimeStampValidationData`.
 struct ValuesStep {
     unsigned: Unsigned,
     values: Vec<(String, Join)>,
-    timestamp: Option<(NodeIdentity, String)>,
+    timestamp: Option<(Placement, String)>,
+}
+
+/// Where a timestamp's `TimeStampValidationData` goes (ETSI TS 101 903
+/// V1.4.2 §8.1.1).
+#[derive(Clone, Copy)]
+enum Placement {
+    /// Right after the unsigned timestamp property it serves.
+    After(NodeIdentity),
+    /// Last among the unsigned signature properties, its `URI` naming the
+    /// signed content timestamp property it serves.
+    Last,
 }
 
 impl ValuesStep {
@@ -346,7 +347,7 @@ impl ValuesStep {
     }
 
     /// Insert the values where they join the signature, or else the
-    /// timestamp's validation data right after its property.
+    /// timestamp's validation data at its [`Placement`].
     fn apply<W: Work>(
         &self,
         document: &mut XmlDocument,
@@ -357,14 +358,17 @@ impl ValuesStep {
         if !self.values.is_empty() {
             return insert_values(document, data, namespace, &self.values, work);
         }
-        let (Some((property, data)), Some(parent)) =
+        let (Some((placement, data)), Some(parent)) =
             (&self.timestamp, self.unsigned.signature_properties())
         else {
             return Ok(());
         };
-        let next = document.with_view(|view| {
-            xml_sec::xmldsig::extension::next_sibling(view, parent, *property, work)
-        })?;
+        let next = match placement {
+            Placement::After(property) => document.with_view(|view| {
+                xml_sec::xmldsig::extension::next_sibling(view, parent, *property, work)
+            })?,
+            Placement::Last => None,
+        };
         match next {
             Some(next) => document.insert_before(next, data)?,
             None => document.append_child(parent, data)?,
@@ -425,6 +429,9 @@ pub fn add_historical_references<W: Work>(
 ) -> Result<(), AugmentError> {
     if profile != Profile::PreEn {
         return Err(AugmentError::HistoricalLevel(profile));
+    }
+    if request.syntax == ReferenceSyntax::V2 {
+        return Err(AugmentError::HistoricalReferenceSyntax(request.syntax));
     }
     let assessment = request.assessment;
     let namespace = profile.namespace();
@@ -537,285 +544,90 @@ fn census_material<'r, W: Work>(
     })
 }
 
-/// The values containers a signature already holds. TS 101 903 V1.1.1 §7.6
-/// allows one `CertificateValues` and one `RevocationValues`, in that order,
-/// each `RevocationValues` holding `CRLValues`, `OCSPValues` and
-/// `OtherValues` in turn; new values of a V1.1.1 signature join those
-/// containers. The later vocabularies repeat them, so nothing is held there.
-#[derive(Clone, Copy, Default)]
-struct Held {
-    certificates: bool,
-    revocation: Option<HeldRevocation>,
-}
-
-/// The containers a held `RevocationValues` holds.
-#[derive(Clone, Copy)]
-struct HeldRevocation {
-    crls: bool,
-    ocsps: bool,
-}
-
-impl Held {
-    /// The containers of `profile` the `unsigned` properties hold.
-    fn of<W: Work>(
-        view: DocumentView<'_>,
-        unsigned: Unsigned,
-        profile: Profile,
-        work: &W,
-    ) -> Result<Self, PlacementError> {
-        let Some(properties) = unsigned.signature_properties() else {
-            return Ok(Self::default());
+/// Where the validation data of the timestamp `property` goes, and the `URI`
+/// that names it there (ETSI TS 101 903 V1.4.2 §8.1.1). An unsigned
+/// timestamp's data goes right after it, unless a later archive timestamp
+/// covers that place: inserting there would change that archive's input. A
+/// signed content timestamp's data goes last, its `URI` naming the property
+/// by its `Id`.
+fn timestamp_placement<W: Work>(
+    document: &XmlDocument,
+    unsigned: Unsigned,
+    property: NodeIdentity,
+    work: &W,
+) -> Result<(Placement, Option<String>), AugmentError> {
+    let properties = unsigned
+        .signature_properties()
+        .ok_or(AugmentError::Construction(
+            structured_xades::produce::Error::Prerequisites,
+        ))?;
+    document.with_view(|view| {
+        let children = placement::children(view, properties, work)?;
+        let Some(at) = children.iter().position(|node| *node == property) else {
+            let id = placement::attribute(view, property, "Id", work)?
+                .ok_or(AugmentError::TimestampDataUnaddressed)?;
+            return Ok((Placement::Last, Some(format!("#{id}"))));
         };
-        if profile != Profile::V111 {
-            return Ok(Self::default());
-        }
-        let namespace = profile.namespace();
-        let held = |parent, local| {
-            Ok::<_, PlacementError>(
-                placement::child(view, parent, namespace, local, work)?.is_some(),
-            )
-        };
-        let revocation =
-            match placement::child(view, properties, namespace, "RevocationValues", work)? {
-                Some(revocation) => Some(HeldRevocation {
-                    crls: held(revocation, "CRLValues")?,
-                    ocsps: held(revocation, "OCSPValues")?,
-                }),
-                None => None,
-            };
-        Ok(Self {
-            certificates: held(properties, "CertificateValues")?,
-            revocation,
-        })
-    }
-}
-
-/// Where a drafted piece of values joins the signature.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Join {
-    /// A new property after the unsigned signature properties.
-    Property,
-    /// A new `CertificateValues` before the held `RevocationValues`.
-    BeforeRevocation,
-    /// Into the held `CertificateValues`.
-    Certificates,
-    /// A new `CRLValues`, the first child of the held `RevocationValues`.
-    FirstInRevocation,
-    /// A new `OCSPValues`, before the held `OtherValues` or last.
-    AfterCrls,
-    /// Into the held `CRLValues`.
-    Crls,
-    /// Into the held `OCSPValues`.
-    Ocsps,
-}
-
-/// One output of [`Split`]: the elements at least `skip` levels below the
-/// values containers, as siblings.
-struct Part {
-    draft: Draft,
-    skip: usize,
-    join: Join,
-    used: bool,
-}
-
-impl Part {
-    fn new(skip: usize, join: Join) -> Self {
-        Self {
-            draft: Draft::siblings(),
-            skip,
-            join,
-            used: false,
-        }
-    }
-
-    fn finish(self) -> Result<Option<(String, Join)>, AugmentError> {
-        if !self.used {
-            return Ok(None);
-        }
-        Ok(Some((self.draft.finish_siblings()?.concat(), self.join)))
-    }
-}
-
-/// The values written once, routed to the containers the signature holds:
-/// a held container receives only the elements below it, a missing one is
-/// written whole.
-struct Split {
-    path: Vec<&'static str>,
-    certificates: Part,
-    revocation: Revocation,
-}
-
-/// Where the revocation values go.
-enum Revocation {
-    /// A new `RevocationValues`.
-    Whole(Part),
-    /// Into the held one: its CRLs and its OCSP responses.
-    Held { crls: Part, ocsps: Part },
-}
-
-impl Split {
-    fn new(held: Held) -> Self {
-        let certificates = match (held.certificates, held.revocation.is_some()) {
-            (true, _) => Part::new(1, Join::Certificates),
-            (false, true) => Part::new(0, Join::BeforeRevocation),
-            (false, false) => Part::new(0, Join::Property),
-        };
-        let nested = |held, into, new| {
-            if held {
-                Part::new(2, into)
-            } else {
-                Part::new(1, new)
+        for later in &children[at + 1..] {
+            if placement::is_element(view, *later, XADES_141, "ArchiveTimeStamp", work)?
+                || placement::is_element(view, *later, XADES, "ArchiveTimeStamp", work)?
+            {
+                return Err(AugmentError::TimestampDataCovered);
             }
-        };
-        let revocation = match held.revocation {
-            None => Revocation::Whole(Part::new(0, Join::Property)),
-            Some(revocation) => Revocation::Held {
-                crls: nested(revocation.crls, Join::Crls, Join::FirstInRevocation),
-                ocsps: nested(revocation.ocsps, Join::Ocsps, Join::AfterCrls),
-            },
-        };
-        Self {
-            path: Vec::new(),
-            certificates,
-            revocation,
         }
-    }
+        Ok((Placement::After(property), None))
+    })
+}
 
-    /// The part the current element belongs to, if it is written at all.
-    fn part(&mut self) -> Option<&mut Part> {
-        let part = match (self.path.first().copied(), self.path.get(1).copied()) {
-            (Some("CertificateValues" | "AttrAuthoritiesCertValues"), _) => &mut self.certificates,
-            (Some(_), second) => match (&mut self.revocation, second) {
-                (Revocation::Whole(whole), _) => whole,
-                (Revocation::Held { crls, .. }, Some("CRLValues")) => crls,
-                (Revocation::Held { ocsps, .. }, Some("OCSPValues")) => ocsps,
-                (Revocation::Held { .. }, _) => return None,
-            },
-            (None, _) => return None,
-        };
-        (self.path.len() > part.skip).then_some(part)
-    }
+/// A writer that puts `uri` on the first element it begins.
+struct Addressed<'w, B> {
+    inner: &'w mut B,
+    uri: Option<&'w str>,
+    depth: usize,
+}
 
-    fn forward<Q: Work>(&mut self, event: Event<'_>, work: &Q) -> Result<(), StagingError> {
-        if let Some(part) = self.part() {
-            part.used = true;
-            part.draft.write(event, work).map_err(StagingError::Draft)?;
+impl<B: Writer> Writer for Addressed<'_, B> {
+    type Error = B::Error;
+
+    fn write<Q: Work>(&mut self, event: Event<'_>, work: &Q) -> Result<(), B::Error> {
+        self.inner.write(event, work)?;
+        match event {
+            Event::Begin(_) => {
+                self.depth += 1;
+                if self.depth == 1
+                    && let Some(uri) = self.uri.take()
+                {
+                    self.inner.write(
+                        Event::Attribute(
+                            Name {
+                                namespace: "",
+                                local: "URI",
+                            },
+                            Value {
+                                lexical: uri,
+                                datatype: Datatype::AnyUri,
+                            },
+                        ),
+                        work,
+                    )?;
+                }
+            }
+            Event::End => self.depth -= 1,
+            Event::Attribute(..) | Event::Text(_) | Event::Binary(_) => {}
         }
         Ok(())
     }
-
-    /// The pieces in insertion order.
-    fn finish(self) -> Result<Vec<(String, Join)>, AugmentError> {
-        let mut pieces = Vec::new();
-        pieces.extend(self.certificates.finish()?);
-        match self.revocation {
-            Revocation::Whole(whole) => pieces.extend(whole.finish()?),
-            Revocation::Held { crls, ocsps } => {
-                pieces.extend(crls.finish()?);
-                pieces.extend(ocsps.finish()?);
-            }
-        }
-        Ok(pieces)
-    }
-}
-
-impl Writer for Split {
-    type Error = StagingError;
-
-    fn write<Q: Work>(&mut self, event: Event<'_>, work: &Q) -> Result<(), StagingError> {
-        match event {
-            Event::Begin(name) => {
-                self.path.push(name.local);
-                self.forward(event, work)
-            }
-            Event::End => {
-                self.forward(event, work)?;
-                self.path.pop();
-                Ok(())
-            }
-            Event::Attribute(..) | Event::Text(_) | Event::Binary(_) => self.forward(event, work),
-        }
-    }
-}
-
-/// Insert `pieces` into `signature`, each where its [`Join`] says; the new
-/// properties go in one insertion after the existing ones.
-fn insert_values<W: Work>(
-    document: &mut XmlDocument,
-    data: &ValidationData<'_, '_>,
-    namespace: &str,
-    pieces: &[(String, Join)],
-    work: &W,
-) -> Result<(), AugmentError> {
-    let mut properties = String::new();
-    for (markup, join) in pieces {
-        if *join == Join::Property {
-            properties.push_str(markup);
-            continue;
-        }
-        // One insertion per generation: each target is located afresh.
-        let (node, before) = document.with_view(|view| {
-            let located =
-                placement::locate_in(view, data.signature, data.id_attributes, namespace, work)?;
-            let held = || AugmentError::Construction(structured_xades::produce::Error::Foreign);
-            let properties = located.unsigned.signature_properties().ok_or_else(held)?;
-            let child = |parent, local| {
-                placement::child(view, parent, namespace, local, work)?.ok_or_else(held)
-            };
-            Ok::<_, AugmentError>(match join {
-                Join::Certificates => (child(properties, "CertificateValues")?, false),
-                Join::BeforeRevocation => (child(properties, "RevocationValues")?, true),
-                Join::Crls => (
-                    child(child(properties, "RevocationValues")?, "CRLValues")?,
-                    false,
-                ),
-                Join::Ocsps => (
-                    child(child(properties, "RevocationValues")?, "OCSPValues")?,
-                    false,
-                ),
-                Join::FirstInRevocation => {
-                    let revocation = child(properties, "RevocationValues")?;
-                    let mut first = None;
-                    for node in placement::children(view, revocation, work)? {
-                        if placement::is_element_node(view, node, work)? {
-                            first = Some(node);
-                            break;
-                        }
-                    }
-                    first.map_or((revocation, false), |first| (first, true))
-                }
-                Join::AfterCrls => {
-                    let revocation = child(properties, "RevocationValues")?;
-                    placement::child(view, revocation, namespace, "OtherValues", work)?
-                        .map_or((revocation, false), |other| (other, true))
-                }
-                Join::Property => unreachable!("new properties are inserted together"),
-            })
-        })?;
-        if before {
-            document.insert_before(node, markup)?;
-        } else {
-            document.append_child(node, markup)?;
-        }
-    }
-    if !properties.is_empty() {
-        let unsigned = document.with_view(|view| {
-            placement::locate_in(view, data.signature, data.id_attributes, namespace, work)
-                .map(|located| located.unsigned)
-        })?;
-        unsigned.insert_in(document, &properties, namespace)?;
-    }
-    Ok(())
 }
 
 /// What the census finds missing, as the next [`ValuesStep`]. Before an
 /// archive timestamp everything goes into the signature's values, drafted
 /// for the containers `held`; once one covers them, each timestamp's missing
-/// TSA material goes into the `TimeStampValidationData` right after it (ETSI
-/// TS 101 903 V1.4.2 §8.1.1, TS 103 171 V2.1.1 §8.1.5) and only what no
-/// timestamp needs into new values.
+/// TSA material goes into its `TimeStampValidationData` (ETSI TS 101 903
+/// V1.4.2 §8.1.1, TS 103 171 V2.1.1 §8.1.5) and only what no timestamp needs
+/// into new values.
 fn missing_values<W: Work>(
     census: &HistoricalCensus<'_, '_, '_, '_, '_, W>,
+    document: &XmlDocument,
     unsigned: Unsigned,
     held: Held,
     profile: Profile,
@@ -884,10 +696,24 @@ fn missing_values<W: Work>(
     }
     let timestamp = match timestamp {
         Some(property) if !timestamp_entries.is_empty() => {
+            // TimeStampValidationData is the v1.4.1 vocabulary only the
+            // TS 103 171 profile of V1.3.2 reads (TS 103 171 V2.1.1 §8.1.5).
+            if profile != Profile::PreEn {
+                return Err(AugmentError::HistoricalLevel(profile));
+            }
+            let (placement, uri) = timestamp_placement(document, unsigned, property, work)?;
             let mut staging = staging();
-            write_historical_timestamp_values(&timestamp_entries, &mut staging, work)
-                .map_err(construction)?;
-            Some((property, staging.draft.finish_siblings()?.concat()))
+            write_historical_timestamp_values(
+                &timestamp_entries,
+                &mut Addressed {
+                    inner: &mut staging,
+                    uri: uri.as_deref(),
+                    depth: 0,
+                },
+                work,
+            )
+            .map_err(construction)?;
+            Some((placement, staging.draft.finish_siblings()?.concat()))
         }
         _ => None,
     };

@@ -19,6 +19,7 @@ mod historical;
 mod seal;
 mod store;
 mod validation_data;
+mod values;
 
 pub use seal::{EvidenceError, SealKind, VerifyError, request_evidence_record};
 
@@ -357,6 +358,20 @@ pub enum AugmentError {
     /// TS 103 171 profile of V1.3.2 uses among the historical vocabularies.
     #[error("the levels beyond T are not created in the {0:?} vocabulary")]
     HistoricalLevel(Profile),
+    /// The V2 reference names (`CompleteCertificateRefsV2`,
+    /// `SigAndRefsTimeStampV2`) are EN 319 132-1 Annex A's; a historical
+    /// signature takes only the original ones.
+    #[error("a historical signature takes no {0:?} references")]
+    HistoricalReferenceSyntax(ReferenceSyntax),
+    /// A timestamp's missing validation data belongs right after it (ETSI
+    /// TS 101 903 V1.4.2 §8.1.1), but a later archive timestamp covers that
+    /// place: it had to be added before that archive timestamp.
+    #[error("a later archive timestamp covers the place of a timestamp's validation data")]
+    TimestampDataCovered,
+    /// A signed content timestamp's missing validation data must name it by
+    /// URI (ETSI TS 101 903 V1.4.2 §8.1.1), but the timestamp has no `Id`.
+    #[error("a signed timestamp whose validation data is missing has no Id")]
+    TimestampDataUnaddressed,
     /// The signer's path is not bound to the signature, so no reference
     /// names its certificates or statuses.
     #[error("the signer's path is not bound to the signature")]
@@ -441,15 +456,17 @@ pub fn request_timestamp<W: Work>(
 /// #     assessment: &Assessment<'_, '_>,
 /// #     evidence: &Inputs<'_>,
 /// #     tsa: impl Fn(&[u8]) -> Vec<u8>,
+/// #     nonce: &[u8],
 /// #     work: &structured_asn1::memory::Memory,
 /// # ) -> Result<(), xml_sec_xades::AugmentError> {
+/// // A fresh random nonce per request (RFC 3161 §2.4.1).
 /// let pending = request_archive_timestamp(
 ///     document,
 ///     &TimestampRequest {
 ///         signature: "sig",
 ///         digest: Algorithm::Sha256,
 ///         policy: None,
-///         nonce: Some(&[0x2a; 8]),
+///         nonce: Some(nonce),
 ///         id_attributes: &[],
 ///     },
 ///     assessment,
@@ -523,15 +540,17 @@ pub fn request_archive_timestamp<W: Work>(
 /// #     document: &mut xml_sec::XmlDocument,
 /// #     assessment: &Assessment<'_, '_>,
 /// #     evidence: &Inputs<'_>,
+/// #     nonce: &[u8],
 /// #     work: &structured_asn1::memory::Memory,
 /// # ) -> Result<xml_sec_xades::PendingTimestamp, xml_sec_xades::AugmentError> {
+/// // A fresh random nonce per request (RFC 3161 §2.4.1).
 /// let pending = request_archive_timestamp_with_renewal(
 ///     document,
 ///     &TimestampRequest {
 ///         signature: "sig",
 ///         digest: Algorithm::Sha256,
 ///         policy: None,
-///         nonce: Some(&[0x2a; 8]),
+///         nonce: Some(nonce),
 ///         id_attributes: &[],
 ///     },
 ///     &DigestRenewal {
@@ -890,7 +909,7 @@ pub fn complete_timestamp<W: Work>(
                                     unsigned,
                                 ),
                                 Err(kind) => extended::timestamped(
-                                    stage, kind, pending, response, completion, unsigned,
+                                    stage, level, kind, pending, response, completion, unsigned,
                                 ),
                             })
                         },
@@ -979,16 +998,32 @@ fn publish<W: Work>(
     properties: &[String],
     work: &W,
 ) -> Result<(), AugmentError> {
+    let unsigned = publication.unsigned;
+    publish_with(
+        document,
+        publication,
+        |document| Ok(unsigned.insert_all(document, properties)?),
+        work,
+    )
+}
+
+/// [`publish`] with the new generation made by `insert`.
+fn publish_with<W: Work>(
+    document: &mut XmlDocument,
+    publication: &Publication<'_, '_, '_>,
+    insert: impl FnOnce(&mut XmlDocument) -> Result<(), AugmentError>,
+    work: &W,
+) -> Result<(), AugmentError> {
     let Publication {
         assessment,
         inputs,
         vocabulary,
         signature,
         id_attributes,
-        unsigned,
+        unsigned: _,
     } = *publication;
     document.transaction(|document| {
-        unsigned.insert_all(document, properties)?;
+        insert(document)?;
         // The caller's targets and keys name elements of the requested
         // generation; they hold for the same elements in the new one.
         let carried = Carried::new::<_, AugmentError>(document, assessment.request, work)?;
@@ -1110,6 +1145,17 @@ impl<'j, 'l> Judged<'j, 'l> {
             Self::Baseline(level) => level,
             Self::Extended(_) => unreachable!("a baseline step runs behind a baseline gate"),
         }
+    }
+}
+
+/// Refuse a level whose requirements are not all met. A baseline timestamp's
+/// input is refused by the shared rules on that ground; an extended
+/// timestamp's and a seal's are computed here, so the gate is checked here.
+fn met(level: Judged<'_, '_>) -> Result<(), AugmentError> {
+    if level.all_requirements_met() {
+        Ok(())
+    } else {
+        Err(AugmentError::Unmet(Outcome::Assessed(())))
     }
 }
 

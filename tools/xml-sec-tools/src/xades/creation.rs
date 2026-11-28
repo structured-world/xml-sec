@@ -443,6 +443,11 @@ pub(crate) enum Expect {
     /// Exactly `count` elements of local name `local`, each holding every
     /// one of these (element, text) facts below itself.
     Each(&'static str, usize, &'static [(&'static str, &'static str)]),
+    /// The certificates and revocations DSS found in a
+    /// `TimeStampValidationData` serve the first archive timestamp, which
+    /// does not cover them, and a later archive timestamp covers them: the
+    /// first one's TSA path runs through such a certificate.
+    FirstArchiveData,
 }
 
 const POLICY: &str = "1.3.6.1.4.1.13762.3.1";
@@ -545,7 +550,7 @@ fn expected_properties(name: &str) -> &'static [Expect] {
 /// The facts of the cases that carry timestamps or validation data beyond
 /// the signature timestamp.
 fn timestamp_properties(name: &str) -> &'static [Expect] {
-    use Expect::{Counted, Text, Validated};
+    use Expect::{Counted, FirstArchiveData, Text, Validated};
     match name {
         "content-timestamps" => &[
             Counted("Timestamp", "Type", "ALL_DATA_OBJECTS_TIMESTAMP", 1),
@@ -593,8 +598,7 @@ fn timestamp_properties(name: &str) -> &'static [Expect] {
             Counted("Timestamp", "Type", "SIGNATURE_TIMESTAMP", 1),
             Counted("Timestamp", "Type", "VALIDATION_DATA_TIMESTAMP", 1),
             Counted("Timestamp", "Type", "ARCHIVE_TIMESTAMP", 2),
-            Text("RelatedCertificate/Origin", "TIMESTAMP_VALIDATION_DATA"),
-            Text("RelatedRevocation/Origin", "TIMESTAMP_VALIDATION_DATA"),
+            FirstArchiveData,
         ],
         _ => &[],
     }
@@ -760,7 +764,59 @@ fn unmet(root: xml::Node<'_, '_>, expect: &Expect) -> Option<String> {
                 .collect();
             (!failing.is_empty()).then(|| format!("DSS: {}", failing.join("; ")))
         }
+        Expect::FirstArchiveData => first_archive_data(root),
     }
+}
+
+/// Why the `TimeStampValidationData` DSS found does not serve the first
+/// archive timestamp, if it does not: its certificates must include one of
+/// that timestamp's chain and must not be among the objects it covers, and a
+/// later archive timestamp must cover every certificate and revocation of it.
+fn first_archive_data(root: xml::Node<'_, '_>) -> Option<String> {
+    const ORIGIN: &str = "TIMESTAMP_VALIDATION_DATA";
+    let found = |local: &str, attribute: &str| -> Vec<String> {
+        xml::below(root, local, None)
+            .filter(|node| xml::text_at(*node, &["Origin"]).as_deref() == Some(ORIGIN))
+            .filter_map(|node| node.attribute(attribute).map(String::from))
+            .collect()
+    };
+    let certificates = found("RelatedCertificate", "Certificate");
+    let revocations = found("RelatedRevocation", "Revocation");
+    if certificates.is_empty() || revocations.is_empty() {
+        return Some(format!(
+            "DSS found {} certificates and {} revocations in TimeStampValidationData",
+            certificates.len(),
+            revocations.len()
+        ));
+    }
+    let archives: Vec<_> = xml::below(root, "Timestamp", None)
+        .filter(|node| node.attribute("Type") == Some("ARCHIVE_TIMESTAMP"))
+        .collect();
+    let Some((first, later)) = archives.split_first() else {
+        return Some("DSS reported no archive timestamp".into());
+    };
+    let covered = |archive: &xml::Node<'_, '_>, token: &str| {
+        xml::below(*archive, "TimestampedObject", None)
+            .any(|object| object.attribute("Token") == Some(token))
+    };
+    let chained = xml::below(*first, "ChainItem", None).any(|item| {
+        item.attribute("Certificate")
+            .is_some_and(|id| certificates.iter().any(|certificate| certificate == id))
+    });
+    if !chained {
+        return Some("the first archive timestamp's chain has no certificate of its data".into());
+    }
+    for token in certificates.iter().chain(&revocations) {
+        if covered(first, token) {
+            return Some(format!(
+                "the first archive timestamp covers its own data {token}"
+            ));
+        }
+        if !later.iter().any(|archive| covered(archive, token)) {
+            return Some(format!("no later archive timestamp covers {token}"));
+        }
+    }
+    None
 }
 
 /// Each expected property of `name` the diagnostic report does not hold.

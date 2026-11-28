@@ -144,7 +144,7 @@ fn utc() -> Result<LeapTable<'static>, String> {
 
 fn main() -> Result<(), String> {
     let mut args = std::env::args_os().skip(1);
-    let usage = "usage: augment_probe request|content-request|content|content-lta-request|content-lta-archive-request|content-lta|refresh|x-request|a-request|extended|pre-en-x-request|pre-en-a-request|pre-en-a2-request|pre-en-lta-request|pre-en-levels|prefixed-request-v111|prefixed-v111|seal-signature-request|seal-request|seal|parallel-request|parallel|complete|archive-request|renewal-request|archive|extend|renew-request|renew FIXTURES OUTPUT";
+    let usage = "usage: augment_probe request|content-request|content|content-lta-request|content-lta-archive-request|content-lta|refresh|x-request|x|a-request|a2-request|extended|historical-request[-v111|-v122]|historical[-v111|-v122]|historical-lt[-v111|-v122]|pre-en-x-request|pre-en-a-request|pre-en-a2-request|pre-en-lta-request|pre-en-levels|prefixed-request-v111|prefixed-v111|seal-signature-request|seal-request|seal|parallel-request|parallel|complete|archive-request|renewal-request|archive|extend|renew-request|renew FIXTURES OUTPUT";
     let (Some(action), Some(fixtures), Some(output), None) =
         (args.next(), args.next(), args.next(), args.next())
     else {
@@ -396,8 +396,10 @@ fn prefixed(
 }
 
 /// `xml` with its `SignedInfo` canonicalization naming the
-/// `InclusiveNamespaces` `PrefixList` `ds` and every digest and signature
-/// value emptied, a template to sign again.
+/// `InclusiveNamespaces` `PrefixList` `ds` and the `SignedInfo` reference
+/// digests and the signature value emptied, a template to sign again. The
+/// signing certificate's digest in the signed properties stays: signing
+/// fills only the reference digests.
 fn prefixed_template(xml: &str) -> Result<String, String> {
     const METHOD: &str =
         "<ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>";
@@ -406,15 +408,27 @@ fn prefixed_template(xml: &str) -> Result<String, String> {
         return Err("no exclusive SignedInfo method".into());
     }
     let mut template = xml.replacen(METHOD, PREFIXED, 1);
-    for (open, close) in [
-        ("<ds:DigestValue>", "</ds:DigestValue>"),
+    let signed_info = template.find("<ds:SignedInfo").ok_or("no SignedInfo")?;
+    for (open, close, within) in [
+        ("<ds:DigestValue>", "</ds:DigestValue>", "</ds:SignedInfo>"),
         (
             "<ds:SignatureValue Id=\"sig-value\">",
             "</ds:SignatureValue>",
+            "</ds:Signature>",
         ),
     ] {
-        let mut from = 0;
-        while let Some(start) = template[from..].find(open).map(|at| from + at + open.len()) {
+        let mut from = signed_info;
+        loop {
+            let limit = from
+                + template[from..]
+                    .find(within)
+                    .ok_or_else(|| format!("no {within}"))?;
+            let Some(start) = template[from..limit]
+                .find(open)
+                .map(|at| from + at + open.len())
+            else {
+                break;
+            };
             let end = start
                 + template[start..]
                     .find(close)

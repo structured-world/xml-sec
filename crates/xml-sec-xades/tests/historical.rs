@@ -91,14 +91,20 @@ fn timestamped_values(profile: Profile, response: &[u8]) {
 }
 
 #[test]
-fn v111_partial_values_completed_in_held_containers() {
+fn partial_values_completed_in_held_containers() {
     // TS 101 903 V1.1.1 §7.6 places at most one CertificateValues and one
-    // RevocationValues in the UnsignedSignatureProperties sequence: a
-    // signature that already holds some of the values takes the missing
-    // ones in those containers, not in second ones.
-    let profile = Profile::V111;
+    // RevocationValues in the UnsignedSignatureProperties sequence, and the
+    // historical readers of V1.2.2 and of the TS 103 171 profile refuse a
+    // second one too: a signature that already holds some of the values
+    // takes the missing ones in those containers, not in second ones.
+    for (profile, response) in RESPONSES {
+        partial_values(profile, response);
+    }
+}
+
+fn partial_values(profile: Profile, response: &[u8]) {
     let fixture = Fixture::historical();
-    let mut document = timestamped(&fixture, profile, RESPONSES[1].1);
+    let mut document = timestamped(&fixture, profile, response);
     values_of(&fixture, &mut document, profile).expect("full values");
     let full = document.as_xml().to_owned();
     let count = |xml: &str, local: &str| {
@@ -495,6 +501,63 @@ fn pre_en_xl(fixture: &Fixture) -> xml_sec::XmlDocument {
     );
     values(fixture, &mut document);
     document
+}
+
+#[test]
+fn historical_v2_references_refused_before_writing() {
+    // CompleteCertificateRefsV2 and SigAndRefsTimeStampV2 are the names of
+    // EN 319 132-1 Annex A; the TS 103 171 profile of V1.3.2 has only the
+    // original ones, so a historical signature refuses V2 up front.
+    let fixture = Fixture::historical();
+    let (_, response) = RESPONSES[0];
+    let mut document = timestamped(&fixture, Profile::PreEn, response);
+    let before = document.as_xml().to_owned();
+    let inputs = fixture.inputs(Requirements::LongTerm, &CRLS);
+    let request = TimestampRequest {
+        signature: "sig",
+        digest: Algorithm::Sha256,
+        policy: None,
+        nonce: Some(NONCE),
+        id_attributes: &[],
+    };
+    fixture.with_assessment(|assessment| {
+        let references = add_historical_references(
+            &mut document,
+            &CompleteReferences {
+                signature: "sig",
+                syntax: ReferenceSyntax::V2,
+                digest: DigestAlgorithm::Sha256,
+                assessment,
+                inputs: &inputs,
+                id_attributes: &[],
+            },
+            Profile::PreEn,
+            &account(),
+        );
+        assert!(
+            matches!(
+                references,
+                Err(AugmentError::HistoricalReferenceSyntax(ReferenceSyntax::V2))
+            ),
+            "{references:?}"
+        );
+        let timestamp = request_historical_extended_timestamp(
+            &document,
+            &request,
+            ExtendedKind::SignatureAndReferences(ReferenceSyntax::V2),
+            Profile::PreEn,
+            assessment,
+            &account(),
+        );
+        assert!(
+            matches!(
+                timestamp,
+                Err(AugmentError::HistoricalReferenceSyntax(ReferenceSyntax::V2))
+            ),
+            "{timestamp:?}"
+        );
+    });
+    assert_eq!(document.as_xml(), before);
 }
 
 #[test]

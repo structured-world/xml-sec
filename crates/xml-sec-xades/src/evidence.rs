@@ -61,9 +61,12 @@ impl<W: Work> XmlRecordXml for Document<'_, '_, '_, '_, W> {
         if let CanonicalInput::Sequence { node, chains } = input {
             // RFC 6283 §4.2.2: the sequence holds its earlier chains in
             // ascending Order. A document subset keeps document order, so the
-            // kept chains must already stand in that order.
+            // kept chains must already stand in that order: each child is
+            // compared with the next one expected only. A kept chain out of
+            // place is excluded where it stands and then left unconsumed, which
+            // the check after the loop refuses.
             let view = self.session.view();
-            let mut kept = chains.iter();
+            let mut kept = chains.iter().peekable();
             let mut child = extension::first_child(view, node, work)?;
             while let Some(current) = child {
                 let is_chain = extension::inspect_node(view, current, work, |value| {
@@ -76,10 +79,8 @@ impl<W: Work> XmlRecordXml for Document<'_, '_, '_, '_, W> {
                     )
                 })?;
                 if is_chain {
-                    if chains.iter().any(|chain| chain.chain.node == current) {
-                        if kept.next().map(|chain| chain.chain.node) != Some(current) {
-                            return Err(Error::ChainOrder);
-                        }
+                    if kept.peek().map(|chain| chain.chain.node) == Some(current) {
+                        kept.next();
                     } else {
                         excluded.try_push(current)?;
                     }

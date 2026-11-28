@@ -84,23 +84,34 @@ pub(crate) struct Fixture {
 }
 
 /// `xml` with its `SignedInfo` canonicalization naming the
-/// `InclusiveNamespaces` `PrefixList` `ds` and every digest and signature
-/// value emptied, a template to sign again.
+/// `InclusiveNamespaces` `PrefixList` `ds` and the `SignedInfo` reference
+/// digests and the signature value emptied, a template to sign again. The
+/// signing certificate's digest in the signed properties stays: signing
+/// fills only the reference digests.
 pub(crate) fn prefixed_template(xml: &str) -> String {
     const METHOD: &str =
         "<ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>";
     const PREFIXED: &str = "<ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"><ec:InclusiveNamespaces xmlns:ec=\"http://www.w3.org/2001/10/xml-exc-c14n#\" PrefixList=\"ds\"/></ds:CanonicalizationMethod>";
     assert!(xml.contains(METHOD), "an exclusive SignedInfo method");
     let mut template = xml.replacen(METHOD, PREFIXED, 1);
-    for (open, close) in [
-        ("<ds:DigestValue>", "</ds:DigestValue>"),
+    let signed_info = template.find("<ds:SignedInfo").expect("a SignedInfo");
+    for (open, close, within) in [
+        ("<ds:DigestValue>", "</ds:DigestValue>", "</ds:SignedInfo>"),
         (
             "<ds:SignatureValue Id=\"sig-value\">",
             "</ds:SignatureValue>",
+            "</ds:Signature>",
         ),
     ] {
-        let mut from = 0;
-        while let Some(start) = template[from..].find(open).map(|at| from + at + open.len()) {
+        let mut from = signed_info;
+        loop {
+            let limit = from + template[from..].find(within).expect("a closed scope");
+            let Some(start) = template[from..limit]
+                .find(open)
+                .map(|at| from + at + open.len())
+            else {
+                break;
+            };
             let end = start + template[start..].find(close).expect("closed value");
             template.replace_range(start..end, "");
             from = start;

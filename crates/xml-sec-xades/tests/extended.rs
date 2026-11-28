@@ -143,6 +143,97 @@ fn a_complete_signature_takes_x_xl_and_a() {
     );
 }
 
+#[test]
+fn extended_partial_values_completed_in_held_containers() {
+    // TS 101 903 V1.4.2 §§7.6.1-7.6.2 allow one CertificateValues and one
+    // RevocationValues: an XAdES-XL that already holds some values, none of
+    // them under an archive timestamp yet, takes the missing ones in those
+    // containers.
+    let fixture = Fixture::new();
+    let mut document = complete(&fixture);
+    stamp(
+        &fixture,
+        &mut document,
+        ExtendedKind::SignatureAndReferences(ReferenceSyntax::V2),
+        [X_REQUEST, X_RESPONSE],
+    );
+    let inputs = fixture.inputs(Requirements::Timestamped, &CRLS);
+    let add = |document: &mut XmlDocument| {
+        fixture.with_assessment(|assessment| {
+            add_extended_values(
+                document,
+                &ValidationData {
+                    signature: "sig",
+                    assessment,
+                    inputs: &inputs,
+                    id_attributes: &[],
+                },
+                &account(),
+            )
+        })
+    };
+    add(&mut document).expect("XAdES-XL");
+    let full = document.as_xml().to_owned();
+    for local in ["EncapsulatedCRLValue", "EncapsulatedX509Certificate"] {
+        let parsed = roxmltree::Document::parse(&full).expect("XML parses");
+        let first = parsed
+            .descendants()
+            .find(|node| node.tag_name().name() == local)
+            .expect("a value")
+            .range();
+        let partial = format!("{}{}", &full[..first.start], &full[first.end..]);
+        let mut document = XmlDocument::parse(partial).expect("partial parses");
+        assert_eq!(
+            add(&mut document).unwrap_or_else(|error| panic!("{local}: {error}")),
+            DataAdded::Published,
+            "{local}"
+        );
+        assert_eq!(
+            unsigned_properties(document.as_xml()),
+            [
+                "SignatureTimeStamp",
+                "CompleteCertificateRefsV2",
+                "CompleteRevocationRefs",
+                "SigAndRefsTimeStampV2",
+                "CertificateValues",
+                "RevocationValues"
+            ],
+            "{local}"
+        );
+    }
+}
+
+#[test]
+fn extended_timestamp_unmet_requirements_refused() {
+    // The level the caller names is the basis the signature must meet when
+    // its extended timestamp is requested: an XAdES-C without its values is
+    // not long-term, so neither the request nor a completion may go ahead.
+    let fixture = Fixture::new();
+    let document = complete(&fixture);
+    let inputs = fixture.inputs(Requirements::LongTerm, &CRLS);
+    let request = TimestampRequest {
+        signature: "sig",
+        digest: Algorithm::Sha256,
+        policy: None,
+        nonce: Some(NONCE),
+        id_attributes: &[],
+    };
+    let refused = fixture.with_assessment(|assessment| {
+        request_extended_timestamp(
+            &document,
+            &request,
+            ExtendedKind::SignatureAndReferences(ReferenceSyntax::V2),
+            assessment,
+            &inputs,
+            &account(),
+        )
+    });
+    assert!(
+        matches!(refused, Err(xml_sec_xades::AugmentError::Unmet(_))),
+        "{refused:?}"
+    );
+}
+
 /// The local names of the direct unsigned signature properties, in order.
 fn unsigned_properties(xml: &str) -> Vec<String> {
     let document = roxmltree::Document::parse(xml).expect("XML parses");

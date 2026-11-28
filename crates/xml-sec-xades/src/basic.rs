@@ -239,8 +239,10 @@ pub enum ValidationError {
     /// A `RenewedDigestsV2` property could not be processed.
     #[error("renewed digest processing failed: {0:?}")]
     Renewal(Box<renewed::CheckError<Error, Error, NodeIdentity, DocumentIdentity, u64>>),
-    /// A TS 101 903 V1.2.2 signature could not be processed.
-    #[error("TS 101 903 V1.2.2 processing failed: {0:?}")]
+    /// A signature in a historical vocabulary (TS 101 903 V1.1.1, V1.2.2 or
+    /// the TS 103 171 profile of V1.3.2) could not be processed; the cause
+    /// names the profile where it matters.
+    #[error("historical XAdES processing failed: {0:?}")]
     Ts101903(Box<crate::ts101903::Ts101903Error>),
 }
 
