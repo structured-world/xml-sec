@@ -191,7 +191,9 @@ pub struct Completion<'a, 'inputs> {
     /// is added.
     pub assessment: &'a Assessment<'a, 'inputs>,
     /// Evidence of the level the new generation must meet, B-T or above:
-    /// anchors of the TSA's path, UTC facts and authority accuracies.
+    /// anchors of the TSA's path, UTC facts and authority accuracies. A
+    /// historical signature's timestamp reads only the evidence; its level
+    /// does not apply (see [`complete_timestamp`]).
     pub inputs: &'a Inputs<'a>,
     /// Caller-established window in which the request was uniquely
     /// outstanding (RFC 3161 §6); it proves freshness when no nonce was sent.
@@ -792,6 +794,14 @@ fn encoded<W: Work>(
 /// signed by a certificate the token carries or the caller supplies in
 /// `completion.inputs`. Freshness comes from the request nonce or from
 /// `completion.window`.
+///
+/// A timestamp of a historical signature (from
+/// [`request_historical_timestamp`] or
+/// [`request_historical_extended_timestamp`]) has no EN 319 132-1 level to
+/// meet, so `completion.inputs.requirements` does not apply to it: the new
+/// generation is published once it still meets the BES requirements of its
+/// profile and every timestamp has a TSA path to the caller's anchors. Its
+/// validation values are checked by [`add_historical_values`].
 ///
 /// # Errors
 /// Returns the original cause, and [`AugmentError::Changed`] when the
