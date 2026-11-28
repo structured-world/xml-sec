@@ -5,9 +5,7 @@
     "unsupported": "xml-sec cannot create this form: each named capability is missing. Shared property construction belongs to the signature primitives the producer composes.",
     "not-applicable": "The class tests DSS's own behaviour, not a signature form xml-sec should make: its API, its validation policy over a PKI scenario, its handling of an input, or a form both implementations refuse or that meets no baseline level."
   },
-  "capabilities": {
-    "ts101903-renewal": "a further archive timestamp over a pre-EN XAdES-A, after the TimeStampValidationData of the earlier archive timestamp's TSA; the historical census of the signature primitives does not yet say which of an archive timestamp's TSA material lies in its own TimeStampValidationData"
-  },
+  "capabilities": {},
   "reasons": {
     "dss-api": "behaviour of the DSS service API: parameter validation and its exceptions, re-initialised or atomic calls, identifier providers, the document extender class, external signature values, digest documents in place of content, TSA failures",
     "pki-scenario": "DSS's validation policy over a PKI condition: cross-certification, self-signed or expired certificates, revocation freshness, trust services and anchors, OCSP responder handling, AIA retrieval, revocation source accounting, a PKI hashed with SHA-1 or SHA-3",
@@ -153,7 +151,7 @@
     "signature/XAdESCounterSignSignaturesConsequentlyTest": { "covered": ["lifecycle/xml-sec-first-countersigned-rsa-crl", "lifecycle/dss-first-countersigned-rsa-crl", "creation/countersigned", "dss-form/countersigned"] },
     "signature/XAdESCrossCertificationDoubleLTAOldValDataTest": { "not-applicable": "pki-scenario" },
     "signature/XAdESCrossCertificationDoubleLTATest": { "not-applicable": "pki-scenario" },
-    "signature/XAdESDoubleATest": { "unsupported": "ts101903-renewal" },
+    "signature/XAdESDoubleATest": { "covered": ["creation/a-renewed-pre-en"] },
     "signature/XAdESDoubleAv2Test": { "covered": ["creation/a-renewed"] },
     "signature/XAdESDoubleLTATest": { "covered": ["lifecycle/xml-sec-first-detached-rsa-crl", "lifecycle/dss-first-detached-rsa-crl"] },
     "signature/XAdESDoubleLTAWithValDataContainerTypesTest": { "covered": ["lifecycle/xml-sec-first-detached-rsa-crl", "lifecycle/dss-first-detached-rsa-crl"] },

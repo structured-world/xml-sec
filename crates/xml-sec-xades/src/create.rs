@@ -612,13 +612,15 @@ pub fn create<W: Work>(
 /// #     request: impl Fn(Properties<'_>) -> Request<'_>,
 /// #     evidence: ContentEvidence<'_>,
 /// #     tsa: impl Fn(&[u8]) -> Vec<u8>,
+/// #     nonce: &[u8],
 /// #     work: &structured_asn1::memory::Memory,
 /// # ) -> Result<(), xml_sec_xades::CreateError> {
+/// // A fresh random nonce per request (RFC 3161 §2.4.1).
 /// let asked = [ContentTimestamp {
 ///     scope: ContentScope::All,
 ///     digest: Algorithm::Sha256,
 ///     policy: None,
-///     nonce: Some(&[0x2a; 8]),
+///     nonce: Some(nonce),
 ///     response: None,
 /// }];
 /// let pending = request_content_timestamps(
@@ -1680,10 +1682,7 @@ fn historical_properties<W: Work>(
     work: &W,
 ) -> Result<ObjectElement, CreateError> {
     let parser = Parser::der(work.memory().clone());
-    let certificate = Certificate::read(&parser, leaf, 0).map_err(CreateError::Certificate)?;
-    if certificate.as_bytes().len() != leaf.len() {
-        return Err(CreateError::TrailingBytes);
-    }
+    let certificate = leaf_certificate(&parser, leaf)?;
     let digest = compute_digest_with_provider(signer.provider, signer.digest, leaf, work.memory())?;
     let basic = produce::Basic {
         target,

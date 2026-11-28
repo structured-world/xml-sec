@@ -55,9 +55,13 @@
 //! this in the ETSI TS 101 903 V1.1.1 or V1.2.2 vocabulary, with
 //! `historical-v111.tsq`/`.tsr` or `historical-v122.tsq`/`.tsr`, writing
 //! `t-v111.xml` and `lt-v111.xml` or `t-v122.xml` and `lt-v122.xml`.
-//! `pre-en-x-request`, `pre-en-a-request`, `pre-en-lta-request` and
-//! `pre-en-levels` take the TS 103 171 signature on through the TS 101 903
-//! levels in the names of V1.3.2, as `extended_levels::pre_en_levels` says.
+//! `pre-en-x-request`, `pre-en-a-request`, `pre-en-a2-request`,
+//! `pre-en-lta-request` and `pre-en-levels` take the TS 103 171 signature on
+//! through the TS 101 903 levels in the names of V1.3.2, as
+//! `extended_levels::pre_en_levels` says. `prefixed-request-v111` and
+//! `prefixed-v111` do the signature timestamp of a V1.1.1 signature whose
+//! canonicalization names an `InclusiveNamespaces` `PrefixList`, with
+//! `prefixed-v111.tsq`/`.tsr`, writing `t-v111-prefixed.xml`.
 //!
 //! `augment_probe complete FIXTURES OUTPUT` completes `request.tsq` with
 //! `FIXTURES/response.tsr` and writes the B-T document `OUTPUT/b-t.xml`.
@@ -140,7 +144,7 @@ fn utc() -> Result<LeapTable<'static>, String> {
 
 fn main() -> Result<(), String> {
     let mut args = std::env::args_os().skip(1);
-    let usage = "usage: augment_probe request|content-request|content|content-lta-request|content-lta-archive-request|content-lta|refresh|x-request|a-request|extended|pre-en-x-request|pre-en-a-request|pre-en-lta-request|pre-en-levels|seal-signature-request|seal-request|seal|parallel-request|parallel|complete|archive-request|renewal-request|archive|extend|renew-request|renew FIXTURES OUTPUT";
+    let usage = "usage: augment_probe request|content-request|content|content-lta-request|content-lta-archive-request|content-lta|refresh|x-request|x|a-request|a2-request|extended|historical-request[-v111|-v122]|historical[-v111|-v122]|historical-lt[-v111|-v122]|pre-en-x-request|pre-en-a-request|pre-en-a2-request|pre-en-lta-request|pre-en-levels|prefixed-request-v111|prefixed-v111|seal-signature-request|seal-request|seal|parallel-request|parallel|complete|archive-request|renewal-request|archive|extend|renew-request|renew FIXTURES OUTPUT";
     let (Some(action), Some(fixtures), Some(output), None) =
         (args.next(), args.next(), args.next(), args.next())
     else {
@@ -226,6 +230,15 @@ fn main() -> Result<(), String> {
     })
 }
 
+/// The actions `extended_levels::pre_en_levels` takes.
+const PRE_EN_LEVELS: [&str; 5] = [
+    "pre-en-x-request",
+    "pre-en-a-request",
+    "pre-en-a2-request",
+    "pre-en-lta-request",
+    "pre-en-levels",
+];
+
 /// The B-B signature `sig`, its timestamp requests, or its augmentation the
 /// `action` names; an unknown action is an empty error.
 fn augmented(
@@ -255,10 +268,17 @@ fn augmented(
             work,
         );
     }
-    if matches!(
-        action,
-        "pre-en-x-request" | "pre-en-a-request" | "pre-en-lta-request" | "pre-en-levels"
-    ) {
+    if matches!(step, "prefixed-request" | "prefixed") {
+        return prefixed(
+            (signer, assessment),
+            (step, profile),
+            fixtures,
+            pki,
+            &write,
+            work,
+        );
+    }
+    if PRE_EN_LEVELS.contains(&action) {
         let document = created_in(
             signer,
             assessment,
@@ -328,6 +348,96 @@ fn augmented(
         _ => return Err(String::new()),
     }
     Ok(())
+}
+
+/// The signature `sig` in the vocabulary of `profile`, its canonicalization
+/// naming the `InclusiveNamespaces` `PrefixList` `ds`: `prefixed-request` writes
+/// its signature timestamp request `prefixed-<suffix>.tsq`, `prefixed`
+/// completes it with `FIXTURES/prefixed-<suffix>.tsr` and writes
+/// `t-<suffix>-prefixed.xml`.
+fn prefixed(
+    (signer, assessment): (&Signer<'_>, &Assessment<'_, '_>),
+    (step, profile): (&str, Profile),
+    fixtures: &Path,
+    pki: [&[u8]; 2],
+    write: &impl Fn(&str, &[u8]) -> Result<(), String>,
+    work: &Memory,
+) -> Result<(), String> {
+    let (_, _, suffix) = extended_levels::historical_names(profile);
+    let created = created_in(signer, assessment, Some(profile), Envelope::Enveloped, work)?;
+    // This library's creation writes no SignedInfo method parameters, so the
+    // signature is signed again from a template that names them.
+    let resigned = xml_sec::xmldsig::SignContext::new(signer.key)
+        .provider(signer.provider)
+        .policy(signer.policy.clone())
+        .sign_template(&prefixed_template(created.as_xml())?)
+        .map_err(|error| format!("prefixed signature: {error}"))?
+        .output;
+    let mut document = XmlDocument::parse(&resigned).map_err(|error| error.to_string())?;
+    let request = TimestampRequest {
+        signature: "sig",
+        digest: Algorithm::Sha256,
+        policy: None,
+        nonce: Some(extended_levels::NONCE),
+        id_attributes: &[],
+    };
+    let pending =
+        xml_sec_xades::request_historical_timestamp(&document, &request, profile, assessment, work)
+            .map_err(|error| format!("prefixed request: {error}"))?;
+    if step == "prefixed-request" {
+        return write(&format!("prefixed-{suffix}.tsq"), pending.request());
+    }
+    let response = read(fixtures, &format!("prefixed-{suffix}.tsr"))?;
+    complete(&mut document, &pending, &response, assessment, pki, work)?;
+    write(
+        &format!("t-{suffix}-prefixed.xml"),
+        document.as_xml().as_bytes(),
+    )
+}
+
+/// `xml` with its `SignedInfo` canonicalization naming the
+/// `InclusiveNamespaces` `PrefixList` `ds` and the `SignedInfo` reference
+/// digests and the signature value emptied, a template to sign again. The
+/// signing certificate's digest in the signed properties stays: signing
+/// fills only the reference digests.
+fn prefixed_template(xml: &str) -> Result<String, String> {
+    const METHOD: &str =
+        "<ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>";
+    const PREFIXED: &str = "<ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"><ec:InclusiveNamespaces xmlns:ec=\"http://www.w3.org/2001/10/xml-exc-c14n#\" PrefixList=\"ds\"/></ds:CanonicalizationMethod>";
+    if !xml.contains(METHOD) {
+        return Err("no exclusive SignedInfo method".into());
+    }
+    let mut template = xml.replacen(METHOD, PREFIXED, 1);
+    let signed_info = template.find("<ds:SignedInfo").ok_or("no SignedInfo")?;
+    for (open, close, within) in [
+        ("<ds:DigestValue>", "</ds:DigestValue>", "</ds:SignedInfo>"),
+        (
+            "<ds:SignatureValue Id=\"sig-value\">",
+            "</ds:SignatureValue>",
+            "</ds:Signature>",
+        ),
+    ] {
+        let mut from = signed_info;
+        loop {
+            let limit = from
+                + template[from..]
+                    .find(within)
+                    .ok_or_else(|| format!("no {within}"))?;
+            let Some(start) = template[from..limit]
+                .find(open)
+                .map(|at| from + at + open.len())
+            else {
+                break;
+            };
+            let end = start
+                + template[start..]
+                    .find(close)
+                    .ok_or_else(|| format!("unterminated {open}"))?;
+            template.replace_range(start..end, "");
+            from = start;
+        }
+    }
+    Ok(template)
 }
 
 /// A `SignatureTimeStamp` request for `sig` with this policy and nonce.

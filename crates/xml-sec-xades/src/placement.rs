@@ -15,6 +15,10 @@ use xml_sec::xmldsig::extension::{self, InspectionError, NodeView, ScalarError, 
 
 pub(crate) const DS: &str = "http://www.w3.org/2000/09/xmldsig#";
 pub(crate) const XADES: &str = "http://uri.etsi.org/01903/v1.3.2#";
+/// ETSI EN 319 132-1 §4.3 and TS 101 903 V1.4.1: the namespace of the
+/// properties V1.4.1 added, such as `ArchiveTimeStamp` and
+/// `TimeStampValidationData`.
+pub(crate) const XADES_141: &str = "http://uri.etsi.org/01903/v1.4.1#";
 
 /// Why a signature's qualifying properties could not be located.
 #[derive(Debug)]
@@ -54,7 +58,7 @@ impl From<MemoryError> for PlacementError {
 }
 
 /// Where a new unsigned signature property goes.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Unsigned {
     /// The existing `UnsignedSignatureProperties`.
     Signature(NodeIdentity),
