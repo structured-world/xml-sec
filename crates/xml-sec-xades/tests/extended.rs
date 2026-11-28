@@ -234,6 +234,56 @@ fn extended_timestamp_unmet_requirements_refused() {
     );
 }
 
+#[test]
+fn extended_completion_unmet_basis_refused() {
+    // The pending basis must still hold when the timestamp is completed:
+    // without the caller's anchor the signature timestamp's TSA path no
+    // longer reaches one, so the X timestamp is not published.
+    let fixture = Fixture::new();
+    let mut document = complete(&fixture);
+    let before = document.as_xml().to_owned();
+    let inputs = fixture.inputs(Requirements::Timestamped, &CRLS);
+    let unanchored = xml_sec_xades::Inputs {
+        anchors: &[],
+        ..fixture.inputs(Requirements::Timestamped, &CRLS)
+    };
+    let request = TimestampRequest {
+        signature: "sig",
+        digest: Algorithm::Sha256,
+        policy: None,
+        nonce: Some(NONCE),
+        id_attributes: &[],
+    };
+    let refused = fixture.with_assessment(|assessment| {
+        let pending = request_extended_timestamp(
+            &document,
+            &request,
+            ExtendedKind::SignatureAndReferences(ReferenceSyntax::V2),
+            assessment,
+            &inputs,
+            &account(),
+        )
+        .expect("extended request");
+        complete_timestamp(
+            &mut document,
+            &pending,
+            X_RESPONSE,
+            &Completion {
+                assessment,
+                inputs: &unanchored,
+                window: None,
+                id_attributes: &[],
+            },
+            &account(),
+        )
+    });
+    assert!(
+        matches!(refused, Err(xml_sec_xades::AugmentError::Unmet(_))),
+        "{refused:?}"
+    );
+    assert_eq!(document.as_xml(), before, "nothing published");
+}
+
 /// The local names of the direct unsigned signature properties, in order.
 fn unsigned_properties(xml: &str) -> Vec<String> {
     let document = roxmltree::Document::parse(xml).expect("XML parses");
