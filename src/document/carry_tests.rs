@@ -344,13 +344,27 @@ fn appended_child_refuses_an_entity_of_an_element_and_text() {
 #[test]
 fn appended_child_takes_an_entity_of_one_element_with_content() {
     // One element whose own child shares the reference's range is still one
-    // appended child: only the parent's direct children count.
+    // appended child: only the parent's direct children count. The xmloxide
+    // backend gives every node an entity expands to the reference's range;
+    // roxmltree gives them the declaration's, which does not place them in
+    // the inserted bytes, so there the append is refused rather than guessed.
     let (document, checked) = appended_entity("<one><two/></one>");
-    let appended = checked.expect("one appended child");
-    document.with_view(|view| {
-        let node = view.resolve_node(appended).expect("the appended element");
-        assert_eq!(node.tag_name().name(), "one");
-    });
+    #[cfg(feature = "xml-backend-xmloxide")]
+    {
+        let appended = checked.expect("one appended child");
+        document.with_view(|view| {
+            let node = view.resolve_node(appended).expect("the appended element");
+            assert_eq!(node.tag_name().name(), "one");
+        });
+    }
+    #[cfg(not(feature = "xml-backend-xmloxide"))]
+    {
+        drop(document);
+        assert!(
+            matches!(checked, Err(XmlDocumentError::InvalidReplacement(_))),
+            "{checked:?}"
+        );
+    }
 }
 
 #[test]
