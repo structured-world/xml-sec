@@ -404,6 +404,9 @@ impl ManifestBuilder {
         }
         validate_namespace_bindings(&self.references)?;
         validate_reference_ids_and_digests(&self.references, Some(&self.id), policy)?;
+        policy.resources.validate_xml_document_len(
+            references_output_len(&self.references).unwrap_or(usize::MAX),
+        )?;
 
         let mut writer = Writer::new(BoundedOutput {
             bytes: Vec::new(),
@@ -898,8 +901,9 @@ impl SignatureBuilder {
         }
         // The template sink stops at the document limit, but escaping builds
         // each value's escaped copy before it reaches the sink: Object content
-        // and attributes, the caller-sized values, are measured escaped first.
-        let mut object_bytes = Some(0_usize);
+        // and attributes and the references' attributes, the caller-sized
+        // values, are measured escaped first.
+        let mut object_bytes = references_output_len(&self.references);
         for object in &self.objects {
             Self::validate_object(object)?;
             object_bytes = object_bytes
@@ -1002,6 +1006,25 @@ impl SignatureBuilder {
     }
 }
 
+/// Escaped bytes of the references' caller-sized attributes (`URI`, `Id`,
+/// `Type`); `None` when it exceeds `usize`. Escaping builds each value's
+/// escaped copy before the bounded sink sees it, so the sum is checked
+/// against the document limit before anything is written.
+fn references_output_len(references: &[ReferenceBuilder]) -> Option<usize> {
+    references.iter().try_fold(0_usize, |sum, reference| {
+        [
+            Some(&reference.uri),
+            reference.id.as_ref(),
+            reference.ref_type.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .try_fold(sum, |sum, value| {
+            sum.checked_add(lexical::escaped_attribute_len(value)?)
+        })
+    })
+}
+
 /// `XMLDSig` 1.1 §4.4.3 types `Reference/@Id` as ID, so each is an `NCName`
 /// declared once, and none is `reserved`; each digest method must be one
 /// `policy` admits.
@@ -1038,6 +1061,18 @@ fn validate_reference_transforms(
     #[cfg(feature = "xslt")] stylesheet_bytes: &mut usize,
 ) -> Result<(), SignatureBuilderError> {
     validate_signing_reference_uri(&reference.uri, policy)?;
+    // A chain already longer than the limit is refused as the caller gave
+    // it, before its parameters are scanned or it is cloned; the generated
+    // count below still catches one the appended canonicalization tips over.
+    let maximum = policy.resources.max_transforms_per_reference;
+    if reference.transforms.len() > maximum {
+        return Err(PolicyViolation::ResourceLimit {
+            resource: crate::policy::resource_name::REFERENCE_TRANSFORMS,
+            maximum,
+            actual: reference.transforms.len(),
+        }
+        .into());
+    }
     // Bound newly introduced owned parameters before cloning the chain
     // or serializing a generated template.
     for transform in &reference.transforms {

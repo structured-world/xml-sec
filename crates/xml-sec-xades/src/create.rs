@@ -380,6 +380,12 @@ pub enum CreateError {
     /// data objects, or name one twice.
     #[error("format details for {0:?} name no data object or one already described")]
     FormatReference(String),
+    /// Signing processes `Manifest`s, so each reference of a supplied one is
+    /// a signed data object that needs its `DataObjectFormat` (EN 319 132-1
+    /// §6.3(k)): no entry names this reference, `#Id`, or it has no `Id`
+    /// (`None`) an entry could name.
+    #[error("the supplied Manifest reference {0:?} has no format a signed data object needs")]
+    UndescribedManifestReference(Option<String>),
     /// A policy store without the explicit signature policy it stores
     /// (EN 319 132-1 §5.2.10).
     #[error("a policy store needs an explicit signature policy")]
@@ -735,6 +741,17 @@ impl<'r> Layout<'r> {
         } else {
             &[]
         };
+        // Each signed Manifest reference is a data object the signature
+        // describes (EN 319 132-1 §6.3(k)); one it cannot is refused here,
+        // before anything is signed.
+        if let Some(undescribed) = signed
+            .iter()
+            .find(|reference| reference.uri.is_none() || reference.mime_type.is_none())
+        {
+            return Err(CreateError::UndescribedManifestReference(
+                undescribed.uri.clone(),
+            ));
+        }
         let plan = reference_plan(&request.objects, &references, signed);
         Ok(Self {
             ids,

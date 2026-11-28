@@ -258,7 +258,16 @@ fn appended_child_refuses_any_other_change() {
     // Edits elsewhere, a child inserted before the last one, a child of
     // another element or a second appended child are not one appended child.
     type Edit = fn(&mut XmlDocument) -> Result<(), XmlDocumentError>;
-    let edits: [(&str, Edit); 4] = [
+    let edits: [(&str, Edit); 5] = [
+        // The inserted bytes `<new/></parent><parent>` close the parent
+        // early and open a sibling: the first `parent` holds `x` and `new`,
+        // but it no longer spans the bytes the old one did plus the insertion.
+        ("an escaped parent boundary", |document| {
+            document.replace_node_with_fragment(
+                element(document, "parent"),
+                "<parent Id=\"parent\"><x Id=\"x\"/><new/></parent><parent></parent>",
+            )
+        }),
         ("elsewhere", |document| {
             document.append_child(element(document, "parent"), "<new/>")?;
             document.append_child(element(document, "after"), "<other/>")

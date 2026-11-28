@@ -180,7 +180,8 @@ fn object_markup_is_bounded_by_the_document_limit() {
 fn aggregate_object_output_is_bounded_before_the_template_is_written() {
     // Text that grows when escaped, and objects that each fit, are measured
     // together against the document ceiling before serialization: the refusal
-    // reports their projected output, not a template already built past it.
+    // reports their projected output, with the reference's `URI` the other
+    // caller-sized value, not a template already built past it.
     let policy = SigningPolicy {
         resources: ResourcePolicy {
             max_xml_document_bytes: 4096,
@@ -196,9 +197,13 @@ fn aggregate_object_output_is_bounded_before_the_template_is_written() {
     for _ in 0..5 {
         many = many.add_object(ObjectBuilder::new(element(&markup)));
     }
+    let uri = "#object".len();
     for (built, projected) in [
-        (escaped, 5 * 1000),
-        (many.build_template_with_policy(&policy), 5 * markup.len()),
+        (escaped, 5 * 1000 + uri),
+        (
+            many.build_template_with_policy(&policy),
+            5 * markup.len() + uri,
+        ),
     ] {
         assert!(
             matches!(

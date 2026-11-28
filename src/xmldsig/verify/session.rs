@@ -933,6 +933,22 @@ impl<W: Work> Drop for AdmittedReplay<'_, W> {
         self.active.set(false);
     }
 }
+/// The session's running replay, ended when this goes out of scope.
+struct ActiveReplay<'a>(&'a Cell<bool>);
+
+impl<'a> ActiveReplay<'a> {
+    fn start(active: &'a Cell<bool>) -> Self {
+        active.set(true);
+        Self(active)
+    }
+}
+
+impl Drop for ActiveReplay<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
 impl<W: Work, E, F: FnMut(&[u8]) -> Result<(), E>> ReplayWriter<'_, W, E, F> {
     fn deliver(&mut self, bytes: &[u8]) -> Result<(), ReplayError<E>> {
         // The receiver sees only nonempty chunks; empty output delivers none.
@@ -1223,8 +1239,10 @@ impl<W: Work, Q: Work> SelectedSignature<'_, '_, '_, '_, W, Q> {
                     .map_err(|error| processing(error.into()))
             },
         )?;
-        self.session.replay_active.set(true);
-        let result = super::super::transforms::replay_reference_transforms(
+        // Cleared on every exit, a panicking receiver's included, so a caller
+        // that catches the panic can replay again.
+        let _active = ActiveReplay::start(&self.session.replay_active);
+        super::super::transforms::replay_reference_transforms(
             node,
             enveloped_signature,
             data,
@@ -1240,9 +1258,7 @@ impl<W: Work, Q: Work> SelectedSignature<'_, '_, '_, '_, W, Q> {
                 timestamp: None,
                 error: core::marker::PhantomData,
             },
-        );
-        self.session.replay_active.set(false);
-        result?;
+        )?;
         Ok(ReplayOutcome::Complete)
     }
 
