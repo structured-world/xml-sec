@@ -4,7 +4,7 @@
 use std::fs;
 
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
-use xml_sec::policy::{ManifestProcessing, SigningPolicy};
+use xml_sec::policy::{ManifestProcessing, PolicyViolation, ResourcePolicy, SigningPolicy};
 use xml_sec::xmldsig::{
     DigestAlgorithm, DsigStatus, ManifestBuilder, ObjectBuilder, ObjectContent, ReferenceBuilder,
     RsaSigningKey, SignContext, SignatureAlgorithm, SignatureBuilder, SignatureBuilderError,
@@ -67,7 +67,7 @@ fn manifest(policy: &SigningPolicy) -> Result<ObjectContent, SignatureBuilderErr
 }
 
 #[test]
-fn a_built_manifest_is_filled_by_signing_and_checked_by_verification() {
+fn manifest_signed_then_verified_entries_valid() {
     // XMLDSig 1.1 §5.1: each Manifest Reference is digested with its own
     // transforms and digest method; signing fills both values before it
     // digests the Manifest, and verification processing Manifests finds
@@ -115,7 +115,7 @@ fn a_built_manifest_is_filled_by_signing_and_checked_by_verification() {
 }
 
 #[test]
-fn a_manifest_needs_an_id_and_a_reference() {
+fn manifest_without_id_or_reference_refused() {
     // XMLDSig 1.1 §5.1: a Manifest has one or more References, and a
     // reference names it through its xs:ID.
     let policy = processing();
@@ -135,7 +135,7 @@ fn a_manifest_needs_an_id_and_a_reference() {
 }
 
 #[test]
-fn a_manifest_declares_each_id_once() {
+fn manifest_repeated_reference_id_refused() {
     // XMLDSig 1.1 types Manifest/@Id and Reference/@Id as xs:ID, unique in
     // the document: two references with one Id, or one sharing the
     // Manifest's own, are refused; references without an Id stay valid.
@@ -171,7 +171,7 @@ fn a_manifest_declares_each_id_once() {
 }
 
 #[test]
-fn a_manifest_reference_meets_the_signing_policy() {
+fn manifest_external_uri_refused_by_policy() {
     // The same policy that admits a SignedInfo reference admits a Manifest
     // one: an external URI the policy refuses is refused when building.
     let policy = processing();
@@ -181,4 +181,71 @@ fn a_manifest_reference_meets_the_signing_policy() {
             .build_with_policy(&policy),
         Err(SignatureBuilderError::Policy(_))
     ));
+}
+
+#[test]
+fn manifest_transform_chain_over_limit_refused_before_cloning() {
+    // A chain the caller made longer than the limit is refused as given,
+    // before its parameters are scanned or it is copied with the generated
+    // canonicalization appended.
+    let policy = SigningPolicy {
+        resources: ResourcePolicy {
+            max_transforms_per_reference: 2,
+            ..ResourcePolicy::default()
+        },
+        ..processing()
+    };
+    let mut reference = ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("");
+    for _ in 0..3 {
+        reference = reference.transform(Transform::Enveloped);
+    }
+    let result = ManifestBuilder::new("manifest")
+        .add_reference(reference)
+        .build_with_policy(&policy);
+    assert!(
+        matches!(
+            result,
+            Err(SignatureBuilderError::Policy(
+                PolicyViolation::ResourceLimit {
+                    maximum: 2,
+                    actual: 3,
+                    ..
+                }
+            ))
+        ),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn manifest_reference_type_escaped_past_limit_refused_before_writing() {
+    // A reference attribute that fits raw but not escaped is measured
+    // escaped before anything is written: the refusal reports the projected
+    // size of the caller's values, not the bytes the sink stopped at.
+    let policy = SigningPolicy {
+        resources: ResourcePolicy {
+            max_xml_document_bytes: 4096,
+            ..ResourcePolicy::default()
+        },
+        ..processing()
+    };
+    let result = ManifestBuilder::new("manifest")
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .ref_type("&".repeat(1000)),
+        )
+        .build_with_policy(&policy);
+    let projected = "#payload".len() + 5 * 1000;
+    assert!(
+        matches!(
+            result,
+            Err(SignatureBuilderError::Policy(PolicyViolation::ResourceLimit {
+                resource: "XML document",
+                maximum: 4096,
+                actual,
+            })) if actual == projected
+        ),
+        "{result:?}"
+    );
 }

@@ -124,10 +124,16 @@ impl<W: Work> VerifiedSession<'_, '_, '_, W> {
             }));
         }
         let mut pruned = work.vector();
+        let mut kept = 0;
         if !excluded.is_empty() {
-            // Each visited node is tested against every excluded subtree.
+            // The excluded subtrees become disjoint id ranges in document
+            // order, so each visited node is one binary search; an element's
+            // attributes and namespaces reuse its answer. The sort and every
+            // node's search are charged up front.
+            let steps = u64::from(usize::BITS - excluded.len().leading_zeros());
             (self.view.node_count() as u64)
-                .checked_mul(excluded.len() as u64)
+                .checked_add(excluded.len() as u64)
+                .and_then(|nodes| nodes.checked_mul(steps))
                 .ok_or(structured_asn1::memory::MemoryError::WorkExceeded)
                 .and_then(|tests| work.charge_work(tests))
                 .map_err(|error| processing(error.into()))?;
@@ -151,11 +157,21 @@ impl<W: Work> VerifiedSession<'_, '_, '_, W> {
                     .try_push(child)
                     .map_err(|error| processing(error.into()))?;
             }
+            // A subtree already inside an earlier kept one, or repeated, adds
+            // nothing to the selection.
+            pruned.sort_unstable_by_key(|excluded| excluded.id());
+            for index in 0..pruned.len() {
+                if kept == 0 || !pruned[kept - 1].subtree_contains_id(pruned[index].id()) {
+                    pruned.swap(kept, index);
+                    kept += 1;
+                }
+            }
         }
         let subtree = crate::c14n::SubtreeVisibility { apex: node };
         let without = crate::c14n::PrunedSubtreeVisibility {
             apex: node,
-            excluded: &pruned,
+            excluded: &pruned[..kept],
+            last: core::cell::Cell::new(None),
         };
         let visibility: &dyn crate::c14n::NodeVisibility<_> = if pruned.is_empty() {
             &subtree

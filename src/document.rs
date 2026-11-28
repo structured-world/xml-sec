@@ -1613,9 +1613,13 @@ impl XmlDocument {
                     return Err(other());
                 }
                 // Only the inserted bytes changed, so `parent` still starts
-                // where it did and keeps its name; no other element starts
-                // there.
+                // where it did, keeps its name and now spans its old bytes
+                // plus the insertion. An insertion that closes it early and
+                // opens a sibling, `<new/></parent><parent>`, leaves an
+                // element there that ends sooner. Both ends lie within the
+                // new document, so the sum cannot wrap.
                 let name = element.tag_name();
+                let spans = range.start..range.end + added;
                 let enclosing = view
                     .parsed
                     .document
@@ -1623,7 +1627,7 @@ impl XmlDocument {
                     .find(|node| {
                         let found = node.tag_name();
                         node.is_element()
-                            && node.range().start == range.start
+                            && node.range() == spans
                             && found.namespace() == name.namespace()
                             && found.name() == name.name()
                     })

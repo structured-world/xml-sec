@@ -164,6 +164,38 @@ fn a_replayed_enveloped_transform_removes_only_its_own_signature() {
 }
 
 #[test]
+fn replay_after_receiver_panic_runs() {
+    // A receiver that panics ends that replay only: a caller who catches the
+    // panic can replay again in the same session, which no running replay
+    // blocks any longer.
+    verified(
+        |_| {},
+        |session| {
+            let (reference, transforms) = (
+                element(session, "Reference"),
+                element(session, "Transforms"),
+            );
+            let selected = session
+                .select_signature(element(session, "Signature"))
+                .expect("the signature verified");
+            let container = Some((transforms, "http://www.w3.org/2000/09/xmldsig#"));
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = selected.replay_transforms(
+                    reference,
+                    "",
+                    container,
+                    &mut |_: &[u8]| -> Result<(), ()> { panic!("the receiver fails") },
+                );
+            }));
+            assert!(panicked.is_err(), "the receiver panicked");
+            selected
+                .replay_transforms(reference, "", container, &mut |_: &[u8]| Ok::<_, ()>(()))
+                .expect("a later replay runs");
+        },
+    );
+}
+
+#[test]
 fn a_receiver_refusal_keeps_its_own_cause() {
     verified(
         |_| {},
@@ -229,6 +261,37 @@ fn an_excluded_subtree_is_cut_out_of_the_canonical_form() {
             let pruned =
                 canonical_without(session, signed, &[cut], method).expect("pruned element");
             assert_eq!(pruned, expected);
+        },
+    );
+}
+
+#[test]
+fn excluded_subtrees_repeated_or_nested_same_output() {
+    // The excluded subtrees are a set: naming one twice, or one inside
+    // another, removes the same nodes as the outer one alone, in any order.
+    verified(
+        |_| {},
+        |session| {
+            let (signed, method, reference, transforms, digest) = (
+                element(session, "SignedInfo"),
+                element(session, "CanonicalizationMethod"),
+                element(session, "Reference"),
+                element(session, "Transforms"),
+                element(session, "DigestMethod"),
+            );
+            let expected =
+                canonical_without(session, signed, &[reference], method).expect("one exclusion");
+            for excluded in [
+                [reference, reference, reference],
+                [transforms, reference, digest],
+                [digest, transforms, reference],
+            ] {
+                assert_eq!(
+                    canonical_without(session, signed, &excluded, method)
+                        .expect("the same exclusion"),
+                    expected
+                );
+            }
         },
     );
 }

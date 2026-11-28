@@ -1310,6 +1310,65 @@ const SUPPLIED_MANIFEST: &str = concat!(
 );
 
 #[test]
+fn enveloped_replay_other_signature_kept() {
+    // XMLDSig 1.1 §6.6.4: the enveloped-signature transform removes the
+    // Signature that contains it, not every Signature. The first signature
+    // excludes every signature, so the second, enveloped, leaves it intact;
+    // replaying the second's document reference keeps the first.
+    let fixture = Fixture::new();
+    let mut document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
+    for (id, envelope) in [
+        ("first", Envelope::ExcludingSignatures),
+        ("second", Envelope::Enveloped),
+    ] {
+        fixture
+            .create(&mut document, request(id, &enveloped(envelope)))
+            .expect(id);
+    }
+    let document = XmlDocument::parse(document.as_xml()).expect("created XML parses");
+    let context = VerifyContext::new()
+        .policy(fixture.context_policy.clone())
+        .key_resolver(&fixture.resolver);
+    let output = with_verified_request(
+        &document,
+        &context,
+        &VerificationRequest::default(),
+        &account(1 << 30),
+        |session| {
+            let view = session.view();
+            let (signature, reference) = (
+                view.node_for_id("second", &[])
+                    .expect("the second signature"),
+                view.node_for_id("second-reference-0", &[])
+                    .expect("its document reference"),
+            );
+            let transforms = extension::first_child(view, reference, session.execution())
+                .expect("readable reference")
+                .expect("the reference's Transforms");
+            let mut output = Vec::new();
+            session
+                .select_signature(signature)
+                .expect("the signature verified")
+                .replay_transforms(
+                    reference,
+                    "",
+                    Some((transforms, DS)),
+                    &mut |bytes: &[u8]| {
+                        output.extend_from_slice(bytes);
+                        Ok::<_, ()>(())
+                    },
+                )
+                .expect("the reference replays");
+            Ok(String::from_utf8(output).expect("canonical XML is UTF-8"))
+        },
+    )
+    .expect("created document verifies");
+    assert!(output.contains("Created payload"), "{output:?}");
+    assert!(output.contains("Id=\"first\""), "{output:?}");
+    assert!(!output.contains("Id=\"second\""), "{output:?}");
+}
+
+#[test]
 fn a_supplied_manifest_is_signed_through_its_id() {
     // XMLDSig 1.1 §5.1: a Manifest the caller built goes into an Object and
     // the signature references its root's Id, typed as a Manifest; signing
@@ -1361,6 +1420,49 @@ fn a_supplied_manifest_is_signed_through_its_id() {
             ("#payload".to_owned(), DsigStatus::Valid)
         ]
     );
+}
+
+#[test]
+fn supplied_manifest_undescribed_reference_refused() {
+    // Processing Manifests makes each reference of a supplied one a signed
+    // data object, which needs a DataObjectFormat (EN 319 132-1 §6.3(k)):
+    // one the entries do not name, or one without an Id no entry can name,
+    // is refused before anything is signed.
+    let fixture = processing_manifests();
+    let cases = [
+        (SUPPLIED_MANIFEST.to_owned(), Some("#supplied-entry")),
+        (
+            SUPPLIED_MANIFEST.replace(" Id=\"supplied-entry\"", ""),
+            None,
+        ),
+    ];
+    for (manifest, undescribed) in cases {
+        let objects = [DataObject::SuppliedManifest {
+            manifest: ObjectElement::parse(manifest, &fixture.policy).expect("one element"),
+            entries: vec![SuppliedEntry {
+                id: "supplied-file",
+                mime_type: "text/plain",
+            }],
+            transforms: Vec::new(),
+            mime_type: "text/xml",
+        }];
+        let mut document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
+        let request = Request {
+            resources: Some(&fixture.resources),
+            ..request("sig", &objects)
+        };
+        let error = fixture
+            .create(&mut document, request)
+            .expect_err("an undescribed reference");
+        assert!(
+            matches!(
+                error,
+                CreateError::UndescribedManifestReference(ref uri) if uri.as_deref() == undescribed
+            ),
+            "{undescribed:?}: {error:?}"
+        );
+        assert_eq!(document.as_xml(), DOCUMENT, "nothing published");
+    }
 }
 
 #[test]
