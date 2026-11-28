@@ -52,6 +52,16 @@ fn reply(generator: &Generator, query: &str, response: &str, accuracy: bool) -> 
     } else {
         TSA_CONFIG.replace("accuracy=secs:1\n", "")
     };
+    reply_under(generator, query, response, &config)
+}
+
+/// [`reply`] by the TSA configured as `config`.
+fn reply_under(
+    generator: &Generator,
+    query: &str,
+    response: &str,
+    config: &str,
+) -> Result<(), String> {
     write(&generator.work.join("tsa.cnf"), config)?;
     generator.openssl(&[
         "ts",
@@ -193,7 +203,9 @@ pub(crate) fn content(corpus: &Corpus, generator: &Generator) -> Result<(), Stri
     // timestamps through the TS 101 903 levels; and, for a signature
     // that excludes every signature from what it signs, its signature
     // timestamp, then the initial archive timestamps of its evidence record
-    // and of a parallel one. Each needs the one before.
+    // and of a parallel one. Each needs the one before. Parallel records use
+    // different TSAs or hash algorithms (ETSI TS 119 132-3 §5): the parallel
+    // one asks for SHA-512, which only its reply admits.
     for (action, query, response) in [
         (
             "content-lta-request",
@@ -235,7 +247,12 @@ pub(crate) fn content(corpus: &Corpus, generator: &Generator) -> Result<(), Stri
             &generator.output.join(query),
             read(&generator.work.join(query))?,
         )?;
-        reply(generator, query, response, true)?;
+        if action == "parallel-request" {
+            let config = TSA_CONFIG.replace("digests=sha256\n", "digests=sha256,sha512\n");
+            reply_under(generator, query, response, &config)?;
+        } else {
+            reply(generator, query, response, true)?;
+        }
     }
     Ok(())
 }

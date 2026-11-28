@@ -376,7 +376,6 @@ impl<'v, 's, 'i, W: Work> Scope<'_, '_, 'v, 's, 'i, '_, W> {
             responders: inputs.responders,
             memory,
         };
-        let external = External::read(parser, inputs, &supplied_parent)?;
         let document_der = incorporated_certificates(view, memory)?;
         let incorporated = read_certificates(parser, &document_der)?;
         let stated = accuracy::read(parser, inputs.accuracies)?;
@@ -406,6 +405,9 @@ impl<'v, 's, 'i, W: Work> Scope<'_, '_, 'v, 's, 'i, '_, W> {
                 });
             }
         };
+        // Revocation inputs are read only by the full census; a paths-only
+        // check returned above without them.
+        let external = External::read(parser, inputs, &supplied_parent)?;
         let participants = pki::historical_participants(
             self.signer,
             self.counters,

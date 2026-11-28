@@ -62,8 +62,8 @@ use structured_pkix::algorithm::digest::{self, AsnDigest};
 use structured_pkix::path::EffectiveKey;
 use structured_xades::baseline::{self, Evidence};
 use structured_xades::produce::{
-    self, Augmentation, Event, PreparationError, ReferenceWriter, ResponseCheck, ResponseError,
-    TimestampKind, Transaction, Writer,
+    self, Augmentation, Event, ExtendedRequestError, PreparationError, ReferenceWriter,
+    ResponseCheck, ResponseError, TimestampKind, Transaction, Writer,
 };
 use structured_xades::renewed::{self, CreationError};
 use structured_xades::timestamp::InputError;
@@ -345,8 +345,8 @@ pub enum AugmentError {
     #[error("the reference digest is not permitted for these references")]
     ProhibitedReferenceDigest,
     /// The request of an extended timestamp could not be made.
-    #[error("extended timestamp request failed: {0}")]
-    ExtendedRequest(String),
+    #[error("extended timestamp request failed: {0:?}")]
+    ExtendedRequest(Box<ExtendedRequestError<Error, NodeIdentity, CmsProviderError>>),
     /// The signature could not be read in its historical vocabulary.
     #[error("historical signature processing failed: {0}")]
     Historical(String),
@@ -831,9 +831,9 @@ pub fn complete_timestamp<W: Work>(
         }
         Stamp::Extended(kind) => (Gate::Extended(&basis), Err(kind)),
         // A historical signature is assessed under its own profile's
-        // requirements, not the EN 319 132-1 levels.
+        // requirements, over the same pooled certificates as the others.
         Stamp::Historical(..) => {
-            return historical::complete(document, pending, response, completion, work);
+            return historical::complete(document, pending, response, completion, &inputs, work);
         }
         Stamp::Seal(kind) => {
             return seal::complete(

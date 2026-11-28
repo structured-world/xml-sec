@@ -90,6 +90,78 @@ fn timestamped_values(profile: Profile, response: &[u8]) {
     );
 }
 
+#[test]
+fn v111_partial_values_completed_in_held_containers() {
+    // TS 101 903 V1.1.1 §7.6 places at most one CertificateValues and one
+    // RevocationValues in the UnsignedSignatureProperties sequence: a
+    // signature that already holds some of the values takes the missing
+    // ones in those containers, not in second ones.
+    let profile = Profile::V111;
+    let fixture = Fixture::historical();
+    let mut document = timestamped(&fixture, profile, RESPONSES[1].1);
+    values_of(&fixture, &mut document, profile).expect("full values");
+    let full = document.as_xml().to_owned();
+    let count = |xml: &str, local: &str| {
+        roxmltree::Document::parse(xml)
+            .expect("XML parses")
+            .descendants()
+            .filter(|node| node.tag_name().name() == local)
+            .count()
+    };
+    for local in ["EncapsulatedCRLValue", "EncapsulatedX509Certificate"] {
+        let parsed = roxmltree::Document::parse(&full).expect("XML parses");
+        let first = parsed
+            .descendants()
+            .find(|node| node.tag_name().name() == local)
+            .expect("a value")
+            .range();
+        let partial = format!("{}{}", &full[..first.start], &full[first.end..]);
+        let mut document = xml_sec::XmlDocument::parse(partial).expect("partial parses");
+        assert_eq!(
+            values_of(&fixture, &mut document, profile)
+                .unwrap_or_else(|error| panic!("{local}: {error}")),
+            DataAdded::Published,
+            "{local}"
+        );
+        assert_eq!(
+            unsigned_names(document.as_xml()),
+            [
+                "SignatureTimeStamp",
+                "CertificateValues",
+                "RevocationValues"
+            ],
+            "{local}"
+        );
+        assert_eq!(
+            count(document.as_xml(), local),
+            count(&full, local),
+            "{local}"
+        );
+    }
+}
+
+/// Add the values `profile` needs to `document` from the fixture's CRLs.
+fn values_of(
+    fixture: &Fixture,
+    document: &mut xml_sec::XmlDocument,
+    profile: Profile,
+) -> Result<DataAdded, xml_sec_xades::AugmentError> {
+    let inputs = fixture.inputs(Requirements::LongTerm, &CRLS);
+    fixture.with_assessment(|assessment| {
+        add_historical_values(
+            document,
+            &ValidationData {
+                signature: "sig",
+                assessment,
+                inputs: &inputs,
+                id_attributes: &[],
+            },
+            profile,
+            &account(),
+        )
+    })
+}
+
 /// The local names of the unsigned signature properties, in order.
 fn unsigned_names(xml: &str) -> Vec<String> {
     let parsed = roxmltree::Document::parse(xml).expect("XML parses");
@@ -338,6 +410,47 @@ fn a_historical_timestamp_without_a_trusted_tsa_path_is_not_published() {
         "{refused:?}"
     );
     assert_eq!(document.as_xml(), before, "nothing published");
+}
+
+#[test]
+fn historical_timestamp_malformed_unrelated_crl_published() {
+    // A completion checks only the TSA paths; revocation material is not
+    // part of it, so a CRL it never reads cannot refuse the timestamp.
+    let fixture = Fixture::historical();
+    let (profile, response) = RESPONSES[0];
+    let mut document = fixture
+        .signed(Properties {
+            historical: Some(profile),
+            ..Properties::default()
+        })
+        .expect("pre-EN B-B");
+    let request = TimestampRequest {
+        signature: "sig",
+        digest: Algorithm::Sha256,
+        policy: None,
+        nonce: Some(NONCE),
+        id_attributes: &[],
+    };
+    let malformed: [&[u8]; 1] = [b"not a CRL"];
+    let inputs = fixture.inputs(Requirements::Timestamped, &malformed);
+    fixture.with_assessment(|assessment| {
+        let pending =
+            request_historical_timestamp(&document, &request, profile, assessment, &account())
+                .expect("the request");
+        complete_timestamp(
+            &mut document,
+            &pending,
+            response,
+            &Completion {
+                assessment,
+                inputs: &inputs,
+                window: None,
+                id_attributes: &[],
+            },
+            &account(),
+        )
+        .expect("the timestamp is published");
+    });
 }
 
 #[test]

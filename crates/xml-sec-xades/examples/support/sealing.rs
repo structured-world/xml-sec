@@ -70,10 +70,14 @@ pub(crate) fn sealed(
         window: None,
         id_attributes: &[],
     };
-    for (kind, nonce, query, response, sealed) in [
+    // ETSI TS 119 132-3 §5: parallel records come from different TSAs or use
+    // different hash algorithms; with one TSA, the parallel record hashes
+    // with SHA-512.
+    for (kind, nonce, digest, query, response, sealed) in [
         (
             SealKind::Initial,
             NONCES[0],
+            Algorithm::Sha256,
             "seal.tsq",
             "seal.tsr",
             "e-ers.xml",
@@ -81,6 +85,7 @@ pub(crate) fn sealed(
         (
             SealKind::Parallel,
             NONCES[1],
+            Algorithm::Sha512,
             "parallel.tsq",
             "parallel.tsr",
             "e-ers-parallel.xml",
@@ -88,7 +93,7 @@ pub(crate) fn sealed(
     ] {
         let request = TimestampRequest {
             signature: "sig",
-            digest: Algorithm::Sha256,
+            digest,
             policy: None,
             nonce: Some(nonce),
             id_attributes: &[],
