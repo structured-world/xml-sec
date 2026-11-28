@@ -14,8 +14,8 @@ use xml_sec::XmlDocument;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::policy::{Instant, SigningPolicy, VerificationPolicy};
 use xml_sec::xmldsig::{
-    DefaultKeyResolver, DigestAlgorithm, KeyResolverConfig, RsaSigningKey, SignatureAlgorithm,
-    UriTypeSet, VerificationRequest, VerifyContext,
+    DefaultKeyResolver, DigestAlgorithm, KeyResolverConfig, RsaSigningKey, SignContext,
+    SignatureAlgorithm, UriTypeSet, VerificationRequest, VerifyContext,
 };
 use xml_sec_xades::properties::Properties;
 use xml_sec_xades::{
@@ -83,6 +83,43 @@ pub(crate) struct Fixture {
     utc: LeapTable<'static>,
 }
 
+/// `xml` with its `SignedInfo` canonicalization naming the
+/// `InclusiveNamespaces` `PrefixList` `ds` and the `SignedInfo` reference
+/// digests and the signature value emptied, a template to sign again. The
+/// signing certificate's digest in the signed properties stays: signing
+/// fills only the reference digests.
+pub(crate) fn prefixed_template(xml: &str) -> String {
+    const METHOD: &str =
+        "<ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>";
+    const PREFIXED: &str = "<ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"><ec:InclusiveNamespaces xmlns:ec=\"http://www.w3.org/2001/10/xml-exc-c14n#\" PrefixList=\"ds\"/></ds:CanonicalizationMethod>";
+    assert!(xml.contains(METHOD), "an exclusive SignedInfo method");
+    let mut template = xml.replacen(METHOD, PREFIXED, 1);
+    let signed_info = template.find("<ds:SignedInfo").expect("a SignedInfo");
+    for (open, close, within) in [
+        ("<ds:DigestValue>", "</ds:DigestValue>", "</ds:SignedInfo>"),
+        (
+            "<ds:SignatureValue Id=\"sig-value\">",
+            "</ds:SignatureValue>",
+            "</ds:Signature>",
+        ),
+    ] {
+        let mut from = signed_info;
+        loop {
+            let limit = from + template[from..].find(within).expect("a closed scope");
+            let Some(start) = template[from..limit]
+                .find(open)
+                .map(|at| from + at + open.len())
+            else {
+                break;
+            };
+            let end = start + template[start..].find(close).expect("closed value");
+            template.replace_range(start..end, "");
+            from = start;
+        }
+    }
+    template
+}
+
 impl Fixture {
     pub(crate) fn new() -> Self {
         let mut signing = SigningPolicy::default();
@@ -100,6 +137,20 @@ impl Fixture {
             verification,
             utc: LeapTable::new(-2_208_988_800, 4_102_444_800, &[]).expect("UTC coverage"),
         }
+    }
+
+    /// `document`'s signature signed again with its `SignedInfo`
+    /// canonicalization naming the `InclusiveNamespaces` `PrefixList` `ds`,
+    /// as `augment_probe prefixed-request-v111` does: a signature this
+    /// library's creation does not write, but one it receives.
+    pub(crate) fn with_prefix_list(&self, document: &XmlDocument) -> XmlDocument {
+        let template = prefixed_template(document.as_xml());
+        let signed = SignContext::new(&self.key)
+            .policy(self.signing.clone())
+            .sign_template(&template)
+            .expect("the prefixed template signs")
+            .output;
+        XmlDocument::parse(&signed).expect("signed XML parses")
     }
 
     /// The fixture under a verification policy that reads the historical

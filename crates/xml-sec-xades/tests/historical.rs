@@ -91,14 +91,20 @@ fn timestamped_values(profile: Profile, response: &[u8]) {
 }
 
 #[test]
-fn v111_partial_values_completed_in_held_containers() {
+fn partial_values_completed_in_held_containers() {
     // TS 101 903 V1.1.1 §7.6 places at most one CertificateValues and one
-    // RevocationValues in the UnsignedSignatureProperties sequence: a
-    // signature that already holds some of the values takes the missing
-    // ones in those containers, not in second ones.
-    let profile = Profile::V111;
+    // RevocationValues in the UnsignedSignatureProperties sequence, and the
+    // historical readers of V1.2.2 and of the TS 103 171 profile refuse a
+    // second one too: a signature that already holds some of the values
+    // takes the missing ones in those containers, not in second ones.
+    for (profile, response) in RESPONSES {
+        partial_values(profile, response);
+    }
+}
+
+fn partial_values(profile: Profile, response: &[u8]) {
     let fixture = Fixture::historical();
-    let mut document = timestamped(&fixture, profile, RESPONSES[1].1);
+    let mut document = timestamped(&fixture, profile, response);
     values_of(&fixture, &mut document, profile).expect("full values");
     let full = document.as_xml().to_owned();
     let count = |xml: &str, local: &str| {
@@ -178,7 +184,12 @@ fn unsigned_names(xml: &str) -> Vec<String> {
 /// The probe's signature in the vocabulary of `profile`, completed with its
 /// signature timestamp `response`.
 fn timestamped(fixture: &Fixture, profile: Profile, response: &[u8]) -> xml_sec::XmlDocument {
-    let mut document = fixture
+    stamped(fixture, signed(fixture, profile), profile, response)
+}
+
+/// The probe's B-B signature in the vocabulary of `profile`.
+fn signed(fixture: &Fixture, profile: Profile) -> xml_sec::XmlDocument {
+    fixture
         .signed(Properties {
             historical: Some(profile),
             // V1.1.1 §7.2.3 requires SignaturePolicyIdentifier.
@@ -186,7 +197,17 @@ fn timestamped(fixture: &Fixture, profile: Profile, response: &[u8]) -> xml_sec:
                 .then_some(Policy::Document(SignaturePolicy::Implied)),
             ..Properties::default()
         })
-        .unwrap_or_else(|error| panic!("{profile:?}: {error}"));
+        .unwrap_or_else(|error| panic!("{profile:?}: {error}"))
+}
+
+/// `document`, a signature in the vocabulary of `profile`, completed with
+/// its signature timestamp `response`.
+fn stamped(
+    fixture: &Fixture,
+    mut document: xml_sec::XmlDocument,
+    profile: Profile,
+    response: &[u8],
+) -> xml_sec::XmlDocument {
     let request = TimestampRequest {
         signature: "sig",
         digest: Algorithm::Sha256,
@@ -222,12 +243,40 @@ const X_PRE_EN: &[u8] = include_bytes!("fixtures/content/x-pre-en.tsr");
 const A_PRE_EN: &[u8] = include_bytes!("fixtures/content/a-pre-en.tsr");
 const LTA_PRE_EN: &[u8] = include_bytes!("fixtures/content/lta-pre-en.tsr");
 
+/// The archive TSA's CA and its CRL; that TSA's answer to the pre-EN archive
+/// timestamp request, and the TSA's answer to the second archive timestamp
+/// request after the first one's validation data.
+const ARCHIVE_CA: &[u8] = include_bytes!("fixtures/content/archive-ca.der");
+const ARCHIVE_CRL: &[u8] = include_bytes!("fixtures/content/archive-ca.crl");
+const A_PRE_EN_OTHER: &[u8] = include_bytes!("fixtures/content/a-pre-en-other.tsr");
+const A2_PRE_EN: &[u8] = include_bytes!("fixtures/content/a2-pre-en.tsr");
+/// The TSA's answer to the signature timestamp request of the V1.1.1
+/// signature whose canonicalization names the `PrefixList` `ds`.
+const PREFIXED_V111: &[u8] = include_bytes!("fixtures/content/prefixed-v111.tsr");
+
 /// Request and complete one `kind` timestamp of the pre-EN signature.
 fn stamp(
     fixture: &Fixture,
     document: &mut xml_sec::XmlDocument,
     kind: ExtendedKind,
     response: &[u8],
+) {
+    stamp_with(
+        fixture,
+        document,
+        kind,
+        response,
+        &fixture.inputs(Requirements::LongTerm, &CRLS),
+    );
+}
+
+/// [`stamp`] completed under `inputs`.
+fn stamp_with(
+    fixture: &Fixture,
+    document: &mut xml_sec::XmlDocument,
+    kind: ExtendedKind,
+    response: &[u8],
+    inputs: &Inputs<'_>,
 ) {
     let request = TimestampRequest {
         signature: "sig",
@@ -236,7 +285,6 @@ fn stamp(
         nonce: Some(NONCE),
         id_attributes: &[],
     };
-    let inputs = fixture.inputs(Requirements::LongTerm, &CRLS);
     fixture.with_assessment(|assessment| {
         let pending = request_historical_extended_timestamp(
             document,
@@ -253,7 +301,7 @@ fn stamp(
             response,
             &Completion {
                 assessment,
-                inputs: &inputs,
+                inputs,
                 window: None,
                 id_attributes: &[],
             },
@@ -264,22 +312,34 @@ fn stamp(
 }
 
 /// Add the values the pre-EN signature's census finds missing.
-fn values(fixture: &Fixture, document: &mut xml_sec::XmlDocument) {
-    let inputs = fixture.inputs(Requirements::LongTerm, &CRLS);
+fn values(fixture: &Fixture, document: &mut xml_sec::XmlDocument) -> DataAdded {
+    values_with(
+        fixture,
+        document,
+        &fixture.inputs(Requirements::LongTerm, &CRLS),
+    )
+}
+
+/// [`values`] from `inputs`.
+fn values_with(
+    fixture: &Fixture,
+    document: &mut xml_sec::XmlDocument,
+    inputs: &Inputs<'_>,
+) -> DataAdded {
     fixture.with_assessment(|assessment| {
         add_historical_values(
             document,
             &ValidationData {
                 signature: "sig",
                 assessment,
-                inputs: &inputs,
+                inputs,
                 id_attributes: &[],
             },
             Profile::PreEn,
             &account(),
         )
         .expect("values")
-    });
+    })
 }
 
 #[test]
@@ -290,8 +350,132 @@ fn a_pre_en_signature_goes_through_the_ts101903_levels() {
     // values of XAdES-XL, then the archive timestamp of XAdES-A, each
     // published only while the signature meets BES.
     let fixture = Fixture::historical();
+    let mut document = pre_en_xl(&fixture);
+    stamp(&fixture, &mut document, ExtendedKind::Archive141, A_PRE_EN);
+    assert_eq!(
+        unsigned_names(document.as_xml()),
+        [
+            "SignatureTimeStamp",
+            "CompleteCertificateRefs",
+            "CompleteRevocationRefs",
+            "SigAndRefsTimeStamp",
+            "CertificateValues",
+            "RevocationValues",
+            "ArchiveTimeStamp"
+        ]
+    );
+    // One CA issues the signer's and the TSA's certificates, so the values
+    // already hold every copy the archive timestamp's TSA needs: before a
+    // second archive timestamp nothing is added, no TimeStampValidationData
+    // duplicates them (TS 101 903 V1.4.2 §8.1.1 allows usable copies
+    // elsewhere in the signature).
+    let archived = document.as_xml().to_owned();
+    assert_eq!(values(&fixture, &mut document), DataAdded::AlreadyPresent);
+    assert_eq!(document.as_xml(), archived);
+}
+
+#[test]
+fn a_second_archive_timestamp_follows_the_first_ones_tsa_data() {
+    // TS 101 903 V1.4.2 §8.1.1 and TS 103 171 V2.1.1 §8.1.5, as DSS's
+    // XAdESDoubleATest: the first archive timestamp comes from a TSA under a
+    // CA the signature holds nothing of. Before the second, that TSA's values
+    // go into a TimeStampValidationData right after the first archive
+    // timestamp, outside its input and never into the values it covers; the
+    // second archive timestamp then covers them.
+    let fixture = Fixture::historical();
+    let mut document = pre_en_xl(&fixture);
+    let (certificates, crls) = (
+        [content::INTERMEDIATE, ARCHIVE_CA],
+        [CRLS[0], CRLS[1], ARCHIVE_CRL],
+    );
+    let inputs = Inputs {
+        certificates: &certificates,
+        crls: &crls,
+        ..fixture.inputs(Requirements::LongTerm, &[])
+    };
+    stamp_with(
+        &fixture,
+        &mut document,
+        ExtendedKind::Archive141,
+        A_PRE_EN_OTHER,
+        &inputs,
+    );
+    let encoded = |der: &[u8]| {
+        structured_base64::STANDARD
+            .encode(der)
+            .expect("fixture base64")
+    };
+    assert!(!document.as_xml().contains(&encoded(ARCHIVE_CA)));
+    assert_eq!(
+        values_with(&fixture, &mut document, &inputs),
+        DataAdded::Published
+    );
+    let xl = [
+        "SignatureTimeStamp",
+        "CompleteCertificateRefs",
+        "CompleteRevocationRefs",
+        "SigAndRefsTimeStamp",
+        "CertificateValues",
+        "RevocationValues",
+    ];
+    assert_eq!(
+        unsigned_names(document.as_xml()),
+        [&xl[..], &["ArchiveTimeStamp", "TimeStampValidationData"]].concat()
+    );
+    for value in [ARCHIVE_CA, ARCHIVE_CRL] {
+        assert!(document.as_xml().contains(&encoded(value)));
+    }
+    // The copy after its timestamp is found: a second call adds nothing.
+    assert_eq!(
+        values_with(&fixture, &mut document, &inputs),
+        DataAdded::AlreadyPresent
+    );
+    stamp_with(
+        &fixture,
+        &mut document,
+        ExtendedKind::Archive141,
+        A2_PRE_EN,
+        &inputs,
+    );
+    assert_eq!(
+        unsigned_names(document.as_xml()),
+        [
+            &xl[..],
+            &[
+                "ArchiveTimeStamp",
+                "TimeStampValidationData",
+                "ArchiveTimeStamp"
+            ]
+        ]
+        .concat()
+    );
+}
+
+#[test]
+fn a_canonicalization_prefix_list_is_repeated_in_the_timestamp() {
+    // TS 101 903 V1.1.1 §7.3: the SignatureTimeStamp names the signature's
+    // canonicalization with its parameters. Exclusive C14N §3 reads the
+    // InclusiveNamespaces PrefixList from the CanonicalizationMethod itself,
+    // so a signature that names one takes its timestamp, and the timestamp
+    // repeats the list.
+    let fixture = Fixture::historical();
+    let prefixed = fixture.with_prefix_list(&signed(&fixture, Profile::V111));
+    let document = stamped(&fixture, prefixed, Profile::V111, PREFIXED_V111);
+    let parsed = roxmltree::Document::parse(document.as_xml()).expect("XML parses");
+    let methods: Vec<_> = parsed
+        .descendants()
+        .filter(|node| node.tag_name().name() == "InclusiveNamespaces")
+        .map(|node| node.attribute("PrefixList"))
+        .collect();
+    // The SignedInfo method's and the timestamp transform's copy.
+    assert_eq!(methods, [Some("ds"), Some("ds")]);
+}
+
+/// The probe's pre-EN signature at XAdES-XL: its signature timestamp, the
+/// complete references, the X timestamp and the values.
+fn pre_en_xl(fixture: &Fixture) -> xml_sec::XmlDocument {
     let (_, response) = RESPONSES[0];
-    let mut document = timestamped(&fixture, Profile::PreEn, response);
+    let mut document = timestamped(fixture, Profile::PreEn, response);
     let inputs = fixture.inputs(Requirements::LongTerm, &CRLS);
     fixture.with_assessment(|assessment| {
         add_historical_references(
@@ -310,25 +494,75 @@ fn a_pre_en_signature_goes_through_the_ts101903_levels() {
         .expect("XAdES-C");
     });
     stamp(
-        &fixture,
+        fixture,
         &mut document,
         ExtendedKind::SignatureAndReferences(ReferenceSyntax::Original),
         X_PRE_EN,
     );
-    values(&fixture, &mut document);
-    stamp(&fixture, &mut document, ExtendedKind::Archive141, A_PRE_EN);
-    assert_eq!(
-        unsigned_names(document.as_xml()),
-        [
-            "SignatureTimeStamp",
-            "CompleteCertificateRefs",
-            "CompleteRevocationRefs",
-            "SigAndRefsTimeStamp",
-            "CertificateValues",
-            "RevocationValues",
-            "ArchiveTimeStamp"
-        ]
-    );
+    values(fixture, &mut document);
+    document
+}
+
+#[test]
+fn historical_v2_references_refused_before_writing() {
+    // CompleteCertificateRefsV2 and SigAndRefsTimeStampV2 are the names of
+    // EN 319 132-1 Annex A; the TS 103 171 profile of V1.3.2 has only the
+    // original ones, so a historical signature refuses V2 up front.
+    let fixture = Fixture::historical();
+    let (_, response) = RESPONSES[0];
+    let mut document = timestamped(&fixture, Profile::PreEn, response);
+    let before = document.as_xml().to_owned();
+    let inputs = fixture.inputs(Requirements::LongTerm, &CRLS);
+    let request = TimestampRequest {
+        signature: "sig",
+        digest: Algorithm::Sha256,
+        policy: None,
+        nonce: Some(NONCE),
+        id_attributes: &[],
+    };
+    fixture.with_assessment(|assessment| {
+        let references = add_historical_references(
+            &mut document,
+            &CompleteReferences {
+                signature: "sig",
+                syntax: ReferenceSyntax::V2,
+                digest: DigestAlgorithm::Sha256,
+                assessment,
+                inputs: &inputs,
+                id_attributes: &[],
+            },
+            Profile::PreEn,
+            &account(),
+        );
+        assert!(
+            matches!(
+                references,
+                Err(AugmentError::HistoricalReferenceSyntax(ReferenceSyntax::V2))
+            ),
+            "{references:?}"
+        );
+        for kind in [
+            ExtendedKind::SignatureAndReferences(ReferenceSyntax::V2),
+            ExtendedKind::ReferencesOnly(ReferenceSyntax::V2),
+        ] {
+            let timestamp = request_historical_extended_timestamp(
+                &document,
+                &request,
+                kind,
+                Profile::PreEn,
+                assessment,
+                &account(),
+            );
+            assert!(
+                matches!(
+                    timestamp,
+                    Err(AugmentError::HistoricalReferenceSyntax(ReferenceSyntax::V2))
+                ),
+                "{kind:?}: {timestamp:?}"
+            );
+        }
+    });
+    assert_eq!(document.as_xml(), before);
 }
 
 #[test]

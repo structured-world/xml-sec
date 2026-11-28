@@ -7,13 +7,12 @@
 //! the staged record with the shared ERS kernel and publishes the generation
 //! only when the document confirms the record is its one change.
 
-use super::Judged;
 use super::{
     AugmentError, Completion, Gate, PendingTimestamp, Staging, StagingError, Stamp,
-    TimestampRequest, archival, construction, encode, gated, selected, unproven,
+    TimestampRequest, archival, construction, encode, gated, met, selected, unproven,
     with_response_check,
 };
-use crate::basic::{Outcome, ValidationError};
+use crate::basic::ValidationError;
 use crate::create::{Assessment, Carried};
 use crate::draft::Draft;
 use crate::evidence::{Kind, Sealing};
@@ -24,7 +23,7 @@ use alloc::{boxed::Box, string::String, vec::Vec};
 use core::convert::Infallible;
 use structured_asn1::Reader;
 use structured_asn1::memory::MemoryError;
-use structured_asn1::memory::{Execution, Work};
+use structured_asn1::memory::{Execution, Memory, OwnedVec, Work};
 use structured_cms::directory::{CertificateAgreement, matches_certificate_in};
 use structured_cms::evidence::verify::{Decision, OrderCause, Selection};
 use structured_cms::stream::{RangesError, Receiver, Source};
@@ -153,16 +152,19 @@ type Plan = EditPlan<NodeIdentity, DocumentIdentity, u64>;
 /// #     assessment: &Assessment<'_, '_>,
 /// #     evidence: &Inputs<'_>,
 /// #     tsa: impl Fn(&[u8]) -> Vec<u8>,
+/// #     nonce: &[u8],
 /// #     work: &structured_asn1::memory::Memory,
 /// # ) -> Result<(), xml_sec_xades::AugmentError> {
 /// let inputs = Inputs { requirements: Requirements::LongTerm, ..*evidence };
+/// // A fresh random nonce per request binds the response to it (RFC 3161
+/// // §2.4.1).
 /// let pending = request_evidence_record(
 ///     document,
 ///     &TimestampRequest {
 ///         signature: "sig",
 ///         digest: Algorithm::Sha256,
 ///         policy: None,
-///         nonce: Some(&[0x2a; 8]),
+///         nonce: Some(nonce),
 ///         id_attributes: &[],
 ///     },
 ///     SealKind::Initial,
@@ -235,7 +237,7 @@ struct Drafted {
     markup: String,
     /// The certificates the token carries, which may hold its signer and the
     /// path to it.
-    carried: Vec<Vec<u8>>,
+    carried: Certificates,
 }
 
 /// Check `response`, draft its record, append it and publish the generation
@@ -316,16 +318,6 @@ pub(super) fn complete<W: Work>(
     })
 }
 
-/// Refuse a level whose requirements are not all met. A timestamp's input is
-/// refused by the shared rules on that ground; a seal's is computed here.
-fn met(level: Judged<'_, '_>) -> Result<(), AugmentError> {
-    if level.all_requirements_met() {
-        Ok(())
-    } else {
-        Err(AugmentError::Unmet(Outcome::Assessed(())))
-    }
-}
-
 /// Run `then` over the plan and initial imprint of a new `kind` record.
 fn with_input<W: Work, R>(
     stage: &crate::basic::Stage<'_, '_, '_, '_, W>,
@@ -393,18 +385,18 @@ fn drafted<W: Work>(
                 .token_element()
                 .ok_or(AugmentError::Refused(status))?
                 .as_bytes();
-            let carried = check
-                .response
-                .token()
-                .map(|token| {
+            let memory = stage.session.execution().memory();
+            let carried = match check.response.token() {
+                Some(token) => copies(
                     token
                         .message()
                         .certificates()
                         .iter()
-                        .map(|certificate| certificate.as_bytes().to_vec())
-                        .collect()
-                })
-                .unwrap_or_default();
+                        .map(Certificate::as_bytes),
+                    memory,
+                )?,
+                None => memory.vector(),
+            };
             let base = stage.document.snapshot();
             let signature = stage.prepared.bound().containers().signature();
             let parent = match plan.placement() {
@@ -460,9 +452,9 @@ fn committed<W: Work>(
     let execution = stage.session.execution();
     let access = Access::new(&owner, owner.snapshot(), execution);
     let census = records::read(&access, stage.prepared.bound()).map_err(EvidenceError::Records)?;
-    let carried: Vec<&[u8]> = drafted.carried.iter().map(Vec::as_slice).collect();
+    let carried: Vec<&[u8]> = drafted.carried.iter().map(|der| &der[..]).collect();
     let held = document_certificates(stage)?;
-    let held: Vec<&[u8]> = held.iter().map(Vec::as_slice).collect();
+    let held: Vec<&[u8]> = held.iter().map(|der| &der[..]).collect();
     let parser = stage.parser;
     let anchors = read_certificates(parser, inputs.anchors)?;
     let supplied = read_certificates(parser, inputs.certificates)?;
@@ -523,7 +515,8 @@ fn committed<W: Work>(
 /// paths over, copied out of the readers that own them.
 fn document_certificates<W: Work>(
     stage: &crate::basic::Stage<'_, '_, '_, '_, W>,
-) -> Result<Vec<Vec<u8>>, AugmentError> {
+) -> Result<Certificates, AugmentError> {
+    let memory = stage.session.execution().memory();
     let stamps = timestamp::counter_timestamps(stage.access, stage.counters)
         .map_err(|error| ValidationError::Stamps(Box::new(error)))?;
     timestamp::with_counter_tokens(
@@ -540,31 +533,52 @@ fn document_certificates<W: Work>(
                     stage.counters,
                     operation,
                     |_, view| {
-                        let mut held = Vec::new();
-                        for value in view.values() {
-                            if let Value::Certificate(certificate) = &value.value {
-                                held.push(certificate.as_bytes().to_vec());
-                            }
-                        }
-                        for basic in view.basic_responses() {
-                            for certificate in basic.response().certificates() {
-                                held.push(certificate.as_bytes().to_vec());
-                            }
-                        }
-                        for reading in tokens.readings() {
-                            for certificate in reading.token().message().certificates() {
-                                held.push(certificate.as_bytes().to_vec());
-                            }
-                        }
-                        Ok::<_, Infallible>(held)
+                        let values = view.values().iter().filter_map(|value| match &value.value {
+                            Value::Certificate(certificate) => Some(certificate.as_bytes()),
+                            _ => None,
+                        });
+                        let responses = view.basic_responses().iter().flat_map(|basic| {
+                            basic
+                                .response()
+                                .certificates()
+                                .iter()
+                                .map(Certificate::as_bytes)
+                        });
+                        let tokens = tokens.readings().iter().flat_map(|reading| {
+                            reading
+                                .token()
+                                .message()
+                                .certificates()
+                                .iter()
+                                .map(Certificate::as_bytes)
+                        });
+                        Ok::<_, Infallible>(copies(values.chain(responses).chain(tokens), memory))
                     },
                 )
                 .map_err(|error| ValidationError::Material(Box::new(error))),
             )
         },
     )
-    .map_err(|error| ValidationError::Tokens(Box::new(error)))?
+    .map_err(|error| ValidationError::Tokens(Box::new(error)))??
     .map_err(AugmentError::from)
+}
+
+/// Owned copies of certificates, each in the operation's accounted memory.
+type Certificates = OwnedVec<OwnedVec<u8>>;
+
+/// `certificates` copied into accounted memory, refused when the operation's
+/// budget runs out before anything outlives the readers they came from.
+fn copies<'c>(
+    certificates: impl Iterator<Item = &'c [u8]>,
+    memory: &Memory,
+) -> Result<Certificates, MemoryError> {
+    let mut copied = memory.vector();
+    for der in certificates {
+        let mut copy = memory.vector();
+        copy.try_extend_from_slice(der)?;
+        copied.try_push(copy)?;
+    }
+    Ok(copied)
 }
 
 /// The historical decision on a staged record's token: its signer has a

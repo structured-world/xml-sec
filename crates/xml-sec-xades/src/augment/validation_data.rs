@@ -1,11 +1,12 @@
 //! B-LT augmentation: the validation data a B-T signature lacks.
 
-use super::{AugmentError, Publication, Staging, construction, pooled, publish, selected};
+use super::values::{Held, Join, Split, insert_values};
+use super::{AugmentError, Publication, Staging, construction, pooled, publish_with, selected};
 use crate::basic::{Outcome, Stage, Vocabulary};
 use crate::create::Assessment;
 use crate::draft::Draft;
 use crate::level::{Census, ExtendedLevel, Inputs, Level, Visit, validate_with};
-use crate::placement::{self, Unsigned};
+use crate::placement::{self, Unsigned, XADES};
 use alloc::{string::String, vec::Vec};
 use core::convert::Infallible;
 use structured_asn1::memory::{OwnedVec, Work};
@@ -237,9 +238,15 @@ fn added<W: Work>(
         _ => {}
     }
     let assessment = data.assessment;
-    let unsigned = document.with_view(|view| {
-        placement::locate(view, data.signature, data.id_attributes, work)
-            .map(|located| located.unsigned)
+    let (unsigned, held) = document.with_view(|view| {
+        let unsigned = placement::locate(view, data.signature, data.id_attributes, work)?.unsigned;
+        // Direct values join the containers the signature holds; the
+        // general AnyValidationData repeats.
+        let held = match form {
+            Form::Direct => Held::of(view, unsigned, XADES, work)?,
+            Form::Any | Form::Refresh => Held::default(),
+        };
+        Ok::<_, AugmentError>((unsigned, held))
     })?;
     let certificates = pooled(data.inputs, assessment, work)?;
     let inputs = Inputs {
@@ -260,7 +267,11 @@ fn added<W: Work>(
         |session| {
             Ok(
                 selected(document, &session, data.signature, data.id_attributes).and_then(|node| {
-                    let visitor = Missing { unsigned, form };
+                    let visitor = Missing {
+                        unsigned,
+                        held,
+                        form,
+                    };
                     match validate_with(&session, node, &census, form.vocabulary(), visitor)? {
                         Outcome::Assessed(property) => property,
                         outcome => Err(AugmentError::Unmet(outcome.map(|_| ()))),
@@ -274,7 +285,7 @@ fn added<W: Work>(
     } else {
         DataAdded::Published
     };
-    publish(
+    publish_with(
         document,
         &Publication {
             assessment,
@@ -284,7 +295,7 @@ fn added<W: Work>(
             id_attributes: data.id_attributes,
             unsigned,
         },
-        &property,
+        |document| insert_values(document, data, XADES, &property, work),
         work,
     )?;
     Ok(added)
@@ -293,11 +304,12 @@ fn added<W: Work>(
 /// The census visitor: the missing values as properties, if any.
 struct Missing {
     unsigned: Unsigned,
+    held: Held,
     form: Form,
 }
 
 impl<W: Work> Visit<W> for Missing {
-    type Output = Result<Vec<String>, AugmentError>;
+    type Output = Result<Vec<(String, Join)>, AugmentError>;
 
     fn supplied_first(&self) -> bool {
         self.form == Form::Refresh
@@ -313,7 +325,7 @@ impl<W: Work> Visit<W> for Missing {
     }
 
     fn census(self, census: &Census<'_, '_, '_, '_, '_, '_, '_, W>) -> Result<Self::Output, Self> {
-        Ok(missing(census, self.unsigned, self.form))
+        Ok(missing(census, self.unsigned, self.held, self.form))
     }
 }
 
@@ -323,13 +335,20 @@ impl<W: Work> Visit<W> for Missing {
 fn missing<W: Work>(
     census: &Census<'_, '_, '_, '_, '_, '_, '_, W>,
     unsigned: Unsigned,
+    held: Held,
     form: Form,
-) -> Result<Vec<String>, AugmentError> {
+) -> Result<Vec<(String, Join)>, AugmentError> {
     let stage = census.stage();
     let work = stage.session.execution();
     let entries = plan(census, work)?;
     if entries.is_empty() {
         return Ok(Vec::new());
+    }
+    if form == Form::Direct {
+        let mut split = Split::new(held);
+        write_extended_values(&entries, ReferenceRole::Signature, &mut split, work)
+            .map_err(construction)?;
+        return split.finish();
     }
     let mut staging = Staging {
         session: stage.session,
@@ -338,14 +357,13 @@ fn missing<W: Work>(
         unsigned: unsigned.signature_properties(),
         draft: Draft::siblings(),
     };
-    match form {
-        Form::Any | Form::Refresh => write_material(&entries, &mut staging, work),
-        Form::Direct => {
-            write_extended_values(&entries, ReferenceRole::Signature, &mut staging, work)
-        }
-    }
-    .map_err(construction)?;
-    Ok(staging.draft.finish_siblings()?)
+    write_material(&entries, &mut staging, work).map_err(construction)?;
+    Ok(staging
+        .draft
+        .finish_siblings()?
+        .into_iter()
+        .map(|property| (property, Join::Property))
+        .collect())
 }
 
 /// Every value B-LT needs that has no eligible copy, each once: first those

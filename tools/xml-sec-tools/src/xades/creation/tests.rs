@@ -327,6 +327,31 @@ fn parallel_evidence_records_each_judged() {
 }
 
 #[test]
+fn timestamp_validation_data_bound_to_first_archive() {
+    // The TimeStampValidationData serves the first archive timestamp: its
+    // CA is in that timestamp's chain, not among what it covers, and the
+    // second archive timestamp covers it. The same origins serving another
+    // timestamp's chain do not stand for that.
+    let report = |first_chain: &str, second_chain: &str| {
+        format!(
+            r#"<DiagnosticData><Signature><FoundCertificates><RelatedCertificate Certificate="C-ca"><Origin>TIMESTAMP_VALIDATION_DATA</Origin></RelatedCertificate></FoundCertificates><FoundRevocations><RelatedRevocation Revocation="R-crl"><Origin>TIMESTAMP_VALIDATION_DATA</Origin></RelatedRevocation></FoundRevocations></Signature><Timestamp Type="ARCHIVE_TIMESTAMP"><CertificateChain><ChainItem Certificate="{first_chain}"/></CertificateChain></Timestamp><Timestamp Type="ARCHIVE_TIMESTAMP"><CertificateChain><ChainItem Certificate="{second_chain}"/></CertificateChain><TimestampedObjects><TimestampedObject Token="C-ca"/><TimestampedObject Token="R-crl"/></TimestampedObjects></Timestamp></DiagnosticData>"#
+        )
+    };
+    let first_archive_data = |text: &str| {
+        let document = super::xml::parse(text, "diagnostic").expect("parses");
+        super::first_archive_data(document.root_element())
+    };
+    assert_eq!(first_archive_data(&report("C-ca", "C-other")), None);
+    let elsewhere = first_archive_data(&report("C-other", "C-ca"));
+    assert!(
+        elsewhere
+            .as_deref()
+            .is_some_and(|why| why.contains("chain")),
+        "{elsewhere:?}"
+    );
+}
+
+#[test]
 fn counted_facts_need_their_number() {
     // Two all-data-object timestamps, not one of each role; both Manifests
     // of a two-Manifest signature.

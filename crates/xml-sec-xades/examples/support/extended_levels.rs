@@ -18,8 +18,8 @@ use xml_sec_xades::{
     request_historical_timestamp,
 };
 
-/// The nonce of every extended request.
-const NONCE: &[u8] = &[0x1c, 0x2d, 0x3e, 0x4f, 0x50, 0x61, 0x72, 0x03];
+/// The nonce of every extended and historical request.
+pub(crate) const NONCE: &[u8] = &[0x1c, 0x2d, 0x3e, 0x4f, 0x50, 0x61, 0x72, 0x03];
 
 /// Writes one named output file.
 type Write<'w> = dyn Fn(&str, &[u8]) -> Result<(), String> + 'w;
@@ -125,9 +125,11 @@ pub(crate) fn historical(
 /// `pre-en-a-request` completes it with `x-pre-en.tsr`, adds the values and
 /// writes the archive timestamp request `a-pre-en.tsq`, `pre-en-lta-request`
 /// writes the archive timestamp request `lta-pre-en.tsq` of the signature
-/// with only its values, and `pre-en-levels` completes everything and writes
-/// `c-pre-en.xml`, `x-pre-en.xml`, `xl-pre-en.xml`, `a-pre-en.xml` and
-/// `lta-pre-en.xml`.
+/// with only its values, `pre-en-a2-request` writes the second archive
+/// timestamp request `a2-pre-en.tsq` of the renewal branch (`PreEn::renewed`),
+/// and `pre-en-levels` completes everything and writes `c-pre-en.xml`,
+/// `x-pre-en.xml`, `xl-pre-en.xml`, `a-pre-en.xml`, `lta-pre-en.xml` and
+/// `a-renewed-pre-en.xml`.
 pub(crate) fn pre_en_levels(
     document: XmlDocument,
     action: &str,
@@ -161,6 +163,32 @@ pub(crate) fn pre_en_levels(
         window: None,
         id_attributes: &[],
     };
+    // The archive TSA's own CA and its CRL, which only the renewal branch's
+    // first archive timestamp needs: the other actions run without them.
+    let renewal_file = |name: &str| {
+        if matches!(action, "pre-en-a2-request" | "pre-en-levels") {
+            read(name)
+        } else {
+            Ok(Vec::new())
+        }
+    };
+    let (archive_ca, archive_crl) = (
+        renewal_file("archive-ca.der")?,
+        renewal_file("archive-ca.crl")?,
+    );
+    let (renewal_certificates, renewal_crls): ([&[u8]; 2], [&[u8]; 3]) = (
+        [intermediate, &archive_ca],
+        [&lists[0], &lists[1], &archive_crl],
+    );
+    let renewal_inputs = Inputs {
+        certificates: &renewal_certificates,
+        crls: &renewal_crls,
+        ..inputs
+    };
+    let renewal = Completion {
+        inputs: &renewal_inputs,
+        ..completion
+    };
     let request = TimestampRequest {
         signature: "sig",
         digest: Algorithm::Sha256,
@@ -173,6 +201,7 @@ pub(crate) fn pre_en_levels(
         assessment,
         request: &request,
         completion: &completion,
+        renewal: &renewal,
         fixtures,
         write,
         work,
@@ -202,6 +231,8 @@ struct PreEn<'a> {
     assessment: &'a Assessment<'a, 'a>,
     request: &'a TimestampRequest<'a>,
     completion: &'a Completion<'a, 'a>,
+    /// The completion that also reads the archive TSA's CA and CRL.
+    renewal: &'a Completion<'a, 'a>,
     fixtures: &'a Path,
     write: &'a Write<'a>,
     work: &'a Memory,
@@ -215,23 +246,75 @@ impl PreEn<'_> {
         pending: &PendingTimestamp,
         answer: &str,
     ) -> Result<(), String> {
+        self.complete_with(document, pending, answer, self.completion)
+    }
+
+    /// [`Self::complete`] under `completion`.
+    fn complete_with(
+        &self,
+        document: &mut XmlDocument,
+        pending: &PendingTimestamp,
+        answer: &str,
+        completion: &Completion<'_, '_>,
+    ) -> Result<(), String> {
         let response = std::fs::read(self.fixtures.join(answer))
             .map_err(|error| format!("read {answer}: {error}"))?;
-        complete_timestamp(document, pending, &response, self.completion, self.work)
+        complete_timestamp(document, pending, &response, completion, self.work)
             .map_err(|error| format!("{answer}: {error}"))
     }
 
     /// Add the values the signature's census finds missing.
     fn values(&self, document: &mut XmlDocument) -> Result<(), String> {
+        self.values_with(document, self.completion)
+    }
+
+    /// [`Self::values`] from the inputs of `completion`.
+    fn values_with(
+        &self,
+        document: &mut XmlDocument,
+        completion: &Completion<'_, '_>,
+    ) -> Result<(), String> {
         let values = ValidationData {
             signature: "sig",
             assessment: self.assessment,
-            inputs: self.completion.inputs,
+            inputs: completion.inputs,
             id_attributes: &[],
         };
         add_historical_values(document, &values, Profile::PreEn, self.work)
             .map(|_| ())
             .map_err(|error| format!("values: {error}"))
+    }
+
+    /// The `XAdESDoubleATest` branch of the XAdES-XL `document`: its archive
+    /// timestamp from the archive TSA (`a-pre-en-other.tsr`, the answer to
+    /// `a-pre-en.tsq`), that TSA's validation data right after it, then a
+    /// second archive timestamp: `pre-en-a2-request` writes its request
+    /// `a2-pre-en.tsq`, `pre-en-levels` completes it with `a2-pre-en.tsr`
+    /// and writes `a-renewed-pre-en.xml`.
+    fn renewed(&self, mut document: XmlDocument) -> Result<(), String> {
+        if !matches!(self.action, "pre-en-a2-request" | "pre-en-levels") {
+            return Ok(());
+        }
+        let archive = |document: &XmlDocument| {
+            request_historical_extended_timestamp(
+                document,
+                self.request,
+                ExtendedKind::Archive141,
+                Profile::PreEn,
+                self.assessment,
+                self.work,
+            )
+            .map_err(|error| format!("renewal archive request: {error}"))
+        };
+        let pending = archive(&document)?;
+        self.complete_with(&mut document, &pending, "a-pre-en-other.tsr", self.renewal)?;
+        self.values_with(&mut document, self.renewal)?;
+        let pending = archive(&document)?;
+        if self.action == "pre-en-a2-request" {
+            return (self.write)("a2-pre-en.tsq", pending.request());
+        }
+        self.complete_with(&mut document, &pending, "a2-pre-en.tsr", self.renewal)?;
+        self.save(&document, "a-renewed-pre-en.xml")
     }
 
     /// Write `document` as `name` when the run completes every level.
@@ -301,8 +384,10 @@ impl PreEn<'_> {
         self.save(document, "x-pre-en.xml")?;
         self.values(document)?;
         self.save(document, "xl-pre-en.xml")?;
+        let xl = XmlDocument::parse(document.as_xml())
+            .map_err(|error| format!("reparse the XL document: {error}"))?;
         self.archive(document, "a")?;
-        Ok(())
+        self.renewed(xl)
     }
 }
 

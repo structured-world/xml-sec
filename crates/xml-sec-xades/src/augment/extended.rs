@@ -2,9 +2,9 @@
 //! references of `XAdES-C` and the X and archive timestamps over them.
 
 use super::{
-    AugmentError, Completion, Gate, PendingTimestamp, Publication, Repeat, Staging, StagingError,
-    Stamp, TimestampRequest, construction, gated, pooled, publish, selected, signed_method,
-    unproven, with_algorithm, with_response_check,
+    AugmentError, Completion, Gate, Judged, PendingTimestamp, Publication, Repeat, Staging,
+    StagingError, Stamp, TimestampRequest, construction, gated, met, pooled, publish, selected,
+    signed_method, unproven, with_algorithm, with_response_check,
 };
 use crate::basic::{Outcome, Stage, Vocabulary};
 use crate::create::Assessment;
@@ -286,15 +286,17 @@ pub(super) fn signer_artifacts<'r, X: Xml<Id = NodeIdentity>, A: Work, Q: Work>(
 /// #     document: &xml_sec::XmlDocument,
 /// #     assessment: &Assessment<'_, '_>,
 /// #     inputs: &Inputs<'_>,
+/// #     nonce: &[u8],
 /// #     work: &structured_asn1::memory::Memory,
 /// # ) -> Result<xml_sec_xades::PendingTimestamp, xml_sec_xades::AugmentError> {
+/// // A fresh random nonce per request (RFC 3161 §2.4.1).
 /// request_extended_timestamp(
 ///     document,
 ///     &TimestampRequest {
 ///         signature: "sig",
 ///         digest: Algorithm::Sha256,
 ///         policy: None,
-///         nonce: Some(&[0x2a; 8]),
+///         nonce: Some(nonce),
 ///         id_attributes: &[],
 ///     },
 ///     ExtendedKind::SignatureAndReferences(ReferenceSyntax::V2),
@@ -334,7 +336,8 @@ pub fn request_extended_timestamp<W: Work>(
             Ok(
                 selected(document, &session, request.signature, request.id_attributes).and_then(
                     |node| {
-                        gated(&session, node, &gate, |stage, _| {
+                        gated(&session, node, &gate, |stage, level| {
+                            met(level)?;
                             extended_request(stage, request, kind)
                         })
                     },
@@ -422,15 +425,18 @@ impl PendingTimestamp {
 }
 
 /// The `kind` timestamp property of a checked response, as markup: the
-/// request made again over the current generation must be the pending one.
+/// signature must still meet the pending basis at `level`, and the request
+/// made again over the current generation must be the pending one.
 pub(super) fn timestamped<W: Work>(
     stage: &Stage<'_, '_, '_, '_, W>,
+    level: Judged<'_, '_>,
     kind: ExtendedKind,
     pending: &PendingTimestamp,
     response: &[u8],
     completion: &Completion<'_, '_>,
     unsigned: Unsigned,
 ) -> Result<String, AugmentError> {
+    met(level)?;
     let repeated = pending.repeated()?;
     with_prepared(
         stage,
