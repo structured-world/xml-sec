@@ -1630,10 +1630,12 @@ impl XmlDocument {
                     })
                     .ok_or_else(other)?;
                 // Every direct child the inserted bytes produced overlaps
-                // them; every node an entity reference expands to takes the
-                // reference's range. Exactly one, an element spanning all of
-                // them, is one appended child: text beside it is a second
-                // child, its own descendants are not the parent's.
+                // them. Exactly one, an element spanning all of them, is one
+                // appended child: text beside it is a second child, its own
+                // descendants are not the parent's. The xmloxide backend gives
+                // every node an entity reference expands to the reference's
+                // range; roxmltree gives them the declaration's, which overlaps
+                // nothing inserted, so such an append is refused there.
                 let mut added_children = enclosing.children().filter(|child| {
                     let span = child.range();
                     span.start < inserted.end && inserted.start < span.end
