@@ -62,6 +62,11 @@
 //! `request_archive_timestamp_with_renewal` first digests the detached objects
 //! of a signed `Manifest` under a new method as a `RenewedDigestsV2`, which
 //! the completion publishes together with the archive that protects it.
+//! `request_evidence_record` seals a B-LT signature with an ETSI TS 119 132-3
+//! evidence record, or adds a parallel one, through the same completion:
+//! the staged record is verified and the document confirms it is the one
+//! change before the generation is published. A sealed signature takes no
+//! other unsigned property.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -83,6 +88,8 @@ mod content;
 mod create;
 #[cfg(feature = "produce")]
 mod draft;
+mod evidence;
+mod historical_xml;
 mod level;
 mod path;
 #[cfg(feature = "produce")]
@@ -98,10 +105,13 @@ mod xml;
 pub use accuracy::AuthorityAccuracy;
 #[cfg(feature = "produce")]
 pub use augment::{
-    AugmentError, Completion, DataAdded, DigestRenewal, PendingTimestamp, PolicyStoreRequest,
-    TimestampRequest, TokenFacts, ValidationData, add_policy_store, add_validation_data,
-    complete_timestamp, refresh_validation_data, request_archive_timestamp,
-    request_archive_timestamp_with_renewal, request_timestamp,
+    AugmentError, CompleteReferences, Completion, DataAdded, DigestRenewal, EvidenceError,
+    ExtendedKind, PendingTimestamp, PolicyStoreRequest, ReferenceSyntax, SealKind,
+    TimestampRequest, TokenFacts, ValidationData, VerifyError, add_complete_references,
+    add_extended_values, add_historical_references, add_historical_values, add_policy_store,
+    add_validation_data, complete_timestamp, refresh_validation_data, request_archive_timestamp,
+    request_archive_timestamp_with_renewal, request_evidence_record, request_extended_timestamp,
+    request_historical_extended_timestamp, request_historical_timestamp, request_timestamp,
 };
 pub use basic::{
     CounterError, EnclosingError, Outcome, PathFailure, Report, TimestampCheckError,
@@ -127,7 +137,7 @@ pub use status::{StatusError, StatusFailure};
 pub use structured_xades::container::Syntax;
 pub use structured_xades::unsigned::Requirements;
 pub use tokens::{TimestampRole, TokenIntegrity, TokenResult, check_tokens};
-pub use ts101903::{Ts101903Error, Ts101903Report, validate_ts101903};
+pub use ts101903::{Ts101903Error, Ts101903Report, validate_historical, validate_ts101903};
 
 /// Original document identity and generation, as seen by the shared core.
 pub type Snapshot = structured_xades::xml::Snapshot<DocumentIdentity, u64>;
@@ -138,13 +148,21 @@ pub type Snapshot = structured_xades::xml::Snapshot<DocumentIdentity, u64>;
 /// charges the caller's execution before data-dependent work.
 pub struct Document<'s, 'view, 'scope, 'inputs, W: Work> {
     session: &'s VerifiedSession<'view, 'scope, 'inputs, W>,
+    /// The one change of the open transaction this generation was staged
+    /// in, when it adds an evidence record this crate drafted.
+    #[cfg(feature = "produce")]
+    sealing: Option<evidence::Sealing>,
 }
 
 impl<'s, 'view, 'scope, 'inputs, W: Work> Document<'s, 'view, 'scope, 'inputs, W> {
     /// Attach the adapter to a verified session; this performs no work.
     #[must_use]
     pub fn new(session: &'s VerifiedSession<'view, 'scope, 'inputs, W>) -> Self {
-        Self { session }
+        Self {
+            session,
+            #[cfg(feature = "produce")]
+            sealing: None,
+        }
     }
 
     /// The verified session this adapter reads.
@@ -199,6 +217,10 @@ pub enum Error {
     /// before any hashing, so this marks a broken invariant.
     #[error("prohibited digest algorithm cannot be computed")]
     ProhibitedDigest,
+    /// The earlier chains of an XMLERS sequence are not in document order,
+    /// so no document subset is their canonical input (RFC 6283 §4.2.2).
+    #[error("XMLERS chains are not in document order")]
+    ChainOrder,
     /// The replay receiver refused further bytes.
     #[error("reference replay receiver refused output")]
     ReceiverRefused,

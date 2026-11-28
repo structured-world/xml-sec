@@ -578,13 +578,9 @@ fn verification(
     })
 }
 
-/// TS 101 903 V1.2.2 is read only when both layers read it.
+/// A syntax is read only when both layers read it: the narrower layer wins.
 fn xades_syntax(a: XadesSyntax, b: XadesSyntax) -> XadesSyntax {
-    if a == XadesSyntax::WithTs101903V122 && b == XadesSyntax::WithTs101903V122 {
-        XadesSyntax::WithTs101903V122
-    } else {
-        XadesSyntax::En319132
-    }
+    a.min(b)
 }
 
 /// BER is read only when both layers read it.

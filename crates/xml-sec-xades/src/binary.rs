@@ -190,28 +190,38 @@ impl<W: Work> DigestProvider<'_, Self> for Document<'_, '_, '_, '_, W> {
     ) -> Result<Resolution<DigestIdentity>, Error> {
         self.check(access.snapshot())?;
         let work = access.execution();
-        // The format prohibition precedes deployment policy: an XMLDSig policy
-        // or build without MD5 must not turn a prohibited method into a policy
-        // error or an unsupported one.
-        let md5 = self.with_attribute(
+        // The shared grammar chose `method` as the DigestMethod of its
+        // property, in the namespace its profile defines (ds, or the 1.1.1
+        // namespace of TS 101 903 V1.1.1); its Algorithm decides the digest.
+        self.with_attribute(
             method,
             Name {
                 namespace: "",
                 local: "Algorithm",
             },
             work,
-            |value| value.is_some_and(|value| any_uri(value) == MD5),
-        )?;
-        if md5 {
-            return Ok(Resolution::Supported(DigestIdentity::Md5));
-        }
-        Ok(match self.session.resolve_digest_method_in(method, work)? {
-            DigestMethodResolution::Supported(algorithm) => {
-                Resolution::Supported(DigestIdentity::Digest(algorithm))
-            }
-            DigestMethodResolution::Unsupported => Resolution::Unsupported,
-            DigestMethodResolution::Malformed => Resolution::Malformed,
-        })
+            |value| {
+                let Some(value) = value else {
+                    return Ok(Resolution::Malformed);
+                };
+                // XMLDSig 1.1 §4.4.3.5 types Algorithm as anyURI, whose
+                // whiteSpace is collapse (XSD 1.0 §4.3.6).
+                let uri = any_uri(value);
+                // The format prohibition precedes deployment policy: an
+                // XMLDSig policy or build without MD5 must not turn a
+                // prohibited method into a policy error or an unsupported one.
+                if uri == MD5 {
+                    return Ok(Resolution::Supported(DigestIdentity::Md5));
+                }
+                Ok(match self.session.resolve_digest_uri_in(uri, work)? {
+                    DigestMethodResolution::Supported(algorithm) => {
+                        Resolution::Supported(DigestIdentity::Digest(algorithm))
+                    }
+                    DigestMethodResolution::Unsupported => Resolution::Unsupported,
+                    DigestMethodResolution::Malformed => Resolution::Malformed,
+                })
+            },
+        )?
     }
 
     fn classify(&self, identity: &DigestIdentity) -> HashClass {

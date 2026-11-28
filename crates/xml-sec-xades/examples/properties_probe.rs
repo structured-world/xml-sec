@@ -15,9 +15,11 @@
 //! policy, the first with a store added after signing (`policy-store-added`),
 //! a policy whose digest the signer supplies without the document
 //! (`policy-supplied`) and an ETSI TR 102 272 ASN.1 policy digested as that
-//! specification defines, stored after signing (`policy-asn1`), with the
-//! detached data as `OUTPUT/detached.txt` and the local policy copy as
-//! `OUTPUT/policy.xml`.
+//! specification defines, stored after signing (`policy-asn1`), signatures in
+//! the vocabulary of TS 101 903 V1.1.1 with a policy (`historical-v111`), of
+//! V1.2.2 (`historical-v122`) and of the TS 103 171 profile of V1.3.2
+//! (`historical-pre-en`), with the detached data as `OUTPUT/detached.txt` and
+//! the local policy copy as `OUTPUT/policy.xml`.
 
 #[path = "support/asn1_policy.rs"]
 mod asn1_policy;
@@ -30,7 +32,7 @@ use structured_asn1::memory::{Memory, MemoryAccount};
 use structured_pkix::temporal::LeapTable;
 use xml_sec::XmlDocument;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
-use xml_sec::policy::{Instant, SigningPolicy, VerificationPolicy};
+use xml_sec::policy::{Instant, SigningPolicy, VerificationPolicy, XadesSyntax};
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DigestAlgorithm, KeyResolverConfig, ObjectContent, ObjectElement,
     RsaSigningKey, SignatureAlgorithm, Transform, UriTypeSet, VerificationRequest, VerifyContext,
@@ -38,7 +40,7 @@ use xml_sec::xmldsig::{
 use xml_sec_xades::properties::{
     Commitment, CommitmentScope, DigestRule, ExplicitPolicy, FormatDetails, Fragment, Identifier,
     NoticeReference, Policy, PolicyDocument, PolicyQualifier, PolicyStore, PolicyTransform,
-    PolicyTransforms, ProductionPlace, Properties, Qualifier, SignaturePolicy, SignerRole,
+    PolicyTransforms, ProductionPlace, Profile, Properties, Qualifier, SignaturePolicy, SignerRole,
     SpecifiedDigest, SuppliedPolicy, UserNotice,
 };
 use xml_sec_xades::{
@@ -266,6 +268,20 @@ impl<'f> Values<'f> {
                 policy: Some(explicit(PolicyTransform::None, &[])),
                 ..Properties::default()
             },
+            // TS 101 903 V1.1.1 requires a signature policy.
+            "historical-v111" => Properties {
+                policy: Some(explicit(PolicyTransform::None, &self.notice)),
+                historical: Some(Profile::V111),
+                ..Properties::default()
+            },
+            "historical-v122" => Properties {
+                historical: Some(Profile::V122),
+                ..Properties::default()
+            },
+            "historical-pre-en" => Properties {
+                historical: Some(Profile::PreEn),
+                ..Properties::default()
+            },
             "policy-local-uri" => Properties {
                 policy: Some(explicit(PolicyTransform::None, &[])),
                 policy_store: Some(store(PolicyDocument::LocalUri("policy.xml"))),
@@ -391,6 +407,8 @@ fn main() -> Result<(), String> {
     verification.key_trust.verify_x509_chains = true;
     verification.key_trust.verification_time = Instant::new(1_800_000_000, 0);
     verification.uris.references = UriTypeSet::ALL;
+    // The historical cases name their vocabulary; the policy reads it.
+    verification.xades_syntax = XadesSyntax::WithHistoricalVocabularies;
     let resolver = DefaultKeyResolver::new(KeyResolverConfig {
         trusted_certs: vec![root.clone()],
         ..KeyResolverConfig::default()
@@ -554,7 +572,7 @@ impl Then<'_> {
 }
 
 /// Every case, in the order they are written.
-const CASES: [&str; 12] = [
+const CASES: [&str; 15] = [
     "policy-explicit",
     "policy-transforms",
     "policy-implied",
@@ -567,6 +585,9 @@ const CASES: [&str; 12] = [
     "policy-store-added",
     "policy-supplied",
     "policy-asn1",
+    "historical-v111",
+    "historical-v122",
+    "historical-pre-en",
 ];
 
 fn document_object() -> DataObject<'static> {

@@ -280,6 +280,7 @@ pub fn validate_basic<W: Work, R>(
         session,
         signature,
         Requirements::Basic,
+        Vocabulary::Baseline,
         [certificates, &[]],
         None,
         |_, report| Ok(Outcome::Assessed(visitor(report))),
@@ -310,7 +311,7 @@ pub(crate) struct Timing<'t> {
 }
 
 /// The completed negative fact of a countersignature binding, or its refusal.
-fn counter_fact<R>(error: CounterError) -> Result<Outcome<R>, ValidationError> {
+pub(crate) fn counter_fact<R>(error: CounterError) -> Result<Outcome<R>, ValidationError> {
     match error {
         WalkError::Visitor(CounterSelectionError::Selection {
             signature,
@@ -378,12 +379,46 @@ pub(crate) fn enclosing_counter<'a, 'v, 's, 'i, W: Work, Q: Work>(
         .map_err(|cause| enclosing(EnclosingError::Counter(cause)))
 }
 
+/// The unsigned-property vocabulary a validation reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Vocabulary {
+    /// EN 319 132-1 baseline signatures, which hold no validation references.
+    Baseline,
+    /// Also the TS 101 903 C, X, XL and A properties in the EN 319 132-1
+    /// Annex A names (`CompleteCertificateRefsV2`, `SigAndRefsTimeStampV2`),
+    /// which only the augmentation that writes them reads.
+    #[cfg(feature = "produce")]
+    ExtendedV2,
+}
+
+impl Vocabulary {
+    /// The preparation of `signature` in this vocabulary. The caller names
+    /// the vocabulary; a signature never selects a grammar that admits more.
+    fn prepare<W: Work>(
+        self,
+        access: &Access<'_, Document<'_, '_, '_, '_, W>, W>,
+        signature: NodeIdentity,
+        requirements: Requirements,
+        enclosing: Option<&counter::Binding<Document<'_, '_, '_, '_, W>>>,
+    ) -> Result<prepare::Preparation<NodeIdentity, DocumentIdentity, u64>, ValidationError> {
+        match self {
+            Self::Baseline => prepare::prepare(access, signature, requirements, enclosing),
+            #[cfg(feature = "produce")]
+            Self::ExtendedV2 => {
+                prepare::prepare_extended_v2(access, signature, requirements, enclosing)
+            }
+        }
+        .map_err(|error| ValidationError::Prepare(Box::new(error)))
+    }
+}
+
 /// Run the B-B pipeline for the requested structural level, then `then` over
 /// its assembled report. A completed negative fact stops before `then`.
 pub(crate) fn with_stage<W: Work, R>(
     session: &VerifiedSession<'_, '_, '_, W>,
     signature: NodeIdentity,
     requirements: Requirements,
+    vocabulary: Vocabulary,
     certificates: [&[&[u8]]; 2],
     timing: Option<Timing<'_>>,
     then: impl for<'a> FnOnce(
@@ -403,8 +438,7 @@ pub(crate) fn with_stage<W: Work, R>(
         });
     }
     let enclosing = enclosing_counter(&document, &access, signature)?;
-    let prepared = prepare::prepare(&access, signature, requirements, enclosing.as_ref())
-        .map_err(|error| ValidationError::Prepare(Box::new(error)))?;
+    let prepared = vocabulary.prepare(&access, signature, requirements, enclosing.as_ref())?;
     let fields = prepare::check_fields(&prepared, &access)
         .map_err(|error| ValidationError::Fields(Box::new(error)))?;
     let incorporated = counter::walk(&access, prepared.bound(), |binding, _| {

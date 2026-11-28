@@ -14,7 +14,8 @@ use structured_asn1::memory::Work;
 use structured_cms::signature_policy::PolicyDigestError;
 pub use structured_xades::identifier::Qualifier;
 use structured_xades::produce::{
-    self, Event, FragmentSlot, ObjectMetadata, PolicyWriter, PropertyWriter, Writer,
+    self, Event, FragmentSlot, ObjectMetadata, PolicyWriter, PropertyWriter, ReferenceWriter,
+    Writer,
 };
 pub use structured_xades::produce::{
     CertifiedRole, Commitment, CommitmentScope, ExplicitPolicy, Identifier, NoticeReference,
@@ -25,6 +26,7 @@ pub use structured_xades::produce::{
 mod specified;
 
 pub use specified::{DigestRule, PolicyHash, SpecifiedDigest};
+pub use structured_xades::legacy::Profile;
 use xml_sec::policy::{PolicyViolation, SigningPolicy};
 use xml_sec::provider::{CryptoProvider, ProviderError};
 use xml_sec::xmldsig::extension::{
@@ -168,6 +170,11 @@ pub struct Properties<'a> {
     pub content_timestamps: &'a [ContentTimestamp<'a>],
     /// What the content timestamp responses are checked with.
     pub content_evidence: Option<ContentEvidence<'a>>,
+    /// The historical vocabulary to write the qualifying properties in:
+    /// ETSI TS 101 903 V1.1.1 or V1.2.2, or the TS 103 171 profile of
+    /// V1.3.2, with `SigningCertificate` and only a signature policy beside
+    /// it. `None` writes EN 319 132-1.
+    pub historical: Option<Profile>,
 }
 
 impl Properties<'_> {
@@ -226,6 +233,23 @@ pub enum PropertyError {
     /// one its input was produced with.
     #[error("the content timestamp method is not the method of its input")]
     ContentMethod,
+    /// A distinguished name could not be rendered.
+    #[error("distinguished name rendering failed: {0}")]
+    Name(structured_pkix::Error),
+    /// A negative serial number has no `xsd:integer` form `X509SerialNumber`
+    /// allows (RFC 5280 §4.1.2.2).
+    #[error("a negative serial number cannot be written")]
+    Negative,
+}
+
+impl From<crate::draft::ValueError> for PropertyError {
+    fn from(error: crate::draft::ValueError) -> Self {
+        match error {
+            crate::draft::ValueError::Draft(error) => Self::Draft(error),
+            crate::draft::ValueError::Name(error) => Self::Name(error),
+            crate::draft::ValueError::Negative => Self::Negative,
+        }
+    }
 }
 
 impl From<TransformError> for PropertyError {
@@ -318,6 +342,32 @@ impl Writer for PropertyDraft<'_> {
 
     fn write<W: Work>(&mut self, event: Event<'_>, work: &W) -> Result<(), PropertyError> {
         Ok(self.draft.write(event, work)?)
+    }
+}
+
+impl ReferenceWriter for PropertyDraft<'_> {
+    fn distinguished_name<W: Work>(
+        &mut self,
+        name: &structured_pkix::Name<'_>,
+        work: &W,
+    ) -> Result<(), PropertyError> {
+        Ok(self.draft.name_text(name, work)?)
+    }
+
+    fn integer<W: Work>(
+        &mut self,
+        value: structured_asn1::Integer<'_>,
+        work: &W,
+    ) -> Result<(), PropertyError> {
+        Ok(self.draft.integer_text(value, work)?)
+    }
+
+    fn datetime<W: Work>(
+        &mut self,
+        value: structured_pkix::Time,
+        work: &W,
+    ) -> Result<(), PropertyError> {
+        Ok(self.draft.time_text(value, work)?)
     }
 }
 

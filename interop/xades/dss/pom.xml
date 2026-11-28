@@ -12,6 +12,9 @@
     <dependency><groupId>eu.europa.ec.joinup.sd-dss</groupId><artifactId>dss-policy-jaxb</artifactId><version>${dss.version}</version></dependency>
     <dependency><groupId>eu.europa.ec.joinup.sd-dss</groupId><artifactId>dss-utils-apache-commons</artifactId><version>${dss.version}</version></dependency>
     <dependency><groupId>eu.europa.ec.joinup.sd-dss</groupId><artifactId>dss-crl-parser-x509crl</artifactId><version>${dss.version}</version></dependency>
+    <!-- Evidence records embedded under ETSI TS 119 132-3, in both formats. -->
+    <dependency><groupId>eu.europa.ec.joinup.sd-dss</groupId><artifactId>dss-evidence-record-xml</artifactId><version>${dss.version}</version></dependency>
+    <dependency><groupId>eu.europa.ec.joinup.sd-dss</groupId><artifactId>dss-evidence-record-asn1</artifactId><version>${dss.version}</version></dependency>
     <!-- DSS's own PKCS#12 token signs with every algorithm DSS supports. -->
     <dependency><groupId>eu.europa.ec.joinup.sd-dss</groupId><artifactId>dss-token</artifactId><version>${dss.version}</version></dependency>
     <!-- DSS's warnings and refusal reasons reach each run's stderr log. -->

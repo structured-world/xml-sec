@@ -52,6 +52,16 @@ fn reply(generator: &Generator, query: &str, response: &str, accuracy: bool) -> 
     } else {
         TSA_CONFIG.replace("accuracy=secs:1\n", "")
     };
+    reply_under(generator, query, response, &config)
+}
+
+/// [`reply`] by the TSA configured as `config`.
+fn reply_under(
+    generator: &Generator,
+    query: &str,
+    response: &str,
+    config: &str,
+) -> Result<(), String> {
     write(&generator.work.join("tsa.cnf"), config)?;
     generator.openssl(&[
         "ts",
@@ -185,8 +195,17 @@ pub(crate) fn content(corpus: &Corpus, generator: &Generator) -> Result<(), Stri
         reply(generator, query, response, true)?;
     }
     // The signature timestamp, then the archive timestamp, of the signature
-    // that carries content timestamps and a policy store, each needing the
-    // response before it.
+    // that carries content timestamps and a policy store; the X timestamp of
+    // the B-T signature with its complete references, then the archive
+    // timestamps after its values; the signature timestamps of the signatures
+    // in the pre-EN, V1.1.1 and V1.2.2 vocabularies, then the archive
+    // timestamp of the pre-EN one with its values and its X and archive
+    // timestamps through the TS 101 903 levels; and, for a signature
+    // that excludes every signature from what it signs, its signature
+    // timestamp, then the initial archive timestamps of its evidence record
+    // and of a parallel one. Each needs the one before. Parallel records use
+    // different TSAs or hash algorithms (ETSI TS 119 132-3 §5): the parallel
+    // one asks for SHA-512, which only its reply admits.
     for (action, query, response) in [
         (
             "content-lta-request",
@@ -198,13 +217,42 @@ pub(crate) fn content(corpus: &Corpus, generator: &Generator) -> Result<(), Stri
             "content-lta-archive.tsq",
             "content-lta-archive.tsr",
         ),
+        ("x-request", "x.tsq", "x.tsr"),
+        ("a-request", "a.tsq", "a.tsr"),
+        ("a2-request", "a2.tsq", "a2.tsr"),
+        ("historical-request", "historical.tsq", "historical.tsr"),
+        ("pre-en-lta-request", "lta-pre-en.tsq", "lta-pre-en.tsr"),
+        ("pre-en-x-request", "x-pre-en.tsq", "x-pre-en.tsr"),
+        ("pre-en-a-request", "a-pre-en.tsq", "a-pre-en.tsr"),
+        (
+            "historical-request-v111",
+            "historical-v111.tsq",
+            "historical-v111.tsr",
+        ),
+        (
+            "historical-request-v122",
+            "historical-v122.tsq",
+            "historical-v122.tsr",
+        ),
+        (
+            "seal-signature-request",
+            "seal-signature.tsq",
+            "seal-signature.tsr",
+        ),
+        ("seal-request", "seal.tsq", "seal.tsr"),
+        ("parallel-request", "parallel.tsq", "parallel.tsr"),
     ] {
         probe(corpus, generator, action)?;
         write(
             &generator.output.join(query),
             read(&generator.work.join(query))?,
         )?;
-        reply(generator, query, response, true)?;
+        if action == "parallel-request" {
+            let config = TSA_CONFIG.replace("digests=sha256\n", "digests=sha256,sha512\n");
+            reply_under(generator, query, response, &config)?;
+        } else {
+            reply(generator, query, response, true)?;
+        }
     }
     Ok(())
 }

@@ -1666,10 +1666,11 @@ pub enum TimestampTokenEncoding {
     Ber,
 }
 
-/// The `XAdES` syntaxes a signature's qualifying properties may use. Signing
-/// always writes ETSI EN 319 132-1.
+/// The `XAdES` syntaxes a signature's qualifying properties may use, each
+/// variant admitting everything the one before it does; the order is that
+/// widening, so the narrower of two policies is the lesser.
 #[cfg(feature = "xmldsig")]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum XadesSyntax {
     /// ETSI EN 319 132-1 only: the `http://uri.etsi.org/01903/v1.3.2#`
     /// properties with their `v1.4.1` additions.
@@ -1680,6 +1681,10 @@ pub enum XadesSyntax {
     /// before EN 319 132-1 carry them.
     /// <https://www.etsi.org/deliver/etsi_ts/101900_101999/101903/01.02.02_60/ts_101903v010202p.pdf>
     WithTs101903V122,
+    /// Also the historical vocabularies an operation names explicitly: ETSI
+    /// TS 101 903 V1.1.1 and the TS 103 171 profile of V1.3.2, whose
+    /// `SigningCertificate` EN 319 132-1 replaced (§5.2.2).
+    WithHistoricalVocabularies,
 }
 
 /// Values a request may select for its own operation in place of the

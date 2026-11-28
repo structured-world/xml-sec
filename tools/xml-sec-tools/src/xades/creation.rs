@@ -28,7 +28,8 @@ pub(crate) struct Case {
     pub(crate) name: &'static str,
     /// Signatures, a countersignature counting as one of its own.
     pub(crate) signatures: usize,
-    /// The baseline format of every signature.
+    /// The format of every signature, or `|`-separated formats each found on
+    /// some signature and covering all of them.
     pub(crate) format: &'static str,
     /// Timestamp tokens.
     pub(crate) timestamps: usize,
@@ -46,7 +47,7 @@ const fn created(name: &'static str, signatures: usize) -> Case {
     }
 }
 
-pub(crate) const CASES: [Case; 49] = [
+pub(crate) const CASES: [Case; 69] = [
     created("enveloped", 1),
     created("enveloping", 1),
     created("internally-detached", 1),
@@ -88,11 +89,148 @@ pub(crate) const CASES: [Case; 49] = [
     created("policy-store-added", 2),
     created("policy-supplied", 1),
     created("policy-asn1", 1),
+    // Signatures in the historical vocabularies, which DSS also reports as
+    // XAdES-BASELINE-B.
+    created("historical-v111", 1),
+    created("historical-v122", 1),
+    created("historical-pre-en", 1),
     Case {
         name: "content-timestamps",
         signatures: 1,
         format: "XAdES-BASELINE-B",
         timestamps: 2,
+        fixtures: "content",
+    },
+    // The TS 101 903 levels of a B-T signature, in the EN 319 132 names:
+    // its complete references, then the X timestamp over them.
+    Case {
+        name: "c",
+        signatures: 1,
+        format: "XAdES-C",
+        timestamps: 1,
+        fixtures: "content",
+    },
+    Case {
+        name: "x",
+        signatures: 1,
+        format: "XAdES-X",
+        timestamps: 2,
+        fixtures: "content",
+    },
+    // Then the values the references name, and an archive timestamp.
+    Case {
+        name: "xl",
+        signatures: 1,
+        format: "XAdES-XL",
+        timestamps: 2,
+        fixtures: "content",
+    },
+    Case {
+        name: "a",
+        signatures: 1,
+        format: "XAdES-A",
+        timestamps: 3,
+        fixtures: "content",
+    },
+    Case {
+        name: "a-renewed",
+        signatures: 1,
+        format: "XAdES-A",
+        timestamps: 4,
+        fixtures: "content",
+    },
+    // A signature in the pre-EN vocabulary with its signature timestamp.
+    Case {
+        name: "t-pre-en",
+        signatures: 1,
+        format: "XAdES-BASELINE-T",
+        timestamps: 1,
+        fixtures: "content",
+    },
+    // A B-LT signature sealed by an evidence record (ETSI TS 119 132-3),
+    // then by a parallel one in the same property.
+    Case {
+        name: "e-ers",
+        signatures: 1,
+        format: "XAdES-ERS",
+        timestamps: 2,
+        fixtures: "content",
+    },
+    Case {
+        name: "e-ers-parallel",
+        signatures: 1,
+        format: "XAdES-ERS",
+        timestamps: 3,
+        fixtures: "content",
+    },
+    // A new B-B signature beside the sealed one, both excluding every
+    // signature from what they sign.
+    Case {
+        name: "e-ers-signed",
+        signatures: 2,
+        format: "XAdES-ERS|XAdES-BASELINE-B",
+        timestamps: 3,
+        fixtures: "content",
+    },
+    // Then with its validation values, which DSS reports as B-LT.
+    Case {
+        name: "lt-pre-en",
+        signatures: 1,
+        format: "XAdES-BASELINE-LT",
+        timestamps: 1,
+        fixtures: "content",
+    },
+    // The same in the ETSI TS 101 903 V1.1.1 and V1.2.2 vocabularies.
+    Case {
+        name: "lt-v111",
+        signatures: 1,
+        format: "XAdES-BASELINE-LT",
+        timestamps: 1,
+        fixtures: "content",
+    },
+    Case {
+        name: "lt-v122",
+        signatures: 1,
+        format: "XAdES-BASELINE-LT",
+        timestamps: 1,
+        fixtures: "content",
+    },
+    // The pre-EN signature with its values and an archive timestamp, as
+    // DSS's pre-EN B-LTA makes it.
+    Case {
+        name: "lta-pre-en",
+        signatures: 1,
+        format: "XAdES-BASELINE-LTA",
+        timestamps: 2,
+        fixtures: "content",
+    },
+    // The TS 101 903 levels of the pre-EN signature, in the names of V1.3.2.
+    Case {
+        name: "c-pre-en",
+        signatures: 1,
+        format: "XAdES-C",
+        timestamps: 1,
+        fixtures: "content",
+    },
+    Case {
+        name: "x-pre-en",
+        signatures: 1,
+        format: "XAdES-X",
+        timestamps: 2,
+        fixtures: "content",
+    },
+    Case {
+        name: "xl-pre-en",
+        signatures: 1,
+        format: "XAdES-XL",
+        timestamps: 2,
+        fixtures: "content",
+    },
+    Case {
+        name: "a-pre-en",
+        signatures: 1,
+        format: "XAdES-A",
+        timestamps: 3,
         fixtures: "content",
     },
     // A B-LT signature that took the next generation of CRLs by a refresh.
@@ -292,15 +430,24 @@ pub(crate) enum Expect {
     /// The fact holds within the diagnostic signature of the `ds:Signature`
     /// with this `Id` (its `DAIdentifier`).
     In(&'static str, &'static Expect),
+    /// Exactly `count` elements of local name `local`, each holding every
+    /// one of these (element, text) facts below itself.
+    Each(&'static str, usize, &'static [(&'static str, &'static str)]),
 }
 
 const POLICY: &str = "1.3.6.1.4.1.13762.3.1";
 const PROOF_OF_ORIGIN: &str = "http://uri.etsi.org/01903/v1.2.2#ProofOfOrigin";
 const PROOF_OF_APPROVAL: &str = "http://uri.etsi.org/01903/v1.2.2#ProofOfApproval";
 
+/// What DSS reports of a well-formed evidence record over intact objects.
+const EVIDENCE_RECORD: &[(&str, &str)] = &[
+    ("StructuralValidation@valid", "true"),
+    ("DataIntact", "true"),
+];
+
 /// The facts of the optional properties DSS must report for `name`.
 fn expected_properties(name: &str) -> &'static [Expect] {
-    use Expect::{Counted, In, Text, Together, Validated};
+    use Expect::{Counted, Each, In, Text, Together};
     if name.starts_with("policy-") {
         return policy_properties(name);
     }
@@ -351,6 +498,45 @@ fn expected_properties(name: &str) -> &'static [Expect] {
             In("counter", &Text("Role", "Manager")),
             In("counter", &Text("Role", "Approver")),
         ],
+        // Both signed Manifests, each with its own entry.
+        "manifest-multiple" => &[
+            Counted("DigestMatcher", "type", "MANIFEST", 2),
+            Counted("DigestMatcher", "type", "MANIFEST_ENTRY", 2),
+        ],
+        // DSS finds every Manifest entry, each after its own transforms.
+        "manifest-transforms" => &[
+            Counted("DigestMatcher", "type", "MANIFEST", 1),
+            Counted("DigestMatcher", "type", "MANIFEST_ENTRY", 3),
+        ],
+        "manifest-supplied" => &[
+            Counted("DigestMatcher", "type", "MANIFEST", 1),
+            Counted("DigestMatcher", "type", "MANIFEST_ENTRY", 2),
+        ],
+        // DSS binds SigningCertificate, digest and issuer-serial, to the
+        // signer's certificate; V1.1.1 carries the policy it requires.
+        "historical-v111" => &[
+            Text("CertificateRef/IssuerSerial@match", "true"),
+            Text("CertificateRef/DigestAlgoAndValue@match", "true"),
+            Text("Policy>Id", POLICY),
+        ],
+        "historical-v122" | "historical-pre-en" => &[
+            Text("CertificateRef/IssuerSerial@match", "true"),
+            Text("CertificateRef/DigestAlgoAndValue@match", "true"),
+        ],
+        // Each record is well formed and its data objects are the signature's
+        // own: DSS finds the signature it seals intact. The parallel case
+        // holds two records, each judged on its own.
+        "e-ers" => &[Each("EvidenceRecord", 1, EVIDENCE_RECORD)],
+        "e-ers-parallel" => &[Each("EvidenceRecord", 2, EVIDENCE_RECORD)],
+        _ => timestamp_properties(name),
+    }
+}
+
+/// The facts of the cases that carry timestamps or validation data beyond
+/// the signature timestamp.
+fn timestamp_properties(name: &str) -> &'static [Expect] {
+    use Expect::{Counted, Text, Validated};
+    match name {
         "content-timestamps" => &[
             Counted("Timestamp", "Type", "ALL_DATA_OBJECTS_TIMESTAMP", 1),
             Counted("Timestamp", "Type", "INDIVIDUAL_DATA_OBJECTS_TIMESTAMP", 1),
@@ -377,22 +563,19 @@ fn expected_properties(name: &str) -> &'static [Expect] {
             Text("Id", POLICY),
             Text("Policy/DigestAlgoAndValue@match", "true"),
         ],
-        // Both signed Manifests, each with its own entry.
-        "manifest-multiple" => &[
-            Counted("DigestMatcher", "type", "MANIFEST", 2),
-            Counted("DigestMatcher", "type", "MANIFEST_ENTRY", 2),
-        ],
-        // DSS finds every Manifest entry, each after its own transforms.
-        "manifest-transforms" => &[
-            Counted("DigestMatcher", "type", "MANIFEST", 1),
-            Counted("DigestMatcher", "type", "MANIFEST_ENTRY", 3),
-        ],
-        "manifest-supplied" => &[
-            Counted("DigestMatcher", "type", "MANIFEST", 1),
-            Counted("DigestMatcher", "type", "MANIFEST_ENTRY", 2),
-        ],
         // Both generations of both CAs' CRLs are incorporated.
         "b-lt-refreshed" => &[Validated("Revocation", 4)],
+        // The X timestamp covers the signature, its timestamp and its
+        // references.
+        "x" | "x-pre-en" | "xl-pre-en" => {
+            &[Counted("Timestamp", "Type", "VALIDATION_DATA_TIMESTAMP", 1)]
+        }
+        // The pre-EN archive timestamps cover what came before them.
+        "a-pre-en" => &[
+            Counted("Timestamp", "Type", "VALIDATION_DATA_TIMESTAMP", 1),
+            Counted("Timestamp", "Type", "ARCHIVE_TIMESTAMP", 1),
+        ],
+        "lta-pre-en" => &[Counted("Timestamp", "Type", "ARCHIVE_TIMESTAMP", 1)],
         _ => &[],
     }
 }
@@ -531,6 +714,32 @@ fn unmet(root: xml::Node<'_, '_>, expect: &Expect) -> Option<String> {
                 None => Some(format!("DSS reported no signature {id}")),
             }
         }
+        Expect::Each(local, count, facts) => {
+            let nodes: Vec<_> = xml::below(root, local, None).collect();
+            if nodes.len() != *count {
+                return Some(format!(
+                    "DSS read {} {local}, {count} expected",
+                    nodes.len()
+                ));
+            }
+            let failing: Vec<String> = nodes
+                .iter()
+                .enumerate()
+                .filter_map(|(index, node)| {
+                    let missing: Vec<_> = facts
+                        .iter()
+                        .filter(|(element, expected)| !holds_text(*node, element, expected))
+                        .collect();
+                    (!missing.is_empty()).then(|| {
+                        let name = node
+                            .attribute("Id")
+                            .map_or_else(|| format!("#{index}"), String::from);
+                        format!("{local} {name} lacks {missing:?}")
+                    })
+                })
+                .collect();
+            (!failing.is_empty()).then(|| format!("DSS: {}", failing.join("; ")))
+        }
     }
 }
 
@@ -585,6 +794,25 @@ fn document_problems(name: &str, document: &str, problems: &mut Vec<String>) {
     }
 }
 
+/// Each reported signature whose format is none of `format`'s, and each of
+/// them no signature has.
+fn format_problems(lines: &[&str], format: &str, problems: &mut Vec<String>) {
+    let formats: Vec<String> = format
+        .split('|')
+        .map(|format| format!(" format={format} "))
+        .collect();
+    for line in lines {
+        if !formats.iter().any(|format| line.contains(format.as_str())) {
+            problems.push(format!("not {format}: {line}"));
+        }
+    }
+    for expected in &formats {
+        if !lines.iter().any(|line| line.contains(expected.as_str())) {
+            problems.push(format!("no signature reported{}", expected.trim_end()));
+        }
+    }
+}
+
 /// What DSS concluded on one created document, and why it does not qualify.
 pub(crate) fn assess(
     case: &Case,
@@ -611,11 +839,7 @@ pub(crate) fn assess(
             lines.len()
         ));
     }
-    for line in &lines {
-        if !line.contains(&format!(" format={format} ")) {
-            problems.push(format!("not {format}: {line}"));
-        }
-    }
+    format_problems(&lines, format, &mut problems);
     let diagnostic_text = xml::read(&reports.join("diagnostic.xml"))?;
     let diagnostic = xml::parse(&diagnostic_text, "diagnostic report")?;
     tokens(diagnostic.root_element(), timestamps, &mut problems);
@@ -712,6 +936,12 @@ pub(crate) fn execute(corpus: &Corpus, results: &Path) -> Result<(), String> {
         ("augment_probe", Some("content"), "content"),
         ("augment_probe", Some("content-lta"), "content"),
         ("augment_probe", Some("refresh"), "content"),
+        ("augment_probe", Some("extended"), "content"),
+        ("augment_probe", Some("historical-lt"), "content"),
+        ("augment_probe", Some("historical-lt-v111"), "content"),
+        ("augment_probe", Some("historical-lt-v122"), "content"),
+        ("augment_probe", Some("pre-en-levels"), "content"),
+        ("augment_probe", Some("parallel"), "content"),
         ("augment_probe", Some("complete"), "augmentation"),
         ("augment_probe", Some("extend"), "levels"),
         ("augment_probe", Some("archive"), "augmentation"),

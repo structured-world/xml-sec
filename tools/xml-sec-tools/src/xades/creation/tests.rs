@@ -167,6 +167,37 @@ fn every_independent_finding_is_reported() {
 }
 
 #[test]
+fn alternative_formats_must_each_be_reported() {
+    // A document holding a sealed and a new signature names both formats:
+    // each signature has one of them and each format some signature.
+    let mixed = Case {
+        signatures: 2,
+        format: "XAdES-ERS|XAdES-BASELINE-B",
+        ..BASIC
+    };
+    let ers = "S-2 format=XAdES-ERS indication=TOTAL_PASSED subindication=null errors=[]\n";
+    let both = format!("{B}{ers}");
+    let problems_of = |output: &str| problems(&mixed, &Reported { output, ..INTACT });
+    assert!(
+        !problems_of(&both)
+            .iter()
+            .any(|problem| problem.contains("format"))
+    );
+    let only_b = format!("{B}{B}");
+    assert!(
+        problems_of(&only_b)
+            .iter()
+            .any(|problem| problem == "no signature reported format=XAdES-ERS")
+    );
+    let other = format!("{B}{T}");
+    assert!(
+        problems_of(&other)
+            .iter()
+            .any(|problem| problem.starts_with("not XAdES-ERS|XAdES-BASELINE-B"))
+    );
+}
+
+#[test]
 fn a_property_dss_did_not_read_is_reported() {
     // A case with optional properties qualifies only when DSS reads each of
     // them back: a policy whose stored document's digest does not match, or
@@ -262,6 +293,37 @@ fn a_fact_of_one_signature_is_read_in_that_signature() {
         .len(),
         4
     );
+}
+
+#[test]
+fn parallel_evidence_records_each_judged() {
+    // Two parallel records each need a valid structure over intact data: one
+    // valid record cannot stand for the other, nor for a missing second one.
+    let record = |id: &str, valid: &str| {
+        format!(
+            "<EvidenceRecord Id=\"{id}\"><StructuralValidation valid=\"{valid}\"/><DataIntact>true</DataIntact></EvidenceRecord>"
+        )
+    };
+    let report = |records: &[String]| {
+        format!(
+            "<DiagnosticData><EvidenceRecords>{}</EvidenceRecords></DiagnosticData>",
+            records.concat()
+        )
+    };
+    let both = report(&[record("ER-1", "true"), record("ER-2", "true")]);
+    assert_eq!(
+        diagnostic_problems("e-ers-parallel", &both),
+        Vec::<String>::new()
+    );
+    let one = report(&[record("ER-1", "true")]);
+    assert_eq!(
+        diagnostic_problems("e-ers-parallel", &one),
+        ["DSS read 1 EvidenceRecord, 2 expected"]
+    );
+    let broken = report(&[record("ER-1", "true"), record("ER-2", "false")]);
+    let problems = diagnostic_problems("e-ers-parallel", &broken);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(problems[0].contains("ER-2"), "{problems:?}");
 }
 
 #[test]

@@ -4,7 +4,7 @@ use alloc::{boxed::Box, format};
 use core::convert::Infallible;
 
 use crate::accuracy::{self, AuthorityAccuracy, Stated};
-use crate::basic::{Stage, Timing, ValidationError, with_stage};
+use crate::basic::{Stage, Timing, ValidationError, Vocabulary, with_stage};
 use crate::path::{self, Authorities, PathFailure};
 use crate::status::{self, StatusError};
 use crate::{Document, Error, Outcome, Report};
@@ -20,6 +20,8 @@ use structured_cms::verify::ContentAgreement;
 use structured_ltv::baseline::{self as composed, LongTerm, Timed};
 use structured_ltv::credential::Authentication;
 use structured_ltv::material::Coverage;
+#[cfg(feature = "produce")]
+use structured_ltv::pki::ParticipantClosure;
 use structured_ltv::pki::{
     AuthorityNode, CheckedPath, ParticipantAuthority, ParticipantRequirements, PathStatuses,
     TimestampBinding, TimestampBindingFailure, TimestampPath,
@@ -56,6 +58,9 @@ use xml_sec::policy::TimestampTokenEncoding;
 use xml_sec::xmldsig::cms::CmsProvider;
 use xml_sec::xmldsig::{VerifiedSession, X509ChainError};
 
+#[cfg(feature = "produce")]
+pub(crate) mod historical;
+
 type N = NodeIdentity;
 type D = DocumentIdentity;
 type G = u64;
@@ -78,6 +83,10 @@ pub(crate) trait Visit<W: Work>: Sized {
     /// Read the reports of the requested level, with the stage they belong to.
     fn level(self, stage: &Stage<'_, '_, '_, '_, W>, level: &Level<'_>) -> Self::Output;
 
+    /// Read the structural requirements a signature with the TS 101 903
+    /// references meets, for a validation in that vocabulary.
+    fn extended(self, stage: &Stage<'_, '_, '_, '_, W>, level: ExtendedLevel) -> Self::Output;
+
     /// Read the material census of a B-LT or B-LTA request before its level is
     /// assessed, or give the visitor back to let the validation continue.
     #[cfg(feature = "produce")]
@@ -93,14 +102,39 @@ pub(crate) trait Visit<W: Work>: Sized {
     }
 }
 
-impl<W: Work, F, R> Visit<W> for F
+/// A visitor of a validation in the baseline vocabulary.
+struct Baseline<F>(F);
+
+impl<W: Work, F, R> Visit<W> for Baseline<F>
 where
     F: for<'a> FnOnce(&Level<'a>) -> R,
 {
     type Output = R;
 
     fn level(self, _stage: &Stage<'_, '_, '_, '_, W>, level: &Level<'_>) -> R {
-        self(level)
+        (self.0)(level)
+    }
+
+    fn extended(self, _stage: &Stage<'_, '_, '_, '_, W>, _level: ExtendedLevel) -> R {
+        unreachable!("a validation in the baseline vocabulary assesses a baseline level")
+    }
+}
+
+/// The visitor that reads whether every requirement holds, in either
+/// vocabulary.
+#[cfg(feature = "produce")]
+pub(crate) struct Met;
+
+#[cfg(feature = "produce")]
+impl<W: Work> Visit<W> for Met {
+    type Output = bool;
+
+    fn level(self, _stage: &Stage<'_, '_, '_, '_, W>, level: &Level<'_>) -> bool {
+        level.all_requirements_met()
+    }
+
+    fn extended(self, _stage: &Stage<'_, '_, '_, '_, W>, level: ExtendedLevel) -> bool {
+        level.all_requirements_met()
     }
 }
 
@@ -209,7 +243,13 @@ pub fn validate<W: Work, R>(
     inputs: &Inputs<'_>,
     visitor: impl for<'a> FnOnce(&Level<'a>) -> R,
 ) -> Result<Outcome<R>, ValidationError> {
-    validate_with(session, signature, inputs, visitor)
+    validate_with(
+        session,
+        signature,
+        inputs,
+        Vocabulary::Baseline,
+        Baseline(visitor),
+    )
 }
 
 /// [`validate`] for any [`Visit`]or.
@@ -217,6 +257,7 @@ pub(crate) fn validate_with<W: Work, V: Visit<W>>(
     session: &VerifiedSession<'_, '_, '_, W>,
     signature: N,
     inputs: &Inputs<'_>,
+    vocabulary: Vocabulary,
     visitor: V,
 ) -> Result<Outcome<V::Output>, ValidationError> {
     let requirements = inputs.requirements;
@@ -232,12 +273,18 @@ pub(crate) fn validate_with<W: Work, V: Visit<W>>(
         session,
         signature,
         requirements,
+        vocabulary,
         // Verification's own path may end at any of them or pass through any of
         // them; only `anchors` end the paths this validation builds itself.
         [inputs.anchors, inputs.certificates],
         timing,
         |stage, basic| {
             if requirements == Requirements::Basic {
+                if extended(stage) {
+                    let level =
+                        ExtendedLevel::new(Requirements::Basic, basic.all_root_requirements_met());
+                    return Ok(Outcome::Assessed(visitor.extended(stage, level)));
+                }
                 let level =
                     baseline::assess(Evidence::Basic(basic)).map_err(ValidationError::Level)?;
                 return Ok(Outcome::Assessed(visitor.level(stage, &level)));
@@ -735,6 +782,10 @@ fn frozen<W: Work, V: Visit<W>>(
     };
     let timed = composed::timestamped(basic, &paths, access).map_err(ValidationError::Timing)?;
     if inputs.requirements == Requirements::Timestamped {
+        if extended(stage) {
+            let level = ExtendedLevel::new(Requirements::Timestamped, timed_met(&timed));
+            return Ok(Outcome::Assessed(visitor.extended(stage, level)));
+        }
         let level =
             baseline::assess(Evidence::Timestamped(&timed)).map_err(ValidationError::Level)?;
         return Ok(Outcome::Assessed(visitor.level(stage, &level)));
@@ -1001,6 +1052,7 @@ fn material_level<W: Work, V: Visit<W>>(
     let visitor = match visitor.census(&Census {
         chain,
         carried: facts.carried,
+        closure: &closure,
         x509: &x509,
     }) {
         Ok(output) => return Ok(Outcome::Assessed(output)),
@@ -1019,6 +1071,10 @@ fn material_level<W: Work, V: Visit<W>>(
     let long_term = composed::long_term(chain.timed, &x509, &format, access)
         .map_err(ValidationError::Participants)?;
     if chain.inputs.requirements == Requirements::LongTerm {
+        if extended(stage) {
+            let level = ExtendedLevel::new(Requirements::LongTerm, long_term_met(&long_term));
+            return Ok(Outcome::Assessed(visitor.extended(stage, level)));
+        }
         let level =
             baseline::assess(Evidence::LongTerm(&long_term)).map_err(ValidationError::Level)?;
         return Ok(Outcome::Assessed(visitor.level(stage, &level)));
@@ -1031,6 +1087,7 @@ fn material_level<W: Work, V: Visit<W>>(
 pub(crate) struct Census<'r, 'c, 'a, 'v, 's, 'i, 't, W: Work> {
     chain: &'r Chain<'c, 'a, 'v, 's, 'i, 't, W>,
     carried: &'r CarriedMaterial<'r, N, D, G>,
+    closure: &'r ParticipantClosure<'r, 'r, 'r, 'r, N, D, G, Xades>,
     x509: &'r material::Checks<'r, 'r, 'r, 'r, 'r, N, D, G>,
 }
 
@@ -1044,6 +1101,11 @@ impl<'r, 'c, 'a, 'v, 's, 'i, W: Work> Census<'r, 'c, 'a, 'v, 's, 'i, '_, W> {
     /// The X.509 material checks of the whole signature.
     pub(crate) fn checks(&self) -> &'r material::Checks<'r, 'r, 'r, 'r, 'r, N, D, G> {
         self.x509
+    }
+
+    /// Every participant's path and status inputs the checks were made from.
+    pub(crate) fn closure(&self) -> &'r ParticipantClosure<'r, 'r, 'r, 'r, N, D, G, Xades> {
+        self.closure
     }
 
     /// The whole `OCSPResponse` that carries `basic`: the caller's, one the
@@ -1249,12 +1311,63 @@ fn archival<W: Work, V: Visit<W>>(
     if let Some((property, failure)) = unconfirmed_renewal(stage)? {
         return Ok(Outcome::Renewal { property, failure });
     }
+    if extended(stage) {
+        let met = long_term_met(long_term) && archives.all_archive_material_covered();
+        return Ok(Outcome::Assessed(
+            visitor.extended(stage, ExtendedLevel::new(Requirements::Archival, met)),
+        ));
+    }
     let level = baseline::assess(Evidence::Archival {
         long_term,
         archives: &archives,
     })
     .map_err(ValidationError::Level)?;
     Ok(Outcome::Assessed(visitor.level(stage, &level)))
+}
+
+/// Whether the stage reads the TS 101 903 references, which no baseline
+/// level holds.
+fn extended<W: Work>(stage: &Stage<'_, '_, '_, '_, W>) -> bool {
+    stage.prepared.extended_syntax().is_some()
+}
+
+/// The B-T predicates of `timed`, as a baseline level joins them.
+fn timed_met(timed: &TimedReport<'_>) -> bool {
+    timed.basic().all_root_requirements_met() && timed.all_static_time_requirements_met()
+}
+
+/// The B-LT predicates of `long_term`, as a baseline level joins them.
+fn long_term_met(long_term: &LongTermReport<'_>) -> bool {
+    timed_met(long_term.timed()) && long_term.all_material_requirements_met()
+}
+
+/// The structural requirements a signature with the TS 101 903 references
+/// meets: the same stage predicates a baseline level joins, without claiming
+/// that level, since EN 319 132-1 §6.3 admits no references in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtendedLevel {
+    requested: Requirements,
+    met: bool,
+}
+
+impl ExtendedLevel {
+    fn new(requested: Requirements, met: bool) -> Self {
+        Self { requested, met }
+    }
+
+    /// The structural requirements assessed.
+    #[cfg(feature = "produce")]
+    #[must_use]
+    pub fn requested(self) -> Requirements {
+        self.requested
+    }
+
+    /// Every stage predicate of the requested requirements holds.
+    #[cfg(feature = "produce")]
+    #[must_use]
+    pub fn all_requirements_met(self) -> bool {
+        self.met
+    }
 }
 
 /// The checked path of every path actor of `participants`, in census order.

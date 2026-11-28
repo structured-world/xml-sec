@@ -563,6 +563,14 @@ const TS_101_903_V122: Syntax = Syntax {
     signed_properties: "http://uri.etsi.org/01903/v1.2.2#SignedProperties",
 };
 
+/// ETSI TS 101 903 V1.1.1 §6.2.2 and §7.1: its namespace and the
+/// `SignedProperties` reference type in it. The TS 103 171 profile of V1.3.2
+/// writes the EN 319 132-1 names, so it needs no entry of its own here.
+const TS_101_903_V111: Syntax = Syntax {
+    namespace: "http://uri.etsi.org/01903/v1.1.1#",
+    signed_properties: "http://uri.etsi.org/01903/v1.1.1#SignedProperties",
+};
+
 fn xades(
     signature: Node<'_, '_>,
     accepted: XadesSyntax,
@@ -575,6 +583,7 @@ fn xades(
     let syntaxes: &[Syntax] = match accepted {
         XadesSyntax::En319132 => &[EN_319_132],
         XadesSyntax::WithTs101903V122 => &[EN_319_132, TS_101_903_V122],
+        XadesSyntax::WithHistoricalVocabularies => &[EN_319_132, TS_101_903_V122, TS_101_903_V111],
     };
     let signature_id = signature
         .attribute("Id")
@@ -676,8 +685,8 @@ fn xades_containers(
     // ETSI EN 319 132-1 V1.3.1 §4.3.2 forbids empty SignedProperties and
     // defines this sequence of optional containers, not arbitrary children.
     // https://www.etsi.org/deliver/etsi_en/319100_319199/31913201/01.03.01_60/en_31913201v010301p.pdf
-    // ETSI TS 101 903 V1.2.2 §6.2.1 has the same sequence and makes
-    // SignedSignatureProperties mandatory.
+    // ETSI TS 101 903 V1.2.2 and V1.1.1 §6.2.1 have the same sequence and
+    // make SignedSignatureProperties mandatory.
     let mut last = 0;
     let mut signature_properties = false;
     for node in properties.children() {
@@ -717,7 +726,7 @@ fn xades_containers(
             "SignedProperties requires a qualifying-property container",
         ));
     }
-    if syntax == TS_101_903_V122 && !signature_properties {
+    if (syntax == TS_101_903_V122 || syntax == TS_101_903_V111) && !signature_properties {
         return Err(configuration(
             "SignedProperties requires SignedSignatureProperties",
         ));
