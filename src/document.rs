@@ -1612,7 +1612,6 @@ impl XmlDocument {
                 {
                     return Err(other());
                 }
-                let inserted = at..at + added;
                 // Only the inserted bytes changed, so `parent` still starts
                 // where it did and keeps its name; no other element starts
                 // there.
@@ -1629,22 +1628,27 @@ impl XmlDocument {
                             && found.name() == name.name()
                     })
                     .ok_or_else(other)?;
-                // Every direct child the inserted bytes produced overlaps
-                // them. Exactly one, an element spanning all of them, is one
-                // appended child: text beside it is a second child, its own
-                // descendants are not the parent's. The xmloxide backend gives
-                // every node an entity reference expands to the reference's
-                // range; roxmltree gives them the declaration's, which overlaps
-                // nothing inserted, so such an append is refused there.
-                let mut added_children = enclosing.children().filter(|child| {
-                    let span = child.range();
-                    span.start < inserted.end && inserted.start < span.end
-                });
-                let node = added_children
-                    .next()
-                    .filter(|node| node.is_element() && node.range() == inserted)
-                    .ok_or_else(other)?;
-                if added_children.next().is_some() {
+                // The bytes changed only before `parent`'s end tag, so its
+                // children are the earlier ones, each unchanged, followed by
+                // what the insertion produced: exactly one element is one
+                // appended child. This compares the child sequences, not
+                // where a node's range points, so it holds alike whether a
+                // backend gives the nodes an entity expands to the reference's
+                // range (xmloxide) or the declaration's (roxmltree). An earlier
+                // child the insertion changed, such as text it merged into, is
+                // no longer the same child.
+                let mut after = enclosing.children();
+                for earlier in element.children() {
+                    let current = after.next().ok_or_else(other)?;
+                    if current.node_type() != earlier.node_type()
+                        || current.range() != earlier.range()
+                        || current.text() != earlier.text()
+                    {
+                        return Err(other());
+                    }
+                }
+                let node = after.next().filter(Node::is_element).ok_or_else(other)?;
+                if after.next().is_some() {
                     return Err(other());
                 }
                 Ok(view.node_identity(node))
